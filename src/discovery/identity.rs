@@ -11099,13 +11099,24 @@ fn pin_scanned_object(
         mounts,
         budget,
     ) {
-        Err(PinFailure::Refused(reason)) if view.original_exited() == Ok(true) => {
-            // The view died mid-pin (its per-PID paths vanished): loss,
-            // not forgery evidence. Downgrade to Gone so the key's live
-            // pins survive churn; gaps already count the member. Live
-            // views keep refusing (fail closed where forgery evidence
-            // is possible).
-            Err(PinFailure::Gone { reason })
+        Err(PinFailure::Refused(reason)) => {
+            let dead = view.original_exited();
+            eprintln!(
+                "p11scope: DIAG v072c pin_refused view_dead={:?} path={} mono_ns={:?}",
+                dead,
+                raw.path,
+                crate::attach::monotonic_ns(),
+            );
+            if dead == Ok(true) {
+                // The view died mid-pin (its per-PID paths vanished): loss,
+                // not forgery evidence. Downgrade to Gone so the key's live
+                // pins survive churn; gaps already count the member. Live
+                // views keep refusing (fail closed where forgery evidence
+                // is possible).
+                Err(PinFailure::Gone { reason })
+            } else {
+                Err(PinFailure::Refused(reason))
+            }
         }
         outcome => outcome,
     }

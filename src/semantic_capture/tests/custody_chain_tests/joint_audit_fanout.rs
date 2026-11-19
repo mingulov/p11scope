@@ -19556,7 +19556,7 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
     let reasons = watchdog_rearm_gap_reasons(&fixture);
     assert!(
         reasons.iter().any(|reason| reason.contains("stuck session")
-            && reason.contains("discarded 3 staged calls from 1 feeds")),
+            && reason.contains("discarded 3 staged calls from 1 feed of")),
         "the re-arm gap counts the stuck session's discard: {reasons:?}"
     );
     assert_eq!(

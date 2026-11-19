@@ -27,6 +27,7 @@ use crate::discovery::identity::{
     reconcile_scanned_modules,
 };
 use crate::discovery::loader::LoaderContextSpec;
+use crate::discovery::refresh_queue::RefreshRequest;
 use crate::discovery::scan::{
     IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScanOutcome, ScannedEntry,
     ScannedTable, WORK_CEILING_REASON, order_tables_by_evidence,
@@ -140,7 +141,7 @@ fn unvalidated_discovery_accounting_changes_only_bounded_loss_evidence() {
     let before_plan = engine.plan.clone();
     let before_discovery = engine.discovery.clone();
     let before_views: Vec<_> = engine.views.iter().map(ProcessView::id).collect();
-    let before_refresh = engine.refresh_requested.clone();
+    let before_refresh = engine.refresh_queue.snapshot_map_for_test();
     let before_retirements = engine.pending_retirements.clone();
     let before_ready = engine.ready_expected_removals.clone();
     let before_facts = engine.capture_facts();
@@ -160,7 +161,7 @@ fn unvalidated_discovery_accounting_changes_only_bounded_loss_evidence() {
         engine.views.iter().map(ProcessView::id).collect::<Vec<_>>(),
         before_views
     );
-    assert_eq!(engine.refresh_requested, before_refresh);
+    assert_eq!(engine.refresh_queue.snapshot_map_for_test(), before_refresh);
     assert_eq!(engine.loader_records_accepted, 7);
     assert_eq!(engine.counter_snapshot.loader_hits, 11);
     assert_eq!(engine.loader_context_state_for_test(owner), Some("live"));
@@ -421,7 +422,7 @@ fn shallow_idle_predicate_covers_pending_refresh_staged_and_scope() {
 
     engine.request_refresh(std::process::id(), None);
     assert!(!engine.discovery_shallow_idle());
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
 
     engine.capture_facts.staged = Some(engine.capture_facts.history.clone());
     assert!(!engine.discovery_shallow_idle());
@@ -4026,7 +4027,7 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
     assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
     // The next successful provider transaction models recovery, after the
     // earlier queued work has completed. It must not clear the consumed loss.
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
     let mut grown = raw.clone();
     grown.tables[0].entries = overlay_entries(&raw, first_offsets(admitted + 2));
     let mut later = raw.tables[0].clone();
@@ -7811,7 +7812,7 @@ fn cgroup_exec_rejects_a_stale_retained_generation() {
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
 
     assert!(pending.is_empty());
-    assert!(!engine.refresh_requested.contains_key(&child.id()));
+    assert!(!engine.refresh_queue.contains_key(&child.id()));
     assert!(
         engine.admitted_cgroup_views[&ProcessViewId(35)]
             .closed_ns
@@ -9902,7 +9903,7 @@ fn leader_exit_loss_closes_only_the_owned_selection_view() {
         SelectionCoverageState::OwnedClosed(generation)
     );
     assert!(
-        !engine.refresh_requested.contains_key(&std::process::id()),
+        !engine.refresh_queue.contains_key(&std::process::id()),
         "link loss does not re-arm the same live view"
     );
 }
@@ -10078,7 +10079,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         pending.get(&ProcessViewId(18)),
         Some(&RetirementCause::ExpectedRemoval)
     );
-    assert!(!engine.refresh_requested.contains_key(&child.id()));
+    assert!(!engine.refresh_queue.contains_key(&child.id()));
     assert!(
         engine
             .counters
@@ -11783,9 +11784,9 @@ fn sibling_silent_abort_defers_loader_arm_without_recording() {
         "nothing bound and nothing stuck prepared: the re-arm starts clean"
     );
     assert!(
-        engine.refresh_requested.contains_key(&victim_pid),
+        engine.refresh_queue.contains_key(&victim_pid),
         "the deferred arm queues its rescan+re-arm: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
     assert_eq!(
         engine.loader_discovery(),
@@ -12250,9 +12251,9 @@ fn sibling_closed_tick_still_defers_loader_arm_without_recording() {
         "nothing bound and nothing stuck prepared: the re-arm starts clean"
     );
     assert!(
-        engine.refresh_requested.contains_key(&victim_pid),
+        engine.refresh_queue.contains_key(&victim_pid),
         "the deferred arm queues its rescan+re-arm: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
     assert_eq!(
         engine.loader_discovery(),
@@ -12927,7 +12928,7 @@ fn a_loader_hit_remapped_by_a_same_batch_exec_is_not_a_discovery_loss() {
 
     let (mut engine, context, _) = engine_with_exec_refreshed_loader_for(pid, armed);
     engine.retirement_intents.clear();
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
     let mut loader = loader_record_for(context, pid);
     loader.table_ptr = observed.start + 0x10;
     let mut exec: DiscoveryRecord = unsafe { std::mem::zeroed() };
@@ -13358,7 +13359,7 @@ fn selected_listed_kthread_never_marks_as_newcomer() {
         "the kthread request queues"
     );
     let serial = selected
-        .refresh_requested
+        .refresh_queue
         .get(&KTHREAD_PID)
         .expect("the queued request")
         .serial;
@@ -13416,7 +13417,7 @@ fn selected_user_process_still_admits() {
         "the user request queues"
     );
     let serial = engine
-        .refresh_requested
+        .refresh_queue
         .get(&self_pid)
         .expect("the queued request")
         .serial;
@@ -14046,7 +14047,7 @@ fn a_loader_hit_whose_armed_image_is_gone_is_not_a_discovery_loss() {
     // Neither channel knows about the exec yet: the record is still behind
     // this hit in the ring.
     engine.retirement_intents.clear();
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
     let mut record = loader_record_for(context, pid);
     record.table_ptr = 0x1000;
     let mut session = ScriptedSession::with_records([], 1);
@@ -14125,7 +14126,7 @@ fn the_identity_branch_still_requires_a_queued_exec_refresh() {
     // No exec queued and no request outstanding: the mapping moved for a
     // reason this capture cannot name.
     engine.retirement_intents.clear();
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
     let mut record = loader_record_for(context, pid);
     record.table_ptr = observed.start + 0x10;
     let mut session = ScriptedSession::with_records([], 1);
@@ -14874,7 +14875,7 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
             &mut pending,
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
     assert!(
         engine
@@ -14890,7 +14891,7 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     );
     // Re-requesting a queued pid is a no-op, not more overflow.
     engine.request_refresh(fill_base, None);
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
 }
 
@@ -16249,10 +16250,9 @@ fn refresh_requests_survive_allocation_exhaustion() {
     refresh_inventory_once(&mut engine);
 
     assert!(
-        engine.refresh_requested.contains_key(&pids[3])
-            && engine.refresh_requested.contains_key(&pids[4]),
+        engine.refresh_queue.contains_key(&pids[3]) && engine.refresh_queue.contains_key(&pids[4]),
         "exhaustion retains the queued work: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
@@ -16379,9 +16379,9 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains_key(&newcomer),
+        engine.refresh_queue.contains_key(&newcomer),
         "exhaustion retains the queued refresh: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
 
     for child in &mut children {
@@ -16516,7 +16516,7 @@ fn an_exec_refresh_never_queues_its_live_view_for_conservative_retirement() {
         engine.pending_retirements.is_empty(),
         "the retained view must never enter conservative retirement replay"
     );
-    assert!(engine.refresh_requested.contains_key(&pid));
+    assert!(engine.refresh_queue.contains_key(&pid));
 }
 
 /// Task 9.2b defect E, second half, in the *capture* path this time.
@@ -17791,7 +17791,7 @@ fn refresh_until_provider_mapped(engine: &mut Engine, pid: u32) {
          engine.modules holds no 68-entry scanned table after {MAX_REFRESHES} refreshes \
          (modules={}, tables={tables:?}, refresh_pending={}, quantum_exhausted={quantum_exhausted})",
         engine.modules.len(),
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
     );
 }
 
@@ -18857,7 +18857,7 @@ fn a_real_terminal_drain_blocks_expected_exit_until_its_journal_clears() {
     assert!(engine.views.is_empty());
     assert!(engine.retirement_intents.is_empty());
     assert!(engine.pending_retirements.is_empty());
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     engine.finalize_expected_target_exit();
     assert!(engine.expected_target_exit);
 }
@@ -18876,7 +18876,7 @@ fn delayed_pre_admission_exec_cannot_refresh_a_reused_pid() {
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &delayed, &mut pending);
 
     assert!(pending.is_empty());
-    assert!(!engine.refresh_requested.contains_key(&std::process::id()));
+    assert!(!engine.refresh_queue.contains_key(&std::process::id()));
 }
 
 #[test]
@@ -18927,7 +18927,7 @@ fn cgroup_departure_is_journaled_before_fallible_retirement() {
         Some(&RetirementCause::ExpectedRemoval)
     );
     assert!(engine.ready_expected_removals.contains(&ProcessViewId(20)));
-    assert!(!engine.refresh_requested.contains_key(&std::process::id()));
+    assert!(!engine.refresh_queue.contains_key(&std::process::id()));
     pending.clear();
     assert_eq!(
         engine.retirement_intents.get(&ProcessViewId(20)),
@@ -20995,7 +20995,7 @@ fn owned_tree_watch_tracks_unseen_members_and_scans_newest_plus_oldest() {
         "noticed members take first-seen times"
     );
     assert!(
-        engine.refresh_requested.is_empty() && engine.newcomer_first_seen.is_empty(),
+        engine.refresh_queue.is_empty() && engine.newcomer_first_seen.is_empty(),
         "the watch never queues frame work nor marks (exits gap exactly)"
     );
     // Newest plus oldest scan per run (neither maps a provider, so
@@ -22981,9 +22981,9 @@ fn learned_staging_rescans_owned_members_and_views_promptly() {
         "the member rescans at once, not at its backoff deadline"
     );
     assert!(
-        engine.refresh_requested.contains_key(&retained_pid),
+        engine.refresh_queue.contains_key(&retained_pid),
         "every retained view owes a prompt refresh: {:?}",
-        engine.refresh_requested.keys().collect::<Vec<_>>(),
+        engine.refresh_queue.keys().collect::<Vec<_>>(),
     );
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");
@@ -23145,7 +23145,7 @@ fn owned_initial_exec_preserves_the_prearm_until_later_loader_discovery() {
     assert!(!engine.retirement_intents.contains_key(&ProcessViewId(0)));
     assert!(
         !engine
-            .refresh_requested
+            .refresh_queue
             .contains_key(&((exec.pid_tgid >> 32) as u32))
     );
 }
@@ -23499,7 +23499,7 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
             &mut pending,
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 0);
 
     // The overflow batch names every queued request later, so no service pass
@@ -23536,10 +23536,10 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
             &mut pending,
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
     assert!(
-        engine.refresh_requested.len() < MAX_PENDING_REFRESH,
+        engine.refresh_queue.len() < MAX_PENDING_REFRESH,
         "inventory must free capacity while the retained refresh waits"
     );
     assert_eq!(
@@ -23551,8 +23551,8 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     // Free capacity after the earlier work settles. No fresh lifecycle event
     // rescues the owner: ordinary later batches must service its owed refresh.
     engine
-        .refresh_requested
-        .retain(|queued_pid, _| *queued_pid == pid);
+        .refresh_queue
+        .retain_for_test(|queued_pid, _| *queued_pid == pid);
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
 
@@ -24203,9 +24203,9 @@ fn twin_route_setup_tick_arms_both_loaders_past_an_expired_quantum() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "both setup refreshes are served: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
 }
 
@@ -24294,7 +24294,7 @@ fn automatic_exec_global_links_survive_caller_exec() {
                 ));
             }
             assert!(!engine.exec_rearm_views.contains_key(&view));
-            assert!(!engine.refresh_requested.contains_key(&pid));
+            assert!(!engine.refresh_queue.contains_key(&pid));
             let scans = engine.deep_scans;
             apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
             assert_eq!(
@@ -24392,7 +24392,7 @@ fn automatic_exec_global_changed_plan_replaces_only_changed_targets() {
         );
         assert!(engine.capture_facts.history.decoded.is_superset(&decoded));
         assert!(!engine.exec_rearm_views.contains_key(&ProcessViewId(0)));
-        assert!(!engine.refresh_requested.contains_key(&pid));
+        assert!(!engine.refresh_queue.contains_key(&pid));
     }
 }
 
@@ -24411,14 +24411,14 @@ fn automatic_exec_global_aborted_refresh_retries_and_settles() {
         apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
         assert_eq!(session.preflight_targets.borrow().len(), preflights + 2);
         assert!(engine.exec_rearm_views.contains_key(&view));
-        let request = engine.refresh_requested[&pid].clone();
+        let request = engine.refresh_queue[&pid].clone();
         assert_eq!(request.owner, Some(view));
         assert!(session.detached_slot_indices.iter().all(Vec::is_empty));
 
         let retry = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(retry.required_complete);
         assert!(!engine.exec_rearm_views.contains_key(&view));
-        assert!(!engine.refresh_requested.contains_key(&pid));
+        assert!(!engine.refresh_queue.contains_key(&pid));
         assert_eq!(engine.plan.slots, slots);
         assert!(slots.iter().all(|slot| engine.plan.is_active(slot.index)));
         assert_eq!(engine.capture_facts.history.modules, modules);
@@ -24435,7 +24435,7 @@ fn automatic_exec_global_aborted_refresh_retries_and_settles() {
         assert!(repeated.required_complete);
         assert_ne!(engine.loader_registry.ids_for_view(view), refreshed);
         assert!(!engine.exec_rearm_views.contains_key(&view));
-        assert!(!engine.refresh_requested.contains_key(&pid));
+        assert!(!engine.refresh_queue.contains_key(&pid));
         let scans = engine.deep_scans;
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert_eq!(engine.deep_scans, scans);
@@ -24858,7 +24858,7 @@ fn automatic_exec_aborted_tick_retry_still_rearms_pid_targets() {
         session.detached_slot_indices
     );
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "the aborted tick retains the refresh request for retry"
     );
     assert!(
@@ -35129,7 +35129,7 @@ impl LoaderPlanningFixture {
                 &mut pending,
             );
         }
-        engine.refresh_requested.clear();
+        engine.refresh_queue.clear_for_test();
         engine.publish_current_capture_facts().unwrap();
         // Settle through the ordinary candidate transaction before measuring
         // loader-only work; projection alone does not populate every planning
@@ -35432,7 +35432,7 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     // exclude cooling pids without bypass), so sweeps find an empty pool
     // while ordinary ticks still see its queued request.
     engine.scheduler.note_evicted(p3);
-    let serial = engine.refresh_requested[&p3].serial;
+    let serial = engine.refresh_queue[&p3].serial;
     let before = loader_planning_operation_counts(&engine);
     let scans_before = engine.deep_scans;
     refresh_inventory_once(&mut engine);
@@ -35457,10 +35457,7 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
     );
     assert_eq!(engine.probationary_completions, 0, "nobody probed");
     assert_eq!(
-        engine
-            .refresh_requested
-            .get(&p3)
-            .map(|request| request.serial),
+        engine.refresh_queue.get(&p3).map(|request| request.serial),
         Some(serial),
         "the waiter's request survives the sweep unconsumed"
     );
@@ -35485,18 +35482,12 @@ fn idle_inventory_tick_at_view_capacity_rebuilds_no_candidates() {
         "the ordinary tick selects nothing without free slots"
     );
     assert_eq!(
-        engine
-            .refresh_requested
-            .get(&p3)
-            .map(|request| request.serial),
+        engine.refresh_queue.get(&p3).map(|request| request.serial),
         Some(serial),
         "the waiter's request stays queued with its serial"
     );
     assert_eq!(
-        engine
-            .refresh_requested
-            .get(&p4)
-            .map(|request| request.serial),
+        engine.refresh_queue.get(&p4).map(|request| request.serial),
         Some(serial + 1),
         "the fresh slotless request stays queued with its serial"
     );
@@ -35540,7 +35531,10 @@ fn assert_tick_evidence_equal(fast: &Engine, full: &Engine) {
         assert_eq!(fast.pinned.sources(pin.id), full.pinned.sources(pin.id));
     }
     assert_eq!(fast.pending_rejected_keys, full.pending_rejected_keys);
-    assert_eq!(fast.refresh_requested, full.refresh_requested);
+    assert_eq!(
+        fast.refresh_queue.snapshot_map_for_test(),
+        full.refresh_queue.snapshot_map_for_test()
+    );
     assert_eq!(
         fast.views
             .iter()
@@ -35885,12 +35879,12 @@ fn a_gated_dynamic_view_with_manifest_getters_is_armed_on_the_next_scan() {
     let pid = engine.views[0].pid();
     assert!(engine.loader_arming_gated(view), "provider-free: gated");
     assert!(engine.loader_registry.ids_for_view(view).is_empty());
-    engine.refresh_requested.remove(&pid);
+    engine.refresh_queue.remove_for_test(&pid);
     let owner = engine.manifest_getter_context(view);
     assert!(owner.is_ok(), "{:?}", owner.err());
     assert!(engine.manifest_getter_context_cached(view).is_none());
     assert!(!engine.loader_arming_gated(view), "the getter ungates it");
-    assert!(engine.refresh_requested.contains_key(&pid));
+    assert!(engine.refresh_queue.contains_key(&pid));
     // The requested scan arms its loader, which then owns the getters.
     refresh_inventory_once(&mut engine);
     assert!(
@@ -36039,7 +36033,7 @@ fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
         }
         let pid = engine.views[0].pid();
         let view = engine.views[0].id();
-        engine.refresh_requested.clear();
+        engine.refresh_queue.clear_for_test();
         apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
         assert_eq!(engine.loader_records_accepted, 1);
         // The batch's own tick pays the debt the record scan owed, although
@@ -36053,7 +36047,7 @@ fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
         // No rescan: it would retire the loader context with its deferred
         // scans (seen live as a named loader memory discovery loss).
         assert!(
-            !engine.refresh_requested.contains_key(&pid),
+            !engine.refresh_queue.contains_key(&pid),
             "getters={getters}"
         );
         // A debt a spent frame carried over is paid by a later quiet tick.
@@ -36067,7 +36061,7 @@ fn a_loader_record_scan_owes_a_getter_pass_when_getters_are_accepted() {
             "getters={getters}: the owed pass ran on the quiet tick"
         );
         assert!(
-            !engine.refresh_requested.contains_key(&pid),
+            !engine.refresh_queue.contains_key(&pid),
             "getters={getters}"
         );
         engine.getter_pass_owed.insert(view);
@@ -36090,7 +36084,7 @@ fn a_quiet_scope_tick_runs_an_owed_getter_pass() {
         engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
         refresh_inventory_once(&mut engine);
         let view = engine.views[0].id();
-        engine.refresh_requested.clear();
+        engine.refresh_queue.clear_for_test();
         if getters {
             accept_a_manifest_getter(&mut engine);
         }
@@ -36378,17 +36372,17 @@ fn skipped_manifest_getter_views_are_requested_without_a_loader_context() {
     let pid = engine.views[0].pid();
     assert!(engine.loader_registry.ids_for_view(view).is_empty());
     let incomplete = BTreeSet::from([view]);
-    engine.refresh_requested.remove(&pid);
+    engine.refresh_queue.remove_for_test(&pid);
     // No getter manifest: nothing to redo for an unarmed view.
     engine.request_skipped_export_views(&incomplete);
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     accept_a_manifest_getter(&mut engine);
     engine.getter_sites_settled.insert(view);
     engine.request_skipped_export_views(&incomplete);
-    assert!(!engine.refresh_requested.contains_key(&pid), "settled");
+    assert!(!engine.refresh_queue.contains_key(&pid), "settled");
     engine.getter_sites_settled.remove(&view);
     engine.request_skipped_export_views(&incomplete);
-    assert!(engine.refresh_requested.contains_key(&pid));
+    assert!(engine.refresh_queue.contains_key(&pid));
 }
 
 /// A failed orphan detach fails the pass closed like a retirement's does,
@@ -36570,10 +36564,7 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
     for engine in [&fast, &full] {
         assert_eq!(engine.probationary_completions, 0, "nobody probed");
         assert_eq!(
-            engine
-                .refresh_requested
-                .get(&p3)
-                .map(|request| request.serial),
+            engine.refresh_queue.get(&p3).map(|request| request.serial),
             Some(1),
             "the waiter's request survives the sweep unconsumed"
         );
@@ -36602,18 +36593,12 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
     );
     for engine in [&fast, &full] {
         assert_eq!(
-            engine
-                .refresh_requested
-                .get(&p3)
-                .map(|request| request.serial),
+            engine.refresh_queue.get(&p3).map(|request| request.serial),
             Some(1),
             "the cooling waiter's request stays queued"
         );
         assert_eq!(
-            engine
-                .refresh_requested
-                .get(&p4)
-                .map(|request| request.serial),
+            engine.refresh_queue.get(&p4).map(|request| request.serial),
             Some(2),
         );
     }
@@ -36631,8 +36616,8 @@ fn unchanged_tick_fast_path_matches_full_rebuilds_tick_for_tick() {
         assert_eq!(engine.views.len(), 2);
         assert!(engine.views.iter().any(|view| view.pid() == p3));
         assert!(engine.views.iter().any(|view| view.pid() == p4));
-        assert!(!engine.refresh_requested.contains_key(&p3));
-        assert!(!engine.refresh_requested.contains_key(&p4));
+        assert!(!engine.refresh_queue.contains_key(&p3));
+        assert!(!engine.refresh_queue.contains_key(&p4));
     }
     // Tick 5: nothing pending anywhere; both take the early return.
     tick_both(
@@ -37299,7 +37284,7 @@ fn clean_deferral_pair(fixture: &LoaderPlanningFixture) -> (Engine, Engine) {
                 &mut pending,
             );
         }
-        engine.refresh_requested.clear();
+        engine.refresh_queue.clear_for_test();
         engine.publish_current_capture_facts().unwrap();
         let raw = engine
             .modules
@@ -40378,9 +40363,9 @@ fn refresh_releases_view_ids_when_a_new_generation_ends_before_admission() {
     );
     assert!(
         lost.iter()
-            .all(|pid| engine.refresh_requested.contains_key(pid)),
+            .all(|pid| engine.refresh_queue.contains_key(pid)),
         "every lost newcomer's pid is queued again: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
     assert_eq!(
         engine.retired_view_ids,
@@ -40445,7 +40430,7 @@ fn refresh_releases_view_ids_at_the_post_retirement_preflight_exits() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "tick 2: the lost newcomer's pid is queued again"
     );
     assert_eq!(
@@ -40795,7 +40780,7 @@ fn a_closed_tick_leaves_a_newcomer_unpublished_and_requested() {
         "the unpublished newcomer's view ID returns to the pool"
     );
     assert!(
-        engine.refresh_requested.contains_key(&newcomer.pid()),
+        engine.refresh_queue.contains_key(&newcomer.pid()),
         "the unpublished newcomer is requested again"
     );
 
@@ -40822,7 +40807,7 @@ fn a_closed_tick_leaves_a_newcomer_unpublished_and_requested() {
         "the next open tick arms the newcomer's loader"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&newcomer.pid()),
+        !engine.refresh_queue.contains_key(&newcomer.pid()),
         "the admission consumes the retry request"
     );
 }
@@ -40861,7 +40846,7 @@ fn closed_tick_with_provider_free_newcomer_marks_no_additions_blocked() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains_key(&sleep.pid()),
+        engine.refresh_queue.contains_key(&sleep.pid()),
         "the unpublished newcomer is still requested again"
     );
 }
@@ -40885,7 +40870,7 @@ fn closed_tick_with_provider_newcomer_still_marks_additions_blocked() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains_key(&child.pid()),
+        engine.refresh_queue.contains_key(&child.pid()),
         "the unpublished newcomer is still requested again"
     );
 }
@@ -41085,7 +41070,7 @@ fn a_generation_lost_during_a_newcomers_attach_leaves_no_orphaned_publication() 
         "the survivor's attached links were rolled back"
     );
     assert!(
-        engine.refresh_requested.contains_key(&survivor.pid()),
+        engine.refresh_queue.contains_key(&survivor.pid()),
         "the unpublished survivor is requested again"
     );
 
@@ -41190,7 +41175,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains_key(&member.pid()),
+        engine.refresh_queue.contains_key(&member.pid()),
         "the member's refresh request survives for the retry"
     );
 
@@ -41212,7 +41197,7 @@ fn a_generation_lost_before_attach_leaves_a_refreshed_views_new_targets_retryabl
         "the next tick arms the member's loader"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&member.pid()),
+        !engine.refresh_queue.contains_key(&member.pid()),
         "the retry consumes the refresh request"
     );
 }
@@ -41283,7 +41268,7 @@ fn a_closure_after_admission_requests_the_newcomer_it_left_unarmed() {
         "the closed tick skips arming"
     );
     assert!(
-        engine.refresh_requested.contains_key(&newcomer.pid()),
+        engine.refresh_queue.contains_key(&newcomer.pid()),
         "the newcomer the closed tick left unarmed is requested again"
     );
 
@@ -41294,7 +41279,7 @@ fn a_closure_after_admission_requests_the_newcomer_it_left_unarmed() {
         "the next tick arms the newcomer"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&newcomer.pid()),
+        !engine.refresh_queue.contains_key(&newcomer.pid()),
         "arming consumes the refresh request"
     );
 }
@@ -41344,7 +41329,7 @@ fn a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed() {
         "the closed tick leaves the surviving newcomer unarmed"
     );
     assert!(
-        engine.refresh_requested.contains_key(&survivor.pid()),
+        engine.refresh_queue.contains_key(&survivor.pid()),
         "the newcomer the closed tick left unarmed is requested again"
     );
 
@@ -41355,7 +41340,7 @@ fn a_foreign_exit_during_arming_requests_the_newcomer_it_left_unarmed() {
         "the next tick arms the surviving newcomer"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&survivor.pid()),
+        !engine.refresh_queue.contains_key(&survivor.pid()),
         "arming consumes the refresh request"
     );
 }
@@ -41424,7 +41409,7 @@ fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
         "the closed tick leaves the refreshed member unarmed"
     );
     assert!(
-        engine.refresh_requested.contains_key(&member.pid()),
+        engine.refresh_queue.contains_key(&member.pid()),
         "the refreshed view the closed tick left unarmed is requested again"
     );
 
@@ -41435,7 +41420,7 @@ fn a_foreign_exit_during_arming_requests_the_refreshed_view_it_left_unarmed() {
         "the next tick arms the member"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&member.pid()),
+        !engine.refresh_queue.contains_key(&member.pid()),
         "arming consumes the refresh request"
     );
 }
@@ -41545,7 +41530,7 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
         "the later view was armed before its exports were skipped"
     );
     assert!(
-        engine.refresh_requested.contains_key(&later.pid()),
+        engine.refresh_queue.contains_key(&later.pid()),
         "the armed view whose exports were skipped is requested again"
     );
 
@@ -41568,7 +41553,7 @@ fn a_closed_tick_retries_the_armed_view_whose_exports_it_skipped() {
         .count();
     assert_eq!(live_contexts, 1, "the retry does not double-arm the loader");
     assert!(
-        !engine.refresh_requested.contains_key(&later.pid()),
+        !engine.refresh_queue.contains_key(&later.pid()),
         "the retry consumes the refresh request"
     );
     let (active, _) = u07_provider_slots(&engine, "u07-exp-second.so");
@@ -41667,7 +41652,7 @@ fn an_open_tick_export_failure_is_not_retried_by_a_later_closure() {
         "the earlier view stays armed through its ordinary failure"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&earlier.pid()),
+        !engine.refresh_queue.contains_key(&earlier.pid()),
         "an open-tick ordinary failure is not re-requested by a later closure"
     );
     assert!(
@@ -41787,7 +41772,7 @@ fn a_generation_skipped_replacement_recovers_the_surviving_owner() {
         "A's slots are active with links, not merely reactivated"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&owner_a.pid()),
+        !engine.refresh_queue.contains_key(&owner_a.pid()),
         "the recovery consumes the re-request"
     );
 
@@ -41891,7 +41876,7 @@ fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() 
         "B never joins the retained views"
     );
     assert!(
-        engine.refresh_requested.contains_key(&owner_a.pid()),
+        engine.refresh_queue.contains_key(&owner_a.pid()),
         "the surviving owner is requested again"
     );
 
@@ -41910,7 +41895,7 @@ fn a_replacement_skipped_by_an_attach_phase_loss_recovers_the_surviving_owner() 
         "A's slots are active with links, not merely reactivated"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&owner_a.pid()),
+        !engine.refresh_queue.contains_key(&owner_a.pid()),
         "the recovery consumes the re-request"
     );
 
@@ -42032,7 +42017,7 @@ fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
         "the later view stays armed through the skipped startup attach"
     );
     assert!(
-        engine.refresh_requested.contains_key(&later.pid()),
+        engine.refresh_queue.contains_key(&later.pid()),
         "the view skipped by the lost startup generation is requested again"
     );
 
@@ -42058,7 +42043,7 @@ fn startup_export_attach_retries_the_view_a_lost_generation_skipped() {
         "the recovery does not double-arm the loader"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&later.pid()),
+        !engine.refresh_queue.contains_key(&later.pid()),
         "the recovery consumes the refresh request"
     );
     let (active, _) = u07_provider_slots(&engine, "u07-g3-second.so");
@@ -43652,12 +43637,12 @@ fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
     // mark, under the counted pending gap.
     assert_eq!(
         engine
-            .refresh_requested
+            .refresh_queue
             .get(&live_pid)
             .and_then(|request| request.owner),
         Some(view_id),
         "the retry binds the original retained view: {:?}",
-        engine.refresh_requested.get(&live_pid)
+        engine.refresh_queue.get(&live_pid)
     );
     assert!(
         engine.handles_deferred.contains_key(&live_pid),
@@ -43706,7 +43691,7 @@ fn named_initial_pin_wait_pends_for_retry_instead_of_terminating_startup() {
     let serviced = engine.refresh_request_snapshot();
     engine.complete_refresh_requests(&serviced, &BTreeSet::new());
     assert!(
-        !engine.refresh_requested.contains_key(&live_pid),
+        !engine.refresh_queue.contains_key(&live_pid),
         "the serviced retry completes its refresh request"
     );
     let candidate = engine
@@ -43822,12 +43807,12 @@ fn named_initial_reserve_deferral_pends_for_retry_instead_of_terminating_startup
     );
     assert_eq!(
         engine
-            .refresh_requested
+            .refresh_queue
             .get(&live_pid)
             .and_then(|request| request.owner),
         Some(view_id),
         "the retry binds the original retained view: {:?}",
-        engine.refresh_requested.get(&live_pid)
+        engine.refresh_queue.get(&live_pid)
     );
     assert!(
         engine.handles_deferred.contains_key(&live_pid),
@@ -53166,7 +53151,7 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 3, "two of five newcomers drain first");
     assert!(
-        engine.refresh_requested.contains_key(&more[4]),
+        engine.refresh_queue.contains_key(&more[4]),
         "the deferred request is retained, not dropped"
     );
     assert!(
@@ -53182,14 +53167,14 @@ fn refresh_tick_bounds_new_admissions_with_explicit_deferral() {
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 5, "two more drain next");
     assert!(
-        engine.refresh_requested.contains_key(&more[4]),
+        engine.refresh_queue.contains_key(&more[4]),
         "still retained after the second deferral"
     );
 
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 6, "the last newcomer drains third");
     assert!(
-        !engine.refresh_requested.contains_key(&more[4]),
+        !engine.refresh_queue.contains_key(&more[4]),
         "the served request clears"
     );
     let mut kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
@@ -53230,7 +53215,7 @@ fn failed_newcomer_does_not_starve_later_process_admission() {
         1,
         "the first tick attempts only the failed PID"
     );
-    assert!(engine.refresh_requested.contains_key(&later_pid));
+    assert!(engine.refresh_queue.contains_key(&later_pid));
 
     refresh_inventory_once(&mut engine);
     let kept: BTreeSet<_> = engine.views.iter().map(ProcessView::pid).collect();
@@ -53239,7 +53224,7 @@ fn failed_newcomer_does_not_starve_later_process_admission() {
         BTreeSet::from([first_pid, later_pid]),
         "the next bounded tick reaches the live child after the failed PID"
     );
-    assert!(!engine.refresh_requested.contains_key(&later_pid));
+    assert!(!engine.refresh_queue.contains_key(&later_pid));
 
     refresh_inventory_once(&mut engine);
     assert_eq!(
@@ -53277,7 +53262,7 @@ fn refresh_tick_deep_scan_quantum_defers_with_evidence() {
     );
     assert_eq!(engine.views.len(), 1, "no admission runs past the quantum");
     assert!(
-        engine.refresh_requested.contains_key(&kept_pid),
+        engine.refresh_queue.contains_key(&kept_pid),
         "the refreshed request is retained"
     );
     assert!(
@@ -53303,9 +53288,9 @@ fn refresh_tick_deep_scan_quantum_defers_with_evidence() {
     refresh_inventory_once(&mut engine);
     assert_eq!(engine.views.len(), 3, "everything drains once unblocked");
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "served requests clear: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
 }
 
@@ -53332,7 +53317,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     pids.push(newcomer);
     e06_write_listing(scope_dir.path(), &pids);
     engine.request_refresh(newcomer, None);
-    let original_request = engine.refresh_requested[&newcomer].clone();
+    let original_request = engine.refresh_queue[&newcomer].clone();
     let next_view_id = engine.next_view_id;
     let dirty_before = engine.exploratory_dirty.clone();
     engine.budget.set_deadline(Some(0));
@@ -53346,7 +53331,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
         "frame 1: no slot means no attempt yet"
     );
     assert!(
-        engine.refresh_requested.contains_key(&newcomer),
+        engine.refresh_queue.contains_key(&newcomer),
         "the queued request survives the ordinary frames"
     );
 
@@ -53383,10 +53368,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
     assert!(noise.contains(&format!(
         "p11scope: discovery: process-view: discovery skipped process view - the process generation could not be retained: {SCAN_DEADLINE_REASON}"
     )), "the scrubbed bounded diagnostic preserves the actual deadline: {noise:?}");
-    assert_eq!(
-        engine.refresh_requested.get(&newcomer),
-        Some(&original_request)
-    );
+    assert_eq!(engine.refresh_queue.get(&newcomer), Some(&original_request));
     assert_eq!(engine.exploratory_dirty, dirty_before);
     assert!(engine.loader_contexts.is_empty());
     assert_eq!(engine.next_view_id, next_view_id, "refusal burns no ID");
@@ -53427,7 +53409,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
             .still_the_same()
     );
     assert!(
-        !engine.refresh_requested.contains_key(&newcomer),
+        !engine.refresh_queue.contains_key(&newcomer),
         "the original request completes"
     );
     assert_eq!(engine.next_view_id, next_view_id);
@@ -53854,12 +53836,13 @@ fn a_polling_rescan_of_provider_free_processes_is_not_a_loss() {
 #[test]
 fn optional_polling_defers_at_a_full_refresh_queue_without_record_loss() {
     let (_children, mut engine, pids) = polling_engine_with_full_exec_queue(2);
-    let requested = engine.refresh_requested.clone();
+    let requested = engine.refresh_queue.snapshot_map_for_test();
 
     engine.queue_polling_rescans(&pids);
 
     assert_eq!(
-        engine.refresh_requested, requested,
+        engine.refresh_queue.snapshot_map_for_test(),
+        requested,
         "EXEC work stays queued"
     );
     assert!(engine.polled_pids.is_empty(), "no poll was admitted");
@@ -53884,15 +53867,15 @@ fn optional_polling_defers_at_a_full_refresh_queue_without_record_loss() {
 fn optional_polling_stops_when_the_last_refresh_entry_is_taken() {
     let (_children, mut engine, pids) =
         polling_engine_with_full_exec_queue(MAX_POLLING_RESCANS + 3);
-    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
-    let requested = engine.refresh_requested.clone();
+    engine.refresh_queue.remove_for_test(&FAKE_PID_FLOOR);
+    let requested = engine.refresh_queue.snapshot_map_for_test();
 
     engine.queue_polling_rescans(&pids);
 
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert!(requested.iter().all(|(pid, queued)| {
         engine
-            .refresh_requested
+            .refresh_queue
             .get(pid)
             .is_some_and(|now| now == queued)
     }));
@@ -53911,12 +53894,12 @@ fn optional_polling_resumes_fairly_after_refresh_capacity_reopens() {
     let (_children, mut engine, pids) = polling_engine_with_full_exec_queue(3);
     engine.queue_polling_rescans(&pids);
     assert_eq!(engine.scheduler.poll_order(&pids), pids);
-    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
+    engine.refresh_queue.remove_for_test(&FAKE_PID_FLOOR);
 
     for (index, pid) in pids.iter().copied().enumerate() {
         engine.queue_polling_rescans(&pids);
         assert_eq!(engine.polled_pids, BTreeSet::from([pid]));
-        assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+        assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
 
         // A saturated round must leave the next eligible view in place.
         let next = pids[(index + 1) % pids.len()];
@@ -53934,7 +53917,7 @@ fn optional_polling_resumes_fairly_after_refresh_capacity_reopens() {
             &BTreeSet::new(),
             &BTreeSet::new(),
         );
-        engine.refresh_requested.remove(&pid);
+        engine.refresh_queue.remove_for_test(&pid);
     }
 
     assert_eq!(engine.polling_rescans_queued, 3);
@@ -53958,7 +53941,7 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
             &mut pending,
         );
     }
-    let requested = engine.refresh_requested.clone();
+    let requested = engine.refresh_queue.snapshot_map_for_test();
 
     // Hermetic newcomer: the overflowing EXEC must name an impossible pid
     // (no /proc entry on any host), so relief can never admit it.
@@ -53973,7 +53956,7 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
         &mut pending,
     );
 
-    assert_eq!(engine.refresh_requested, requested);
+    assert_eq!(engine.refresh_queue.snapshot_map_for_test(), requested);
     assert_eq!(engine.discovery_truncated, 1);
     assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
     assert!(
@@ -54014,7 +53997,7 @@ fn polling_engine_with_full_exec_queue(
             &mut pending,
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 0);
     (children, engine, pids)
 }
@@ -54120,9 +54103,9 @@ fn a_polled_process_that_exits_before_its_rescan_leaves_no_pending_poll() {
         engine.polled_pids
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "no refresh outlives its view or its rescan: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
     assert!(
         engine
@@ -54160,7 +54143,7 @@ fn optional_polling_waits_while_enumerated_newcomers_are_unserved() {
     );
     assert_eq!(engine.polling_rescans_queued, 0);
 
-    engine.refresh_requested.remove(&newcomer);
+    engine.refresh_queue.remove_for_test(&newcomer);
     engine.queue_polling_rescans(&pids);
     assert_eq!(
         engine.polled_pids.len(),
@@ -55030,7 +55013,7 @@ fn expired_tick_quantum_defers_refreshed_scans_with_requests_retained() {
     engine.scheduler.set_tick_quantum_ns_for_test(0);
     refresh_inventory_once(&mut engine);
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "the deferred refresh request stays queued"
     );
     assert!(
@@ -56176,7 +56159,7 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
 
     // Past the queue cap the excess request drops with its loss marker
     // and its dropped age (here clock-unknown: the diff never marked it).
-    let queued = engine.refresh_requested.len();
+    let queued = engine.refresh_queue.len();
     // Hermetic fill: the fill range and the overflow newcomer must be
     // impossible pids (no /proc entry on any host), so the excess request
     // drops with its loss marker on every host.
@@ -56189,10 +56172,10 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     for pid in 0..(MAX_PENDING_REFRESH - queued) as u32 {
         engine.request_refresh(fill_base + pid, Some(4_000_000_000));
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     let truncated_before = engine.discovery_truncated;
     engine.request_refresh_consumed(overflow_pid, Some(4_001_000_000));
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, truncated_before + 1);
     let stats = engine.newcomer_stats(Some(4_002_000_000));
     assert_eq!(stats.dropped, 0);
@@ -58562,16 +58545,16 @@ fn refresh_completion_interleaving(same_pid: bool) {
         "the newcomer really published its distinct physical provider"
     );
     assert!(
-        !fixture.engine.refresh_requested.contains_key(&retained_pid),
+        !fixture.engine.refresh_queue.contains_key(&retained_pid),
         "older serviced work completes"
     );
     assert!(
-        fixture.engine.refresh_requested.contains_key(&newcomer_pid),
+        fixture.engine.refresh_queue.contains_key(&newcomer_pid),
         "post-apply EXEC was not serviced by the older inventory pass"
     );
     if same_pid {
         assert_eq!(
-            fixture.engine.refresh_requested[&newcomer_pid].first_seen_ns,
+            fixture.engine.refresh_queue[&newcomer_pid].first_seen_ns,
             Some(20)
         );
     }
@@ -58717,11 +58700,11 @@ fn blocked_tick_with_clean_tail_still_counts_toward_starvation() {
         );
     }
     assert_eq!(
-        fixture.engine.refresh_requested.len(),
+        fixture.engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "the refresh queue is full, so the head parks every frame"
     );
-    let serials_before = fixture.engine.refresh_requested.clone();
+    let serials_before = fixture.engine.refresh_queue.snapshot_map_for_test();
     let late_provider = fixture.providers[1].display().to_string();
     let admitted = |engine: &Engine| {
         engine.views.iter().any(|view| view.pid() == newcomer)
@@ -58790,7 +58773,7 @@ fn blocked_tick_with_clean_tail_still_counts_toward_starvation() {
         .unwrap_or_default()
     {
         assert_eq!(
-            fixture.engine.refresh_requested.get(&pid),
+            fixture.engine.refresh_queue.get(&pid),
             serials_before.get(&pid),
             "a refused selection keeps its serial and age"
         );
@@ -58824,19 +58807,19 @@ fn blocked_tick_with_clean_tail_still_counts_toward_starvation() {
 fn refresh_retry_preserves_newer_serial_and_first_seen() {
     let mut engine = Engine::empty();
     assert!(engine.request_refresh_consumed(42, Some(10)));
-    let first = engine.refresh_requested[&42].clone();
+    let first = engine.refresh_queue[&42].clone();
     assert!(engine.request_refresh_consumed(42, Some(20)));
-    let newer = engine.refresh_requested[&42].clone();
+    let newer = engine.refresh_queue[&42].clone();
     assert!(newer.serial > first.serial);
     assert_eq!(newer.first_seen_ns, Some(10));
     assert!(engine.request_refresh(42, Some(30)));
     assert!(engine.request_refresh(42, None));
-    assert_eq!(engine.refresh_requested[&42].clone(), newer);
+    assert_eq!(engine.refresh_queue[&42].clone(), newer);
     engine.complete_refresh_requests(&BTreeMap::from([(42, first.serial)]), &BTreeSet::new());
-    assert_eq!(engine.refresh_requested[&42].clone(), newer);
+    assert_eq!(engine.refresh_queue[&42].clone(), newer);
     assert!(engine.request_refresh_consumed(43, None));
     assert!(engine.request_refresh_consumed(43, Some(40)));
-    assert_eq!(engine.refresh_requested[&43].first_seen_ns, None);
+    assert_eq!(engine.refresh_queue[&43].first_seen_ns, None);
 
     // A refused setup retry has a live owner and original loader authority.
     // Reuse the existing bounded retirement-intent replay, which cannot
@@ -58863,14 +58846,14 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     // genuinely full queue; departed-fill admission is pinned separately
     // by late_holder_refresh_queues_past_departed_pending.
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        if let Some(request) = engine.refresh_requested.get_mut(&(FAKE_PID_FLOOR + offset)) {
+        if let Some(request) = engine.refresh_queue.get_mut(&(FAKE_PID_FLOOR + offset)) {
             request.owner = Some(ProcessViewId(u32::MAX));
         }
     }
-    let requested = engine.refresh_requested.clone();
+    let requested = engine.refresh_queue.snapshot_map_for_test();
     for _ in 0..2 {
         assert!(!engine.request_refresh(pid, Some(50)));
-        assert_eq!(engine.refresh_requested, requested);
+        assert_eq!(engine.refresh_queue.snapshot_map_for_test(), requested);
         assert_eq!(engine.retirement_intents.len(), 1);
         assert_eq!(
             engine.retirement_intents.get(&view),
@@ -58888,7 +58871,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
         "owed setup cannot retire ahead of the collected record"
     );
     assert_eq!(engine.loader_records_accepted, 0);
-    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
+    engine.refresh_queue.remove_for_test(&FAKE_PID_FLOOR);
     engine.frame_work_budget_ns = u64::MAX;
     engine.drain_discovery_from(&mut session).unwrap();
     assert!(engine.pending_discovery_records.is_empty());
@@ -58910,7 +58893,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
         }]),
         "the completed retry owes one catch-up for its newly armed context"
     );
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     let scans = engine.deep_scans;
     let memory_scans = engine.loader_memory_scan_attempts;
     let detached = session.detached.clone();
@@ -58926,7 +58909,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     assert_eq!(session.attached_slots.iter().sum::<usize>(), attached);
     assert_eq!(session.dynamic_attach_calls, exports);
     assert_eq!(session.dynamic_loader_attach_calls, loader_attaches);
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.retirement_intents.contains_key(&view));
     assert_eq!(engine.loader_records_accepted, 1);
     assert_eq!(engine.discovery_truncated, 0);
@@ -58945,7 +58928,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     assert_eq!(session.attached_slots.iter().sum::<usize>(), attached);
     assert_eq!(session.dynamic_attach_calls, exports);
     assert_eq!(session.dynamic_loader_attach_calls, loader_attaches);
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.retirement_intents.contains_key(&view));
 
     // A normal shallow cgroup frame frees the absent requests while the
@@ -58981,7 +58964,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     // genuinely full queue; departed-fill admission is pinned separately
     // by late_holder_refresh_queues_past_departed_pending.
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        if let Some(request) = engine.refresh_requested.get_mut(&(FAKE_PID_FLOOR + offset)) {
+        if let Some(request) = engine.refresh_queue.get_mut(&(FAKE_PID_FLOOR + offset)) {
             request.owner = Some(ProcessViewId(u32::MAX));
         }
     }
@@ -58990,7 +58973,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     engine
         .drain_discovery_shallow_from(&mut session, false)
         .unwrap();
-    assert!(engine.refresh_requested.is_empty());
+    assert!(engine.refresh_queue.is_empty());
     assert_eq!(
         engine.retirement_intents.get(&view),
         Some(&RetirementCause::ExecRefresh)
@@ -59008,7 +58991,7 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
         "an owed retry upgrades the next quiet shallow frame"
     );
     assert!(!engine.retirement_intents.contains_key(&view));
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.loader_registry.ids_for_view(view).is_empty());
     assert!(!engine.plan.slots.is_empty());
     assert_eq!(engine.discovery_truncated, 0);
@@ -59046,7 +59029,7 @@ fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
     // genuinely full queue; departed-fill admission is pinned separately
     // by late_holder_refresh_queues_past_departed_pending.
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        if let Some(request) = engine.refresh_requested.get_mut(&(FAKE_PID_FLOOR + offset)) {
+        if let Some(request) = engine.refresh_queue.get_mut(&(FAKE_PID_FLOOR + offset)) {
             request.owner = Some(ProcessViewId(u32::MAX));
         }
     }
@@ -59059,7 +59042,7 @@ fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(record)))].into();
     engine.drain_discovery_from(&mut session).unwrap();
     assert_eq!(engine.pending_discovery_records.len(), 1);
-    engine.refresh_requested.remove(&FAKE_PID_FLOOR);
+    engine.refresh_queue.remove_for_test(&FAKE_PID_FLOOR);
     engine.frame_work_budget_ns = u64::MAX;
 
     // Starved: the rescan defers, the request is retained, no new arm.
@@ -59075,7 +59058,7 @@ fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "the deferred refresh request stays queued"
     );
     let stalled = engine.loader_registry.ids_for_view(view);
@@ -59105,21 +59088,21 @@ fn refresh_retry_rearm_defers_under_zero_tick_quantum_then_arms() {
         }]),
         "the completed retry owes one catch-up for its newly armed context"
     );
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
 }
 
 #[test]
 fn refresh_serial_exhaustion_refuses_without_reuse() {
     let mut engine = Engine::empty();
-    engine.last_refresh_serial = u64::MAX - 1;
+    engine.refresh_queue.set_last_serial_for_test(u64::MAX - 1);
     assert!(engine.request_refresh_consumed(42, Some(10_000_000)));
-    let last = engine.refresh_requested[&42].clone();
+    let last = engine.refresh_queue[&42].clone();
     assert_eq!(last.serial, u64::MAX);
     assert!(!engine.request_refresh_consumed(42, Some(20_000_000)));
     assert!(!engine.request_refresh_consumed(43, Some(30_000_000)));
-    assert_eq!(engine.last_refresh_serial, u64::MAX);
+    assert_eq!(engine.refresh_queue.last_serial_for_test(), u64::MAX);
     assert_eq!(
-        engine.refresh_requested,
+        engine.refresh_queue.snapshot_map_for_test(),
         BTreeMap::from([(42, last.clone())])
     );
     assert_eq!(engine.discovery_truncated, 2);
@@ -59129,7 +59112,7 @@ fn refresh_serial_exhaustion_refuses_without_reuse() {
     assert!(engine.request_refresh(42, Some(40)));
     assert!(!engine.request_refresh(43, Some(40)));
     assert_eq!(
-        engine.refresh_requested,
+        engine.refresh_queue.snapshot_map_for_test(),
         BTreeMap::from([(42, last.clone())])
     );
     assert_eq!(
@@ -59156,10 +59139,10 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
     assert!(engine.request_refresh_consumed(44, Some(20)));
     engine.complete_refresh_requests(&serviced, &BTreeSet::from([42]));
     assert_eq!(
-        engine.refresh_requested.keys().copied().collect::<Vec<_>>(),
+        engine.refresh_queue.keys().copied().collect::<Vec<_>>(),
         [41, 42, 44]
     );
-    assert_eq!(engine.refresh_requested[&41].first_seen_ns, Some(10));
+    assert_eq!(engine.refresh_queue[&41].first_seen_ns, Some(10));
 
     // Expected-exit/link-loss cleanup is owned by its exact retained view,
     // and cannot clear an unmatched replacement request for the same PID.
@@ -59170,9 +59153,9 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
     assert_eq!(binding.abi, HookAbi::Interface);
     assert!(!engine.modules.is_empty());
     assert!(engine.request_refresh_consumed(pid, Some(30)));
-    assert_eq!(engine.refresh_requested[&pid].owner, Some(view));
+    assert_eq!(engine.refresh_queue[&pid].owner, Some(view));
     engine.clear_refresh_for_view(view, pid);
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     // The actual lowering route refuses to join the fresh record to the
     // retained old generation. A later timestamp alone cannot establish
     // this distinction for an EXEC already matched by lifecycle_retirement.
@@ -59196,14 +59179,14 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
         outcome,
         DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
     ));
-    let replacement = engine.refresh_requested[&pid].clone();
+    let replacement = engine.refresh_queue[&pid].clone();
     assert_eq!(replacement.owner, None);
     engine.queue_retirement(
         view,
         RetirementCause::ExpectedRemoval,
         &mut PendingViewRetirements::new(),
     );
-    assert_eq!(engine.refresh_requested[&pid].clone(), replacement);
+    assert_eq!(engine.refresh_queue[&pid].clone(), replacement);
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
             skip.subject == "live interface selection"
@@ -59233,7 +59216,7 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
             )
             .unwrap()
     );
-    assert!(fixture.engine.refresh_requested.is_empty());
+    assert!(fixture.engine.refresh_queue.is_empty());
     assert_eq!(fixture.engine.deep_scans, scans);
     assert!(!fixture.engine.plan.slots.is_empty());
 }
@@ -59246,14 +59229,14 @@ fn matched_lifecycle_refresh_keeps_owner_for_proven_exit() {
     fixture.engine.scope = Scope::Pid(pid);
     assert!(!fixture.engine.plan.slots.is_empty());
     assert!(fixture.engine.request_refresh(pid, Some(10_000_000)));
-    let first = fixture.engine.refresh_requested[&pid].clone();
+    let first = fixture.engine.refresh_queue[&pid].clone();
     let mut pending = PendingViewRetirements::new();
     fixture.engine.dispatch_lifecycle_record(
         &mut ScriptedSession::default(),
         &exec_record_for(pid),
         &mut pending,
     );
-    let renewed = fixture.engine.refresh_requested[&pid].clone();
+    let renewed = fixture.engine.refresh_queue[&pid].clone();
     assert_eq!(renewed.owner, Some(view));
     assert!(renewed.serial > first.serial);
     assert_eq!(renewed.first_seen_ns, first.first_seen_ns);
@@ -59267,7 +59250,7 @@ fn matched_lifecycle_refresh_keeps_owner_for_proven_exit() {
     fixture.engine.promote_stale_execs(&mut pending);
     assert_eq!(pending.get(&view), Some(&RetirementCause::ExpectedRemoval));
     assert!(
-        !fixture.engine.refresh_requested.contains_key(&pid),
+        !fixture.engine.refresh_queue.contains_key(&pid),
         "a matched late EXEC belongs to the proven-ended retained group"
     );
     assert!(
@@ -59405,7 +59388,7 @@ fn busy_retained_refreshes_share_one_scan_ticks_with_newcomers() {
         "the retained rescan plus the newcomer admission scanned within two passes"
     );
     assert!(
-        fixture.engine.refresh_requested.is_empty(),
+        fixture.engine.refresh_queue.is_empty(),
         "neither the retained refresh nor the newcomer stayed queued"
     );
     assert!(
@@ -59433,7 +59416,7 @@ fn zero_or_failed_clock_keeps_refresh_order_and_requests() {
     let view = fixture.engine.views[0].id();
     let pid = fixture.children[0].pid();
     fixture.engine.request_refresh(pid, Some(10));
-    let requested = fixture.engine.refresh_requested.clone();
+    let requested = fixture.engine.refresh_queue.snapshot_map_for_test();
     let scans_before = fixture.engine.deep_scans;
     fixture.engine.scheduler.set_tick_quantum_ns_for_test(0);
     fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
@@ -59451,7 +59434,10 @@ fn zero_or_failed_clock_keeps_refresh_order_and_requests() {
     assert!(scans.is_empty());
     assert!(deferred.contains(&pid));
     assert_eq!(fixture.engine.deep_scans, scans_before);
-    assert_eq!(fixture.engine.refresh_requested, requested);
+    assert_eq!(
+        fixture.engine.refresh_queue.snapshot_map_for_test(),
+        requested
+    );
     fixture.engine.scheduler.set_tick_quantum_ns_for_test(1);
     fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
     let (scans, _, _, _) = fixture.engine.scan_inventory_views(
@@ -59483,7 +59469,7 @@ fn pressure_parked_head_waits_for_unprotected_service() {
         );
     }
     assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(2_000)));
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
         .chain((0..255u32).map(|offset| FAKE_PID_FLOOR + offset))
@@ -59511,18 +59497,16 @@ fn pressure_parked_head_waits_for_unprotected_service() {
         "the parked head was serviced, not dropped"
     );
     assert!(
-        !engine
-            .refresh_requested
-            .contains_key(&(FAKE_PID_FLOOR + 255)),
+        !engine.refresh_queue.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the unprotected request was serviced"
     );
     let head = engine
-        .refresh_requested
+        .refresh_queue
         .get(&head_pid)
         .expect("the original head dispatched into the freed slot");
     let mut previous = head.serial;
     for offset in 0..255u32 {
-        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
+        let request = &engine.refresh_queue[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(1_000 + u64::from(offset)),
@@ -59583,10 +59567,10 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let pid_before = engine.refresh_requested[&pid].clone();
-    let decoy_before = engine.refresh_requested[&decoy].clone();
-    let unprotected_before = engine.refresh_requested[&unprotected].clone();
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let pid_before = engine.refresh_queue[&pid].clone();
+    let decoy_before = engine.refresh_queue[&decoy].clone();
+    let unprotected_before = engine.refresh_queue[&unprotected].clone();
     // The suffix names every fake, so pid-order selection serves the
     // decoy first and the unprotected request second.
     let head_pid = 6_000_000u32;
@@ -59607,7 +59591,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     // transaction runs; the selectable unprotected entry waits for the
     // next opportunity instead of running second in this one.
     session.refuse_preflights([true]);
-    let serial_before = engine.last_refresh_serial;
+    let serial_before = engine.refresh_queue.last_serial_for_test();
     let passes_before = engine.pressure_service_passes;
     let outcome = engine
         .service_backlog_quantum(&mut session)
@@ -59650,26 +59634,27 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
         "the re-parked prefix keeps the head first"
     );
     assert_eq!(
-        engine.refresh_requested.get(&decoy),
+        engine.refresh_queue.get(&decoy),
         Some(&decoy_before),
         "the refused entry keeps its serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&unprotected),
+        engine.refresh_queue.get(&unprotected),
         Some(&unprotected_before),
         "the next entry waits untouched for its own opportunity"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request was never selected"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the head waits parked while rotation continues"
     );
     assert_eq!(
-        engine.last_refresh_serial, serial_before,
+        engine.refresh_queue.last_serial_for_test(),
+        serial_before,
         "the refused attempt mints no serial"
     );
     assert!(outcome.progressed, "the ruled-out rotation moves work");
@@ -59679,7 +59664,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     // the freed slot, and the suffix renews in order. Exactly one more
     // transaction runs.
     session.refuse_preflights([false, false]);
-    let serial_before = engine.last_refresh_serial;
+    let serial_before = engine.refresh_queue.last_serial_for_test();
     let passes_before = engine.pressure_service_passes;
     let outcome = engine
         .service_backlog_quantum(&mut session)
@@ -59700,7 +59685,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     );
     assert_eq!(engine.discovery_truncated, 0, "service loses nothing");
     assert!(
-        !engine.refresh_requested.contains_key(&unprotected),
+        !engine.refresh_queue.contains_key(&unprotected),
         "the selected entry completed"
     );
     assert!(
@@ -59719,7 +59704,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
         "the successful completion armed its loader"
     );
     let head = engine
-        .refresh_requested
+        .refresh_queue
         .get(&head_pid)
         .expect("the original head dispatched into the freed slot");
     assert_eq!(
@@ -59728,13 +59713,13 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
         "exactly one accepted serial for the original head"
     );
     assert_eq!(
-        engine.last_refresh_serial,
+        engine.refresh_queue.last_serial_for_test(),
         serial_before + 1 + 253,
         "one serial per renewal after the head, none extra"
     );
     let mut previous = serial_before + 1;
     for offset in 0..253u32 {
-        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
+        let request = &engine.refresh_queue[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -59747,12 +59732,12 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
         previous = request.serial;
     }
     assert_eq!(
-        engine.refresh_requested.get(&decoy),
+        engine.refresh_queue.get(&decoy),
         Some(&decoy_before),
         "the ruled-out entry still keeps its serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request was never selected"
     );
@@ -59812,7 +59797,7 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
             "request {offset} consumes"
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     // Every context is live against a live view before the pass.
     assert_eq!(engine.views.len(), MAX_PENDING_REFRESH);
     for (pid, view) in pids.iter().zip(engine.views.iter()) {
@@ -59854,7 +59839,7 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
         "the all-blocked head is refused exactly once"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "a refused head leaves no request behind"
     );
     assert_eq!(
@@ -59873,7 +59858,7 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
     );
     let mut previous = 0u64;
     for (offset, pid) in pids.iter().enumerate() {
-        let request = &engine.refresh_requested[pid];
+        let request = &engine.refresh_queue[pid];
         assert_eq!(
             request.first_seen_ns,
             Some(1_000 + offset as u64),
@@ -59933,7 +59918,7 @@ fn pressure_all_blocked_fifo_refuses_once_then_advances() {
     );
     refresh_inventory_once(&mut engine);
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "a later tick still services the old requests"
     );
     assert_eq!(
@@ -60176,15 +60161,15 @@ fn pressure_services_unprotected_request_before_original_head() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(oracle.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(oracle.refresh_queue.len(), MAX_PENDING_REFRESH);
     let oracle_selection = PressureSelection {
         pid: oracle_peer,
-        serial: oracle.refresh_requested[&oracle_peer].serial,
+        serial: oracle.refresh_queue[&oracle_peer].serial,
     };
     let oracle_protection = oracle.pressure_protection_for(&[], &[]);
     let mut oracle_collect = Engine::collect_discovery_records;
     let mut oracle_diverted = Vec::new();
-    let oracle_decoy_before = oracle.refresh_requested[&oracle_decoy].clone();
+    let oracle_decoy_before = oracle.refresh_queue[&oracle_decoy].clone();
     let oracle_cold_cache = oracle.budget.retained_counts().4;
     assert_eq!(oracle_cold_cache, 0, "the bare refusal starts cold");
     let oracle_scans_before = oracle.deep_scans;
@@ -60209,7 +60194,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     assert!(refused.attempted, "the bare refusal ran a real attempt");
     assert_eq!(oracle.deep_scans, oracle_scans_before + 1);
     assert_eq!(
-        oracle.refresh_requested.get(&oracle_decoy),
+        oracle.refresh_queue.get(&oracle_decoy),
         Some(&oracle_decoy_before),
         "the bare refusal preserves its request serial and age"
     );
@@ -60243,7 +60228,7 @@ fn pressure_services_unprotected_request_before_original_head() {
         .expect("the bare service transaction completes");
     assert!(oracle_outcome.attempted, "the oracle ran a real attempt");
     assert!(
-        !oracle.refresh_requested.contains_key(&oracle_peer),
+        !oracle.refresh_queue.contains_key(&oracle_peer),
         "the bare transaction completes the live request"
     );
     assert!(
@@ -60326,7 +60311,7 @@ fn pressure_services_unprotected_request_before_original_head() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert!(
         engine
             .loader_registry
@@ -60341,24 +60326,22 @@ fn pressure_services_unprotected_request_before_original_head() {
             .is_empty(),
         "the decoy request starts with settled old contexts"
     );
-    let pid_before = engine.refresh_requested[&pid].clone();
-    let decoy_before = engine.refresh_requested[&decoy].clone();
-    let unprotected_before = engine.refresh_requested[&unprotected].clone();
+    let pid_before = engine.refresh_queue[&pid].clone();
+    let decoy_before = engine.refresh_queue[&decoy].clone();
+    let unprotected_before = engine.refresh_queue[&unprotected].clone();
     let unrelated_before: Vec<RefreshRequest> = (0..253u32)
-        .map(|offset| engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone())
+        .map(|offset| engine.refresh_queue[&(FAKE_PID_FLOOR + offset)].clone())
         .collect();
     let unrelated_unchanged = |engine: &Engine| {
         for (offset, before) in unrelated_before.iter().enumerate() {
             assert_eq!(
-                engine
-                    .refresh_requested
-                    .get(&(FAKE_PID_FLOOR + offset as u32)),
+                engine.refresh_queue.get(&(FAKE_PID_FLOOR + offset as u32)),
                 Some(before),
                 "unrelated request {offset} keeps its serial and age"
             );
         }
     };
-    let serial_before = engine.last_refresh_serial;
+    let serial_before = engine.refresh_queue.last_serial_for_test();
     let work_before = engine.budget.work_units_count();
     let scans_before = engine.deep_scans;
     let arms_before = engine.loader_arms();
@@ -60406,7 +60389,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     assert_eq!(parked.terminal_owner, None);
     assert!(parked.terminal_exports.is_empty());
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the head waits parked while rotation continues"
     );
     assert_eq!(engine.pressure_service_passes, 1);
@@ -60421,17 +60404,17 @@ fn pressure_services_unprotected_request_before_original_head() {
     );
     assert_eq!(engine.discovery_truncated, 0, "rotation refuses nothing");
     assert_eq!(
-        engine.refresh_requested.get(&decoy),
+        engine.refresh_queue.get(&decoy),
         Some(&decoy_before),
         "the refused selection keeps its serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&unprotected),
+        engine.refresh_queue.get(&unprotected),
         Some(&unprotected_before),
         "the next selection waits untouched"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request was never selected"
     );
@@ -60449,7 +60432,8 @@ fn pressure_services_unprotected_request_before_original_head() {
         "rotation continues past the refused entry"
     );
     assert_eq!(
-        engine.last_refresh_serial, serial_before,
+        engine.refresh_queue.last_serial_for_test(),
+        serial_before,
         "the refused attempt mints no serial"
     );
     let work_after_first = engine.budget.work_units_count();
@@ -60498,7 +60482,7 @@ fn pressure_services_unprotected_request_before_original_head() {
         "no dropped age was recorded"
     );
     let head_request = engine
-        .refresh_requested
+        .refresh_queue
         .get(&head_pid)
         .expect("the original head dispatched into the freed slot");
     assert_eq!(
@@ -60507,12 +60491,12 @@ fn pressure_services_unprotected_request_before_original_head() {
         "exactly one accepted serial for the original head"
     );
     assert_eq!(
-        engine.last_refresh_serial,
+        engine.refresh_queue.last_serial_for_test(),
         serial_before + 1,
         "park, service and dispatch mint exactly one serial"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&unprotected),
+        !engine.refresh_queue.contains_key(&unprotected),
         "the unprotected provider completed"
     );
     assert!(
@@ -60531,12 +60515,12 @@ fn pressure_services_unprotected_request_before_original_head() {
         "the successful completion armed its loader"
     );
     assert_eq!(
-        engine.refresh_requested.get(&decoy),
+        engine.refresh_queue.get(&decoy),
         Some(&decoy_before),
         "the ruled-out entry survives with serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request was never selected"
     );
@@ -60584,13 +60568,13 @@ fn pressure_services_unprotected_request_before_original_head() {
         "renewals and replays charge no work"
     );
     assert_eq!(
-        engine.last_refresh_serial,
+        engine.refresh_queue.last_serial_for_test(),
         serial_before + 1 + 253,
         "one serial per renewal, none extra"
     );
     let mut previous = serial_before + 1;
     for offset in 0..253u32 {
-        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
+        let request = &engine.refresh_queue[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -60604,19 +60588,19 @@ fn pressure_services_unprotected_request_before_original_head() {
     }
     assert_eq!(
         engine
-            .refresh_requested
+            .refresh_queue
             .get(&head_pid)
             .map(|request| request.serial),
         Some(serial_before + 1),
         "the head was never re-dispatched"
     );
     assert_eq!(
-        engine.refresh_requested.get(&decoy),
+        engine.refresh_queue.get(&decoy),
         Some(&decoy_before),
         "the ruled-out entry still keeps its serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request still keeps its serial and age"
     );
@@ -60648,7 +60632,7 @@ fn pressure_service_pass_leaves_h1_fairness_accounting_untouched() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(3_000 + u64::from(offset)))
         );
     }
-    assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(fixture.engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     let under_cap_before = fixture.engine.scheduler.under_cap_ticks_for_test();
     let over_cap_before = fixture.engine.scheduler.over_cap_passes();
     let cursor_before = fixture.engine.scheduler.cursor_for_test();
@@ -60742,7 +60726,7 @@ fn pressure_service_pass_leaves_h1_fairness_accounting_untouched() {
     // the service never touched.
     refresh_inventory_once(&mut fixture.engine);
     assert!(
-        fixture.engine.refresh_requested.is_empty(),
+        fixture.engine.refresh_queue.is_empty(),
         "the settling tick drains the stale map"
     );
     assert!(
@@ -60803,11 +60787,11 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         );
     }
     assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(3_000)));
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     // Only the retained pid is protected here (the parked loader names it);
     // the fake requests are unprotected stale entries, of which the service
     // completes exactly its lowest selection.
-    let real_before = engine.refresh_requested[&pid].clone();
+    let real_before = engine.refresh_queue[&pid].clone();
     let scans_before = engine.deep_scans;
     // A drain would snapshot the session's loader-hit counter; the direct
     // pass sets the same authority explicitly.
@@ -60844,17 +60828,17 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         "the parked head was serviced, not dropped"
     );
     assert!(
-        engine.refresh_requested.contains_key(&head_pid),
+        engine.refresh_queue.contains_key(&head_pid),
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&FAKE_PID_FLOOR),
+        !engine.refresh_queue.contains_key(&FAKE_PID_FLOOR),
         "the selected stale request was serviced"
     );
     // The selected transaction completes only its selection: every other
     // unprotected request is retained with its serial and age.
     for offset in 1..254u32 {
-        let request = engine.refresh_requested.get(&(FAKE_PID_FLOOR + offset));
+        let request = engine.refresh_queue.get(&(FAKE_PID_FLOOR + offset));
         assert_eq!(
             request.map(|request| request.first_seen_ns),
             Some(Some(2_000 + u64::from(offset))),
@@ -60862,9 +60846,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         );
     }
     assert!(
-        engine
-            .refresh_requested
-            .contains_key(&(FAKE_PID_FLOOR + 255)),
+        engine.refresh_queue.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the unselected unprotected request is retained, not cleared"
     );
     assert_eq!(
@@ -60881,7 +60863,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         "the only scan is the parked loader's validation dispatch, not service"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&real_before),
         "the protected live request keeps its serial and age across service"
     );
@@ -60944,9 +60926,9 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         );
     }
     assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(3_000)));
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let pid_before = engine.refresh_requested[&pid].clone();
-    let pid2_before = engine.refresh_requested[&pid2].clone();
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let pid_before = engine.refresh_queue[&pid].clone();
+    let pid2_before = engine.refresh_queue[&pid2].clone();
     let terminal_loader = loader_record_for(armed, pid);
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
         terminal_loader,
@@ -60982,18 +60964,16 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     );
     assert_eq!(engine.discovery_truncated, 0, "rotation refuses nothing");
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the head waits parked while rotation continues"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid2),
+        engine.refresh_queue.get(&pid2),
         Some(&pid2_before),
         "the diverted selection keeps its serial and age"
     );
     assert!(
-        engine
-            .refresh_requested
-            .contains_key(&(FAKE_PID_FLOOR + 255)),
+        engine.refresh_queue.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the stale entry waits for the next opportunity"
     );
     assert_eq!(
@@ -61051,22 +61031,20 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         "the parked head was serviced, not dropped"
     );
     assert!(
-        engine.refresh_requested.contains_key(&head_pid),
+        engine.refresh_queue.contains_key(&head_pid),
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine
-            .refresh_requested
-            .contains_key(&(FAKE_PID_FLOOR + 255)),
+        !engine.refresh_queue.contains_key(&(FAKE_PID_FLOOR + 255)),
         "the stale selection freed the slot"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request was never selected"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid2),
+        engine.refresh_queue.get(&pid2),
         Some(&pid2_before),
         "the diverted selection keeps its serial and age"
     );
@@ -61130,11 +61108,11 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let fail_a_before = engine.refresh_requested[&fail_a].clone();
-    let fail_b_before = engine.refresh_requested[&fail_b].clone();
-    let pid_before = engine.refresh_requested[&pid].clone();
-    let success_serial_before = engine.refresh_requested[&success].serial;
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let fail_a_before = engine.refresh_queue[&fail_a].clone();
+    let fail_b_before = engine.refresh_queue[&fail_b].clone();
+    let pid_before = engine.refresh_queue[&pid].clone();
+    let success_serial_before = engine.refresh_queue[&success].serial;
     // Absent cursor: no ordinary tick ever ran, so H1 fairness starts
     // untouched; the episode must neither need nor move it.
     assert_eq!(engine.scheduler.cursor_for_test(), None);
@@ -61203,11 +61181,11 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     );
     assert_eq!(engine.discovery_truncated, 0, "rotation refuses nothing");
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the head waits parked while rotation continues"
     );
     assert_eq!(
-        engine.refresh_requested.get(&fail_a),
+        engine.refresh_queue.get(&fail_a),
         Some(&fail_a_before),
         "the failed selection keeps its serial and age"
     );
@@ -61225,11 +61203,11 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     // concurrent arrival refills the map: the episode must skip the absent
     // snapshot entry without an attempt and must never select the arrival,
     // which is not in its snapshot.
-    engine.refresh_requested.remove(&absent);
+    engine.refresh_queue.remove_for_test(&absent);
     let newcomer = 7_000_000u32;
     assert!(engine.request_refresh_consumed(newcomer, Some(5_000)));
-    let newcomer_before = engine.refresh_requested[&newcomer].clone();
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let newcomer_before = engine.refresh_queue[&newcomer].clone();
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     // Second opportunity: the absent entry is skipped and the next low-ID
     // selection fails the same honest way. No indefinite retry of the
     // first failure: it is never reselected.
@@ -61264,12 +61242,12 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
         "rotation never reselects a ruled-out entry"
     );
     assert_eq!(
-        engine.refresh_requested.get(&fail_b),
+        engine.refresh_queue.get(&fail_b),
         Some(&fail_b_before),
         "the second failure keeps its serial and age"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the head still waits for the successful provider"
     );
     fairness_untouched(&engine);
@@ -61294,11 +61272,11 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     );
     assert_eq!(engine.discovery_truncated, 0, "rotation loses nothing");
     assert!(
-        engine.refresh_requested.contains_key(&head_pid),
+        engine.refresh_queue.contains_key(&head_pid),
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&success),
+        !engine.refresh_queue.contains_key(&success),
         "the successful provider completed"
     );
     assert!(
@@ -61317,22 +61295,22 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
         "the successful completion armed its loader"
     );
     assert_eq!(
-        engine.refresh_requested.get(&fail_a),
+        engine.refresh_queue.get(&fail_a),
         Some(&fail_a_before),
         "the first failure still keeps its serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&fail_b),
+        engine.refresh_queue.get(&fail_b),
         Some(&fail_b_before),
         "the second failure still keeps its serial and age"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
+        engine.refresh_queue.get(&pid),
         Some(&pid_before),
         "the armed request was never selected"
     );
     assert_eq!(
-        engine.refresh_requested.get(&newcomer),
+        engine.refresh_queue.get(&newcomer),
         Some(&newcomer_before),
         "the arrival is not in the snapshot and is never selected"
     );
@@ -61350,7 +61328,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     );
     let mut previous = 0u64;
     for offset in 0..251u32 {
-        let request = &engine.refresh_requested[&(FAKE_PID_FLOOR + offset)].clone();
+        let request = &engine.refresh_queue[&(FAKE_PID_FLOOR + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -61373,10 +61351,10 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
         "the settling tick refuses nothing"
     );
     assert!(engine.request_refresh(success, Some(9_000)));
-    let retry_serial = engine.refresh_requested[&success].serial;
+    let retry_serial = engine.refresh_queue[&success].serial;
     assert!(engine.request_refresh(success, Some(9_001)));
     assert_eq!(
-        engine.refresh_requested[&success].serial, retry_serial,
+        engine.refresh_queue[&success].serial, retry_serial,
         "a retry of the live request renews nothing"
     );
     let mut renewal = vec![refresh_exec(success)];
@@ -61390,7 +61368,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
             &mut PauseClosure::new(true),
         )
         .expect("the renewal dispatch keeps the batch alive");
-    let renewed = engine.refresh_requested[&success].clone();
+    let renewed = engine.refresh_queue[&success].clone();
     assert!(
         renewed.serial > retry_serial && renewed.serial > success_serial_before,
         "the consumed renewal keeps a newer serial than every older entry"
@@ -61488,7 +61466,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     // Park a fresh head at the full map: one opportunity must serve the
     // selected request through eviction, admission, rescan and rearm.
     session.refuse_preflights([false, false]);
@@ -61519,7 +61497,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
         "the pass ran a real attempt instead of ruling the viewless selection out"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&selected),
+        !engine.refresh_queue.contains_key(&selected),
         "the pass completes the selected request"
     );
     assert_eq!(
@@ -61581,7 +61559,7 @@ fn pressure_service_pass_evicts_exploratory_view_to_admit_selected_at_capacity()
         "no rotation outlives the freed slot"
     );
     assert!(
-        engine.refresh_requested.contains_key(&6_000_000u32),
+        engine.refresh_queue.contains_key(&6_000_000u32),
         "the head dispatches into the freed slot"
     );
     assert_eq!(
@@ -61636,8 +61614,8 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let serial_before = engine.refresh_requested[&selected].serial;
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let serial_before = engine.refresh_queue[&selected].serial;
     let scans_before = engine.deep_scans;
     let arms_before = engine.loader_arms();
     session.refuse_preflights([false, false]);
@@ -61673,7 +61651,7 @@ fn pressure_service_pass_without_evictable_view_rules_out_after_refusing_probe()
         "the seed context survives"
     );
     assert_eq!(
-        engine.refresh_requested[&selected].serial, serial_before,
+        engine.refresh_queue[&selected].serial, serial_before,
         "the ruled-out request keeps its serial"
     );
     assert!(
@@ -61736,7 +61714,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     // The parked prefix protects the head pid: the shield covers exactly
     // the in-pass window where the classifier is blind to the parked record
     // (it sits in the pass-local prefix, not the pending queue).
@@ -61785,7 +61763,7 @@ fn pressure_service_pass_never_evicts_parked_head_view() {
         .expect("the head view survives");
     assert!(head_live.still_the_same(), "the head stays live");
     assert!(
-        engine.refresh_requested.contains_key(&selected),
+        engine.refresh_queue.contains_key(&selected),
         "the ruled-out request is retained"
     );
     assert_eq!(
@@ -61840,7 +61818,7 @@ fn probationary_probe_completes_provider_free_newcomer_at_capacity() {
     let scans_before = engine.deep_scans;
     refresh_inventory_once(&mut engine);
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the provider-free newcomer completes without a view"
     );
     assert_eq!(engine.views.len(), 2, "no view admitted, none removed");
@@ -61889,7 +61867,7 @@ fn probationary_probe_keeps_provider_bearing_newcomer_queued_at_capacity() {
     let scans_before = engine.deep_scans;
     refresh_inventory_once(&mut engine);
     assert!(
-        engine.refresh_requested.contains_key(&provider),
+        engine.refresh_queue.contains_key(&provider),
         "the provider-bearing newcomer stays queued for a real view"
     );
     assert!(
@@ -61945,11 +61923,11 @@ fn probationary_probe_refuses_without_a_complete_scan() {
         engine.deep_scans,
         engine.budget.attempted_io_bytes(),
         engine.budget.stopped_reason(),
-        engine.refresh_requested.contains_key(&head_pid),
+        engine.refresh_queue.contains_key(&head_pid),
         engine.probationary_completions,
     );
     assert!(
-        engine.refresh_requested.contains_key(&head_pid),
+        engine.refresh_queue.contains_key(&head_pid),
         "a refused probe retains the request"
     );
     assert_eq!(
@@ -62030,8 +62008,8 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let real_before = fixture.engine.refresh_requested[&retained_pid].clone();
+    assert_eq!(fixture.engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let real_before = fixture.engine.refresh_queue[&retained_pid].clone();
     let scans_before = fixture.engine.deep_scans;
     let ticks_before = fixture.engine.scheduler.under_cap_ticks_for_test();
     let head_pid = 6_000_000u32;
@@ -62074,11 +62052,11 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         "the unserviceable head is refused exactly once"
     );
     assert!(
-        !fixture.engine.refresh_requested.contains_key(&head_pid),
+        !fixture.engine.refresh_queue.contains_key(&head_pid),
         "a refused head leaves no request behind"
     );
     assert_eq!(
-        fixture.engine.refresh_requested.get(&retained_pid),
+        fixture.engine.refresh_queue.get(&retained_pid),
         Some(&real_before),
         "the deferred live request keeps its serial and age"
     );
@@ -62097,7 +62075,7 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         "later service never erases the historical loss"
     );
     assert!(
-        fixture.engine.refresh_requested.is_empty(),
+        fixture.engine.refresh_queue.is_empty(),
         "the working-clock pass drains every request"
     );
 }
@@ -62178,7 +62156,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
         "a tick leftover keeps honest immediate refusal"
     );
     assert!(
-        !tick_engine.refresh_requested.contains_key(&6_000_001u32),
+        !tick_engine.refresh_queue.contains_key(&6_000_001u32),
         "a refused leftover leaves no request behind"
     );
 
@@ -62220,7 +62198,7 @@ fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
         "the deferred prefix dispatched in order"
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "the deferred prefix was serviced, not dropped"
     );
     assert_eq!(
@@ -62258,10 +62236,10 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
         }
         if pressure {
             assert!(engine.request_refresh_consumed(FAKE_PID_FLOOR + 255, Some(3_000)));
-            assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+            assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
         } else {
             assert_eq!(
-                engine.refresh_requested.len(),
+                engine.refresh_queue.len(),
                 MAX_PENDING_REFRESH - 1,
                 "the oracle side never trips pressure"
             );
@@ -62350,22 +62328,20 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
     // every stale request drains.
     for (engine, label) in [(&pressured, "pressure"), (&oracle, "oracle")] {
         assert_eq!(
-            engine.refresh_requested.len(),
+            engine.refresh_queue.len(),
             1,
             "{label} retains exactly the live request"
         );
         assert!(
-            engine
-                .refresh_requested
-                .contains_key(&engine.views[0].pid()),
+            engine.refresh_queue.contains_key(&engine.views[0].pid()),
             "{label} retains the live view's request"
         );
     }
     // Both sides renew the live request twice after the head, in order; the
     // absolute serials differ by the one extra request the pressure side
     // seeds (the unprotected entry its service pass completes).
-    let pressured_live = &pressured.refresh_requested[&pressured.views[0].pid()];
-    let oracle_live = &oracle.refresh_requested[&oracle.views[0].pid()];
+    let pressured_live = &pressured.refresh_queue[&pressured.views[0].pid()];
+    let oracle_live = &oracle.refresh_queue[&oracle.views[0].pid()];
     assert_eq!(
         (pressured_live.serial, pressured_live.first_seen_ns),
         (259, Some(1_000)),
@@ -62462,7 +62438,7 @@ fn discovery_retained_prefix_dispatches_before_fresh_within_one_allowance() {
         4096,
         "one full allowance is the most the Engine ever holds"
     );
-    let remaining: BTreeSet<u32> = engine.refresh_requested.keys().copied().collect();
+    let remaining: BTreeSet<u32> = engine.refresh_queue.keys().copied().collect();
     let expected: BTreeSet<u32> = (3840..4000u32)
         .map(|offset| 1_000_000 + offset)
         .chain((0..96u32).map(|offset| 2_000_000 + offset))
@@ -62513,7 +62489,7 @@ fn discovery_frame_collects_fresh_only_within_shared_allowance() {
     );
     assert_eq!(engine.discovery_truncated, 0);
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "service plus the ordinary tick drains every request"
     );
     assert_eq!(
@@ -63057,10 +63033,11 @@ fn combined_cap_scenario(precharge: u64) -> (Engine, tempfile::TempDir) {
     // Exact FIFO once: every acquired record renewed exactly once, and the
     // per-pid last renewals keep ring order.
     assert_eq!(
-        engine.last_refresh_serial, ACQUIRED as u64,
+        engine.refresh_queue.last_serial_for_test(),
+        ACQUIRED as u64,
         "4,096 renewals consumed exactly 4,096 serials"
     );
-    assert_eq!(engine.refresh_requested.len(), 200);
+    assert_eq!(engine.refresh_queue.len(), 200);
     // Dispatch order is the layout order: pending's 2,000 in script order,
     // then the restaged block (xfer 1,500, tail 500, nested 96), each
     // in its own script order. Every script round-robins the same 200
@@ -63084,7 +63061,7 @@ fn combined_cap_scenario(precharge: u64) -> (Engine, tempfile::TempDir) {
     lasts.sort();
     let mut previous = 0u64;
     for (_, pid) in lasts {
-        let serial = engine.refresh_requested[&pid].serial;
+        let serial = engine.refresh_queue[&pid].serial;
         assert!(serial > previous, "last renewals keep ring order");
         previous = serial;
     }
@@ -63349,8 +63326,12 @@ fn discovery_capacity_block_is_not_terminal_empty() {
         DISCOVERY_HELD_CAP,
         "the held prefix stays queued and unsettled"
     );
-    assert_eq!(engine.last_refresh_serial, 0, "no serial completion");
-    assert!(engine.refresh_requested.is_empty());
+    assert_eq!(
+        engine.refresh_queue.last_serial_for_test(),
+        0,
+        "no serial completion"
+    );
+    assert!(engine.refresh_queue.is_empty());
     assert!(
         engine.terminal_batch_for_test().is_none(),
         "no terminal batch completes from a capacity stop"
@@ -63390,7 +63371,8 @@ fn discovery_capacity_block_is_not_terminal_empty() {
     assert!(engine.pending_discovery_records.is_empty());
     assert!(session.dequeues.is_empty(), "the ring drained exactly");
     assert_eq!(
-        engine.last_refresh_serial, DISCOVERY_HELD_CAP as u64,
+        engine.refresh_queue.last_serial_for_test(),
+        DISCOVERY_HELD_CAP as u64,
         "every acquired record dispatched exactly once"
     );
     assert_eq!(engine.terminal_capacity_backlog_for_test(), 0);
@@ -63526,7 +63508,7 @@ fn discovery_terminal_capacity_failure_is_visible_and_finite() {
         "the unread suffix is never touched"
     );
     assert_eq!(engine.dispatched_loader_records(), 0, "no accepted replay");
-    assert_eq!(engine.last_refresh_serial, 0);
+    assert_eq!(engine.refresh_queue.last_serial_for_test(), 0);
     let batch = engine.terminal_batch_for_test().expect("batch still held");
     assert_eq!((batch.record_count(), batch.complete()), (256, false));
     assert_eq!(
@@ -64133,7 +64115,7 @@ fn cold_leader_exit_bound_route() -> (TabledSeedProvider, Engine, ScriptedSessio
     assert!(engine.pending_leader_exit_views.contains(&view));
     assert_eq!(engine.views[0].original_exited(), Ok(false));
     assert!(engine.views[0].still_the_same());
-    let request = &engine.refresh_requested[&pid];
+    let request = &engine.refresh_queue[&pid];
     assert_eq!(request.owner, Some(view));
     assert!(request.serial > 0);
     assert!(request.exec_binding.is_some());
@@ -64151,7 +64133,7 @@ fn automatic_exec_cold_leader_exit_bound_exec_requests_one_immediate_next_frame(
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
     let original_admission = engine.views[0].view_admission();
-    let request = engine.refresh_requested[&pid].clone();
+    let request = engine.refresh_queue[&pid].clone();
     let entries_before = engine.plan.entries_seen;
     let early_unknown_before = engine.newcomer_ages.dropped_unknown;
     let native_before = session
@@ -64185,7 +64167,7 @@ fn automatic_exec_cold_leader_exit_bound_exec_requests_one_immediate_next_frame(
         "settlement cannot reopen the closed attachment opportunity"
     );
     assert!(engine.loader_registry.ids_for_view(view).is_empty());
-    assert_eq!(engine.refresh_requested[&pid], request);
+    assert_eq!(engine.refresh_queue[&pid], request);
     assert!(session.physical_gap_summary().open);
     assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
     assert!(
@@ -64219,9 +64201,9 @@ fn automatic_exec_cold_leader_exit_immediate_frame_keeps_refusals_closed() {
         let view = engine.views[0].id();
         match refusal {
             "absent" => {
-                engine.refresh_requested.remove(&pid);
+                engine.refresh_queue.remove_for_test(&pid);
             }
-            "unbound" => engine.refresh_requested.get_mut(&pid).unwrap().exec_binding = None,
+            "unbound" => engine.refresh_queue.get_mut(&pid).unwrap().exec_binding = None,
             "older" => {
                 engine.queue_leader_exit_assessment(view, Some(exec.hook_ts_ns + 1));
             }
@@ -64229,8 +64211,7 @@ fn automatic_exec_cold_leader_exit_immediate_frame_keeps_refusals_closed() {
                 engine.queue_leader_exit_assessment(view, Some(exec.hook_ts_ns));
             }
             "foreign" => {
-                engine.refresh_requested.get_mut(&pid).unwrap().owner =
-                    Some(ProcessViewId(view.0 + 1));
+                engine.refresh_queue.get_mut(&pid).unwrap().owner = Some(ProcessViewId(view.0 + 1));
             }
             _ => {}
         }
@@ -64279,7 +64260,7 @@ fn automatic_exec_cold_leader_exit_later_bound_exec_recovers() {
     let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
-    let request = engine.refresh_requested[&pid].clone();
+    let request = engine.refresh_queue[&pid].clone();
     let registrations = session
         .pid_continuity
         .as_ref()
@@ -64333,7 +64314,7 @@ fn automatic_exec_cold_leader_exit_later_bound_exec_recovers() {
             .target_map_prepares,
         maps_before
     );
-    let pending_after_loss = engine.refresh_requested.get(&pid).cloned();
+    let pending_after_loss = engine.refresh_queue.get(&pid).cloned();
     assert_eq!(
         pending_after_loss,
         Some(request),
@@ -64387,7 +64368,7 @@ fn automatic_exec_cold_leader_exit_later_bound_exec_recovers() {
         !session.physical_gap_summary().open,
         "actual complete new pairs close the physical gap"
     );
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.exec_rearm_views.contains_key(&view));
     assert_eq!(engine.task_uprobe_link_losses, 1);
     assert!(engine.pending_leader_exit_order.is_empty());
@@ -64709,7 +64690,7 @@ fn automatic_exec_cold_leader_exit_unknown_equal_later_order_refuses() {
             .identities();
         settle_cold_leader_exit(&mut engine);
         assert!(
-            !engine.refresh_requested.contains_key(&pid),
+            !engine.refresh_queue.contains_key(&pid),
             "ordering case {condition}"
         );
         assert_eq!(engine.task_uprobe_link_losses, 1);
@@ -64732,20 +64713,13 @@ fn automatic_exec_cold_leader_exit_changed_request_refuses() {
         let (_fixture, mut engine, mut session, exec) = cold_leader_exit_bound_route();
         let pid = engine.views[0].pid();
         let view = engine.views[0].id();
-        let original = engine.refresh_requested[&pid].clone();
+        let original = engine.refresh_queue[&pid].clone();
         match condition {
-            0 => engine.refresh_requested.get_mut(&pid).unwrap().exec_binding = None,
-            1 => {
-                engine
-                    .refresh_requested
-                    .get_mut(&pid)
-                    .unwrap()
-                    .exec_hook_ts_ns = None
-            }
-            2 => engine.refresh_requested.get_mut(&pid).unwrap().serial += 1,
+            0 => engine.refresh_queue.get_mut(&pid).unwrap().exec_binding = None,
+            1 => engine.refresh_queue.get_mut(&pid).unwrap().exec_hook_ts_ns = None,
+            2 => engine.refresh_queue.get_mut(&pid).unwrap().serial += 1,
             3 => {
-                engine.refresh_requested.get_mut(&pid).unwrap().owner =
-                    Some(ProcessViewId(view.0 + 1))
+                engine.refresh_queue.get_mut(&pid).unwrap().owner = Some(ProcessViewId(view.0 + 1))
             }
             4 => {
                 engine.exec_rearm_views.remove(&view);
@@ -64757,7 +64731,7 @@ fn automatic_exec_cold_leader_exit_changed_request_refuses() {
                 assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
             }
             7 => {
-                engine.refresh_requested.remove(&pid);
+                engine.refresh_queue.remove_for_test(&pid);
                 assert!(engine.request_refresh(pid, None));
             }
             _ => {
@@ -64773,11 +64747,11 @@ fn automatic_exec_cold_leader_exit_changed_request_refuses() {
                     &unknown,
                     &mut PendingViewRetirements::new(),
                 );
-                assert!(engine.refresh_requested[&pid].exec_binding.is_none());
-                assert!(engine.refresh_requested[&pid].exec_hook_ts_ns.is_none());
+                assert!(engine.refresh_queue[&pid].exec_binding.is_none());
+                assert!(engine.refresh_queue[&pid].exec_hook_ts_ns.is_none());
             }
         }
-        let changed = engine.refresh_requested[&pid].clone();
+        let changed = engine.refresh_queue[&pid].clone();
         assert!(!engine.pid_exec_after_leader_exit(
             view,
             pid,
@@ -64790,12 +64764,12 @@ fn automatic_exec_cold_leader_exit_changed_request_refuses() {
         settle_cold_leader_exit(&mut engine);
         if condition == 3 {
             assert_eq!(
-                engine.refresh_requested[&pid], changed,
+                engine.refresh_queue[&pid], changed,
                 "another owner's request is never removed"
             );
         } else {
             assert!(
-                !engine.refresh_requested.contains_key(&pid),
+                !engine.refresh_queue.contains_key(&pid),
                 "request case {condition}"
             );
         }
@@ -64820,7 +64794,7 @@ fn automatic_exec_cold_leader_exit_all_older_exits_recover_once() {
     let (_fixture, mut engine, mut session, exec) = cold_leader_exit_bound_route();
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
-    let original = engine.refresh_requested[&pid].clone();
+    let original = engine.refresh_queue[&pid].clone();
     let first_exit = engine.pending_leader_exit_order[&view].unwrap();
     assert!(first_exit < exec.hook_ts_ns - 1);
     engine.queue_leader_exit_assessment(view, Some(exec.hook_ts_ns - 1));
@@ -64830,7 +64804,7 @@ fn automatic_exec_cold_leader_exit_all_older_exits_recover_once() {
         Some(exec.hook_ts_ns - 1)
     );
     settle_cold_leader_exit(&mut engine);
-    assert_eq!(engine.refresh_requested[&pid], original);
+    assert_eq!(engine.refresh_queue[&pid], original);
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
     let detaches = session
         .detached_slot_indices
@@ -64841,7 +64815,7 @@ fn automatic_exec_cold_leader_exit_all_older_exits_recover_once() {
         detaches, 1,
         "all older EXITs still owe one physical recovery"
     );
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.exec_rearm_views.contains_key(&view));
     engine.queue_leader_exit_assessment(view, Some(first_exit));
     settle_cold_leader_exit(&mut engine);
@@ -64962,7 +64936,7 @@ fn automatic_exec_cold_leader_exit_ended_original_prunes_order() {
     assert_eq!(engine.views[0].original_exited(), Ok(true));
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
     assert!(engine.views.is_empty());
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.exec_rearm_views.contains_key(&view));
     assert!(engine.pending_leader_exit_order.is_empty());
     assert_eq!(
@@ -64985,11 +64959,11 @@ fn automatic_exec_cold_leader_exit_unavailable_view_defers_and_terminal_prunes()
     let (_fixture, mut engine, session, _exec) = cold_leader_exit_bound_route();
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
-    let request = engine.refresh_requested[&pid].clone();
+    let request = engine.refresh_queue[&pid].clone();
     let order = engine.pending_leader_exit_order[&view];
     let retained = std::mem::take(&mut engine.views);
     settle_cold_leader_exit(&mut engine);
-    assert_eq!(engine.refresh_requested[&pid], request);
+    assert_eq!(engine.refresh_queue[&pid], request);
     assert!(engine.pending_leader_exit_views.contains(&view));
     assert_eq!(engine.pending_leader_exit_order[&view], order);
     assert_eq!(engine.task_uprobe_link_losses, 0);
@@ -65018,7 +64992,7 @@ fn automatic_exec_cold_leader_exit_system_cgroup_keep_prior_policy() {
             engine.pending_leader_exit_order[&view]
         ));
         settle_cold_leader_exit(&mut engine);
-        assert!(!engine.refresh_requested.contains_key(&pid));
+        assert!(!engine.refresh_queue.contains_key(&pid));
         assert_eq!(engine.task_uprobe_link_losses, 1);
         assert!(!session.detached_slot_indices.iter().any(|s| !s.is_empty()));
     }
@@ -65088,7 +65062,7 @@ fn automatic_exec_provider_mapped_before_loader_rearm_is_caught_without_loader_h
     let armed = engine.loader_registry.ids_for_view(view);
     assert_eq!(armed.len(), 1);
     assert_eq!(engine.capture_facts().loader_discovery.hits, 0);
-    assert!(engine.refresh_requested.is_empty());
+    assert!(engine.refresh_queue.is_empty());
     assert!(
         engine
             .modules
@@ -65567,7 +65541,7 @@ fn completed_rearm_route(
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
-    let bound = engine.refresh_requested[&pid].clone();
+    let bound = engine.refresh_queue[&pid].clone();
     assert!(bound.exec_binding.is_some());
     assert_eq!(bound.owner, Some(view));
     assert_eq!(engine.exec_rearm_views[&view], Some(bound.serial));
@@ -65594,7 +65568,7 @@ fn completed_rearm_route(
         "ordinary recovery must publish successfully"
     );
     assert!(outcome.static_failures.is_empty());
-    assert_eq!(engine.refresh_requested[&pid], bound);
+    assert_eq!(engine.refresh_queue[&pid], bound);
     assert_eq!(engine.exec_rearm_views[&view], Some(bound.serial));
     assert!(engine.views[0].still_the_same());
     let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
@@ -65630,7 +65604,7 @@ fn assert_completed_rearm_same_request_keeps_fresh_pairs(recovered_class: u8) {
     let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
-    let bound = engine.refresh_requested[&pid].clone();
+    let bound = engine.refresh_queue[&pid].clone();
     let candidate = engine
         .live_candidate(
             engine.pinned.clone(),
@@ -65680,7 +65654,7 @@ fn assert_completed_rearm_same_request_keeps_fresh_pairs(recovered_class: u8) {
     assert!(gap_before.episodes > 0 && !gap_before.open);
     let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
     assert!(outcome.required_complete);
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert!(!engine.exec_rearm_views.contains_key(&view));
     assert_eq!(engine.capture_facts.history.modules, history.modules);
     assert_eq!(engine.capture_facts.history.decoded, history.decoded);
@@ -65712,7 +65686,7 @@ fn carried_completed_rearm(engine: &mut Engine, session: &mut ScriptedSession) -
         )
         .unwrap();
     let view = engine.views[0].id();
-    let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
+    let serial = engine.refresh_queue[&engine.views[0].pid()].serial;
     let prepared = engine
         .prepare_exec_rearm(session, view, serial, &candidate)
         .unwrap();
@@ -65757,7 +65731,7 @@ fn assert_completed_rearm_revalidates_after_fallible_preflight(recovered_class: 
             .unwrap()
             .borrow()
             .native_attach_calls;
-        let request = engine.refresh_requested[&engine.views[0].pid()].clone();
+        let request = engine.refresh_queue[&engine.views[0].pid()].clone();
         let change = match case {
             0 => crate::attach::PreflightChange::Producer,
             1 => crate::attach::PreflightChange::Observation,
@@ -65781,7 +65755,7 @@ fn assert_completed_rearm_revalidates_after_fallible_preflight(recovered_class: 
             .unwrap();
         assert!(outcome.refused(), "case {case}");
         assert_eq!(
-            engine.refresh_requested[&engine.views[0].pid()],
+            engine.refresh_queue[&engine.views[0].pid()],
             request,
             "case {case}"
         );
@@ -65810,7 +65784,7 @@ fn automatic_exec_completed_rearm_task_replaced_health_fault_and_missing_identit
 fn assert_completed_rearm_health_fault_and_missing_identity_refuse(recovered_class: u8) {
     for case in 0..8 {
         let (_fixture, engine, mut session, _record) = completed_rearm_route(recovered_class);
-        let request = &engine.refresh_requested[&engine.views[0].pid()];
+        let request = &engine.refresh_queue[&engine.views[0].pid()];
         {
             let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
             match case {
@@ -65854,7 +65828,7 @@ fn assert_completed_rearm_rejects_foreign_owner_and_renewal(recovered_class: u8)
     let (_fixture, mut engine, mut session, record) = completed_rearm_route(recovered_class);
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
-    let request = engine.refresh_requested[&pid].clone();
+    let request = engine.refresh_queue[&pid].clone();
     let candidate = carried_completed_rearm(&mut engine, &mut session);
     let fresh_view = ProcessView::open(view, pid).unwrap();
     assert!(
@@ -65904,7 +65878,7 @@ fn assert_completed_rearm_rejects_foreign_owner_and_renewal(recovered_class: u8)
         "matching numeric domain, key and pairs cannot borrow a Session allocation"
     );
     assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
-    let renewed = engine.refresh_requested[&pid].clone();
+    let renewed = engine.refresh_queue[&pid].clone();
     let before = session
         .pid_continuity
         .as_ref()
@@ -65915,7 +65889,7 @@ fn assert_completed_rearm_rejects_foreign_owner_and_renewal(recovered_class: u8)
         .apply_candidate(&mut session, candidate, &mut true, false, &[])
         .unwrap();
     assert!(outcome.refused());
-    assert_eq!(engine.refresh_requested[&pid], renewed);
+    assert_eq!(engine.refresh_queue[&pid], renewed);
     assert_eq!(engine.exec_rearm_views[&view], Some(renewed.serial));
     assert_eq!(
         session
@@ -65951,7 +65925,7 @@ fn assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(recovered_cla
         let newer = continuity_exec_class(&engine, &mut session, class);
         engine.dispatch_lifecycle_record(&mut session, &newer, &mut PendingViewRetirements::new());
         let pid = engine.views[0].pid();
-        let request = engine.refresh_requested[&pid].clone();
+        let request = engine.refresh_queue[&pid].clone();
         let before = session
             .pid_continuity
             .as_ref()
@@ -65964,7 +65938,7 @@ fn assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(recovered_cla
                 .unwrap()
                 .refused()
         );
-        assert_eq!(engine.refresh_requested[&pid], request);
+        assert_eq!(engine.refresh_queue[&pid], request);
         assert_eq!(
             engine.exec_rearm_views[&engine.views[0].id()],
             Some(request.serial)
@@ -65983,7 +65957,7 @@ fn assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(recovered_cla
                 .views
                 .first()
                 .is_some_and(|view| view.still_the_same()),
-            engine.refresh_requested.get(&pid),
+            engine.refresh_queue.get(&pid),
         );
         let current = session
             .pid_continuity
@@ -66022,7 +65996,7 @@ fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgem
         let candidate = carried_completed_rearm(&mut engine, &mut session);
         let view = engine.views[0].id();
         let pid = engine.views[0].pid();
-        let request = engine.refresh_requested[&pid].clone();
+        let request = engine.refresh_queue[&pid].clone();
         let completed = BTreeSet::from([(view, request.serial)]);
         let before = session
             .pid_continuity
@@ -66042,7 +66016,7 @@ fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgem
             !engine.exec_rearm_views.contains_key(&view),
             disposition == ApplyDisposition::Accepted
         );
-        assert_eq!(engine.refresh_requested[&pid], request);
+        assert_eq!(engine.refresh_queue[&pid], request);
         assert_eq!(
             session
                 .pid_continuity
@@ -66057,7 +66031,7 @@ fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgem
     let (_fixture, mut engine, _session, _record) =
         completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
     let view = engine.views[0].id();
-    let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
+    let serial = engine.refresh_queue[&engine.views[0].pid()].serial;
     engine.settle_applied_exec_rearms(
         [(view, serial)],
         &BTreeSet::new(),
@@ -66084,7 +66058,7 @@ fn automatic_exec_completed_rearm_task_replaced_requires_every_requested_unique_
 
 fn assert_completed_rearm_requires_every_requested_unique_pair(recovered_class: u8) {
     let (_fixture, engine, mut session, _record) = completed_rearm_route(recovered_class);
-    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    let request = &engine.refresh_queue[&engine.views[0].pid()];
     for slots in [
         Vec::new(),
         vec![engine.plan.slots[0].clone(), engine.plan.slots[0].clone()],
@@ -66129,7 +66103,7 @@ fn automatic_exec_completed_rearm_excludes_ordinary_targets_and_multi_siblings()
     for grouped in [false, true] {
         let (_fixture, engine, mut session, _record) =
             completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
-        let request = &engine.refresh_requested[&engine.views[0].pid()];
+        let request = &engine.refresh_queue[&engine.views[0].pid()];
         let selected = engine.plan.slots.last().unwrap().clone();
         let spared = &engine.plan.slots[..engine.plan.slots.len() - 1];
         if grouped {
@@ -66180,7 +66154,7 @@ fn automatic_exec_completed_rearm_task_replaced_clock_boundaries_and_unavailabil
 fn assert_completed_rearm_clock_boundaries_and_unavailability_refuse(recovered_class: u8) {
     for case in 0..7 {
         let (_fixture, mut engine, mut session, record) = completed_rearm_route(recovered_class);
-        let request = engine.refresh_requested[&engine.views[0].pid()].clone();
+        let request = engine.refresh_queue[&engine.views[0].pid()].clone();
         let mut recovery = engine
             .live_candidate(
                 engine.pinned.clone(),
@@ -66289,7 +66263,7 @@ fn assert_completed_rearm_mixed_pre_and_post_exec_pairs_refuse(recovered_class: 
         .unwrap()
         .borrow_mut()
         .fresh_empty_started_ns();
-    let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
+    let serial = engine.refresh_queue[&engine.views[0].pid()].serial;
     let candidate = engine
         .live_candidate(
             engine.pinned.clone(),
@@ -66346,7 +66320,7 @@ fn automatic_exec_completed_rearm_unclassified_recovery_stays_conservative() {
         .unwrap()
         .borrow_mut()
         .fresh_empty_started_ns();
-    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    let request = &engine.refresh_queue[&engine.views[0].pid()];
     assert!(
         session
             .prepare_completed_rearm(
@@ -66439,7 +66413,7 @@ fn assert_completed_rearm_partial_native_success_cannot_mint_subset(recovered_cl
         .unwrap()
         .borrow_mut()
         .fresh_empty_started_ns();
-    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    let request = &engine.refresh_queue[&engine.views[0].pid()];
     assert!(
         session
             .prepare_completed_rearm(
@@ -66475,7 +66449,7 @@ fn automatic_exec_completed_rearm_task_replaced_held_identity_changes_refuse_pre
 fn assert_completed_rearm_held_identity_changes_refuse_prepare_and_apply(recovered_class: u8) {
     let (fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
     let candidate = carried_completed_rearm(&mut engine, &mut session);
-    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    let request = &engine.refresh_queue[&engine.views[0].pid()];
     for field in 0..2 {
         let mut slots = engine.plan.slots.clone();
         if field == 0 {
@@ -66562,7 +66536,7 @@ fn automatic_exec_completed_rearm_health_read_follows_held_registry_validation()
     let (_fixture, mut engine, mut session, _record) =
         completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
     let candidate = carried_completed_rearm(&mut engine, &mut session);
-    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    let request = &engine.refresh_queue[&engine.views[0].pid()];
     let reads = session
         .pid_continuity
         .as_ref()
@@ -66632,7 +66606,7 @@ fn assert_completed_rearm_final_clock_producer_advance_refuses_before_mutation(
     let candidate = carried_completed_rearm(&mut engine, &mut session);
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
-    let request = engine.refresh_requested[&pid].clone();
+    let request = engine.refresh_queue[&pid].clone();
     let (identities, calls, frontier) = {
         let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
         let frontier = pairs.completed_frontier();
@@ -66672,7 +66646,7 @@ fn assert_completed_rearm_final_clock_producer_advance_refuses_before_mutation(
         pairs.completed_health_frontiers,
     );
     assert_eq!(pairs.completed_health_frontiers, [moved]);
-    assert_eq!(engine.refresh_requested[&pid], request);
+    assert_eq!(engine.refresh_queue[&pid], request);
     assert_eq!(engine.exec_rearm_views[&view], Some(request.serial));
 }
 
@@ -66695,7 +66669,7 @@ fn automatic_exec_completed_rearm_final_clock_unknown_or_incomparable_refuses() 
         let candidate = carried_completed_rearm(&mut engine, &mut session);
         let pid = engine.views[0].pid();
         let view = engine.views[0].id();
-        let request = engine.refresh_requested[&pid].clone();
+        let request = engine.refresh_queue[&pid].clone();
         let (identities, calls) = {
             let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
             pairs.script_completed_clock_origins(active, children, offsets);
@@ -66710,7 +66684,7 @@ fn automatic_exec_completed_rearm_final_clock_unknown_or_incomparable_refuses() 
             .apply_candidate(&mut session, candidate, &mut true, false, &[])
             .unwrap();
         assert!(outcome.refused(), "{active:?}/{children:?}/{offsets:?}");
-        assert_eq!(engine.refresh_requested[&pid], request);
+        assert_eq!(engine.refresh_queue[&pid], request);
         assert_eq!(engine.exec_rearm_views[&view], Some(request.serial));
         let pairs = session.pid_continuity.as_ref().unwrap().borrow();
         assert_eq!(pairs.completed_clock_frontiers.len(), 1);
@@ -67195,27 +67169,27 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     let record = observed_candidate_exec(&engine, &mut session);
     let mut pending = PendingViewRetirements::new();
     engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
-    let first = engine.refresh_requested[&pid].clone();
+    let first = engine.refresh_queue[&pid].clone();
     assert!(first.exec_binding.is_some());
     assert!(engine.request_refresh(pid, Some(u64::MAX)));
-    assert_eq!(engine.refresh_requested[&pid], first);
+    assert_eq!(engine.refresh_queue[&pid], first);
     assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
-    let second = engine.refresh_requested[&pid].clone();
+    let second = engine.refresh_queue[&pid].clone();
     assert!(second.serial > first.serial);
     assert!(second.exec_binding.is_none());
     assert_eq!(second.first_seen_ns, first.first_seen_ns);
     assert_eq!(engine.exec_rearm_views[&view], Some(second.serial));
     engine.complete_refresh_requests(&BTreeMap::from([(pid, first.serial)]), &BTreeSet::new());
-    assert_eq!(engine.refresh_requested[&pid], second);
+    assert_eq!(engine.refresh_queue[&pid], second);
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
-    let bound = engine.refresh_requested[&pid].clone();
+    let bound = engine.refresh_queue[&pid].clone();
     assert!(bound.exec_binding.is_some());
     let mut wrong = crate::attach::PidSessionFixture::new(&engine.views[0]);
     wrong.attach(&engine.plan.slots, &engine.pinned).unwrap();
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
-    let bound = engine.refresh_requested[&pid].clone();
+    let bound = engine.refresh_queue[&pid].clone();
     wrong.observe(record);
     assert!(
         wrong
@@ -67262,7 +67236,7 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
         .unwrap();
     assert!(prepared.preservation.is_some());
     assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
-    let renewed = engine.refresh_requested[&pid].clone();
+    let renewed = engine.refresh_queue[&pid].clone();
     let mut candidate = candidate;
     assert!(!engine.consume_exec_rearm(&mut candidate, prepared));
     assert!(candidate.delta.replace.is_empty());
@@ -67289,7 +67263,7 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     );
     let current_record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &current_record, &mut pending);
-    let serial = engine.refresh_requested[&pid].serial;
+    let serial = engine.refresh_queue[&pid].serial;
     let mut carried = engine
         .live_candidate(
             engine.pinned.clone(),
@@ -67304,7 +67278,7 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     assert!(engine.consume_exec_rearm(&mut carried, prepared));
     let newer = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &newer, &mut pending);
-    let newest = engine.refresh_requested[&pid].clone();
+    let newest = engine.refresh_queue[&pid].clone();
     let old_pairs = session
         .pid_continuity
         .as_ref()
@@ -67326,11 +67300,11 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     );
     engine.settle_exec_rearms([(view, serial)]);
     assert_eq!(engine.exec_rearm_views[&view], Some(newest.serial));
-    assert_eq!(engine.refresh_requested[&pid], newest);
-    engine.last_refresh_serial = u64::MAX;
+    assert_eq!(engine.refresh_queue[&pid], newest);
+    engine.refresh_queue.set_last_serial_for_test(u64::MAX);
     let refused = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &refused, &mut pending);
-    assert!(engine.refresh_requested[&pid].exec_binding.is_none());
+    assert!(engine.refresh_queue[&pid].exec_binding.is_none());
     assert_eq!(engine.exec_rearm_views[&view], None);
     let (_fixture, mut engine, mut session) = continuity_route();
     let pid = engine.views[0].pid();
@@ -67349,17 +67323,17 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     }
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
-    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.refresh_queue.contains_key(&pid));
     assert_eq!(
         engine.exec_rearm_views[&view], None,
         "full queue grants no previous positive binding"
     );
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
     assert!(engine.request_refresh(pid, Some(2)));
-    assert!(engine.refresh_requested[&pid].exec_binding.is_none());
+    assert!(engine.refresh_queue[&pid].exec_binding.is_none());
     assert_eq!(
         engine.exec_rearm_views[&view],
-        Some(engine.refresh_requested[&pid].serial)
+        Some(engine.refresh_queue[&pid].serial)
     );
 }
 
@@ -67411,11 +67385,7 @@ fn automatic_exec_pid_continuity_apply_recheck_refuses_before_mutation() {
             "final recheck precedes any static detach call"
         );
         assert_eq!(session.replaced_slot_indices.len(), replacement_count);
-        assert!(
-            engine
-                .refresh_requested
-                .contains_key(&engine.views[0].pid())
-        );
+        assert!(engine.refresh_queue.contains_key(&engine.views[0].pid()));
         assert!(engine.exec_rearm_views.contains_key(&engine.views[0].id()));
         if condition == 0 {
             session
@@ -67439,7 +67409,7 @@ fn automatic_exec_pid_continuity_apply_recheck_refuses_before_mutation() {
                 old,
                 "a later batch performs fresh conservative lowering after frontier refusal"
             );
-            assert!(engine.refresh_requested.is_empty());
+            assert!(engine.refresh_queue.is_empty());
         }
     }
 }
@@ -67749,7 +67719,7 @@ fn automatic_exec_pid_continuity_partial_single_multi_retry_keeps_gap() {
         let retry = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(retry.changed);
         assert!(
-            engine.refresh_requested.is_empty(),
+            engine.refresh_queue.is_empty(),
             "the repaired pairs settle the owed refresh"
         );
         assert!(
@@ -67801,7 +67771,7 @@ fn automatic_exec_pid_continuity_partial_single_multi_retry_keeps_gap() {
         .group_all();
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
-    let serial = engine.refresh_requested[&pid].serial;
+    let serial = engine.refresh_queue[&pid].serial;
     let mut candidate = engine
         .live_candidate(
             engine.pinned.clone(),
@@ -68703,9 +68673,9 @@ fn midfinal_residual_deferred_inventory_keeps_named_view_until_proven_exit() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "the serviced request completes instead of sticking: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
 
     // A later proven exit retires exactly once, then the capture is quiet.
@@ -69123,9 +69093,9 @@ fn midfinal_residual_deferred_inventory_keeps_cgroup_view_until_proven_exit() {
         engine.retirement_intents
     );
     assert!(
-        !engine.refresh_requested.contains_key(&pid_a),
+        !engine.refresh_queue.contains_key(&pid_a),
         "the serviced request completes instead of sticking: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
 
     // The child exits and the kernel drops it from the listing; the next
@@ -69287,9 +69257,9 @@ fn midfinal_res2_declined_inventory_keeps_selection_derived_slots() {
         engine.counters.object_skips
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "the serviced request completes instead of sticking: {:?}",
-        engine.refresh_requested
+        engine.refresh_queue
     );
     drop(fixture);
 }
@@ -70708,7 +70678,7 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
     let scans = case.engine.deep_scans;
     let slots = case.engine.plan.slots.len();
     let pinned = case.engine.pinned.pinned().count();
-    let requests = case.engine.refresh_requested.clone();
+    let requests = case.engine.refresh_queue.snapshot_map_for_test();
     assert!(
         !requests.is_empty(),
         "the real retired owner still has unserved recovery work"
@@ -70740,7 +70710,7 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
     assert!(zero.pending && !zero.progressed);
     assert_eq!(case.session.counter_reads(), reads);
     assert!(case.engine.global_retirement_frame_owed && case.engine.immediate_exec_recovery_frame);
-    assert_eq!(case.engine.refresh_requested, requests);
+    assert_eq!(case.engine.refresh_queue.snapshot_map_for_test(), requests);
     assert_eq!(case.engine.pending_leader_exit_views, assessments);
     assert_eq!(case.engine.pending_leader_exit_order, assessment_order);
     let hint = case
@@ -70755,7 +70725,7 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
     assert!(!case.engine.immediate_exec_recovery_frame);
     assert_eq!(case.engine.pending_leader_exit_views, assessments);
     assert_eq!(case.engine.pending_leader_exit_order, assessment_order);
-    assert_eq!(case.engine.refresh_requested, requests);
+    assert_eq!(case.engine.refresh_queue.snapshot_map_for_test(), requests);
     assert!(
         case.engine
             .views
@@ -70802,7 +70772,8 @@ fn collected_finish_disposes_settled_retirement_frame_without_admission() {
         "one bounded terminal-hint disposition reports actual progress"
     );
     assert_eq!(
-        case.engine.refresh_requested, requests,
+        case.engine.refresh_queue.snapshot_map_for_test(),
+        requests,
         "the same original pid/serial/owner/binding stays disclosed as unserved, not credited as a new frame"
     );
     let after = case.engine.newcomer_stats(None);
@@ -72220,7 +72191,7 @@ fn collected_graph_exec_refresh_is_disposed_once() {
             .insert(view, RetirementCause::ExecRefresh)
             .is_none()
     );
-    assert!(engine.refresh_requested.is_empty());
+    assert!(engine.refresh_queue.is_empty());
     let first = engine
         .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
         .unwrap();
@@ -72233,7 +72204,7 @@ fn collected_graph_exec_refresh_is_disposed_once() {
     assert!(!engine.retirement_intents.contains_key(&view));
     assert!(engine.views.iter().any(|owner| owner.id() == view));
     assert!(!engine.pending_retirements.contains(&view));
-    assert!(engine.refresh_requested.is_empty());
+    assert!(engine.refresh_queue.is_empty());
     assert!(engine.counters.object_skips.iter().any(|skip| {
         skip.subject == "live discovery lifecycle"
             && skip.reason == "an exec refresh observed before the terminal stop was not rescanned"
@@ -72278,7 +72249,7 @@ fn exec_refresh_outside_finish_still_requests_refresh() {
         engine.retirement_intents.get(&view),
         Some(&RetirementCause::ExecRefresh)
     );
-    assert!(engine.refresh_requested.contains_key(&pid));
+    assert!(engine.refresh_queue.contains_key(&pid));
 }
 
 #[test]
@@ -74564,7 +74535,7 @@ fn collected_graph_slow_owed_cancel_returns_input_without_trip() {
 #[test]
 fn collected_graph_closed_never_owes_recovery_frame() {
     let mut case = graph_case_with_exit(true);
-    assert!(case.engine.refresh_requested.is_empty());
+    assert!(case.engine.refresh_queue.is_empty());
     drive_graph_case_to_drained(&mut case);
     assert!(
         !case.engine.global_retirement_frame_owed,
@@ -74575,7 +74546,7 @@ fn collected_graph_closed_never_owes_recovery_frame() {
         "a closed graph owes no exec recovery frame"
     );
     assert!(
-        case.engine.refresh_requested.is_empty(),
+        case.engine.refresh_queue.is_empty(),
         "a closed graph requests no refresh"
     );
 }
@@ -77194,7 +77165,7 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
                 .request_refresh_consumed(FAKE_PID_FLOOR + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     engine.collected_finish_actions = Some(64);
     session.refuse_preflights([false, false]);
     // Two refused heads: the suffix advances in ring order behind the
@@ -77241,16 +77212,16 @@ fn collected_finish_pressure_head_disposes_without_refresh() {
         "the protected view survives"
     );
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "no refresh slot is consumed"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "the refused head takes no slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&second_pid),
+        !engine.refresh_queue.contains_key(&second_pid),
         "the refused suffix takes no slot"
     );
 
@@ -80965,11 +80936,11 @@ fn scarce_tick_serves_fresh_pending_newcomer_before_older_backlog() {
     engine.scheduler.begin_deep_scan_tick(Some(150));
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&fresh_pid),
+        !engine.refresh_queue.contains_key(&fresh_pid),
         "the fresh pending newcomer completes first"
     );
     assert!(
-        engine.refresh_requested.contains_key(&older_pid),
+        engine.refresh_queue.contains_key(&older_pid),
         "the older backlog pid waits another tick"
     );
     assert_eq!(
@@ -80978,7 +80949,7 @@ fn scarce_tick_serves_fresh_pending_newcomer_before_older_backlog() {
     );
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&older_pid),
+        !engine.refresh_queue.contains_key(&older_pid),
         "the older backlog pid completes next"
     );
     assert_eq!(engine.probationary_completions, 2);
@@ -81018,7 +80989,7 @@ fn scarce_tick_keeps_unattempted_fresh_newcomer_ahead_of_backlog() {
     // quantum expires before any attempt, so both stay queued.
     opus_probe_refresh_with_permits(&mut engine, 0);
     assert!(
-        engine.refresh_requested.contains_key(&fresh_pid),
+        engine.refresh_queue.contains_key(&fresh_pid),
         "the fresh newcomer was not attempted on tick 1"
     );
     assert_eq!(engine.probationary_completions, 0);
@@ -81026,11 +80997,11 @@ fn scarce_tick_keeps_unattempted_fresh_newcomer_ahead_of_backlog() {
     // the unattempted fresh pid still completes first.
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&fresh_pid),
+        !engine.refresh_queue.contains_key(&fresh_pid),
         "the unattempted fresh newcomer keeps priority and completes first"
     );
     assert!(
-        engine.refresh_requested.contains_key(&older_pid),
+        engine.refresh_queue.contains_key(&older_pid),
         "the older backlog pid waits another tick"
     );
     assert_eq!(engine.probationary_completions, 1);
@@ -81084,8 +81055,8 @@ fn scarce_tick_provider_free_attempt_does_not_consume_last_slot() {
         "the provider-free attempt consumed no view slot"
     );
     assert_eq!(engine.probationary_completions, 1);
-    assert!(!engine.refresh_requested.contains_key(&sleep_pid));
-    assert!(!engine.refresh_requested.contains_key(&provider_pid));
+    assert!(!engine.refresh_queue.contains_key(&sleep_pid));
+    assert!(!engine.refresh_queue.contains_key(&provider_pid));
 }
 
 /// Kept-fresh priority is one extra tick only: a fresh pid deferred
@@ -81125,11 +81096,11 @@ fn scarce_tick_demotes_fresh_newcomer_after_one_carry_over_tick() {
     // Tick 3: the carry-over is spent, so the older backlog pid wins.
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&older_pid),
+        !engine.refresh_queue.contains_key(&older_pid),
         "the older backlog pid completes first after the carry-over expires"
     );
     assert!(
-        engine.refresh_requested.contains_key(&fresh_pid),
+        engine.refresh_queue.contains_key(&fresh_pid),
         "the twice-deferred fresh pid demoted to backlog"
     );
     assert_eq!(engine.probationary_completions, 1);
@@ -81486,14 +81457,11 @@ fn opus_r4_b4_fresh_waiters_settle_within_one_sweep() {
         .scheduler
         .begin_deep_scan_tick(crate::attach::monotonic_ns());
     for pid in &waiters {
-        let had = engine.refresh_requested.get(pid).map(|r| r.first_seen_ns);
+        let had = engine.refresh_queue.get(pid).map(|r| r.first_seen_ns);
         assert!(engine.request_refresh(*pid, crate::attach::monotonic_ns()));
         eprintln!(
             "OPUS-B4F request pid={pid} existing={had:?} now_seen={:?}",
-            engine
-                .refresh_requested
-                .get(pid)
-                .and_then(|r| r.first_seen_ns)
+            engine.refresh_queue.get(pid).and_then(|r| r.first_seen_ns)
         );
     }
     let mut settled = 0usize;
@@ -81626,12 +81594,12 @@ fn scarce_backlog_attempt_repays_owed_debt() {
     engine.scheduler.begin_deep_scan_tick(Some(150));
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&fresh1),
+        !engine.refresh_queue.contains_key(&fresh1),
         "tick 1 serves the fresh pid first"
     );
     assert!(
-        engine.refresh_requested.contains_key(&backlog1)
-            && engine.refresh_requested.contains_key(&backlog2),
+        engine.refresh_queue.contains_key(&backlog1)
+            && engine.refresh_queue.contains_key(&backlog2),
         "both backlogs wait another tick"
     );
     assert_eq!(engine.probationary_completions, 1);
@@ -81641,28 +81609,27 @@ fn scarce_backlog_attempt_repays_owed_debt() {
     assert!(engine.request_refresh(fresh2, Some(2_000_000)));
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&backlog1),
+        !engine.refresh_queue.contains_key(&backlog1),
         "tick 2 serves the pending backlog first (the owed lead)"
     );
     assert!(
-        engine.refresh_requested.contains_key(&backlog2)
-            && engine.refresh_requested.contains_key(&fresh2),
+        engine.refresh_queue.contains_key(&backlog2) && engine.refresh_queue.contains_key(&fresh2),
         "the second backlog and the second fresh wait"
     );
     assert_eq!(engine.probationary_completions, 2);
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&fresh2),
+        !engine.refresh_queue.contains_key(&fresh2),
         "tick 3 serves the waiting fresh pid first (the debt was repaid)"
     );
     assert!(
-        engine.refresh_requested.contains_key(&backlog2),
+        engine.refresh_queue.contains_key(&backlog2),
         "the remaining backlog waits"
     );
     assert_eq!(engine.probationary_completions, 3);
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        !engine.refresh_requested.contains_key(&backlog2),
+        !engine.refresh_queue.contains_key(&backlog2),
         "the remaining backlog completes last"
     );
     assert_eq!(engine.probationary_completions, 4);
@@ -81725,8 +81692,8 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     engine.scheduler.begin_deep_scan_tick(Some(150));
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        engine.refresh_requested.contains_key(&backlog1)
-            && engine.refresh_requested.contains_key(&backlog2),
+        engine.refresh_queue.contains_key(&backlog1)
+            && engine.refresh_queue.contains_key(&backlog2),
         "pass 1 defers both backlogs past the evictable view"
     );
     assert_eq!(engine.views.len(), 2);
@@ -81747,13 +81714,13 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
         "pass 2 evicted the parked view"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&fresh1) && viewed.contains(&fresh1),
+        !engine.refresh_queue.contains_key(&fresh1) && viewed.contains(&fresh1),
         "pass 2 serves the fresh pid first through the freed slot"
     );
     assert!(
-        engine.refresh_requested.contains_key(&backlog1)
-            && engine.refresh_requested.contains_key(&backlog2)
-            && engine.refresh_requested.contains_key(&fresh2),
+        engine.refresh_queue.contains_key(&backlog1)
+            && engine.refresh_queue.contains_key(&backlog2)
+            && engine.refresh_queue.contains_key(&fresh2),
         "the backlogs and the second fresh wait"
     );
     assert_eq!(engine.probationary_completions, 0);
@@ -81761,9 +81728,9 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     // the full cap; the debt survives the zero-attempt pass.
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        engine.refresh_requested.contains_key(&backlog1)
-            && engine.refresh_requested.contains_key(&backlog2)
-            && engine.refresh_requested.contains_key(&fresh2),
+        engine.refresh_queue.contains_key(&backlog1)
+            && engine.refresh_queue.contains_key(&backlog2)
+            && engine.refresh_queue.contains_key(&fresh2),
         "pass 3 defers everything past the evictable fresh view"
     );
     assert_eq!(engine.probationary_completions, 0);
@@ -81772,12 +81739,11 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     opus_probe_refresh_with_permits(&mut engine, 1);
     let viewed = opus_probe_view_pids(&engine);
     assert!(
-        !engine.refresh_requested.contains_key(&backlog1) && viewed.contains(&backlog1),
+        !engine.refresh_queue.contains_key(&backlog1) && viewed.contains(&backlog1),
         "pass 4 serves the pending backlog first (the owed lead)"
     );
     assert!(
-        engine.refresh_requested.contains_key(&backlog2)
-            && engine.refresh_requested.contains_key(&fresh2),
+        engine.refresh_queue.contains_key(&backlog2) && engine.refresh_queue.contains_key(&fresh2),
         "the second backlog and the second fresh wait"
     );
     assert_eq!(engine.probationary_completions, 0);
@@ -81785,8 +81751,7 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     // the full cap.
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        engine.refresh_requested.contains_key(&backlog2)
-            && engine.refresh_requested.contains_key(&fresh2),
+        engine.refresh_queue.contains_key(&backlog2) && engine.refresh_queue.contains_key(&fresh2),
         "pass 5 defers the backlog and the fresh past the evictable view"
     );
     assert_eq!(engine.probationary_completions, 0);
@@ -81795,18 +81760,18 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     opus_probe_refresh_with_permits(&mut engine, 1);
     let viewed = opus_probe_view_pids(&engine);
     assert!(
-        !engine.refresh_requested.contains_key(&fresh2) && viewed.contains(&fresh2),
+        !engine.refresh_queue.contains_key(&fresh2) && viewed.contains(&fresh2),
         "pass 6 serves the waiting fresh pid first (the debt was repaid)"
     );
     assert!(
-        engine.refresh_requested.contains_key(&backlog2),
+        engine.refresh_queue.contains_key(&backlog2),
         "the remaining backlog waits"
     );
     assert_eq!(engine.probationary_completions, 0);
     // Pass 7 (ordinary): the lone backlog defers at the full cap.
     opus_probe_refresh_with_permits(&mut engine, 1);
     assert!(
-        engine.refresh_requested.contains_key(&backlog2),
+        engine.refresh_queue.contains_key(&backlog2),
         "pass 7 defers the lone backlog past the evictable view"
     );
     assert_eq!(engine.probationary_completions, 0);
@@ -81815,10 +81780,10 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     opus_probe_refresh_with_permits(&mut engine, 1);
     let viewed = opus_probe_view_pids(&engine);
     assert!(
-        !engine.refresh_requested.contains_key(&backlog2) && viewed.contains(&backlog2),
+        !engine.refresh_queue.contains_key(&backlog2) && viewed.contains(&backlog2),
         "the remaining backlog completes last"
     );
-    assert!(engine.refresh_requested.is_empty());
+    assert!(engine.refresh_queue.is_empty());
     assert_eq!(engine.probationary_completions, 0);
 }
 
@@ -82443,10 +82408,10 @@ fn idle_tick_resets_the_consecutive_drop_chain() {
     drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
     assert_eq!(engine.consecutive_dropped_passes, 1);
     assert!(
-        engine.refresh_requested.is_empty() || engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.is_empty() || engine.refresh_queue.contains_key(&pid),
         "only the dropped request may wait"
     );
-    engine.refresh_requested.clear();
+    engine.refresh_queue.clear_for_test();
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(
         engine.consecutive_dropped_passes, 0,
@@ -82477,7 +82442,7 @@ fn healthy_tick_resets_the_consecutive_drop_chain() {
     for _round in 0..12 {
         assert!(engine.request_refresh(pid, None));
         apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
-        if !engine.refresh_requested.contains_key(&pid) {
+        if !engine.refresh_queue.contains_key(&pid) {
             healthy = true;
             break;
         }
@@ -82492,7 +82457,7 @@ fn healthy_tick_resets_the_consecutive_drop_chain() {
     drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
     assert_eq!(engine.consecutive_dropped_passes, 2);
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "two drops after a healthy tick still retain the request for retry"
     );
     child.kill().unwrap();
@@ -83019,11 +82984,11 @@ fn third_consecutive_drop_completes_serviced_requests() {
             .expect("a dropped pass still returns Ok");
         if engine.dropped_pass_count_for_test("test-forced apply failure") < 3 {
             assert!(
-                engine.refresh_requested.contains_key(&pid),
+                engine.refresh_queue.contains_key(&pid),
                 "fewer than three drops retain the serviced request for retry"
             );
         }
-        if !engine.refresh_requested.contains_key(&pid) {
+        if !engine.refresh_queue.contains_key(&pid) {
             completed = true;
             break;
         }
@@ -83079,7 +83044,7 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
         assert!(engine.request_refresh(poison_pid, None));
         apply_ordinary_batch(&mut engine, &mut session, vec![])
             .expect("poisoned passes drop, never abort");
-        if !engine.refresh_requested.contains_key(&poison_pid) {
+        if !engine.refresh_queue.contains_key(&poison_pid) {
             completed = true;
             break;
         }
@@ -83240,7 +83205,7 @@ fn capacity_exhaustion_without_evictable_view_gaps_waiting_live_newcomer() {
     refresh_inventory_once(&mut engine);
     refresh_inventory_once(&mut engine);
     assert!(
-        engine.refresh_requested.contains_key(&provider),
+        engine.refresh_queue.contains_key(&provider),
         "the provider-bearing newcomer stays queued for a real view"
     );
     let stats = engine.newcomer_stats(crate::attach::monotonic_ns());
@@ -83299,7 +83264,7 @@ fn departed_newcomer_prunes_from_pending_and_counts_short_lived_gap() {
         "the departed mark prunes"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&departed),
+        !engine.refresh_queue.contains_key(&departed),
         "the departed request settles"
     );
     let stats = engine.newcomer_stats(crate::attach::monotonic_ns());
@@ -84606,7 +84571,7 @@ fn late_holder_refresh_queues_past_departed_pending() {
     let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
     let args = e06_cgroup_args(scope_dir.path(), vec![], None);
     let mut engine = Engine::discover(&args, &scope, None).expect("a cgroup capture");
-    engine.refresh_requested.remove(&holder);
+    engine.refresh_queue.remove_for_test(&holder);
     let mut fake = 4_000_000u32;
     let mut filled = 0;
     while filled < MAX_PENDING_REFRESH {
@@ -84621,21 +84586,21 @@ fn late_holder_refresh_queues_past_departed_pending() {
         fake += 1;
         assert!(fake < 4_200_000, "enough unused pids to fill the queue");
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let queued: BTreeSet<u32> = engine.refresh_requested.keys().copied().collect();
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let queued: BTreeSet<u32> = engine.refresh_queue.keys().copied().collect();
     assert!(
         engine.request_refresh(holder, Some(2_000_000)),
         "a live holder queues past departed pending"
     );
-    assert!(engine.refresh_requested.contains_key(&holder));
+    assert!(engine.refresh_queue.contains_key(&holder));
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "relief replaces exactly one entry, the queue stays bounded"
     );
     let evicted: Vec<u32> = queued
         .iter()
-        .filter(|pid| !engine.refresh_requested.contains_key(pid))
+        .filter(|pid| !engine.refresh_queue.contains_key(pid))
         .copied()
         .collect();
     assert_eq!(
@@ -84694,11 +84659,11 @@ fn late_holder_relief_preserves_protected_requests_and_bound() {
         "the view-bearing departed pid queues"
     );
     assert_eq!(
-        engine.refresh_requested[&reaped_pid].owner, None,
+        engine.refresh_queue[&reaped_pid].owner, None,
         "the reaped view confers no owner, only view protection"
     );
     let mut offset = 1u32;
-    while engine.refresh_requested.len() < MAX_PENDING_REFRESH {
+    while engine.refresh_queue.len() < MAX_PENDING_REFRESH {
         assert!(
             engine.request_refresh(FAKE_PID_FLOOR + offset, Some(400)),
             "the queue accepts departed pid {} while filling",
@@ -84706,28 +84671,28 @@ fn late_holder_relief_preserves_protected_requests_and_bound() {
         );
         offset += 1;
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let before = engine.refresh_requested.clone();
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let before = engine.refresh_queue.snapshot_map_for_test();
     assert!(
         engine.request_refresh_consumed(holder, Some(500)),
         "a live holder's consumed refresh evicts one departed entry"
     );
-    assert!(engine.refresh_requested.contains_key(&holder));
+    assert!(engine.refresh_queue.contains_key(&holder));
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "relief replaces exactly one entry, the queue stays bounded"
     );
     for pid in [live, owned, reaped_pid] {
         assert_eq!(
-            engine.refresh_requested.get(&pid),
+            engine.refresh_queue.get(&pid),
             before.get(&pid),
             "the protected request for {pid} keeps its full value"
         );
     }
     let evicted: Vec<u32> = before
         .keys()
-        .filter(|pid| !engine.refresh_requested.contains_key(pid))
+        .filter(|pid| !engine.refresh_queue.contains_key(pid))
         .copied()
         .collect();
     assert_eq!(
@@ -84758,17 +84723,18 @@ fn late_holder_relief_refuses_when_every_entry_is_protected() {
             "the owner-bearing filler queues"
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let before = engine.refresh_requested.clone();
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
+    let before = engine.refresh_queue.snapshot_map_for_test();
     assert!(
         !engine.request_refresh(holder, Some(2_000)),
         "a live arrival is refused when every entry is protected"
     );
     assert_eq!(
-        engine.refresh_requested, before,
+        engine.refresh_queue.snapshot_map_for_test(),
+        before,
         "a refused arrival mutates nothing"
     );
-    assert!(!engine.refresh_requested.contains_key(&holder));
+    assert!(!engine.refresh_queue.contains_key(&holder));
 }
 
 /// A failed live produced read keeps the prior triple and files the
@@ -84833,7 +84799,7 @@ fn review_relief_keeps_live_group_after_leader_exit() {
         "the live group queues while its leader is alive"
     );
     let mut offset = 0u32;
-    while engine.refresh_requested.len() < MAX_PENDING_REFRESH {
+    while engine.refresh_queue.len() < MAX_PENDING_REFRESH {
         assert!(
             engine.request_refresh(FAKE_PID_FLOOR + offset, Some(200)),
             "the queue accepts departed pid {} while filling",
@@ -84841,7 +84807,7 @@ fn review_relief_keeps_live_group_after_leader_exit() {
         );
         offset += 1;
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     group.leave_leader();
     assert!(
         process::process_is_zombie(tgid),
@@ -84856,20 +84822,19 @@ fn review_relief_keeps_live_group_after_leader_exit() {
     let guards = e06_spawn_sleeps(1);
     let arrival = guards[0].pid();
     assert_ne!(arrival, tgid);
-    let before: std::collections::BTreeSet<u32> =
-        engine.refresh_requested.keys().copied().collect();
+    let before: std::collections::BTreeSet<u32> = engine.refresh_queue.keys().copied().collect();
     assert!(
         engine.request_refresh_consumed(arrival, Some(300)),
         "a live arrival triggers relief"
     );
     assert!(
-        engine.refresh_requested.contains_key(&tgid),
+        engine.refresh_queue.contains_key(&tgid),
         "relief keeps the live group's request"
     );
     group.call_three();
     let evicted: Vec<u32> = before
         .iter()
-        .filter(|pid| !engine.refresh_requested.contains_key(pid))
+        .filter(|pid| !engine.refresh_queue.contains_key(pid))
         .copied()
         .collect();
     assert_eq!(
@@ -84916,14 +84881,14 @@ fn review_relief_admits_live_group_after_leader_exit() {
             FAKE_PID_FLOOR + offset
         );
     }
-    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.refresh_queue.len(), MAX_PENDING_REFRESH);
     assert!(
         engine.request_refresh_consumed(tgid, Some(200)),
         "a live group admits past departed pending after its leader exits"
     );
-    assert!(engine.refresh_requested.contains_key(&tgid));
+    assert!(engine.refresh_queue.contains_key(&tgid));
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "relief replaces exactly one entry, the queue stays bounded"
     );
@@ -87655,7 +87620,7 @@ fn handle_table_loader_arming_defers_for_refresh_on_budget_wait() {
         .unwrap();
     assert!(!outcome, "a deferred arming changes nothing: {outcome:?}");
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "the refresh pends for the next tick"
     );
     assert_eq!(
@@ -87775,7 +87740,7 @@ fn handle_table_refresh_rescan_defers_on_budget_wait() {
         "old pins stay"
     );
     assert!(
-        engine.refresh_requested.contains_key(&pid),
+        engine.refresh_queue.contains_key(&pid),
         "the refresh pends for the next tick"
     );
     let gaps_after = engine
@@ -88587,7 +88552,7 @@ int main(int argc, char **argv) {
         "tick 4: refresh holds the cap"
     );
     assert!(
-        engine.refresh_requested.contains_key(&live_pid),
+        engine.refresh_queue.contains_key(&live_pid),
         "the waited rescan pends for the next tick (a skipped rescan would not)"
     );
 
@@ -92555,7 +92520,7 @@ fn owned_run_newcomer_with_an_incomplete_first_scan_owes_a_prompt_rescan() {
             "owned {owned} incomplete {incomplete}: the request stays queued: {failed:?}"
         );
         assert_eq!(
-            engine.refresh_requested.contains_key(&me),
+            engine.refresh_queue.contains_key(&me),
             owed,
             "owned {owned} incomplete {incomplete}: a rescan is requested"
         );

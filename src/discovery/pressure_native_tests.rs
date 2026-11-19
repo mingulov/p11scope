@@ -2530,13 +2530,8 @@ fn settle_live_episode(
         report.pending_high_water = report
             .pending_high_water
             .max(engine.pending_discovery_records.len());
-        report.requested_high_water = report
-            .requested_high_water
-            .max(engine.refresh_requested.len());
-        let owned_pending_request = engine
-            .refresh_requested
-            .keys()
-            .any(|pid| owned.contains(pid));
+        report.requested_high_water = report.requested_high_water.max(engine.refresh_queue.len());
+        let owned_pending_request = engine.refresh_queue.keys().any(|pid| owned.contains(pid));
         let owned_pending_record = engine
             .pending_discovery_records
             .iter()
@@ -2566,7 +2561,7 @@ fn settle_live_episode(
                 })
                 .collect();
             let sample_requests: Vec<u32> = engine
-                .refresh_requested
+                .refresh_queue
                 .keys()
                 .filter(|pid| owned.contains(pid))
                 .copied()
@@ -2598,7 +2593,7 @@ fn settle_live_episode(
                 "{what}: unsettled after {:?}: owned-requests={} pending-owned-records={} requested-hw={} views={} owned-views={} owned-armed={} rotation={} truncated={} dropped={} passes={} attempts={} arms={} minted={} scans={} sample={sample_requests:?} episode_loss={episode_loss:?}",
                 start.elapsed(),
                 engine
-                    .refresh_requested
+                    .refresh_queue
                     .keys()
                     .filter(|pid| owned.contains(pid))
                     .count(),
@@ -3021,7 +3016,7 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
             .filter(|pid| owned.contains(pid))
             .chain(
                 engine
-                    .refresh_requested
+                    .refresh_queue
                     .keys()
                     .filter(|pid| owned.contains(pid))
                     .copied(),
@@ -3043,7 +3038,7 @@ fn pressure_257_provider_loads_name_the_view_capacity_gap() {
             .filter(|view| owned.contains(&view.pid()))
             .count();
         let queued: usize = engine
-            .refresh_requested
+            .refresh_queue
             .keys()
             .filter(|pid| owned.contains(pid))
             .count();
@@ -3456,7 +3451,7 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
         "{WHAT}: no arming before the first drain"
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "{WHAT}: no requests before the first drain"
     );
     assert!(
@@ -3472,7 +3467,7 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
 
     // Collect the burst without applying: the construction proof comes
     // from genuine kernel records, never from spawn order.
-    let serial_before = engine.last_refresh_serial;
+    let serial_before = engine.refresh_queue.last_serial_for_test();
     let scans_before = engine.deep_scans;
     let (records, malformed, _) = engine
         .collect_frame_discovery(&mut session)
@@ -3531,9 +3526,9 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
         "{WHAT}: the episode must run at least one service pass"
     );
     assert!(
-        engine.last_refresh_serial - serial_before >= owned.len() as u64,
+        engine.refresh_queue.last_serial_for_test() - serial_before >= owned.len() as u64,
         "{WHAT}: every owned EXEC queued (serial delta {})",
-        engine.last_refresh_serial - serial_before
+        engine.refresh_queue.last_serial_for_test() - serial_before
     );
     // Task 2: exact tickets on owned pids only, late rearm on 256, head 0.
     assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
@@ -3838,13 +3833,13 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
         );
     }
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         MAX_PENDING_REFRESH,
         "{WHAT}: the map is full"
     );
     assert!(
         engine
-            .refresh_requested
+            .refresh_queue
             .values()
             .all(|request| request.owner.is_none()),
         "{WHAT}: every entry is ownerless (blocking broken)"
@@ -4028,7 +4023,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     // filling map and spend work the armed checkpoint forbids. The cgroup
     // scope gates ambient EXECs at event time, so the gate below is a
     // scope-leak detector, not a noise lottery.
-    let serial_before = engine.last_refresh_serial;
+    let serial_before = engine.refresh_queue.last_serial_for_test();
     let (records, malformed, _) = engine
         .collect_frame_discovery(&mut session)
         .unwrap_or_else(|error| panic!("{WHAT}: burst 1 collect failed: {error:#}"));
@@ -4143,10 +4138,10 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         engine.discovery_truncated
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "{WHAT}: REFUSED: residue in the map ({} keys: {:?}); refuses the cell as a scope leak",
-        engine.refresh_requested.len(),
-        engine.refresh_requested.keys().take(8).collect::<Vec<_>>()
+        engine.refresh_queue.len(),
+        engine.refresh_queue.keys().take(8).collect::<Vec<_>>()
     );
     twin_census(&engine, &owned, "lagged", WHAT);
 
@@ -4160,7 +4155,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         );
     }
     assert_eq!(
-        engine.refresh_requested.len(),
+        engine.refresh_queue.len(),
         256,
         "{WHAT}: the map is full of live obligations"
     );
@@ -4252,7 +4247,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         "{WHAT}: the all-blocked head is refused exactly once"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&head_pid),
+        !engine.refresh_queue.contains_key(&head_pid),
         "{WHAT}: a refused head leaves no request behind"
     );
     assert_eq!(
@@ -4364,7 +4359,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         minted_floor = minted_now;
         println!(
             "t8: {WHAT}: suffix tick {tick}: map={} minted={minted_now} scans={} truncated={} dropped={}",
-            engine.refresh_requested.len(),
+            engine.refresh_queue.len(),
             engine.deep_scans,
             engine.discovery_truncated,
             engine.newcomer_ages.dropped_unknown
@@ -4438,7 +4433,10 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             child.pid()
         );
     }
-    let serial_delta = engine.last_refresh_serial.saturating_sub(serial_before);
+    let serial_delta = engine
+        .refresh_queue
+        .last_serial_for_test()
+        .saturating_sub(serial_before);
     let passes_end = engine.pressure_service_passes;
     let attempts_end = engine.pressure_attempts;
     let arms_end = engine.loader_arms;
@@ -4537,7 +4535,7 @@ fn pressure_live256_unparked_head_control_admits() {
         "{WHAT}: the cgroup holds exactly the 256 owned providers"
     );
 
-    let serial_before = engine.last_refresh_serial;
+    let serial_before = engine.refresh_queue.last_serial_for_test();
     let (records, malformed, _) = engine
         .collect_frame_discovery(&mut session)
         .unwrap_or_else(|error| panic!("{WHAT}: burst 1 collect failed: {error:#}"));
@@ -4601,10 +4599,10 @@ fn pressure_live256_unparked_head_control_admits() {
         engine.discovery_truncated
     );
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "{WHAT}: REFUSED: residue in the map ({} keys: {:?}); refuses the cell as a scope leak",
-        engine.refresh_requested.len(),
-        engine.refresh_requested.keys().take(8).collect::<Vec<_>>()
+        engine.refresh_queue.len(),
+        engine.refresh_queue.keys().take(8).collect::<Vec<_>>()
     );
 
     // The same fresh head against the empty map, under the same batch
@@ -4685,7 +4683,7 @@ fn pressure_live256_unparked_head_control_admits() {
         "{WHAT}: the unparked head is not refused"
     );
     assert!(
-        engine.refresh_requested.contains_key(&head_pid),
+        engine.refresh_queue.contains_key(&head_pid),
         "{WHAT}: the unparked head consumes a request"
     );
     assert_eq!(
@@ -4695,10 +4693,7 @@ fn pressure_live256_unparked_head_control_admits() {
 
     let settle2 = settle_live_episode(&mut engine, &mut session, &owned2, WHAT);
     assert!(
-        !engine
-            .refresh_requested
-            .keys()
-            .any(|pid| owned2.contains(pid)),
+        !engine.refresh_queue.keys().any(|pid| owned2.contains(pid)),
         "{WHAT}: the head request completes"
     );
     assert_no_episode_loss(&engine, WHAT);
@@ -4745,7 +4740,10 @@ fn pressure_live256_unparked_head_control_admits() {
             child.pid()
         );
     }
-    let serial_delta = engine.last_refresh_serial.saturating_sub(serial_before);
+    let serial_delta = engine
+        .refresh_queue
+        .last_serial_for_test()
+        .saturating_sub(serial_before);
     let passes_end = engine.pressure_service_passes;
     let attempts_end = engine.pressure_attempts;
     population.terminate_all(WHAT, &|_| 0);

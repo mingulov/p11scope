@@ -37,6 +37,7 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
+use crate::discovery::refresh_queue::{RefreshIntake, RefreshQueue, RefreshRequest};
 use crate::discovery::scan::{
     CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
     ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
@@ -827,10 +828,10 @@ pub struct Engine {
     ring_consumed: crate::ring_accounting::RingConsumed,
     ring_positions: crate::ring_accounting::RingPositions,
     malformed_discovery: u64,
-    /// Requests retain their original age; each consumed-record renewal gets
-    /// a unique serial so an older inventory pass cannot complete newer work.
-    refresh_requested: BTreeMap<u32, RefreshRequest>,
-    last_refresh_serial: u64,
+    /// Every refresh intent, owned by admission owner 3 (serials,
+    /// relief, completion and reclaim decide there; this engine only
+    /// files the disclosure the queue returns).
+    refresh_queue: RefreshQueue,
     scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
     /// Loader hits whose records resolved benignly (accepted, scan
@@ -4120,28 +4121,6 @@ type DiscoveryCollector<'a> =
 /// direct reads it replaces exactly.
 type TickClock<'a> = dyn FnMut() -> Option<u64> + 'a;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RefreshRequest {
-    first_seen_ns: Option<u64>,
-    serial: u64,
-    owner: Option<ProcessViewId>,
-    exec_binding: Option<crate::attach::ExecBinding>,
-    // The matched, bound EXEC's kernel hook clock, never its arrival clock.
-    exec_hook_ts_ns: Option<u64>,
-    // Windowed as a fresh newcomer (or into the admission window) but the
-    // tick quantum expired before any attempt: the request keeps fresh
-    // priority on the NEXT scarce tick instead of demoting to backlog by
-    // arrival age alone behind the whole queue. One extra tick only:
-    // classification consumes the flag into `fresh_carry_spent`, and a
-    // spent carry-over cannot be re-earned, so a persistently
-    // unattempted pid cannot bloat the fresh class and starve later
-    // arrivals.
-    deferred_fresh: bool,
-    // The one-tick carry-over above has been spent: this request no
-    // longer qualifies as fresh through `deferred_fresh` and cannot
-    // earn it again (preserved across serial renewal like the flag).
-    fresh_carry_spent: bool,
-}
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 
@@ -14096,8 +14075,7 @@ impl Engine {
             ring_consumed: crate::ring_accounting::RingConsumed::default(),
             ring_positions: crate::ring_accounting::RingPositions::default(),
             malformed_discovery: 0,
-            refresh_requested: BTreeMap::new(),
-            last_refresh_serial: 0,
+            refresh_queue: RefreshQueue::default(),
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             loader_benign_hits: 0,
@@ -16771,7 +16749,7 @@ impl Engine {
             // refresh failed — so it is confined to the one context shape that
             // has no alternative, never used for a context that carries a
             // mapping of its own.
-            None => self.refresh_requested.contains_key(&pid),
+            None => self.refresh_queue.contains_key(&pid),
         }
     }
 
@@ -17271,41 +17249,29 @@ impl Engine {
         consumed: bool,
         owner: Option<ProcessViewId>,
     ) -> bool {
-        let existing = self.refresh_requested.get(&pid).cloned();
-        if existing.is_some() && !consumed {
-            return true;
-        }
-        if existing.is_none() && self.refresh_requested.len() >= MAX_PENDING_REFRESH {
-            // Fair-queue relief: a live waiter's request evicts one departed,
-            // ownerless queue entry instead of refusing. Departed entries can
-            // never be serviced; without relief a full queue of short-lived
-            // dead pids starves a late provider's holder unboundedly. Only
-            // entries with no retained owner, no view, and no /proc directory
-            // are evicted, so live pressure waiters keep their pinned
-            // retention. A departed newcomer never triggers relief (it would
-            // only churn the queue). A zombie leader keeps its /proc entry
-            // while a worker still runs, so path liveness retains the whole
-            // live group. Relief is live-operation only: during the
-            // collected finish at stop no refresh service pass runs, so an
-            // admitted head would sit unserviced with no loss record; refuse
-            // it below with the explicit loss instead.
-            let newcomer_live = self.views.iter().any(|view| view.pid() == pid)
-                || std::path::Path::new(&format!("/proc/{pid}")).exists();
-            let victim = if newcomer_live && self.collected_finish_actions.is_none() {
-                self.refresh_requested
-                    .iter()
-                    .find(|(qpid, request)| {
-                        request.owner.is_none()
-                            && !self.views.iter().any(|view| view.pid() == **qpid)
-                            && !std::path::Path::new(&format!("/proc/{qpid}")).exists()
-                    })
-                    .map(|(qpid, _)| *qpid)
-            } else {
-                None
-            };
-            if let Some(victim) = victim {
-                self.refresh_requested.remove(&victim);
-            } else {
+        let collected_finish = self.collected_finish_actions.is_some();
+        match self.refresh_queue.request(
+            pid,
+            now_ns,
+            consumed,
+            owner,
+            &self.views,
+            collected_finish,
+        ) {
+            RefreshIntake::Accepted {
+                serial,
+                owner,
+                inserted,
+            } => {
+                if inserted
+                    && let Some(owner) = owner
+                    && let Some(marker) = self.exec_rearm_views.get_mut(&owner)
+                {
+                    *marker = Some(serial);
+                }
+                true
+            }
+            RefreshIntake::QueueFull { consumed } => {
                 if consumed {
                     self.discovery_truncated = self.discovery_truncated.saturating_add(1);
                     // Diff-first arrivals retain their known dropped age.
@@ -17322,87 +17288,48 @@ impl Engine {
                         "refresh retry exceeded the bounded pending queue; work remains unfinished",
                     );
                 }
-                return false;
+                false
+            }
+            RefreshIntake::SerialsExhausted {
+                consumed,
+                existing_first_seen,
+            } => {
+                if consumed {
+                    self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+                    let refresh_seen = existing_first_seen;
+                    let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
+                    let seen = match (refresh_seen, diff_seen) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) | (None, Some(a)) => Some(a),
+                        (None, None) => None,
+                    };
+                    self.newcomer_ages
+                        .note_dropped(newcomer_age_ms(seen, now_ns));
+                    self.mark_live_loss(
+                        "live discovery refresh",
+                        "refresh request serials were exhausted; a consumed request was refused",
+                    );
+                } else {
+                    self.mark_partial(
+                        "live discovery refresh",
+                        "refresh request serials were exhausted; retry work remains unfinished",
+                    );
+                }
+                false
             }
         }
-        let Some(serial) = self.last_refresh_serial.checked_add(1) else {
-            if consumed {
-                self.discovery_truncated = self.discovery_truncated.saturating_add(1);
-                let refresh_seen = existing.as_ref().and_then(|request| request.first_seen_ns);
-                let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
-                let seen = match (refresh_seen, diff_seen) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (Some(a), None) | (None, Some(a)) => Some(a),
-                    (None, None) => None,
-                };
-                self.newcomer_ages
-                    .note_dropped(newcomer_age_ms(seen, now_ns));
-                self.mark_live_loss(
-                    "live discovery refresh",
-                    "refresh request serials were exhausted; a consumed request was refused",
-                );
-            } else {
-                self.mark_partial(
-                    "live discovery refresh",
-                    "refresh request serials were exhausted; retry work remains unfinished",
-                );
-            }
-            return false;
-        };
-        self.last_refresh_serial = serial;
-        let owner = owner.or_else(|| {
-            self.views
-                .iter()
-                .find(|view| view.pid() == pid && view.still_the_same())
-                .map(ProcessView::id)
-        });
-        self.refresh_requested.insert(
-            pid,
-            RefreshRequest {
-                first_seen_ns: existing
-                    .as_ref()
-                    .map_or(now_ns, |request| request.first_seen_ns),
-                serial,
-                owner,
-                exec_binding: None,
-                exec_hook_ts_ns: None,
-                deferred_fresh: existing
-                    .as_ref()
-                    .is_some_and(|request| request.deferred_fresh),
-                fresh_carry_spent: existing
-                    .as_ref()
-                    .is_some_and(|request| request.fresh_carry_spent),
-            },
-        );
-        if let Some(owner) = owner
-            && let Some(marker) = self.exec_rearm_views.get_mut(&owner)
-        {
-            *marker = Some(serial);
-        }
-        true
     }
 
     fn clear_refresh_for_view(&mut self, view: ProcessViewId, pid: u32) {
-        if self
-            .refresh_requested
-            .get(&pid)
-            .is_some_and(|request| request.owner == Some(view))
-        {
-            self.refresh_requested.remove(&pid);
-        }
+        self.refresh_queue.clear_for_view(view, pid);
     }
 
     fn refresh_request_snapshot(&self) -> BTreeMap<u32, u64> {
-        self.refresh_requested
-            .iter()
-            .map(|(pid, request)| (*pid, request.serial))
-            .collect()
+        self.refresh_queue.snapshot()
     }
 
     fn complete_refresh_requests(&mut self, serviced: &BTreeMap<u32, u64>, failed: &BTreeSet<u32>) {
-        self.refresh_requested.retain(|pid, request| {
-            failed.contains(pid) || serviced.get(pid) != Some(&request.serial)
-        });
+        self.refresh_queue.complete(serviced, failed);
     }
 
     /// Marks one diff-discovered newcomer's arrival (first diff wins; later
@@ -17489,7 +17416,7 @@ impl Engine {
     /// pid, or after — either order keeps the earlier observation).
     fn sample_newcomer_admission(&mut self, pid: u32, now_ns: Option<u64>) {
         let refresh_seen = self
-            .refresh_requested
+            .refresh_queue
             .get(&pid)
             .and_then(|request| request.first_seen_ns);
         let mark = self.newcomer_first_seen.get(&pid).copied();
@@ -19108,21 +19035,19 @@ impl Engine {
                     .iter()
                     .find(|view| view.id() == prepared.view)
                     .is_some_and(|view| {
-                        self.refresh_requested
-                            .get(&view.pid())
-                            .is_some_and(|request| {
-                                request.owner == Some(prepared.view)
-                                    && request.serial == prepared.serial
-                                    && request.exec_binding.as_ref().is_some_and(|binding| {
-                                        session.validate_preservation(
-                                            &prepared.receipt,
-                                            binding,
-                                            view,
-                                            prepared.serial,
-                                            &candidate.pinned,
-                                        )
-                                    })
-                            })
+                        self.refresh_queue.get(&view.pid()).is_some_and(|request| {
+                            request.owner == Some(prepared.view)
+                                && request.serial == prepared.serial
+                                && request.exec_binding.as_ref().is_some_and(|binding| {
+                                    session.validate_preservation(
+                                        &prepared.receipt,
+                                        binding,
+                                        view,
+                                        prepared.serial,
+                                        &candidate.pinned,
+                                    )
+                                })
+                        })
                     })
             })
             && candidate.exec_completions.iter().all(|prepared| {
@@ -19130,21 +19055,19 @@ impl Engine {
                     .iter()
                     .find(|view| view.id() == prepared.view)
                     .is_some_and(|view| {
-                        self.refresh_requested
-                            .get(&view.pid())
-                            .is_some_and(|request| {
-                                request.owner == Some(prepared.view)
-                                    && request.serial == prepared.serial
-                                    && request.exec_binding.as_ref().is_some_and(|binding| {
-                                        session.validate_completed_rearm(
-                                            &prepared.receipt,
-                                            binding,
-                                            view,
-                                            prepared.serial,
-                                            &candidate.pinned,
-                                        )
-                                    })
-                            })
+                        self.refresh_queue.get(&view.pid()).is_some_and(|request| {
+                            request.owner == Some(prepared.view)
+                                && request.serial == prepared.serial
+                                && request.exec_binding.as_ref().is_some_and(|binding| {
+                                    session.validate_completed_rearm(
+                                        &prepared.receipt,
+                                        binding,
+                                        view,
+                                        prepared.serial,
+                                        &candidate.pinned,
+                                    )
+                                })
+                        })
                     })
             })
             && !self.cancellation_requested()
@@ -20002,7 +19925,7 @@ impl Engine {
             });
             return None;
         }
-        let Some(request) = self.refresh_requested.get(&retained.pid()) else {
+        let Some(request) = self.refresh_queue.get(&retained.pid()) else {
             crate::attach::reexec_diagnostic::observe!(session, |diag| {
                 diag.note(
                     DiagnosticPhase::Rearm,
@@ -20032,7 +19955,7 @@ impl Engine {
                     DiagnosticOutcome::Queued
                 },
                 [
-                    Some(self.refresh_requested.len() as u64),
+                    Some(self.refresh_queue.len() as u64),
                     Some(self.exec_rearm_views.len() as u64),
                     None,
                     None,
@@ -20137,7 +20060,7 @@ impl Engine {
             .views
             .iter()
             .find(|view| view.id() == prepared.view)
-            .and_then(|view| self.refresh_requested.get(&view.pid()));
+            .and_then(|view| self.refresh_queue.get(&view.pid()));
         let renewed = current.is_none_or(|request| {
             request.owner != Some(prepared.view) || request.serial != prepared.serial
         });
@@ -20264,7 +20187,7 @@ impl Engine {
                 .views
                 .iter()
                 .find(|old| old.id() == view)
-                .and_then(|old| self.refresh_requested.get(&old.pid()));
+                .and_then(|old| self.refresh_queue.get(&old.pid()));
             if current
                 .is_some_and(|request| request.owner == Some(view) && request.serial == serial)
                 && self.exec_rearm_views.get(&view) == Some(&Some(serial))
@@ -21683,7 +21606,7 @@ impl Engine {
                 continue;
             };
             let pid = self.views[position].pid();
-            if self.refresh_requested.contains_key(&pid) {
+            if self.refresh_queue.contains_key(&pid) {
                 // Superseded: the owed refresh rescans this view whole.
                 self.pending_loader_arm_scans.remove(&key);
                 continue;
@@ -28914,12 +28837,12 @@ impl Engine {
     /// whenever the record is lowerable and its generation is gone, even
     /// though attribution itself may still reject the record first.
     fn record_needs_new_request(&self, queued: &QueuedDiscoveryRecord) -> bool {
-        if self.refresh_requested.len() < MAX_PENDING_REFRESH {
+        if self.refresh_queue.len() < MAX_PENDING_REFRESH {
             return false;
         }
         let record = &queued.record;
         let pid = (record.pid_tgid >> 32) as u32;
-        if self.refresh_requested.contains_key(&pid) {
+        if self.refresh_queue.contains_key(&pid) {
             return false;
         }
         match record.kind {
@@ -29086,7 +29009,7 @@ impl Engine {
         self.pressure_episode = Some(PressureEpisode {
             head: key,
             snapshot: self
-                .refresh_requested
+                .refresh_queue
                 .iter()
                 .map(|(pid, request)| (*pid, (request.serial, request.owner)))
                 .collect(),
@@ -29113,12 +29036,12 @@ impl Engine {
             .iter()
             .filter(|(pid, _)| !episode.ruled_out.contains(pid))
             .filter(|(pid, (serial, _))| {
-                self.refresh_requested
+                self.refresh_queue
                     .get(pid)
                     .is_some_and(|live| live.serial == *serial)
             })
             .filter(|(pid, _)| {
-                self.refresh_requested
+                self.refresh_queue
                     .get(pid)
                     .is_some_and(|live| self.pressure_request_eligible(**pid, live, protection))
             })
@@ -29408,7 +29331,7 @@ impl Engine {
                 if record.kind == DISCOVERY_KIND_EXEC {
                     if accepted {
                         let request = self
-                            .refresh_requested
+                            .refresh_queue
                             .get_mut(&pid)
                             .expect("accepted refresh request");
                         refreshed_serial = Some(request.serial);
@@ -29424,7 +29347,7 @@ impl Engine {
                             .as_ref()
                             .map(|_| record.hook_ts_ns)
                             .filter(|timestamp| *timestamp != 0);
-                    } else if let Some(request) = self.refresh_requested.get_mut(&pid) {
+                    } else if let Some(request) = self.refresh_queue.get_mut(&pid) {
                         request.exec_binding = None;
                         request.exec_hook_ts_ns = None;
                     }
@@ -29438,7 +29361,7 @@ impl Engine {
                 self.exec_rearm_views.insert(view, refreshed_serial);
                 crate::attach::reexec_diagnostic::observe!(session, |diag| {
                     diag.serial(refreshed_serial);
-                    let request = self.refresh_requested.get(&pid);
+                    let request = self.refresh_queue.get(&pid);
                     diag.note(
                         DiagnosticPhase::Request,
                         if refreshed_serial.is_some() {
@@ -29447,7 +29370,7 @@ impl Engine {
                             DiagnosticOutcome::Refused
                         },
                         [
-                            Some(self.refresh_requested.len() as u64),
+                            Some(self.refresh_queue.len() as u64),
                             Some(u64::from(request.is_some_and(|r| r.owner == Some(view)))),
                             Some(u64::from(request.is_some_and(|r| r.exec_binding.is_some()))),
                             None,
@@ -29793,7 +29716,7 @@ impl Engine {
         exit_hook_ts_ns: Option<u64>,
     ) -> bool {
         matches!(self.scope, Scope::Pid(named) if named == pid)
-            && self.refresh_requested.get(&pid).is_some_and(|request| {
+            && self.refresh_queue.get(&pid).is_some_and(|request| {
                 request.owner == Some(view)
                     && self.exec_rearm_views.get(&view) == Some(&Some(request.serial))
                     && request.exec_binding.is_some()
@@ -30214,7 +30137,7 @@ impl Engine {
         // newer serial). A quantum deferral settles nothing and scans
         // nothing; the episode rules the entry out without an attempt.
         let completed = self
-            .refresh_requested
+            .refresh_queue
             .get(&selection.pid)
             .is_none_or(|live| live.serial != selection.serial);
         let attempted =
@@ -30414,7 +30337,7 @@ impl Engine {
                         self.pending_discovery_records.extend(parked);
                         break;
                     }
-                    if self.refresh_requested.len() < MAX_PENDING_REFRESH {
+                    if self.refresh_queue.len() < MAX_PENDING_REFRESH {
                         batch = parked.into_iter();
                         self.pressure_episode_clear();
                         continue;
@@ -30670,9 +30593,9 @@ impl Engine {
                 // running so it can free capacity instead of deferring the
                 // whole frame behind the full queue.
                 if cause == RetirementCause::ExecRefresh
-                    && !self.refresh_requested.contains_key(&retained_pid)
+                    && !self.refresh_queue.contains_key(&retained_pid)
                 {
-                    if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                    if self.refresh_queue.len() >= MAX_PENDING_REFRESH {
                         continue;
                     }
                     if !self.request_refresh(retained_pid, crate::attach::monotonic_ns()) {
@@ -31497,7 +31420,7 @@ impl Engine {
         {
             return false;
         }
-        if self.refresh_requested.contains_key(&pid) {
+        if self.refresh_queue.contains_key(&pid) {
             return false;
         }
         if self.pending_leader_exit_views.contains(&id)
@@ -31571,7 +31494,7 @@ impl Engine {
         let known: BTreeSet<u32> = self.views.iter().map(ProcessView::pid).collect();
         if pids
             .iter()
-            .any(|pid| self.refresh_requested.contains_key(pid) && !known.contains(pid))
+            .any(|pid| self.refresh_queue.contains_key(pid) && !known.contains(pid))
         {
             return;
         }
@@ -31581,7 +31504,7 @@ impl Engine {
             if polling >= MAX_POLLING_RESCANS {
                 break;
             }
-            if self.refresh_requested.contains_key(&pid) {
+            if self.refresh_queue.contains_key(&pid) {
                 continue;
             }
             let retained_exploratory = self
@@ -31594,7 +31517,7 @@ impl Engine {
             // Optional polls wait for queue capacity; no producer record was
             // dropped. Keep the cursor after the last admitted poll so this
             // candidate gets its turn when capacity becomes available.
-            if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+            if self.refresh_queue.len() >= MAX_PENDING_REFRESH {
                 self.note_frame_deferral();
                 break;
             }
@@ -31742,7 +31665,7 @@ impl Engine {
     /// only where it finds none (P3, the last resort).
     fn find_evictable_victim_for_selected(&self, selected: u32) -> Option<ProcessViewId> {
         let owner = self
-            .refresh_requested
+            .refresh_queue
             .get(&selected)
             .and_then(|request| request.owner);
         self.exploratory_evictable_views().into_iter().find(|id| {
@@ -31786,7 +31709,7 @@ impl Engine {
         let pending: BTreeSet<u32> = enumerated
             .iter()
             .copied()
-            .filter(|pid| self.refresh_requested.contains_key(pid))
+            .filter(|pid| self.refresh_queue.contains_key(pid))
             .collect();
         let mut desired = known.clone();
         desired.extend(pending.iter().copied());
@@ -32118,7 +32041,7 @@ impl Engine {
             }
         };
         if !backlog_or_rotation
-            && let Some(request) = self.refresh_requested.get_mut(&pid)
+            && let Some(request) = self.refresh_queue.get_mut(&pid)
             && !request.fresh_carry_spent
         {
             request.deferred_fresh = true;
@@ -32417,7 +32340,7 @@ impl Engine {
                     // only provider-freedom a complete scan proved.
                     // Rotation candidates and unproven pids defer as before.
                     let mut probed = false;
-                    if self.refresh_requested.contains_key(&pid)
+                    if self.refresh_queue.contains_key(&pid)
                         && self.find_evictable_victim_for_selected(pid).is_none()
                     {
                         probed = true;
@@ -32436,7 +32359,7 @@ impl Engine {
                             _ => self.scheduler.note_newcomer_attempt(pid),
                         }
                         // Attempted at last: kept-fresh priority is spent.
-                        if let Some(request) = self.refresh_requested.get_mut(&pid) {
+                        if let Some(request) = self.refresh_queue.get_mut(&pid) {
                             request.deferred_fresh = false;
                         }
                         if provider_free {
@@ -32495,7 +32418,7 @@ impl Engine {
                 _ => self.scheduler.note_newcomer_attempt(pid),
             }
             // Attempted at last: kept-fresh priority is spent.
-            if let Some(request) = self.refresh_requested.get_mut(&pid) {
+            if let Some(request) = self.refresh_queue.get_mut(&pid) {
                 request.deferred_fresh = false;
             }
             let open_start = crate::attach::monotonic_ns();
@@ -32646,7 +32569,7 @@ impl Engine {
                         && unprocessed
                             .as_slice()
                             .iter()
-                            .any(|tail_pid| self.refresh_requested.contains_key(tail_pid));
+                            .any(|tail_pid| self.refresh_queue.contains_key(tail_pid));
                     if waiter_follows {
                         debug_assert!(
                             staged_yield.is_none(),
@@ -32726,7 +32649,7 @@ impl Engine {
             d.begin(
                 DiagnosticPhase::Refresh,
                 [
-                    Some(self.refresh_requested.len() as u64),
+                    Some(self.refresh_queue.len() as u64),
                     Some(self.exec_rearm_views.len() as u64),
                     None,
                     None,
@@ -32935,7 +32858,7 @@ impl Engine {
             if self.views.is_empty() {
                 bail!("the named process generation is no longer retained");
             }
-            if self.refresh_requested.is_empty() {
+            if self.refresh_queue.is_empty() {
                 return Ok(false);
             }
         }
@@ -33045,7 +32968,7 @@ impl Engine {
         if self.pressure_service_active {
             let selected = self.pressure_selected.map(|selection| selection.pid);
             failed_refresh_pids.extend(
-                self.refresh_requested
+                self.refresh_queue
                     .keys()
                     .filter(|pid| Some(**pid) != selected)
                     .copied(),
@@ -33071,7 +32994,7 @@ impl Engine {
                     view.still_the_same(),
                     membership_authoritative,
                     desired.contains(&view.pid()),
-                    self.refresh_requested.contains_key(&view.pid()),
+                    self.refresh_queue.contains_key(&view.pid()),
                 )
                 .map(|cause| (view.id(), cause))
             })
@@ -33159,7 +33082,7 @@ impl Engine {
                     [
                         Some(serviced_requests.len() as u64),
                         Some(failed_refresh_pids.len() as u64),
-                        Some(self.refresh_requested.len() as u64),
+                        Some(self.refresh_queue.len() as u64),
                         Some(self.exec_rearm_views.len() as u64),
                     ],
                 );
@@ -33215,7 +33138,7 @@ impl Engine {
             for pid in new_pids.iter().copied() {
                 if !pending.contains(&pid) {
                     rotation.push(pid);
-                } else if self.refresh_requested.get(&pid).is_some_and(|request| {
+                } else if self.refresh_queue.get(&pid).is_some_and(|request| {
                     (request.deferred_fresh && !request.fresh_carry_spent)
                         || request
                             .first_seen_ns
@@ -33241,7 +33164,7 @@ impl Engine {
             // whose carry-over was not already spent (genuinely new
             // arrivals), never for this tick's carry-over spenders.
             for pid in fresh.iter() {
-                if let Some(request) = self.refresh_requested.get_mut(pid)
+                if let Some(request) = self.refresh_queue.get_mut(pid)
                     && request.deferred_fresh
                 {
                     request.deferred_fresh = false;
@@ -33252,7 +33175,7 @@ impl Engine {
             // it keeps fresh priority next tick instead of demoting by age.
             let fresh_set: BTreeSet<u32> = fresh.iter().copied().collect();
             for pid in deferred.iter().filter(|pid| fresh_set.contains(pid)) {
-                if let Some(request) = self.refresh_requested.get_mut(pid)
+                if let Some(request) = self.refresh_queue.get_mut(pid)
                     && !request.fresh_carry_spent
                 {
                     request.deferred_fresh = true;
@@ -34050,7 +33973,7 @@ impl Engine {
                     DiagnosticOutcome::Ok,
                     [
                         Some(self.exec_rearm_views.len() as u64),
-                        Some(self.refresh_requested.len() as u64),
+                        Some(self.refresh_queue.len() as u64),
                         None,
                         None,
                     ],
@@ -34327,7 +34250,7 @@ impl Engine {
                 [
                     Some(serviced_requests.len() as u64),
                     Some(failed_refresh_pids.len() as u64),
-                    Some(self.refresh_requested.len() as u64),
+                    Some(self.refresh_queue.len() as u64),
                     Some(self.exec_rearm_views.len() as u64),
                 ],
             );
@@ -34362,7 +34285,7 @@ impl Engine {
             && self.ready_expected_removals.is_empty()
             && self.expected_target_exit_pending.is_none()
             && self.pending_leader_exit_views.is_empty()
-            && self.refresh_requested.is_empty()
+            && self.refresh_queue.is_empty()
             && self.capture_facts.staged.is_none()
             && !self.learned_unapplied
             && self.pending_learned.is_empty()
@@ -40057,7 +39980,7 @@ impl Engine {
             .keys()
             .filter(|pid| pending_mark(pid))
             .count() as u64;
-        for pid in self.refresh_requested.keys() {
+        for pid in self.refresh_queue.keys() {
             if !(self.newcomer_first_seen.contains_key(pid) && pending_mark(pid)) {
                 pending = pending.saturating_add(1);
             }
@@ -40065,7 +39988,7 @@ impl Engine {
         stats.pending = pending;
         let mut oldest: Option<u64> = None;
         for seen in self
-            .refresh_requested
+            .refresh_queue
             .values()
             .map(|request| request.first_seen_ns)
             .chain(
@@ -40428,7 +40351,7 @@ impl Engine {
             // the 256-view cap at most 32 batches interleave.
             let work_waiting = session.staged_discovery_len() > 0
                 || !self.pending_discovery_records.is_empty()
-                || !self.refresh_requested.is_empty()
+                || !self.refresh_queue.is_empty()
                 || !self.pending_loader_scans.is_empty();
             if work_waiting && !stop_requested() {
                 let now_ns = crate::attach::monotonic_ns();

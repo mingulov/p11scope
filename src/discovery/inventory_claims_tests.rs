@@ -318,7 +318,7 @@ fn inventory_generic_refresh_is_not_exec_authority() {
     assert!(engine.retirement_intents.is_empty());
     assert!(engine.pending_retirements.is_empty());
     assert!(
-        engine.refresh_requested.is_empty(),
+        engine.refresh_queue.is_empty(),
         "never enters legacy exec refresh queue"
     );
 }

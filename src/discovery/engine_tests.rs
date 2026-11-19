@@ -77885,6 +77885,10 @@ fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
         "the drive built the sealed authority before rebinding"
     );
     assert!(saw_rebind, "the drive ran terminal rebind credits");
+    assert!(
+        checked_sealed,
+        "the drive checked the sealed authority on a rebind credit"
+    );
     assert!(engine.pending_retirements.is_empty());
     assert_eq!(engine.collected_graphs_created, 1);
     assert!(engine.collected_graph_refused().is_none());

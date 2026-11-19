@@ -18422,6 +18422,10 @@ impl Engine {
         // claims for learned tables and the scrub below drops the
         // alias-filed ones (E1 persistence).
         live.insert(Self::RUN_LEARNED_VIEW_ID);
+        debug_assert!(
+            !retired.contains(&Self::RUN_LEARNED_VIEW_ID),
+            "the reserved run-learned owner is never retired"
+        );
         let authority = ClaimAuthority::candidate(&live, fresh, declined, retired);
         let bind_start = crate::attach::monotonic_ns();
         // Every scope binds strictly: an uncorroborated decode of a

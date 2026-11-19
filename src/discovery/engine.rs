@@ -15776,17 +15776,23 @@ impl Engine {
     }
 
     /// Snapshot a pending coverage-retire window: the live attached
-    /// slots `selected` is about to detach, minus any module the same
+    /// slots `selected` is about to detach, minus any endpoint the same
     /// apply re-attaches (same-apply replacements disclose no window;
     /// their detach-reattach interval stays covered by the existing
-    /// replacement accounting). Attached means session-proven: only
-    /// slots with a retained attach-complete stamp count, so retiring
-    /// plan-active cover that never attached (a rejected key's slots,
-    /// a conservative replay of an unattached plan) files no phantom
-    /// window. `None` when the retire is not live-global (the ended arm,
-    /// or an owned arm composed with same-apply reattach), on empty cover,
-    /// full reattach, no proven attach, or an unreadable clock. Call before
-    /// any arm mutates the plan; the caller opens it once the detach commits.
+    /// replacement accounting). Darkness is per endpoint, so exclusion
+    /// is per `plan::AttachKey` (object + file offset): a same-module
+    /// mixed retire (one endpoint retires dark while a sibling endpoint
+    /// of the same module re-attaches) still files for the dark key,
+    /// while a same-key rearm (ExecRefresh, static-to-exact) stays
+    /// silent. The module set survives for record projection only.
+    /// Attached means session-proven: only slots with a retained
+    /// attach-complete stamp count, so retiring plan-active cover that
+    /// never attached (a rejected key's slots, a conservative replay of
+    /// an unattached plan) files no phantom window. `None` when the
+    /// retire is not live-global (the ended arm, or an owned arm composed
+    /// with same-apply reattach), on empty cover, full reattach, no
+    /// proven attach, or an unreadable clock. Call before any arm mutates
+    /// the plan; the caller opens it once the detach commits.
     fn coverage_retire_snapshot(
         &self,
         session: &dyn EngineSession,
@@ -15802,28 +15808,22 @@ impl Engine {
         if selected.is_empty() {
             return None;
         }
-        let reattached: BTreeSet<plan::ModuleId> = candidate
+        let reattached: BTreeSet<plan::AttachKey> = candidate
             .delta
             .new
             .iter()
             .chain(&candidate.delta.replace)
-            .flat_map(|slot| slot.module_ids.iter().copied())
+            .map(plan::AttachKey::of)
             .collect();
         let mut modules = BTreeSet::new();
         let mut slots = 0u64;
         for slot in selected.iter().filter(|slot| {
             self.plan.is_active(slot.index) && session.slot_attached_at(slot.index).is_some()
         }) {
-            let fresh: Vec<plan::ModuleId> = slot
-                .module_ids
-                .iter()
-                .copied()
-                .filter(|id| !reattached.contains(id))
-                .collect();
-            if fresh.is_empty() {
+            if reattached.contains(&plan::AttachKey::of(slot)) {
                 continue;
             }
-            modules.extend(fresh);
+            modules.extend(slot.module_ids.iter().copied());
             slots += 1;
         }
         if modules.is_empty() {
@@ -15838,11 +15838,13 @@ impl Engine {
     /// first revived module would end the window on the records of
     /// modules that are still dark, silently un-disclosing their tail
     /// loss. Runs at the end of every apply that reaches it; a window
-    /// opened earlier in the same apply is never closed here (its
-    /// detach committed without same-apply reattach by construction,
-    /// and no attach ran since). An unreadable clock leaves windows
-    /// open (fail closed: the projection reads them open-ended instead
-    /// of fabricating an end).
+    /// opened earlier in the same apply closes here when every windowed
+    /// module kept a plan-active slot — the partial-module retire, or a
+    /// same-module mixed retire whose sibling re-attached. The slot
+    /// count still forces PARTIAL, so only the window tail (never the
+    /// disclosure) is cut. An unreadable clock leaves windows open (fail
+    /// closed: the projection reads them open-ended instead of
+    /// fabricating an end).
     fn close_revived_coverage_windows(&mut self) {
         if !self
             .coverage_retire_windows

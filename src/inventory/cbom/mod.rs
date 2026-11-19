@@ -126,10 +126,13 @@ fn write_sink(
     mut sink: AtomicFile,
     before_commit: impl FnOnce(),
 ) -> Result<()> {
-    serde_json::to_writer(sink.file(), document).context("writing CBOM JSON")?;
-    sink.file()
-        .write_all(b"\n")
-        .context("writing CBOM newline")?;
+    let mut bytes = serde_json::to_vec(document).context("rendering CBOM JSON")?;
+    bytes.push(b'\n');
+    if let Err(error) = sink.write_document(&bytes) {
+        let failure =
+            sink.fail_write_with_recovery(&bytes, format!("writing CBOM JSON failed: {error}"));
+        return Err(anyhow::Error::msg(failure.into_message()));
+    }
     before_commit();
     // The descriptor is retained even if its original name is
     // replaced. AtomicFile independently enforces trusted ancestors

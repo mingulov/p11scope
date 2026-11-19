@@ -8210,11 +8210,15 @@ pub(crate) fn finish_output(
             .collect(),
     };
     if let Some(mut sink) = sink {
-        let result = sink
-            .file()
-            .write_all(&document_bytes)
-            .map_err(|error| format!("writing inventory report failed: {error}"))
-            .and_then(|()| sink.commit());
+        let result = match sink.write_document(&document_bytes) {
+            Ok(()) => sink.commit(),
+            Err(error) => Err(sink
+                .fail_write_with_recovery(
+                    &document_bytes,
+                    format!("writing inventory report failed: {error}"),
+                )
+                .into_message()),
+        };
         outcome.report_committed = Some(result.is_ok());
         if let Err(error) = result {
             outcome

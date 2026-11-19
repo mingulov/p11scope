@@ -50,9 +50,9 @@ pub(crate) enum ChargeOutcome {
     Stopped {
         reason: &'static str,
         /// A terminal stop never heals: collection stops (external
-        /// authority), zero-capacity allowances (degenerate config)
-        /// and exhausted capture-lifetime allowances (nothing left
-        /// to admit). Renewable stops heal at `end_pass`.
+        /// authority) and zero-capacity allowances (degenerate
+        /// config). A tripped nonzero work allowance renews at
+        /// `end_pass`; every other stop heals at its own boundary.
         terminal: bool,
     },
 }
@@ -300,6 +300,7 @@ pub(crate) struct ScanPassOwner {
     active_scan: Option<ScanCheckpoint>,
     next_scan_serial: u64,
     window_exhaustions: u64,
+    interval_exhaustions: u64,
     deadline_ns: Option<u64>,
     #[cfg(test)]
     last_installed_deadline: Option<u64>,
@@ -325,6 +326,7 @@ impl ScanPassOwner {
             active_scan: None,
             next_scan_serial: 0,
             window_exhaustions: 0,
+            interval_exhaustions: 0,
             deadline_ns: None,
             #[cfg(test)]
             last_installed_deadline: None,
@@ -334,7 +336,7 @@ impl ScanPassOwner {
         }
     }
 
-    /// A Detailed owner with per-pass work and I/O allowances.
+    /// A Detailed owner with a work ceiling and I/O allowances.
     pub(crate) fn detailed(work_ceiling: u64, io_bytes: u64) -> Self {
         Self::from_limits(ScanLimits {
             per_object_bytes: io_bytes,
@@ -367,6 +369,7 @@ impl ScanPassOwner {
             active_scan: None,
             next_scan_serial: 0,
             window_exhaustions: 0,
+            interval_exhaustions: 0,
             deadline_ns: None,
             #[cfg(test)]
             last_installed_deadline: None,
@@ -415,6 +418,13 @@ impl ScanPassOwner {
 
     pub(crate) fn window_exhaustions(&self) -> u64 {
         self.window_exhaustions
+    }
+
+    /// Passes that tripped the work ceiling: the count behind the
+    /// per-interval exhaustion gap. Sticky and never reset.
+    #[cfg(test)]
+    pub(crate) fn interval_exhaustions(&self) -> u64 {
+        self.interval_exhaustions
     }
 
     pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
@@ -487,42 +497,47 @@ impl ScanPassOwner {
         self.deadline_ns.is_some() || self.active_window.is_some() || self.collection_work.is_some()
     }
 
-    /// Ends one pass: renews pass-scoped allowances (I/O bytes,
-    /// deadline) and clears renewable stops, keeping the cursor and
-    /// capture-lifetime consumed work. Returns the cleared stop when
-    /// it was never reported, so the driver files it against its own
-    /// pass instead of losing it; `None` for a clean pass, an already
-    /// reported stop, an active window (windows own their renewal),
-    /// or a terminal stop (collection stops, zero caps and exhausted
-    /// capture ceilings are kept and never admit).
+    /// Ends one pass (controller ruling 11:38): the Detailed work
+    /// ceiling is a renewing budget, never a capture-lifetime sticky
+    /// stop. When the pass tripped the work ceiling on a nonzero
+    /// allowance, count the exhaustion, reset the spent units and
+    /// clear the latch; the next pass retries with a fresh allowance.
+    /// Returns the cleared stop when it was never reported, so the
+    /// driver files it against its own pass instead of losing it.
+    /// Returns `None` and changes nothing for a clean pass (spend
+    /// accumulates across clean passes, so the lifetime anti-DoS
+    /// bound holds until the first trip), an already reported stop,
+    /// an active window (windows own their renewal), any other stop
+    /// (deadlines clear at their own batch end; I/O stays
+    /// capture-lifetime), or a zero cap (re-trips instantly, so its
+    /// stop stays put).
     pub(crate) fn end_pass(&mut self) -> Option<&'static str> {
         if self.active_window.is_some() {
             return None;
         }
-        self.pass_io_bytes = 0;
-        let reason = self.scan_stop_reason?;
-        if reason == COLLECTION_STOP_REASON || !self.allowance_allows_progress(reason) {
+        if !matches!(self.policy, DiscoveryPolicy::DetailedLegacy) {
             return None;
         }
+        if self.scan_stop_reason != Some(WORK_CEILING_REASON) {
+            return None;
+        }
+        if self.work_ceiling == 0 {
+            return None;
+        }
+        self.interval_exhaustions = self.interval_exhaustions.saturating_add(1);
+        self.work_units = 0;
         let unreported = !self.scan_stop_reported;
         self.scan_stop_reason = None;
         self.scan_stop_reported = false;
-        self.deadline_ns = None;
-        unreported.then_some(reason)
+        unreported.then_some(WORK_CEILING_REASON)
     }
 
     /// Whether the tripped dimension could admit anything next pass.
-    /// An exhausted allowance re-trips instantly, so its stop stays
-    /// put; a stop with headroom left renews. Detailed work is
-    /// capture-lifetime (consumed units persist across passes), so
-    /// its headroom is the ceiling remainder; pass-scoped
-    /// allowances renew at `end_pass`, so theirs is the allowance.
+    /// A zero allowance re-trips instantly, so its stop stays put;
+    /// a tripped nonzero work allowance renews at `end_pass`.
     fn allowance_allows_progress(&self, reason: &'static str) -> bool {
         match reason {
-            WORK_CEILING_REASON => match self.policy {
-                DiscoveryPolicy::DetailedLegacy => self.work_units < self.work_ceiling,
-                DiscoveryPolicy::Inventory(_) => self.work_allowance() > 0,
-            },
+            WORK_CEILING_REASON => self.work_allowance() > 0,
             IO_CEILING_REASON => self.io_allowance() > 0,
             _ => true,
         }
@@ -667,14 +682,14 @@ impl ScanPassOwner {
             self.set_scan_stop(WORK_CEILING_REASON);
             return ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
-                terminal: !self.allowance_allows_progress(WORK_CEILING_REASON),
+                terminal: false,
             };
         };
         if next > self.work_ceiling {
             self.set_scan_stop(WORK_CEILING_REASON);
             return ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
-                terminal: !self.allowance_allows_progress(WORK_CEILING_REASON),
+                terminal: false,
             };
         }
         self.work_units = next;
@@ -1152,24 +1167,24 @@ mod tests {
 
     /// Owner 2 (admission refactor), renew/terminal table: every stop
     /// on every scope either renews next pass with cursor resume or
-    /// stays terminal. Renewable stops (work/IO ceilings with
-    /// headroom left, deadline, clock) renew at `end_pass` and the
-    /// refused tail retries first; collection stops, zero caps and
-    /// exhausted capture ceilings never admit. N/A cells are
+    /// stays put. A tripped nonzero work ceiling renews at `end_pass`
+    /// (fresh allowance, counted exhaustion) and the refused tail
+    /// retries first; clean passes accumulate spend; collection stops
+    /// and zero caps never admit; deadlines clear at their own batch
+    /// end and I/O stays capture-lifetime. N/A cells are
     /// marked with their reason (a charge site only trips its own
     /// stop; Inventory windows reject a zero cap at construction).
     #[test]
     fn admission_owner2_pass_budget_renews_and_resumes() {
-        // Detailed work × exhausted ceiling: the capture-lifetime
-        // stop stays put (consumed work persists across passes); the
-        // cursor is kept for the record.
+        // Detailed work × tripped ceiling: renews with a fresh
+        // allowance and a counted exhaustion; the cursor resumes.
         let mut pass = detailed(100, 1024);
         assert_eq!(pass.charge_work(100), ChargeOutcome::Admitted);
         assert_eq!(
             pass.charge_work(1),
             ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
-                terminal: true,
+                terminal: false,
             }
         );
         assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
@@ -1179,16 +1194,10 @@ mod tests {
             ((3, Some(30)), MemberOutcome::CutShortBudgetStop),
             ((4, Some(40)), MemberOutcome::CutShortBudgetStop),
         ]);
-        assert_eq!(pass.end_pass(), None);
-        assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
-        assert_eq!(
-            pass.charge_work(1),
-            ChargeOutcome::Stopped {
-                reason: WORK_CEILING_REASON,
-                terminal: true,
-            },
-            "an exhausted capture ceiling stays sticky"
-        );
+        assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
+        assert_eq!(pass.interval_exhaustions(), 1);
+        assert_eq!(pass.stopped_reason(), None);
+        assert_eq!(pass.charge_work(1), ChargeOutcome::Admitted);
         assert_eq!(
             pass.cursor().order_members(&[
                 (1, Some(10)),
@@ -1200,28 +1209,35 @@ mod tests {
             vec![5, 3, 4, 1, 2],
             "never-attempted first, then cut-short retries, then examined"
         );
-        // Detailed work × partially consumed ceiling: the refused
-        // charge was too big for the remainder, so the stop renews
-        // and small charges still admit next pass.
+        // Detailed work × clean pass: spend accumulates (no trip, no
+        // reset), so the lifetime anti-DoS bound holds until the
+        // first trip; a heavy workload trips honestly again, one
+        // counted gap per quantum.
         let mut pass = detailed(100, 1024);
         assert_eq!(pass.charge_work(90), ChargeOutcome::Admitted);
-        assert_eq!(
-            pass.charge_work(50),
-            ChargeOutcome::Stopped {
-                reason: WORK_CEILING_REASON,
-                terminal: false,
-            }
-        );
-        assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
-        assert_eq!(pass.charge_work(5), ChargeOutcome::Admitted);
+        assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.interval_exhaustions(), 0);
         assert_eq!(
             pass.charge_work(50),
             ChargeOutcome::Stopped {
                 reason: WORK_CEILING_REASON,
                 terminal: false,
             },
-            "the remainder still refuses oversized charges"
+            "the clean pass kept its spend"
         );
+        assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
+        assert_eq!(pass.interval_exhaustions(), 1);
+        assert_eq!(pass.charge_work(100), ChargeOutcome::Admitted);
+        assert_eq!(
+            pass.charge_work(1),
+            ChargeOutcome::Stopped {
+                reason: WORK_CEILING_REASON,
+                terminal: false,
+            },
+            "the fresh quantum trips honestly again"
+        );
+        assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
+        assert_eq!(pass.interval_exhaustions(), 2);
         // A reported stop renews silently: its row already published.
         let mut pass = detailed(100, 1024);
         assert_eq!(
@@ -1233,21 +1249,30 @@ mod tests {
         );
         assert_eq!(pass.take_scan_stop_reason(), Some(WORK_CEILING_REASON));
         assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.interval_exhaustions(), 1);
         assert_eq!(pass.stopped_reason(), None);
         assert_eq!(pass.charge_work(1), ChargeOutcome::Admitted);
 
-        // Detailed work × deadline: renews with a fresh (cleared) deadline.
+        // Detailed work × deadline: `end_pass` leaves time stops
+        // alone; the batch end clears them via `set_deadline(None)`.
         let mut pass = detailed(100, 1024);
         pass.set_deadline(Some(1000));
         assert_eq!(pass.check_deadline(Some(1001)), Some(SCAN_DEADLINE_REASON));
-        assert_eq!(pass.end_pass(), Some(SCAN_DEADLINE_REASON));
+        assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.stopped_reason(), Some(SCAN_DEADLINE_REASON));
+        pass.set_deadline(None);
+        assert_eq!(pass.stopped_reason(), None);
         assert_eq!(pass.charge_work(1), ChargeOutcome::Admitted);
 
-        // Detailed work × clock: an unreadable clock is transient.
+        // Detailed work × clock: same shape (an unreadable clock is
+        // transient, but its latch still heals at the batch end).
         let mut pass = detailed(100, 1024);
         pass.set_deadline(Some(1000));
         assert_eq!(pass.check_deadline(None), Some(SCAN_CLOCK_REASON));
-        assert_eq!(pass.end_pass(), Some(SCAN_CLOCK_REASON));
+        assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.stopped_reason(), Some(SCAN_CLOCK_REASON));
+        pass.set_deadline(None);
+        assert_eq!(pass.stopped_reason(), None);
         assert_eq!(pass.charge_work(1), ChargeOutcome::Admitted);
 
         // Detailed work × collection stop: terminal, kept across passes.
@@ -1294,7 +1319,8 @@ mod tests {
         // Detailed work × I/O ceiling: N/A (work charging never trips
         // the I/O allowance; the I/O site owns that stop below).
 
-        // Detailed I/O × I/O ceiling: renews.
+        // Detailed I/O × I/O ceiling: stays capture-lifetime
+        // (`end_pass` never touches I/O bytes or their latch).
         let mut pass = detailed(100, 64);
         assert_eq!(pass.charge_io(64), ChargeOutcome::Admitted);
         assert_eq!(
@@ -1304,10 +1330,18 @@ mod tests {
                 terminal: false,
             }
         );
-        assert_eq!(pass.end_pass(), Some(IO_CEILING_REASON));
-        assert_eq!(pass.charge_io(1), ChargeOutcome::Admitted);
-        // The lifetime total keeps counting for headroom reporting.
-        assert_eq!(pass.attempted_io_bytes(), 65);
+        assert_eq!(pass.end_pass(), None);
+        assert_eq!(pass.stopped_reason(), Some(IO_CEILING_REASON));
+        assert_eq!(
+            pass.charge_io(1),
+            ChargeOutcome::Stopped {
+                reason: IO_CEILING_REASON,
+                terminal: false,
+            }
+        );
+        // The lifetime total keeps counting for headroom reporting
+        // (refused attempts record nothing).
+        assert_eq!(pass.attempted_io_bytes(), 64);
 
         // Detailed I/O × collection stop: terminal.
         let mut pass = detailed(100, 64);

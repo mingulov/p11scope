@@ -13290,6 +13290,45 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.drop_abandoned_joint_staged(ledger);
     }
 
+    /// Clear the per-quantum touched-feed set at publish-complete (a
+    /// published quantum is sealed history, never abandoned).
+    pub(crate) fn reset_quantum_touched_feeds(&mut self) {
+        self.registry.reset_quantum_touched_feeds();
+    }
+
+    /// Discard the abandoned quantum's stranded staged calls as
+    /// watchdog stuck-session loss (scoped running-rearm recovery
+    /// only): every feed that staged this quantum's heads drops its
+    /// whole queue by pure disposal (custody released exactly, no
+    /// reduction, no preservation, no replay); every other feed is
+    /// untouched. Returns the stuck feed ids (nonempty at discard),
+    /// the discarded staged-call total and the number of feeds that
+    /// held any.
+    pub(crate) fn discard_stuck_session_staged(
+        &mut self,
+    ) -> (
+        Vec<crate::discovery::caller_registry::instance_input::RegistryInstanceId>,
+        u64,
+        u64,
+    ) {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.discard_quantum_touched_staged(ledger)
+    }
+
+    /// Record the watchdog scoped break for the stuck session just
+    /// discarded: the next Idle collect voids exactly these feeds'
+    /// domains/images (plus seal-barring unbound staging) instead of
+    /// the whole stream. Feeds whose instance row is gone contribute
+    /// nothing (their history went with the row).
+    pub(crate) fn record_scoped_watchdog_break(
+        &mut self,
+        stuck: &[crate::discovery::caller_registry::instance_input::RegistryInstanceId],
+    ) {
+        let members = self.registry.stuck_session_identities(stuck);
+        self.joint_capture
+            .break_scoped_after_running_abandon(&members);
+    }
+
     /// Pose a coordinator-half pending Joint publication (no registry
     /// phase): the hold twin's wedge stand-in. Real registry-pending
     /// shapes are driven by the joint fixtures instead.

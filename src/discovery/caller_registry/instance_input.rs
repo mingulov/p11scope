@@ -3182,6 +3182,92 @@ impl CallerRegistry {
     /// as unknown-key rows beside the `record_lost` count, as on the
     /// loss path); any other feed's leftovers dispose as counted
     /// history. Feed modes are untouched.
+    /// Note one feed's staging for the current quantum (watchdog
+    /// touched set): called exactly when a head lands on the feed, so
+    /// the set names precisely the feeds holding this quantum's
+    /// staged history. Fallback replays and direct reductions stage
+    /// nothing and touch nothing.
+    fn note_quantum_touch(&mut self, id: RegistryInstanceId) {
+        self.quantum_touched_feeds.insert(id);
+    }
+
+    /// Take and clear the per-quantum touched set (running re-arm
+    /// only): the abandoned quantum's staged feeds, which the scoped
+    /// recovery disposes and records as the stuck session.
+    pub(crate) fn take_quantum_touched_feeds(&mut self) -> BTreeSet<RegistryInstanceId> {
+        std::mem::take(&mut self.quantum_touched_feeds)
+    }
+
+    /// Clear the per-quantum touched set at publish-complete: a
+    /// published quantum is sealed history, never abandoned, so its
+    /// feeds leave the stuck-session candidate set.
+    pub(crate) fn reset_quantum_touched_feeds(&mut self) {
+        self.quantum_touched_feeds.clear();
+    }
+
+    /// Discard the touched feeds' stranded staged calls as watchdog
+    /// stuck-session loss (scoped running-rearm recovery only): every
+    /// feed that staged this quantum's heads drops its whole queue by
+    /// pure disposal (custody released exactly, no reduction, no
+    /// preservation, no replay); every other feed is untouched. Each
+    /// feed contributes its depth as disposed history. Returns the
+    /// stuck feed ids (nonempty at discard, for the scoped void's
+    /// domain/image derivation), the discarded staged-call total and
+    /// the number of feeds that held any (the named loss the re-arm
+    /// gap counts).
+    pub(crate) fn discard_quantum_touched_staged(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> (Vec<RegistryInstanceId>, u64, u64) {
+        let touched = self.take_quantum_touched_feeds();
+        let mut stuck = Vec::new();
+        let mut calls = 0u64;
+        let mut feeds = 0u64;
+        for id in touched {
+            let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+                continue;
+            };
+            let depth = record.feed.staged_len();
+            if depth == 0 {
+                continue;
+            }
+            if record.feed.mode() == FeedMode::Joint {
+                let discarded = record.feed.discard_staged_as_stuck_loss(Some(&mut *ledger));
+                debug_assert_eq!(discarded, depth);
+            } else {
+                record.feed.drop_abandoned_staged(ledger);
+            }
+            debug_assert_eq!(record.feed.staged_len(), 0);
+            calls = calls.saturating_add(depth as u64);
+            feeds = feeds.saturating_add(1);
+            stuck.push(id);
+        }
+        (stuck, calls, feeds)
+    }
+
+    /// Identity of stuck-session feeds for the scoped void: caller
+    /// plus the journal domain-key parts (domain tag, image
+    /// cookie/exec, router) as primitives, since the journal builds
+    /// its private keys. Feeds whose instance row is gone contribute
+    /// nothing (their history went with the row).
+    pub(crate) fn stuck_session_identities(
+        &self,
+        ids: &[RegistryInstanceId],
+    ) -> Vec<(u32, u64, (u64, u64), u64)> {
+        ids.iter()
+            .filter_map(|id| {
+                let record = self.instance_state.records.get(id)?;
+                let key = &record.key;
+                Some((
+                    record.caller.0,
+                    key.domain.journal_tag(),
+                    (key.image.task_cookie, key.image.exec_id),
+                    key.router.get(),
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn drop_abandoned_joint_staged(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
@@ -3991,7 +4077,10 @@ impl CallerRegistry {
                     }
                 };
                 match action {
-                    StageAction::Staged => return Ok(0),
+                    StageAction::Staged => {
+                        self.note_quantum_touch(id);
+                        return Ok(0);
+                    }
                     StageAction::CarveOut => {}
                     StageAction::FallbackUncounted => {
                         direct_counted_in_stage = true;

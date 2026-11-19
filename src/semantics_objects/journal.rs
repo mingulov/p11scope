@@ -1380,6 +1380,21 @@ pub(crate) struct TestPhaseSample {
 /// integer. Ingest is wire truth only; model input happens at seal, after
 /// the audit passes, so an audit failure voids staged proof before any
 /// model input exists to corrupt.
+/// A watchdog re-arm's scoped break (stuck session only): the next
+/// Idle collect voids exactly these journal domains/images (plus any
+/// seal-barring unbound staging) instead of the whole stream. The
+/// stream position stays intact, so unlike a stream break this
+/// invalidates nothing and raises no global void cut: healthy
+/// sessions keep staged proof and re-prove above their own (unmoved)
+/// fences.
+#[derive(Debug, Default)]
+pub(crate) struct ScopedWatchdogBreak {
+    /// Stuck journal domain keys (fence + wipe + preserve scope).
+    domains: Vec<JournalDomainKey>,
+    /// Stuck images (open/refused wipe scope).
+    images: Vec<(u64, u64)>,
+}
+
 pub(crate) struct JournalAdapter {
     /// The current seal attempt's wait cause (internal; never authority
     /// and never user-visible text). Reset at every seal attempt.
@@ -1388,6 +1403,12 @@ pub(crate) struct JournalAdapter {
     consumed_through: u64,
     stream_boundary: Option<crate::events::EventsConsumptionCut>,
     stream_broken: bool,
+    /// A pending watchdog scoped break (stuck session only), recorded
+    /// by the re-arm after it discarded the stuck feeds. The next Idle
+    /// collect consumes it with a scoped void; a stream break
+    /// subsumes it. At most one pends: the Idle collect consumes any
+    /// pending break before ingesting the next quantum.
+    scoped_break: Option<ScopedWatchdogBreak>,
     /// Diagnostic-only break source counts (Task 0): breaks recorded
     /// through the dispose arm vs the ingest arm. Saturating;
     /// instrumentation only, never authority.
@@ -1579,6 +1600,7 @@ impl JournalAdapter {
             consumed_through: 0,
             stream_boundary: None,
             stream_broken: false,
+            scoped_break: None,
             break_dispose: 0,
             break_ingest: 0,
             void_audit: 0,
@@ -1729,6 +1751,44 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn break_stream_for_test(&mut self) {
         self.stream_broken = true;
+    }
+
+    /// Record a watchdog scoped break for one stuck session: each
+    /// member is (caller, domain tag, image cookie/exec, router). A
+    /// pending break unions with the new members (both still need
+    /// voiding); a stream break subsumes any pending scoped break at
+    /// consume time.
+    pub(crate) fn break_scoped_for_watchdog(&mut self, members: &[(u32, u64, (u64, u64), u64)]) {
+        let entry = self
+            .scoped_break
+            .get_or_insert_with(ScopedWatchdogBreak::default);
+        for (caller, tag, image, router) in members {
+            let key = JournalDomainKey {
+                domain_tag: *tag,
+                caller: *caller,
+                cookie: image.0,
+                exec: image.1,
+                router: *router,
+            };
+            if !entry.domains.contains(&key) {
+                entry.domains.push(key);
+            }
+            if !entry.images.contains(image) {
+                entry.images.push(*image);
+            }
+        }
+    }
+
+    /// Take the pending watchdog scoped break for the Idle void, if one
+    /// stands.
+    pub(crate) fn take_scoped_break(&mut self) -> Option<ScopedWatchdogBreak> {
+        self.scoped_break.take()
+    }
+
+    /// Drop a pending watchdog scoped break unconsumed: a stream void
+    /// already wiped its whole scope.
+    pub(crate) fn drop_scoped_break(&mut self) {
+        self.scoped_break = None;
     }
 
     /// Test-only read of the adapter invalidation flag; see above.
@@ -3031,6 +3091,74 @@ impl JournalAdapter {
             h3_voided: None,
             fence: Some(upper),
         }
+    }
+
+    /// End a stuck session after a watchdog re-arm abandoned its
+    /// quantum (scoped break): preserve that session's unbounded
+    /// abandonments as permanent refusals, fence the consumed history
+    /// on its domains only, and drop staged custody for its images
+    /// (plus any seal-barring unbound staging, which would otherwise
+    /// wedge the next frame behind the recovered lane) — refusing no
+    /// key. Later seals re-prove above the recorded fence; nothing
+    /// re-covers fenced history. Unlike a stream break, the stream
+    /// position stays intact: nothing invalidates, no re-sync is
+    /// owed, and the global void cut stays put, so healthy sessions
+    /// keep staged proof and re-prove above their own fences. An
+    /// entry convertible for (or claimed by) a healthy live key is
+    /// never wiped: converted entries wipe by their key, unconverted
+    /// ones only when no healthy claimant names their shape. Wiped
+    /// terminals shed at claim time (their void-wipe evidence routes
+    /// them to plain S1, never to a staged orphan head), and
+    /// neutral ones excuse at ingest, so no taint and no replay
+    /// refusal follows.
+    pub(crate) fn void_ingest_break_scoped_inner(
+        &mut self,
+        model: &mut ObjectSemantics,
+        gap: JournalGap,
+        scope: ScopedWatchdogBreak,
+    ) -> SealFailure {
+        let upper = self.consumed_through;
+        let mut effects = self.preserve_abandonment_refusals_scoped(model, Some(&scope.images));
+        effects
+            .effects
+            .extend(self.fence_void_scoped(model, upper, &scope.domains).effects);
+        // Pinned bootstraps stay: the audit needs them to verify
+        // staged heads. The fence carries the loss for wiped history:
+        // below-cut re-proof refuses with loss at seal time, while
+        // fresh above-cut births re-prove above the fence. (A rebirth
+        // that reuses an era with a new cut may still mismatch its
+        // pinned cut and stay degraded with a named gap; the lane and
+        // healthy sessions are unaffected.)
+        self.void_staged_scoped(upper, &scope.domains, &scope.images);
+        let mut domains: Vec<ObjectDomain> = scope
+            .domains
+            .iter()
+            .filter_map(|key| {
+                self.keys.get(key).map(|state| {
+                    ObjectDomain::sealed(&JournalDomainProof {
+                        key: *key,
+                        era: state.era,
+                    })
+                })
+            })
+            .collect();
+        domains.sort();
+        domains.dedup();
+        SealFailure {
+            scope: SealFailureScope::AffectedDomains(domains),
+            gap,
+            effects,
+            h3_voided: None,
+            fence: Some(upper),
+        }
+    }
+
+    /// Whether any live key outside the stuck set claims this staged
+    /// shape: such entries belong (at least in part) to a healthy
+    /// session and a scoped wipe must keep them.
+    fn has_healthy_claimant(&self, shape: &StagedShape, stuck: &[JournalDomainKey]) -> bool {
+        self.claimants_naming(shape)
+            .is_some_and(|claimants| claimants.keys().any(|key| !stuck.contains(key)))
     }
 
     fn has_s1only_subjects(&self) -> bool {
@@ -5198,6 +5326,26 @@ impl SealFailure {
             SealFailureScope::AffectedDomains(owned) => owned.contains(&domain),
         }
     }
+
+    /// Union another failure's scope into this one (pending-void
+    /// merge): domain sets unite; an unqualified side widens the
+    /// union to unqualified.
+    pub(crate) fn merge_scope_from(&mut self, other: &SealFailure) {
+        let joined = match (&self.scope, &other.scope) {
+            (
+                SealFailureScope::AffectedDomains(mine),
+                SealFailureScope::AffectedDomains(theirs),
+            ) => {
+                let mut domains = mine.clone();
+                domains.extend(theirs.iter().cloned());
+                domains.sort();
+                domains.dedup();
+                SealFailureScope::AffectedDomains(domains)
+            }
+            _ => SealFailureScope::Unqualified,
+        };
+        self.scope = joined;
+    }
 }
 
 /// Finite attestation refusal.
@@ -5489,7 +5637,10 @@ impl JournalAdapter {
     /// original claims it; this reports only the exact wipe record. The
     /// H0 wire position stays in its own device domain: it is never
     /// compared with the journal consumption ordinal a fence records.
-    #[cfg(test)]
+    /// Whether a void recorded wiping this admission's retained
+    /// original: exact wipe evidence (the invocation left `open`
+    /// under the latest void wipe), never mere absence, so
+    /// not-yet-ingested admissions are unaffected.
     pub(crate) fn admission_voided(&self, admitted: &AdmittedInstanceCall) -> bool {
         self.claim_refusal_cause(admitted) == PlainS1Cause::Voided
     }
@@ -6998,10 +7149,25 @@ impl JournalAdapter {
     /// never becomes replacement birth authority over continuing
     /// provider effects.
     fn preserve_abandonment_refusals(&mut self, model: &mut ObjectSemantics) -> ObjectEffects {
+        self.preserve_abandonment_refusals_scoped(model, None)
+    }
+
+    /// Preserve staged unbounded abandonments as permanent refusals,
+    /// optionally scoped to one stuck session's images (`None`
+    /// preserves every image, for stream voids). Entries outside the
+    /// scope keep their abandonments staged for their own seals.
+    fn preserve_abandonment_refusals_scoped(
+        &mut self,
+        model: &mut ObjectSemantics,
+        only_images: Option<&[(u64, u64)]>,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         let mut doomed: BTreeSet<JournalDomainKey> = BTreeSet::new();
         let mut taint: BTreeSet<(u64, u64)> = BTreeSet::new();
         for entry in self.open.values() {
+            if only_images.is_some_and(|images| !images.contains(&entry.image)) {
+                continue;
+            }
             if !entry.abandon.is_some_and(|staged| {
                 abandon_disposition(staged.abandon.reason())
                     == Some(AbandonDisposition::UnboundedInvalidation)
@@ -7087,6 +7253,65 @@ impl JournalAdapter {
             effects.effects.extend(lost.effects);
         }
         effects
+    }
+
+    /// Fence one scoped void explicitly: only the stuck session's keys
+    /// rise to the voided interval's upper cut, and only their
+    /// model-held domains record the interval as lost. Healthy keys
+    /// keep their fences (and the global void cut stays put), so
+    /// their seals re-prove above their own history. Iterates the
+    /// stuck keys only — never the whole key table.
+    fn fence_void_scoped(
+        &mut self,
+        model: &mut ObjectSemantics,
+        upper: u64,
+        stuck: &[JournalDomainKey],
+    ) -> ObjectEffects {
+        let mut effects = ObjectEffects::default();
+        for key in stuck {
+            let Some(state) = self.keys.get_mut(key) else {
+                continue;
+            };
+            state.void_fence = state.void_fence.max(upper);
+            if !state.model_registered {
+                continue;
+            }
+            let era = state.era;
+            let domain = ObjectDomain::sealed(&JournalDomainProof { key: *key, era });
+            let lost = model.outcome_lost(
+                super::LostOutcome::Voided(domain, RefCut::sealed(ConsumptionOrdinal(upper))),
+                &mut self.ledger,
+            );
+            effects.effects.extend(lost.effects);
+        }
+        effects
+    }
+
+    /// Whether a seal barrier stands: unbound staging (an open or
+    /// refused begin whose image was never attested) at or below the
+    /// consumed frontier. Such entries barrier every seal past them.
+    /// The watchdog consults this before parking: barrier-stuck
+    /// consumers trip into re-arm and scoped void (which sheds the
+    /// barrier) instead of parking (which would degrade them every
+    /// frame while the barrier persists).
+    pub(crate) fn has_seal_barrier(&self) -> bool {
+        self.has_unbound_staging(self.consumed_through)
+    }
+
+    /// Clear pinned bootstrap cuts for one image's keys (reseed): a
+    /// void-fenced image rebirthing above its fence replaces stale
+    /// below-cut evidence with its fresh birth (which would otherwise
+    /// mismatch its own pinned cut and stay degraded). Stream voids
+    /// already cleared (no-op there); scoped voids keep pins for the
+    /// audit, so the reseed clears them here instead.
+    pub(crate) fn clear_bootstraps_for_reseed(&mut self, cookie: u64, exec: u64) {
+        if let Some(keys) = self.image_keys.get(&(cookie, exec)).cloned() {
+            for key in keys {
+                if let Some(state) = self.keys.get_mut(&key) {
+                    state.bootstraps.clear();
+                }
+            }
+        }
     }
 
     /// Whether staged wire truth no bound key can account for sits at
@@ -7375,6 +7600,99 @@ impl JournalAdapter {
         for state in self.keys.values_mut() {
             state.bootstraps.clear();
         }
+    }
+
+    /// Drop staged wire truth for a scoped void: the stuck session's
+    /// images plus any seal-barring unbound staging (an open or
+    /// refused begin whose image was never attested bars every seal
+    /// past it, so leaving it would wedge the recovered lane behind
+    /// the shed session). Converted entries wipe by their key;
+    /// unconverted ones wipe only when no healthy claimant names
+    /// their shape, so an entry convertible for (or claimed by) a
+    /// healthy live key is never wiped. Wiped terminals shed at claim
+    /// time (their void-wipe evidence routes them to plain S1, never
+    /// to a staged orphan head), and neutral ones excuse at ingest,
+    /// so no taint and no replay refusal follows. Per-entry custody
+    /// releases keep the ledger exact, and the retained census is
+    /// rebuilt from survivors.
+    fn void_staged_scoped(
+        &mut self,
+        upper: u64,
+        stuck: &[JournalDomainKey],
+        stuck_images: &[(u64, u64)],
+    ) {
+        // Decide the wipe set first (immutable borrows only), then mutate.
+        let mut wiped_open: Vec<JournalNativeKey> = Vec::new();
+        let mut wiped_refused: BTreeSet<CallIdentity> = BTreeSet::new();
+        for (key, entry) in self.open.iter() {
+            let barrier = entry.converted_ticket.is_none()
+                && entry.begin_ordinal <= upper
+                && !self.image_keys.contains_key(&entry.image);
+            let stuck_entry = match entry.converted_for {
+                Some(converted) => stuck.contains(&converted),
+                None => {
+                    stuck_images.contains(&entry.image)
+                        && !self.has_healthy_claimant(&shape_of_entry(entry), stuck)
+                }
+            };
+            if barrier || stuck_entry {
+                wiped_open.push(*key);
+            }
+        }
+        for refused in self.refused.iter() {
+            let barrier = refused.cut <= upper && !self.image_keys.contains_key(&refused.image);
+            let stuck_entry = stuck_images.contains(&refused.image)
+                && !self.has_healthy_claimant(&refused.shape(), stuck);
+            if barrier || stuck_entry {
+                wiped_refused.insert(refused.identity());
+            }
+        }
+        // Mirror the stream void's wiped-invocation record and
+        // derived-absence notes for exactly the wiped set.
+        self.void_wiped.clear();
+        self.void_wiped.extend(wiped_open.iter().copied());
+        let absent: Vec<((u64, u64), JournalNativeKey, u32)> = wiped_open
+            .iter()
+            .filter_map(|key| self.open.get(key).map(|entry| (*key, entry)))
+            .filter(|(_, entry)| {
+                entry.end.is_none()
+                    && entry.abandon.is_none()
+                    && !entry.begin.no_end()
+                    && entry.corroborated_return.is_none()
+                    && disposes_unclaimable_original(entry.function)
+            })
+            .map(|(key, entry)| (entry.image, key, entry.function))
+            .collect();
+        for (image, key, function) in absent {
+            self.note_derived_absence(image, key, function);
+        }
+        // Release per-entry custody exactly, then drop the wiped state.
+        // The stuck keys' claims stay: their shapes may still be
+        // named by kept entries, and seals consult the fence (not
+        // claim presence) for loss. Wiped shapes simply never seal.
+        for key in &wiped_open {
+            let entry = self.open.remove(key).expect("wiped open entry");
+            self.ledger.release_h8open(entry.begin_ordinal);
+        }
+        self.refused
+            .retain(|refused| !wiped_refused.contains(&refused.identity()));
+        // Rebuild the retained census from survivors: open members
+        // keep iff their native key still stages; refused members iff
+        // their shape still stages.
+        let surviving_refused: BTreeSet<CallIdentity> = self
+            .refused
+            .iter()
+            .map(|refused| refused.identity())
+            .collect();
+        for members in self.retained_counts.values_mut() {
+            members.retain(|member| match member {
+                RetainedMember::Open(native) => self.open.contains_key(native),
+                RetainedMember::Refused(shape) => surviving_refused.contains(&shape.identity),
+            });
+        }
+        self.retained_counts
+            .retain(|_, members| !members.is_empty());
+        self.retained_census_drift = false;
     }
 
     fn retained_failure_domain(&self, bootstrap: &BootstrapReceipt) -> Option<ObjectDomain> {

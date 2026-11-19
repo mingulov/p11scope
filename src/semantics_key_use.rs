@@ -1280,7 +1280,12 @@ impl JointStaging {
         {
             return (FailureBatchProgress::Held, 0);
         }
-        let disposition = audited.disposition();
+        // A parked consumer's retry-mapped failure delivers as a
+        // forced fallback (degrade with counted loss) instead of
+        // retrying, so the frame cursor advances past it.
+        let disposition = batch
+            .forced_disposition()
+            .unwrap_or_else(|| audited.disposition());
         let gap = audited.failure().gap;
         let fence = audited.fence();
         let covered = matches!(audited.h3(), H3DispositionEvidence::Clean {
@@ -1654,6 +1659,26 @@ impl JointStaging {
         ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> usize {
         self.dispose_pure_below_barrier(barrier, ledger)
+    }
+
+    /// Discard every staged head as watchdog stuck-session loss
+    /// (scoped running-rearm recovery only): the stuck session's
+    /// staged calls can never reduce, so the recovery drops the whole
+    /// queue without reducing, preserving or replaying any head. Each
+    /// popped head releases custody exactly (no ledger leak, no
+    /// under-charge), advances the frontier and counts as disposed
+    /// history (`record_lost`); the live reducer, S1 counts and
+    /// already-minted associations are untouched. Memory-only and
+    /// bounded by the staging caps — the same nature as the ledger's
+    /// own role-release walk — so no work-credit accounting applies.
+    /// Feed mode is untouched: the fenced void the re-arm breaks for
+    /// still ends the segment on its own delivery. Returns the
+    /// discarded depth.
+    pub(crate) fn discard_staged_as_stuck_loss(
+        &mut self,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        self.dispose_pure_below_barrier(None, ledger)
     }
 
     /// The pure disposal core shared by the test-only handle above

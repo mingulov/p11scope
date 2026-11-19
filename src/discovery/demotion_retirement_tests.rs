@@ -8132,8 +8132,10 @@ fn demotion_retirement_round5_folded_instances_saturate_run_wide_across_provider
         ModuleKey, RegistryLimits,
     };
     const PER_MODULE: usize = 3500;
-    assert!(PER_MODULE < MAX_FOLDED_INSTANCES_PER_MODULE);
-    assert!(5 * PER_MODULE > MAX_FOLDED_INSTANCES_GLOBAL);
+    const {
+        assert!(PER_MODULE < MAX_FOLDED_INSTANCES_PER_MODULE);
+        assert!(5 * PER_MODULE > MAX_FOLDED_INSTANCES_GLOBAL);
+    }
     let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
     let caller = CallerId(7);
     let mut modules = Vec::new();

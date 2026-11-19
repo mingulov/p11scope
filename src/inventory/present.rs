@@ -5359,6 +5359,12 @@ fn render_snapshot_inner(
                     departed.identities_dropped
                 ));
             }
+            if departed.folded_instances_dropped > 0 {
+                tail.push_str(&format!(
+                    " (+{} instances past the bound)",
+                    departed.folded_instances_dropped
+                ));
+            }
             if departed.mechs_overflow > 0 {
                 tail.push_str(&format!(
                     " (+{} mechanisms past the row bound)",

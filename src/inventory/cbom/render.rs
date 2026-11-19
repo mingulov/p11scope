@@ -738,6 +738,20 @@ fn coverage_parts(projection: &Projection) -> Vec<String> {
             "modules with saturated departed identities",
         ));
     }
+    if unknowns.departed_folded_instances_dropped > 0 {
+        parts.push(counted(
+            unknowns.departed_folded_instances_dropped as usize,
+            "departed folded instance dropped",
+            "departed folded instances dropped",
+        ));
+    }
+    if unknowns.departed_folded_instances_saturated > 0 {
+        parts.push(counted(
+            unknowns.departed_folded_instances_saturated as usize,
+            "module with saturated departed folded instances",
+            "modules with saturated departed folded instances",
+        ));
+    }
     if unknowns.departed_mechs_overflow > 0
         || unknowns.departed_mechs_overflow_calls > 0
         || unknowns.departed_mechs_overflow_errors > 0

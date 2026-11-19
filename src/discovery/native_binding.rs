@@ -1122,9 +1122,7 @@ impl NativeBinder {
     }
 
     /// Drop one retired caller's cached bindings and ended marks from
-    /// every domain. The atomic fold runs this with its clearing; the
-    /// staged oversized fold runs it once at commit, after its last
-    /// sequence slice.
+    /// every domain. The atomic fold runs this with its clearing.
     pub(crate) fn release_caller_domains(&mut self, id: CallerId) {
         for domain in &mut self.domains {
             domain.callers.remove(&id);

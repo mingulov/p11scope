@@ -184,15 +184,16 @@ versioned separately and are opaque, exact dispatch keys.
   through the shared stop-checked stride, committing the carry
   wholesale once it is complete; every declared module match costs
   a planning unit even against an empty module table.
-- A caller costlier than a whole fold window stays live and unfolded
-  with its data kept instead of folding past the budget: no window
-  can reserve it, so each pass leaves it carried under a counted
-  `fold deferred: caller exceeds one pass's fold budget` gap while
-  fitting siblings fold around it. Fold commits read every member
-  exactly once from the stop-paced per-pass index, matching the
-  admitted cost, and each touched module's departed identity lands
-  inside that same member traversal, so no separate module pass runs
-  uncharged.
+- A caller costlier than a whole fold window remains in inventory,
+  unfolded, with its evidence kept instead of folding past the
+  budget: no window can reserve it, so each pass leaves it carried
+  under a counted `fold deferred: caller exceeds one pass's fold
+  budget` gap while fitting siblings fold around it. Fold commits
+  read every member exactly once from the stop-paced per-pass index,
+  matching the admitted cost, which charges one unit per touched
+  module's departed identity alongside the member units; each
+  identity lands inside that same member traversal, so no separate
+  module pass runs uncharged.
 
 ## [0.7.1] - 2026-11-17
 

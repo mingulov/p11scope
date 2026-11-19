@@ -273,8 +273,7 @@ pub(crate) const FOLD_DEFERRED_OVERSIZED_SUBJECT: &str =
 /// Gap reason for a deferred oversized fold: constant, so every
 /// deferral of one caller folds into its row's repeats. Pinned
 /// verbatim by the admission-table test below.
-pub(crate) const FOLD_DEFERRED_OVERSIZED_REASON: &str =
-    "the caller stays live and unfolded with its data kept and retries next pass";
+pub(crate) const FOLD_DEFERRED_OVERSIZED_REASON: &str = "the retired caller and its evidence remain in inventory as unfolded rows; the fold retries next pass";
 
 /// Terminal wording for the short-lived never-scanned count: `confirmed`
 /// programs were never enumerated twice in a row or were listed only as
@@ -1289,13 +1288,19 @@ impl JointAuditSubjectDiagnosis {
 
 /// Per-call departed-fold indexes: instance owners, edges with claimed
 /// instance children, forwarding-layer modules, per-caller edge layer
-/// flags, and the terminal subset modules. Built lazily on the first
-/// foldable caller.
+/// flags, per-caller departed-identity units, and the terminal subset
+/// modules. Built lazily on the first foldable caller.
 struct FoldContext {
     instances_by_caller: HashMap<CallerId, Vec<RegistryInstanceId>>,
     claimed_children: BTreeSet<(CallerId, ModuleId)>,
     forwarding: BTreeSet<ModuleId>,
     edge_flags: HashMap<CallerId, (bool, bool)>,
+    /// One admission unit per departed-identity write: each caller's
+    /// distinct touched-module count, derived inside the same
+    /// stop-paced edge and instance planning the other indexes ride,
+    /// so the reservation covers the first-touch inserts with no
+    /// extra scan.
+    identity_units: HashMap<CallerId, usize>,
     subset_modules: Option<BTreeSet<ModuleId>>,
 }
 
@@ -1325,11 +1330,12 @@ struct MemberSizes {
 /// passes instead of delaying one publication, and the remainder
 /// resumes next pass without a re-note. One credit folds one caller
 /// plus up to [`FOLD_PLAN_STRIDE`] of its member units (cookies,
-/// pairs, edges, instances, summaries, pidfd custody); a high-fanout
-/// caller spends one extra credit per further stride, so member work
-/// paces the call instead of riding free. A caller costlier than a
-/// whole window never folds: no window can reserve it, so it stays
-/// live and unfolded with its data kept, under the counted
+/// pairs, edges, instances, summaries, pidfd custody, one unit per
+/// touched module's departed identity); a high-fanout caller spends
+/// one extra credit per further stride, so member work paces the
+/// call instead of riding free. A caller costlier than a whole
+/// window never folds: no window can reserve it, so it remains in
+/// inventory, unfolded, with its evidence kept, under the counted
 /// [`FOLD_DEFERRED_OVERSIZED_SUBJECT`] gap, and retries every pass
 /// while fitting siblings fold around it.
 const FOLD_CALLERS_PER_PUBLICATION: usize = 1024;
@@ -6035,10 +6041,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Name one folded caller in one touched module's departed
     /// identity set, on the member traversal's first touch of that
     /// module; a row-less caller (no edges, no instances) counts on
-    /// without naming anything, exactly like before. The caller folds
-    /// each module's first member inside its charged traversal, so the
-    /// insert rides that member's unit instead of a separate module
-    /// pass.
+    /// without naming anything, exactly like before. The reservation
+    /// charges one unit per insert, derived from the same per-pass
+    /// index the traversal folds from, so the admitted cost covers
+    /// both without a separate module pass.
     fn insert_folded_module_identity(
         &mut self,
         id: CallerId,
@@ -6323,10 +6329,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// simply not a candidate — so an abort keeps the unprocessed
     /// suffix carried without rebuilding it. Each fold reserves its
     /// charge before it runs — one credit plus one per further member
-    /// stride — and a caller that does not fit the remaining credits
-    /// waits for a fresh window. A caller costlier than a whole
-    /// window never folds: no window can reserve it, so it stays live
-    /// and unfolded with its data kept, under the counted
+    /// stride, counting one unit per touched module's departed
+    /// identity alongside the member units — and a caller that does
+    /// not fit the remaining credits waits for a fresh window. A
+    /// caller costlier than a whole window never folds: no window can
+    /// reserve it, so it remains in inventory, unfolded, with its
+    /// evidence kept, under the counted
     /// [`FOLD_DEFERRED_OVERSIZED_SUBJECT`] gap, while fitting callers
     /// still fold atomically. Released pidfd custody joins a bounded
     /// close queue serviced one pin per stop check; a stop defers the
@@ -6532,13 +6540,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Charge the member work before running it: the pre-indexed
             // sizes make this O(1) lookups — no range scans run here —
             // covering cookies, pair targets and recoveries, edges,
-            // instances, summaries and pidfd custody. A caller that
-            // does not fit the remaining credits waits for a fresh
-            // window instead of spending work it was never granted; a
-            // caller costlier than a whole window stays live and
-            // unfolded under its counted gap instead of folding alone
-            // past the budget, so no row starves and no pass runs
-            // unbounded work.
+            // instances, summaries, pidfd custody and one unit per
+            // touched module's departed identity. A caller that does
+            // not fit the remaining credits waits for a fresh window
+            // instead of spending work it was never granted; a caller
+            // costlier than a whole window remains in inventory,
+            // unfolded, under its counted gap instead of folding
+            // alone past the budget, so no row starves and no pass
+            // runs unbounded work.
             let pairs_ref = pairs.as_ref().expect("indexes build before the loop");
             let ctx_ref = folded.as_ref().expect("indexes build before the loop");
             let sizes_ref = sizes.as_ref().expect("indexes build before the loop");
@@ -6549,14 +6558,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .saturating_add(sizes_ref.edges.get(&id).map_or(0, Vec::len))
                 .saturating_add(ctx_ref.instances_by_caller.get(&id).map_or(0, Vec::len))
                 .saturating_add(sizes_ref.summaries.get(&id).map_or(0, Vec::len))
-                .saturating_add(self.semantic_bindings.fold_pin_count(id));
+                .saturating_add(self.semantic_bindings.fold_pin_count(id))
+                .saturating_add(ctx_ref.identity_units.get(&id).copied().unwrap_or(0));
             let cost = 1usize.saturating_add(units / FOLD_PLAN_STRIDE as usize);
             if cost > FOLD_CALLERS_PER_PUBLICATION {
                 // No window can reserve this caller, so it never folds:
-                // it stays live and unfolded with its data kept, under
-                // a counted named gap, and retries every pass. The row
-                // stays carried (nothing here removes it) and siblings
-                // still fold around it.
+                // it remains in inventory, unfolded, with its evidence
+                // kept, under a counted named gap, and retries every
+                // pass. The row stays carried (nothing here removes
+                // it) and siblings still fold around it.
                 self.registry.record_gap(RegistryGap {
                     caller: Some(id),
                     module: None,
@@ -6798,11 +6808,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         mut unit: impl FnMut() -> bool,
     ) -> Option<FoldContext> {
         let mut instances_by_caller: HashMap<CallerId, Vec<RegistryInstanceId>> = HashMap::new();
+        // Distinct touched modules per caller, for the one-unit
+        // departed-identity charge: derived inside these same
+        // stop-paced scans, with no extra pass and no extra stop
+        // polling.
+        let mut touched: HashMap<CallerId, BTreeSet<ModuleId>> = HashMap::new();
         for record in self.registry.instances() {
             instances_by_caller
                 .entry(record.caller)
                 .or_default()
                 .push(record.id);
+            touched
+                .entry(record.caller)
+                .or_default()
+                .insert(record.module);
             if unit() {
                 return None;
             }
@@ -6871,6 +6890,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let mut active = false;
             let mut refused_backend = false;
             for (key_caller, module) in keys {
+                // Every indexed edge key counts, exactly like the
+                // admission lengths the commit folds from.
+                touched.entry(*caller).or_default().insert(*module);
                 let Some(edge) = self.registry.edge(*key_caller, *module) else {
                     if unit() {
                         return None;
@@ -6899,11 +6921,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(subset) = subset {
             subset_modules = Some(self.subset_module_ids(subset, &mut unit)?);
         }
+        let identity_units: HashMap<CallerId, usize> = touched
+            .into_iter()
+            .map(|(caller, modules)| (caller, modules.len()))
+            .collect();
         Some(FoldContext {
             instances_by_caller,
             claimed_children,
             forwarding,
             edge_flags,
+            identity_units,
             subset_modules,
         })
     }

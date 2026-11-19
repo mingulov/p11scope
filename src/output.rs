@@ -2048,7 +2048,10 @@ fn create_fallback_recovered_dir(base: &Path) -> Result<(std::fs::File, PathBuf)
         let dir = unsafe { std::fs::File::from_raw_fd(fd) };
         let fallback = base.parent().unwrap_or_else(|| Path::new("/")).join(text);
         if let Err(error) = verify_recovered_dir(&dir, &fallback) {
-            let _ = unlinkat(&parent, &name);
+            // No cleanup: a just-created dir always verifies (caller-owned
+            // 0700, sticky parent admits no swap), so a failure names a
+            // foreign object that must be left alone, never unlinked.
+            // (A file `unlinkat` on a dir is a no-op in any case.)
             return Err(error);
         }
         return Ok((dir, fallback));

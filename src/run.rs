@@ -13740,7 +13740,7 @@ fn reduce_profile_event(
     // Temporary loss forensics: per-event pid and time series on
     // stderr under P11SCOPE_FIX1_EVLOG (reverted before landing).
     // One line per CALL/FORK: exact per-worker arrival proof.
-    if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some() {
+    if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some_and(|value| !value.is_empty()) {
         let kind = match ev.event_type {
             p11scope_ebpf_common::event_type::CALL => "CALL",
             p11scope_ebpf_common::event_type::FORK => "FORK",

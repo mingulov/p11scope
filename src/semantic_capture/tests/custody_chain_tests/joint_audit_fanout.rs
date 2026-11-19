@@ -16537,6 +16537,55 @@ fn joint_machine_auditing_foreign_h3_hold_refuses_the_rearm() {
     );
 }
 
+/// Guard twin for the Auditing-phase re-arm order: nothing ever
+/// stages before apply, so an Auditing-phase re-arm always finds an
+/// empty touched set and its stuck-session discard is a no-op — the
+/// foreign-hold refusal below moves no staged or disposed history.
+/// If Auditing ever stages, this fails loudly and the discard/H3-gate
+/// order must be revisited.
+#[test]
+fn joint_machine_auditing_foreign_h3_hold_discards_nothing() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_auditing();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .pose_foreign_h3_hold_for_test();
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the preflight's foreign-hold refusal latches the running machine"
+    );
+    assert_eq!(
+        fixture.staged_total(),
+        0,
+        "nothing stages before apply: the discard has no history to take"
+    );
+    let disposed_before = fixture.disposed_total();
+    assert_eq!(fixture.rearm("semantic_unavailable"), None);
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::H3SlotHeld),
+        "the stop names the foreign-held H3 slot"
+    );
+    assert_eq!(
+        fixture.staged_total(),
+        0,
+        "the refused re-arm stages nothing"
+    );
+    assert_eq!(
+        fixture.disposed_total(),
+        disposed_before,
+        "the refused re-arm disposes nothing"
+    );
+}
+
 /// Back-to-back twin at the audit step: two consecutive Auditing
 /// refusals re-arm without a recovery between them. The first void is
 /// still pending when the second void applies, so the pending-void

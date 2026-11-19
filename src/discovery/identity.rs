@@ -1422,6 +1422,13 @@ pub struct PinnedObjects {
     by_id: BTreeMap<PinnedObjectId, Entry>,
     raw_to_id: RawToId,
     rejected_keys: BTreeSet<ObjectKey>,
+    /// The proven-collision subset of `rejected_keys`: keys under which
+    /// two proven entries contradicted (forgery or group rejection at
+    /// insert). Only these replay across `absorb`: an unproven
+    /// observation never rejects, so it never marks. Absorb replays
+    /// marked keys unconditionally and propagates the marker, with
+    /// ambiguity riding the same provenance.
+    proven_collision_keys: BTreeSet<ObjectKey>,
     ambiguous_keys: BTreeSet<ObjectKey>,
     ambiguity_published: BTreeSet<ObjectKey>,
     ownership: BTreeMap<ProcessViewId, ViewClaims>,
@@ -1464,6 +1471,7 @@ impl Clone for PinnedObjects {
             by_id: self.by_id.clone(),
             raw_to_id: self.raw_to_id.clone(),
             rejected_keys: self.rejected_keys.clone(),
+            proven_collision_keys: self.proven_collision_keys.clone(),
             ambiguous_keys: self.ambiguous_keys.clone(),
             ambiguity_published: self.ambiguity_published.clone(),
             ownership: self.ownership.clone(),
@@ -1600,6 +1608,7 @@ impl PinnedObjects {
             by_id: BTreeMap::new(),
             raw_to_id: RawToId::default(),
             rejected_keys: BTreeSet::new(),
+            proven_collision_keys: BTreeSet::new(),
             ambiguous_keys: BTreeSet::new(),
             ambiguity_published: BTreeSet::new(),
             ownership: BTreeMap::new(),
@@ -1629,13 +1638,14 @@ impl PinnedObjects {
     /// Whether two scan-produced pin sets carry identical identity
     /// content: every raw observation resolves to an entry with the same
     /// mapping identity, held-fd device, pin, digest, ABI, exports and
-    /// proof flags, and the rejection, ambiguity, ownership,
-    /// raw-ownership and carried-proof layers agree. Scan-local object ids, the held
+    /// proof flags, and the rejection, proven-collision, ambiguity,
+    /// ownership, raw-ownership and carried-proof layers agree. Scan-local object ids, the held
     /// `File` handles and the per-object unchanged-check stamps are not
     /// content: ids are remapped by identity on absorb, and the stamps
     /// only ever move later under `check_unchanged`.
     pub(crate) fn same_pin_content(&self, other: &Self) -> bool {
         if self.rejected_keys != other.rejected_keys
+            || self.proven_collision_keys != other.proven_collision_keys
             || self.ambiguous_keys != other.ambiguous_keys
             || self.ambiguity_published != other.ambiguity_published
             || self.overlay_uncertain != other.overlay_uncertain
@@ -1805,11 +1815,31 @@ impl PinnedObjects {
                 }
             }
         }
-        for key in other.rejected_keys {
-            self.reject_observation(key);
+        // Only proven collisions replay: an unproven observation in
+        // the incoming set never rejects here, and its ambiguity
+        // markers die with it — no ambiguity without a proven
+        // collision. Proven keys replay unconditionally with the
+        // same entry-removing routing refusal a cross-partition
+        // collision takes, and the marker propagates.
+        for key in other.proven_collision_keys.iter().copied() {
+            self.reject_key(key);
         }
-        self.ambiguous_keys.extend(other.ambiguous_keys);
-        self.ambiguity_published.extend(other.ambiguity_published);
+        self.proven_collision_keys
+            .extend(other.proven_collision_keys.iter().copied());
+        self.ambiguous_keys.extend(
+            other
+                .ambiguous_keys
+                .iter()
+                .copied()
+                .filter(|key| other.proven_collision_keys.contains(key)),
+        );
+        self.ambiguity_published.extend(
+            other
+                .ambiguity_published
+                .iter()
+                .copied()
+                .filter(|key| other.proven_collision_keys.contains(key)),
+        );
         for (view, claims) in other.ownership {
             let ours = self.ownership.entry(view).or_default();
             ours.tables.extend(
@@ -2063,9 +2093,20 @@ impl PinnedObjects {
             .collect()
     }
 
+    /// Re-applies rejected keys onto a conservative planning scratch.
+    /// Records unproven rejections (never marked proven): it feeds
+    /// planning scratches only, never an absorbed fresh side, so no
+    /// proven collision can slip the absorb guard through it, and
+    /// routing stays refused either way.
     pub(crate) fn reapply_rejected_keys(&mut self, keys: &BTreeSet<ObjectKey>) -> Vec<Skipped> {
         for key in keys {
-            self.reject_observation(*key);
+            // Same routing as before: a repeated re-application files
+            // the finite collision-group ambiguity, once per raw key.
+            let repeated = self.rejected_keys.contains(key);
+            self.reject_key(*key);
+            if repeated {
+                self.ambiguous_keys.insert(*key);
+            }
         }
         let mut skipped = Vec::new();
         self.publish_ambiguities(&mut skipped);
@@ -3249,15 +3290,27 @@ impl PinnedObjects {
             .is_some_and(|(ours, theirs)| compare(ours, theirs))
     }
 
+    /// Resolves a scanned raw only when the resolving view proved it:
+    /// the single per-view proof fence. A view whose own pin failed
+    /// binds nothing through a peer's identical raw; every binder,
+    /// queue and gap renderer funnels through here. Physical sharing
+    /// still works: two views that each proved the same raw each own
+    /// the same tuple.
     pub fn id_for_scanned(
         &self,
         module: &ScannedModule,
         key: ObjectKey,
         path: &str,
     ) -> Option<PinnedObjectId> {
-        self.raw_to_id
-            .get(&RawObjectInstance::scanned(module, key, path)?)
-            .copied()
+        let raw = RawObjectInstance::scanned(module, key, path)?;
+        if !self
+            .raw_ownership
+            .get(&module.view)
+            .is_some_and(|owned| owned.contains(&raw))
+        {
+            return None;
+        }
+        self.raw_to_id.get(&raw).copied()
     }
 
     pub fn summary(&self, id: PinnedObjectId) -> Option<PinnedSummary<'_>> {
@@ -3553,7 +3606,10 @@ impl PinnedObjects {
                     !known.sha256.is_empty() && known.sha256 == entry.sha256
                 })
             {
+                // Forgery: two proven entries contradict under one key.
+                // The only rejection that marks a proven collision.
                 self.reject_key(key);
+                self.proven_collision_keys.insert(key);
                 return None;
             } else {
                 skipped.push(Skipped {
@@ -3582,7 +3638,10 @@ impl PinnedObjects {
             return Some(id);
         }
         if !same_key.is_empty() {
+            // Group rejection: two proven entries contradict under one
+            // key. The only rejection that marks a proven collision.
             self.reject_key(key);
+            self.proven_collision_keys.insert(key);
             return None;
         }
         let id = PinnedObjectId(self.next_id);
@@ -3607,14 +3666,6 @@ impl PinnedObjects {
             .next()
             .is_some_and(|raw| raw.mount_namespace.is_some())
             && aliases.all(|raw| raw.mount_namespace.is_some())
-    }
-
-    /// Whether a witness-proven pre-copy-up observation is kept under
-    /// `key`: a proven side is never nuked by a sibling's pin failure.
-    fn has_pre_copy_up_for_key(&self, key: ObjectKey) -> bool {
-        self.by_id
-            .values()
-            .any(|entry| entry.raw.key == key && entry.pre_copy_up)
     }
 
     fn reject_key(&mut self, key: ObjectKey) {
@@ -3652,17 +3703,6 @@ impl PinnedObjects {
             claims.remove(&ids);
         }
         if !ids.is_empty() {
-            self.ambiguous_keys.insert(key);
-        }
-    }
-
-    /// Records another member of a group that is already known only as rejected.
-    /// The first unavailable observation establishes fail-closed state; the second
-    /// establishes the finite collision-group ambiguity, once per raw key.
-    fn reject_observation(&mut self, key: ObjectKey) {
-        let repeated = self.rejected_keys.contains(&key);
-        self.reject_key(key);
-        if repeated {
             self.ambiguous_keys.insert(key);
         }
     }
@@ -4180,6 +4220,7 @@ mod conservative_copy {
         Ownership,
         RawOwnership,
         Rejected,
+        ProvenCollision,
         Ambiguous,
         Published,
         ApplyRejected,
@@ -4448,6 +4489,10 @@ mod conservative_copy {
                         .checked_add(selection.rejected.len())
                         .ok_or(GraphRefusal::Overflow)?,
                 )?,
+            )?;
+            add(
+                &mut total,
+                tree::<ObjectKey, ()>(source.proven_collision_keys.len())?,
             )?;
             add(&mut total, tree::<ObjectKey, ()>(keys)?)?;
             add(
@@ -4771,6 +4816,7 @@ mod conservative_copy {
         ) -> Result<(), GraphRefusal> {
             let original = match self.phase {
                 Phase::Rejected => &source.rejected_keys,
+                Phase::ProvenCollision => &source.proven_collision_keys,
                 Phase::Ambiguous => &source.ambiguous_keys,
                 Phase::Published => &source.ambiguity_published,
                 Phase::ApplyRejected => &selection.rejected,
@@ -4781,6 +4827,9 @@ mod conservative_copy {
                 match self.phase {
                     Phase::Rejected | Phase::ApplyRejected => {
                         self.output_mut()?.rejected_keys.insert(key);
+                    }
+                    Phase::ProvenCollision => {
+                        self.output_mut()?.proven_collision_keys.insert(key);
                     }
                     Phase::Ambiguous => {
                         self.output_mut()?.ambiguous_keys.insert(key);
@@ -4795,7 +4844,8 @@ mod conservative_copy {
                 }
             } else {
                 self.next_phase(match self.phase {
-                    Phase::Rejected => Phase::Ambiguous,
+                    Phase::Rejected => Phase::ProvenCollision,
+                    Phase::ProvenCollision => Phase::Ambiguous,
                     Phase::Ambiguous => Phase::Published,
                     Phase::Published => Phase::ApplyRejected,
                     _ => Phase::Publish,
@@ -5011,9 +5061,11 @@ mod conservative_copy {
                 Phase::RawMap => self.advance_raw_output(source, selection, reserve, false)?,
                 Phase::Ownership => self.advance_ownership(source, selection)?,
                 Phase::RawOwnership => self.advance_raw_output(source, selection, reserve, true)?,
-                Phase::Rejected | Phase::Ambiguous | Phase::Published | Phase::ApplyRejected => {
-                    self.advance_sets(source, selection)?
-                }
+                Phase::Rejected
+                | Phase::ProvenCollision
+                | Phase::Ambiguous
+                | Phase::Published
+                | Phase::ApplyRejected => self.advance_sets(source, selection)?,
                 Phase::Publish => {
                     let next = next_set(
                         &self
@@ -10128,10 +10180,10 @@ fn record_scanned_candidate(
                 pinned.raw_ownership.entry(view).or_default().insert(raw);
             }
         }
-        // Handle-class waits keep the wait arm exactly as before.
-        // (1a behavior preservation: budget/deadline/clock waits
-        // below keep today's refusal routing; 1b routes every `Wait`
-        // through the wait arm and drops the split.)
+        // Handle-class waits keep the wait arm exactly as before:
+        // the open waits for the next tick with the whole view. Every
+        // other outcome files its own named skip below; no outcome
+        // here rejects the key.
         Err(PinOutcome::Wait { cause, reason, .. })
             if matches!(
                 cause,
@@ -10155,15 +10207,12 @@ fn record_scanned_candidate(
             });
         }
         Err(outcome) => {
-            // A missing mapping identity or digest makes every equal raw-key
-            // observation incomparable. Remember the failed member so a candidate
-            // from another process view cannot become receiver-wins authority.
-            // A pre-copy-up failure refuses only itself: its proof stands on
-            // its own file, so it never nukes the key — and neither does a
-            // plain failure while a proven pre observation is kept.
-            if !raw.pre_copy_up && !pinned.has_pre_copy_up_for_key(raw.key) {
-                pinned.reject_observation(raw.key);
-            }
+            // An unproven observation files a named skip for its view
+            // and never rejects the key: only a proven collision (two
+            // proven entries contradicting at insert) fails a key
+            // closed. The failed view binds nothing — the proof fence
+            // in `id_for_scanned` refuses it — while proven peers keep
+            // counting. Skip shapes stay exactly as before.
             skipped.push(Skipped {
                 subject: raw.path,
                 reason: outcome.reason().to_string(),
@@ -13452,7 +13501,7 @@ mod tests {
         assert!(!one.same_pin_content(&fewer), "a missing pin is content");
 
         let mut rejected = pin_set(&[(overlay(102), SHA, 7), (overlay(104), SHA, 9)], false);
-        rejected.reject_observation(overlay(102));
+        rejected.reject_key(overlay(102));
         assert!(
             !one.same_pin_content(&rejected),
             "a rejected key is content"
@@ -13646,7 +13695,7 @@ mod tests {
                 }
                 3 => {
                     let mut m = pin_set(&refs, false);
-                    m.reject_observation(refs[0].0);
+                    m.reject_key(refs[0].0);
                     m
                 }
                 _ => {
@@ -16713,7 +16762,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unavailable_identity_rejects_its_whole_raw_key_group() {
+    /// Controller ruling 11:38 (1): an unavailable pin failure never
+    /// rejects a key group that already has a proven pin. The failed
+    /// observation files its named skip; the proven peer stays pinned
+    /// and admitted, with no ambiguity (ambiguity needs a proven
+    /// collision).
+    fn an_unavailable_identity_keeps_its_proven_peer_and_files_a_named_skip() {
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -16760,23 +16814,37 @@ mod tests {
             }
             assert_eq!(
                 pinned.pinned().count(),
-                0,
-                "an unavailable group member left an attachable candidate"
+                1,
+                "the proven peer survives the unavailable observation"
+            );
+            assert!(
+                !pinned.rejects(key),
+                "the key stays admitted without a proven collision"
             );
             let mut aggregate = PinnedObjects::empty();
             skipped.extend(aggregate.absorb(pinned));
-            assert_eq!(aggregate.pinned().count(), 0);
+            assert_eq!(aggregate.pinned().count(), 1);
             assert!(
                 skipped
                     .iter()
-                    .any(|skip| skip.reason.contains("physical identity is ambiguous")),
-                "the rejected collision group needs bounded ambiguity evidence: {skipped:?}"
+                    .any(|skip| skip.reason.contains("mapping identity unavailable")),
+                "the failed observation keeps its named skip: {skipped:?}"
+            );
+            assert!(
+                skipped
+                    .iter()
+                    .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
+                "no ambiguity without a proven collision: {skipped:?}"
             );
         }
     }
 
     #[test]
-    fn two_unavailable_same_key_observations_emit_one_bounded_ambiguity() {
+    /// Controller ruling 11:38 (1): unavailable observations never
+    /// reject, so a repeated unavailable member emits no ambiguity
+    /// category — only proven collisions do. Both views keep their
+    /// named skips and the key stays admitted.
+    fn two_unavailable_same_key_observations_file_named_skips_without_ambiguity() {
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -16811,24 +16879,24 @@ mod tests {
         }
 
         assert_eq!(aggregate.pinned().count(), 0);
-        let ambiguity: Vec<_> = skipped
-            .iter()
-            .filter(|skip| skip.reason.contains("physical identity is ambiguous"))
-            .collect();
-        assert_eq!(
-            ambiguity.len(),
-            1,
-            "the second unavailable member must emit exactly one collision category: {skipped:?}"
+        assert!(
+            !aggregate.rejects(key),
+            "the key stays admitted without a proven collision"
         );
-        let public = crate::render::capture_skipped_out(ambiguity[0]);
-        let rendered = serde_json::to_string(&public).unwrap();
-        assert_eq!(
-            public.reason,
-            "physical identity is ambiguous; the collision group was not attached"
-        );
-        for private in ["/private/", "ROUND1_UNAVAILABLE_ERROR", "view-1", "view-2"] {
-            assert!(!rendered.contains(private), "leaked {private}: {rendered}");
+        for view in 1..=2 {
+            assert!(
+                skipped.iter().any(|skip| skip
+                    .reason
+                    .contains(&format!("ROUND1_UNAVAILABLE_ERROR_{view}"))),
+                "view {view} keeps its named skip: {skipped:?}"
+            );
         }
+        assert!(
+            skipped
+                .iter()
+                .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
+            "no ambiguity without a proven collision: {skipped:?}"
+        );
     }
 
     /// Re-exec channel for the self-chrooting pin fixture below. The parent
@@ -18145,7 +18213,10 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_rejection_plus_a_later_local_collision_publishes_once() {
+    /// Controller ruling 11:38 (1): unavailable observations never
+    /// reject, so later local ones publish no ambiguity category —
+    /// only proven collisions do.
+    fn unavailable_observations_across_aggregate_and_local_publish_no_ambiguity() {
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -18164,15 +18235,22 @@ mod tests {
         skipped.extend(aggregate.absorb(later));
 
         assert_eq!(aggregate.pinned().count(), 0);
+        assert!(
+            !aggregate.rejects(key),
+            "the key stays admitted without a proven collision"
+        );
         assert_eq!(
             ambiguity_count(&skipped),
-            1,
-            "a local collision must not publish separately from the aggregate: {skipped:?}"
+            0,
+            "no ambiguity without a proven collision: {skipped:?}"
         );
     }
 
     #[test]
-    fn separate_later_view_collisions_publish_once_for_the_capture() {
+    /// Controller ruling 11:38 (1): unavailable observations never
+    /// reject, so later per-view ones publish no capture-wide
+    /// ambiguity category — only proven collisions do.
+    fn unavailable_observations_from_later_views_publish_no_capture_wide_ambiguity() {
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -18187,15 +18265,22 @@ mod tests {
         }
 
         assert_eq!(aggregate.pinned().count(), 0);
+        assert!(
+            !aggregate.rejects(key),
+            "the key stays admitted without a proven collision"
+        );
         assert_eq!(
             ambiguity_count(&skipped),
-            1,
-            "each per-view set must not publish the capture-wide category: {skipped:?}"
+            0,
+            "no ambiguity without a proven collision: {skipped:?}"
         );
     }
 
     #[test]
-    fn distinct_unavailable_collision_keys_each_publish_once() {
+    /// Controller ruling 11:38 (1): unavailable observations never
+    /// reject, so distinct keys with unavailable members publish no
+    /// ambiguity categories — only proven collisions do.
+    fn unavailable_observations_on_distinct_keys_publish_no_ambiguity() {
         let first = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,
@@ -18212,7 +18297,73 @@ mod tests {
             skipped.extend(aggregate.absorb(local));
         }
 
-        assert_eq!(ambiguity_count(&skipped), 2, "{skipped:?}");
+        assert!(
+            !aggregate.rejects(first) && !aggregate.rejects(second),
+            "both keys stay admitted without a proven collision"
+        );
+        assert_eq!(
+            ambiguity_count(&skipped),
+            0,
+            "no ambiguity without a proven collision: {skipped:?}"
+        );
+    }
+
+    /// A proven collision — two proven entries contradicting under one
+    /// raw key — still rejects the key globally with exactly one
+    /// bounded ambiguity row, even across a retained plain pin, and
+    /// never publishes it twice.
+    #[test]
+    fn proven_collisions_publish_bounded_ambiguity_once() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // The fresh side contradicts itself: same digest, two files.
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &backing_file(&dir, "first.so"));
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &backing_file(&dir, "second.so"));
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+        let mut fresh_skipped = first.absorb(second);
+        assert!(first.rejects(key), "the fresh collision rejects its key");
+        assert_eq!(first.pinned().count(), 0);
+        assert_eq!(ambiguity_count(&fresh_skipped), 1, "{fresh_skipped:?}");
+
+        // The retained plain pin does not suppress the proven
+        // collision when the fresh side merges under it.
+        let mut retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut retained, &backing_file(&dir, "retained.so"));
+        let mut merged_skipped = retained.absorb(first);
+        assert!(retained.rejects(key), "the proven collision replays");
+        assert_eq!(retained.pinned().count(), 0);
+        assert!(
+            retained.sweep_match_keys().get(&key).is_none(),
+            "a rejected key never matches"
+        );
+
+        // Exactly one ambiguity row across every merge, with the
+        // fixed public text and no private content.
+        fresh_skipped.append(&mut merged_skipped);
+        let ambiguity: Vec<_> = fresh_skipped
+            .iter()
+            .filter(|skip| skip.reason.contains("physical identity is ambiguous"))
+            .collect();
+        assert_eq!(ambiguity.len(), 1, "{fresh_skipped:?}");
+        let public = crate::render::capture_skipped_out(ambiguity[0]);
+        assert_eq!(
+            public.reason,
+            "physical identity is ambiguous; the collision group was not attached"
+        );
+
+        // A second merge publishes nothing again.
+        let again = retained.absorb(PinnedObjects::empty());
+        assert!(
+            again
+                .iter()
+                .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
+            "no second ambiguity row: {again:?}"
+        );
     }
 
     #[test]
@@ -19795,6 +19946,7 @@ mod tests {
     fn assert_conservative_value(expected: &PinnedObjects, actual: &PinnedObjects) {
         assert_eq!(actual.raw_to_id, expected.raw_to_id);
         assert_eq!(actual.rejected_keys, expected.rejected_keys);
+        assert_eq!(actual.proven_collision_keys, expected.proven_collision_keys);
         assert_eq!(actual.ambiguous_keys, expected.ambiguous_keys);
         assert_eq!(actual.ambiguity_published, expected.ambiguity_published);
         assert_eq!(actual.ownership, expected.ownership);
@@ -21227,7 +21379,7 @@ mod tests {
         use crate::semantics_edge::resources::SemanticResourcePool;
         for cancel in [false, true] {
             let (_dir, mut source, raw) = conservative_cursor_fixture();
-            source.reject_observation(raw[2].key);
+            source.reject_key(raw[2].key);
             let mut negative = raw[0].clone();
             negative.tables[0].entries.clear();
             for ordinal in 0..64 {

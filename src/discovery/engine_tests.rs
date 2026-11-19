@@ -37229,6 +37229,7 @@ fn clean_deferral_pair(fixture: &LoaderPlanningFixture) -> (Engine, Engine) {
         assert!(base_pins.absorb(step).is_empty());
         raw.push(module);
     }
+    own_all_raws(&mut base_pins);
     // Synthetic entries use fake offsets; prove them so strict live binds
     // keep working for engine-logic tests.
     base_pins.prove_scanned_entries_for_test(&raw);

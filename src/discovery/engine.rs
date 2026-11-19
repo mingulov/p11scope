@@ -23232,13 +23232,19 @@ impl Engine {
         // reason (no schema change) and keep the stored module
         // intact. A missing digest proves no change (production
         // pins always carry one), so only a proven mismatch refuses.
+        // The committed side is the run's learned state, owned under
+        // the reserved run-learned view — not the new prover's view,
+        // which never committed. Query as the alias owner so the
+        // per-view proof fence resolves the learned digest.
+        let mut learned_query = proof.module.clone();
+        learned_query.view = Self::RUN_LEARNED_VIEW_ID;
         let generation_changed = pins
             .summary(proof.object)
             .map(|summary| summary.sha256)
             .filter(|digest| !digest.is_empty())
             .zip(
                 self.pinned
-                    .id_for_scanned(&proof.module, proof.module.key, &proof.module.path)
+                    .id_for_scanned(&learned_query, learned_query.key, &learned_query.path)
                     .and_then(|id| self.pinned.summary(id))
                     .map(|summary| summary.sha256)
                     .filter(|digest| !digest.is_empty()),

@@ -2018,10 +2018,15 @@ fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_sil
         "premise: the renewed cover shares the retired slot's module"
     );
     let fresh_index = candidate.delta.new[0].index;
+    let retired_index = engine.plan.slots[0].index;
+    let fresh_slot = candidate.delta.new[0].clone();
     let mut session = ScriptedSession::default();
     session
         .scripted_stamps
         .insert(engine.plan.slots[0].index, 1);
+    // Fresh attaches stamp + link like the real session's per-slot
+    // completion (2 keeps the fresh stamp distinct from the old one).
+    session.stamp_attached_slots = Some(2);
     let mut additions = true;
     let outcome = engine
         .apply_candidate(&mut session, candidate, &mut additions, false, &[])
@@ -2033,6 +2038,31 @@ fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_sil
     assert!(
         engine.plan.is_active(fresh_index),
         "premise: the renewed endpoint re-attached"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| slots == &vec![retired_index]),
+        "premise: the old slot detached exactly: {:?}",
+        session.detached_slot_indices
+    );
+    assert_eq!(
+        session.attached_requests,
+        vec![vec![(
+            fresh_slot.index,
+            fresh_slot.object,
+            fresh_slot.file_offset
+        )]],
+        "premise: the fresh attachment was submitted exactly once"
+    );
+    assert!(
+        session.slot_attached_at(fresh_index).is_some(),
+        "premise: the fresh attach completed with a Session stamp"
+    );
+    assert!(
+        session.has_slot_link(fresh_index),
+        "premise: the fresh attach installed a Session link"
     );
     assert!(
         engine.coverage_retire_windows.is_empty(),

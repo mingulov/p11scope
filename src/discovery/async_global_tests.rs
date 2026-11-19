@@ -1615,6 +1615,129 @@ fn async_global_revived_module_closes_its_coverage_window() {
     );
 }
 
+/// A shared window over two retired modules stays open while only one
+/// re-attaches: closing on the first revival would end the window on
+/// the still-dark module's record, silently un-disclosing its tail
+/// loss. Only the second revival closes it.
+#[test]
+fn async_global_partial_revive_keeps_the_shared_coverage_window_open() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut session = ScriptedSession::default();
+    let peer = peer_candidate(&mut engine, &modules);
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, peer, &mut additions, false, &[])
+        .unwrap();
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "premise: both providers hold a slot"
+    );
+    let first = engine.plan.slots[0].index;
+    let second = engine.plan.slots[1].index;
+    session.scripted_stamps.insert(first, 1);
+    session.scripted_stamps.insert(second, 1);
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+    let mut retire = engine
+        .live_candidate(pins, modules.to_vec(), skipped)
+        .expect("the intact pins offer a candidate");
+    assert!(
+        retire.delta.new.is_empty() && retire.delta.replace.is_empty(),
+        "premise: nothing is left to attach"
+    );
+    retire.delta.retire.push(engine.plan.slots[0].clone());
+    retire.delta.retire.push(engine.plan.slots[1].clone());
+    retire.plan.deactivate(first);
+    retire.plan.deactivate(second);
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, retire, &mut additions, false, &[])
+        .unwrap();
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "premise: one window covers both retired modules"
+    );
+    assert_eq!(engine.coverage_retire_windows[0].modules.len(), 2);
+    assert_eq!(engine.coverage_retired_slots(), 2);
+    let one_mods: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+    let mut partial = engine
+        .live_candidate(pins, modules.to_vec(), skipped)
+        .expect("the intact pins offer a revive candidate");
+    assert_eq!(
+        partial.delta.new.len(),
+        2,
+        "premise: the revive re-attaches both modules"
+    );
+    // A revival allocates fresh slot positions; partition by module,
+    // not by the retired positions.
+    let (keep, drop): (Vec<_>, Vec<_>) = partial
+        .delta
+        .new
+        .iter()
+        .cloned()
+        .partition(|slot| slot.module_ids.iter().any(|id| one_mods.contains(id)));
+    assert_eq!(keep.len(), 1, "premise: one new slot covers module one");
+    assert_eq!(drop.len(), 1, "premise: one new slot covers module two");
+    partial.delta.new = keep;
+    for slot in &drop {
+        partial.plan.deactivate(slot.index);
+    }
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, partial, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        outcome.accepted(),
+        "premise: the partial revive commits (detach_failed={} changed={})",
+        outcome.detach_failed,
+        outcome.changed,
+    );
+    let live_mods: std::collections::BTreeSet<crate::plan::ModuleId> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| engine.plan.is_active(slot.index))
+        .flat_map(|slot| slot.module_ids.iter().copied())
+        .collect();
+    assert!(
+        one_mods.iter().all(|id| live_mods.contains(id)),
+        "premise: module one revived: {live_mods:?}"
+    );
+    assert!(
+        engine.coverage_retire_windows[0]
+            .modules
+            .iter()
+            .any(|id| !live_mods.contains(id)),
+        "premise: a windowed module stayed dark: {live_mods:?}"
+    );
+    assert_eq!(
+        engine.coverage_retire_windows[0].end_ns, None,
+        "the partial revival leaves the shared window open"
+    );
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+    let full = engine
+        .live_candidate(pins, modules.to_vec(), skipped)
+        .expect("the intact pins offer the second revive");
+    let mut additions = true;
+    engine
+        .apply_candidate(&mut session, full, &mut additions, false, &[])
+        .unwrap();
+    let window = &engine.coverage_retire_windows[0];
+    let end = window
+        .end_ns
+        .expect("the full revival stamps the window end");
+    assert!(
+        end >= window.start_ns,
+        "the closed window keeps sane bounds"
+    );
+}
+
 /// Retiring plan-active cover the session never attached opens no
 /// coverage window: probes that never installed observed no calls,
 /// so the detach loses nothing (a rejected key's slots, a

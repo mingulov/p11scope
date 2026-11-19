@@ -20663,6 +20663,47 @@ mod tests {
     }
 
     #[test]
+    fn scanned_rebind_cursor_denies_carried_views_but_reconciles_their_rows() {
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        let (_dir, mut source, raw) = conservative_cursor_fixture();
+        // Shape view 1 as carried: its row rides (the shared provider-0
+        // pin stays resolvable through view 2's co-ownership) but it owns
+        // no claims — the terminal input shape for a retired view.
+        source.drop_view_claims(ProcessViewId(1));
+        assert!(source.view_claims(ProcessViewId(1)).is_none());
+        let pool = SemanticResourcePool::default();
+        let reserve = pool.reserver();
+        let selection = conservative_selection(&pool, BTreeSet::new(), BTreeSet::new());
+        let mut pins = PinnedConservativeCursor::new();
+        finish_conservative_copy(&source, &mut pins, &selection, &reserve);
+        let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
+        let mut rebind = ScannedRebindCursor::new();
+        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        let modules = rebind
+            .modules()
+            .expect("the carried row still reaches structural readiness");
+        assert_eq!(
+            modules.len(),
+            raw.len(),
+            "every row reconciles, carried included"
+        );
+        assert!(
+            pins.reference_rebind_claims_for_test(ProcessViewId(1))
+                .is_none(),
+            "the carried view files no terminal claims"
+        );
+        for view in [ProcessViewId(2), ProcessViewId(3)] {
+            let claims = pins
+                .reference_rebind_claims_for_test(view)
+                .unwrap_or_else(|| panic!("the live view keeps its terminal claims: {view:?}"));
+            assert!(
+                !claims.tables.is_empty() && !claims.pins.is_empty(),
+                "the live view's terminal claims still name its objects: {view:?}"
+            );
+        }
+    }
+
+    #[test]
     fn scanned_rebind_cursor_refuses_unverified_forward_like_original_binding() {
         use crate::semantics_edge::resources::SemanticResourcePool;
         const VERIFIED_OFFSET: u64 = 0xebe0;

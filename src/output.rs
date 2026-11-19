@@ -4733,6 +4733,12 @@ mod tests {
     #[test]
     fn foreign_recovery_base_falls_back_to_a_fresh_sibling() {
         use std::os::unix::fs::MetadataExt as _;
+        // Serialize the recovery-override env read below against
+        // concurrent override holders; without the lock the `set_var`
+        // safety comment would not hold for this reader.
+        let _lock = RECOVERED_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let plant = private_tempdir();
         let file_base = plant.path().join("p11scope-recovered-file");
         std::fs::write(&file_base, b"not a directory").unwrap();
@@ -4815,6 +4821,11 @@ mod tests {
     /// failed fallback instead of a bare refusal.
     #[test]
     fn recovery_fallback_failure_reports_both_errors() {
+        // Serialize the recovery-override env read below against
+        // concurrent override holders (see the sibling fallback test).
+        let _lock = RECOVERED_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let plant = private_tempdir();
         let base = plant.path().join("p11scope-recovered");
         std::fs::set_permissions(plant.path(), std::fs::Permissions::from_mode(0o555)).unwrap();

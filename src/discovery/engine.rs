@@ -19722,19 +19722,19 @@ impl Engine {
         // opens its window here, before any later early return can skip
         // it. Revivals close at the end of their own apply; anything
         // still open reads open-ended at capture end.
-        if detach_slots_outcome.is_ok() {
-            if let Some((modules, slots, start_ns)) = retire_hook {
-                self.coverage_retire_windows.push(CoverageRetireWindow {
-                    modules,
-                    start_ns,
-                    end_ns: None,
-                    slots,
-                });
-                self.mark_partial(
-                    crate::render::COVERAGE_RETIRED_SUBJECT,
-                    crate::render::COVERAGE_RETIRED_REASON,
-                );
-            }
+        if detach_slots_outcome.is_ok()
+            && let Some((modules, slots, start_ns)) = retire_hook
+        {
+            self.coverage_retire_windows.push(CoverageRetireWindow {
+                modules,
+                start_ns,
+                end_ns: None,
+                slots,
+            });
+            self.mark_partial(
+                crate::render::COVERAGE_RETIRED_SUBJECT,
+                crate::render::COVERAGE_RETIRED_REASON,
+            );
         }
         self.sync_physical_gap(session);
         self.stage_timings.span(

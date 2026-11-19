@@ -13640,6 +13640,9 @@ pub(crate) mod tests {
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             ));
             assert!(absorbed.is_empty(), "distinct keys absorb cleanly");
+            // Production scan pins file ownership with the entry; the
+            // twin rows below re-bind through it.
+            test_fixture::record_scan_ownership(&mut pins, id, key, &shared_path_text);
             keys.push((key, id));
         }
         let scanned: Vec<crate::discovery::scan::ScannedModule> = keys

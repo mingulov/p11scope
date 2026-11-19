@@ -17,9 +17,9 @@ mod inventory_claims;
 mod tabled_readiness;
 use crate::discovery::identity::test_fixture::{
     PATH as OVERLAY_PATH, SHA as OVERLAY_SHA, backing_file as overlay_backing_file,
-    module as overlay_module, overlay as overlay_key, pins as overlay_pins,
-    real_scan_pin as overlay_real_scan_pin, reback as overlay_reback, record_scan_ownership,
-    view_pin as overlay_view_pin,
+    module as overlay_module, overlay as overlay_key, own_all_raws, own_all_raws_under,
+    pins as overlay_pins, real_scan_pin as overlay_real_scan_pin, reback as overlay_reback,
+    record_scan_ownership, view_pin as overlay_view_pin,
 };
 use crate::discovery::identity::{
     ManifestStaleReason, PinnedObjectId, ReconciledModule, open_view_object, pin_manifest_objects,
@@ -991,6 +991,7 @@ fn typed_prearm_attach_unavailability_is_the_only_fallback() {
 fn engine_with_overlay(minor: u64) -> (Engine, ScannedModule, PinnedObjectId, PinnedTimingKey) {
     let module = overlay_module(overlay_key(minor));
     let mut pins = overlay_pins(&[(module.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     // Synthetic entries use fake offsets; prove them so strict live binds
     // keep working for engine-logic tests (default bind ignores proofs).
     pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
@@ -1271,8 +1272,14 @@ fn retire_prunes_vanished_owners_and_retires_orphaned_dependency_slots() {
         file_offset: 0x2000,
     });
     let mut pins = overlay_view_pin(&raw_a, 999, OVERLAY_SHA, 1, true);
-    let absorb_skips = pins.absorb(overlay_view_pin(&raw_b, 1000, OVERLAY_SHA, 1, true));
+    let mut pins_b = overlay_view_pin(&raw_b, 1000, OVERLAY_SHA, 1, true);
+    own_all_raws(&mut pins);
+    own_all_raws(&mut pins_b);
+    let absorb_skips = pins.absorb(pins_b);
     assert!(absorb_skips.is_empty(), "{absorb_skips:?}");
+    // View B's table references view A's file: its scan pins the entry
+    // object too, so both views own the shared raw.
+    own_all_raws_under(&mut pins, raw_b.view);
     let (modules_a, skipped_a) = bind_scanned_modules(std::slice::from_ref(&raw_a), &mut pins);
     assert!(skipped_a.is_empty(), "{skipped_a:?}");
     let (modules_b, skipped_b) = bind_scanned_modules(std::slice::from_ref(&raw_b), &mut pins);
@@ -2026,6 +2033,7 @@ fn capture_facts_keep_all_decoded_occurrences_for_a_capacity_refusal() {
         })
         .collect();
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let mut engine = Engine::empty();
@@ -3443,6 +3451,7 @@ fn shared_scope_capture_starts_when_every_module_is_refused() {
     raw.tables[0].entries =
         overlay_entries(&raw, first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let mut tombstones = BTreeSet::new();
@@ -3496,7 +3505,8 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
     // No interface links any table: nothing is published, every table is
     // an unresolved lookalike.
     closure.interfaces.clear();
-    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let mut engine = Engine::empty();
     engine.pinned = pins;
     let (modules, skipped) =
@@ -3552,7 +3562,9 @@ fn named_capture_starts_beside_an_unpublished_closure_alone() {
     let mut provider = overlay_module(overlay_key(58));
     provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
     let mut candidate_pins = engine.pinned.clone();
-    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let mut provider_pins = overlay_pins(&[(provider.key, "c3a91d07", 1)]);
+    own_all_raws(&mut provider_pins);
+    let skipped = candidate_pins.absorb(provider_pins);
     candidate_pins.prove_scanned_entries_for_test(&[closure.clone(), provider.clone()]);
     let candidate = engine
         .live_candidate(
@@ -3626,10 +3638,10 @@ fn named_capture_startup_twins_beside_an_unpublished_closure() {
         first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
     );
     let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
-    assert!(
-        pins.absorb(overlay_pins(&[(oversized.key, "c3a91d07", 1)]))
-            .is_empty()
-    );
+    let mut oversized_pins = overlay_pins(&[(oversized.key, "c3a91d07", 1)]);
+    own_all_raws(&mut pins);
+    own_all_raws(&mut oversized_pins);
+    assert!(pins.absorb(oversized_pins).is_empty());
     let (modules, skipped) = bind_scanned_modules(&[oversized, closure], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let error = build(&modules, &pins).expect_err("a real capacity refusal leaves nothing");
@@ -3739,6 +3751,7 @@ fn engine_admitting_overlay(minor: u64, admitted: u32) -> (Engine, ScannedModule
     let mut raw = overlay_module(overlay_key(minor));
     raw.tables[0].entries = overlay_entries(&raw, first_offsets(admitted));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     // Synthetic entries use fake offsets; prove them so strict live binds
     // keep working for engine-logic tests.
     pins.prove_scanned_entries_for_test(std::slice::from_ref(&raw));
@@ -3850,6 +3863,7 @@ fn merge_assigns_occurrence_indices_in_sorted_key_order() {
     };
     raw.tables[0].entries = vec![entry(8), entry(0), entry(8)];
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let mut engine = Engine::empty();
@@ -4486,6 +4500,7 @@ fn a_later_provider_prefix_replaces_the_earlier_whole_refusal() {
             .map(|scan| (scan.key, OVERLAY_SHA, 1))
             .collect();
         let mut pins = overlay_pins(&entries);
+        own_all_raws(&mut pins);
         let (modules, skipped) = bind_scanned_modules(scans, &mut pins);
         assert!(skipped.is_empty(), "{skipped:?}");
         let plan = plan::build_from_sources_scoped(
@@ -4577,7 +4592,8 @@ fn capacity_lowering_and_growth_omission_keep_separate_high_water_marks() {
     use plan::AdmissionScope;
     let a_key = overlay_key(66);
     let filler_key = overlay_key(67);
-    let pins = overlay_pins(&[(a_key, OVERLAY_SHA, 1), (filler_key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(a_key, OVERLAY_SHA, 1), (filler_key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let pristine_a = overlay_module(a_key);
     let pristine_filler = overlay_module(filler_key);
     let a_obj = pins
@@ -4924,7 +4940,8 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
     let mut closure = published_source.clone();
     // Nothing published: every table is an unresolved lookalike.
     closure.interfaces.clear();
-    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let mut engine = Engine::empty();
     engine.pinned = pins;
     let (modules, skipped) =
@@ -4987,7 +5004,9 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
         interface.table = Some(60 + index);
     }
     let mut candidate_pins = engine.pinned.clone();
-    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let mut provider_pins = overlay_pins(&[(provider.key, "c3a91d07", 1)]);
+    own_all_raws(&mut provider_pins);
+    let skipped = candidate_pins.absorb(provider_pins);
     candidate_pins.prove_scanned_entries_for_test(&[published.clone(), provider.clone()]);
     let candidate = engine
         .live_candidate(
@@ -5086,7 +5105,8 @@ fn awaiting_seed_decision_survives_a_gap_rewording() {
     let published_source = p11kit_like_64_table_module();
     let mut closure = published_source.clone();
     closure.interfaces.clear();
-    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let mut engine = Engine::empty();
     let mut candidate = engine
         .live_candidate(pins, vec![closure.clone()], Vec::new())
@@ -5206,6 +5226,7 @@ fn capacity_refused_provider_seed_without_owner_stays_incomplete() {
         first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
     );
     let mut pins = overlay_pins(&[(provider.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     pins.prove_scanned_entries_for_test(std::slice::from_ref(&provider));
     let mut engine = Engine::empty();
     let candidate = engine
@@ -5273,6 +5294,7 @@ fn unpublished_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
     let mut closure = published_source.clone();
     closure.interfaces.clear();
     let mut pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     pins.prove_scanned_entries_for_test(std::slice::from_ref(&closure));
     let mut engine = Engine::empty();
     let candidate = engine
@@ -5322,7 +5344,10 @@ fn refused_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
     }
     let mut engine = Engine::empty();
     let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
-    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let mut provider_pins = overlay_pins(&[(provider.key, "c3a91d07", 1)]);
+    own_all_raws(&mut candidate_pins);
+    own_all_raws(&mut provider_pins);
+    let skipped = candidate_pins.absorb(provider_pins);
     candidate_pins.prove_scanned_entries_for_test(&[published.clone(), provider.clone()]);
     let candidate = engine
         .live_candidate(candidate_pins, vec![published, provider], skipped)
@@ -5522,7 +5547,9 @@ fn live_overlay_peer_keeps_one_stable_slot_without_new_attach_work() {
     let (mut engine, first, original, _) = engine_with_overlay(104);
     let second = overlay_module(overlay_key(102));
     let mut candidate_pins = engine.pinned.clone();
-    let skipped = candidate_pins.absorb(overlay_pins(&[(second.key, OVERLAY_SHA, 1)]));
+    let mut second_pins = overlay_pins(&[(second.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut second_pins);
+    let skipped = candidate_pins.absorb(second_pins);
     candidate_pins.prove_scanned_entries_for_test(&[first.clone(), second.clone()]);
 
     let candidate = engine
@@ -5560,6 +5587,7 @@ fn same_key_overlay_uncertainty_keeps_causal_timing_null() {
     let dir = tempfile::tempdir().unwrap();
     let mut incoming = overlay_view_pin(&module, 999, OVERLAY_SHA, 1, true);
     overlay_reback(&mut incoming, &overlay_backing_file(&dir, "peer.so"));
+    own_all_raws(&mut incoming);
     let incoming_object = incoming
         .id_for_scanned(&module, module.key, &module.path)
         .unwrap();
@@ -18508,7 +18536,8 @@ fn loader_counts_deduplicate_replaced_context_by_stable_bound_tuple() {
 
     let view = ProcessViewId(5);
     let module = overlay_module(overlay_key(105));
-    let pins = overlay_pins(&[(module.key, OVERLAY_SHA, 1)]);
+    let mut pins = overlay_pins(&[(module.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let loader = pins
         .id_for_scanned(&module, module.key, &module.path)
         .unwrap();
@@ -21907,6 +21936,7 @@ fn learn_owned_proofs_persists_decoded_tables_for_live_candidates() {
     let backing = dir.path().join("libgetteronly.so");
     std::fs::write(&backing, "p11scope-fixture:getter-only-provider-bytes").expect("write backing");
     let mut pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    own_all_raws(&mut pins);
     let pin = pins.pinned().next().expect("one pin");
     let key = pin.key;
     let object = pin.id;
@@ -22520,6 +22550,7 @@ fn live_candidate_refuses_unproven_learned_entries_before_attach_in_host_wide_sc
     let backing = dir.path().join("libgetteronly.so");
     std::fs::write(&backing, "p11scope-fixture:getter-only-provider-bytes").expect("write backing");
     let mut pins = real_scan_pin(&backing, None, 400, &"ef".repeat(32));
+    own_all_raws(&mut pins);
     let pin = pins.pinned().next().expect("one pin");
     let key = pin.key;
     let object = pin.id;
@@ -22662,6 +22693,8 @@ fn run_learned_harvest_refuses_tables_from_a_new_file_generation() {
     // digest, and new tables that must never join the old module.
     let backing = dir.path().join("libgetteronly.so");
     let mut pins = real_scan_pin(&backing, None, 400, &"ab".repeat(32));
+    // The new generation's scan owns its raw under the proving view.
+    own_all_raws_under(&mut pins, ProcessViewId(11));
     let pin = pins.pinned().next().expect("one pin");
     assert_eq!(pin.key, key, "the generations share the union key");
     let mut module = fixture_module(key);
@@ -29765,7 +29798,9 @@ fn seed_for_unadmitted_closure_skips_the_owner_check() {
     let mut closure = p11kit_like_64_table_module();
     closure.interfaces.clear();
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut seed_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut seed_pins);
+    engine.pinned = seed_pins;
     let (modules, skipped) =
         bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -29815,7 +29850,10 @@ fn seed_for_admitted_provider_keeps_the_owner_check() {
     provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
     let mut engine = Engine::empty();
     let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
-    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let mut provider_pins = overlay_pins(&[(provider.key, "c3a91d07", 1)]);
+    own_all_raws(&mut candidate_pins);
+    own_all_raws(&mut provider_pins);
+    let skipped = candidate_pins.absorb(provider_pins);
     let candidate = engine
         .live_candidate(
             candidate_pins,
@@ -29853,7 +29891,9 @@ fn seed_for_unknown_or_refused_object_keeps_the_owner_check() {
     let mut closure = p11kit_like_64_table_module();
     closure.interfaces.clear();
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut seed_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut seed_pins);
+    engine.pinned = seed_pins;
     let (modules, skipped) =
         bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -29934,7 +29974,9 @@ fn seed_loop_skips_an_unadmitted_closure_seed_benignly() {
     let mut closure = p11kit_like_64_table_module();
     closure.interfaces.clear();
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut seed_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut seed_pins);
+    engine.pinned = seed_pins;
     let (modules, skipped) =
         bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -29985,7 +30027,9 @@ fn seed_loop_still_fails_a_non_closure_seed_without_an_owner() {
     let mut closure = p11kit_like_64_table_module();
     closure.interfaces.clear();
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut seed_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut seed_pins);
+    engine.pinned = seed_pins;
     let (modules, skipped) =
         bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -31665,7 +31709,9 @@ fn live_extension_at_capacity_refuses_a_whole_new_module_without_aborting() {
     };
     let new = with_endpoints(overlay_module(overlay_key(71)), 101);
     let mut pins = engine.pinned.clone();
-    let skipped = pins.absorb(overlay_pins(&[(new.key, OVERLAY_SHA, 1)]));
+    let mut new_pins = overlay_pins(&[(new.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut new_pins);
+    let skipped = pins.absorb(new_pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let (modules, skipped) = bind_scanned_modules(&[kept, new.clone()], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -31730,6 +31776,7 @@ fn live_candidate_omits_existing_growth_at_capacity_without_aborting() {
     raw.tables[0].live_return = true;
     let full = with_endpoints(raw.clone(), capacity - 100);
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&full), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let mut engine = Engine::empty();
@@ -31878,7 +31925,9 @@ fn tick_refuses_a_whole_new_module_at_capacity_without_aborting() {
     kept.tables[0].entries = overlay_entries(&raw, first_offsets(capacity - 100 - 68));
     let new = with_endpoints(overlay_module(overlay_key(71)), 101);
     let mut pins = engine.pinned.clone();
-    let skipped = pins.absorb(overlay_pins(&[(new.key, OVERLAY_SHA, 1)]));
+    let mut new_pins = overlay_pins(&[(new.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut new_pins);
+    let skipped = pins.absorb(new_pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let (modules, skipped) = bind_scanned_modules(&[kept, new.clone()], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -34551,6 +34600,7 @@ fn split_prearm_join_fixture() -> (
     let module = overlay_module(maps_key);
     let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
     overlay_reback(&mut scan, &file);
+    own_all_raws(&mut scan);
     let mut prearm_pins = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
     overlay_reback(&mut prearm_pins, &file);
     let prearm = PrearmInput {
@@ -34692,6 +34742,7 @@ fn scan_and_prearm_for_distinct_same_content_files_keep_two_providers() {
     let module = overlay_module(maps_key);
     let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
     overlay_reback(&mut scan, &scan_file);
+    own_all_raws(&mut scan);
     let mut prearm_pins = split_prearm_pin(other_fd_key, other_maps_key, OVERLAY_SHA, 1);
     overlay_reback(&mut prearm_pins, &prearm_file);
     let view = module.view;
@@ -34752,8 +34803,10 @@ fn prearm_join_refiles_a_pre68_overlay_split_onto_its_scan_pin() {
     let fd_key = overlay_key(41);
     let mut scan = split_scan_pin(maps_key, fd_key, OVERLAY_SHA, 1);
     overlay_reback(&mut scan, &file);
+    own_all_raws(&mut scan);
     let mut prearm = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
     overlay_reback(&mut prearm, &file);
+    own_all_raws(&mut prearm);
     let mut pinned = scan;
     assert!(pinned.absorb(prearm).is_empty());
     let module = overlay_module(maps_key);
@@ -34936,6 +34989,7 @@ impl LoaderPlanningFixture {
             assert!(provider_pins.absorb(pins).is_empty());
             raw.push(module);
         }
+        own_all_raws(&mut provider_pins);
         let make_loader = |minor, name| {
             let path = dir.path().join(name);
             let _file = overlay_backing_file(&dir, name);
@@ -34944,12 +34998,12 @@ impl LoaderPlanningFixture {
             loader.tables.clear();
             loader.exports.clear();
             let mut pins = real_scan_pin(&path, Some(loader.key), minor + 1, OVERLAY_SHA);
-            let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader), &mut pins);
-            assert!(skips.is_empty());
             // Production scans attach scan ownership at pin time; the live
             // rebind restores the scan pin layer from it, so the fixture
             // carries the same row or full-path ticks drop the loader view.
             record_scan_ownership(&mut pins, loader.view, loader.key, &loader.path);
+            let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader), &mut pins);
+            assert!(skips.is_empty());
             let local = pins
                 .id_for_scanned(&loader, loader.key, &loader.path)
                 .unwrap();
@@ -36933,8 +36987,6 @@ fn loader_pin_reuse_adds_a_view_to_an_existing_exact_loader() {
         222,
         OVERLAY_SHA,
     );
-    let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader_module), &mut pins);
-    assert!(skips.is_empty());
     // Same production-shape scan ownership as the fixture loaders: the
     // reference full-path rebind restores scan pins from this row.
     record_scan_ownership(
@@ -36943,6 +36995,8 @@ fn loader_pin_reuse_adds_a_view_to_an_existing_exact_loader() {
         loader_module.key,
         &loader_module.path,
     );
+    let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader_module), &mut pins);
+    assert!(skips.is_empty());
     let local = pins
         .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
         .unwrap();
@@ -37057,6 +37111,7 @@ fn loader_pin_reuse_falls_back_for_cross_overlay_canonicalization() {
         .views
         .push(ProcessView::open(loader_module.view, std::process::id()).unwrap());
     let mut loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+    own_all_raws(&mut loader_pins);
     let (_, skips) = bind_scanned_modules(std::slice::from_ref(&loader_module), &mut loader_pins);
     assert!(skips.is_empty());
     let local_loader = loader_pins
@@ -37338,12 +37393,13 @@ fn publish_deferral_matches_full_publication_step_for_step() {
     let mut late_module = overlay_module(overlay_key(230));
     late_module.path = late_path.display().to_string();
     late_module.tables[0].entries = overlay_entries(&late_module, first_offsets(3));
-    let late_pins = crate::discovery::identity::test_fixture::real_scan_pin(
+    let mut late_pins = crate::discovery::identity::test_fixture::real_scan_pin(
         &late_path,
         Some(late_module.key),
         231,
         OVERLAY_SHA,
     );
+    own_all_raws(&mut late_pins);
     for engine in [&mut deferred, &mut full] {
         assert!(engine.pinned.absorb(late_pins.clone()).is_empty());
         let (mut bound, skips) =
@@ -37397,7 +37453,8 @@ fn publish_deferral_matches_full_publication_step_for_step() {
     let mut loader_module = overlay_module(overlay_key(102));
     loader_module.tables.clear();
     loader_module.exports.clear();
-    let base_loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+    let mut base_loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+    own_all_raws(&mut base_loader_pins);
     let pair = || {
         let mut engine = Engine::empty();
         engine.plan = base.plan.clone();
@@ -38124,7 +38181,8 @@ fn conflicting_loader_planning_fixture(mutated_original: bool) {
         );
         OVERLAY_SHA
     };
-    let pins = real_scan_pin(Path::new(&loader.path), Some(loader.key), 221, sha);
+    let mut pins = real_scan_pin(Path::new(&loader.path), Some(loader.key), 221, sha);
+    own_all_raws(&mut pins);
     let local = pins
         .id_for_scanned(&loader, loader.key, &loader.path)
         .unwrap();
@@ -38269,6 +38327,7 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
     let (mut engine, _, provider, _) = engine_with_overlay(104);
     let loader_module = overlay_module(overlay_key(102));
     let mut loader_pins = overlay_view_pin(&loader_module, 999, OVERLAY_SHA, 1, true);
+    own_all_raws(&mut loader_pins);
     let (_, bind_skips) =
         bind_scanned_modules(std::slice::from_ref(&loader_module), &mut loader_pins);
     assert!(bind_skips.is_empty(), "{bind_skips:?}");
@@ -48901,6 +48960,7 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     raw.module_hint = Some(PathBuf::from(&raw.path));
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
@@ -48994,6 +49054,7 @@ fn ordered_admission_unnamed_closure_attaches_only_its_published_table() {
     let raw = p11kit_like_64_table_module();
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
@@ -49063,6 +49124,7 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
     raw.module_hint = Some(PathBuf::from(&raw.path));
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
@@ -49164,6 +49226,7 @@ fn unnamed_closure_attaches_only_its_published_table_without_heuristic_names() {
     let raw = p11kit_like_64_table_module();
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
@@ -49228,6 +49291,7 @@ fn live_return_tables_keep_names_and_bypass_the_heuristic_cap() {
         .collect();
     raw.interfaces = vec![];
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
@@ -49316,6 +49380,7 @@ fn published_tables_bypass_heuristic_cap_with_sufficient_budget() {
         .collect();
 
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut pins);
     let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
@@ -49417,6 +49482,7 @@ fn global_budget_refuses_oversized_module_atomically_and_admits_later_small_modu
         (oversized.key, OVERLAY_SHA, 1),
         (small.key, OVERLAY_SHA, 1),
     ]);
+    own_all_raws(&mut pins);
     let raws = [filler, oversized, small];
     let (modules, skipped) = bind_scanned_modules(&raws, &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
@@ -49567,6 +49633,10 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
 
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    // Both views proved the shared file, as two production scans would.
+    own_all_raws(&mut pins);
+    own_all_raws_under(&mut pins, view1.view);
+    own_all_raws_under(&mut pins, view2.view);
     let (modules, skipped) = bind_scanned_modules(&[view1, view2, sidecar], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(modules.len(), 3);
@@ -49684,7 +49754,9 @@ fn spill_history_engine() -> (Engine, ScannedModule) {
     raw.interfaces.clear();
     let sidecar = overlay_module(overlay_key(58));
     let mut engine = Engine::empty();
-    engine.pinned = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let mut spill_pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    own_all_raws(&mut spill_pins);
+    engine.pinned = spill_pins;
     let (modules, skipped) = bind_scanned_modules(&[raw.clone(), sidecar], &mut engine.pinned);
     assert!(skipped.is_empty());
     engine.plan = plan::build_from_reconciled_modules(&modules);
@@ -83926,7 +83998,7 @@ fn complete_initial_arming_files_no_window_gap_for_pid_scope() {
 fn complete_initial_arming_measures_the_window_on_the_real_clock() {
     let (fixture_a, view_a, mut module_a, pins_a) = loaded_seed_provider();
     let _fixture_a = fixture_a;
-    let (fixture_b, view_b, mut module_b, pins_b) =
+    let (fixture_b, view_b, mut module_b, mut pins_b) =
         loaded_seed_provider_with_seed_table(false, true);
     let _fixture_b = fixture_b;
     let _view_b = view_b;
@@ -83940,6 +84012,7 @@ fn complete_initial_arming_measures_the_window_on_the_real_clock() {
     // Distinct view ids: the second child re-opens under id 1, and its
     // module rides that id so the candidate binds it to the right view.
     module_b.view = ProcessViewId(1);
+    own_all_raws_under(&mut pins_b, ProcessViewId(1));
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
     // Closed universe: this completion measures the window and the
@@ -84109,7 +84182,7 @@ fn complete_initial_arming_measures_the_window_on_the_real_clock() {
 fn complete_initial_arming_closed_universe_admits_no_foreign_slot() {
     let (fixture_a, view_a, mut module_a, pins_a) = loaded_seed_provider();
     let _fixture_a = fixture_a;
-    let (fixture_b, view_b, mut module_b, pins_b) =
+    let (fixture_b, view_b, mut module_b, mut pins_b) =
         loaded_seed_provider_with_seed_table(false, true);
     let _fixture_b = fixture_b;
     let _view_b = view_b;
@@ -84123,6 +84196,7 @@ fn complete_initial_arming_closed_universe_admits_no_foreign_slot() {
     // Distinct view ids: the second child re-opens under id 1, and its
     // module rides that id so the candidate binds it to the right view.
     module_b.view = ProcessViewId(1);
+    own_all_raws_under(&mut pins_b, ProcessViewId(1));
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
     // Closed universe: this completion measures the window and the
@@ -93493,7 +93567,9 @@ fn live_candidate_refuses_uncorroborated_entries_without_function_proof() {
     });
     let mut pins = overlay_pins(&[(provider, OVERLAY_SHA, 1)]);
     let dependency_module = overlay_module(dependency);
-    let dependency_pins = overlay_view_pin(&dependency_module, 2, OVERLAY_SHA, 1, false);
+    let mut dependency_pins = overlay_view_pin(&dependency_module, 2, OVERLAY_SHA, 1, false);
+    own_all_raws(&mut pins);
+    own_all_raws(&mut dependency_pins);
     assert!(pins.absorb(dependency_pins).is_empty());
     let mut engine = Engine::empty();
     let candidate = engine
@@ -93553,7 +93629,9 @@ fn rebuild_discovered_refuses_uncorroborated_entries_in_every_scope() {
         });
         let mut pins = overlay_pins(&[(provider, OVERLAY_SHA, 1)]);
         let dependency_module = overlay_module(dependency);
-        let dependency_pins = overlay_view_pin(&dependency_module, 2, OVERLAY_SHA, 1, false);
+        let mut dependency_pins = overlay_view_pin(&dependency_module, 2, OVERLAY_SHA, 1, false);
+        own_all_raws(&mut pins);
+        own_all_raws(&mut dependency_pins);
         assert!(pins.absorb(dependency_pins).is_empty());
         let view = ProcessView::open(module.view, std::process::id()).unwrap();
         let mut discovered = lifecycle_discovered(vec![view]);

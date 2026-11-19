@@ -383,7 +383,10 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
         let Some(text) = stash_body(source) else {
             return false;
         };
-        let code = code_tokens(text);
+        // Every check below runs on the normalized stash, so a line
+        // break inside a whitespace run never fails the pin while
+        // any inserted, removed or reworded token still does.
+        let code = normalize(&code_tokens(text));
         // The sole acquisition: the shared macro exactly once, with
         // the raw reader, the probe context, the layout and the
         // descriptor-derived mask variable. A widened mask
@@ -403,7 +406,7 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
         // condition or the refusal body, breaks the contiguity and
         // fails closed.
         const PROLOGUE: &str = "ctx: &ProbeContext, key: &StartKey, descriptor: u32, layout: LinuxLayout, ) { let mask = length_entry_fetch_mask(descriptor); if mask == 0 { let _ = EVIDENCE_START.remove(key); return; } let start_ts_ns = unsafe { p11_owner_start_get(key, 0).as_ref() }.map(|start| start.ts_ns); let mut row = EvidenceStart::default(); let mut words = [0u64; 7]; let mut present: u8 = 0; acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present);";
-        if !normalize(&code).starts_with(&normalize(PROLOGUE)) {
+        if !code.starts_with(&normalize(PROLOGUE)) {
             return false;
         }
         // Descriptor-derived mask: the single definition resolves from
@@ -426,6 +429,17 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
         "stash_length_entry must refuse on a zero mask before acquiring, then acquire only through the single exact acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present) invocation with no other arg_u64 use"
     );
     let start = SOURCE.find("    fn stash_length_entry(").unwrap();
+    // A wrapped spelling of the pinned invocation (a line break
+    // inside a whitespace run) still satisfies the contract.
+    let wrapped = SOURCE[start..].replacen(
+        "acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present);",
+        "acquire_length_entry_args!(arg_u64,\n            ctx, layout, mask, words, present);",
+        1,
+    );
+    assert!(
+        contract(&format!("{}{}", &SOURCE[..start], wrapped)),
+        "a wrapped pinned invocation must satisfy the contract"
+    );
     let tail = SOURCE[start..].replacen("acquire_length_entry_args!", "REMOVED!", 1);
     assert!(
         !contract(&format!("{}{}", &SOURCE[..start], tail)),

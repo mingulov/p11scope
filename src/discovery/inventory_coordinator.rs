@@ -743,7 +743,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// closes them one per stop check. A stop defers the remainder
     /// under coordinator custody; a quiet pass drains the queue
     /// whole, so steady state piles nothing up. Bounded by one
-    /// pass's folds times the per-caller pins.
+    /// pass's folds times the per-caller pins. The terminal path
+    /// moves the queue out before the drop (see
+    /// [`Self::drain_pending_closes_for_exit`]), so a latched stop
+    /// never leaves it to the teardown batch.
     pending_close_queue: Vec<Arc<PidPin>>,
     /// Proven-exited caller rows retired into the counted aggregate
     /// (monotonic, saturating).
@@ -5984,6 +5987,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             drop(self.pending_close_queue.pop());
         }
+    }
+
+    /// Terminal drain for the deferred close queue, run after output
+    /// attempts while the coordinator is still alive. Every queued pin
+    /// moves out of the coordinator first, so the coordinator's drop
+    /// can never close them in one unchecked batch; then one pin
+    /// closes per further-stop check. A set stop keeps the remainder,
+    /// which the caller transfers to the established exit retention;
+    /// a quiet drain closes everything. The queue holds at most one
+    /// pass's folds, so a quiet drain is bounded by the caller budget,
+    /// and at most one close runs past a stop.
+    pub(crate) fn drain_pending_closes_for_exit(
+        &mut self,
+        further_stop: &dyn Fn() -> bool,
+    ) -> Vec<Arc<PidPin>> {
+        let mut owned = std::mem::take(&mut self.pending_close_queue);
+        while !owned.is_empty() {
+            if further_stop() {
+                break;
+            }
+            drop(owned.pop());
+        }
+        owned
     }
 
     /// One retirement pass under an explicit stop query, with
@@ -26216,36 +26242,67 @@ exit 0
     }
 
     /// Terminal-close twin: with the operator signal latched, the
-    /// queued last-owner pidfds belong to a terminal owner — the
-    /// coordinator's drop must not close them in one unchecked batch.
+    /// terminal drain closes every queued last-owner pidfd under a
+    /// quiet further-stop query — the coordinator's drop then closes
+    /// nothing, and the fold receipt still publishes exactly once.
     #[test]
     fn fold_terminal_close_drain_closes_queued_pins_with_real_fds_under_latched_stop() {
-        let (native, pins, _fds, signals) = stage_latched_close_scene();
+        let (mut native, pins, _fds, signals) = stage_latched_close_scene();
         assert_eq!(
             signals.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "the latch stays set through teardown"
         );
-        drop(native);
-        let alive = pins.iter().filter(|pin| pin.upgrade().is_some()).count();
+        let retired = native.scene.coordinator.retired_caller_rows_for_test();
+        assert_eq!(retired, 4, "the folds published before the teardown");
+        let rest = native
+            .scene
+            .coordinator
+            .drain_pending_closes_for_exit(&|| false);
+        assert!(
+            rest.is_empty(),
+            "a quiet terminal drain closes the whole queue"
+        );
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "every queued pin closes exactly once in the terminal drain"
+        );
         assert_eq!(
-            alive, 3,
-            "a terminal owner holds the queued pins past the coordinator drop"
+            signals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the latch stays set through teardown"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_caller_rows_for_test(),
+            retired,
+            "the drain publishes no row twice"
+        );
+        drop(native);
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "the drop closes nothing twice"
         );
     }
 
-    /// Terminal-retention twin: a further stop keeps the remainder
-    /// outside the drop with its pidfds open, instead of closing
-    /// them in the teardown batch.
+    /// Terminal-retention twin: a set further-stop closes nothing and
+    /// moves the whole remainder to the exit owner outside the
+    /// coordinator, with its pidfds open; a mid-drain trip closes a
+    /// bounded prefix and retains the rest. The coordinator's drop
+    /// closes nothing either way, and the retention release closes
+    /// each remainder pin exactly once.
     #[test]
     fn fold_terminal_close_second_signal_retains_remainder_outside_the_drop() {
-        let (native, pins, fds, signals) = stage_latched_close_scene();
+        // A set further-stop retains the whole remainder.
+        let (mut native, pins, fds, signals) = stage_latched_close_scene();
+        let retained = native
+            .scene
+            .coordinator
+            .drain_pending_closes_for_exit(&|| true);
         assert_eq!(
-            signals.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the latch stays set through teardown"
+            retained.len(),
+            3,
+            "a further stop retains the whole remainder"
         );
-        drop(native);
         let queued: Vec<(_, _)> = pins
             .iter()
             .zip(fds.iter())
@@ -26259,6 +26316,46 @@ exit 0
         assert!(
             queued.iter().all(|(_, fd)| pidfd_alive(**fd)),
             "retained pidfds stay open past the drop"
+        );
+        drop(native);
+        assert_eq!(
+            pins.iter().filter(|pin| pin.upgrade().is_some()).count(),
+            3,
+            "the drop closes nothing the exit owner holds"
+        );
+        drop(retained);
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "the retention release closes each pin exactly once"
+        );
+        assert_eq!(
+            signals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the latch stays set through teardown"
+        );
+        // A trip after two closes retains just the tail.
+        let (mut native, pins, _fds, _) = stage_latched_close_scene();
+        let steps = std::cell::Cell::new(0u64);
+        let retained = native.scene.coordinator.drain_pending_closes_for_exit(&|| {
+            steps.set(steps.get() + 1);
+            steps.get() > 2
+        });
+        assert_eq!(retained.len(), 1, "the trip keeps the undrained tail");
+        assert_eq!(
+            steps.get(),
+            3,
+            "one further-stop check runs per close plus the trip"
+        );
+        drop(native);
+        assert_eq!(
+            pins.iter().filter(|pin| pin.upgrade().is_some()).count(),
+            1,
+            "the drop closes nothing the exit owner holds"
+        );
+        drop(retained);
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "the retention release closes the tail exactly once"
         );
     }
 

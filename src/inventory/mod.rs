@@ -8939,9 +8939,21 @@ fn retire_rendered_callers_with_stop<Source: ProcessSource>(
     let Some(view) = state.last_stream_view.as_ref() else {
         return report;
     };
-    let ids: Vec<crate::discovery::caller_registry::CallerId> =
-        view.callers.iter().map(|caller| caller.id).collect();
-    report.callers_copied = ids.len();
+    // Every scan below counts through the one shared stride — the
+    // caller-ID copy, the membership reads, the identity build with
+    // its path-minimum scan, and the carry stage — so a stop abandons
+    // the pass within one stride with the coordinator carry untouched.
+    let mut units = 0u64;
+    let mut ids: Vec<crate::discovery::caller_registry::CallerId> =
+        Vec::with_capacity(view.callers.len());
+    for caller in view.callers.iter() {
+        if cert_unit(&mut units, stop) {
+            report.units = units;
+            return report;
+        }
+        ids.push(caller.id);
+        report.callers_copied += 1;
+    }
     // Fold only callers whose every edge and instance already
     // streamed (or every caller when no log runs): a
     // folded-never-streamed edge or instance would leave the stream
@@ -8955,7 +8967,6 @@ fn retire_rendered_callers_with_stop<Source: ProcessSource>(
     // fully certified rows, and still-eligible rows re-note next
     // pass.
     let foldable: Vec<crate::discovery::caller_registry::CallerId> = if stream.emits() {
-        let mut units = 0u64;
         // One per-caller instance index per call, not one scan per
         // candidate: the registry holds instances in one map.
         let mut instances_by_caller: BTreeMap<
@@ -8993,23 +9004,49 @@ fn retire_rendered_callers_with_stop<Source: ProcessSource>(
             if !candidate {
                 // Live rows cannot fold this pass; keep the
                 // current once-streamed noting so the set still
-                // reflects the view.
-                let streamed = coordinator
-                    .registry()
-                    .edges_of(id)
-                    .all(|edge| state.edges.has_record(id, edge.module))
-                    && instances_by_caller.get(&id).is_none_or(|members| {
-                        members
-                            .iter()
-                            .all(|instance| state.instances.has_record(*instance))
-                    });
+                // reflects the view. Each membership read counts:
+                // an uncounted `all` would scan whole tables past a
+                // stop.
+                let mut streamed = true;
+                for edge in coordinator.registry().edges_of(id) {
+                    if cert_unit(&mut units, stop) {
+                        report.units = units;
+                        return report;
+                    }
+                    if !state.edges.has_record(id, edge.module) {
+                        streamed = false;
+                        break;
+                    }
+                }
+                if streamed && let Some(members) = instances_by_caller.get(&id) {
+                    for instance in members {
+                        if cert_unit(&mut units, stop) {
+                            report.units = units;
+                            return report;
+                        }
+                        if !state.instances.has_record(*instance) {
+                            streamed = false;
+                            break;
+                        }
+                    }
+                }
                 if streamed {
                     foldable.push(id);
                 }
                 continue;
             }
-            let index = identities.get_or_insert_with(|| IdentityIndex::new(view));
-            report.identity_built = true;
+            if identities.is_none() {
+                // Two statements: the pacing closure borrows the
+                // counter, so it must drop before the abort reads it.
+                let built = IdentityIndex::new_counted(view, || cert_unit(&mut units, stop));
+                let Some(built) = built else {
+                    report.units = units;
+                    return report;
+                };
+                report.identity_built = true;
+                identities = Some(built);
+            }
+            let index = identities.as_ref().expect("built above");
             let mut edges_terminal = true;
             for edge in coordinator.registry().edges_of(id) {
                 if cert_unit(&mut units, stop) {
@@ -9073,16 +9110,25 @@ fn retire_rendered_callers_with_stop<Source: ProcessSource>(
         ids
     };
     // The carry from a credit-deferred pass must not authorize a
-    // fold this pass excludes: intersect first, so a caller whose
-    // terminal payload changed while its revision waits in the FIFO
-    // keeps its row (and its queued update) until the revision lands.
-    // Still-eligible rows are re-noted every pass, so the
-    // intersection only defers, never strands.
+    // fold this pass excludes: a caller whose terminal payload changed
+    // while its revision waits in the FIFO keeps its row (and its
+    // queued update) until the revision lands. Still-eligible rows are
+    // re-noted every pass, so a deferred row never strands. The new
+    // carry stages locally through the shared stride — an abort
+    // discards it with the coordinator carry untouched — and commits
+    // wholesale: retain-then-note equalled the certified set exactly,
+    // so the assignment changes nothing but the pacing.
     report.certified = foldable.len();
-    let certified: BTreeSet<crate::discovery::caller_registry::CallerId> =
-        foldable.iter().copied().collect();
-    coordinator.retain_rendered_callers(&certified);
-    coordinator.note_rendered_callers(&foldable);
+    let mut certified: BTreeSet<crate::discovery::caller_registry::CallerId> = BTreeSet::new();
+    for id in foldable.iter() {
+        if cert_unit(&mut units, stop) {
+            report.units = units;
+            return report;
+        }
+        certified.insert(*id);
+    }
+    report.units = units;
+    coordinator.set_rendered_callers(certified);
     report.committed = true;
     // The fold paces its planning strides against the live stop
     // query (the local flag plus the operator counter, when wired),

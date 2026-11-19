@@ -1350,7 +1350,10 @@ def check_streams(view, res):
         got = 0
         for key in keys:
             count = ((last.get(key) or {}).get("entries") or {}).get("count")
-            if type(count) is not int:
+            # A streamed count must be a valid u64 before the
+            # saturating sum: clipping an out-of-range count would
+            # falsely agree with a saturated aggregate.
+            if type(count) is not int or not 0 <= count <= (1 << 64) - 1:
                 got = None
                 break
             # The producer adds saturating at u64::MAX while its

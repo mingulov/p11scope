@@ -462,6 +462,30 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "an equivalent parenthesized direct fetch must fail the contract"
     );
+    // A rebound descriptor before the mask definition (descriptor 94
+    // selects the DecapsulateKey scalar [6] even on an Encrypt
+    // descriptor 31 authorizing [3, 4], or a narrowed 0 authorizing
+    // none) must fail the contract.
+    let tail = SOURCE[start..].replacen(
+        "        let mask = length_entry_fetch_mask(descriptor);",
+        "        let descriptor = 94;\n        let mask = length_entry_fetch_mask(descriptor);",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "a rebound descriptor before the mask definition must fail the contract"
+    );
+    // A weakened zero-mask refusal (descriptor 0 bypasses the required
+    // early delete and return) must fail the contract.
+    let tail = SOURCE[start..].replacen(
+        "        if mask == 0 {",
+        "        if mask == 0 && descriptor != 0 {",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "a weakened zero-mask refusal must fail the contract"
+    );
 }
 
 /// Shared length acquisition (v0.8.0 keymeta Task 2): the

@@ -1079,6 +1079,19 @@ impl PreparedSemanticBatch {
                     next += 1;
                     continue;
                 }
+                // A void recorded wiping this admission's exact H8
+                // original (a terminal whose BEGIN a void released):
+                // shed it as plain S1 under the Voided cause instead
+                // of claiming and staging an orphan head no seal can
+                // account for. Exact wipe evidence only; not-yet-
+                // ingested admissions are unaffected. The gap is
+                // counted once at reduction, where the caller is
+                // known; no claim classification stops the lane.
+                if ingested.admission_voided(input, adapter) {
+                    input.retain_as_plain_s1(PlainS1Cause::Voided);
+                    next += 1;
+                    continue;
+                }
                 if !ingested.matches_admission(input)
                     && !ingested.matches_retained_admission(input, adapter)
                 {

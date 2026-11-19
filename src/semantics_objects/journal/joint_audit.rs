@@ -290,10 +290,26 @@ enum ConsumerState {
     Delivered,
     LossDelivered,
 }
+/// Gap subject for a parked stuck consumer's forced-fallback
+/// degrade: the watchdog parked the consumer past its retry stall
+/// with counted loss instead of tripping the lane.
+pub(crate) const PARKED_CONSUMER_SUBJECT: &str = "joint stuck consumer parked";
+
 struct FrameConsumer {
     target: JointFeedTarget,
     state: ConsumerState,
     failure: FailureReplayCursor,
+    /// Consecutive delivery visits that made no progress (retried or
+    /// held): reset on any advance or charged visit. The watchdog
+    /// parks consumers still streaked when the frame bound fires.
+    stuck_streak: u32,
+    /// Parked by the watchdog: the next delivery degrades this
+    /// consumer with a forced fallback instead of retrying, so the
+    /// cursor advances past it. Cleared on advance.
+    parked: bool,
+    /// The last failure gap that streaked this consumer, for the
+    /// park gap's named cause.
+    last_stuck_gap: Option<super::JournalGap>,
 }
 struct ActiveSeal {
     consumer: usize,
@@ -494,6 +510,11 @@ pub(super) struct FailureReplayCursor {
 pub(crate) struct FailureBatchDelivery<'q> {
     audited: AuditedFailure<'q>,
     pub(super) cursor: &'q mut FailureReplayCursor,
+    /// Watchdog park override: a parked consumer's retry-mapped
+    /// failure delivers as a forced fallback (degrade with counted
+    /// loss) instead of retrying, so the cursor advances past it.
+    /// `None` delivers the failure's own disposition.
+    forced_disposition: Option<SealFailureDisposition>,
 }
 
 /// Completion metadata minted from the SAME borrowed originals and cursor.
@@ -512,6 +533,12 @@ impl NegativeDelivered {
 impl<'q> FailureBatchDelivery<'q> {
     pub(crate) fn audited(&self) -> &AuditedFailure<'q> {
         &self.audited
+    }
+
+    /// The watchdog park override, if this delivery degrades a parked
+    /// consumer instead of its failure's own disposition.
+    pub(crate) fn forced_disposition(&self) -> Option<SealFailureDisposition> {
+        self.forced_disposition
     }
     pub(crate) fn effects_complete(&self) -> bool {
         self.audited.originals[self.cursor.slot..]
@@ -1612,6 +1639,9 @@ impl IngestedJointQuantum {
                     ConsumerState::NegativeOnly
                 },
                 failure: FailureReplayCursor::default(),
+                stuck_streak: 0,
+                parked: false,
+                last_stuck_gap: None,
             }
         }));
         // One charged snapshot, no duplicate-domain hash table or queue.
@@ -1640,6 +1670,11 @@ impl IngestedJointQuantum {
     fn advance_consumer(&mut self, state: ConsumerState) {
         debug_assert!(self.consumers[self.cursor].state == ConsumerState::Pending);
         self.consumers[self.cursor].state = state;
+        // Advancing is progress: the stuck streak, park flag and last
+        // gap reset with the state move.
+        self.consumers[self.cursor].stuck_streak = 0;
+        self.consumers[self.cursor].parked = false;
+        self.consumers[self.cursor].last_stuck_gap = None;
         self.pending -= 1;
         self.future += usize::from(state == ConsumerState::Future);
         self.skip_completed_consumers();
@@ -1654,8 +1689,36 @@ impl IngestedJointQuantum {
     }
 
     fn advance_pending_visit(&mut self) {
+        // A charged visit is progress: reset the passed consumer's
+        // stuck streak (its state stays Pending for its spans).
+        if self.cursor < self.consumers.len() {
+            self.consumers[self.cursor].stuck_streak = 0;
+            self.consumers[self.cursor].last_stuck_gap = None;
+        }
         self.cursor += 1;
         self.skip_completed_consumers();
+    }
+
+    /// Park delivery-stuck consumers (watchdog): every Pending
+    /// consumer with a stuck-delivery streak that is not already
+    /// parked degrades on its next delivery (forced fallback with
+    /// counted loss) instead of retrying, so the frame cursor
+    /// advances past it. Future consumers keep waiting (their input
+    /// may still arrive); terminal consumers are done. Returns the
+    /// newly parked count; zero means no consumer can progress by
+    /// parking (all Future, terminal, or already parked).
+    pub(crate) fn park_stuck_consumers(&mut self) -> usize {
+        let mut parked = 0;
+        for consumer in &mut self.consumers {
+            if consumer.state == ConsumerState::Pending
+                && consumer.stuck_streak > 0
+                && !consumer.parked
+            {
+                consumer.parked = true;
+                parked += 1;
+            }
+        }
+        parked
     }
 
     fn progress(&self) -> QuantumSealProgress {
@@ -1978,9 +2041,17 @@ impl IngestedJointQuantum {
         // A retry replays this visit from the start next time, so what it
         // spends here is refunded below: it delivers nothing.
         let before = *remaining;
+        // A parked consumer degrades instead of retrying: force the
+        // fallback its feed would take under a fenced void. The streak
+        // is copied out here (the batch borrows the consumer below).
+        let forced_disposition = self.consumers[index]
+            .parked
+            .then_some(SealFailureDisposition::Fallback);
+        let park_streak = self.consumers[index].stuck_streak;
         let mut batch = FailureBatchDelivery {
             audited,
             cursor: &mut self.consumers[index].failure,
+            forced_disposition,
         };
         let (registry, owner, _, _, _) = ports.split();
         let (adapter, model) = owner.parts();
@@ -2006,6 +2077,10 @@ impl IngestedJointQuantum {
                 remaining,
             )
         };
+        // The delivered failure's gap, copied out before the outcome
+        // match (the batch borrows frame state the arms mutate).
+        let stuck_gap = batch.audited().failure().gap;
+        let forced = batch.forced_disposition();
         match outcome {
             FailureBatchProgress::NegativeDelivered(completed) => {
                 if !completed.matches(&batch) {
@@ -2017,10 +2092,34 @@ impl IngestedJointQuantum {
                 Ok(self.progress())
             }
             FailureBatchProgress::Complete(
-                FailureApplyOutcome::Degraded { .. } | FailureApplyOutcome::FellBack { .. },
+                outcome @ (FailureApplyOutcome::Degraded { .. }
+                | FailureApplyOutcome::FellBack { .. }),
             ) => {
                 if batch.negative_delivered().is_none() {
                     return Err(RawQuantumRefusal::DispositionMismatch);
+                }
+                // A parked consumer's forced fallback lands its named
+                // park gap here, with exact loss counts: the watchdog
+                // parked it past its retry stall instead of tripping.
+                if forced.is_some() {
+                    let units = match outcome {
+                        FailureApplyOutcome::FellBack { replayed } => replayed,
+                        FailureApplyOutcome::Degraded { disposed } => disposed,
+                        _ => 0,
+                    };
+                    registry.record_gap(crate::discovery::caller_registry::RegistryGap {
+                        caller: Some(target.caller()),
+                        module: None,
+                        pid: None,
+                        subject: PARKED_CONSUMER_SUBJECT.to_string(),
+                        reason: format!(
+                            "consumer parked after {} stuck delivery visits ({}); degraded with counted loss ({} calls)",
+                            park_streak,
+                            stuck_gap.label(),
+                            units,
+                        ),
+                        budget: None,
+                    });
                 }
                 // Diagnostic-only (scope round): the void above ended a
                 // Joint feed. One void fanning out to many feeds counts
@@ -2059,7 +2158,11 @@ impl IngestedJointQuantum {
                 self.consumers[index].failure = FailureReplayCursor::default();
                 // Nothing was delivered and the next visit replays the
                 // same spans: no progress, so the running Audited bound
-                // can end a seal that only ever retries.
+                // can end a seal that only ever retries. Record the
+                // streak for the watchdog park.
+                self.consumers[index].stuck_streak =
+                    self.consumers[index].stuck_streak.saturating_add(1);
+                self.consumers[index].last_stuck_gap = Some(stuck_gap);
                 *remaining = before;
                 diagnosis.note_failure_retried();
                 Ok(QuantumSealProgress::LocalPending)
@@ -2081,16 +2184,25 @@ impl IngestedJointQuantum {
                     diagnosis.note_failure_progress();
                     Ok(QuantumSealProgress::DeliveryReady)
                 } else {
+                    self.consumers[index].stuck_streak =
+                        self.consumers[index].stuck_streak.saturating_add(1);
+                    self.consumers[index].last_stuck_gap = Some(stuck_gap);
                     diagnosis.note_failure_stuck();
                     Ok(QuantumSealProgress::LocalPending)
                 }
             }
             FailureBatchProgress::Held => {
+                self.consumers[index].stuck_streak =
+                    self.consumers[index].stuck_streak.saturating_add(1);
+                self.consumers[index].last_stuck_gap = Some(stuck_gap);
                 diagnosis.note_failure_stuck();
                 Ok(QuantumSealProgress::LocalPending)
             }
             #[cfg(test)]
             FailureBatchProgress::Complete(FailureApplyOutcome::Ignored) => {
+                self.consumers[index].stuck_streak =
+                    self.consumers[index].stuck_streak.saturating_add(1);
+                self.consumers[index].last_stuck_gap = Some(stuck_gap);
                 diagnosis.note_failure_stuck();
                 Ok(QuantumSealProgress::LocalPending)
             }

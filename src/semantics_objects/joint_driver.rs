@@ -249,6 +249,20 @@ pub(crate) struct JointCaptureOwner {
     // sweep one credit at a time. Publication into `pending_void`
     // waits for sweep completion, as does collection.
     void_cleanup: Option<PendingVoid>,
+    /// The last void's scope (stream or scoped), set by every void
+    /// that ran: the Idle caller takes it to decide the follow-up
+    /// disposal (a scoped void's stuck feeds were already discarded
+    /// by the re-arm, so nothing more disposes; a stream void strands
+    /// staged calls across the wiped history). Cleared on take.
+    last_void_scope: Option<JointVoidScope>,
+}
+
+/// Which history one void ended: the whole stream (ingest break) or
+/// one stuck session (watchdog scoped break).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum JointVoidScope {
+    Stream,
+    Scoped,
 }
 
 /// A void's original failure and the lease that paid for it.
@@ -271,6 +285,7 @@ impl JointCaptureOwner {
             adapter,
             pending_void: None,
             void_cleanup: None,
+            last_void_scope: None,
         }
     }
 
@@ -285,6 +300,7 @@ impl JointCaptureOwner {
             adapter: JournalAdapter::with_ledger(limits, StagingLedger::with_resources(reserver)),
             pending_void: None,
             void_cleanup: None,
+            last_void_scope: None,
         }
     }
 
@@ -347,11 +363,15 @@ impl JointCaptureOwner {
     /// rows, and later seals re-prove above the recorded fence;
     /// receipts cut below it never resume. The next collect then
     /// re-syncs above the fence,
-    /// like any unlocalized loss. The void's storage is prepaid from
-    /// the ledger's reserver as in `dispose_without_ingest`; a refusal
-    /// keeps the fail-closed refusal. Returns whether the lane was
-    /// voided; the caller then records the void's own gap
-    /// ([`INGEST_BREAK_VOID_GAP`]).
+    /// like any unlocalized loss. A watchdog scoped break takes the
+    /// same path narrowed to its stuck session (fence, wipe and
+    /// failure scope only; no invalidation, no re-sync, no global
+    /// cut), and a stream break subsumes any pending scoped one. The
+    /// void's storage is prepaid from the ledger's reserver as in
+    /// `dispose_without_ingest`; a refusal keeps the fail-closed
+    /// refusal. Returns whether the lane was voided; the caller then
+    /// records the void's own gap ([`INGEST_BREAK_VOID_GAP`]) and
+    /// takes the void's scope for the follow-up disposal.
     pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
         let started = self.start_void_ingest_break()?;
         if started {
@@ -367,11 +387,20 @@ impl JointCaptureOwner {
     /// `poll_void_cleanup` to complete, as does collection.
     pub(crate) fn start_void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
         let adapter = &self.adapter;
-        if !adapter.stream_broken
-            || adapter.invalidated
-            || adapter.stopped
-            || adapter.consumed_through == u64::MAX
-        {
+        if adapter.invalidated || adapter.stopped || adapter.consumed_through == u64::MAX {
+            return Ok(false);
+        }
+        let stream_broken = adapter.stream_broken;
+        // A stream break subsumes any pending scoped break (the stream
+        // void wipes its whole scope); otherwise a pending scoped
+        // break voids exactly its stuck session. Neither runs twice.
+        let scoped = if stream_broken {
+            self.adapter.drop_scoped_break();
+            None
+        } else {
+            self.adapter.take_scoped_break()
+        };
+        if !stream_broken && scoped.is_none() {
             return Ok(false);
         }
         let bytes = super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
@@ -383,10 +412,31 @@ impl JointCaptureOwner {
             .ok_or(RawQuantumRefusal::ForeignLedger)?
             .reserve(bytes)
             .map_err(RawQuantumRefusal::Resource)?;
-        let failure = self
-            .adapter
-            .void_ingest_break_start(&mut self.model, INGEST_BREAK_VOID_GAP);
+        // A scoped void fails exactly its stuck domains; the re-arm
+        // already discarded their heads, so delivery replays nothing
+        // (verifying empty against empty) and closes the feeds for
+        // reseed, like a stream void's delivery to its wiped feeds.
+        // Healthy domains are outside the failure's scope and seal
+        // through it. The scoped wipe runs synchronously inside its
+        // start (no H8 sweep), so its cleanup publishes immediately
+        // below; the stream void starts its resumable sweep instead.
+        let (failure, scope) = match scoped {
+            Some(break_scope) => (
+                self.adapter.void_ingest_break_scoped_inner(
+                    &mut self.model,
+                    INGEST_BREAK_VOID_GAP,
+                    break_scope,
+                ),
+                JointVoidScope::Scoped,
+            ),
+            None => (
+                self.adapter
+                    .void_ingest_break_start(&mut self.model, INGEST_BREAK_VOID_GAP),
+                JointVoidScope::Stream,
+            ),
+        };
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+        self.last_void_scope = Some(scope);
         self.void_cleanup = Some(PendingVoid {
             failure,
             bytes,
@@ -430,11 +480,12 @@ impl JointCaptureOwner {
         // void needs a re-sync and an ingest first, so an older void
         // is always delivered before a newer one can apply. Should
         // that ever change, the guard below keeps the first void's
-        // failure but raises its fence to the larger one, so the
+        // failure but raises its fence and unions its scope, so the
         // delivered void covers both breaks.
         match self.pending_void.as_mut() {
             Some(pending) => {
                 pending.failure.fence = pending.failure.fence.max(cleanup.failure.fence);
+                pending.failure.merge_scope_from(&cleanup.failure);
             }
             None => {
                 self.pending_void = Some(cleanup);
@@ -442,16 +493,26 @@ impl JointCaptureOwner {
         }
     }
 
-    /// Break the linked stream after a running quantum was abandoned
-    /// unsealed: its ingested history never passed a seal, so the next
-    /// running Idle collect fences the abandoned quantum's history as
-    /// an explicitly lost interval ([`Self::void_ingest_break`], named)
-    /// and re-syncs above it, exactly like a stream broken while
-    /// ingesting. A stopped adapter takes nothing (the void refuses it
-    /// anyway).
-    pub(crate) fn break_stream_after_running_abandon(&mut self) {
+    /// Take the last void's scope, if a void ran: the Idle caller uses
+    /// it to decide the follow-up disposal (scoped voids strand
+    /// nothing more; stream voids strand staged calls across the wiped
+    /// history). Cleared on take.
+    pub(crate) fn take_last_void_scope(&mut self) -> Option<JointVoidScope> {
+        self.last_void_scope.take()
+    }
+
+    /// Record a watchdog scoped break after a running quantum was
+    /// abandoned: each member is (caller, domain tag, image
+    /// cookie/exec, router). The next running Idle collect consumes it
+    /// with a scoped void (stuck session plus seal-barring unbound
+    /// staging) instead of a stream void. A stopped adapter takes
+    /// nothing (the void refuses it anyway).
+    pub(crate) fn break_scoped_after_running_abandon(
+        &mut self,
+        members: &[(u32, u64, (u64, u64), u64)],
+    ) {
         if !self.adapter.stopped {
-            self.adapter.stream_broken = true;
+            self.adapter.break_scoped_for_watchdog(members);
         }
     }
 
@@ -644,8 +705,9 @@ impl IngestedRaw {
 
     /// Whether a void recorded wiping this admission's retained original
     /// before the claim: a same-domain collected admission whose exact H8
-    /// invocation left `open` under the latest void wipe.
-    #[cfg(test)]
+    /// invocation left `open` under the latest void wipe. The claim step
+    /// sheds such admissions as plain S1 (never staging an orphan
+    /// head a later seal could trip over).
     pub(crate) fn admission_voided(
         &self,
         admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,

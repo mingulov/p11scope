@@ -1953,6 +1953,103 @@ fn async_global_owned_retire_with_reattach_stays_silent() {
     );
 }
 
+/// A paused owned-generation turnover stays silent: the old generation's
+/// endpoint retires while the renewed cover for the same provider (same
+/// module, a distinct endpoint) attaches in the same apply and the
+/// reattach actually runs. Silence is justified by the pause — the owned
+/// child is stopped, so no calls are lost in the gap — not by endpoint
+/// cover: the same shape unowned files (the mixed-retire twin), which is
+/// what proves the owned exclusion. The implemented exclusion is
+/// apply-wide (any same-apply reattach silences, even unrelated);
+/// narrowing to the turnover awaits an owner ruling.
+#[test]
+fn async_global_paused_owned_generation_turnover_with_running_reattach_stays_silent() {
+    let (child, mut engine, modules) = engine_with_one_accepted_provider();
+    engine.owned_run_pid = Some(child.id());
+    engine.set_pause_owned_batch(true);
+    assert!(
+        engine.pause_owned_batch,
+        "premise: the turnover runs under pause"
+    );
+    assert_eq!(
+        engine.views[0].pid(),
+        child.id(),
+        "premise: the provider cover maps the owned child"
+    );
+    let mut second = modules[0].clone();
+    second.tables[0].entries.push(ScannedEntry {
+        name: "C_GetSlotList",
+        object: second.key,
+        object_path: second.path.clone(),
+        file_offset: 0x2000,
+    });
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(
+        &engine.views[0],
+        std::slice::from_ref(&second),
+    ));
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&second));
+    let mut candidate = engine
+        .live_candidate(pins, vec![second], skipped)
+        .expect("the renewed endpoint offers a candidate");
+    assert_eq!(
+        candidate.delta.new.len(),
+        1,
+        "premise: the renewed cover allocates exactly one slot"
+    );
+    assert!(
+        candidate.delta.replace.is_empty(),
+        "premise: nothing replaces"
+    );
+    candidate.delta.retire.push(engine.plan.slots[0].clone());
+    candidate.plan.deactivate(0);
+    let retired_key = crate::plan::AttachKey::of(&engine.plan.slots[0]);
+    let fresh_key = crate::plan::AttachKey::of(&candidate.delta.new[0]);
+    assert_ne!(retired_key, fresh_key, "premise: distinct endpoints");
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert_eq!(
+        candidate.delta.new[0]
+            .module_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        retired_modules,
+        "premise: the renewed cover shares the retired slot's module"
+    );
+    let fresh_index = candidate.delta.new[0].index;
+    let mut session = ScriptedSession::default();
+    session
+        .scripted_stamps
+        .insert(engine.plan.slots[0].index, 1);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the scripted detach commits"
+    );
+    assert!(
+        engine.plan.is_active(fresh_index),
+        "premise: the renewed endpoint re-attached"
+    );
+    assert!(
+        engine.coverage_retire_windows.is_empty(),
+        "a paused owned turnover files no window"
+    );
+    assert_eq!(engine.coverage_retired_slots(), 0);
+    assert!(
+        !engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT }),
+        "a paused owned turnover files no gap row: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// The owned-leader-maps-provider capture with a descendant view present:
 /// every slot is owned, so a mid-capture pure retire of attached cover
 /// still files its counted window. (At the witness seam the trigger — a
@@ -2024,6 +2121,126 @@ fn async_global_owned_leader_with_descendant_pure_retire_opens_a_counted_coverag
     assert_eq!(window.modules, retired_modules);
     assert_eq!(window.slots, 2);
     assert_eq!(engine.coverage_retired_slots(), 2);
+}
+
+/// An owned capture with a true descendant view present still files its
+/// pure retire: the descendant (a live child of the owned leader, with
+/// parentage pinned via `/proc/<pid>/status`) does not silence the
+/// window. The refused-source-to-pure-retire handoff — the descendant
+/// worker's pin refusal nuking the shared key, then retiring pure — is
+/// not driven here (the refusal mechanics are trigger scope); this twin
+/// pins the narrower witness seam (a manually assembled pure owned retire
+/// with a true descendant present) pending an owner ruling on whether a
+/// handoff-driving fixture is required.
+#[test]
+fn async_global_owned_with_true_descendant_pure_retire_opens_a_counted_coverage_window() {
+    let owned = std::process::id();
+    let owned_view = ProcessView::open(ProcessViewId(3), owned).unwrap();
+    let modules = snapshot_two_provider_modules(&owned_view);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(owned);
+    engine.next_view_id = 4;
+    engine.views.push(owned_view);
+    engine.owned_run_pid = Some(owned);
+    let pins = pin_test_modules(&engine.views[0], &modules[..1]);
+    let candidate = engine
+        .live_candidate(pins, vec![modules[0].clone()], Vec::new())
+        .unwrap();
+    assert_eq!(
+        candidate.delta.new.len(),
+        1,
+        "premise: the owned cover allocates exactly one slot"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        outcome.accepted(),
+        "premise: the first candidate is accepted whole"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        1,
+        "premise: the owned cover holds one slot"
+    );
+    let guards = e06_spawn_sleeps(1);
+    let descendant_pid = guards[0].pid();
+    let status =
+        std::fs::read_to_string(format!("/proc/{descendant_pid}/status")).unwrap();
+    let ppid = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|ppid| ppid.trim().parse::<u32>().ok())
+        })
+        .unwrap();
+    assert_eq!(
+        ppid, owned,
+        "premise: the added view is a true descendant of the owned leader"
+    );
+    let descendant_view = ProcessView::open(ProcessViewId(4), descendant_pid).unwrap();
+    engine.views.push(descendant_view);
+    engine.next_view_id = 5;
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules[..1]));
+    let mut retire = engine
+        .live_candidate(pins, vec![modules[0].clone()], skipped)
+        .expect("the intact pins offer a candidate");
+    assert!(
+        retire.delta.new.is_empty() && retire.delta.replace.is_empty(),
+        "premise: the retire is pure (no same-apply reattach)"
+    );
+    retire.delta.retire.push(engine.plan.slots[0].clone());
+    retire.plan.deactivate(0);
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    let mut session = ScriptedSession::default();
+    session
+        .scripted_stamps
+        .insert(engine.plan.slots[0].index, 1);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, retire, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the scripted detach commits"
+    );
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "a pure owned retire with a descendant present files its window"
+    );
+    let window = &engine.coverage_retire_windows[0];
+    assert_eq!(window.modules, retired_modules);
+    assert_eq!(window.slots, 1);
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+                && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+        }),
+        "the paired finite gap row files: {:?}",
+        engine.counters.object_skips
+    );
+    let facts = engine.capture_facts();
+    let record = facts
+        .discovery
+        .modules
+        .iter()
+        .find(|record| retired_modules.contains(&record.id))
+        .expect("the retired owner projects a record");
+    assert!(
+        record
+            .unobserved_windows
+            .as_ref()
+            .is_some_and(|windows| windows.iter().any(|window| {
+                window.reason == crate::render::UnobservedReason::CoverageRetired
+            })),
+        "the retired owner's record carries the window: {record:?}"
+    );
 }
 
 /// A same-module mixed retire discloses the darkened endpoint: S1 of M

@@ -1158,7 +1158,9 @@ impl ChurnCondition {
                 self.admitted.insert(pid);
                 if first_churn_a {
                     self.kill_admitting_pass = Some(
-                        self.last_pass.map(|pass| pass.saturating_add(1)).unwrap_or(0),
+                        self.last_pass
+                            .map(|pass| pass.saturating_add(1))
+                            .unwrap_or(0),
                     );
                 }
             }
@@ -1824,8 +1826,7 @@ fn churn_stop_needs_both_exits_not_one() {
     }
     condition.pump();
     assert!(
-        condition.exited.contains(&GUARD_ANCHOR)
-            && condition.exited.contains(&GUARD_CHURN_A),
+        condition.exited.contains(&GUARD_ANCHOR) && condition.exited.contains(&GUARD_CHURN_A),
         "both exit rows are consumed before their marker"
     );
     assert_eq!(
@@ -1916,8 +1917,7 @@ fn churn_stop_refuses_exits_buffered_before_kill_request() {
         );
         assert!(condition.churn_c.is_some(), "churn-C birth is visible");
         assert!(
-            condition.exited.contains(&GUARD_ANCHOR)
-                && condition.exited.contains(&GUARD_CHURN_A),
+            condition.exited.contains(&GUARD_ANCHOR) && condition.exited.contains(&GUARD_CHURN_A),
             "both buffered exits are consumed in the request tick"
         );
         assert_eq!(
@@ -1972,8 +1972,7 @@ fn churn_stop_ignores_terminal_marker() {
     std::fs::write(&condition.events, &terminal).unwrap();
     condition.pump();
     assert!(
-        condition.exited.contains(&GUARD_ANCHOR)
-            && condition.exited.contains(&GUARD_CHURN_A),
+        condition.exited.contains(&GUARD_ANCHOR) && condition.exited.contains(&GUARD_CHURN_A),
         "both exits are consumed under the terminal marker"
     );
     assert_eq!(

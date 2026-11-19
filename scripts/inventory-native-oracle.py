@@ -5550,6 +5550,69 @@ def self_test():
             return {"events": _account(ev, +2)}
         case("jsonl-edge-folded-saturated-sum", None,
              folded_edge_saturated_sum)
+        def folded_edge_count_out_of_range(s, d, dash):
+            # One folded edge whose streamed count exceeds u64::MAX
+            # while its module aggregate sits at the max: the saturating
+            # sum must not clip the invalid count into agreement.
+            max64 = (1 << 64) - 1
+            kw = folded_edge_exact(s, d, dash)
+            staged = next(e for e in kw["events"] if e["kind"] == "edge_observed"
+                          and e["event"].get("caller") == "c900")
+            staged["event"]["entries"]["count"] = max64 + 1
+            module = next(m for m in d["modules"] if m["id"] == staged["event"]["module"])
+            module["departed_use"] = {"edges": 1,
+                                      "entries": {"count": max64, "saturated": 0}}
+            return kw
+        case("jsonl-edge-folded-count-out-of-range", "AGREE-EDGE-EVENTS",
+             folded_edge_count_out_of_range)
+        def folded_edge_global_only(s, d, dash):
+            # All edges folded with zero edge_observed records and no
+            # module departed summary: only the global folded-budget
+            # comparison can fire here.
+            d["edges"] = []
+            d["budgets"]["callers"].update(retired=1, late_refused=0)
+            d["budgets"].setdefault("edges", {}).update(folded=1)
+            extra = [("caller_event", {"event": "admitted", "caller": "c900"}),
+                     ("caller_event", {"event": "retired", "caller": "c900",
+                                       "reason": "synthetic retirement"})]
+            return {"events": s.events(d, True, extra)}
+        case("jsonl-edge-folded-global-only", "AGREE-EDGE-EVENTS",
+             folded_edge_global_only)
+        def folded_edge_module_only(s, d, dash):
+            # Two folded edges on two modules with a correct global
+            # total: one module's entries sum disagrees, so only the
+            # module guard fires.
+            gone, gone2 = "c900", "c901"
+            d["budgets"]["callers"].update(retired=2, late_refused=0)
+            d["budgets"].setdefault("edges", {}).update(folded=2)
+            extra = [("caller_event", {"event": "admitted", "caller": gone}),
+                     ("caller_event", {"event": "retired", "caller": gone,
+                                       "reason": "synthetic retirement"}),
+                     ("caller_event", {"event": "admitted", "caller": gone2}),
+                     ("caller_event", {"event": "retired", "caller": gone2,
+                                       "reason": "synthetic retirement"})]
+            ev = s.events(d, True, extra)
+            model = next(e for e in ev if e["kind"] == "edge_observed")
+            at = next(i for i, e in enumerate(ev) if e["kind"] == "edge_observed")
+            other = next(m for m in d["modules"] if m["id"] != model["event"]["module"])
+            first = _deep(model)
+            first["event"]["caller"] = gone
+            second = _deep(model)
+            second["event"]["caller"] = gone2
+            second["event"]["module"] = other["id"]
+            ev.insert(at + 1, first)
+            ev.insert(at + 2, second)
+            exact = next(m for m in d["modules"] if m["id"] == first["event"]["module"])
+            exact["departed_use"] = {
+                "edges": 1,
+                "entries": {"count": first["event"]["entries"]["count"], "saturated": 0}}
+            stale = next(m for m in d["modules"] if m["id"] == second["event"]["module"])
+            stale["departed_use"] = {
+                "edges": 1,
+                "entries": {"count": second["event"]["entries"]["count"] + 5, "saturated": 0}}
+            return {"events": _account(ev, +2)}
+        case("jsonl-edge-folded-module-only", "AGREE-EDGE-EVENTS",
+             folded_edge_module_only)
         case("jsonl-edge-folded-unaccounted", "AGREE-EDGE-EVENTS",
              lambda s, d, dash: folded_edge(s, d, dash, folded=0))
         case("jsonl-edge-folded-overcounted", "AGREE-EDGE-EVENTS",

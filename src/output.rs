@@ -1825,7 +1825,7 @@ fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf
         Err(first) => {
             #[cfg(test)]
             if std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR")
-                .is_some_and(|dir| PathBuf::from(dir) == base)
+                .is_some_and(|dir| dir == base.as_os_str())
             {
                 return Err(first);
             }

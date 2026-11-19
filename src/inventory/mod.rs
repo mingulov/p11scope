@@ -62,6 +62,7 @@ use anyhow::{Context as _, Result};
 #[cfg(test)]
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

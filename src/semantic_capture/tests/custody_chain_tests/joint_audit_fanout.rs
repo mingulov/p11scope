@@ -18120,6 +18120,51 @@ fn joint_watchdog_recovery_scopes_to_the_stuck_session() {
     );
 }
 
+// Doc-accuracy pins (scoped watchdog recovery): the operator doc
+// must describe the scoped behavior the table above pins — loss
+// scoped to the stuck session, running audit trips re-arming, and
+// the parked-consumer gap — never the pre-refactor whole-view stop.
+const WATCHDOG_KNOWN_LIMITATIONS_MD: &str =
+    include_str!("../../../../docs/known-limitations.md");
+
+#[test]
+fn known_limitations_scopes_watchdog_loss_to_the_stuck_session() {
+    assert!(
+        !WATCHDOG_KNOWN_LIMITATIONS_MD.contains("lose per-key rows for the rest of the run"),
+        "the whole-view stop claim must not return"
+    );
+    assert!(
+        WATCHDOG_KNOWN_LIMITATIONS_MD.contains("only the stuck session loses its per-key detail"),
+        "the scoped loss is disclosed"
+    );
+    assert!(
+        WATCHDOG_KNOWN_LIMITATIONS_MD
+            .contains("only the stuck session's waiting calls are affected"),
+        "the running re-arm discards only the stuck session"
+    );
+}
+
+#[test]
+fn known_limitations_names_the_parked_consumer_gap() {
+    assert!(
+        WATCHDOG_KNOWN_LIMITATIONS_MD.contains("joint stuck consumer parked"),
+        "the parked-consumer gap subject is disclosed"
+    );
+}
+
+#[test]
+fn known_limitations_running_audit_trips_rearm() {
+    assert!(
+        !WATCHDOG_KNOWN_LIMITATIONS_MD.contains("This ends tracking"),
+        "a running audit trip re-arms instead of ending tracking"
+    );
+    assert!(
+        WATCHDOG_KNOWN_LIMITATIONS_MD
+            .contains("the lane re-arms past the trip with the stuck session's loss counted"),
+        "the audit-trip re-arm is disclosed"
+    );
+}
+
 /// Storm twin: a dense burst of re-arms back to back still stops.
 /// Thirty-two re-arms at one posed instant spend the window; the
 /// next refusal keeps the latch and names the spent rate bound.

@@ -731,6 +731,26 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// fold and servicing removals share it).
     #[cfg(test)]
     recovery_order_search_visits: u64,
+    /// Caller edges touched while folding (test count): every
+    /// per-edge pass of the commit counts, so the admitted preflight
+    /// (one unit per edge) holds only when each edge folds once.
+    #[cfg(test)]
+    fold_edge_commit_visits: u64,
+    /// Caller instances touched while folding (test count): every
+    /// per-instance pass of the commit counts, so the admitted
+    /// preflight (one unit per instance) holds only when each folds
+    /// once.
+    #[cfg(test)]
+    fold_instance_commit_visits: u64,
+    /// Pair targets dropped by caller folds (test count).
+    #[cfg(test)]
+    fold_pair_drop_visits: u64,
+    /// Stranded pair recoveries settled by caller folds (test count).
+    #[cfg(test)]
+    fold_pair_settle_visits: u64,
+    /// Departed identities inserted by caller folds (test count).
+    #[cfg(test)]
+    fold_commit_identity_inserts: u64,
     /// Edges examined while sizing fold admission (test count): the
     /// stop-paced member pre-index, never a per-caller range scan.
     #[cfg(test)]
@@ -1513,6 +1533,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             fold_pair_recovery_visits: 0,
             #[cfg(test)]
             recovery_order_search_visits: 0,
+            #[cfg(test)]
+            fold_edge_commit_visits: 0,
+            #[cfg(test)]
+            fold_instance_commit_visits: 0,
+            #[cfg(test)]
+            fold_pair_drop_visits: 0,
+            #[cfg(test)]
+            fold_pair_settle_visits: 0,
+            #[cfg(test)]
+            fold_commit_identity_inserts: 0,
             #[cfg(test)]
             fold_edge_sizing_visits: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -5822,6 +5852,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// suspended pair pins the exited caller afterwards. Shared by the
     /// atomic fold and the staged slices.
     fn drop_pair_target_for_fold(&mut self, key: PairKey, pairs: &mut PairFoldWork) {
+        #[cfg(test)]
+        {
+            self.fold_pair_drop_visits = self.fold_pair_drop_visits.saturating_add(1);
+        }
         let (base, base_since) = self.pair_drop_base(&key);
         let _ = self.take_pruned_pair_base(&key);
         self.pair_targets
@@ -5835,6 +5869,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Settle one stranded recovery for a caller fold, disclosing any
     /// withheld range. Shared by the atomic fold and the staged slices.
     fn settle_stranded_recovery_for_fold(&mut self, key: PairKey, pairs: &mut PairFoldWork) {
+        #[cfg(test)]
+        {
+            self.fold_pair_settle_visits = self.fold_pair_settle_visits.saturating_add(1);
+        }
         let Some(recovery) = self.recoveries.remove(&key) else {
             return;
         };
@@ -5860,6 +5898,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         refused_set: &BTreeSet<CallerId>,
         now_ns: u64,
     ) -> Option<(u64, bool)> {
+        #[cfg(test)]
+        {
+            self.fold_edge_commit_visits = self.fold_edge_commit_visits.saturating_add(1);
+        }
         let edge = self.registry.edge(caller, module)?;
         let coverage = self.presented_coverage(edge);
         let observation = self.registry.entry_observation_for(edge, &coverage);
@@ -5897,6 +5939,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         instance: RegistryInstanceId,
         now_ns: u64,
     ) -> Option<(ModuleId, bool, bool)> {
+        #[cfg(test)]
+        {
+            self.fold_instance_commit_visits = self.fold_instance_commit_visits.saturating_add(1);
+        }
         let taken = self.registry.take_instance_for_fold(instance)?;
         let joined = taken
             .semantic
@@ -5963,6 +6009,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .as_ref()
             .and_then(|metadata| metadata.status(id));
         for module in edge_modules.union(instance_modules) {
+            #[cfg(test)]
+            {
+                self.fold_commit_identity_inserts =
+                    self.fold_commit_identity_inserts.saturating_add(1);
+            }
             self.registry.insert_departed_identity(
                 *module,
                 DepartedIdentity {
@@ -6091,6 +6142,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn recovery_order_search_visits_for_test(&self) -> u64 {
         self.recovery_order_search_visits
+    }
+
+    /// Test-only: caller edges touched while folding.
+    #[cfg(test)]
+    pub(crate) fn fold_edge_commit_visits_for_test(&self) -> u64 {
+        self.fold_edge_commit_visits
+    }
+
+    /// Test-only: caller instances touched while folding.
+    #[cfg(test)]
+    pub(crate) fn fold_instance_commit_visits_for_test(&self) -> u64 {
+        self.fold_instance_commit_visits
+    }
+
+    /// Test-only: pair targets dropped by caller folds.
+    #[cfg(test)]
+    pub(crate) fn fold_pair_drop_visits_for_test(&self) -> u64 {
+        self.fold_pair_drop_visits
+    }
+
+    /// Test-only: stranded pair recoveries settled by caller folds.
+    #[cfg(test)]
+    pub(crate) fn fold_pair_settle_visits_for_test(&self) -> u64 {
+        self.fold_pair_settle_visits
+    }
+
+    /// Test-only: departed identities inserted by caller folds.
+    #[cfg(test)]
+    pub(crate) fn fold_commit_identity_inserts_for_test(&self) -> u64 {
+        self.fold_commit_identity_inserts
     }
 
     /// Test-only: summed bases in the departed dropped-pair aggregate.
@@ -6798,6 +6879,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut active = false;
         let mut refused_backend = false;
         for edge in self.registry.edges_of(id) {
+            #[cfg(test)]
+            {
+                self.fold_edge_commit_visits = self.fold_edge_commit_visits.saturating_add(1);
+            }
             if ctx.forwarding.contains(&edge.module) {
                 continue;
             }
@@ -6819,6 +6904,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .edges_of(id)
             .map(|edge| (edge.caller, edge.module))
             .collect();
+        #[cfg(test)]
+        {
+            self.fold_edge_commit_visits = self
+                .fold_edge_commit_visits
+                .saturating_add(edge_keys.len() as u64);
+        }
         let mut entries = 0u64;
         let mut had_claims = false;
         let mut edge_modules = BTreeSet::new();
@@ -6845,6 +6936,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .get(&id)
             .cloned()
             .unwrap_or_default();
+        #[cfg(test)]
+        {
+            self.fold_instance_commit_visits = self
+                .fold_instance_commit_visits
+                .saturating_add(instance_ids.len() as u64);
+        }
         let mut instance_modules = BTreeSet::new();
         let mut folded_instances = Vec::new();
         let mut joined = false;
@@ -27374,6 +27471,1859 @@ exit 0
             })
             .sum();
         assert_eq!(dropped_base, 10, "the staged base lands exactly once");
+    }
+
+    /// Stage one exited caller with exact member counts for a staged-cutoff
+    /// twin: `binder` cookie sequences plus small counts of every other
+    /// member kind. The helper leaves the registry unpublished and the
+    /// row unnoted; the twin publishes and notes.
+    fn stage_cutoff_caller(
+        native: &mut NativeScene,
+        pid: u32,
+        binder: u64,
+        targets: u64,
+        recoveries: u64,
+        edges: u64,
+        instances: u64,
+        summaries: u32,
+    ) -> CallerId {
+        let domain = native.domain;
+        // Globally keyed members (sequences, pairs, instances) salt by pid
+        // so two heavies share one scene without colliding; edges and
+        // summaries key per caller already.
+        let salt = u64::from(pid) * 1_000_000;
+        let heavy = stage_exited_caller(native, pid, 100);
+        for sequence in 0..binder {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                salt + 100 + sequence,
+                sequence,
+                Some(heavy),
+            );
+        }
+        for target in 0..targets {
+            let key = PairKey::scripted(domain, salt + 500 + target, target, target as u32);
+            native.scene.coordinator.pair_targets.insert(
+                key,
+                PairTarget::scripted_bound(
+                    heavy,
+                    ModuleKey::physical(8, 1, 7000, None, "/fold/cutoff-pair.so"),
+                    0,
+                    10,
+                    10,
+                ),
+            );
+            native.scene.coordinator.recovery_order.push(key);
+        }
+        for recovery in 0..recoveries {
+            let key = PairKey::scripted(domain, salt + 1500 + recovery, recovery, recovery as u32);
+            native
+                .scene
+                .coordinator
+                .recoveries
+                .insert(key, PairRecovery::scripted(heavy, 0, ModuleId(3)));
+            native.scene.coordinator.recovery_order.push(key);
+        }
+        for edge in 0..edges {
+            native
+                .scene
+                .coordinator
+                .registry_mut()
+                .scripted_module_edge(
+                    ModuleKey::physical(8, 1, 7000 + edge, None, "/fold/cutoff.so"),
+                    heavy,
+                );
+        }
+        for slot in 0..instances {
+            let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+                domain,
+                p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: salt + 300 + slot,
+                    exec_id: 1,
+                },
+                crate::discovery::instances::InstanceId::from_raw(salt + 7 + slot),
+                ModuleKey::physical(8, 1, 7000, None, "/fold/cutoff.so"),
+            );
+            native.scene.coordinator.registry_mut().note_instance(
+                crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(
+                    key, heavy,
+                ),
+            );
+        }
+        for object in 0..summaries {
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .count_ownership
+                    .register_pair(heavy, object),
+                "the summary fits"
+            );
+        }
+        heavy
+    }
+
+    /// Count pair targets of the heavy caller still in a live (non-dropped)
+    /// variant.
+    fn live_pair_targets_for_cutoff(native: &NativeScene, heavy: CallerId) -> usize {
+        native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .filter(|target| match target {
+                PairTarget::Dropped { .. } => false,
+                PairTarget::Bound { caller, .. }
+                | PairTarget::Pending { caller, .. }
+                | PairTarget::Suspended { caller, .. } => *caller == heavy,
+            })
+            .count()
+    }
+
+    /// Assert the normal publication still shows the staged caller in its
+    /// old coherent state: the row present with every edge live and no
+    /// departed aggregate anywhere.
+    fn assert_cutoff_publication_coherent(native: &NativeScene, heavy: CallerId, edges: usize) {
+        let passes = native.scene.coordinator.passes();
+        let view = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "workload",
+            0,
+            300,
+            passes,
+        );
+        assert!(
+            view.callers.iter().any(|caller| caller.id == heavy),
+            "the publication still carries the staged row"
+        );
+        assert_eq!(
+            view.edges
+                .iter()
+                .filter(|edge| edge.caller == heavy)
+                .count(),
+            edges,
+            "the publication still carries every staged edge live"
+        );
+        assert!(
+            view.modules.iter().all(
+                |module| module
+                    .departed_use
+                    .as_ref()
+                    .is_none_or(|departed| departed.edges == 0
+                        && departed.instances_folded == 0
+                        && departed.identities.is_empty())
+            ),
+            "the publication carries no departed aggregate for the staged row"
+        );
+    }
+
+    /// Staged-cutoff twin (pairs): the first slice pauses 86 pair
+    /// targets into a staged oversized fold. The paused stage leaves
+    /// every live row untouched: the publication between slices shows
+    /// the old coherent caller, a stop there keeps it, and the quiet
+    /// resume publishes the complete fold exactly once.
+    #[test]
+    fn fold_staged_cutoff_in_pairs_keeps_live_state_coherent() {
+        const BINDER: u64 = 65_450;
+        const TARGETS: u64 = 100;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5030, BINDER, TARGETS, 5, 5, 5, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        let stage = native
+            .scene
+            .coordinator
+            .staged_fold
+            .as_ref()
+            .expect("the oversized caller stages");
+        assert!(
+            stage.binder_keys.is_empty(),
+            "the first slice clears the binder lists"
+        );
+        assert_eq!(
+            stage.pair_targets.len(),
+            14,
+            "the first slice pauses 86 targets into the pair lists"
+        );
+        assert_eq!(
+            stage.pair_recoveries.len(),
+            5,
+            "recoveries wait past the pair cutoff"
+        );
+        assert_eq!(stage.edge_keys.len(), 5, "edges wait past the pair cutoff");
+        assert_eq!(
+            stage.instance_ids.len(),
+            5,
+            "instances wait past the pair cutoff"
+        );
+        assert_eq!(
+            stage.summary_keys.len(),
+            5,
+            "summaries wait past the pair cutoff"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "every staged sequence stays bound past the slice"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            TARGETS as usize,
+            "every staged target stays live past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.recoveries.len(),
+            5,
+            "every staged recovery waits past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            5,
+            "every staged edge stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            5,
+            "every staged instance stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            5,
+            "every staged summary waits past the slice"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (0, 0),
+            "no departed aggregate accrues before the commit"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            0,
+            "no row retires before the commit"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the staged row waits carried"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the staged row waits past the slice"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, 5);
+        let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&wired));
+        wired.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stop at the cutoff publishes nothing"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, 5);
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the stopped row keeps its facts"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the stopped stage waits for its resume"
+        );
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            1,
+            "the quiet resume publishes the completed fold once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            0,
+            "every staged target drops"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every staged edge folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            0,
+            "every staged instance folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "every staged summary clears"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the completed fold retires exactly one row"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (5, 5),
+            "the completed fold aggregates every edge and instance"
+        );
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(
+            dropped_base,
+            10 * TARGETS,
+            "every staged base lands exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            5,
+            "the completed fold names the caller on every touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cutoff twin (edges): the first slice pauses 76 edges
+    /// into a staged oversized fold. The paused stage leaves every
+    /// live row untouched: the publication between slices shows the
+    /// old coherent caller, a stop there keeps it, and the quiet
+    /// resume publishes the complete fold exactly once.
+    #[test]
+    fn fold_staged_cutoff_in_edges_keeps_live_state_coherent() {
+        const BINDER: u64 = 65_450;
+        const EDGES: u64 = 100;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5031, BINDER, 5, 5, EDGES, 5, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        let stage = native
+            .scene
+            .coordinator
+            .staged_fold
+            .as_ref()
+            .expect("the oversized caller stages");
+        assert!(
+            stage.binder_keys.is_empty(),
+            "the first slice clears the binder lists"
+        );
+        assert!(
+            stage.pair_targets.is_empty(),
+            "the first slice clears the pair targets"
+        );
+        assert!(
+            stage.pair_recoveries.is_empty(),
+            "the first slice clears the pair recoveries"
+        );
+        assert_eq!(
+            stage.edge_keys.len(),
+            24,
+            "the first slice pauses 76 edges into the edge list"
+        );
+        assert_eq!(
+            stage.instance_ids.len(),
+            5,
+            "instances wait past the edge cutoff"
+        );
+        assert_eq!(
+            stage.summary_keys.len(),
+            5,
+            "summaries wait past the edge cutoff"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "every staged sequence stays bound past the slice"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            5,
+            "every staged target stays live past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.recoveries.len(),
+            5,
+            "every staged recovery waits past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            EDGES as usize,
+            "every staged edge stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            5,
+            "every staged instance stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            5,
+            "every staged summary waits past the slice"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (0, 0),
+            "no departed aggregate accrues before the commit"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            0,
+            "no row retires before the commit"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the staged row waits carried"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the staged row waits past the slice"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, EDGES as usize);
+        let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&wired));
+        wired.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stop at the cutoff publishes nothing"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, EDGES as usize);
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the stopped row keeps its facts"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the stopped stage waits for its resume"
+        );
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            1,
+            "the quiet resume publishes the completed fold once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            0,
+            "every staged target drops"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every staged edge folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            0,
+            "every staged instance folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "every staged summary clears"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the completed fold retires exactly one row"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (EDGES, 5),
+            "the completed fold aggregates every edge and instance"
+        );
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(dropped_base, 50, "every staged base lands exactly once");
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            EDGES,
+            "the completed fold names the caller on every touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cutoff twin (instances): the first slice pauses 71
+    /// instances into a staged oversized fold. The paused stage leaves
+    /// every live row untouched: the publication between slices shows
+    /// the old coherent caller, a stop there keeps it, and the quiet
+    /// resume publishes the complete fold exactly once.
+    #[test]
+    fn fold_staged_cutoff_in_instances_keeps_live_state_coherent() {
+        const BINDER: u64 = 65_450;
+        const INSTANCES: u64 = 100;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5032, BINDER, 5, 5, 5, INSTANCES, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        let stage = native
+            .scene
+            .coordinator
+            .staged_fold
+            .as_ref()
+            .expect("the oversized caller stages");
+        assert!(
+            stage.binder_keys.is_empty(),
+            "the first slice clears the binder lists"
+        );
+        assert!(
+            stage.pair_targets.is_empty(),
+            "the first slice clears the pair targets"
+        );
+        assert!(
+            stage.pair_recoveries.is_empty(),
+            "the first slice clears the pair recoveries"
+        );
+        assert!(
+            stage.edge_keys.is_empty(),
+            "the first slice clears the edge list"
+        );
+        assert_eq!(
+            stage.instance_ids.len(),
+            29,
+            "the first slice pauses 71 instances into the instance list"
+        );
+        assert_eq!(
+            stage.summary_keys.len(),
+            5,
+            "summaries wait past the instance cutoff"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "every staged sequence stays bound past the slice"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            5,
+            "every staged target stays live past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.recoveries.len(),
+            5,
+            "every staged recovery waits past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            5,
+            "every staged edge stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            INSTANCES as usize,
+            "every staged instance stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            5,
+            "every staged summary waits past the slice"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (0, 0),
+            "no departed aggregate accrues before the commit"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            0,
+            "no row retires before the commit"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the staged row waits carried"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the staged row waits past the slice"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, 5);
+        let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&wired));
+        wired.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stop at the cutoff publishes nothing"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, 5);
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the stopped row keeps its facts"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the stopped stage waits for its resume"
+        );
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            1,
+            "the quiet resume publishes the completed fold once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            0,
+            "every staged target drops"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every staged edge folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            0,
+            "every staged instance folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "every staged summary clears"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the completed fold retires exactly one row"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (5, INSTANCES),
+            "the completed fold aggregates every edge and instance"
+        );
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(dropped_base, 50, "every staged base lands exactly once");
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            5,
+            "the completed fold names the caller on every touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cutoff twin (summaries): the first slice pauses 66
+    /// summaries into a staged oversized fold. The paused stage leaves
+    /// every live row untouched: the publication between slices shows
+    /// the old coherent caller, a stop there keeps it, and the quiet
+    /// resume publishes the complete fold exactly once.
+    #[test]
+    fn fold_staged_cutoff_in_summaries_keeps_live_state_coherent() {
+        const BINDER: u64 = 65_450;
+        const SUMMARIES: u32 = 100;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5033, BINDER, 5, 5, 5, 5, SUMMARIES);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        let stage = native
+            .scene
+            .coordinator
+            .staged_fold
+            .as_ref()
+            .expect("the oversized caller stages");
+        assert!(
+            stage.binder_keys.is_empty(),
+            "the first slice clears the binder lists"
+        );
+        assert!(
+            stage.pair_targets.is_empty(),
+            "the first slice clears the pair targets"
+        );
+        assert!(
+            stage.pair_recoveries.is_empty(),
+            "the first slice clears the pair recoveries"
+        );
+        assert!(
+            stage.edge_keys.is_empty(),
+            "the first slice clears the edge list"
+        );
+        assert!(
+            stage.instance_ids.is_empty(),
+            "the first slice clears the instance list"
+        );
+        assert_eq!(
+            stage.summary_keys.len(),
+            34,
+            "the first slice pauses 66 summaries into the summary list"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "every staged sequence stays bound past the slice"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            5,
+            "every staged target stays live past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.recoveries.len(),
+            5,
+            "every staged recovery waits past the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            5,
+            "every staged edge stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            5,
+            "every staged instance stays live past the slice"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            SUMMARIES as usize,
+            "every staged summary waits past the slice"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (0, 0),
+            "no departed aggregate accrues before the commit"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            0,
+            "no row retires before the commit"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the staged row waits carried"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the staged row waits past the slice"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, 5);
+        let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&wired));
+        wired.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stop at the cutoff publishes nothing"
+        );
+        assert_cutoff_publication_coherent(&native, heavy, 5);
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the stopped row keeps its facts"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the stopped stage waits for its resume"
+        );
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            1,
+            "the quiet resume publishes the completed fold once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            0,
+            "every staged target drops"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every staged edge folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            0,
+            "every staged instance folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "every staged summary clears"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the completed fold retires exactly one row"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (5, 5),
+            "the completed fold aggregates every edge and instance"
+        );
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(dropped_base, 50, "every staged base lands exactly once");
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            5,
+            "the completed fold names the caller on every touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-entry twin: both paths into a staged resume — the fresh
+    /// stage on its staging pass and the open stage on its resume pass —
+    /// check the wired stop before rehearsing a single member. A trip at
+    /// either entry pauses with every live row untouched and the stage
+    /// waiting; the quiet passes then complete the fold exactly once.
+    /// The edge-free scene keeps planning identical across the fix, so
+    /// the trip checks below pin both entries.
+    #[test]
+    fn fold_staged_mutation_entries_check_stop_before_rehearsing() {
+        const BINDER: u64 = 65_500;
+        // Staging-pass trip check: entry gate + 1,025 planning laps + row
+        // gate + 1,025 staging laps, then the first resume check. The
+        // resume-pass trip needs no staging term.
+        const STAGING_ARM_TRIP: u64 = 2053;
+        const RESUME_ARM_TRIP: u64 = 1027;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5034, BINDER, 50, 10, 0, 0, 10);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > STAGING_ARM_TRIP - 1
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            0,
+            "a stop at the fresh stage entry publishes nothing"
+        );
+        assert_eq!(
+            checks.get(),
+            STAGING_ARM_TRIP,
+            "the trip fires at the fresh stage entry"
+        );
+        let stage = native
+            .scene
+            .coordinator
+            .staged_fold
+            .as_ref()
+            .expect("the trip lands past staging, at the resume entry");
+        assert_eq!(
+            stage.binder_keys.len(),
+            BINDER as usize,
+            "the fresh stage entry rehearses no sequence"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "every staged sequence stays bound past the entry trip"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            50,
+            "every staged target stays live past the entry trip"
+        );
+        // The open stage's resume entry (no row gate and no staging
+        // collection precede it): the same trip pauses with nothing
+        // rehearsed.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > RESUME_ARM_TRIP - 1
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(400, None, &stop)
+                .retired,
+            0,
+            "a stop at the open stage entry publishes nothing"
+        );
+        assert_eq!(
+            checks.get(),
+            RESUME_ARM_TRIP,
+            "the trip fires at the open stage entry"
+        );
+        let stage = native
+            .scene
+            .coordinator
+            .staged_fold
+            .as_ref()
+            .expect("the entry trip keeps the stage waiting");
+        assert_eq!(
+            stage.binder_keys.len(),
+            BINDER as usize,
+            "the open stage entry rehearses no sequence"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "every staged sequence stays bound past the resume trip"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the staged row waits past the entry trips"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            0,
+            "the next slice still publishes nothing"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            1,
+            "the quiet passes complete the fold once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(700, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cancel twin (missing member): a staged summary removed
+    /// behind the open stage cancels it — the pass publishes nothing,
+    /// the row waits carried with its remaining evidence — and the next
+    /// pass restages from current truth and folds exactly once.
+    #[test]
+    fn fold_staged_cancel_on_missing_member_restages_exact() {
+        const BINDER: u64 = 65_450;
+        const SUMMARIES: u32 = 100;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5035, BINDER, 5, 5, 5, 5, SUMMARIES);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the oversized caller stages"
+        );
+        native
+            .scene
+            .coordinator
+            .count_ownership
+            .remove_summary(&(heavy, 0));
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stage that lost a member publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_none(),
+            "the diverged stage cancels instead of folding stale keys"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the cancelled row waits carried"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            (SUMMARIES - 1) as usize,
+            "the cancelled row keeps its remaining summaries"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the cancelled row keeps its facts"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            0,
+            "the restaged slice still publishes nothing"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            1,
+            "the restaged fold publishes once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "every remaining summary clears"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the restaged fold retires exactly one row"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(700, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cancel twin (late member): an edge admitted behind the open
+    /// stage cancels it — the pass publishes nothing and the row waits
+    /// carried — and the next pass restages over the fuller truth and
+    /// folds every edge exactly once.
+    #[test]
+    fn fold_staged_cancel_on_late_member_restages_exact() {
+        const BINDER: u64 = 65_450;
+        const EDGES: u64 = 100;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5036, BINDER, 5, 5, EDGES, 5, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the oversized caller stages"
+        );
+        native
+            .scene
+            .coordinator
+            .registry_mut()
+            .scripted_module_edge(
+                ModuleKey::physical(8, 1, 7000 + EDGES, None, "/fold/cutoff.so"),
+                heavy,
+            );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stage behind a late edge publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_none(),
+            "the diverged stage cancels instead of folding stale keys"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the cancelled row waits carried"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            (EDGES + 1) as usize,
+            "the cancelled row keeps every edge including the late one"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            0,
+            "the restaged slice still publishes nothing"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            1,
+            "the restaged fold publishes once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every edge including the late one folds"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            totals.edges,
+            EDGES + 1,
+            "the restaged fold aggregates every edge"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the restaged fold retires exactly one row"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(700, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cancel twin (lost certification): a row referenced behind
+    /// its open stage cancels it — the pass publishes nothing — and once
+    /// unreferenced and re-noted the row restages and folds exactly once.
+    #[test]
+    fn fold_staged_cancel_on_lost_certification_restages_exact() {
+        const BINDER: u64 = 65_450;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5037, BINDER, 100, 5, 5, 5, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the oversized caller stages"
+        );
+        native
+            .scene
+            .coordinator
+            .pending_adjudication
+            .insert(heavy, 5037);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stage behind a referenced row publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_none(),
+            "the uncertified stage cancels instead of folding"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the cancelled row keeps its facts"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "the cancelled row keeps its sequences"
+        );
+        native.scene.coordinator.pending_adjudication.remove(&heavy);
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            0,
+            "the restaged slice still publishes nothing"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            1,
+            "the restaged fold publishes once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the restaged fold retires exactly one row"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(700, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-cancel twin (binder veto): a pending binder row staged behind
+    /// the open stage cancels it — the pass publishes nothing and the row
+    /// waits carried — and once drained the row restages and folds exactly
+    /// once.
+    #[test]
+    fn fold_staged_cancel_on_binder_veto_restages_exact() {
+        const BINDER: u64 = 65_450;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5038, BINDER, 5, 5, 5, 5, 100);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a paused stage publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_some(),
+            "the oversized caller stages"
+        );
+        let domain = native.domain;
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_pending_sighting_for_test(domain, heavy, 9100);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "a stage behind a vetoed row publishes nothing"
+        );
+        assert!(
+            native.scene.coordinator.staged_fold.is_none(),
+            "the vetoed stage cancels instead of folding"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the cancelled row waits carried"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the cancelled row keeps its facts"
+        );
+        native
+            .scene
+            .coordinator
+            .binder
+            .drain_pending_for_test(domain);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            0,
+            "the restaged slice still publishes nothing"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            1,
+            "the restaged fold publishes once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            1,
+            "the restaged fold retires exactly one row"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(700, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Admission-cost twin: a 63-unit caller costs exactly one credit
+    /// and folds beside 1,022 single-credit siblings, while a 64-unit
+    /// caller costs two and waits for the next window. Every member of
+    /// the admitted callers folds exactly once — the charged
+    /// cardinality covers the actual per-member passes.
+    #[test]
+    fn fold_admitted_caller_near_credit_boundary_applies_each_member_once() {
+        const SIBLINGS: u32 = 1022;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut ids = Vec::new();
+        for caller in 0..SIBLINGS {
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                10_000 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        // A: 20 sequences + 5 targets + 5 recoveries + 20 edges +
+        // 8 instances + 5 summaries = 63 units = 1 credit.
+        let heavy_a = stage_cutoff_caller(&mut native, 7000, 20, 5, 5, 20, 8, 5);
+        // B: the same plus one summary = 64 units = 2 credits.
+        let heavy_b = stage_cutoff_caller(&mut native, 7001, 20, 5, 5, 20, 8, 6);
+        ids.push(heavy_a);
+        ids.push(heavy_b);
+        assert_eq!(
+            ids.iter().max(),
+            Some(&heavy_b),
+            "the boundary callers sort last, A before B"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            u64::from(SIBLINGS) + 1,
+            "one credit admits the 63-unit caller beside its siblings"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy_b).is_some(),
+            "the 64-unit caller waits past the credit boundary"
+        );
+        let owners = native
+            .scene
+            .coordinator
+            .binder
+            .cookie_bound_owners_for_test();
+        assert_eq!(owners.len(), 20, "the waiting row keeps its sequences");
+        assert!(
+            owners.iter().all(|owner| *owner == heavy_b),
+            "no other row loses evidence to the pass"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_edge_commit_visits_for_test(),
+            20,
+            "each admitted edge folds exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_instance_commit_visits_for_test(),
+            8,
+            "each admitted instance folds exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_fold_visits_for_test(),
+            5,
+            "each admitted summary clears exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .fold_sequence_visits_for_test(),
+            u64::from(SIBLINGS) + 20,
+            "each admitted sequence clears exactly once"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_pair_drop_visits_for_test(),
+            5,
+            "each admitted target drops exactly once"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_pair_settle_visits_for_test(),
+            5,
+            "each admitted recovery settles exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            20,
+            "the admitted fold names the caller once per touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the remainder resumes without a re-note"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy_b).is_none(),
+            "the waiting row eventually folds"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_edge_commit_visits_for_test(),
+            40,
+            "both boundary callers fold each edge exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_instance_commit_visits_for_test(),
+            16,
+            "both boundary callers fold each instance exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_fold_visits_for_test(),
+            11,
+            "both boundary callers clear each summary exactly once"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .fold_sequence_visits_for_test(),
+            u64::from(SIBLINGS) + 40,
+            "both boundary callers clear each sequence exactly once"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            u64::from(SIBLINGS) + 2,
+            "every row publishes exactly once"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (40, 16),
+            "the boundary folds aggregate every member"
+        );
     }
 
     /// Tombstone-occupancy fixture: fold seven callers with semantic

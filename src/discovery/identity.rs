@@ -10400,7 +10400,7 @@ impl ClaimAuthority {
 /// manifest absorption without moving manifest authority between scan peers.
 /// Files claims for every bound module: only for fresh-scan binds with no
 /// carried modules. Candidate rebuilds use
-/// [`bind_scanned_modules_strict_gated`].
+/// `bind_scanned_modules_strict_gated` (crate-internal).
 pub fn bind_scanned_modules(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,

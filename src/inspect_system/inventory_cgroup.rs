@@ -1086,8 +1086,9 @@ pub(crate) fn collect_with(
             Path::new("/proc"),
             cap,
             &mut budget,
-            // Cgroup transactions carry no cross-pass scanned set.
-            &BTreeSet::new(),
+            // Cgroup transactions carry no cross-pass cursor: one
+            // transaction scans once, so tiers stay empty.
+            &crate::discovery::scan_pass::MemberTiers::default(),
         );
     }
     let mut noise = DiscoveryNoiseAggregator::default();

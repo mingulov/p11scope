@@ -3661,7 +3661,10 @@ fn k1_no_route_collect_row(
     };
     for pass in [1, 2] {
         let (queries_before, _) = witness_stats_for_test();
-        let scanned: BTreeSet<u32> = scanned_for_fresh();
+        let scanned = crate::discovery::scan_pass::MemberTiers {
+            examined: scanned_for_fresh(),
+            ..Default::default()
+        };
         let catalog = crate::inspect_system::collect_system_with_identity(
             &[],
             &hooks,
@@ -3714,7 +3717,10 @@ fn k1_no_route_collect_row(
     // Single-shot collect() proves its sweep overlays through the same
     // no-route witness budget.
     let (single_before, _) = witness_stats_for_test();
-    let single_scanned: BTreeSet<u32> = scanned_for_fresh();
+    let single_scanned = crate::discovery::scan_pass::MemberTiers {
+        examined: scanned_for_fresh(),
+        ..Default::default()
+    };
     let single =
         crate::inspect_system::collect(&[], &[], &hooks, Some(1), policy, &single_scanned, false)
             .map_err(|error| format!("k1 no-route single-shot collect: {error:#}"))?;

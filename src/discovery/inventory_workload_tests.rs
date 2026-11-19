@@ -3042,6 +3042,7 @@ mod c1b {
                 } else {
                     MemberStatus::MapsMatched
                 },
+                work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
                 objects: if drop.contains(&pid) {
                     Vec::new()
                 } else {
@@ -3061,6 +3062,7 @@ mod c1b {
             hints_examined: false,
             pid,
             status: MemberStatus::NotSelected { loss: None },
+            work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
             objects: Vec::new(),
             generation: None,
         }));

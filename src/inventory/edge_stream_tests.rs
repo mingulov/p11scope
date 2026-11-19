@@ -2176,14 +2176,16 @@ fn stage_cert_scene() -> (
     (harness, stream, state, exiting, dir, wired)
 }
 
-/// Certification-stride twin: trip the wired operator counter after a
-/// nonzero stride inside the caller copy, the identity build and the
-/// carry stage in turn. Each trip aborts the pass — nothing folds and
-/// the carry stays intact — and clearing the counter resumes to an
-/// exact fold of the exited row with every live row surviving.
+/// Certification-stride twin, wired: trip the wired operator counter
+/// from a visit hook after a nonzero stride inside the caller copy,
+/// the identity build and the carry stage in turn, while the
+/// production wrapper polls it through its own stop query. Each trip
+/// aborts the pass — nothing folds and the carry stays intact — and
+/// clearing the counter resumes to an exact fold of the exited row
+/// with every live row surviving.
 #[test]
 fn fold_certification_aborts_and_resumes_at_every_stride_phase() {
-    for (trip_after, phase) in [(1u64, "copy"), (5, "identity"), (6, "carry")] {
+    for (trip_after, phase) in [(10u64, "copy"), (300, "identity"), (350, "carry")] {
         let (mut harness, stream, mut state, exiting, _dir, wired) = stage_cert_scene();
         if phase == "carry" {
             // A credit-deferred row the commit would replace: the
@@ -2192,32 +2194,24 @@ fn fold_certification_aborts_and_resumes_at_every_stride_phase() {
                 .coordinator_mut()
                 .note_rendered_callers(&[CallerId(999_999)]);
         }
-        let checks = std::cell::Cell::new(0u64);
-        let stop = || {
-            checks.set(checks.get() + 1);
-            if checks.get() > trip_after {
-                wired.store(1, std::sync::atomic::Ordering::SeqCst);
+        // The signal travels hook -> wired counter -> production stop
+        // query: no injected predicate stands between the trip and the
+        // abort, so the abort below proves the production wiring.
+        let _guard = crate::discovery::engine::inventory_coordinator::test_visit_hook::hold({
+            let wired = std::sync::Arc::clone(&wired);
+            move |units| {
+                if units > trip_after {
+                    wired.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            wired.load(std::sync::atomic::Ordering::SeqCst) > 0
-        };
+        });
         let now = harness.now_ns();
-        let report = retire_rendered_callers_with_stop(
-            harness.coordinator_mut(),
-            None,
-            &stream,
-            &mut state,
-            now,
-            &stop,
-        );
-        assert_eq!(
-            checks.get(),
-            trip_after + 1,
-            "{phase}: the trip fires exactly once past the threshold"
-        );
+        let report =
+            retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
         assert_eq!(
             wired.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "{phase}: the abort observes the wired counter"
+            "{phase}: the hook trips the wired counter"
         );
         assert_eq!(
             report.retired, 0,
@@ -2229,27 +2223,43 @@ fn fold_certification_aborts_and_resumes_at_every_stride_phase() {
         );
         match phase {
             "copy" => {
+                assert_eq!(
+                    report.units, 64,
+                    "copy: the first stride lap aborts the ID copy"
+                );
+                assert_eq!(
+                    report.callers_copied, 63,
+                    "copy: the ID copy aborts partway, past a nonzero stride"
+                );
                 assert!(
                     !report.identity_built,
                     "copy: the identity index never builds"
                 );
-                assert!(
-                    (1..70).contains(&report.callers_copied),
-                    "copy: the ID copy aborts partway, past a nonzero stride"
-                );
                 assert_eq!(report.certified, 0, "copy: nothing certifies");
             }
             "identity" => {
-                assert!(
-                    !report.identity_built,
-                    "identity: the index build aborts before completing"
+                assert_eq!(
+                    report.units, 320,
+                    "identity: the trip lands inside the identity build"
                 );
                 assert_eq!(
                     report.callers_copied, 70,
                     "identity: the ID copy completed first"
                 );
+                assert!(
+                    !report.identity_built,
+                    "identity: the index build aborts before completing"
+                );
+                assert_eq!(
+                    report.certified, 0,
+                    "identity: nothing certifies before the index completes"
+                );
             }
             "carry" => {
+                assert_eq!(
+                    report.units, 384,
+                    "carry: the trip lands inside the carry stage"
+                );
                 assert!(
                     report.identity_built,
                     "carry: certification completed before the trip"
@@ -2277,7 +2287,9 @@ fn fold_certification_aborts_and_resumes_at_every_stride_phase() {
             harness.coordinator().adapter().record(exiting).is_some(),
             "{phase}: no row folds on the aborted pass"
         );
-        // Clearing the counter resumes to an exact fold.
+        // Clearing the counter and releasing the hook resumes to an
+        // exact fold.
+        drop(_guard);
         wired.store(0, std::sync::atomic::Ordering::SeqCst);
         if phase != "carry" {
             // The aborted pass noted nothing: a quiet bare retirement

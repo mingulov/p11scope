@@ -759,6 +759,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// (test count): the stop-paced member pre-index.
     #[cfg(test)]
     fold_summary_sizing_visits: std::cell::Cell<u64>,
+    /// Declared-layer matcher visits at the fold-planning call site
+    /// (test count): every declaration, stat, comparison and ordered
+    /// visit the coordinator's stride callback observes.
+    #[cfg(test)]
+    forwarding_match_visits: std::cell::Cell<u64>,
     /// The next pending-count handle (P3): minted in staging order.
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
@@ -1437,7 +1442,50 @@ impl FoldStride {
     /// stop source asks to abort.
     fn unit(&mut self, stop: &dyn Fn() -> bool) -> bool {
         self.used = self.used.saturating_add(1);
+        #[cfg(test)]
+        test_visit_hook::fire(self.used);
         self.used.is_multiple_of(FOLD_PLAN_STRIDE) && stop()
+    }
+}
+
+/// Test-only visit hook for the shared pacing stride: twins trip the
+/// wired stop source from per-visit callbacks while the production
+/// paths poll it through their own [`InventoryCoordinator::stop_query`]
+/// queries, so the twins prove the production wiring instead of an
+/// injected predicate. Both the fold-planning stride and the
+/// streaming certification stride fire it. Thread-local with an RAII
+/// guard, so a panicking twin never leaks its hook into the next test
+/// on the thread.
+#[cfg(test)]
+pub(crate) mod test_visit_hook {
+    std::thread_local! {
+        static HOOK: std::cell::RefCell<Option<Box<dyn Fn(u64)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Hold a visit hook for the guard's lifetime; dropping the guard
+    /// clears it.
+    pub(crate) fn hold(hook: impl Fn(u64) + 'static) -> VisitHookGuard {
+        HOOK.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
+        VisitHookGuard
+    }
+
+    /// Clears the held visit hook on drop, including on panic.
+    pub(crate) struct VisitHookGuard;
+
+    impl Drop for VisitHookGuard {
+        fn drop(&mut self) {
+            HOOK.with(|held| held.borrow_mut().take());
+        }
+    }
+
+    /// Fire the held hook, if any, with the current unit count.
+    pub(crate) fn fire(units: u64) {
+        HOOK.with(|held| {
+            if let Some(hook) = held.borrow().as_ref() {
+                hook(units);
+            }
+        });
     }
 }
 
@@ -1606,6 +1654,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             fold_edge_sizing_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             fold_summary_sizing_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            forwarding_match_visits: std::cell::Cell::new(0),
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
@@ -6203,6 +6253,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.fold_summary_sizing_visits.get()
     }
 
+    /// Test-only: declared-layer matcher visits at the fold-planning
+    /// call site.
+    #[cfg(test)]
+    pub(crate) fn forwarding_match_visits_for_test(&self) -> u64 {
+        self.forwarding_match_visits.get()
+    }
+
+    /// Count one declared-layer matcher visit at the fold-planning
+    /// call site; test builds only.
+    fn count_forwarding_match_visit(&self) {
+        #[cfg(test)]
+        {
+            self.forwarding_match_visits
+                .set(self.forwarding_match_visits.get().saturating_add(1));
+        }
+    }
+
     /// Test-only: pair targets examined by departed-caller folds.
     #[cfg(test)]
     pub(crate) fn fold_pair_target_visits_for_test(&self) -> u64 {
@@ -6963,7 +7030,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (forwarding_declared, _) = crate::render::match_forwarding_inputs_counted(
             self.forwarding_inputs(),
             &module_keys,
-            &mut unit,
+            || {
+                self.count_forwarding_match_visit();
+                unit()
+            },
         )?;
         let mut forwarding: BTreeSet<ModuleId> = forwarding_declared.into_iter().collect();
         for module in self.registry.modules() {
@@ -26676,10 +26746,13 @@ exit 0
         );
     }
 
-    /// F4 forwarding twin: the declared-layer match counts its stats
-    /// and comparisons through the shared stride cursor and aborts on
-    /// stop — nothing folds, the row waits in the carry — and the
-    /// next pass folds it exactly once.
+    /// F4 forwarding twin, wired: the declared-layer match counts its
+    /// stats and comparisons through the shared stride cursor and aborts
+    /// on the wired stop — nothing folds, the row waits in the carry —
+    /// and the next pass folds it exactly once. The signal travels from
+    /// a visit hook through the production stop query (no injected
+    /// predicate), and the twin counts the matcher's visits at the
+    /// coordinator call site to prove the trip lands inside the match.
     #[test]
     fn fold_forwarding_match_aborts_on_stop_and_resumes_exact() {
         let (mut native, _live) = NativeScene::new();
@@ -26705,23 +26778,41 @@ exit 0
             .coordinator
             .set_forwarding(vec![std::path::PathBuf::from("no-such-layer.so"); 100]);
         native.scene.coordinator.note_rendered_callers(&[id]);
-        // Quiet at the entry gate and the first stride lap, tripped
-        // at the second: both laps land inside the declared-layer
-        // match (100 declarations over 10 modules), which runs
-        // without a stop check pre-fix.
-        let checks = std::cell::Cell::new(0u64);
-        let stop = || {
-            checks.set(checks.get() + 1);
-            checks.get() > 2
-        };
+        // One declaration and comparison visit per row plus one
+        // ordered-output visit per module (bare names stat nothing):
+        // 100 declarations over the scripted modules plus the fixture
+        // module.
+        let modules = native.scene.coordinator.registry().modules().count();
+        let total = 100 + 100 * modules + modules;
+        let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&wired));
+        // Trip the wired counter from the visit hook past planning and
+        // into the match: the next stride lap aborts inside the matcher.
+        let before = native.scene.coordinator.forwarding_match_visits_for_test();
+        let _guard = test_visit_hook::hold({
+            let wired = std::sync::Arc::clone(&wired);
+            move |units| {
+                if units > 30 {
+                    wired.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
         assert_eq!(
             native
                 .scene
                 .coordinator
-                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retire_rendered_callers(300, None)
                 .retired,
             0,
             "a stop inside the forwarding match folds nothing"
+        );
+        let visits = native.scene.coordinator.forwarding_match_visits_for_test() - before;
+        assert!(
+            visits > 0 && visits < total as u64,
+            "the wired trip lands inside the declared-layer match after {visits} of {total} visits"
         );
         assert!(
             native.scene.coordinator.adapter.record(id).is_some(),
@@ -26741,6 +26832,9 @@ exit 0
             vec![id],
             "the waiting row keeps its cookie binding"
         );
+        drop(_guard);
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        let before = native.scene.coordinator.forwarding_match_visits_for_test();
         assert_eq!(
             native
                 .scene
@@ -26750,6 +26844,11 @@ exit 0
             1,
             "the next pass folds the waiting row"
         );
+        assert_eq!(
+            native.scene.coordinator.forwarding_match_visits_for_test() - before,
+            total as u64,
+            "the quiet match visits every declaration, comparison and ordered row"
+        );
         assert!(
             native
                 .scene
@@ -26758,6 +26857,85 @@ exit 0
                 .cookie_bound_owners_for_test()
                 .is_empty(),
             "the resumed fold clears the cookie exactly once"
+        );
+    }
+
+    /// Forwarding twin (bare names, minimal table): 100 basename
+    /// declarations over only the fixture module still cost one
+    /// planning unit each through the coordinator call site — counted
+    /// there, not just in the standalone matcher (which pins the truly
+    /// empty table) — and a wired stop inside them aborts the pass
+    /// with the row waiting.
+    #[test]
+    fn fold_forwarding_match_bare_names_over_fixture_module_count_and_abort() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5021, 100);
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_cookie_for_test(domain, 100, 0, Some(id));
+        native
+            .scene
+            .coordinator
+            .set_forwarding(vec![std::path::PathBuf::from("no-such-layer.so"); 100]);
+        native.scene.coordinator.note_rendered_callers(&[id]);
+        // Only the fixture module stands: 100 declarations, one
+        // comparison each against it, one ordered visit.
+        assert_eq!(
+            native.scene.coordinator.registry().modules().count(),
+            1,
+            "only the fixture module competes with the bare-name declarations"
+        );
+        let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&wired));
+        let before = native.scene.coordinator.forwarding_match_visits_for_test();
+        let _guard = test_visit_hook::hold({
+            let wired = std::sync::Arc::clone(&wired);
+            move |units| {
+                if units > 10 {
+                    wired.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "a stop inside the bare-name declarations folds nothing"
+        );
+        let visits = native.scene.coordinator.forwarding_match_visits_for_test() - before;
+        assert!(
+            visits > 0 && visits < 201,
+            "the wired trip lands inside the bare-name declarations after {visits} of 201 visits"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_some(),
+            "no row folds on the aborted pass"
+        );
+        drop(_guard);
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        let before = native.scene.coordinator.forwarding_match_visits_for_test();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the next pass folds the waiting row"
+        );
+        assert_eq!(
+            native.scene.coordinator.forwarding_match_visits_for_test() - before,
+            201,
+            "each bare-name declaration costs its unit plus its comparison"
         );
     }
 

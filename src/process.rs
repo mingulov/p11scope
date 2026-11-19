@@ -1495,6 +1495,15 @@ impl PidPin {
         }
     }
 
+    /// Tests-only: the held pidfd's raw number, if this pin holds one.
+    /// The terminal-close twins prove real last-owner FD liveness with
+    /// it (`fcntl` reads the descriptor table; a stale number fails
+    /// `EBADF` instead of touching another file).
+    #[cfg(test)]
+    pub(crate) fn pidfd_raw_for_test(&self) -> Option<std::os::fd::RawFd> {
+        self.pidfd.as_ref().map(AsRawFd::as_raw_fd)
+    }
+
     /// Tests-only pidfd custody with no retained start time: the
     /// shape `open` yields when the pidfd succeeds but the `/proc`
     /// start-time read does not.

@@ -26105,6 +26105,163 @@ exit 0
         );
     }
 
+    /// True while `fd` names an open file description. Reads only the
+    /// descriptor table (`F_GETFD`); a closed number fails instead of
+    /// touching whatever later reuse may hold it.
+    fn pidfd_alive(fd: std::os::fd::RawFd) -> bool {
+        // SAFETY: `fcntl` with `F_GETFD` takes no pointer argument and
+        // only queries the descriptor table entry for `fd`.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    /// Fold four exited callers whose semantic bindings hold real
+    /// last-owner pidfds, stop the close drain after one close, and
+    /// latch the operator signal: three queued pins with live FDs wait
+    /// out the stop, modelling the operator-stop teardown. Returns the
+    /// scene with its fold receipt published, weak pins, their raw FDs
+    /// and the still-latched signal counter.
+    fn stage_latched_close_scene() -> (
+        NativeScene,
+        Vec<std::sync::Weak<crate::process::PidPin>>,
+        Vec<std::os::fd::RawFd>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let here = std::process::id();
+        let mut ids = Vec::new();
+        let mut pins = Vec::new();
+        let mut fds = Vec::new();
+        for caller in 0..4u32 {
+            let id = stage_exited_caller(&mut native, 5020 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            let pin = std::sync::Arc::new(crate::process::PidPin::test_pidfd_only(here));
+            let fd = pin
+                .pidfd_raw_for_test()
+                .expect("pidfd_open holds a real FD");
+            assert!(
+                pidfd_alive(fd),
+                "pin {caller} holds a live FD before the fold"
+            );
+            pins.push(std::sync::Arc::downgrade(&pin));
+            fds.push(fd);
+            native
+                .scene
+                .coordinator
+                .semantic_bindings
+                .insert_for_test(semantics::SemanticCallerBinding::scripted(
+                    id,
+                    ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                    domain,
+                    ImageIdentity {
+                        task_cookie: 500 + u64::from(caller),
+                        exec_id: 1,
+                    },
+                    pin,
+                ))
+                .expect("the binding fits");
+            ids.push(id);
+        }
+        for (at, pin) in pins.iter().enumerate() {
+            assert_eq!(
+                pin.strong_count(),
+                1,
+                "pin {at} is last-owned before the fold"
+            );
+        }
+        // The wired operator counter stays quiet through the fold; the
+        // counting trip below stops the close drain after one close.
+        let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        native
+            .scene
+            .coordinator
+            .set_stop_source(std::sync::Arc::clone(&signals));
+        native.scene.coordinator.note_rendered_callers(&ids);
+        // Quiet through the entry gate, the four row gates and the four
+        // handoff checks, tripped inside the close drain: the scene
+        // stays far below one stride, so no stride check fires first.
+        let checks = std::cell::Cell::new(0u64);
+        let latched = std::sync::Arc::clone(&signals);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            latched.load(std::sync::atomic::Ordering::SeqCst) > 0 || checks.get() > 10
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            4,
+            "the folds publish before the close drain trips"
+        );
+        let closed = pins.iter().filter(|pin| pin.upgrade().is_none()).count();
+        assert_eq!(closed, 1, "the drain closes one pin, then defers on stop");
+        // The operator signal lands during the drain and stays latched:
+        // production's counter only increments, never clears.
+        signals.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            fds.iter()
+                .zip(pins.iter())
+                .filter(|(_, pin)| pin.upgrade().is_some())
+                .all(|(fd, _)| pidfd_alive(*fd)),
+            "every queued pin still holds a live FD under the latch"
+        );
+        (native, pins, fds, signals)
+    }
+
+    /// Terminal-close twin: with the operator signal latched, the
+    /// queued last-owner pidfds belong to a terminal owner — the
+    /// coordinator's drop must not close them in one unchecked batch.
+    #[test]
+    fn fold_terminal_close_drain_closes_queued_pins_with_real_fds_under_latched_stop() {
+        let (native, pins, _fds, signals) = stage_latched_close_scene();
+        assert_eq!(
+            signals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the latch stays set through teardown"
+        );
+        drop(native);
+        let alive = pins.iter().filter(|pin| pin.upgrade().is_some()).count();
+        assert_eq!(
+            alive, 3,
+            "a terminal owner holds the queued pins past the coordinator drop"
+        );
+    }
+
+    /// Terminal-retention twin: a further stop keeps the remainder
+    /// outside the drop with its pidfds open, instead of closing
+    /// them in the teardown batch.
+    #[test]
+    fn fold_terminal_close_second_signal_retains_remainder_outside_the_drop() {
+        let (native, pins, fds, signals) = stage_latched_close_scene();
+        assert_eq!(
+            signals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the latch stays set through teardown"
+        );
+        drop(native);
+        let queued: Vec<(_, _)> = pins
+            .iter()
+            .zip(fds.iter())
+            .filter(|(pin, _)| pin.upgrade().is_some())
+            .collect();
+        assert_eq!(
+            queued.len(),
+            3,
+            "a retained remainder survives the coordinator drop"
+        );
+        assert!(
+            queued.iter().all(|(_, fd)| pidfd_alive(**fd)),
+            "retained pidfds stay open past the drop"
+        );
+    }
+
     /// Twin: an exec newcomer the next pass enumerates and admits is
     /// covered, never counted as short-lived.
     #[test]

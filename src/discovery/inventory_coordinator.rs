@@ -751,6 +751,16 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Departed identities inserted by caller folds (test count).
     #[cfg(test)]
     fold_commit_identity_inserts: u64,
+    /// (Edge folds, instance folds) completed when each departed
+    /// identity inserted, in insertion order (test timeline): the
+    /// inserts ride inside the charged member traversal, so each
+    /// mark precedes the traversal's end.
+    #[cfg(test)]
+    fold_identity_insert_marks: Vec<(u64, u64)>,
+    /// Credits remaining when the last staged commit began (test
+    /// capture): pins commits that run at a zero balance.
+    #[cfg(test)]
+    commit_credits_at_entry: usize,
     /// Edges examined while sizing fold admission (test count): the
     /// stop-paced member pre-index, never a per-caller range scan.
     #[cfg(test)]
@@ -775,6 +785,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// time, resuming first every pass until its completed fold
     /// publishes.
     staged_fold: Option<StagedFold>,
+    /// Staged-commit application debt, in credits: a staged commit's
+    /// member application runs without a reservation (its members
+    /// exceed any window), so the commit books its admitted-formula
+    /// cost here and future passes yield it from their windows before
+    /// folding (see `retire_inner`). Ordinary folds never touch this:
+    /// they reserve before running.
+    fold_credit_debt: usize,
     /// Released pidfd custody awaiting its close: folds hand their
     /// pins here instead of dropping them, and the paced drain
     /// closes them one per stop check. A stop defers the remainder
@@ -1651,6 +1668,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             #[cfg(test)]
             fold_commit_identity_inserts: 0,
             #[cfg(test)]
+            fold_identity_insert_marks: Vec::new(),
+            #[cfg(test)]
+            commit_credits_at_entry: 0,
+            #[cfg(test)]
             fold_edge_sizing_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             fold_summary_sizing_visits: std::cell::Cell::new(0),
@@ -1661,6 +1682,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_owners: BTreeMap::new(),
             rendered_callers: BTreeSet::new(),
             staged_fold: None,
+            fold_credit_debt: 0,
             pending_close_queue: Vec::new(),
             retired_caller_rows: 0,
             retired_with_calls: 0,
@@ -6140,6 +6162,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 self.fold_commit_identity_inserts =
                     self.fold_commit_identity_inserts.saturating_add(1);
+                self.fold_identity_insert_marks.push((
+                    self.fold_edge_commit_visits,
+                    self.fold_instance_commit_visits,
+                ));
             }
             self.registry.insert_departed_identity(
                 *module,
@@ -6358,6 +6384,59 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn rendered_len_for_test(&self) -> usize {
         self.rendered_callers.len()
+    }
+
+    /// Test-only: whether a staged oversized fold is open.
+    #[cfg(test)]
+    pub(crate) fn staged_fold_open_for_test(&self) -> bool {
+        self.staged_fold.is_some()
+    }
+
+    /// Test-only: whether the open staged fold drained (None when no
+    /// stage is open).
+    #[cfg(test)]
+    pub(crate) fn staged_fold_complete_for_test(&self) -> Option<bool> {
+        self.staged_fold.as_ref().map(StagedFold::is_complete)
+    }
+
+    /// Test-only: staged-commit application debt still owed by future
+    /// windows.
+    #[cfg(test)]
+    pub(crate) fn fold_credit_debt_for_test(&self) -> usize {
+        self.fold_credit_debt
+    }
+
+    /// Test-only: (edge folds, instance folds) completed at each
+    /// departed-identity insert, in insertion order.
+    #[cfg(test)]
+    pub(crate) fn fold_identity_insert_marks_for_test(&self) -> &[(u64, u64)] {
+        &self.fold_identity_insert_marks
+    }
+
+    /// Test-only: credits remaining when the last staged commit began.
+    #[cfg(test)]
+    pub(crate) fn commit_credits_at_entry_for_test(&self) -> usize {
+        self.commit_credits_at_entry
+    }
+
+    /// Test-only: stage one binder cookie sequence bound to `bound`
+    /// (forwards to the binder, for harnesses outside this module).
+    #[cfg(test)]
+    pub(crate) fn stage_binder_cookie_for_test(
+        &mut self,
+        domain: NativeDomainId,
+        ticket: u64,
+        exec: u64,
+        bound: Option<CallerId>,
+    ) {
+        self.binder
+            .stage_cookie_for_test(domain, ticket, exec, bound);
+    }
+
+    /// Test-only: every caller still bound to a binder cookie sequence.
+    #[cfg(test)]
+    pub(crate) fn binder_bound_owners_for_test(&self) -> Vec<CallerId> {
+        self.binder.cookie_bound_owners_for_test()
     }
 
     /// Replace the carried rows with the freshly certified set. A
@@ -7381,6 +7460,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         handoff: &mut Vec<Arc<PidPin>>,
         now_ns: u64,
     ) -> (CommitOutcome, Option<StagedFold>) {
+        #[cfg(test)]
+        {
+            self.commit_credits_at_entry = *credits;
+        }
         // The wired stop gates publication itself: a drained stage never
         // commits past a stop.
         if stop() {
@@ -29963,6 +30046,305 @@ exit 0
             (totals.edges, totals.instances_folded),
             (5, 5),
             "the commit aggregates every edge and instance"
+        );
+    }
+
+    /// Staged-validation twin: a stop that arrives during the commit's
+    /// ownership revalidation waits with the drained stage — live
+    /// untouched, receipt empty — instead of reaching the first
+    /// mutation unchecked, and the quiet resume publishes the complete
+    /// fold exactly once. Driven through the production entry with a
+    /// counting stop, like the mutation-entry twin.
+    #[test]
+    fn fold_staged_commit_validation_checks_stop_before_mutating() {
+        const BINDER: u64 = 65_511;
+        // Trip check: the entry gate plus every planning and resume
+        // stride lap plus the resume and commit entry gates count 2,052
+        // checks on a quiet pass, then one: the trip lands on the
+        // validation's first lap, past the commit's entry check and
+        // before the first mutation.
+        const TRIP: u64 = 2053;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5040, BINDER, 5, 5, 5, 5, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > TRIP - 1
+        };
+        let receipt = native.scene.coordinator.retire_rendered_callers_with_stop(300, None, &stop);
+        assert_eq!(receipt.retired, 0, "a stop during commit validation publishes nothing");
+        assert_eq!(
+            checks.get(),
+            TRIP,
+            "the trip fires inside validation, past the commit entry check"
+        );
+        assert_eq!(
+            native.scene.coordinator.staged_fold_complete_for_test(),
+            Some(true),
+            "the validation trip keeps the drained stage waiting"
+        );
+        assert!(
+            receipt.folded_edges.is_empty() && receipt.folded_instances.is_empty(),
+            "the waiting validation folds nothing into the receipt"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "the waiting validation keeps every sequence bound"
+        );
+        assert_eq!(
+            live_pair_targets_for_cutoff(&native, heavy),
+            5,
+            "the waiting validation keeps every target live"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            5,
+            "the waiting validation keeps every edge live"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            5,
+            "the waiting validation keeps every summary"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the waiting validation keeps the row"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the quiet resume publishes the complete fold once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row folds on the resume"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (5, 5),
+            "the resume aggregates every edge and instance"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Staged-charge twin: a commit that runs with zero credits
+    /// remaining still publishes exactly once through the production
+    /// entry, and books its admitted-formula cost as debt: the next
+    /// windows yield the debt before folding, so a newly exited caller
+    /// waits exactly until the debt clears, then folds.
+    #[test]
+    fn fold_staged_commit_at_zero_credits_charges_future_windows() {
+        const BINDER: u64 = 131_047;
+        // Members: 131,047 sequences + 5 targets + 5 recoveries +
+        // 5 edges + 5 instances + 5 summaries = 131,072 = 2,048
+        // strides. The first pass rehearses 1,024 strides and pauses;
+        // the second drains the remaining 1,024 with zero left and
+        // commits at a zero balance.
+        // Debt: 1 + (131,072 members + 5 touched modules + 0 pins) / 64.
+        const DEBT: usize = 2049;
+        let (mut native, _live) = NativeScene::new();
+        let heavy = stage_cutoff_caller(&mut native, 5041, BINDER, 5, 5, 5, 5, 5);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "the first slice publishes nothing"
+        );
+        assert_eq!(
+            native.scene.coordinator.staged_fold_complete_for_test(),
+            Some(false),
+            "the first slice leaves the stage open"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .len(),
+            BINDER as usize,
+            "the open stage keeps every sequence bound"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the drained commit publishes once at a zero balance"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .commit_credits_at_entry_for_test(),
+            0,
+            "the commit runs with zero credits remaining"
+        );
+        assert_eq!(
+            native.scene.coordinator.fold_credit_debt_for_test(),
+            DEBT,
+            "the commit books its admitted-formula cost"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (5, 5),
+            "the commit aggregates every edge and instance"
+        );
+        let waiter = stage_exited_caller(&mut native, 5042, 500);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[waiter]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(600, None)
+                .retired,
+            0,
+            "the first debt window folds nothing"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(waiter).is_some(),
+            "the waiter survives the first debt window"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(700, None)
+                .retired,
+            0,
+            "the second debt window folds nothing"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(waiter).is_some(),
+            "the waiter survives the second debt window"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(800, None)
+                .retired,
+            1,
+            "the cleared window folds the waiter"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(waiter).is_none(),
+            "the waiter eventually folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(900, None)
+                .retired,
+            0,
+            "no row publishes twice"
+        );
+    }
+
+    /// Module-attribution twin: an ordinary fold names the caller once
+    /// per touched module inside the charged member traversal — each
+    /// identity lands while its module's first member folds, not in a
+    /// separate pass after the traversal.
+    #[test]
+    fn fold_ordinary_commit_names_modules_inside_member_traversal() {
+        let (mut native, _live) = NativeScene::new();
+        // 2 sequences + 1 target + 1 recovery + 3 edges + 2 instances +
+        // 1 summary = 10 units = 1 credit; the 3 edges name distinct
+        // modules and both instances share the first edge's module.
+        let heavy = stage_cutoff_caller(&mut native, 5043, 2, 1, 1, 3, 2, 1);
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1,
+            "the one-credit caller folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            3,
+            "one identity per touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_identity_insert_marks_for_test(),
+            &[(1, 0), (2, 0), (3, 0)],
+            "each identity lands while its module's first edge folds"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row folds"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (3, 2),
+            "the fold aggregates every edge and instance"
         );
     }
 

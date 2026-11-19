@@ -1208,7 +1208,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 18446744073709551615,
-          "description": "Wrapped-key material octets (L-8 for plain AES-KW wrap output and fresh-view unwrap input, admitted 0..=8191 with L 8..=8199; larger observed values refuse as unsupported with -v reason outside_admission_bound, park nothing and publish no size)."
+          "description": "Wrapped-key material octets (L-8 for plain AES-KW wrap output and fresh-view unwrap input, admitted 0..=8191 with L 8..=8199; on a proved wrapped-key row a larger observed value refuses as unsupported with reason outside_admission_bound, counts its completion and publishes no size; on a rowless wrap or fresh-view unwrap it leaves no park and contributes no wrapped-size evidence to the subsequent row)."
         },
         "about": {
           "const": "wrapped",

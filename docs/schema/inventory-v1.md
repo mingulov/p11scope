@@ -1424,15 +1424,21 @@ never imply S1 loss.
   `corroboration_mismatch` gap reason: the corroborating length
   disagreed with the terminal length, which still classifies
   (versions 1–6 never carry it). Version 7 also adds the
-  `wrapped_park_refused` gap reason: a wrapped-material park was
-  refused past the park budget (inference-side; rows intact,
-  coverage populated; versions 1–6 never carry it). Plain AES-KW
-  (`CKM_AES_KEY_WRAP`) wrap outputs and fresh-view unwrap inputs
-  infer wrapped-key material L−8 through 8191 material octets
-  (L 8..=8199), about the wrapped key; a larger observed value is
-  refused directly (`unsupported` with `-v` reason
-  `outside_admission_bound`): it counts its completion, publishes no
-  size, parks nothing and forward-fills nothing.
+  `wrapped_park_refused` gap reason: an admitted wrapped-material
+  park was refused past the park budget (capacity only;
+  above-bound lengths park nothing and never count here;
+  inference-side; rows intact, coverage populated; versions 1–6
+  never carry it). Plain AES-KW (`CKM_AES_KEY_WRAP`) wrap outputs
+  and fresh-view unwrap inputs infer wrapped-key material L−8
+  through 8191 material octets (L 8..=8199), about the wrapped
+  key. On a proved wrapped-key row a larger observed value
+  refuses directly (`unsupported` with reason
+  `outside_admission_bound`): it counts its completion, publishes
+  no size, parks nothing and forward-fills nothing; under `-v`
+  the row reads `size unsupported (outside admission bound)`. On
+  a rowless wrap or fresh-view unwrap the above-bound observation
+  leaves no park and contributes no wrapped-size evidence to the
+  subsequent row.
 - `unknown_key_operations[]` (sorted by category and reason) holds
   capture-wide unknown-key summaries without `started` (starts are
   never fabricated into the unknown bucket).

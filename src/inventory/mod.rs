@@ -2197,6 +2197,7 @@ fn run_with_terminal_budget(
         let _ = crate::sink::try_stderr_line(line);
     });
     finish_caller_metadata_cleanup(&mut coordinator, request.second_signal);
+    finish_pending_close_drain(&mut coordinator, request.second_signal);
     let cleanup = finish_semantic_native_cleanup(semantic_lane, request.second_signal);
     combine_semantic_terminal_errors(capture_error, cleanup)?;
     Ok(outcome.exit_code())
@@ -2224,6 +2225,23 @@ pub(crate) fn finish_caller_metadata_cleanup_for_test(
     second_signal: &dyn Fn() -> bool,
 ) {
     finish_caller_metadata_cleanup(coordinator, second_signal);
+}
+
+/// Terminal pidfd-close drain: after output attempts, while the
+/// coordinator is still alive, close the fold's deferred pidfd queue
+/// one pin per further-stop check. A further operator signal keeps
+/// the remainder in the established exit retention instead of closing
+/// it in the teardown drop. Beside the caller-metadata join: both run
+/// after outputs are attempted, on both the classic and dashboard
+/// terminal paths.
+fn finish_pending_close_drain(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    second_signal: &dyn Fn() -> bool,
+) {
+    let rest = coordinator.drain_pending_closes_for_exit(second_signal);
+    if !rest.is_empty() {
+        ExitRetention::hold(rest);
+    }
 }
 
 fn finish_semantic_native_cleanup(
@@ -9485,6 +9503,7 @@ fn run_dashboard(
         },
     );
     finish_caller_metadata_cleanup(&mut coordinator, second_signal);
+    finish_pending_close_drain(&mut coordinator, second_signal);
     let cleanup = finish_semantic_native_cleanup(semantic_lane, second_signal);
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.

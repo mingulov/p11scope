@@ -23620,6 +23620,9 @@ impl Engine {
         // reason (no schema change) and keep the stored module
         // intact. A missing digest proves no change (production
         // pins always carry one), so only a proven mismatch refuses.
+        // The first harvest of a module has no committed pin to
+        // compare with, so run-learned refusal protects re-harvests
+        // only; the first sight always applies.
         let generation_changed = pins
             .summary(proof.object)
             .map(|summary| summary.sha256)

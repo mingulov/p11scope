@@ -112,11 +112,26 @@ derives the stuck set from the abandoned frame's consumer targets:
 - domains: their `ObjectDomain`s;
 - images: their caller bindings' images.
 
-Conservative closure (fail-closed): any retained feed sharing an
-image or domain with the stuck set joins it, counted explicitly.
-Same-PID files sharing a domain/image therefore degrade together —
-shared identity means shared fate, never silent splitting. Every other
-feed/domain/image is healthy and is preserved bit-for-bit.
+Scoping is per level, by that level's own identity (verified
+against code before implementation):
+
+- feeds scope by feed id (`JointFeedTarget`): always separable,
+  even same-PID/same-image;
+- domains scope by full `JournalDomainKey`
+  (`domain_tag/caller/cookie/exec/router`,
+  `src/semantics_objects/journal.rs:394`): same-PID files differ
+  by router, so they separate;
+- open-table entries scope by attribution: entries converted for
+  (`converted_for`), or attributable only to, stuck keys wipe;
+  entries attributable to a healthy live key stay;
+- image taint (`tainted_images`) stays per-image (fail-closed):
+  same-image sessions share taint fate. This is residual R1: the
+  stuck session must avoid destroy-overlap for full same-image
+  preservation (the RED test and the soak do); cross-image healthy
+  sessions are fully preserved regardless.
+
+Shared identity means shared fate at that level, never silent
+splitting; everything else is preserved bit-for-bit.
 
 ### 3.2 Per-session seal ownership: park, then advance
 

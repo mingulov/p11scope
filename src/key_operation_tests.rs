@@ -28851,6 +28851,85 @@ fn keymeta_unsupported_never_flips() {
     );
 }
 
+/// `unsupported` never flips to `inferred`: a later valued terminal
+/// leaves an unsupported row unsupported with its first reason and no
+/// detail. The zero vehicle is the S-path zero word (an OK trailer
+/// with a zero value classifies outside the admission bound); the
+/// subset vehicle is an unmapped legacy cipher ahead of an RSA value.
+#[test]
+fn keymeta_unsupported_never_flips_to_inferred() {
+    // S-path zero word first, then a standard RSA value.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(0)),
+        None,
+    );
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 300);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        400,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_OUTSIDE_ADMISSION_BOUND)
+    );
+    assert_eq!(inferred.size.detail, None);
+    assert_eq!(inferred.size.completions, 2);
+    // Unmapped subset first, then a standard RSA value.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0121), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 300);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        400,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_MAP)
+    );
+    assert_eq!(inferred.size.detail, None);
+    assert_eq!(inferred.size.completions, 2);
+}
+
 /// Corroboration mismatch records the named residual without
 /// conflicting; the terminal still classifies.
 #[test]

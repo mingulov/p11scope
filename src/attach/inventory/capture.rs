@@ -2023,6 +2023,69 @@ fn monotonic_ns() -> u64 {
 /// service window ahead of every attach.
 const INFO_RETURN_RETRY_PER_EXTEND: usize = 64;
 
+/// Keymeta Task 7 (spec §17.4, INV-2): the one bounded-work owner
+/// for info-return retries. Every visit — a Singles retry, a Multi
+/// site filter step (excluded indexes included) — passes through
+/// this owner: `poll` gates the queue head, `charge` spends one
+/// post-gate unit, `visit` gates and spends one filter step
+/// atomically, and `window_open` rechecks the window where no
+/// visit is spent. Nothing is visited at or past the extend
+/// deadline or past the visit allowance. The two gate orders are
+/// deliberate and table-pinned: the queue gate always samples the
+/// clock, while a filter step skips sampling once spent.
+struct InfoRetryBudget<'a> {
+    remaining: usize,
+    deadline: Instant,
+    now: &'a mut dyn FnMut() -> Instant,
+}
+
+impl<'a> InfoRetryBudget<'a> {
+    fn new(deadline: Instant, now: &'a mut dyn FnMut() -> Instant) -> Self {
+        Self {
+            remaining: INFO_RETURN_RETRY_PER_EXTEND,
+            deadline,
+            now,
+        }
+    }
+
+    /// Whether a visit may start: inside the window with allowance
+    /// left. Always samples the clock, like the queue gate it owns.
+    fn poll(&mut self) -> bool {
+        (self.now)() < self.deadline && self.remaining > 0
+    }
+
+    /// Spend one visit unit after a successful `poll`. The Singles
+    /// retry charges here; the Multi filter charges through `visit`.
+    fn charge(&mut self) {
+        self.remaining -= 1;
+    }
+
+    /// Gate and spend one filter step atomically. Skips sampling
+    /// once spent, like the site gates it owns.
+    fn visit(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        if (self.now)() >= self.deadline {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    /// Whether native work may start: inside the window. Allowance
+    /// is for visits, so the pre-work check and a completed
+    /// filter's single attach consult the window only.
+    fn window_open(&mut self) -> bool {
+        (self.now)() < self.deadline
+    }
+
+    /// Visits spent so far this call, for the bound table.
+    fn spent(&self) -> usize {
+        INFO_RETURN_RETRY_PER_EXTEND - self.remaining
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Keymeta Task 7 (spec §17.4, N4): retry the private info-return
 /// pending list first on every extend, within the same window and
@@ -2030,7 +2093,7 @@ const INFO_RETURN_RETRY_PER_EXTEND: usize = 64;
 /// links its return and publishes `INFO_KIND` once. EMFILE re-parks
 /// the rest with the named counted gap and stops (descriptors are
 /// still exhausted); deterministic refusals fail disclosed with
-/// links retained.
+/// links retained. Returns the visits spent, for the bound table.
 fn retry_info_returns<I: InventoryLinkIo>(
     io: &mut I,
     targets: &InventoryTargets,
@@ -2039,17 +2102,20 @@ fn retry_info_returns<I: InventoryLinkIo>(
     receipt: &mut ExtendReceipt,
     deadline: Instant,
     now: &mut dyn FnMut() -> Instant,
-) {
+) -> usize {
     // In-place queue: the deque moves out once and moves back once,
     // and every yield pushes the front item back into the SAME deque
     // before moving it back — never `append` across deques, which
     // copies both backing slices scaled to the whole queue. An
     // expired call before any work touches nothing at all.
     if book.info_return_pending.is_empty() {
-        return;
+        return 0;
     }
-    if now() >= deadline {
-        return;
+    // The one bounded-work owner for this call: every gate and
+    // charge below consults it, so the bound has one wording.
+    let mut budget = InfoRetryBudget::new(deadline, now);
+    if !budget.window_open() {
+        return budget.spent();
     }
     // Keymeta Task 7 (spec §17.4): the hazard gate refuses once for
     // the capture — a parked return (or group) drops here counted,
@@ -2068,25 +2134,24 @@ fn retry_info_returns<I: InventoryLinkIo>(
                 }
             }
         }
-        return;
+        return budget.spent();
     }
     let mut queue: VecDeque<InfoReturnPending> = std::mem::take(&mut book.info_return_pending);
-    let mut remaining = INFO_RETURN_RETRY_PER_EXTEND;
     while !queue.is_empty() {
         // The window and allowance gate every visit before popping:
         // nothing — not even a revoked Single's drop — is visited
         // at or past the deadline or past the visit allowance, and
         // an expired or spent extend moves no queue storage.
-        if now() >= deadline || remaining == 0 {
+        if !budget.poll() {
             book.info_return_pending = queue;
-            return;
+            return budget.spent();
         }
         let Some(next) = queue.pop_front() else {
             break;
         };
         match next {
             InfoReturnPending::Singles(endpoint) => {
-                remaining -= 1;
+                budget.charge();
                 // Revoked endpoints (spec §17.4) drop here, at
                 // their retry: the staging extend already recorded
                 // the revocation, so no return link is ever
@@ -2112,7 +2177,7 @@ fn retry_info_returns<I: InventoryLinkIo>(
                         receipt.info_return_deferred += 1;
                         queue.push_front(InfoReturnPending::Singles(endpoint));
                         book.info_return_pending = queue;
-                        return;
+                        return budget.spent();
                     }
                     Err(error) => {
                         book.fail(receipt, &endpoint, format!("{error:#}"), retained);
@@ -2165,19 +2230,17 @@ fn retry_info_returns<I: InventoryLinkIo>(
                 let mut yielded = false;
                 while validated < sites.len() {
                     if multi_site_excluded(&excluded, validated) {
-                        if remaining == 0 || now() >= deadline {
+                        if !budget.visit() {
                             yielded = true;
                             break;
                         }
-                        remaining -= 1;
                         validated += 1;
                         continue;
                     }
-                    if remaining == 0 || now() >= deadline {
+                    if !budget.visit() {
                         yielded = true;
                         break;
                     }
-                    remaining -= 1;
                     let site = sites[validated];
                     if book.info_revoked.contains(&site.endpoint) {
                         multi_site_exclude(&mut excluded, validated);
@@ -2199,7 +2262,7 @@ fn retry_info_returns<I: InventoryLinkIo>(
                         staged_points,
                     });
                     book.info_return_pending = queue;
-                    return;
+                    return budget.spent();
                 }
                 // Filter complete: the staged survivors were built
                 // during credited visits, so no scan or copy runs
@@ -2211,7 +2274,7 @@ fn retry_info_returns<I: InventoryLinkIo>(
                 // native work. The original vector, cursor, mask and
                 // staged survivors requeue unchanged — never a
                 // rebuilt survivors-only copy.
-                if now() >= deadline {
+                if !budget.window_open() {
                     queue.push_front(InfoReturnPending::Multi {
                         object,
                         sites,
@@ -2223,7 +2286,7 @@ fn retry_info_returns<I: InventoryLinkIo>(
                         staged_points,
                     });
                     book.info_return_pending = queue;
-                    return;
+                    return budget.spent();
                 }
                 let local = PinnedObjectId(object.index());
                 let retry = |book: &mut CaptureBook,
@@ -2276,7 +2339,7 @@ fn retry_info_returns<I: InventoryLinkIo>(
                             staged_points,
                         });
                         book.info_return_pending = queue;
-                        return;
+                        return budget.spent();
                     }
                     Err(p11scope_bpf_multi::BisectHalt {
                         halt: p11scope_bpf_multi::GroupHalt::Unsupported(error),
@@ -2354,6 +2417,7 @@ fn retry_info_returns<I: InventoryLinkIo>(
             }
         }
     }
+    budget.spent()
 }
 
 /// Keymeta Task 7 (spec §17.4, INV-2): cell writes per extend for

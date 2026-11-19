@@ -5896,9 +5896,10 @@ fn info_ring_loss_routes_to_evidence_not_lifecycle() {
 /// Keymeta Task 7 retry bound (spec §17.4, INV-2): one table over
 /// the Singles retry's visit accounting. Every row parks through
 /// the real extend path, drives `retry_info_returns` directly with
-/// a counting clock, and pins the clock samples spent, the yield
-/// point and the outcome: a clean link, a pre-work expiry that
-/// touches nothing, an EMFILE head that re-parks and stops, and
+/// a counting clock, and pins the visits spent, the clock samples
+/// spent, the yield point and the outcome: a clean link, a
+/// pre-work expiry that touches nothing, an EMFILE head that
+/// re-parks and stops, and
 /// the allowance spent at the 65th pop.
 #[test]
 fn info_retry_budget_table_pins_singles_charges_and_yields() {
@@ -5932,12 +5933,20 @@ fn info_retry_budget_table_pins_singles_charges_and_yields() {
         (fixture, harness)
     }
     // (parked, expired, emfile_head, expect_linked, expect_pending,
-    // expect_calls): the full Singles bound matrix.
-    for (parked, expired, emfile_head, expect_linked, expect_pending, expect_calls) in [
-        (1u32, false, false, 1usize, 0usize, 2usize),
-        (1, true, false, 0, 1, 1),
-        (2, false, true, 0, 2, 2),
-        (65, false, false, 64, 1, 66),
+    // expect_visits, expect_calls): the full Singles bound matrix.
+    for (
+        parked,
+        expired,
+        emfile_head,
+        expect_linked,
+        expect_pending,
+        expect_visits,
+        expect_calls,
+    ) in [
+        (1u32, false, false, 1usize, 0usize, 1usize, 2usize),
+        (1, true, false, 0, 1, 0, 1),
+        (2, false, true, 0, 2, 1, 2),
+        (65, false, false, 64, 1, 64, 66),
     ] {
         let (_fixture, mut harness) = park_singles(parked);
         if emfile_head {
@@ -5955,7 +5964,7 @@ fn info_retry_budget_table_pins_singles_charges_and_yields() {
             fixed
         };
         let mut receipt = ExtendReceipt::default();
-        retry_info_returns(
+        let visits = retry_info_returns(
             &mut harness.io,
             &mut harness.targets,
             &mut harness.links,
@@ -5963,6 +5972,10 @@ fn info_retry_budget_table_pins_singles_charges_and_yields() {
             &mut receipt,
             deadline,
             &mut clock,
+        );
+        assert_eq!(
+            visits, expect_visits,
+            "row parked={parked} expired={expired} emfile_head={emfile_head}: visits"
         );
         let linked = harness
             .ops()
@@ -5993,8 +6006,9 @@ fn info_retry_budget_table_pins_singles_charges_and_yields() {
 /// Keymeta Task 7 retry bound (spec §17.4, INV-2): one table over
 /// the Multi retry's visit accounting. Every row parks one group
 /// through the real extend path, drives `retry_info_returns`
-/// directly with a counting clock, and pins the clock samples
-/// spent, the yield point and the storage outcome: a clean link,
+/// directly with a counting clock, and pins the visits spent, the
+/// clock samples spent, the yield point and the storage outcome:
+/// a clean link,
 /// a 96-site filter yielding at the 64-visit allowance with its
 /// storage in place, revoked sites spending visits without
 /// linking, and a post-filter expiry requeueing the original
@@ -6037,6 +6051,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
         expect_linked: usize,
         expect_pending: usize,
         expect_validated: Option<usize>,
+        expect_visits: usize,
         expect_calls: usize,
     }
     for row in [
@@ -6047,6 +6062,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
             expect_linked: 3,
             expect_pending: 0,
             expect_validated: None,
+            expect_visits: 3,
             expect_calls: 6,
         },
         Row {
@@ -6056,6 +6072,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
             expect_linked: 0,
             expect_pending: 1,
             expect_validated: Some(64),
+            expect_visits: 64,
             expect_calls: 66,
         },
         Row {
@@ -6065,6 +6082,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
             expect_linked: 2,
             expect_pending: 0,
             expect_validated: None,
+            expect_visits: 4,
             expect_calls: 7,
         },
         Row {
@@ -6074,6 +6092,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
             expect_linked: 0,
             expect_pending: 1,
             expect_validated: Some(5),
+            expect_visits: 5,
             expect_calls: 8,
         },
     ] {
@@ -6099,7 +6118,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
             }
         };
         let mut receipt = ExtendReceipt::default();
-        retry_info_returns(
+        let visits = retry_info_returns(
             &mut harness.io,
             &mut harness.targets,
             &mut harness.links,
@@ -6107,6 +6126,11 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
             &mut receipt,
             deadline,
             &mut clock,
+        );
+        assert_eq!(
+            visits, row.expect_visits,
+            "row sites={} revoke={:?}: visits",
+            row.sites, row.revoke
         );
         let returns: Vec<usize> = harness
             .group_ops()

@@ -343,10 +343,13 @@ fn end_length_header_trailer_and_absent_tail_initialize_in_poisoned_storage() {
 /// invocation — the raw reader with the probe context, the layout
 /// and the descriptor-derived mask variable, spelled exactly once
 /// — whose exact fetch sequence the ebpf-common twin asserts with
-/// a spy at the production boundary. The mask resolves from the
-/// descriptor, and a zero mask (count-only, narrowed, unlisted,
-/// corrupt, info) deletes any stale row and returns before that
-/// call. No `arg_u64` use of any spelling may remain in the stash
+/// a spy at the production boundary. The comment-free stash
+/// signature and prologue are pinned contiguously (whitespace
+/// normalized) through that call, so the mask resolves from the
+/// stash's own descriptor parameter and a zero mask (count-only,
+/// narrowed, unlisted, corrupt, info) runs the complete refusal
+/// block — stale-row delete and return — before any acquisition.
+/// No `arg_u64` use of any spelling may remain in the stash
 /// body outside the pinned invocation: an extra read there — or a
 /// widened mask in the invocation — would bypass the shared
 /// guard-to-index binding the twin pins.
@@ -370,6 +373,12 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    /// Whitespace-normalized form: every whitespace run becomes one
+    /// space, so the prologue pin ignores indentation and line breaks
+    /// but still fails on any inserted, removed or reworded token.
+    fn normalize(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
     fn contract(source: &str) -> bool {
         let Some(text) = stash_body(source) else {
             return false;
@@ -385,26 +394,22 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
         if code.matches("acquire_length_entry_args!").count() != 1 || !code.contains(INVOCATION) {
             return false;
         }
-        let acquire = code
-            .find("acquire_length_entry_args!")
-            .expect("counted once");
-        let head = &code[..acquire];
-        // Descriptor-derived mask with a zero-mask refusal: the mask
-        // resolves from the descriptor before the acquisition, and
-        // the refusal branch deletes any stale row and returns.
+        // Contiguous signature-to-acquisition pin (comment-free above,
+        // whitespace normalized): the stash parameter list, the
+        // descriptor-derived mask, the complete zero-mask refusal
+        // block and the acquisition preamble appear contiguously
+        // through the sole macro call. A rebound `descriptor` before
+        // the mask definition, or any weakening of the `if mask == 0`
+        // condition or the refusal body, breaks the contiguity and
+        // fails closed.
+        const PROLOGUE: &str = "ctx: &ProbeContext, key: &StartKey, descriptor: u32, layout: LinuxLayout, ) { let mask = length_entry_fetch_mask(descriptor); if mask == 0 { let _ = EVIDENCE_START.remove(key); return; } let start_ts_ns = unsafe { p11_owner_start_get(key, 0).as_ref() }.map(|start| start.ts_ns); let mut row = EvidenceStart::default(); let mut words = [0u64; 7]; let mut present: u8 = 0; acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present);";
+        if !normalize(&code).starts_with(&normalize(PROLOGUE)) {
+            return false;
+        }
+        // Descriptor-derived mask: the single definition resolves from
+        // the stash parameter the prologue pins.
         const DEFINITION: &str = "let mask = length_entry_fetch_mask(descriptor);";
         if code.matches(DEFINITION).count() != 1 {
-            return false;
-        }
-        let (Some(definition), Some(zero)) = (head.find(DEFINITION), head.find("if mask == 0"))
-        else {
-            return false;
-        };
-        if definition > zero {
-            return false;
-        }
-        let refusal = &head[zero..];
-        if !(refusal.contains("EVIDENCE_START.remove(key)") && refusal.contains("return;")) {
             return false;
         }
         // No other mask use: past the definition, `mask` names only

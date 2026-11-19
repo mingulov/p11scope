@@ -613,6 +613,64 @@ mod tests {
         assert_no_temporary_files(directory.path());
     }
 
+    /// A diagnostics `-o` write failure (ENOSPC here) plus a second
+    /// signal reports cancellation without a recovery save: the
+    /// export checks cancellation before starting recovery, the old
+    /// destination keeps its bytes, no fallback file remains, and no
+    /// temp litters the directory.
+    #[test]
+    fn diagnostics_write_failure_plus_cancellation_reports_cancelled_without_recovery() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || {
+                // Cancel once the recovery staging holds a footer:
+                // the export is complete there, but promotion must
+                // still check cancellation first.
+                let Ok(entries) = std::fs::read_dir(&recovered_base) else {
+                    return false;
+                };
+                entries.filter_map(|entry| entry.ok()).any(|entry| {
+                    std::fs::read_to_string(entry.path())
+                        .map(|data| {
+                            data.lines()
+                                .filter_map(|line| {
+                                    serde_json::from_str::<serde_json::Value>(line).ok()
+                                })
+                                .any(|line| line["kind"] == "footer")
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("cancelled"),
+            "cancellation wins over recovery, got: {error}"
+        );
+        assert!(
+            !error.contains("capture saved to"),
+            "no recovery save when cancelled, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(
+            saved.is_empty(),
+            "no fallback file remains when cancelled: {saved:?}"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
     #[test]
     fn second_signal_during_export_preserves_existing_destination() {
         let directory = private_directory();

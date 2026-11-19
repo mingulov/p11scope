@@ -29768,9 +29768,10 @@ fn keymeta_direct_query_never_sizes() {
     assert_eq!(inferred.size.completions, 0);
 }
 
-/// Without length capture the seal carries no length into the settled
-/// call (never a guess): a base-form END settles with `length: None`.
-/// The 648-byte validated-trailer twin arrives with BPF length capture.
+/// Without a length trailer the seal carries no length into the
+/// settled call (never a guess): a base-form END settles with
+/// `length: None`. See keymeta_seal_carries_length_trailer for the
+/// 648-byte validated-trailer twin.
 #[test]
 fn keymeta_seal_carries_no_length_without_capture() {
     use p11scope_ebpf_common::object_journal::JournalRecord;
@@ -29795,6 +29796,55 @@ fn keymeta_seal_carries_no_length_without_capture() {
         success.prefix.settled()[0].length,
         None,
         "a base-form END settles with no length"
+    );
+}
+
+/// The seal carries the settled 648 END's validated trailer into the
+/// settled call (never into correlation).
+#[test]
+fn keymeta_seal_carries_length_trailer() {
+    use p11scope_ebpf_common::evidence_table::{
+        LENGTH_KIND_SCELL, LENGTH_STATUS_OK, LENGTH_TRAILER_VERSION,
+    };
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES, JournalRecord, LengthTrailer,
+    };
+    let mut scene = JointScene::new();
+    let fid = function_id("C_Sign");
+    let begin = begin_bytes(1, 1, fid, 0);
+    let mut full = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+    full[24 + 108..24 + 112].copy_from_slice(&fid.to_le_bytes());
+    let trailer = LengthTrailer {
+        version: LENGTH_TRAILER_VERSION,
+        kind: LENGTH_KIND_SCELL,
+        status: LENGTH_STATUS_OK,
+        reserved: [0; 4],
+        value: 256,
+    };
+    // SAFETY: the frozen repr(C) trailer holds only initialized
+    // integer fields; the journal validator re-checks it on ingest.
+    let trailer_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&trailer as *const LengthTrailer).cast::<u8>(), 16) };
+    let mut wire = vec![0u8; JOURNAL_END_LENGTH_BYTES];
+    wire[..JOURNAL_END_FULL_BYTES].copy_from_slice(&full);
+    wire[2..4].copy_from_slice(&(JOURNAL_END_LENGTH_BYTES as u16).to_le_bytes());
+    wire[JOURNAL_END_FULL_BYTES..].copy_from_slice(trailer_bytes);
+    let record = decode_journal_record(&wire, &scene.descriptors).expect("648 decodes");
+    let JournalRecord::End(end) = record else {
+        panic!("END input");
+    };
+    let admitted = scene
+        .fixture
+        .admit_original_event("C_Sign", end.payload_base().event);
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    scene.ingest(&begin);
+    scene.ingest(&wire);
+    let success = scene.seal().expect("quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1);
+    assert_eq!(
+        success.prefix.settled()[0].length,
+        Some(LengthOutcome::Value(256)),
+        "the settled call carries its trailer"
     );
 }
 

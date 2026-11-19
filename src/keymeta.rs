@@ -608,7 +608,6 @@ pub(crate) fn evidence_noun(tag: EvidenceTag) -> &'static str {
 
 /// One call's admitted length outcome: a classified-candidate value
 /// or a BPF-unavailable trailer (refused shapes retain zero).
-#[cfg_attr(not(test), allow(dead_code))] // Staged length outcomes; BPF length capture constructs them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LengthOutcome {
     Value(u64),

@@ -3810,13 +3810,17 @@ fn sealed_fingerprint(
 /// application's output cell (allowlist v1; the BEGIN/END agreement admits
 /// that rewrite only on an OK or pending return with a non-null output);
 /// see [`session_output_of`]. Everything else reports no session output.
-/// The settled length outcome for one staged END (keymeta §9):
-/// without length capture every END is base-form and carries
-/// nothing, so the seal reports no length (never a guess). BPF
-/// length capture reads the staged END's validated trailer here.
+/// The settled length outcome for one staged END (keymeta §9): the
+/// validated trailer's value, or unavailable when BPF refused the
+/// shape (refused shapes retain zero). Base-form ENDs carry nothing.
 fn sealed_length(end: Option<StagedEnd>) -> Option<crate::keymeta::LengthOutcome> {
-    let _ = end;
-    None
+    use crate::keymeta::LengthOutcome;
+    let trailer = end?.end.length_trailer()?;
+    if trailer.status == p11scope_ebpf_common::evidence_table::LENGTH_STATUS_OK {
+        Some(LengthOutcome::Value(trailer.value))
+    } else {
+        Some(LengthOutcome::Unavailable)
+    }
 }
 
 fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> CompletedFact {

@@ -1068,17 +1068,67 @@ class StreamTwins(unittest.TestCase):
                                  f"{where}: queries slots")
 
         def check_promotion(stream, snapshot):
-            # A true promotion pass: one object genuinely updated (its
-            # v7 body differs) at the publication revision the marker
-            # carries; every other object retains its single v6
-            # record (the emitter skips unchanged rows). Every
-            # changed known key row likewise re-sends at v7 on that
-            # same pass (the inferred blocks are the change), while
-            # unknown rows stay at their carried v6 revisions.
+            # Two publications: the carried v6 rows close with their
+            # v6 marker, then the v7 promotion pass commits. One
+            # object genuinely updates (its v7 body differs) at the
+            # publication revision the v7 marker carries; every other
+            # object retains its single v6 record (the emitter skips
+            # unchanged rows). Every changed known key row likewise
+            # re-sends at v7 on that same pass (the inferred blocks
+            # are the change), while unknown rows stay at their
+            # carried v6 revisions. The v7 rows share their marker
+            # timestamp, and each marker carries its pass accounting.
             objects = [line for line in stream
                        if line["kind"] == "object_observed"]
-            marker = next(line for line in stream
-                          if line["kind"] == "pass_committed")
+            markers = [line for line in stream
+                       if line["kind"] == "pass_committed"]
+            self.assertEqual(len(markers), 2,
+                             "the v6 group and the v7 pass each commit")
+            v6_marker, v7_marker = markers
+            self.assertEqual(v6_marker["event"]["pass"], 1)
+            self.assertEqual(v7_marker["event"]["pass"], 2)
+            self.assertEqual(v6_marker["event"]["object_version"], 6)
+            self.assertEqual(v7_marker["event"]["object_version"], 7)
+            self.assertLess(v6_marker["event"]["object_revision"],
+                            v7_marker["event"]["object_revision"])
+            self.assertLess(v6_marker["at_ns"], v7_marker["at_ns"],
+                            "the v6 publication precedes the v7 pass")
+            v6_rows = [line for line in stream
+                       if line["kind"] in ("object_observed",
+                                           "key_operations_observed")
+                       and line["event"]["revision"]
+                       <= v6_marker["event"]["object_revision"]]
+            v7_rows = [line for line in stream
+                       if line["kind"] in ("object_observed",
+                                           "key_operations_observed")
+                       and line["event"]["revision"]
+                       == v7_marker["event"]["object_revision"]]
+            self.assertTrue(v7_rows, "the v7 pass carries rows")
+            self.assertEqual(v6_marker["event"]["key_operation_events"],
+                             len(v6_rows))
+            self.assertEqual(v7_marker["event"]["key_operation_events"],
+                             len(v7_rows))
+            self.assertEqual(v6_marker["event"]
+                             ["key_operation_events_deferred"], 0)
+            self.assertEqual(v7_marker["event"]
+                             ["key_operation_events_deferred"], 0)
+            self.assertTrue(all(line["at_ns"] == v7_marker["at_ns"]
+                                for line in v7_rows),
+                            "the v7 rows share their marker timestamp")
+            first_v7 = min(stream.index(line) for line in v7_rows)
+            last_v7 = max(stream.index(line) for line in v7_rows)
+            self.assertLess(stream.index(v6_marker), first_v7)
+            self.assertLess(last_v7, stream.index(v7_marker))
+            v7_objects = [line for line in v7_rows
+                          if line["kind"] == "object_observed"]
+            v7_keys = [line for line in v7_rows
+                       if line["kind"] == "key_operations_observed"]
+            self.assertTrue(v7_objects and v7_keys,
+                            "the v7 pass carries its object and keys")
+            self.assertLess(max(stream.index(line)
+                                for line in v7_objects),
+                            min(stream.index(line) for line in v7_keys),
+                            "the v7 object precedes its keys")
             by_object = {}
             for line in objects:
                 by_object.setdefault(line["event"]["row"]["object"],
@@ -1095,7 +1145,7 @@ class StreamTwins(unittest.TestCase):
                                 lines[1]["event"]["row"],
                                 "the v7 replacement genuinely updates it")
             self.assertEqual(lines[1]["event"]["revision"],
-                             marker["event"]["object_revision"],
+                             v7_marker["event"]["object_revision"],
                              "the v7 update and the marker share it")
             for oid, lines in by_object.items():
                 if oid != updated[0]:
@@ -1121,7 +1171,7 @@ class StreamTwins(unittest.TestCase):
                                 and versions[-1] == 7,
                                 f"key {key} promotes once, on the pass")
                 self.assertEqual(lines[-1]["event"]["revision"],
-                                 marker["event"]["object_revision"],
+                                 v7_marker["event"]["object_revision"],
                                  "the v7 key update shares the marker")
                 self.assertNotEqual(lines[-2]["event"]["row"],
                                     lines[-1]["event"]["row"],
@@ -1143,12 +1193,15 @@ class StreamTwins(unittest.TestCase):
             # and the marker alike; every other object retains its
             # v6 record (the emitter skips unchanged rows), and the
             # snapshot reconciles to the last carried row per object.
+            # The replacement shares the v7 marker timestamp (the
+            # producer emits its pass rows and marker with one
+            # now_ns).
             revisions = [line["event"]["revision"] for line in stream
                          if line["kind"] in ("object_observed",
                                              "key_operations_observed")]
             new_revision = max(revisions) + 1
-            at_ns = max(line["at_ns"] for line in stream
-                        if line["kind"] == "key_operations_observed") + 50
+            at_ns = next(line["at_ns"] for line in stream
+                         if line["kind"] == "pass_committed")
             first = next(line for line in stream
                          if line["kind"] == "object_observed")
             updated = copy.deepcopy(first["event"]["row"])
@@ -1175,12 +1228,12 @@ class StreamTwins(unittest.TestCase):
             # at v7 (the inferred blocks are the change; counters
             # carry no new completions) at the same publication
             # revision the marker carries, in producer order after the
-            # object replacement. Unknown rows are unchanged and stay.
+            # object replacement, sharing its timestamp. Unknown rows
+            # are unchanged and stay.
             marker = next(line for line in stream
                           if line["kind"] == "pass_committed")
             new_revision = marker["event"]["object_revision"]
-            at_ns = max(line["at_ns"] for line in stream
-                        if line["kind"] == "key_operations_observed") + 60
+            at_ns = marker["at_ns"]
             last_by_key = {}
             for line in stream:
                 if line["kind"] == "key_operations_observed" \
@@ -1204,10 +1257,51 @@ class StreamTwins(unittest.TestCase):
                                    "event": {"revision": new_revision,
                                              "version": 7, "bucket": "known",
                                              "row": carried}})
-                at_ns += 1
             marker_index = next(index for index, line in enumerate(stream)
                                 if line["kind"] == "pass_committed")
             stream[marker_index:marker_index] = promotions
+            for seq, line in enumerate(stream):
+                line["seq"] = seq
+            return stream
+
+        def close_v6_pass(stream):
+            # Two publications: the carried v6 rows close with their
+            # v6 marker, then the v7 pass commits. Each marker carries
+            # its pass accounting (emitted rows, nothing deferred).
+            v7_marker = next(line for line in stream
+                             if line["kind"] == "pass_committed")
+            v7_revision = v7_marker["event"]["object_revision"]
+            v6_rows = [line for line in stream
+                       if line["kind"] in ("object_observed",
+                                           "key_operations_observed")
+                       and line["event"]["revision"] < v7_revision]
+            v7_rows = [line for line in stream
+                       if line["kind"] in ("object_observed",
+                                           "key_operations_observed")
+                       and line["event"]["revision"] == v7_revision]
+            v6_revision = max(line["event"]["revision"]
+                              for line in v6_rows)
+            v6_at = max(line["at_ns"] for line in v6_rows
+                        if line["kind"] == "key_operations_observed") + 50
+            status = v7_marker["event"]["object_status"]
+            v6_marker = {"schema": "p11scope/inventory-events/v1",
+                         "seq": 0, "at_ns": v6_at,
+                         "kind": "pass_committed",
+                         "event": {"pass": 1,
+                                   "object_revision": v6_revision,
+                                   "object_version": 6,
+                                   "object_status": status,
+                                   "gaps_suppressed": 0,
+                                   "key_operation_events": len(v6_rows),
+                                   "key_operation_events_deferred": 0}}
+            v7_marker["event"]["pass"] = 2
+            v7_marker["event"]["key_operation_events"] = len(v7_rows)
+            v7_marker["event"]["key_operation_events_deferred"] = 0
+            first_v7 = next(index for index, line in enumerate(stream)
+                            if line["kind"] in ("object_observed",
+                                                "key_operations_observed")
+                            and line["event"]["revision"] == v7_revision)
+            stream.insert(first_v7, v6_marker)
             for seq, line in enumerate(stream):
                 line["seq"] = seq
             return stream
@@ -1277,6 +1371,7 @@ class StreamTwins(unittest.TestCase):
                 row["inferred_size"]["completions"] = row["completed"]
             stream = promote_objects(stream, snapshot)
             stream = promote_keys(stream, snapshot)
+            stream = close_v6_pass(stream)
             check_promotion(stream, snapshot)
             oracle.validate_snapshot(snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)

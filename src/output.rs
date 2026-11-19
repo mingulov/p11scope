@@ -4823,4 +4823,38 @@ mod tests {
             "the error names the failed fallback, got: {error}"
         );
     }
+
+    /// A valid 255-byte destination basename with a 253-byte extension
+    /// still recovers: the recovery name uses a bounded suffix, so it
+    /// stays within `NAME_MAX` instead of failing with `ENAMETOOLONG`.
+    #[test]
+    fn recovery_long_suffix_saves_with_a_bounded_name() {
+        let _lock = RECOVERED_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let plant = private_tempdir();
+        let base = plant.path().join("p11scope-recovered");
+        // `r.` + 253 `x`: a 255-byte basename, valid on disk.
+        let long_dest = plant.path().join(format!("r.{}", "x".repeat(253)));
+        assert_eq!(
+            long_dest
+                .file_name()
+                .expect("the long dest has a name")
+                .len(),
+            255
+        );
+        let saved = save_recovered_bytes(b"{\"ok\":true}", &long_dest, &base)
+            .expect("a long suffix recovers");
+        let name = saved
+            .file_name()
+            .expect("the saved path has a name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.len() <= 255,
+            "the recovery name stays within NAME_MAX: {name} ({} bytes)",
+            name.len()
+        );
+        assert_eq!(std::fs::read(&saved).unwrap(), b"{\"ok\":true}");
+    }
 }

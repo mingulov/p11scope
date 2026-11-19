@@ -1305,6 +1305,12 @@ impl SemanticBindingSet {
             .saturating_add(usize::from(self.refused_successors.contains_key(&caller)))
     }
 
+    /// Test-only: negative-only tombstones of folded callers' images.
+    #[cfg(test)]
+    pub(crate) fn folded_images_len_for_test(&self) -> usize {
+        self.folded_images.len()
+    }
+
     /// Remember one folded caller's ticket as negative-only evidence.
     /// An unknown image (zero cookie) needs no entry: it never proves
     /// another caller. A repeat ticket is already remembered. Past

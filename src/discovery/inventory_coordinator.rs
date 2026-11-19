@@ -27371,6 +27371,74 @@ exit 0
         assert_eq!(dropped_base, 10, "the staged base lands exactly once");
     }
 
+    /// Tombstone-occupancy fixture: fold seven callers with semantic
+    /// bindings through the real fold — five distinct tickets, one
+    /// zero-cookie image, one duplicate ticket — and count the
+    /// inserted tombstones directly. Bounds the per-fold retention
+    /// the soak legs can only estimate from edge and caller counts.
+    #[test]
+    fn fold_inserts_one_tombstone_per_distinct_folded_image() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        assert_eq!(
+            std::mem::size_of::<(NativeDomainId, u64)>(),
+            16,
+            "one tombstone key is two u64s"
+        );
+        let mut ids = Vec::new();
+        for (slot, cookie) in [0u32, 1, 2, 3, 4, 5, 6]
+            .into_iter()
+            .zip([500u64, 501, 502, 503, 504, 0, 500])
+        {
+            let id = stage_exited_caller(&mut native, 5020 + slot, 100);
+            let pin = std::sync::Arc::new(crate::process::PidPin::test_proc_only(1234 + slot));
+            native
+                .scene
+                .coordinator
+                .semantic_bindings
+                .insert_for_test(semantics::SemanticCallerBinding::scripted(
+                    id,
+                    ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                    domain,
+                    ImageIdentity {
+                        task_cookie: cookie,
+                        exec_id: 1,
+                    },
+                    pin,
+                ))
+                .expect("the binding fits");
+            ids.push(id);
+        }
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .semantic_bindings
+                .folded_images_len_for_test(),
+            0,
+            "no tombstone before the fold"
+        );
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            7,
+            "every row folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .semantic_bindings
+                .folded_images_len_for_test(),
+            5,
+            "one tombstone per distinct nonzero image: five tickets, no zero-cookie entry, no duplicate"
+        );
+    }
+
     /// Twin: an exec newcomer the next pass enumerates and admits is
     /// covered, never counted as short-lived.
     #[test]

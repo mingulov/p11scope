@@ -11090,7 +11090,6 @@ fn pin_scanned_object(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ProvedEntry, PinFailure> {
-    let raw_path = raw.path.clone();
     match pin_scanned_object_inner(
         view,
         raw,
@@ -11101,15 +11100,7 @@ fn pin_scanned_object(
         budget,
     ) {
         Err(PinFailure::Refused(reason)) => {
-            let dead = view.original_exited();
-            eprintln!(
-                "p11scope: DIAG v072c pin_refused view_dead={:?} path={} reason={} mono_ns={:?}",
-                dead,
-                raw_path,
-                reason.chars().take(160).collect::<String>(),
-                crate::attach::monotonic_ns(),
-            );
-            if dead == Ok(true) {
+            if view.original_exited() == Ok(true) {
                 // The view died mid-pin (its per-PID paths vanished): loss,
                 // not forgery evidence. Downgrade to Gone so the key's live
                 // pins survive churn; gaps already count the member. Live

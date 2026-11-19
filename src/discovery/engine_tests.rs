@@ -95417,3 +95417,1803 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
         "the loader scan sees a fresh budget, not the spent tick's"
     );
 }
+
+// ============================================================================
+// Merge-ownership table: spec `docs/superpowers/specs/2026-11-19-modeb-merge-ownership.md`
+// §9. One case per entry point × invariant cell; shared builders and oracle
+// bundles below keep the cells uniform. Base expectations (production code at
+// `55be66b9e`): RED where the base violates the model, GREEN where the base
+// already holds it (non-vacuity for those via the guard-disabled mutant run,
+// recorded in the lane report). Pre-existing twins cover two cells and are
+// cited, not duplicated. E8/E9 rows live in `inventory_claims_tests.rs`
+// (native inventory harness); E5-merge and E2/E3/E6/E7/E8-merge are N/A (no
+// controllable merge seam — the shared `merge_scanned_module` mechanism is
+// covered at Direct/E1/E4/E9); E10–E12 ride the ungated fresh-scan binder,
+// covered by the existing binder tests as authority-all controls.
+//
+// Ownership cells (retired R claimless, live owners intact, pins resolvable):
+//   E1 inventory × shared-pin      → merge_ownership_e1_inventory_shared_pin_stays_claimless (RED)
+//   E1 inventory × shared decay    → merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry (GREEN guard)
+//   E1 inventory × carried         → generational_removal_carry_stays_claimless_across_unrelated_refresh (pre-existing, GREEN)
+//   E2 conservative × shared-pin   → merge_ownership_e2_conservative_shared_pin_stays_claimless (RED)
+//   E2 conservative × carried      → owned_run_conservative_replay_keeps_carried_pins_claimless (pre-existing, GREEN)
+//   E3 loader × shared-pin/carried → merge_ownership_e3_loader_* (GREEN)
+//   E4 lowering × shared-pin/carried → merge_ownership_e4_lowering_* (GREEN, choke-direct)
+//   E5 loader scan × shared-pin/carried → merge_ownership_e5_loader_scan_* (GREEN, choke-direct)
+//   E6 learned × shared-pin/carried → merge_ownership_e6_learned_staging_* (GREEN, choke-direct)
+//   E7 selection × shared-pin/carried → merge_ownership_e7_selection_* (GREEN, choke-direct)
+// D2 guards (applies refuse R-riding candidates; Step 2 preserves this):
+//   merge_ownership_e4_lowering_refuses_with_r_riding (GREEN)
+//   merge_ownership_e5_loader_scan_refuses_with_r_riding (GREEN)
+//   merge_ownership_e6_learned_staging_refuses_with_r_riding (GREEN)
+// (E4/E5/E6/E7 are choke-direct: the full entries refuse R-riding
+// candidates at live admission, so the ownership seam is each entry's
+// exact choke call with its tick events, mirrored argument-for-argument.
+// E8 commits without a generation check, so it drives the real entry.)
+// Merge cells (links bound to one mapping; history coalesced):
+//   Direct × addr-change  → merge_ownership_direct_multi_row_link_drops_on_superseded_mapping (RED)
+//   Direct × repeat-remap → merge_ownership_direct_repeated_remap_coalesces_unlinked_history (RED)
+//   Direct × planner      → merge_ownership_direct_multi_row_union_grants_no_linkage (RED)
+//   E1 × addr-change/repeat → merge_ownership_e1_refresh_* (RED)
+//   E4 × addr-change/repeat → merge_ownership_e4_lowered_* (RED)
+//
+// View ids 90/91/92/93 belong to this section's fixtures: R retires (never
+// listed), L co-owns R's pin while listed live, B is an unrelated live view.
+
+const MO_VIEW_R: u32 = 90;
+const MO_VIEW_L: u32 = 91;
+const MO_VIEW_B: u32 = 92;
+const MO_VIEW_FRESH: u32 = 93;
+
+fn mo_mount_namespace(id: u32) -> crate::process::MountNamespaceId {
+    crate::process::MountNamespaceId {
+        device: 1,
+        inode: u64::from(id),
+    }
+}
+
+struct MoSharedPin {
+    module_r: ScannedModule,
+    module_l: ScannedModule,
+    pins: PinnedObjects,
+    object: PinnedObjectId,
+}
+
+/// Two views, one canonical pin: R and L map the same file (same maps key,
+/// pin and digest), so absorb merges their pins into one id with two raw
+/// aliases — the production same-open-file shape, with no overlay
+/// uncertainty. L's raw ownership is recorded (production pins record it);
+/// R's never is (R retires before the entry under test runs).
+fn mo_shared_pin_parts() -> MoSharedPin {
+    let key = overlay_key(u64::from(MO_VIEW_R));
+    let module_r = overlay_module(key);
+    assert_eq!(module_r.view, ProcessViewId(MO_VIEW_R));
+    let mut module_l = overlay_module(key);
+    module_l.view = ProcessViewId(MO_VIEW_L);
+    module_l.mount_namespace = mo_mount_namespace(MO_VIEW_L);
+    let mut pins = overlay_view_pin(&module_l, 1000, OVERLAY_SHA, 1, false);
+    record_scan_ownership(&mut pins, module_l.view, key, &module_l.path);
+    let skips = pins.absorb(overlay_view_pin(&module_r, 999, OVERLAY_SHA, 1, false));
+    assert!(
+        skips.is_empty(),
+        "exact same-file pins merge cleanly: {skips:?}"
+    );
+    let object_r = pins.id_for_scanned(&module_r, key, &module_r.path);
+    let object_l = pins.id_for_scanned(&module_l, key, &module_l.path);
+    assert_eq!(object_r, object_l, "both views resolve one canonical pin");
+    let object = object_r.expect("the shared pin resolves");
+    MoSharedPin {
+        module_r,
+        module_l,
+        pins,
+        object,
+    }
+}
+
+struct MoSolePin {
+    module_r: ScannedModule,
+    module_b: ScannedModule,
+    pins: PinnedObjects,
+    object_r: PinnedObjectId,
+    object_b: PinnedObjectId,
+}
+
+/// R alone on its pin plus an unrelated live view B: the sole-carry shape.
+fn mo_sole_pin_parts() -> MoSolePin {
+    let module_r = overlay_module(overlay_key(u64::from(MO_VIEW_R)));
+    let module_b = overlay_module(overlay_key(u64::from(MO_VIEW_B)));
+    let mut pins = overlay_view_pin(&module_r, 999, OVERLAY_SHA, 1, false);
+    let skips = pins.absorb(overlay_view_pin(&module_b, 1001, OVERLAY_SHA, 2, false));
+    assert!(skips.is_empty(), "{skips:?}");
+    record_scan_ownership(&mut pins, module_b.view, module_b.key, &module_b.path);
+    let object_r = pins
+        .id_for_scanned(&module_r, module_r.key, &module_r.path)
+        .expect("R's pin resolves");
+    let object_b = pins
+        .id_for_scanned(&module_b, module_b.key, &module_b.path)
+        .expect("B's pin resolves");
+    assert_ne!(object_r, object_b, "sole pins stay distinct objects");
+    MoSolePin {
+        module_r,
+        module_b,
+        pins,
+        object_r,
+        object_b,
+    }
+}
+
+/// Bind fixture modules and shape R as carried: R's module stays bound
+/// (exact attached targets ride) but R owns no claims — the exact shape a
+/// removal carry plus its claimless rebind leave behind.
+fn mo_bind_and_carry(pins: &mut PinnedObjects, modules: &[ScannedModule]) -> Vec<ReconciledModule> {
+    let (bound, skipped) = bind_scanned_modules(modules, pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(bound.len(), modules.len(), "every fixture module binds");
+    pins.drop_view_claims(ProcessViewId(MO_VIEW_R));
+    assert!(
+        pins.view_claims(ProcessViewId(MO_VIEW_R)).is_none(),
+        "the fixture starts with R carried"
+    );
+    bound
+}
+
+/// The retired view owns no claims — the terminal-retirement oracle.
+fn mo_assert_retired_claimless(pinned: &PinnedObjects, what: &str) {
+    assert!(
+        pinned.view_claims(ProcessViewId(MO_VIEW_R)).is_none(),
+        "the retired view owns no claims ({what})"
+    );
+}
+
+/// A live owner keeps its claims, its pin stays resolvable, its module
+/// binds, and its slot stays attached.
+fn mo_assert_live_owner(
+    pinned: &PinnedObjects,
+    modules: &[ReconciledModule],
+    plan: &plan::AttachPlan,
+    view: ProcessViewId,
+    object: PinnedObjectId,
+    what: &str,
+) {
+    let claims = pinned
+        .view_claims(view)
+        .unwrap_or_else(|| panic!("the live view keeps its claims ({what})"));
+    assert!(
+        claims.pins.contains(&object)
+            || claims.tables.contains(&object)
+            || claims.targets.iter().any(|(id, _)| *id == object),
+        "the live view's claims still name its object ({what})"
+    );
+    assert!(
+        pinned.summary(object).is_some(),
+        "the live pin stays resolvable ({what})"
+    );
+    assert!(
+        modules.iter().any(|module| module.object == object),
+        "the live module still binds ({what})"
+    );
+    assert!(
+        plan.slots
+            .iter()
+            .any(|slot| plan.is_active(slot.index) && slot.object == object),
+        "the live slot stays attached ({what})"
+    );
+}
+
+/// A carried pin stays resolvable. A sole-carried pin reads as carried
+/// coverage; a live-co-owned pin is owned, never carried — the object
+/// predicate and the per-view retirement it must not stand in for.
+fn mo_assert_carried_pin(
+    pinned: &PinnedObjects,
+    modules: &[ReconciledModule],
+    plan: &plan::AttachPlan,
+    object: PinnedObjectId,
+    sole: bool,
+    what: &str,
+) {
+    assert!(
+        pinned.summary(object).is_some(),
+        "the carried pin stays resolvable ({what})"
+    );
+    assert!(
+        modules.iter().any(|module| module.object == object),
+        "the carried module still binds ({what})"
+    );
+    assert!(
+        plan.slots
+            .iter()
+            .any(|slot| plan.is_active(slot.index) && slot.object == object),
+        "the carried slot stays attached ({what})"
+    );
+    if sole {
+        assert!(
+            pinned.carried_ids().contains(&object),
+            "the sole-carried pin reads as carried coverage ({what})"
+        );
+    } else {
+        assert!(
+            !pinned.carried_ids().contains(&object),
+            "a live-co-owned pin is owned, not carried ({what})"
+        );
+    }
+}
+
+/// A System engine with R carried on the shared pin and L listed live.
+fn mo_shared_engine() -> (Engine, PinnedObjectId) {
+    let parts = mo_shared_pin_parts();
+    let mut pins = parts.pins;
+    let bound = mo_bind_and_carry(&mut pins, &[parts.module_r, parts.module_l.clone()]);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_L), std::process::id()).unwrap());
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && slot.object == parts.object),
+        "the fixture starts attached"
+    );
+    (engine, parts.object)
+}
+
+/// A System engine with R carried on a sole pin and B listed live.
+fn mo_sole_engine() -> (Engine, PinnedObjectId, PinnedObjectId) {
+    let parts = mo_sole_pin_parts();
+    let mut pins = parts.pins;
+    let bound = mo_bind_and_carry(&mut pins, &[parts.module_r, parts.module_b.clone()]);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_B), std::process::id()).unwrap());
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && slot.object == parts.object_r),
+        "the fixture starts attached"
+    );
+    (engine, parts.object_r, parts.object_b)
+}
+
+#[test]
+fn merge_ownership_e1_inventory_shared_pin_stays_claimless() {
+    // E1 × shared-pin: R retires with live co-owner L on one canonical
+    // pin. Candidate 1 carries R; candidate 2 is an unrelated refresh
+    // while a newcomer waits, so the carried pin is preserved (not
+    // purged) and R's module binds again. The rebind must not refile
+    // claims under R just because L owns the pin — suppression is
+    // per-view, never per-object. Stale retirement then drops R's
+    // module as redundant (L covers the object) without touching L.
+    let parts = mo_shared_pin_parts();
+    let module_b = overlay_module(overlay_key(u64::from(MO_VIEW_B)));
+    let mut pins = parts.pins;
+    assert!(
+        pins.absorb(overlay_view_pin(&module_b, 1001, OVERLAY_SHA, 2, false))
+            .is_empty()
+    );
+    record_scan_ownership(&mut pins, module_b.view, module_b.key, &module_b.path);
+    let bound = mo_bind_and_carry(
+        &mut pins,
+        &[parts.module_r, parts.module_l.clone(), module_b.clone()],
+    );
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    for view in [MO_VIEW_L, MO_VIEW_B] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(view), std::process::id()).unwrap());
+    }
+    let view_r = ProcessViewId(MO_VIEW_R);
+    let view_l = ProcessViewId(MO_VIEW_L);
+    let view_b = ProcessViewId(MO_VIEW_B);
+    let object = parts.object;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = engine
+        .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    mo_assert_retired_claimless(&carried.pinned, "removal carry");
+    mo_assert_live_owner(
+        &carried.pinned,
+        &carried.modules,
+        &carried.plan,
+        view_l,
+        object,
+        "removal carry",
+    );
+    mo_assert_carried_pin(
+        &carried.pinned,
+        &carried.modules,
+        &carried.plan,
+        object,
+        false,
+        "removal carry",
+    );
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    // A waiting newcomer: the refresh preserves carried pins instead of
+    // purging them, so R's carried module binds again through the rebind
+    // under test (with an empty preserve set the co-owned raw would decay
+    // at the purge instead — see the decay twin below).
+    engine.newcomer_first_seen.insert(999_999, Some(1));
+    let refreshed = vec![(view_b, Vec::new(), PinnedObjects::empty())];
+    let next = engine
+        .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        next.built_by_full_rebuild,
+        "the refresh rebuilds (no cached-plan shortcut)"
+    );
+    assert!(
+        next.modules
+            .iter()
+            .any(|module| module.scanned.view == view_r),
+        "R's carried module binds again through the preserved pin"
+    );
+    mo_assert_retired_claimless(&next.pinned, "unrelated refresh");
+    mo_assert_live_owner(
+        &next.pinned,
+        &next.modules,
+        &next.plan,
+        view_l,
+        object,
+        "unrelated refresh",
+    );
+    mo_assert_carried_pin(
+        &next.pinned,
+        &next.modules,
+        &next.plan,
+        object,
+        false,
+        "unrelated refresh",
+    );
+    // Stale retirement drops R's module as redundant: the live co-owner
+    // covers the object, so the carry ends without losing coverage.
+    let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view_r]);
+    let mut session = ScriptedSession::default();
+    let mut outcome = super::ApplyOutcome::default();
+    let mut staled = next;
+    engine.retire_stale_candidate_sources(&mut session, &mut staled, &stale, &mut outcome);
+    assert!(
+        staled
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != view_r),
+        "stale retirement drops the live-co-owned carried module as redundant"
+    );
+    mo_assert_retired_claimless(&staled.pinned, "stale retirement");
+    mo_assert_live_owner(
+        &staled.pinned,
+        &staled.modules,
+        &staled.plan,
+        view_l,
+        object,
+        "stale retirement",
+    );
+    mo_assert_carried_pin(
+        &staled.pinned,
+        &staled.modules,
+        &staled.plan,
+        object,
+        false,
+        "stale retirement",
+    );
+}
+
+#[test]
+fn merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry() {
+    // E1 × shared-pin decay shape (GREEN guard): with an empty preserve
+    // set the unrelated refresh purges R's unowned raw alias — the pin
+    // stays via L's alias — so R's module stops binding and the carry
+    // ends early with no claims ever refiled. Coverage continues through
+    // the live co-owner. This pins the soundness of the decay; the
+    // refile hazard (preserved pin, module still binding) is the twin
+    // above.
+    let parts = mo_shared_pin_parts();
+    let module_b = overlay_module(overlay_key(u64::from(MO_VIEW_B)));
+    let mut pins = parts.pins;
+    assert!(
+        pins.absorb(overlay_view_pin(&module_b, 1001, OVERLAY_SHA, 2, false))
+            .is_empty()
+    );
+    record_scan_ownership(&mut pins, module_b.view, module_b.key, &module_b.path);
+    let bound = mo_bind_and_carry(
+        &mut pins,
+        &[parts.module_r, parts.module_l.clone(), module_b.clone()],
+    );
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    for view in [MO_VIEW_L, MO_VIEW_B] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(view), std::process::id()).unwrap());
+    }
+    let view_r = ProcessViewId(MO_VIEW_R);
+    let view_l = ProcessViewId(MO_VIEW_L);
+    let view_b = ProcessViewId(MO_VIEW_B);
+    let object = parts.object;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = engine
+        .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        carried
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view_r),
+        "R's module rides the removal carry"
+    );
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    assert!(
+        engine.newcomer_first_seen.is_empty(),
+        "no newcomers wait, so the refresh preserves nothing"
+    );
+    let refreshed = vec![(view_b, Vec::new(), PinnedObjects::empty())];
+    let next = engine
+        .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        next.built_by_full_rebuild,
+        "the refresh rebuilds (no cached-plan shortcut)"
+    );
+    assert!(
+        next.modules
+            .iter()
+            .all(|module| module.scanned.view != view_r),
+        "the purge ends the co-owned carry by dropping its raw alias"
+    );
+    mo_assert_retired_claimless(&next.pinned, "unrelated refresh");
+    mo_assert_live_owner(
+        &next.pinned,
+        &next.modules,
+        &next.plan,
+        view_l,
+        object,
+        "unrelated refresh",
+    );
+    mo_assert_carried_pin(
+        &next.pinned,
+        &next.modules,
+        &next.plan,
+        object,
+        false,
+        "unrelated refresh",
+    );
+}
+
+#[test]
+fn merge_ownership_e2_conservative_shared_pin_stays_claimless() {
+    // E2 × shared-pin: R retires with live co-owner L on one canonical
+    // pin. Replay 1 carries R; replay 2 has no new retirements. The
+    // already-carried module must not regain claims under R.
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let parts = mo_shared_pin_parts();
+    let mut pins = parts.pins;
+    let bound = mo_bind_and_carry(&mut pins, &[parts.module_r, parts.module_l.clone()]);
+    let mut engine = Engine::empty();
+    engine.scope = cgroup;
+    engine.owned_run_pid = Some(424242);
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_L), std::process::id()).unwrap());
+    let view_r = ProcessViewId(MO_VIEW_R);
+    let view_l = ProcessViewId(MO_VIEW_L);
+    let object = parts.object;
+    let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+    let carried = engine
+        .conservative_candidate(&BTreeSet::from([view_r]), &keys)
+        .unwrap();
+    mo_assert_retired_claimless(&carried.pinned, "retiring replay");
+    mo_assert_live_owner(
+        &carried.pinned,
+        &carried.modules,
+        &carried.plan,
+        view_l,
+        object,
+        "retiring replay",
+    );
+    mo_assert_carried_pin(
+        &carried.pinned,
+        &carried.modules,
+        &carried.plan,
+        object,
+        false,
+        "retiring replay",
+    );
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    let later = engine
+        .conservative_candidate(&BTreeSet::new(), &keys)
+        .unwrap();
+    mo_assert_retired_claimless(&later.pinned, "later replay");
+    mo_assert_live_owner(
+        &later.pinned,
+        &later.modules,
+        &later.plan,
+        view_l,
+        object,
+        "later replay",
+    );
+    mo_assert_carried_pin(
+        &later.pinned,
+        &later.modules,
+        &later.plan,
+        object,
+        false,
+        "later replay",
+    );
+}
+
+#[test]
+fn merge_ownership_e3_loader_shared_pin_stays_claimless() {
+    // E3 × shared-pin: a loader assembly rides the carried module for
+    // the shared pin; the scanned view keeps fresh claims, R keeps none.
+    let (mut engine, object) = mo_shared_engine();
+    let scanned = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(scanned, std::process::id()).unwrap());
+    let (loader_module, loader_pins, local) = {
+        let view_ref = engine
+            .views
+            .iter()
+            .find(|view| view.id() == scanned)
+            .expect("the engine retains the scanned view");
+        let loader_module = crate::discovery::identity::test_fixture::small_owned_module(view_ref);
+        let loader_pins = pin_test_module(view_ref, &loader_module);
+        let local = loader_pins
+            .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+            .expect("the loader pin resolves");
+        (loader_module, loader_pins, local)
+    };
+    let (candidate, retained) = engine
+        .loader_candidate(scanned, &loader_module, &loader_pins, local, Vec::new())
+        .unwrap();
+    assert!(
+        retained.is_some(),
+        "the loader assembly ran and kept its loader"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "loader assembly");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_L),
+        object,
+        "loader assembly",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object,
+        false,
+        "loader assembly",
+    );
+}
+
+#[test]
+fn merge_ownership_e3_loader_carried_provider_stays_claimless() {
+    // E3 × carried: the sole-carried provider rides the loader assembly
+    // claimless while the live view keeps its claims.
+    let (mut engine, object_r, object_b) = mo_sole_engine();
+    let scanned = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(scanned, std::process::id()).unwrap());
+    let (loader_module, loader_pins, local) = {
+        let view_ref = engine
+            .views
+            .iter()
+            .find(|view| view.id() == scanned)
+            .expect("the engine retains the scanned view");
+        let loader_module = crate::discovery::identity::test_fixture::small_owned_module(view_ref);
+        let loader_pins = pin_test_module(view_ref, &loader_module);
+        let local = loader_pins
+            .id_for_scanned(&loader_module, loader_module.key, &loader_module.path)
+            .expect("the loader pin resolves");
+        (loader_module, loader_pins, local)
+    };
+    let (candidate, retained) = engine
+        .loader_candidate(scanned, &loader_module, &loader_pins, local, Vec::new())
+        .unwrap();
+    assert!(
+        retained.is_some(),
+        "the loader assembly ran and kept its loader"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "loader assembly");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_B),
+        object_b,
+        "loader assembly",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object_r,
+        true,
+        "loader assembly",
+    );
+}
+
+#[test]
+fn merge_ownership_e4_lowering_shared_pin_stays_claimless() {
+    // E4 × shared-pin, through the entry's exact rebuild call: the full
+    // entry refuses R-riding candidates (D2 staleness; pinned by the
+    // refusal guard below), so the ownership seam is the choke call with
+    // the entry's tick events (fresh observed view), mirrored here
+    // argument-for-argument (absorb + merge + keep-set).
+    let (mut engine, object) = mo_shared_engine();
+    let observed = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(observed, std::process::id()).unwrap());
+    let lowered = overlay_module(overlay_key(u64::from(MO_VIEW_FRESH)));
+    assert_eq!(lowered.view, observed);
+    let mut lowered_pins = overlay_view_pin(&lowered, 1003, OVERLAY_SHA, 3, false);
+    record_scan_ownership(&mut lowered_pins, observed, lowered.key, &lowered.path);
+    let mut candidate_pins = engine.pinned.clone();
+    let mut skipped = Vec::new();
+    skipped.extend(candidate_pins.absorb(lowered_pins));
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    merge_scanned_module(&mut raw_modules, lowered);
+    let claimless = engine.dead_module_views(&raw_modules, Some(observed));
+    let candidate = engine
+        .live_candidate_with_claimless(candidate_pins, raw_modules, skipped, &claimless)
+        .unwrap();
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == observed),
+        "the lowered module joins the rebuilt candidate"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "lowering rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_L),
+        object,
+        "lowering rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object,
+        false,
+        "lowering rebuild",
+    );
+}
+
+#[test]
+fn merge_ownership_e4_lowering_refuses_with_r_riding() {
+    // D2 guard: the full lowering entry refuses a carried-riding
+    // candidate (generation_stale) and mutates nothing — Step 2 must
+    // preserve this apply behavior while centralizing claim filing.
+    let (mut engine, _object) = mo_shared_engine();
+    let observed = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(observed, std::process::id()).unwrap());
+    let lowered = overlay_module(overlay_key(u64::from(MO_VIEW_FRESH)));
+    assert_eq!(lowered.view, observed);
+    let mut pins = overlay_view_pin(&lowered, 1003, OVERLAY_SHA, 3, false);
+    record_scan_ownership(&mut pins, observed, lowered.key, &lowered.path);
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == observed)
+        .expect("the engine retains the observed view");
+    let slots_before = engine.plan.slots.len();
+    let outcome = engine
+        .apply_pinned_lowered_module(
+            lowered.clone(),
+            pins,
+            Vec::new(),
+            position,
+            1_000_000,
+            &mut session,
+            &mut additions,
+            &mut pending,
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
+        "the entry returns normally (refusal is an outcome, not an error)"
+    );
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != observed),
+        "the refused lowering commits nothing"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots_before,
+        "the refused lowering leaves the plan untouched"
+    );
+    mo_assert_retired_claimless(&engine.pinned, "refused lowering");
+}
+
+#[test]
+fn merge_ownership_e4_lowering_carried_provider_stays_claimless() {
+    // E4 × carried, through the entry's exact rebuild call (see the
+    // shared twin for why the full entry is refusal-guarded, not
+    // commit-asserted).
+    let (mut engine, object_r, object_b) = mo_sole_engine();
+    let observed = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(observed, std::process::id()).unwrap());
+    let lowered = overlay_module(overlay_key(u64::from(MO_VIEW_FRESH)));
+    assert_eq!(lowered.view, observed);
+    let mut lowered_pins = overlay_view_pin(&lowered, 1003, OVERLAY_SHA, 3, false);
+    record_scan_ownership(&mut lowered_pins, observed, lowered.key, &lowered.path);
+    let mut candidate_pins = engine.pinned.clone();
+    let mut skipped = Vec::new();
+    skipped.extend(candidate_pins.absorb(lowered_pins));
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    merge_scanned_module(&mut raw_modules, lowered);
+    let claimless = engine.dead_module_views(&raw_modules, Some(observed));
+    let candidate = engine
+        .live_candidate_with_claimless(candidate_pins, raw_modules, skipped, &claimless)
+        .unwrap();
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == observed),
+        "the lowered module joins the rebuilt candidate"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "lowering rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_B),
+        object_b,
+        "lowering rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object_r,
+        true,
+        "lowering rebuild",
+    );
+}
+
+/// Commit carried fixture modules into an e07 engine (whose plan starts
+/// empty, so the rescan's rebuild visibly attaches them).
+fn mo_commit_into_e07(engine: &mut Engine, pins: PinnedObjects, modules: Vec<ScannedModule>) {
+    let skips = engine.pinned.absorb(pins);
+    assert!(skips.is_empty(), "{skips:?}");
+    let bound = mo_bind_and_carry(&mut engine.pinned, &modules);
+    engine.modules.extend(bound);
+}
+
+#[test]
+fn merge_ownership_e5_loader_scan_shared_pin_stays_claimless() {
+    // E5 × shared-pin, through the entry's exact rebuild call (empty-scan
+    // shape): the full entry refuses R-riding candidates (D2 staleness;
+    // pinned by the refusal guard below), so the ownership seam is the
+    // choke call with the entry's tick events (fresh scanned view),
+    // mirrored here argument-for-argument.
+    let mut engine = e07_engine();
+    let parts = mo_shared_pin_parts();
+    mo_commit_into_e07(
+        &mut engine,
+        parts.pins,
+        vec![parts.module_r, parts.module_l.clone()],
+    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_L), std::process::id()).unwrap());
+    let object = parts.object;
+    let scanned = ProcessViewId(0);
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view != scanned)
+        .map(|module| module.scanned.clone())
+        .collect();
+    assert_eq!(raw_modules.len(), 2, "R and L ride the rebuild");
+    let claimless = engine.dead_module_views(&raw_modules, Some(scanned));
+    let candidate = engine
+        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .unwrap();
+    mo_assert_retired_claimless(&candidate.pinned, "loader scan rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_L),
+        object,
+        "loader scan rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object,
+        false,
+        "loader scan rebuild",
+    );
+}
+
+#[test]
+fn merge_ownership_e5_loader_scan_refuses_with_r_riding() {
+    // D2 guard: the full loader-scan entry refuses a carried-riding
+    // candidate (generation_stale) and mutates nothing — Step 2 must
+    // preserve this apply behavior while centralizing claim filing.
+    let mut engine = e07_engine();
+    let parts = mo_sole_pin_parts();
+    mo_commit_into_e07(
+        &mut engine,
+        parts.pins,
+        vec![parts.module_r, parts.module_b.clone()],
+    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_B), std::process::id()).unwrap());
+    let context = e07_loader_context(&mut engine, ProcessViewId(0));
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
+        "the entry returns normally (refusal is an outcome, not an error)"
+    );
+    assert!(
+        engine.plan.slots.is_empty(),
+        "the refused rescan leaves the empty plan untouched"
+    );
+    assert_eq!(
+        engine.modules.len(),
+        2,
+        "the refused rescan commits no found modules"
+    );
+    mo_assert_retired_claimless(&engine.pinned, "refused loader scan");
+}
+
+#[test]
+fn merge_ownership_e5_loader_scan_carried_provider_stays_claimless() {
+    // E5 × carried, through the entry's exact rebuild call (see the
+    // shared twin for why the full entry is refusal-guarded, not
+    // commit-asserted).
+    let mut engine = e07_engine();
+    let parts = mo_sole_pin_parts();
+    mo_commit_into_e07(
+        &mut engine,
+        parts.pins,
+        vec![parts.module_r, parts.module_b.clone()],
+    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_B), std::process::id()).unwrap());
+    let (object_r, object_b) = (parts.object_r, parts.object_b);
+    let scanned = ProcessViewId(0);
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .filter(|module| module.scanned.view != scanned)
+        .map(|module| module.scanned.clone())
+        .collect();
+    assert_eq!(raw_modules.len(), 2, "R and B ride the rebuild");
+    let claimless = engine.dead_module_views(&raw_modules, Some(scanned));
+    let candidate = engine
+        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .unwrap();
+    mo_assert_retired_claimless(&candidate.pinned, "loader scan rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_B),
+        object_b,
+        "loader scan rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object_r,
+        true,
+        "loader scan rebuild",
+    );
+}
+
+#[test]
+fn merge_ownership_e6_learned_staging_shared_pin_stays_claimless() {
+    // E6 × shared-pin, through the entry's exact rebuild call: the full
+    // entry refuses R-riding candidates (D2 staleness; pinned by the
+    // refusal guard below), so the ownership seam is the choke call with
+    // the entry's tick events (no keep-set), mirrored here
+    // argument-for-argument.
+    let (mut engine, object) = mo_shared_engine();
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let claimless = engine.dead_module_views(&raw_modules, None);
+    let candidate = engine
+        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .unwrap();
+    mo_assert_retired_claimless(&candidate.pinned, "learned staging rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_L),
+        object,
+        "learned staging rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object,
+        false,
+        "learned staging rebuild",
+    );
+}
+
+#[test]
+fn merge_ownership_e6_learned_staging_refuses_with_r_riding() {
+    // D2 guard: the file-only learned apply refuses a carried-riding
+    // candidate (generation_stale): the latch stays set and nothing
+    // commits — Step 2 must preserve this while centralizing filing.
+    let (mut engine, _object) = mo_shared_engine();
+    engine.learned_unapplied = true;
+    let modules_before = engine.modules.len();
+    let slots_before = engine.plan.slots.len();
+    let mut session = ScriptedSession::with_records([], 0);
+    engine.apply_learned_staging(&mut session);
+    assert!(
+        engine.learned_unapplied,
+        "the refused apply leaves the latch set for the ordinary refresh"
+    );
+    assert_eq!(
+        engine.modules.len(),
+        modules_before,
+        "the refused apply commits no modules"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots_before,
+        "the refused apply leaves the plan untouched"
+    );
+    mo_assert_retired_claimless(&engine.pinned, "refused learned staging");
+}
+
+#[test]
+fn merge_ownership_e6_learned_staging_carried_provider_stays_claimless() {
+    // E6 × carried, through the entry's exact rebuild call (see the
+    // shared twin for why the full entry is refusal-guarded, not
+    // commit-asserted).
+    let (mut engine, object_r, object_b) = mo_sole_engine();
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let claimless = engine.dead_module_views(&raw_modules, None);
+    let candidate = engine
+        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .unwrap();
+    mo_assert_retired_claimless(&candidate.pinned, "learned staging rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_B),
+        object_b,
+        "learned staging rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object_r,
+        true,
+        "learned staging rebuild",
+    );
+}
+
+#[test]
+fn merge_ownership_e7_selection_shared_pin_stays_claimless() {
+    // E7 × shared-pin: the selection-claim rebuild rides the carried
+    // module for the shared pin claimless while the live co-owner keeps
+    // its claims. Driven through the production choke with E7's exact
+    // inputs (production's `propose_selection_claim` output plus the
+    // same empty keep set the inline site passes); the pending admission
+    // on the candidate proves the selection path ran.
+    let (_fixture, mut engine, _session, first_binding) = attached_selection_route();
+    let parts = mo_shared_pin_parts();
+    let skips = engine.pinned.absorb(parts.pins);
+    assert!(skips.is_empty(), "{skips:?}");
+    let bound = mo_bind_and_carry(
+        &mut engine.pinned,
+        &[parts.module_r, parts.module_l.clone()],
+    );
+    // Absorb into a non-empty pin set reassigns ids: resolve the shared
+    // pin from the bound modules, not from the standalone parts.
+    let object = bound
+        .iter()
+        .find(|module| module.scanned.view == ProcessViewId(MO_VIEW_L))
+        .expect("L's module bound")
+        .object;
+    assert_eq!(
+        bound
+            .iter()
+            .find(|module| module.scanned.view == ProcessViewId(MO_VIEW_R))
+            .expect("R's module bound")
+            .object,
+        object,
+        "R and L share one canonical pin after absorb"
+    );
+    engine.modules.extend(bound);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_L), std::process::id()).unwrap());
+    let provider = engine
+        .pinned
+        .owned_timing_key(first_binding.object)
+        .unwrap();
+    let first_table = selection_only_table(
+        &engine,
+        first_binding,
+        0x20,
+        &[("C_Initialize", 0x100)],
+        Vec::new(),
+    );
+    let result = SelectionRequest {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    };
+    let (claims, tables, pending) = engine
+        .propose_selection_claim(&first_binding, provider, &first_table, &result)
+        .unwrap();
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let claimless = engine.dead_module_views(&raw_modules, None);
+    let candidate = engine
+        .live_candidate_with_selection(
+            engine.pinned.clone(),
+            raw_modules,
+            claims,
+            tables,
+            pending,
+            &claimless,
+        )
+        .unwrap();
+    assert!(
+        candidate.selection_admission.is_some(),
+        "the selection rebuild ran with its pending admission"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "selection rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_L),
+        object,
+        "selection rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object,
+        false,
+        "selection rebuild",
+    );
+}
+
+#[test]
+fn merge_ownership_e7_selection_carried_provider_stays_claimless() {
+    // E7 × carried: the sole-carried provider rides the selection-claim
+    // rebuild claimless while the live view keeps its claims.
+    let (_fixture, mut engine, _session, first_binding) = attached_selection_route();
+    let parts = mo_sole_pin_parts();
+    let skips = engine.pinned.absorb(parts.pins);
+    assert!(skips.is_empty(), "{skips:?}");
+    let bound = mo_bind_and_carry(
+        &mut engine.pinned,
+        &[parts.module_r, parts.module_b.clone()],
+    );
+    // Absorb into a non-empty pin set reassigns ids: resolve from bound.
+    let object_r = bound
+        .iter()
+        .find(|module| module.scanned.view == ProcessViewId(MO_VIEW_R))
+        .expect("R's module bound")
+        .object;
+    let object_b = bound
+        .iter()
+        .find(|module| module.scanned.view == ProcessViewId(MO_VIEW_B))
+        .expect("B's module bound")
+        .object;
+    assert_ne!(object_r, object_b, "sole pins stay distinct after absorb");
+    engine.modules.extend(bound);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_B), std::process::id()).unwrap());
+    let provider = engine
+        .pinned
+        .owned_timing_key(first_binding.object)
+        .unwrap();
+    let first_table = selection_only_table(
+        &engine,
+        first_binding,
+        0x20,
+        &[("C_Initialize", 0x100)],
+        Vec::new(),
+    );
+    let result = SelectionRequest {
+        name: SelectionNameClass::ExactStandard,
+        version: SelectionVersionClass::V3_0,
+        flags: 0,
+    };
+    let (claims, tables, pending) = engine
+        .propose_selection_claim(&first_binding, provider, &first_table, &result)
+        .unwrap();
+    let raw_modules: Vec<_> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    let claimless = engine.dead_module_views(&raw_modules, None);
+    let candidate = engine
+        .live_candidate_with_selection(
+            engine.pinned.clone(),
+            raw_modules,
+            claims,
+            tables,
+            pending,
+            &claimless,
+        )
+        .unwrap();
+    assert!(
+        candidate.selection_admission.is_some(),
+        "the selection rebuild ran with its pending admission"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "selection rebuild");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        ProcessViewId(MO_VIEW_B),
+        object_b,
+        "selection rebuild",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object_r,
+        true,
+        "selection rebuild",
+    );
+}
+
+fn mo_merge_key() -> ObjectKey {
+    ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 42,
+    }
+}
+
+/// One 68-slot 3.2 legacy prefix, the `remapped_legacy_prefix_...` shape:
+/// same normalized content at any address, so two rows at distinct
+/// addresses are one remapped table.
+fn mo_merge_table(key: ObjectKey, path: &str, address: u64, proof: bool) -> ScannedTable {
+    let entries = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .enumerate()
+        .map(|(index, field)| ScannedEntry {
+            name: field.name,
+            object: key,
+            object_path: path.into(),
+            file_offset: 0x1000 + (index as u64) * 8,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 68);
+    ScannedTable {
+        version: (3, 2),
+        walk: "known_prefix",
+        entries,
+        null_entries: vec![],
+        unpinned: vec![],
+        address,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: proof,
+    }
+}
+
+fn mo_merge_interface(index: usize, table: Option<usize>) -> ScannedInterface {
+    ScannedInterface {
+        index,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table,
+    }
+}
+
+fn mo_merge_module(
+    view: ProcessViewId,
+    key: ObjectKey,
+    path: &str,
+    tables: Vec<ScannedTable>,
+    interfaces: Vec<ScannedInterface>,
+) -> ScannedModule {
+    ScannedModule {
+        key_is_identity: false,
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        pre_copy_up: None,
+        view,
+        mount_namespace: mo_mount_namespace(view.0),
+        key,
+        path: path.into(),
+        tables_scan_finished: true,
+        decoder_abi: None,
+        exports: vec![],
+        tables,
+        interfaces,
+    }
+}
+
+/// Planner authority for one merged module, the `authority_of` shape from
+/// `remapped_legacy_prefix_carries_only_the_fresh_extension_proof`: the
+/// getter-present fixture blocks the sole leg, so linkage is the only leg
+/// that can grant here.
+fn mo_merge_authority_of(scanned: &ScannedModule) -> plan::AttachPlan {
+    let object = PinnedObjectId(42);
+    let reconciled = ReconciledModule {
+        scanned: scanned.clone(),
+        object,
+        entry_objects: scanned
+            .tables
+            .iter()
+            .map(|table| vec![object; table.entries.len()])
+            .collect(),
+        forward_verified: scanned
+            .tables
+            .iter()
+            .map(|table| vec![false; table.entries.len()])
+            .collect(),
+        exports: std::sync::Arc::from(vec![("C_GetFunctionList".to_string(), 0x1000u64)]),
+        getter_present: true,
+        witness_fault: false,
+    };
+    plan::build_from_sources(
+        std::slice::from_ref(&reconciled),
+        &[],
+        &PinnedObjects::empty(),
+    )
+}
+
+#[test]
+fn merge_ownership_direct_multi_row_link_drops_on_superseded_mapping() {
+    // Direct × addr-change: one incoming module carries the same table at
+    // two mappings, each with its own exact-standard link. Both rows union
+    // onto one destination; the surviving row shows the second mapping, so
+    // the second link re-derives onto it and the first link drops to
+    // unlinked history — it must never point at another mapping's row.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(0);
+    let existing = mo_merge_module(view, key, path, vec![], vec![]);
+    let incoming = mo_merge_module(
+        view,
+        key,
+        path,
+        vec![
+            mo_merge_table(key, path, 0x1000, false),
+            mo_merge_table(key, path, 0x2000, false),
+        ],
+        vec![
+            mo_merge_interface(0, Some(0)),
+            mo_merge_interface(1, Some(1)),
+        ],
+    );
+    let mut modules = vec![existing];
+    merge_scanned_module(&mut modules, incoming);
+    assert_eq!(modules.len(), 1, "same module unions, not twins");
+    assert_eq!(
+        modules[0].tables.len(),
+        1,
+        "one normalized table unions onto one row"
+    );
+    assert_eq!(
+        modules[0].tables[0].address, 0x2000,
+        "the fresher mapping wins the row"
+    );
+    assert_eq!(modules[0].interfaces.len(), 2);
+    assert_eq!(
+        modules[0].interfaces[0].table, None,
+        "a superseded mapping keeps its link history unlinked"
+    );
+    assert_eq!(
+        modules[0].interfaces[1].table,
+        Some(0),
+        "the surviving mapping keeps its own link"
+    );
+}
+
+#[test]
+fn merge_ownership_direct_repeated_remap_coalesces_unlinked_history() {
+    // Direct × repeat-remap: alternating remaps of one linked table must
+    // not accumulate an unlinked history row per remap — the invalidated
+    // association coalesces with its equivalent unlinked record.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(0);
+    let mut modules = vec![mo_merge_module(
+        view,
+        key,
+        path,
+        vec![mo_merge_table(key, path, 0x1000, false)],
+        vec![mo_merge_interface(0, Some(0))],
+    )];
+    for round in 0..32 {
+        let address = if round % 2 == 0 { 0x2000 } else { 0x1000 };
+        merge_scanned_module(
+            &mut modules,
+            mo_merge_module(
+                view,
+                key,
+                path,
+                vec![mo_merge_table(key, path, address, false)],
+                vec![mo_merge_interface(0, Some(0))],
+            ),
+        );
+    }
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].tables.len(), 1);
+    let linked = modules[0]
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_some())
+        .count();
+    let unlinked = modules[0]
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_none())
+        .count();
+    assert_eq!(linked, 1, "one current link survives the remaps");
+    assert_eq!(
+        unlinked, 1,
+        "repeated remaps keep one history row, not one per remap"
+    );
+}
+
+#[test]
+fn merge_ownership_direct_multi_row_union_grants_no_linkage() {
+    // Direct × planner: the authority consequence of the superseded-mapping
+    // rule. The merged row at the fresh address carries the fresh proof but
+    // no linkage from the old mapping, so no leg grants and the prefix
+    // stays count-only.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(0);
+    let existing = mo_merge_module(view, key, path, vec![], vec![]);
+    let incoming = mo_merge_module(
+        view,
+        key,
+        path,
+        vec![
+            mo_merge_table(key, path, 0x1000, true),
+            mo_merge_table(key, path, 0x2000, true),
+        ],
+        vec![mo_merge_interface(0, Some(0))],
+    );
+    let mut modules = vec![existing];
+    merge_scanned_module(&mut modules, incoming);
+    assert_eq!(modules.len(), 1, "same module unions, not twins");
+    assert_eq!(modules[0].tables.len(), 1);
+    assert_eq!(modules[0].tables[0].address, 0x2000);
+    assert!(
+        modules[0].tables[0].extension_impossible,
+        "the union honors the fresh decode's proof"
+    );
+    assert_eq!(modules[0].interfaces.len(), 1);
+    assert_eq!(
+        modules[0].interfaces[0].table, None,
+        "the superseded mapping's link drops"
+    );
+    let merged_authority = mo_merge_authority_of(&modules[0]);
+    assert_eq!(merged_authority.slots.len(), 68);
+    assert!(
+        merged_authority
+            .slots
+            .iter()
+            .all(|slot| !slot.semantic_authorized),
+        "a superseded link never authorizes the surviving mapping"
+    );
+    assert!(
+        merged_authority.standard_layout_evidence().is_empty(),
+        "no leg grants on the multi-row union"
+    );
+    assert!(
+        merged_authority
+            .slots
+            .iter()
+            .all(|slot| slot.semantics == p11scope_ebpf_common::SlotSemantics::COUNT_ONLY),
+        "the multi-row union stays count-only"
+    );
+}
+
+/// A live view whose committed module carries `tables`: refreshed scans
+/// for it union through E1's `merge_scanned_module` call. Refreshed pins
+/// re-pin the same file (a rescan that found the provider), so the merge
+/// input binds instead of purging.
+fn mo_merge_engine(
+    view: ProcessViewId,
+    key: ObjectKey,
+    path: &str,
+    tables: Vec<ScannedTable>,
+    interfaces: Vec<ScannedInterface>,
+) -> Engine {
+    let committed = mo_merge_module(view, key, path, tables, interfaces);
+    let mut pins = overlay_view_pin(&committed, 999, OVERLAY_SHA, 1, false);
+    record_scan_ownership(&mut pins, view, key, path);
+    let (bound, skipped) = bind_scanned_modules(std::slice::from_ref(&committed), &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(bound.len(), 1);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    engine
+        .views
+        .push(ProcessView::open(view, std::process::id()).unwrap());
+    engine
+}
+
+fn mo_refresh_pins(module: &ScannedModule, mount_id: u64) -> PinnedObjects {
+    let mut pins = overlay_view_pin(module, mount_id, OVERLAY_SHA, 1, false);
+    record_scan_ownership(&mut pins, module.view, module.key, &module.path);
+    pins
+}
+
+#[test]
+fn merge_ownership_e1_refresh_multi_row_link_drops() {
+    // E1 × addr-change: a refreshed scan carries the same table at two
+    // mappings with asymmetric links. The union row shows the second
+    // mapping; its link survives and the first mapping's link drops.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(7);
+    // The retained row sits at a third address with live slots, so the
+    // owned-run rescan carry rides it into the raw set as the union
+    // target; both incoming rows remap onto it in turn.
+    let mut engine = mo_merge_engine(
+        view,
+        key,
+        path,
+        vec![mo_merge_table(key, path, 0x0800, false)],
+        vec![],
+    );
+    // Owned run: rescanned modules union into the retained module instead
+    // of replacing it, so the refresh exercises the merge seam.
+    engine.owned_run_pid = Some(424242);
+    let rescan = mo_merge_module(
+        view,
+        key,
+        path,
+        vec![
+            mo_merge_table(key, path, 0x1000, false),
+            mo_merge_table(key, path, 0x2000, false),
+        ],
+        vec![
+            mo_merge_interface(0, Some(0)),
+            mo_merge_interface(1, Some(1)),
+        ],
+    );
+    let pins = mo_refresh_pins(&rescan, 1000);
+    let refreshed = vec![(view, vec![rescan], pins)];
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let candidate = engine
+        .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+        .unwrap();
+    let merged = candidate
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view)
+        .expect("the refreshed module binds through the union");
+    assert_eq!(
+        merged.scanned.tables.len(),
+        1,
+        "one normalized table unions onto one row"
+    );
+    assert_eq!(merged.scanned.tables[0].address, 0x2000);
+    assert_eq!(merged.scanned.interfaces.len(), 2);
+    assert_eq!(
+        merged.scanned.interfaces[0].table, None,
+        "a superseded mapping keeps its link history unlinked"
+    );
+    assert_eq!(
+        merged.scanned.interfaces[1].table,
+        Some(0),
+        "the surviving mapping keeps its own link"
+    );
+}
+
+#[test]
+fn merge_ownership_e1_repeated_refresh_coalesces_history() {
+    // E1 × repeat-remap: three alternating refreshed rescans of one linked
+    // table keep one history row, not one per remap.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(7);
+    let mut engine = mo_merge_engine(
+        view,
+        key,
+        path,
+        vec![mo_merge_table(key, path, 0x1000, false)],
+        vec![mo_merge_interface(0, Some(0))],
+    );
+    // Owned run: rescanned modules union into the retained module instead
+    // of replacing it, so each refresh exercises the merge seam.
+    engine.owned_run_pid = Some(424242);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    for round in 0..3u64 {
+        let address = if round % 2 == 0 { 0x2000 } else { 0x1000 };
+        let rescan = mo_merge_module(
+            view,
+            key,
+            path,
+            vec![mo_merge_table(key, path, address, false)],
+            vec![mo_merge_interface(0, Some(0))],
+        );
+        let pins = mo_refresh_pins(&rescan, 1000 + round);
+        let refreshed = vec![(view, vec![rescan], pins)];
+        let candidate = engine
+            .inventory_candidate(&empty, &refreshed, &[], Vec::new(), &empty)
+            .unwrap();
+        engine.plan = candidate.plan;
+        engine.pinned = candidate.pinned;
+        engine.modules = candidate.modules;
+    }
+    let merged = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view)
+        .expect("the refreshed module binds through the unions");
+    assert_eq!(merged.scanned.tables.len(), 1);
+    let linked = merged
+        .scanned
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_some())
+        .count();
+    let unlinked = merged
+        .scanned
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_none())
+        .count();
+    assert_eq!(linked, 1, "one current link survives the refreshes");
+    assert_eq!(
+        unlinked, 1,
+        "repeated refreshes keep one history row, not one per remap"
+    );
+}
+
+/// Lower one module through E4 and commit it: the entry merges, rebuilds
+/// and applies, so the module's content in committed state proves the
+/// merge ran.
+fn mo_apply_lowered(engine: &mut Engine, lowered: &ScannedModule, mount_id: u64) {
+    let mut pins = overlay_view_pin(lowered, mount_id, OVERLAY_SHA, 1, false);
+    record_scan_ownership(&mut pins, lowered.view, lowered.key, &lowered.path);
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let position = engine
+        .views
+        .iter()
+        .position(|view| view.id() == lowered.view)
+        .expect("the engine retains the observed view");
+    let outcome = engine
+        .apply_pinned_lowered_module(
+            lowered.clone(),
+            pins,
+            Vec::new(),
+            position,
+            1_000_000,
+            &mut session,
+            &mut additions,
+            &mut pending,
+        )
+        .unwrap();
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
+        "the lowering applied"
+    );
+}
+
+#[test]
+fn merge_ownership_e4_lowered_multi_row_link_drops() {
+    // E4 × addr-change: a lowered module carries the same table at two
+    // mappings with asymmetric links. The union row shows the second
+    // mapping; its link survives and the first mapping's link drops.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(7);
+    let mut engine = mo_merge_engine(view, key, path, vec![], vec![]);
+    let lowered = mo_merge_module(
+        view,
+        key,
+        path,
+        vec![
+            mo_merge_table(key, path, 0x1000, false),
+            mo_merge_table(key, path, 0x2000, false),
+        ],
+        vec![
+            mo_merge_interface(0, Some(0)),
+            mo_merge_interface(1, Some(1)),
+        ],
+    );
+    mo_apply_lowered(&mut engine, &lowered, 1000);
+    let merged = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view)
+        .expect("the lowered module joined the committed state");
+    assert_eq!(
+        merged.scanned.tables.len(),
+        1,
+        "one normalized table unions onto one row"
+    );
+    assert_eq!(merged.scanned.tables[0].address, 0x2000);
+    assert_eq!(merged.scanned.interfaces.len(), 2);
+    assert_eq!(
+        merged.scanned.interfaces[0].table, None,
+        "a superseded mapping keeps its link history unlinked"
+    );
+    assert_eq!(
+        merged.scanned.interfaces[1].table,
+        Some(0),
+        "the surviving mapping keeps its own link"
+    );
+}
+
+#[test]
+fn merge_ownership_e4_repeated_lowering_coalesces_history() {
+    // E4 × repeat-remap: three alternating lowered remaps of one linked
+    // table keep one history row, not one per remap.
+    let key = mo_merge_key();
+    let path = "/opt/p.so";
+    let view = ProcessViewId(7);
+    let mut engine = mo_merge_engine(
+        view,
+        key,
+        path,
+        vec![mo_merge_table(key, path, 0x1000, false)],
+        vec![mo_merge_interface(0, Some(0))],
+    );
+    for round in 0..3u64 {
+        let address = if round % 2 == 0 { 0x2000 } else { 0x1000 };
+        let lowered = mo_merge_module(
+            view,
+            key,
+            path,
+            vec![mo_merge_table(key, path, address, false)],
+            vec![mo_merge_interface(0, Some(0))],
+        );
+        mo_apply_lowered(&mut engine, &lowered, 1000 + round);
+    }
+    let merged = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view)
+        .expect("the lowered module joined the committed state");
+    assert_eq!(merged.scanned.tables.len(), 1);
+    let linked = merged
+        .scanned
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_some())
+        .count();
+    let unlinked = merged
+        .scanned
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_none())
+        .count();
+    assert_eq!(linked, 1, "one current link survives the lowerings");
+    assert_eq!(
+        unlinked, 1,
+        "repeated lowerings keep one history row, not one per remap"
+    );
+}

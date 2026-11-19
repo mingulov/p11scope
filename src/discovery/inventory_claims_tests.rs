@@ -765,3 +765,568 @@ fn inventory_two_owner_noop_refresh_fits_the_existing_exact_reference_budget() {
         assert_eq!(prepared.candidate().modules.len(), 2);
     }
 }
+
+// ============================================================================
+// Merge-ownership table, E8/E9 rows (spec
+// `docs/superpowers/specs/2026-11-19-modeb-merge-ownership.md` §9; the E1–E7
+// and direct-merge rows live in `engine_tests.rs`). Real mapped providers
+// on one OwnedMapper child: R retires (carried via a production E1 removal),
+// L/Y stay listed live, X is released (E8) or uninvolved (E9). Base
+// expectations: E8/E9 ownership GREEN (per-view derivation already holds;
+// non-vacuity via the guard-disabled mutant run), M-E9 merge cells RED
+// (shared `merge_scanned_module` mechanism).
+
+/// Owners R (to be carried), L (live co-owner or reconciled owner) and X
+/// on one child: same pid, same mount namespace, distinct view ids.
+struct MoOwners {
+    subject: OwnedMapper,
+    engine: Engine,
+    view_r: ProcessViewId,
+    view_live: ProcessViewId,
+    view_x: ProcessViewId,
+}
+
+fn mo_owners() -> MoOwners {
+    let subject = OwnedMapper::ready();
+    let mut engine = inventory_engine(4);
+    let view_r = open_owner(&mut engine, subject.pid());
+    let view_live = open_owner(&mut engine, subject.pid());
+    let view_x = open_owner(&mut engine, subject.pid());
+    assert_ne!(view_r, view_live);
+    assert_ne!(view_r, view_x);
+    assert_ne!(view_live, view_x);
+    MoOwners {
+        subject,
+        engine,
+        view_r,
+        view_live,
+        view_x,
+    }
+}
+
+/// Reassign a mapped module to another same-pid owner: same file, same
+/// mount namespace, distinct view — one canonical pin, two owners.
+fn mo_reassign(mut module: ScannedModule, view: ProcessViewId) -> ScannedModule {
+    module.view = view;
+    module
+}
+
+fn mo_providers(fixture: &MoOwners, view: ProcessViewId, count: usize) -> Vec<ScannedModule> {
+    let view_ref = fixture
+        .engine
+        .views
+        .iter()
+        .find(|candidate| candidate.id() == view)
+        .expect("the engine retains the owner view");
+    mapped_providers(&fixture.subject, view_ref, count)
+}
+
+/// Carry R through a production E1 removal and commit it: R's module
+/// rides for its still-attached object without claims under R. The view
+/// itself is unlisted, mirroring the production tick commit — a carried
+/// view is never listed live.
+fn mo_carry_r(fixture: &mut MoOwners) {
+    let removed = BTreeSet::from([fixture.view_r]);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = fixture
+        .engine
+        .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        carried.pinned.view_claims(fixture.view_r).is_none(),
+        "the E1 removal carries R claimless"
+    );
+    fixture.engine.plan = carried.plan;
+    fixture.engine.pinned = carried.pinned;
+    fixture.engine.modules = carried.modules;
+    fixture
+        .engine
+        .views
+        .retain(|view| view.id() != fixture.view_r);
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_r),
+        "the carried view leaves the live list"
+    );
+}
+
+fn mo_assert_owner_live(
+    pinned: &PinnedObjects,
+    modules: &[ReconciledModule],
+    plan: &plan::AttachPlan,
+    view: ProcessViewId,
+    what: &str,
+) {
+    let claims = pinned
+        .view_claims(view)
+        .unwrap_or_else(|| panic!("the live owner keeps its claims ({what})"));
+    assert!(
+        !claims.pins.is_empty() || !claims.tables.is_empty() || !claims.targets.is_empty(),
+        "the live owner's claims are non-empty ({what})"
+    );
+    assert!(
+        modules.iter().any(|module| module.scanned.view == view),
+        "the live owner's module still binds ({what})"
+    );
+    let owned: BTreeSet<PinnedObjectId> = claims
+        .pins
+        .iter()
+        .chain(&claims.tables)
+        .chain(claims.targets.iter().map(|(object, _)| object))
+        .copied()
+        .collect();
+    assert!(
+        plan.slots
+            .iter()
+            .any(|slot| { plan.is_active(slot.index) && owned.contains(&slot.object) }),
+        "the live owner keeps an attached slot ({what})"
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_shared_pin_stays_claimless() {
+    // E8 × shared-pin: R and L share one provider file; X owns a
+    // distinct file. After E1 carries R, releasing X rebuilds the
+    // remaining owners' facts: R rides claimless, L keeps its claims,
+    // and the shared pin stays resolvable without becoming carried.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_l = mo_reassign(providers[0].clone(), fixture.view_live);
+    let module_x = mo_reassign(providers[1].clone(), fixture.view_x);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_live)
+            .expect("L's module seeded")
+            .object,
+        shared,
+        "R and L share one canonical pin"
+    );
+    mo_carry_r(&mut fixture);
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.view_claims(fixture.view_r).is_none(),
+        "the retired view owns no claims (scoped release)"
+    );
+    mo_assert_owner_live(
+        &fixture.engine.pinned,
+        &fixture.engine.modules,
+        &fixture.engine.plan,
+        fixture.view_live,
+        "scoped release",
+    );
+    assert!(
+        fixture.engine.pinned.summary(shared).is_some(),
+        "the shared pin stays resolvable (scoped release)"
+    );
+    assert!(
+        !fixture.engine.pinned.carried_ids().contains(&shared),
+        "a live-co-owned pin is owned, not carried (scoped release)"
+    );
+}
+
+#[test]
+fn merge_ownership_e8_release_carried_provider_stays_claimless() {
+    // E8 × carried: R owns a sole provider file; X owns a distinct file
+    // and Y a third. After E1 carries R, releasing X rebuilds the rest:
+    // R rides claimless, Y keeps its claims, X is gone.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_x, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_y = mo_reassign(providers[2].clone(), fixture.view_live);
+    let module_x = mo_reassign(providers[1].clone(), fixture.view_x);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_y]);
+    seed_claims(&mut fixture.engine, fixture.view_x, &[module_x]);
+    let sole = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    mo_carry_r(&mut fixture);
+    fixture.engine.release_scoped_owner(fixture.view_x).unwrap();
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .all(|view| view.id() != fixture.view_x),
+        "the release dropped the owner's view"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != fixture.view_x),
+        "the release dropped the owner's modules"
+    );
+    assert!(
+        fixture.engine.pinned.view_claims(fixture.view_r).is_none(),
+        "the retired view owns no claims (scoped release)"
+    );
+    mo_assert_owner_live(
+        &fixture.engine.pinned,
+        &fixture.engine.modules,
+        &fixture.engine.plan,
+        fixture.view_live,
+        "scoped release",
+    );
+    assert!(
+        fixture.engine.pinned.summary(sole).is_some(),
+        "the carried pin stays resolvable (scoped release)"
+    );
+    assert!(
+        fixture.engine.pinned.carried_ids().contains(&sole),
+        "the sole-carried pin reads as carried coverage (scoped release)"
+    );
+}
+
+#[test]
+fn merge_ownership_e9_reconcile_shared_pin_stays_claimless() {
+    // E9 × shared-pin: R and L share one provider file. After E1 carries
+    // R, a partial receipt for L (its committed file plus one fresh
+    // file) reconciles: R rides claimless, L keeps its claims, and the
+    // fresh file visibly joins (proving the receipt merged).
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_live, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_l = mo_reassign(providers[0].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    let shared = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    assert_eq!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_live)
+            .expect("L's module seeded")
+            .object,
+        shared,
+        "R and L share one canonical pin"
+    );
+    mo_carry_r(&mut fixture);
+    let fresh = mo_reassign(providers[2].clone(), fixture.view_live);
+    let committed = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_live)
+        .expect("L's committed module rides the receipt")
+        .scanned
+        .clone();
+    let scanned = receipt(
+        &mut fixture.engine,
+        fixture.view_live,
+        vec![committed, fresh],
+        true,
+    );
+    assert!(matches!(scanned, ScanReceipt::AdditionsOnly(_)));
+    let prepared = fixture
+        .engine
+        .prepare_inventory_reconciliation(scanned, &mut FixtureImages)
+        .unwrap();
+    let candidate = prepared.candidate();
+    assert_eq!(
+        candidate.modules.len(),
+        3,
+        "the receipt merges its fresh file with the committed modules"
+    );
+    assert!(
+        candidate.pinned.view_claims(fixture.view_r).is_none(),
+        "the retired view owns no claims (reconciliation)"
+    );
+    mo_assert_owner_live(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        fixture.view_live,
+        "reconciliation",
+    );
+    assert!(
+        candidate.pinned.summary(shared).is_some(),
+        "the shared pin stays resolvable (reconciliation)"
+    );
+    assert!(
+        !candidate.pinned.carried_ids().contains(&shared),
+        "a live-co-owned pin is owned, not carried (reconciliation)"
+    );
+}
+
+#[test]
+fn merge_ownership_e9_reconcile_carried_provider_stays_claimless() {
+    // E9 × carried: R owns a sole file, Y a distinct file. After E1
+    // carries R, a partial receipt for Y reconciles: R rides claimless,
+    // Y keeps its claims, and the fresh file visibly joins.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_live, 3);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let module_y = mo_reassign(providers[1].clone(), fixture.view_live);
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_y]);
+    let sole = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_r)
+        .expect("R's module seeded")
+        .object;
+    mo_carry_r(&mut fixture);
+    let fresh = mo_reassign(providers[2].clone(), fixture.view_live);
+    let committed = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_live)
+        .expect("Y's committed module rides the receipt")
+        .scanned
+        .clone();
+    let scanned = receipt(
+        &mut fixture.engine,
+        fixture.view_live,
+        vec![committed, fresh],
+        true,
+    );
+    assert!(matches!(scanned, ScanReceipt::AdditionsOnly(_)));
+    let prepared = fixture
+        .engine
+        .prepare_inventory_reconciliation(scanned, &mut FixtureImages)
+        .unwrap();
+    let candidate = prepared.candidate();
+    assert_eq!(
+        candidate.modules.len(),
+        3,
+        "the receipt merges its fresh file with the committed modules"
+    );
+    assert!(
+        candidate.pinned.view_claims(fixture.view_r).is_none(),
+        "the retired view owns no claims (reconciliation)"
+    );
+    mo_assert_owner_live(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        fixture.view_live,
+        "reconciliation",
+    );
+    assert!(
+        candidate.pinned.summary(sole).is_some(),
+        "the carried pin stays resolvable (reconciliation)"
+    );
+    assert!(
+        candidate.pinned.carried_ids().contains(&sole),
+        "the sole-carried pin reads as carried coverage (reconciliation)"
+    );
+}
+
+/// One decoded table in the mapped-module shape (`provider_module`):
+/// same normalized content at any address, so two rows at distinct
+/// addresses are one remapped table.
+fn mo_surgery_table(module: &ScannedModule, address: u64) -> ScannedTable {
+    ScannedTable {
+        version: (2, 40),
+        walk: "full",
+        entries: vec![ScannedEntry {
+            name: "C_Initialize",
+            object: module.key,
+            object_path: module.path.clone(),
+            file_offset: 0x1000,
+        }],
+        null_entries: vec![],
+        unpinned: vec![],
+        address,
+        file_offset: Some(0),
+        live_return: false,
+        manifest_supported: false,
+        extension_impossible: false,
+    }
+}
+
+fn mo_surgery_interface(index: usize, table: Option<usize>) -> ScannedInterface {
+    ScannedInterface {
+        index,
+        name_class: "exact_standard",
+        name_lossy: None,
+        name_private: None,
+        flags: 0,
+        table,
+    }
+}
+
+#[test]
+fn merge_ownership_e9_receipt_multi_row_link_drops() {
+    // E9 × addr-change: a receipt carries the owner's table at two
+    // mappings with asymmetric links. The union row shows the second
+    // mapping; its link survives and the first mapping's link drops.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_live, 2);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let mut module_l = mo_reassign(providers[1].clone(), fixture.view_live);
+    module_l.tables = Vec::new();
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    mo_carry_r(&mut fixture);
+    let committed = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_live)
+        .expect("L's committed module rides the receipt")
+        .scanned
+        .clone();
+    assert!(
+        committed.tables.is_empty(),
+        "the union target starts without rows"
+    );
+    let mut rescan = committed.clone();
+    rescan.tables = vec![
+        mo_surgery_table(&committed, 0x1000),
+        mo_surgery_table(&committed, 0x2000),
+    ];
+    rescan.interfaces = vec![
+        mo_surgery_interface(0, Some(0)),
+        mo_surgery_interface(1, Some(1)),
+    ];
+    let scanned = receipt(&mut fixture.engine, fixture.view_live, vec![rescan], true);
+    assert!(matches!(scanned, ScanReceipt::AdditionsOnly(_)));
+    let prepared = fixture
+        .engine
+        .prepare_inventory_reconciliation(scanned, &mut FixtureImages)
+        .unwrap();
+    let candidate = prepared.candidate();
+    let merged = candidate
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_live)
+        .expect("the receipt module binds through the union");
+    assert_eq!(
+        merged.scanned.tables.len(),
+        1,
+        "one normalized table unions onto one row"
+    );
+    assert_eq!(merged.scanned.tables[0].address, 0x2000);
+    assert_eq!(merged.scanned.interfaces.len(), 2);
+    assert_eq!(
+        merged.scanned.interfaces[0].table, None,
+        "a superseded mapping keeps its link history unlinked"
+    );
+    assert_eq!(
+        merged.scanned.interfaces[1].table,
+        Some(0),
+        "the surviving mapping keeps its own link"
+    );
+    assert!(
+        candidate.pinned.view_claims(fixture.view_r).is_none(),
+        "the retired view owns no claims (reconciliation)"
+    );
+}
+
+#[test]
+fn merge_ownership_e9_repeated_receipt_coalesces_history() {
+    // E9 × repeat-remap: three alternating receipts of one linked table
+    // keep one history row, not one per remap.
+    let mut fixture = mo_owners();
+    let providers = mo_providers(&fixture, fixture.view_live, 2);
+    let module_r = mo_reassign(providers[0].clone(), fixture.view_r);
+    let mut module_l = mo_reassign(providers[1].clone(), fixture.view_live);
+    module_l.tables = vec![mo_surgery_table(&module_l, 0x1000)];
+    module_l.interfaces = vec![mo_surgery_interface(0, Some(0))];
+    seed_claims(&mut fixture.engine, fixture.view_r, &[module_r]);
+    seed_claims(&mut fixture.engine, fixture.view_live, &[module_l]);
+    mo_carry_r(&mut fixture);
+    for round in 1..4u64 {
+        let address = if round % 2 == 1 { 0x2000 } else { 0x1000 };
+        let committed = fixture
+            .engine
+            .modules
+            .iter()
+            .find(|module| module.scanned.view == fixture.view_live)
+            .expect("L's committed module rides the receipt")
+            .scanned
+            .clone();
+        let mut rescan = committed.clone();
+        rescan.tables = vec![mo_surgery_table(&committed, address)];
+        rescan.interfaces = vec![mo_surgery_interface(0, Some(0))];
+        let scanned = receipt_at(
+            &mut fixture.engine,
+            fixture.view_live,
+            vec![rescan],
+            true,
+            round,
+        );
+        assert!(matches!(scanned, ScanReceipt::AdditionsOnly(_)));
+        let prepared = fixture
+            .engine
+            .prepare_inventory_reconciliation(scanned, &mut FixtureImages)
+            .unwrap();
+        let candidate = prepared.candidate();
+        fixture.engine.plan.clone_from(&candidate.plan);
+        fixture.engine.pinned.clone_from(&candidate.pinned);
+        fixture.engine.modules.clone_from(&candidate.modules);
+    }
+    let merged = fixture
+        .engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fixture.view_live)
+        .expect("the receipt module binds through the unions");
+    assert_eq!(merged.scanned.tables.len(), 1);
+    let linked = merged
+        .scanned
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_some())
+        .count();
+    let unlinked = merged
+        .scanned
+        .interfaces
+        .iter()
+        .filter(|interface| interface.table.is_none())
+        .count();
+    assert_eq!(linked, 1, "one current link survives the receipts");
+    assert_eq!(
+        unlinked, 1,
+        "repeated receipts keep one history row, not one per remap"
+    );
+}

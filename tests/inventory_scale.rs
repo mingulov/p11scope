@@ -2334,6 +2334,10 @@ fn review_mixed_pre_and_post_request_exits() {
             !condition.killed,
             "({label}) admission without churn-A leaves the kill latch clear"
         );
+        assert!(
+            condition.exited.iter().all(|pid| condition.admitted.contains(pid)),
+            "({label}) fixture feed emitted an exit before its admission"
+        );
         std::fs::write(
             condition.ready.join("churn-c.ready"),
             format!("READY {}\n", GUARD_CHURN_C),

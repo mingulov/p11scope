@@ -16864,6 +16864,15 @@ enum WatchdogRecoveryEntry {
     /// E8: scoped recovery discards by bulk free with a counted gap —
     /// no per-head preservation work at any staged depth.
     BoundedBulkDiscard,
+    /// E9a: a delivery-stuck consumer parks (forced-fallback degrade)
+    /// and the frame completes with no trip, no abandon, no rearm.
+    ConsumerParkNoTrip,
+    /// E9b: a scoped void sheds barrier-causing unbound staging with
+    /// loss while healthy sessions keep proof and seal exact.
+    BarrierShedScopedVoid,
+    /// E10: an unapplied re-arm keeps carried history (nothing staged
+    /// this quantum, nothing disposed).
+    UnappliedRearmKeepsCarried,
 }
 
 /// One feed's observable recovery state: mode, staged depth, reduced
@@ -17014,15 +17023,15 @@ struct WatchdogStuckScene {
     held_disposed: u64,
 }
 
-/// Build the multi-session scene through the applied stuck quantum,
-/// recording every baseline the scoped-recovery asserts compare.
-fn watchdog_stuck_scene(row: &str) -> WatchdogStuckScene {
+/// Build the held prefix: A stays running (BEGIN-only) while B
+/// completes one call; the prefix publishes with B staged behind A.
+/// Returns the fixture and A's END bytes for rows that terminate the
+/// stuck call after recovery.
+fn watchdog_prefix_scene(row: &str) -> (MachineScene, Vec<u8>) {
     use crate::semantics_key_use::FeedMode;
     let mut fixture = MachineScene::new(2);
     fixture.prime(2);
     let pid = std::process::id();
-    // A stays running (BEGIN-only) while B completes one call; the
-    // prefix publishes with B staged behind A.
     let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
     let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
     for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
@@ -17042,6 +17051,14 @@ fn watchdog_stuck_scene(row: &str) -> WatchdogStuckScene {
     );
     assert_eq!(held[0].1.6, 0, "{row}: nothing disposed yet");
     assert_eq!(held[0].1.7, None, "{row}: no fence yet");
+    (fixture, end_a.to_vec())
+}
+
+/// Build the multi-session scene through the applied stuck quantum,
+/// recording every baseline the scoped-recovery asserts compare.
+fn watchdog_stuck_scene(row: &str) -> WatchdogStuckScene {
+    let (mut fixture, end_a) = watchdog_prefix_scene(row);
+    let pid = std::process::id();
     // Stuck A's quantum on file 0: drive the real commit to applied
     // with nonzero staged work.
     fixture.scene.push(pid, 0, "C_SignInit", 5);
@@ -17063,7 +17080,7 @@ fn watchdog_stuck_scene(row: &str) -> WatchdogStuckScene {
     );
     WatchdogStuckScene {
         fixture,
-        end_a: end_a.to_vec(),
+        end_a,
         stuck_staged,
         stuck_disposed,
         held_staged,
@@ -17559,6 +17576,244 @@ fn watchdog_entry_finish_trip_refusal() {
     );
 }
 
+/// E9a: a delivery-stuck consumer parks instead of tripping the
+/// lane — a BoundNotReady seal failure pins the cursor
+/// (spend-then-refund, net zero); the watchdog parks the stuck
+/// consumer (forced-fallback degrade with counted loss plus a named
+/// park gap) and the frame completes with no trip, no abandon and no
+/// rearm. The posed failure stands in for any production Retry-pin
+/// (BoundNotReady, H3Pending or FrontierRegression at delivery).
+fn watchdog_entry_consumer_park_no_trip() {
+    const ROW: &str = "E9a consumer park, no trip";
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    watchdog_drive_to_applied(&mut fixture);
+    let target = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+        .next()
+        .expect("one stuck target")
+        .0;
+    let failure = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .scripted_failure(
+            JournalGap::BoundNotReady,
+            target.bootstrap(),
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+    fixture.machine.pose_frame_failure_for_test(failure);
+    // Backdate the stall clock WITHOUT freezing the polls: seals and
+    // deliveries run naturally against the stuck failure.
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    let mut published = false;
+    for _ in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(JointServiceProgress::Pending) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        published,
+        "{ROW}: the frame completes past its parked consumer"
+    );
+    assert_eq!(
+        fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{ROW}: no trip stands"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        0,
+        "{ROW}: no rearm consumed"
+    );
+    assert!(
+        watchdog_rearm_gap_reasons(&fixture).is_empty(),
+        "{ROW}: no abandon gap lands"
+    );
+    let feed = watchdog_feed_states(&fixture, 0);
+    assert_eq!(feed.len(), 1, "{ROW}: one stuck incarnation");
+    assert_eq!(
+        feed[0].1.1, 0,
+        "{ROW}: the parked feed stages nothing after"
+    );
+    assert_ne!(
+        feed[0].1.0,
+        FeedMode::Joint,
+        "{ROW}: the parked feed leaves Joint"
+    );
+    assert!(
+        watchdog_scope_gaps(&fixture)
+            .iter()
+            .any(|(subject, _)| subject == "joint stuck consumer parked"),
+        "{ROW}: the park stages its named gap"
+    );
+}
+
+/// E9b: a scoped void sheds barrier-causing unbound staging — a stuck
+/// foreign call (in-flight, never attested) bars seals; the trip
+/// re-arms with scoped recovery that sheds the barrier with loss
+/// while the held session keeps proof and seals exact after.
+fn watchdog_entry_barrier_shed_scoped_void() {
+    const ROW: &str = "E9b barrier shed in scoped void";
+    use crate::semantics_key_use::FeedMode;
+    let (mut fixture, end_a) = watchdog_prefix_scene(ROW);
+    let foreign = push_unbound_foreign_call(&mut fixture, 50, false);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 5);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 6);
+    fixture.scene.push(pid, 0, "C_SignFinal", 7);
+    watchdog_drive_to_applied(&mut fixture);
+    let stuck = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck.len(), 1, "{ROW}: one stuck incarnation");
+    let (stuck_staged, stuck_disposed) = (stuck[0].1.1, stuck[0].1.6);
+    let held = watchdog_feed_states(&fixture, 1);
+    let (held_staged, held_disposed) = (held[0].1.1, held[0].1.6);
+    assert!(
+        stuck_staged > 0,
+        "{ROW}: the stuck quantum stages its calls before recovery"
+    );
+    assert_eq!(
+        held_staged, 1,
+        "{ROW}: the held call is still staged at recovery"
+    );
+    let mut scene = WatchdogStuckScene {
+        fixture,
+        end_a,
+        stuck_staged,
+        stuck_disposed,
+        held_staged,
+        held_disposed,
+    };
+    watchdog_pose_audit_trip(&mut scene.fixture);
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the tripped quantum re-arms as published"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    // A fresh stuck-file call seals post-rearm: the barrier lifted.
+    scene.fixture.scene.push(pid, 0, "C_CreateObject", 60);
+    scene
+        .fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(scene.end_a.clone());
+    assert!(
+        scene.fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the recovered lane accepts the next commit"
+    );
+    scene
+        .fixture
+        .published_labeled("watchdog-e9b-recovery", None);
+    let stuck = watchdog_feed_states(&scene.fixture, 0);
+    assert_eq!(
+        stuck[0].1.2, 1,
+        "{ROW}: the fresh call seals exact past the shed barrier"
+    );
+    assert_eq!(
+        stuck[0].1.0,
+        FeedMode::Joint,
+        "{ROW}: the stuck file stays Joint"
+    );
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(held[0].1.1, 0, "{ROW}: the held call seals after recovery");
+    assert_eq!(
+        held[0].1.6, scene.held_disposed,
+        "{ROW}: the held seal disposes nothing"
+    );
+    assert_eq!(held[0].1.7, None, "{ROW}: the held feed records no fence");
+    assert!(
+        scene.fixture.machine.disposition_reason().is_none(),
+        "{ROW}: the recovered lane never latches"
+    );
+    drop(foreign);
+}
+
+/// E10: an unapplied re-arm keeps carried history — a transient
+/// refusal before anything applied abandons nothing staged (the
+/// touched set is empty) and the held call stays staged; the lane
+/// continues and the held call seals once the stuck call ends.
+fn watchdog_entry_unapplied_rearm_keeps_carried() {
+    const ROW: &str = "E10 unapplied re-arm keeps carried";
+    use crate::semantics_key_use::FeedMode;
+    let (mut fixture, end_a) = watchdog_prefix_scene(ROW);
+    fixture.refuse_at_audited(5);
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied(),
+        "{ROW}: nothing applied before the refusal"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "{ROW}: the unapplied quantum re-arms"
+    );
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(
+        held[0].1.1, 1,
+        "{ROW}: the held call stays staged across the unapplied re-arm"
+    );
+    assert_eq!(held[0].1.6, 0, "{ROW}: the held feed disposes nothing");
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::Joint,
+        "{ROW}: the held feed stays Joint"
+    );
+    assert_eq!(held[0].1.7, None, "{ROW}: the held feed records no fence");
+    assert!(
+        !watchdog_rearm_gap_reasons(&fixture).is_empty(),
+        "{ROW}: the re-arm names its abandon"
+    );
+    fixture.scene.drain.source_mut().push_record(end_a.clone());
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the re-armed lane accepts the next commit"
+    );
+    fixture.published_labeled("watchdog-e10-recovery", None);
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(held[0].1.1, 0, "{ROW}: the held call seals after recovery");
+    assert_eq!(held[0].1.6, 0, "{ROW}: the held seal disposes nothing");
+    assert!(
+        fixture.machine.disposition_reason().is_none(),
+        "{ROW}: the recovered lane never latches"
+    );
+    assert_eq!(
+        fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{ROW}: no new trip stands after healthy work"
+    );
+}
+
 /// Table-driven entry-point coverage for per-session watchdog
 /// recovery (seal-refactor design §4): every recovery/void entry
 /// point degrades and counts only the stuck session while healthy
@@ -17567,7 +17822,7 @@ fn watchdog_entry_finish_trip_refusal() {
 /// every failing row at once.
 #[test]
 fn joint_watchdog_recovery_scopes_to_the_stuck_session() {
-    let rows: [(WatchdogRecoveryEntry, fn()); 8] = [
+    let rows: [(WatchdogRecoveryEntry, fn()); 11] = [
         (
             WatchdogRecoveryEntry::TransientRearm,
             watchdog_entry_transient_rearm,
@@ -17599,6 +17854,18 @@ fn joint_watchdog_recovery_scopes_to_the_stuck_session() {
         (
             WatchdogRecoveryEntry::BoundedBulkDiscard,
             watchdog_entry_bounded_bulk_discard,
+        ),
+        (
+            WatchdogRecoveryEntry::ConsumerParkNoTrip,
+            watchdog_entry_consumer_park_no_trip,
+        ),
+        (
+            WatchdogRecoveryEntry::BarrierShedScopedVoid,
+            watchdog_entry_barrier_shed_scoped_void,
+        ),
+        (
+            WatchdogRecoveryEntry::UnappliedRearmKeepsCarried,
+            watchdog_entry_unapplied_rearm_keeps_carried,
         ),
     ];
     let mut failures = Vec::new();

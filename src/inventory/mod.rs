@@ -12685,6 +12685,7 @@ mod tests {
                     crate::cli::CallerMetadataMode::None,
                     false,
                     false,
+                    false,
                 )
                 .unwrap_err();
                 assert!(

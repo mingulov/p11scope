@@ -2431,7 +2431,7 @@ fn judge_key_sizes_off_observations(
             size.get("status").unwrap_or(&serde_json::Value::Null)
         );
         ensure!(
-            size.get("detail").is_none_or(|detail| detail.is_null()),
+            size.get("detail").is_some_and(|detail| detail.is_null()),
             "KEYSIZE_OFF: object {object:?} size detail is not null: {size}"
         );
         ensure!(

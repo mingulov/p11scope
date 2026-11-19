@@ -3108,9 +3108,10 @@ impl JournalAdapter {
     /// never wiped: converted entries wipe by their key, unconverted
     /// ones only when no healthy claimant names their shape. Wiped
     /// terminals shed at claim time (their void-wipe evidence routes
-    /// them to plain S1, never to a staged orphan head), and
-    /// neutral ones excuse at ingest, so no taint and no replay
-    /// refusal follows.
+    /// them to plain S1, never to a staged orphan head). At ingest,
+    /// excuse-eligible wipes excuse without tainting, while any other
+    /// wiped BEGIN's late END taints its image fail-closed; no replay
+    /// refusal follows in either arm.
     pub(crate) fn void_ingest_break_scoped_inner(
         &mut self,
         model: &mut ObjectSemantics,

@@ -10202,6 +10202,16 @@ fn record_scanned_candidate(
                     }
                 }
             }
+            // Temporary loss forensics (reverted before landing).
+            if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some_and(|value| !value.is_empty()) {
+                eprintln!(
+                    "p11scope: fix1pin outcome=refused nuked={} view={:?} path={} reason={}",
+                    !raw.pre_copy_up && !pinned.has_pre_copy_up_for_key(raw.key),
+                    view,
+                    raw.path,
+                    reason,
+                );
+            }
             skipped.push(Skipped {
                 subject: raw.path,
                 reason,

@@ -84,6 +84,12 @@ pub struct AtomicFile {
     /// injection. Production builds have no such field.
     #[cfg(test)]
     fail_sync_with: Option<i32>,
+    /// Test-only write fault: when `Some(errno)`, `write_document`
+    /// fails with that errno instead of writing, so the write-failure
+    /// fallback is behaviorally pinned without fault injection.
+    /// Production builds have no such field.
+    #[cfg(test)]
+    fail_write_with: Option<i32>,
 }
 
 /// Why one commit attempt failed: a final-name security refusal keeps
@@ -245,6 +251,8 @@ impl AtomicFile {
                         cleanup: true,
                         #[cfg(test)]
                         fail_sync_with: None,
+                        #[cfg(test)]
+                        fail_write_with: None,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -264,6 +272,14 @@ impl AtomicFile {
 
     pub fn file(&mut self) -> &mut std::fs::File {
         &mut self.temp_file
+    }
+
+    /// Test-only: every `write_document` on this sink fails with
+    /// `errno` instead of writing, so `-o` write-failure twins pin
+    /// the recovery fallback without filling a disk.
+    #[cfg(test)]
+    pub(crate) fn set_fail_write_with(&mut self, errno: i32) {
+        self.fail_write_with = Some(errno);
     }
 
     /// The final report path, for error and fallback lines naming it.
@@ -2005,6 +2021,7 @@ mod tests {
             handover: None,
             cleanup: true,
             fail_sync_with: None,
+            fail_write_with: None,
         }
     }
 

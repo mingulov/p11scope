@@ -552,6 +552,53 @@ mod tests {
         assert_no_temporary_files(directory.path());
     }
 
+    /// A diagnostics `-o` write failure (ENOSPC here) saves the
+    /// finished export to the recovery dir instead of dropping it:
+    /// the error names the fallback, the saved file is the complete
+    /// JSONL export (header through footer), the destination keeps
+    /// its old bytes, and no temp litters the directory.
+    #[test]
+    fn diagnostics_write_failure_saves_the_export_to_recovery() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "one fallback file: {saved:?}");
+        assert!(
+            error.contains(&saved[0].display().to_string()),
+            "the error names the fallback path, got: {error}"
+        );
+        let data = std::fs::read_to_string(&saved[0]).unwrap();
+        let lines: Vec<serde_json::Value> = data
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("export line parses"))
+            .collect();
+        assert!(lines.len() >= 2, "header through footer: {data}");
+        assert_eq!(lines.first().unwrap()["kind"], "header");
+        assert_eq!(lines.last().unwrap()["kind"], "footer");
+        assert_eq!(lines.last().unwrap()["capture_outcome"], "completed");
+        assert_no_temporary_files(directory.path());
+    }
+
     #[test]
     fn second_signal_during_export_preserves_existing_destination() {
         let directory = private_directory();

@@ -921,6 +921,9 @@ struct ChurnCondition {
     birth_fired: bool,
     last_pass: Option<u64>,
     kill_admitting_pass: Option<u64>,
+    exit_observing_pass: Option<u64>,
+    file_id: Option<(u64, u64)>,
+    stop_requested: bool,
     rotated: bool,
 }
 
@@ -956,14 +959,25 @@ impl ChurnCondition {
             Err(_) => return,
         };
         // Rotation tripwire: the run disables rotation (wide threshold), so
-        // a shrink below the consumed offset means the tail lost markers and
-        // must fail loudly below instead of evaluating guards on a partial
-        // stream. Nothing else truncates this file.
-        if file
-            .metadata()
-            .map(|meta| meta.len())
-            .is_ok_and(|len| len < self.offset)
-        {
+        // a replaced file (device/inode change) or a shrink below the
+        // consumed offset means the tail lost markers and must fail loudly
+        // below instead of evaluating guards on a partial stream. Nothing
+        // else replaces or truncates this file. The length check alone
+        // misses a rename whose regrown file already reaches the offset.
+        let meta = match file.metadata() {
+            Ok(meta) => meta,
+            Err(_) => return,
+        };
+        let id = (meta.dev(), meta.ino());
+        match self.file_id {
+            Some(known) if known != id => {
+                self.rotated = true;
+                return;
+            }
+            Some(_) => {}
+            None => self.file_id = Some(id),
+        }
+        if meta.len() < self.offset {
             self.rotated = true;
             return;
         }
@@ -1017,20 +1031,23 @@ impl ChurnCondition {
         }
     }
 
-    /// Progress stop: the conditioned kill has fired, a later pass has
-    /// published past the admitting pass, and churn-C's birth is visible.
-    /// The run then ends on progress instead of the wall clock; the
-    /// `--duration` backstop only bounds a stalled observer. Waiting for
-    /// churn-C's ready file too keeps an early stop from racing its birth:
-    /// the birth trigger fired at the first pass, so by a later pass the
-    /// spawner has had a full pass to fork it, and any residual lag just
-    /// runs one more pass.
+    /// Progress stop: the conditioned kill has fired, a nonterminal pass
+    /// past the admitting pass carried both exit observations, and
+    /// churn-C's birth is visible. A later pass alone proves nothing: a
+    /// descheduled pump can consume pre-kill markers in one tick, and a
+    /// pass published after the kill request may have scanned before the
+    /// signals landed. The run then ends on progress instead of the wall
+    /// clock; the `--duration` backstop only bounds a stalled observer.
+    /// Waiting for churn-C's ready file too keeps an early stop from
+    /// racing its birth: the birth trigger fired at the first pass, so by
+    /// a later pass the spawner has had a full pass to fork it, and any
+    /// residual lag just runs one more pass.
     fn settled_for_stop(&self) -> bool {
         self.killed
             && self.churn_c.is_some()
             && matches!(
-                (self.kill_admitting_pass, self.last_pass),
-                (Some(admitting), Some(last)) if last > admitting
+                (self.kill_admitting_pass, self.exit_observing_pass),
+                (Some(admitting), Some(observing)) if observing > admitting
             )
     }
 
@@ -1055,6 +1072,16 @@ impl ChurnCondition {
         let terminal = payload.get("final").and_then(Value::as_bool) == Some(true);
         if !terminal && let Some(pass) = payload.get("pass").and_then(Value::as_u64) {
             self.last_pass = Some(self.last_pass.map_or(pass, |last| last.max(pass)));
+            // Caller events precede their pass marker in the commit batch,
+            // so both conditioned exits being present at marker time means
+            // this pass carried them. The first such pass gates the stop.
+            if self.exit_observing_pass.is_none()
+                && let (Some(anchor), Some(churn_a)) = (self.anchor, self.churn_a)
+                && self.exited.contains(&anchor)
+                && self.exited.contains(&churn_a)
+            {
+                self.exit_observing_pass = Some(pass);
+            }
         }
     }
 
@@ -1163,11 +1190,18 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
+        exit_observing_pass: None,
+        file_id: None,
+        stop_requested: false,
         rotated: false,
     };
     let (output, peak) = spawn_with_peak_pumping(&mut cmd, &stderr_log, &mut || {
         condition.pump();
-        condition.settled_for_stop()
+        let stop = condition.settled_for_stop();
+        if stop {
+            condition.stop_requested = true;
+        }
+        stop
     });
     // Final tail: the last pass may have published between the final
     // pump tick and the child's exit.
@@ -1221,7 +1255,8 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let passes = doc["observation"]["passes"].as_u64().unwrap();
     assert!(
         passes >= 2,
-        "churn settlement needs an admitting pass plus a later pass observing the mid-run deaths; got {passes} published passes (hang guard {hang}s)"
+        "churn settlement needs an admitting pass plus a later pass observing the mid-run deaths; got {passes} published passes (hang guard {hang}s, progress stop requested: {})",
+        condition.stop_requested
     );
     // Kill-cadence guard: the conditioned kill needs a pass AFTER the
     // admitting pass observing the deaths. `passes >= 2` alone does
@@ -1232,7 +1267,9 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
             .expect("pass markers published for completed passes");
         assert!(
             last > admitting,
-            "conditioned kill landed on pass {admitting}'s publish but no later pass published (last pass {last}); the mid-run deaths need a pass after the admitting pass"
+            "conditioned kill landed on pass {admitting}'s publish but no later pass published (last pass {last}, progress stop requested: {}, exit-observing pass: {:?}); the mid-run deaths need a pass after the admitting pass",
+            condition.stop_requested,
+            condition.exit_observing_pass
         );
     }
     // The conditions fired mid-run: every baseline fixture admitted,
@@ -1251,7 +1288,9 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     for (pid, name) in [(anchor_pid, "anchor"), (churn_a_pid, "churn-A")] {
         assert!(
             condition.exited.contains(&pid),
-            "{name} (pid {pid}) exited after its conditioned kill"
+            "{name} (pid {pid}) exited after its conditioned kill (progress stop requested: {}, exit-observing pass: {:?})",
+            condition.stop_requested,
+            condition.exit_observing_pass
         );
     }
     assert!(
@@ -1459,6 +1498,9 @@ fn scripted_churn_condition(dir: &Path) -> ChurnCondition {
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
+        exit_observing_pass: None,
+        file_id: None,
+        stop_requested: false,
         rotated: false,
     }
 }
@@ -1566,33 +1608,45 @@ fn churn_pump_trips_rotation_tripwire_on_shrink() {
 #[test]
 fn churn_settled_for_stop_needs_kill_and_later_pass_and_birth() {
     // Twin: the progress stop fires only when the kill has fired, a later
-    // pass published past the admitting pass, and churn-C's birth is
-    // visible. Each missing leg vetoes the stop on its own.
+    // pass carrying both exit observations published past the admitting
+    // pass, and churn-C's birth is visible. Each missing leg vetoes the
+    // stop on its own. A later pass without the exits never stops, even
+    // with the kill and the birth.
     let dir = tmp("inventory-churn-guard-stop");
     let mut condition = scripted_churn_condition(&dir);
+    condition.anchor = Some(GUARD_ANCHOR);
+    condition.churn_a = Some(GUARD_CHURN_A);
+    condition.exited.insert(GUARD_ANCHOR);
+    condition.exited.insert(GUARD_CHURN_A);
     condition.kill_admitting_pass = Some(0);
     condition.last_pass = Some(1);
+    condition.exit_observing_pass = Some(1);
     condition.churn_c = Some(GUARD_CHURN_C);
     assert!(
         !condition.settled_for_stop(),
-        "passes plus birth without the kill never stop"
+        "exit pass plus birth without the kill never stop"
     );
     condition.killed = true;
-    condition.last_pass = Some(0);
+    condition.exit_observing_pass = None;
     assert!(
         !condition.settled_for_stop(),
-        "the kill without a later pass never stops"
+        "the kill without an exit-observing pass never stops"
     );
-    condition.last_pass = Some(1);
+    condition.exit_observing_pass = Some(0);
+    assert!(
+        !condition.settled_for_stop(),
+        "an exit-observing pass that is not past the admitting pass never stops"
+    );
+    condition.exit_observing_pass = Some(1);
     condition.churn_c = None;
     assert!(
         !condition.settled_for_stop(),
-        "the kill plus a later pass without churn-C's birth never stops"
+        "the kill plus an exit-observing pass without churn-C's birth never stops"
     );
     condition.churn_c = Some(GUARD_CHURN_C);
     assert!(
         condition.settled_for_stop(),
-        "kill plus later pass plus birth stop the run"
+        "kill plus exit-observing pass plus birth stop the run"
     );
     condition.kill_admitting_pass = None;
     assert!(

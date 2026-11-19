@@ -6459,9 +6459,7 @@ fn seal_start_live(
     }
     #[cfg(test)]
     if let Some(verdict) = seal_startup_test::take_start_verdict() {
-        // The requested journal mode is not observed yet (the seam
-        // records it); every scripted start reads as ordinary.
-        seal_startup_test::record_start(scope, None);
+        seal_startup_test::record_start(scope, journal.map(|spec| spec.key_sizes));
         return verdict;
     }
     crate::inventory_semantics::AttestedSemanticLane::start_live(

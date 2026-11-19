@@ -5970,7 +5970,7 @@ fn info_retry_budget_table_pins_singles_charges_and_yields() {
         let mut receipt = ExtendReceipt::default();
         let visits = retry_info_returns(
             &mut harness.io,
-            &mut harness.targets,
+            &harness.targets,
             &mut harness.links,
             &mut harness.book,
             &mut receipt,
@@ -6124,7 +6124,7 @@ fn info_retry_budget_table_pins_multi_charges_and_yields() {
         let mut receipt = ExtendReceipt::default();
         let visits = retry_info_returns(
             &mut harness.io,
-            &mut harness.targets,
+            &harness.targets,
             &mut harness.links,
             &mut harness.book,
             &mut receipt,

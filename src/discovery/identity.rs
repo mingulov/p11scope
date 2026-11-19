@@ -10048,15 +10048,18 @@ pub(crate) const PIN_BUDGET_STOP_DETAIL: &str =
     "capture library-handle budget exhausted; the pin was not attempted";
 
 /// How one scan pin failed (fix6 A3, owner 20:25): an ordinary refusal —
-/// recorded with today's reason and key rejection — or handle
-/// exhaustion, which waits for the next tick instead (a counted named
-/// gap, never a rejection). Every pre-existing `Err(reason)` site
-/// converts through `From`, so only the library-open sites name the
-/// distinction.
+/// recorded with today's reason and key rejection — handle exhaustion,
+/// which waits for the next tick instead (a counted named gap, never a
+/// rejection) — or a view that died mid-pin, which is loss rather than
+/// forgery evidence: it files its gap without rejecting the key and
+/// never defers for a retry that cannot help. Every pre-existing
+/// `Err(reason)` site converts through `From`, so only the
+/// library-open sites name the distinction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PinFailure {
     Refused(String),
     Wait { reason: String },
+    Gone { reason: String },
 }
 
 impl PinFailure {
@@ -10199,6 +10202,16 @@ fn record_scanned_candidate(
                     }
                 }
             }
+            skipped.push(Skipped {
+                subject: raw.path,
+                reason,
+            });
+        }
+        Err(PinFailure::Gone { reason }) => {
+            // The view died mid-pin: loss, not forgery evidence. File the
+            // gap like a refusal but leave the key (and every live view's
+            // pins on it) alone; unlike a wait, a dead view never becomes
+            // pinnable, so this never defers for retry.
             skipped.push(Skipped {
                 subject: raw.path,
                 reason,
@@ -17012,6 +17025,124 @@ mod tests {
                 "the rejected collision group needs bounded ambiguity evidence: {skipped:?}"
             );
         }
+    }
+
+    /// Twin (regression): a pin that fails for a view which died mid-pin
+    /// is loss, not forgery evidence: it must not come back refused
+    /// (refusals reject the whole key, silently dropping every live
+    /// view's coverage of the file under churn).
+    #[test]
+    fn dead_view_pin_failure_is_not_a_refusal() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let view = ProcessView::open(ProcessViewId(7), pid).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            view.original_exited(),
+            Ok(true),
+            "the fixture view died before its pin"
+        );
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut module = module(key);
+        module.path = "/nonexistent-v072-gone-test/libnope.so".into();
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::default();
+        let outcome = pin_scanned_object(
+            &view,
+            raw,
+            None,
+            None,
+            &|_| Err("test pinned identity never runs on a failed open".into()),
+            &mut mounts,
+            &mut budget,
+        );
+        assert!(
+            !matches!(outcome, Err(PinFailure::Refused(_))),
+            "a dead view's pin failure must not refuse (it would reject a live key): {:?}",
+            outcome.as_ref().map(|_| ()),
+        );
+    }
+
+    /// Twin (control): the same failing pin on a live view still
+    /// refuses, preserving fail-closed behavior where forgery evidence
+    /// is possible.
+    #[test]
+    fn live_view_pin_failure_still_refuses() {
+        let view = ProcessView::open(ProcessViewId(7), std::process::id()).unwrap();
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut module = module(key);
+        module.path = "/nonexistent-v072-gone-test/libnope.so".into();
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::default();
+        let outcome = pin_scanned_object(
+            &view,
+            raw,
+            None,
+            None,
+            &|_| Err("test pinned identity never runs on a failed open".into()),
+            &mut mounts,
+            &mut budget,
+        );
+        assert!(
+            matches!(outcome, Err(PinFailure::Refused(_))),
+            "a live view's pin failure must keep refusing: {:?}",
+            outcome.as_ref().map(|_| ()),
+        );
+    }
+
+    /// Twin: a Gone pin loss files its gap without rejecting the key,
+    /// so other views' live pins on the same file survive churn.
+    #[test]
+    fn gone_pin_loss_keeps_live_pins_on_its_key() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let mut source = image_pins(&[(key, "aaaaaaaa", 1)]);
+        let entry = source.by_id.pop_first().unwrap().1;
+        let raw = entry.raw.clone();
+        let mut pinned = PinnedObjects::empty();
+        let mut skipped = Vec::new();
+        record_scanned_candidate(
+            &mut pinned,
+            ProcessViewId(0),
+            raw.clone(),
+            Ok(entry),
+            &mut skipped,
+            true,
+        );
+        assert_eq!(pinned.pinned().count(), 1);
+        record_scanned_candidate(
+            &mut pinned,
+            ProcessViewId(1),
+            raw,
+            Err(PinFailure::Gone {
+                reason: "mapping identity unavailable".into(),
+            }),
+            &mut skipped,
+            true,
+        );
+        assert_eq!(
+            pinned.pinned().count(),
+            1,
+            "a gone view must not nuke live pins on its key"
+        );
+        assert!(
+            skipped.iter().any(|skip| !skip.reason.is_empty()),
+            "the gone observation still files its gap: {skipped:?}"
+        );
     }
 
     #[test]

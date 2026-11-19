@@ -703,7 +703,10 @@ mid-capture global retirement detaches live attached counting probes
 with no same-apply reattach (`start_ns` is the detach decision
 instant, conservative by the async worker latency) and closes when
 every module in the window re-attaches, else it reads open-ended at
-capture end. Every
+capture end. An owned-run retirement composed with same-apply
+reattach — the paused ExecRefresh/static-to-exact generation turnover
+— files no window; a pure owned retire with no same-apply reattach
+files one like any live retire. Every
 window carries conservative outer bounds, never a missed-call
 estimate; the affected-slot count rides in
 `evidence.coverage_retired_slots`.

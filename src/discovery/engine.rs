@@ -15783,9 +15783,10 @@ impl Engine {
     /// slots with a retained attach-complete stamp count, so retiring
     /// plan-active cover that never attached (a rejected key's slots,
     /// a conservative replay of an unattached plan) files no phantom
-    /// window. `None` on ended/owned arms, empty cover, full reattach,
-    /// no proven attach, or an unreadable clock. Call before any arm
-    /// mutates the plan; the caller opens it once the detach commits.
+    /// window. `None` when the retire is not live-global (the ended arm,
+    /// or an owned arm composed with same-apply reattach), on empty cover,
+    /// full reattach, no proven attach, or an unreadable clock. Call before
+    /// any arm mutates the plan; the caller opens it once the detach commits.
     fn coverage_retire_snapshot(
         &self,
         session: &dyn EngineSession,
@@ -19615,6 +19616,15 @@ impl Engine {
             && selected
                 .iter()
                 .all(|slot| self.slot_owned_by_run(slot, &candidate));
+        // A pure owned retire (no same-apply reattach planned) has no
+        // replacement cover by construction: the running owned child
+        // loses live calls exactly like an unowned retire, so it fires.
+        // An owned retire composed with same-apply reattach stays
+        // silent — the paused ExecRefresh/static-to-exact generation
+        // turnover, whose reattach carries the new generation.
+        let live_global = ended.is_none()
+            && (!owned_only
+                || (candidate.delta.new.is_empty() && candidate.delta.replace.is_empty()));
         let detach_slots_start = crate::attach::monotonic_ns();
         // Coverage-retire witness: snapshot the live attached cover this
         // apply may detach, before any arm mutates the plan. Opened below
@@ -19623,7 +19633,7 @@ impl Engine {
             &*session,
             &selected,
             &candidate,
-            ended.is_none() && !owned_only,
+            live_global,
             detach_slots_start,
         );
         #[cfg(feature = "h6-reexec-diagnostic")]

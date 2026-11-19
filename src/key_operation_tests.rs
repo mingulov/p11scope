@@ -16480,17 +16480,17 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
         jsonl_after.known, jsonl_before.known,
         "JSONL keeps proved rows"
     );
-    // Concise text keeps the block exactly apart from the provider
-    // display name, which degrades once the instance row folds (the
-    // proved instance outliving its instances[] row is the escalated
-    // CBOM-join question, not this fix). The raw blocks must differ
-    // — that pins the degradation as real — while the normalized
-    // blocks compare exactly and the degraded name reads explicitly.
+    // Concise text keeps the block exactly: the folded instance
+    // keeps its provider display name through the departed
+    // aggregate's join keys (the escalated CBOM-join question is
+    // answered — the proved instance outliving its instances[] row
+    // rejoins). The raw blocks compare exactly, and so do the
+    // normalized ones.
     let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
     let block_after = key_ops_text_block(&text_after);
-    assert_ne!(
+    assert_eq!(
         block_after, block_before,
-        "the fold degrades the provider display name: {block_after:?}"
+        "folded renders exactly like live: {block_after:?}"
     );
     let normalized_before: Vec<String> = block_before
         .iter()
@@ -16505,10 +16505,10 @@ fn fold_sole_clean_feed_keeps_proved_rows_across_renders() {
         "concise text keeps the proved rows exactly: {block_after:?} vs {block_before:?}"
     );
     assert!(
-        block_after
+        !block_after
             .iter()
             .any(|line| line.contains("unidentified provider")),
-        "the folded instance reads as an unidentified provider: {block_after:?}"
+        "the folded instance keeps its provider name: {block_after:?}"
     );
     assert!(
         !block_before
@@ -16660,15 +16660,15 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
         "JSONL keeps proved rows exactly"
     );
     // Concise text keeps the partial header counts, the exact loss
-    // line and the per-category tally totals; the folded feed's line
-    // degrades to the unidentified provider while the sibling keeps
-    // its provider name. The grouping split is the escalated
-    // CBOM-join question, so the split is pinned, not hidden.
+    // line and the per-category tally totals; the folded feed keeps
+    // its provider name through the departed join keys beside the
+    // sibling, so the grouping stays whole (the escalated CBOM-join
+    // question is answered).
     let text_after = render_snapshot_with_verbosity(&after, TextVerbosity::Concise);
     let block_after = key_ops_text_block(&text_after);
-    assert_ne!(
+    assert_eq!(
         block_after, block_before,
-        "the fold splits the provider grouping: {block_after:?}"
+        "folded renders exactly like live: {block_after:?}"
     );
     let totals_before = key_tally_totals(&block_before);
     assert!(
@@ -16678,7 +16678,7 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
     assert_eq!(
         key_tally_totals(&block_after),
         totals_before,
-        "concise keeps exact tally totals across the split: {block_after:?}"
+        "concise keeps exact tally totals across the fold: {block_after:?}"
     );
     let header_before = block_before.first().expect("partial header");
     let header_after = block_after.first().expect("partial header");
@@ -16689,11 +16689,12 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
     assert_eq!(
         header_without_provider_count(header_after),
         header_without_provider_count(header_before),
-        "concise header keeps every count but the split provider total: {block_after:?}"
+        "concise header keeps every count: {block_after:?}"
     );
-    assert!(
-        header_provider_count(header_after) > header_provider_count(header_before),
-        "the fold splits one provider group into two: {block_after:?}"
+    assert_eq!(
+        header_provider_count(header_after),
+        header_provider_count(header_before),
+        "the fold keeps one provider group: {block_after:?}"
     );
     assert_eq!(
         block_after
@@ -16705,10 +16706,10 @@ fn fold_lossy_feed_keeps_named_loss_beside_healthy_sibling() {
         "concise still names the loss beside exact rows: {block_after:?}"
     );
     assert!(
-        block_after
+        !block_after
             .iter()
             .any(|line| line.contains("unidentified provider")),
-        "the folded feed reads as an unidentified provider: {block_after:?}"
+        "the folded feed keeps its provider name: {block_after:?}"
     );
     assert!(
         block_after.iter().any(|line| {

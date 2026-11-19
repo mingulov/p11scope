@@ -1963,11 +1963,8 @@ fn async_global_owned_retire_with_reattach_stays_silent() {
 fn async_global_owned_leader_with_descendant_pure_retire_opens_a_counted_coverage_window() {
     let (child, mut engine, modules) = engine_with_one_accepted_provider();
     engine.owned_run_pid = Some(child.id());
-    let descendant = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let descendant_view = ProcessView::open(ProcessViewId(4), descendant.id()).unwrap();
+    let peers = e06_spawn_sleeps(1);
+    let descendant_view = ProcessView::open(ProcessViewId(4), peers[0].pid()).unwrap();
     engine.views.push(descendant_view);
     engine.next_view_id = 5;
     let peer = peer_candidate(&mut engine, &modules);

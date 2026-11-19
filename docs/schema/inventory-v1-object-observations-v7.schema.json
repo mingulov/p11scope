@@ -1134,7 +1134,7 @@
       "properties": {
         "status": {
           "enum": ["inferred", "unknown", "conflicting", "unsupported"],
-          "description": "inferred: one size. unknown: no evidence or evidence outside every map (named reason in -v text only). conflicting: two distinct sizes, or a contradicting established size. unsupported: evidence exists but the subset has no map, or the length is outside the subset admission bound (RSA outside 64..=2048, AES-KW material above 8191; -v reason outside_admission_bound, publishes no size, parks nothing; never overwrites inferred, never flips)."
+          "description": "inferred: one size. unknown: no evidence or evidence outside every map (named reason in -v text only). conflicting: two distinct sizes, or a contradicting established size. unsupported: evidence exists but the subset has no map, or the length is outside the subset admission bound (RSA outside 64..=2048, AES-KW material above 8191; the refused completion still counts, JSON unsupported sets only from a weak unknown, -v prints size unsupported (outside admission bound) only when that reason is set; publishes no size, parks nothing; never overwrites inferred, never flips)."
         },
         "detail": {
           "anyOf": [{"type": "null"}, {"$ref": "#/$defs/size_detail"}],
@@ -1144,7 +1144,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 18446744073709551615,
-          "description": "Completions carrying admitted length evidence (flag on with a trailer, read or unavailable) behind this row."
+          "description": "Completions carrying attached length evidence behind this row: valued or unavailable observations count while the flag is on, and a direct observation still counts when size classification refuses it."
         },
         "conflict_detail": {
           "$ref": "#/$defs/size_detail",
@@ -1208,7 +1208,7 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 18446744073709551615,
-          "description": "Wrapped-key material octets (L-8 for plain AES-KW wrap output and fresh-view unwrap input, admitted 0..=8191 with L 8..=8199; on a proved wrapped-key row a larger observed value contributes no new size but counts its completion, reports unsupported with reason outside_admission_bound only when the row has no stronger size evidence, and otherwise keeps its inferred, conflicting, or stronger unknown state; on a rowless wrap or fresh-view unwrap it leaves no park and contributes no wrapped-size evidence to the subsequent row)."
+          "description": "Wrapped-key material octets (L-8 for plain AES-KW wrap output and fresh-view unwrap input, admitted 0..=8191 with L 8..=8199; on a proved wrapped-key row a larger observed value contributes no new size but counts its completion: the row JSON status reads unsupported only when its prior size state is a weak unknown (the above-bound direct completion sets it), -v prints size unsupported (outside admission bound) only when that reason is set, and prior inferred, conflicting or stronger unknown state stays; on a rowless wrap or fresh-view unwrap it leaves no park and contributes no wrapped-size evidence to the subsequent row)."
         },
         "about": {
           "const": "wrapped",

@@ -13841,6 +13841,54 @@ pub(crate) mod tests {
         assert!(unmatched.is_empty());
     }
 
+    /// Pacing twin: every declaration costs a planning unit — even a
+    /// bare name against an empty module table, which otherwise
+    /// converts and collects unboundedly without a stop check — and
+    /// every stat, comparison and ordered-output visit counts exactly
+    /// once through the shared callback.
+    #[test]
+    fn forwarding_match_counts_every_declaration_stat_and_comparison() {
+        use std::path::PathBuf;
+        // A bare-name declaration against zero modules still visits
+        // the callback once for its own conversion and bookkeeping.
+        let declared = vec![PathBuf::from("no-such-layer.so"); 100];
+        let modules: Vec<(ModuleId, String, (u64, u64), u64)> = Vec::new();
+        let visits = std::cell::Cell::new(0u64);
+        let (matched, unmatched) = match_forwarding_inputs_counted(&declared, &modules, || {
+            visits.set(visits.get() + 1);
+            false
+        })
+        .expect("a quiet match completes");
+        assert!(matched.is_empty());
+        assert_eq!(unmatched.len(), 100);
+        assert_eq!(
+            visits.get(),
+            100,
+            "each declaration costs one unit with zero modules"
+        );
+        // Two paths over three modules: one unit per declaration, one
+        // per stat, one per comparison, one per ordered-output visit.
+        let modules = vec![
+            (ModuleId(3), "/opt/liba.so".into(), (8, 1), 100),
+            (ModuleId(4), "/snap/liba.so".into(), (8, 2), 200),
+            (ModuleId(5), "/opt/libb.so".into(), (8, 1), 300),
+        ];
+        let declared = vec![PathBuf::from("/opt/liba.so"), PathBuf::from("/opt/libb.so")];
+        let visits = std::cell::Cell::new(0u64);
+        let (matched, unmatched) = match_forwarding_inputs_counted(&declared, &modules, || {
+            visits.set(visits.get() + 1);
+            false
+        })
+        .expect("a quiet match completes");
+        assert!(matched.is_empty(), "unresolvable paths match nothing");
+        assert_eq!(unmatched.len(), 2);
+        assert_eq!(
+            visits.get(),
+            2 + 2 + 2 * 3 + 3,
+            "declarations, stats, comparisons and ordered visits each count once"
+        );
+    }
+
     /// The O-Module case: a typo'd `--module` path matches no mapped file
     /// and is reported back verbatim, in operator order.
     #[test]

@@ -36280,7 +36280,7 @@ impl Engine {
             &mut graph.rebind,
             reserve,
             GRAPH_STRIDE,
-            &authority,
+            authority,
         ) {
             Ok(GraphStep::Ready) => {
                 graph.phase = GraphPhase::Plan;

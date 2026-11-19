@@ -3894,14 +3894,15 @@ impl PinnedObjects {
 
 // Inactive collected graph-builder boundary. Ready is structural and borrowed;
 // Engine installation must first supply its own persistent backing-lease sink.
+use conservative_copy::conservative_pin_tree_bytes;
+#[cfg(test)]
+use conservative_copy::deallocate_drained_unique_arc;
 #[allow(unused_imports)]
 pub(crate) use conservative_copy::{
     ConservativePinSelection, GraphRefusal, GraphStep, InstalledModulesBacking,
     InstalledPinsBacking, PinnedConservativeCursor, RetainedScannedInputs, RetiredFileHandoff,
     ScannedInputMeasure, ScannedRebindCursor,
 };
-#[cfg(test)]
-use conservative_copy::{conservative_pin_tree_bytes, deallocate_drained_unique_arc};
 
 #[allow(dead_code)] // Staged pure builders, not yet selected by the live Engine.
 mod conservative_copy {

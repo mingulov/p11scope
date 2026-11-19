@@ -135,25 +135,28 @@ splitting; everything else is preserved bit-for-bit.
 
 ### 3.2 Per-session seal ownership: park, then advance
 
-New frame operation `park_stuck_consumer`, driven only by the watchdog
-owner when the running bound fires:
+New frame operation `park_stuck_consumers`, driven only by the
+watchdog owner when the running bound fires (skipped while a seal
+barrier stands — barrier pins trip into re-arm and scoped void,
+which sheds the barrier, instead):
 
-1. Take the cursor consumer's pending seal failure (the real failure —
-   `BoundNotReady`, `Retry`, held — never invented).
-2. Deliver it once as terminal scoped loss through the existing
-   failure-delivery path (`deliver_joint_failure`) with retry
-   disabled, scoped to `SealFailureScope::AffectedDomains(stuck
-   domains)`. The feed degrades exactly as it would under a fenced
-   void today (fallback/S1 rows + counted loss + named gap).
-3. Mark the consumer `LossDelivered` (existing variant: degraded with
-   counted loss — no new state) and advance the cursor past it via the
-   existing skip logic.
-4. Repeat for further stuck consumers up to the bound; healthy
-   consumers seal and deliver normally between parks.
+1. Flag every Pending consumer with a stuck-delivery streak
+   (consecutive retried/held visits, tracked on the consumer;
+   Future consumers are never parked — their input may arrive).
+2. The next delivery of a parked consumer forces the fallback
+   disposition through the existing failure-delivery path: the feed
+   degrades exactly as under a fenced void (fallback/S1 rows +
+   counted loss), the cursor advances past it, and the named park
+   gap lands with exact loss counts. A parked consumer whose seal
+   recovers naturally still seals (the flag only alters retry
+   deliveries).
+3. Healthy consumers seal and deliver normally between parks; the
+   frame completes with no trip, no abandon and no re-arm.
 
-If no consumer can progress, the frame is abandoned (scoped, §3.4) and
-the lane re-arms. If the whole stuck set is the whole frame, behavior
-reduces to today's abandon — correctly, with per-session counts.
+If no consumer can progress by parking (all Future, terminal, or
+already parked), the frame is abandoned (scoped, §3.4) and the lane
+re-arms. If the whole stuck set is the whole frame, behavior reduces
+to today's abandon — correctly, with per-session counts.
 
 ### 3.3 One watchdog owner
 
@@ -179,16 +182,31 @@ Two break kinds, distinguished by what was lost:
   while the stream position is intact. These record a SCOPED break
   (stuck set, §3.1) and the Idle void consumes it with:
   - `fence_void_scoped`: raise `void_fence` and record
-    `outcome_lost` only for stuck domains' keys;
-  - `void_staged_scoped`: wipe open entries, refused entries and
-    claims only for stuck images; `void_wiped` and derived-absence
-    notes cover only those;
-  - per-domain void cuts for births: scoped breaks must NOT raise the
-    global `voided_through` (healthy births below the cut keep
-    answering); stuck-identity births check their domain's cut.
-    (Exact birth-cut check site to verify in implementation.)
-  - `drop_abandoned_joint_staged_scoped`: dispose only stuck-set
-    feeds (see §3.5).
+    `outcome_lost` only for stuck domains' keys (iterating the stuck
+    keys only, never the whole table);
+  - `void_staged_scoped`: wipe open/refused entries by key
+    attribution — converted entries wipe by their key, unconverted
+    ones only when no healthy claimant names their shape — plus
+    seal-barring unbound staging (which has no key to fence);
+    `void_wiped` and derived-absence notes cover exactly the wiped
+    set; claims and pinned bootstraps stay (the audit needs them);
+  - no global `voided_through` raise, no invalidation, no re-sync:
+    seals already check `max(key fence, global cut)`, so stuck keys
+    refuse below-cut history while healthy keys re-prove above
+    their own unmoved fences;
+  - `discard_quantum_touched_staged`: dispose only stuck-set
+    feeds (see §3.5);
+  - the void delivers its scoped failure to the stuck feeds (empty
+    after discard, so verification is empty-against-empty) which
+    closes them for reseed exactly like a stream void's delivery;
+  - orphan terminals shed at claim time: a void-wiped BEGIN's late
+    END routes to plain S1 under the Voided cause (never to a
+    staged orphan head), and neutral ones excuse at ingest (no
+    taint);
+  - reseed clears pinned bootstrap cuts: a void-fenced image
+    rebirthing above its fence replaces stale below-cut evidence
+    (stream voids already clear at wipe time, so this is a no-op
+    for them).
 
 Fail-closed destroy is preserved with narrowed scope: a stranded
 destroy inside the stuck session still promotes to taint its own
@@ -227,14 +245,18 @@ New:
 - Seal-side birth consumption (`SelectedBirth` lookup per consumer)
   proceeds past parked consumers via cursor advance (§3.2): healthy
   members' births flow while the stuck member is degraded.
-- Per-member progress bound: any funnel member (claim, stage, birth,
-  seal consumer) with no progress across the watchdog bound is parked
-  with a named gap. No member waits on another member's progress.
-- Instrumentation: timestamped per-member birth outcomes
-  (admitted/deferred/refused + reason + age) so a soak can root-cause
-  any leg4-type stall instead of guessing. If the leg4 signature
-  reproduces (no late rows, no voids/trips), the owning birth lane
-  gets evidence, not speculation.
+- Per-member progress bound: any seal consumer retrying/held without
+  progress is parked with a named gap at the frame bound; a seal
+  barrier skips the park and trips into re-arm and scoped void
+  (which sheds the barrier) instead of degrading behind it. No
+  member waits on another member's progress; Future consumers keep
+  waiting (their input may still arrive).
+- No new birth-outcome instrumentation: presence-side outcomes are
+  already disclosed per member (birth gaps carry admitted/deferred/
+  refused with reasons), and the leg4 signature (no rows with no
+  voids/trips) is absence-side — nothing reaches the funnel to log.
+  If it reproduces, the owning birth lane gets the gap/counter
+  evidence, not speculation.
 
 ## 4. Entry-point table (normative for the table-driven test)
 
@@ -247,7 +269,7 @@ lane liveness past recovery.
 |---|-------------|---------|-----------------|
 | E1 | Running transient re-arm (`rearm_after_running_refusal` via `hold_joint_commit_lane_and_publish`) | `Unavailable` at Auditing/Audited, no finish trip | Park stuck consumers; scoped feed dispose + scoped break; lane re-arms; healthy feeds/domains/images bit-identical |
 | E2 | Running audit-trip re-arm (NEW: G5) | Audit no-progress bound fires | Same scoped recovery as E1, then re-arm; trip cleared; healthy sessions preserved; new callers join |
-| E3 | Idle ingest-break void (`void_ingest_break` at Idle collect) | `stream_broken` from ingest side | Stream-wide void ONLY for genuine ingest breaks; watchdog breaks consume the recorded scope (E1/E2 never re-widen here) |
+| E3 guard | Genuine ingest break stays stream-wide | `break_stream_for_test` + Idle collect | Stream-wide void ONLY for genuine ingest breaks (fence all, wipe all, drop all with preserved completions); watchdog breaks consume the recorded scope instead (E1/E2 never re-widen; the watchdog-void-consume pin lives in the shared joins helper) |
 | E4 | Exit hold (`hold_joint_lane_for_exit`) | Lane stops | Full terminal abandon UNCHANGED (correct at stop); pins no over-scoping regression in the other direction |
 | E5 | Finish no-progress trip | Finish bound fires | Re-arm still refused (`WatchdogTripped`); hold discloses; UNCHANGED |
 | E6 | Seal cursor park (§3.2) | Watchdog bound with stuck cursor consumer | Cursor advances past degraded consumer; later healthy consumers seal/deliver in the same frame |
@@ -257,14 +279,19 @@ lane liveness past recovery.
 | E9b | Barrier shed in scoped void (§3.4) | Foreign in-flight call + trip + rearm | Barrier shed with loss; held session kept and seals exact; fresh stuck-file call seals |
 | E10 | Unapplied re-arm keeps carried (§3.4) | Transient refusal before anything applied | Touched set empty, nothing disposed; held call stays staged; lane continues |
 
-E4/E5 are no-change guard rows: the refactor must not alter terminal
-behavior while localizing running recovery.
+E3/E4/E5 are no-change guard rows: the refactor must not alter
+genuine-break or terminal behavior while localizing running
+recovery.
 
 ## 5. Gaps, wire and schema
 
-- Gap subjects unchanged (notably `RUNNING_REARM_SUBJECT`). Reason
-  texts change only where behavior changes: the re-arm reason names
-  the scoped discard (`discarded {calls} staged calls from {feeds}
+- Gap subjects unchanged (notably `RUNNING_REARM_SUBJECT`), with
+  one addition: `joint stuck consumer parked` names each forced-
+  fallback degrade (caller-attributed, with stuck-visit count, cause
+  gap and exact loss count) — a fix (previously this loss tripped
+  the whole lane or never surfaced per consumer). Reason texts
+  change only where behavior changes: the re-arm reason names the
+  scoped discard (`discarded {calls} staged calls from {feeds}
   feeds of the stuck session; per-key attribution unknown for those
   calls`) and drops the stream-wide "lose per-key rows for the rest
   of the run" claim for healthy sessions (false after this lands).
@@ -302,10 +329,10 @@ manifest, no profile-schema touch.
 - R2. The leg4-type late stall (no voids/trips) has an unknown cause;
   this design bounds and instruments the funnel (§3.6) but claims no
   root-cause fix for it. Soak forensics decide.
-- R3. Birth-cut check site for per-domain void cuts must be verified
-  during implementation (§3.4); if births cannot scope cleanly, the
-  fallback is the global cut with a documented residual (healthy
-  births below the cut refuse loudly, never silently).
+- R3. RESOLVED during implementation: no per-domain cut map was
+  needed — seals and birth verification already check
+  `max(key fence, global cut)`, so leaving the global cut put while
+  fencing stuck keys scopes births correctly with zero new state.
 - R4. This supersedes the watchdog-continue interim fallback; the two
   lanes must not both land. Integration order is the integrator's
   call; this spec records the supersession explicitly.

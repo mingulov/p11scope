@@ -77,6 +77,20 @@ versioned separately and are opaque, exact dispatch keys.
   aggregate. Inventory text names folded departed callers per module:
   a `departed use:` summary row counts the folded callers, entries
   and edges (plus any identities or mechanisms past the row bound).
+- Key-operations watchdog recovery is now scoped to the stuck
+  session: a transient audit refusal or an audit no-progress trip on
+  a running lane discards only the stuck session's staged calls,
+  counted under a named `semantic quantum abandoned; lane continues`
+  gap, while healthy sessions keep staged proof and continue exact
+  and the lane continues. A seal consumer stalled without tripping
+  is parked past its stall with its counted loss under a new `joint
+  stuck consumer parked` gap instead of stopping the lane. Only
+  finish trips, other-step refusals, or a spent continuation bound
+  still stop tracking.
+- A key-operations view whose only evidence is per-key loss now
+  degrades to partial instead of voiding to unavailable: pending
+  keys lost to an H3 audit gap record one named `outcome_lost` gap
+  each.
 
 ### Fixed
 

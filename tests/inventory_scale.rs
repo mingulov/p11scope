@@ -1473,6 +1473,12 @@ fn guard_pass_marker_line(pass: u64) -> String {
     format!("{{\"kind\":\"pass_committed\",\"event\":{{\"pass\":{pass}}}}}\n")
 }
 
+fn guard_exit_line(pid: u32) -> String {
+    format!(
+        "{{\"kind\":\"caller_event\",\"event\":{{\"event\":\"exited\",\"identity_context\":{{\"caller\":{{\"pid\":{pid},\"executable\":{{\"path\":\"{GUARD_DRIVER}\"}}}}}}}}}}\n"
+    )
+}
+
 #[test]
 fn churn_kill_guard_records_admitting_pass_on_same_tick_batch() {
     // The whole commit batch lands in one pump tick: the admitted line
@@ -1592,6 +1598,137 @@ fn churn_settled_for_stop_needs_kill_and_later_pass_and_birth() {
     assert!(
         !condition.settled_for_stop(),
         "a kill without its admitting pass never stops"
+    );
+}
+
+#[test]
+fn churn_stop_waits_for_exits_after_backlog() {
+    // Twin: a descheduled pump can consume pass 0 and pass 1 in one tick
+    // before the kill signals land. The pre-kill pass 1 must not satisfy
+    // the stop: only a later pass carrying both exit observations does.
+    let dir = tmp("inventory-churn-guard-stop-backlog");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}{}",
+            guard_admitted_line(GUARD_CHURN_A),
+            guard_pass_marker_line(0),
+            guard_pass_marker_line(1)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        condition.ready.join("churn-c.ready"),
+        format!("READY {}\n", GUARD_CHURN_C),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.kill_admitting_pass, Some(0));
+    assert_eq!(condition.last_pass, Some(1));
+    assert!(condition.churn_c.is_some(), "churn-C birth is visible");
+    assert!(condition.exited.is_empty(), "no exit observed yet");
+    assert!(
+        !condition.settled_for_stop(),
+        "a later pass without either exit observation must not stop"
+    );
+    let mut later = std::fs::read_to_string(&condition.events).unwrap();
+    later.push_str(&guard_exit_line(GUARD_ANCHOR));
+    later.push_str(&guard_exit_line(GUARD_CHURN_A));
+    later.push_str(&guard_pass_marker_line(2));
+    std::fs::write(&condition.events, later).unwrap();
+    condition.pump();
+    assert!(
+        condition.settled_for_stop(),
+        "both exits carried by a later pass stop the run"
+    );
+}
+
+#[test]
+fn churn_stop_needs_both_exits_not_one() {
+    // Twin: a pass published after the kill request may have scanned
+    // before the signals took effect. Zero exits, then one exit, must
+    // each veto the stop on their own; only both exits stop it.
+    let dir = tmp("inventory-churn-guard-stop-exits");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}",
+            guard_admitted_line(GUARD_CHURN_A),
+            guard_pass_marker_line(0)
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        condition.ready.join("churn-c.ready"),
+        format!("READY {}\n", GUARD_CHURN_C),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.kill_admitting_pass, Some(0));
+    let mut stream = std::fs::read_to_string(&condition.events).unwrap();
+    stream.push_str(&guard_pass_marker_line(1));
+    std::fs::write(&condition.events, &stream).unwrap();
+    condition.pump();
+    assert_eq!(condition.last_pass, Some(1));
+    assert!(
+        !condition.settled_for_stop(),
+        "a post-request pass without exits must not stop"
+    );
+    stream.push_str(&guard_exit_line(GUARD_ANCHOR));
+    stream.push_str(&guard_pass_marker_line(2));
+    std::fs::write(&condition.events, &stream).unwrap();
+    condition.pump();
+    assert!(
+        !condition.settled_for_stop(),
+        "one exit observation must not stop without the other"
+    );
+    stream.push_str(&guard_exit_line(GUARD_CHURN_A));
+    stream.push_str(&guard_pass_marker_line(3));
+    std::fs::write(&condition.events, &stream).unwrap();
+    condition.pump();
+    assert!(
+        condition.settled_for_stop(),
+        "both exit observations stop the run"
+    );
+}
+
+#[test]
+fn churn_pump_trips_rotation_tripwire_on_rename_regrow() {
+    // Twin: rotation renames the file and a new file regrows. When the
+    // regrown file is already at least as long as the consumed offset,
+    // the length check alone misses the replacement; the device/inode
+    // change must still latch `rotated`.
+    let dir = tmp("inventory-churn-guard-rotation-rename");
+    let mut condition = scripted_churn_condition(&dir);
+    let initial = format!(
+        "{}{}",
+        guard_admitted_line(GUARD_CHURN_A),
+        guard_pass_marker_line(0)
+    );
+    std::fs::write(&condition.events, &initial).unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert!(!condition.rotated, "a growing stream trips nothing");
+    let consumed = condition.offset;
+    std::fs::rename(&condition.events, dir.join("events.jsonl.1")).unwrap();
+    let mut regrow = format!(
+        "{}{}{}",
+        guard_admitted_line(GUARD_CHURN_B),
+        guard_pass_marker_line(1),
+        guard_pass_marker_line(2)
+    );
+    while (regrow.len() as u64) < consumed {
+        regrow.push_str(&guard_pass_marker_line(2));
+    }
+    std::fs::write(&condition.events, &regrow).unwrap();
+    condition.pump();
+    assert!(
+        condition.rotated,
+        "a rename with regrow to the consumed offset latches rotated"
     );
 }
 

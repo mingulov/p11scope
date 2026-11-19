@@ -17899,6 +17899,25 @@ fn watchdog_entry_consumer_park_no_trip() {
             .any(|(subject, _)| subject == "joint stuck consumer parked"),
         "{ROW}: the park stages its named gap"
     );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut park_callers = registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "joint stuck consumer parked")
+        .map(|gap| gap.caller)
+        .collect::<Vec<_>>();
+    park_callers.extend(
+        registry
+            .staged_gaps_for_test()
+            .into_iter()
+            .filter(|gap| gap.subject == "joint stuck consumer parked")
+            .map(|gap| gap.caller),
+    );
+    assert_eq!(
+        park_callers,
+        [Some(target.caller())],
+        "{ROW}: the park gap names exactly its stuck caller"
+    );
 }
 
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck

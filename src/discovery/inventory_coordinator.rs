@@ -27403,6 +27403,365 @@ exit 0
         );
     }
 
+    /// Identity-charge twin: two 62-member callers differ only in
+    /// distinct touched modules — A names one module (one edge plus
+    /// one instance on that edge's module), B names two (two edges
+    /// plus one instance sharing the first). Each departed-identity
+    /// write costs one admission unit, so A totals 63 units (1
+    /// credit) and B totals 64 (2 credits): beside 1,022
+    /// single-credit siblings A folds while B waits with every row
+    /// untouched, proving the next credit is reserved before any
+    /// mutation. Without the charge both cost one credit and fold.
+    #[test]
+    fn fold_identity_charge_tips_credit_boundary_before_any_mutation() {
+        const SIBLINGS: u32 = 1022;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut ids = Vec::new();
+        for caller in 0..SIBLINGS {
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                10_000 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        // A: 60 sequences + 1 edge + 1 instance on that edge's
+        // module = 62 members + 1 identity = 63 units = 1 credit.
+        let heavy_a = stage_cutoff_caller(&mut native, 7000, 60, 0, 0, 1, 1, 0);
+        // B: 59 sequences + 2 edges + 1 instance sharing the first
+        // edge's module = 62 members + 2 identities = 64 units =
+        // 2 credits.
+        let heavy_b = stage_cutoff_caller(&mut native, 7001, 59, 0, 0, 2, 1, 0);
+        ids.push(heavy_a);
+        ids.push(heavy_b);
+        assert_eq!(
+            ids.iter().max(),
+            Some(&heavy_b),
+            "the boundary callers sort last, A before B"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            u64::from(SIBLINGS) + 1,
+            "one remaining credit admits the 63-unit caller but not the 64-unit one"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy_b).is_some(),
+            "the 64-unit caller waits past the credit boundary"
+        );
+        // The wait costs nothing: B keeps every row and no identity
+        // names it.
+        let owners = native
+            .scene
+            .coordinator
+            .binder
+            .cookie_bound_owners_for_test();
+        assert_eq!(owners.len(), 59, "the waiting row keeps its sequences");
+        assert!(
+            owners.iter().all(|owner| *owner == heavy_b),
+            "no other row loses evidence to the pass"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .edges_of(heavy_b)
+                .count(),
+            2,
+            "the waiting row keeps its edges"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy_b)
+                .count(),
+            1,
+            "the waiting row keeps its instance"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            1,
+            "only the admitted caller's single identity lands"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_identity_insert_marks_for_test(),
+            &[(1, 0)],
+            "the admitted identity lands while its module's first edge folds"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (1, 1),
+            "the pass aggregates only the admitted caller's members"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the remainder resumes without a re-note"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy_b).is_none(),
+            "the waiting row eventually folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            3,
+            "both boundary callers name one identity per touched module"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_identity_insert_marks_for_test(),
+            &[(1, 0), (2, 1), (3, 1)],
+            "each identity lands while its module's first member folds"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (3, 2),
+            "both boundary folds aggregate every member"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_callers(),
+            u64::from(SIBLINGS) + 2,
+            "every row publishes exactly once"
+        );
+    }
+
+    /// Oversized-deferral twin: a 70,014-member caller carrying every
+    /// member kind (sequences, pair targets, recoveries, edges,
+    /// semantic instances, summaries) defers under its counted gap
+    /// while a fitting caller staged after it still folds the same
+    /// pass — the deferral never pins the queue. Both passes fold
+    /// nothing of the oversized row: every row and its evidence stay
+    /// live, repeats count the run's deferrals, and only the
+    /// sibling's members aggregate.
+    #[test]
+    fn fold_oversized_mixed_members_defer_around_fitting_sibling() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        // 70,000 sequences + 3 targets + 2 recoveries + 4 edges +
+        // 3 instances + 2 summaries = 70,014 members: no window
+        // reserves it with or without the identity charge.
+        let heavy = stage_cutoff_caller(&mut native, 5030, 70_000, 3, 2, 4, 3, 2);
+        // The fitting sibling sorts after the oversized row: it
+        // folds only when the deferral falls through to it.
+        let sibling = stage_exited_caller(&mut native, 5031, 100);
+        for sequence in 0..2u64 {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                200_000 + sequence,
+                sequence,
+                Some(sibling),
+            );
+        }
+        native
+            .scene
+            .coordinator
+            .registry_mut()
+            .scripted_module_edge(
+                ModuleKey::physical(8, 1, 9000, None, "/fold/sibling.so"),
+                sibling,
+            );
+        assert!(
+            sibling > heavy,
+            "the fitting sibling sorts after the oversized row"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        native
+            .scene
+            .coordinator
+            .note_rendered_callers(&[heavy, sibling]);
+        // Pass 1: the sibling folds around the deferral.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            1,
+            "the fitting sibling folds past the oversized deferral"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the oversized row stays carried past the deferral"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(sibling).is_none(),
+            "the sibling leaves when it folds"
+        );
+        // The deferral folds nothing of the oversized row.
+        let bound = native.scene.coordinator.binder_bound_owners_for_test();
+        assert_eq!(bound.len(), 70_000, "every deferred sequence stays bound");
+        assert!(
+            bound.iter().all(|owner| *owner == heavy),
+            "no other row loses evidence to the deferral"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            4,
+            "every deferred edge stays live"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            3,
+            "every deferred instance stays live"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            2,
+            "every deferred summary waits"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_targets.len(),
+            3,
+            "every deferred pair target waits"
+        );
+        assert_eq!(
+            native.scene.coordinator.recoveries.len(),
+            2,
+            "every deferred recovery waits"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (1, 0),
+            "the pass aggregates only the sibling's edge"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            1,
+            "only the sibling's identity lands"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_identity_insert_marks_for_test(),
+            &[(1, 0)],
+            "the sibling's identity lands while its edge folds"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        let registry = &native.scene.coordinator.registry;
+        let found = registry.gaps().iter().enumerate().find(|(_, gap)| {
+            gap.subject == FOLD_DEFERRED_OVERSIZED_SUBJECT && gap.caller == Some(heavy)
+        });
+        let Some((index, gap)) = found else {
+            panic!(
+                "the deferred caller gaps under its counted row: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(
+            gap.reason,
+            "the retired caller and its evidence remain in inventory as unfolded rows; the fold retries next pass",
+            "the deferral names the retained rows without a lifecycle claim"
+        );
+        assert_eq!(
+            registry.gap_repeats()[index],
+            1,
+            "one deferral recorded after pass 1"
+        );
+        // Pass 2 without a re-note: the carried row retries on its
+        // kept carry, gaps again, and still folds nothing.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            0,
+            "pass 2 folds nothing: the oversized row defers again"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the oversized row stays carried past two passes"
+        );
+        native.scene.coordinator.registry_mut().publish();
+        let registry = &native.scene.coordinator.registry;
+        let found = registry.gaps().iter().enumerate().find(|(_, gap)| {
+            gap.subject == FOLD_DEFERRED_OVERSIZED_SUBJECT && gap.caller == Some(heavy)
+        });
+        let Some((index, _)) = found else {
+            panic!(
+                "the deferred row keeps its counted gap: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(
+            registry.gap_repeats()[index],
+            2,
+            "repeats count the run's deferrals"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder_bound_owners_for_test()
+                .len(),
+            70_000,
+            "every deferred sequence stays bound past two passes"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            4,
+            "every deferred edge stays live past two passes"
+        );
+        let totals = native.scene.coordinator.registry().departed_totals();
+        assert_eq!(
+            (totals.edges, totals.instances_folded),
+            (1, 0),
+            "the deferral folds nothing across both passes"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_commit_identity_inserts_for_test(),
+            1,
+            "no pass inserts identities outside the sibling's fold"
+        );
+    }
+
     /// Module-attribution twin: an ordinary fold names the caller once
     /// per touched module inside the charged member traversal — each
     /// identity lands while its module's first member folds, not in a

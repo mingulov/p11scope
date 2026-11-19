@@ -24,6 +24,7 @@ pub(crate) mod module_init;
 
 use instance_input::{
     AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
+    RegistryInstanceId,
 };
 
 use crate::attach::capture::{DomainCookie, NativeDomainId};
@@ -3194,6 +3195,13 @@ pub(crate) struct DepartedUse {
     pub identities: BTreeMap<CallerId, DepartedIdentity>,
     pub identities_saturated: bool,
     pub identities_dropped: u64,
+    /// Folded instances' join keys (instance label to caller): key rows
+    /// keep their provider and application after their instance row
+    /// leaves `instances[]`. First rows named up to the folded-instance
+    /// bounds; past them only the drop count survives.
+    pub folded_instances: BTreeMap<RegistryInstanceId, CallerId>,
+    pub folded_instances_saturated: bool,
+    pub folded_instances_dropped: u64,
 }
 
 /// One folded edge's contribution, derived by the coordinator from
@@ -3361,6 +3369,12 @@ pub(crate) struct UnboundImageLimits {
 pub(crate) const DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE: usize = 4096;
 /// Default run-wide unidentified-image bound (LIM-1).
 pub(crate) const DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL: usize = 16_384;
+
+/// Per-module folded-instance join-key bound: named instance rows in
+/// one module's departed aggregate (mirroring the identity bounds).
+pub(crate) const MAX_FOLDED_INSTANCES_PER_MODULE: usize = 4096;
+/// Run-wide folded-instance join-key bound.
+pub(crate) const MAX_FOLDED_INSTANCES_GLOBAL: usize = 16_384;
 
 impl Default for UnboundImageLimits {
     fn default() -> Self {
@@ -4153,6 +4167,9 @@ pub(crate) struct CallerRegistry {
     /// the run-wide identity budget (mirroring
     /// [`DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL`]). Monotonic.
     folded_identities_global: usize,
+    /// Folded instance join keys across all per-module departed sets:
+    /// the run-wide [`MAX_FOLDED_INSTANCES_GLOBAL`] budget. Monotonic.
+    folded_instances_global: usize,
     /// Pending-count placements the last publication decided, in apply
     /// order (P3): drained by the coordinator after each publish.
     pending_count_decisions: Vec<PendingCountDecision>,
@@ -4424,6 +4441,7 @@ impl CallerRegistry {
             unidentified_pids_dropped: 0,
             folded_mechs_global: 0,
             folded_identities_global: 0,
+            folded_instances_global: 0,
             pending_count_decisions: Vec::new(),
             demoted_place_growth: HashMap::new(),
             witness_census: BindingCensus::default(),
@@ -5090,6 +5108,38 @@ impl CallerRegistry {
         }
         departed.identities_saturated = true;
         departed.identities_dropped = departed.identities_dropped.saturating_add(1);
+    }
+
+    /// Name one folded instance's join keys in its module's bounded
+    /// map, mirroring [`Self::insert_departed_identity`]: a known
+    /// instance keeps its first row, a new instance past the
+    /// per-module or run-wide bound saturates and counts as dropped
+    /// instead of growing.
+    pub(crate) fn insert_folded_instance(
+        &mut self,
+        module: ModuleId,
+        instance: RegistryInstanceId,
+        caller: CallerId,
+    ) {
+        let module_record = self
+            .modules
+            .get_mut(&module)
+            .expect("folded instance module retained");
+        let departed = module_record
+            .departed_use
+            .get_or_insert_with(DepartedUse::default);
+        if departed.folded_instances.contains_key(&instance) {
+            return;
+        }
+        if departed.folded_instances.len() < MAX_FOLDED_INSTANCES_PER_MODULE
+            && self.folded_instances_global < MAX_FOLDED_INSTANCES_GLOBAL
+        {
+            departed.folded_instances.insert(instance, caller);
+            self.folded_instances_global = self.folded_instances_global.saturating_add(1);
+            return;
+        }
+        departed.folded_instances_saturated = true;
+        departed.folded_instances_dropped = departed.folded_instances_dropped.saturating_add(1);
     }
 
     /// One caller's edges: a range query over the `(caller, module)` key,

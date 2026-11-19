@@ -10381,6 +10381,14 @@ fn departed_use_json(
         }).collect::<Vec<_>>(),
         "identities_saturated": departed.identities_saturated,
         "identities_dropped": departed.identities_dropped,
+        "folded_instances": departed.folded_instances.iter().map(|(instance, caller)| {
+            serde_json::json!({
+                "id": instance.label(),
+                "caller": caller.label(),
+            })
+        }).collect::<Vec<_>>(),
+        "folded_instances_saturated": departed.folded_instances_saturated,
+        "folded_instances_dropped": departed.folded_instances_dropped,
     })
 }
 

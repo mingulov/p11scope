@@ -71,6 +71,11 @@ pub(super) struct Unknowns {
     pub departed_identities_dropped: u64,
     /// Modules whose folded identity list saturated, counted.
     pub departed_identities_saturated: u64,
+    /// Folded instance join keys past the per-module/run-wide bounds,
+    /// summed.
+    pub departed_folded_instances_dropped: u64,
+    /// Modules whose folded-instance list saturated, counted.
+    pub departed_folded_instances_saturated: u64,
     /// Folded mechanism rows past the bounds, with their calls/errors.
     pub departed_mechs_overflow: u64,
     pub departed_mechs_overflow_calls: u64,
@@ -307,7 +312,7 @@ fn count_rows(value: &Value, limits: InputLimits) -> Result<()> {
         let Some(departed) = module.get("departed_use") else {
             continue;
         };
-        for key in ["identities", "mechanisms"] {
+        for key in ["identities", "mechanisms", "folded_instances"] {
             add(departed
                 .get(key)
                 .and_then(Value::as_array)
@@ -459,6 +464,10 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
     // unioned. A present-but-unreadable aggregate stays unread, like
     // any unknown additive subtree.
     let mut app_departed: BTreeMap<String, u64> = BTreeMap::new();
+    // Folded callers' executable paths by caller label: folded key
+    // rows rejoin their application through this, like live rows
+    // join through `caller_app`.
+    let mut departed_caller_path: BTreeMap<String, String> = BTreeMap::new();
     // One caller folds into every module it touched, so the same
     // caller label repeats across modules; caller labels are never
     // reused, so first sight counts the incarnation once. Pathless
@@ -484,6 +493,22 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
         {
             out.unknowns.departed_identities_saturated += 1;
         }
+        out.unknowns.departed_folded_instances_dropped = out
+            .unknowns
+            .departed_folded_instances_dropped
+            .saturating_add(
+                departed
+                    .get("folded_instances_dropped")
+                    .and_then(u64_of)
+                    .unwrap_or(0),
+            );
+        if departed
+            .get("folded_instances_saturated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            out.unknowns.departed_folded_instances_saturated += 1;
+        }
         let Some(identities) = departed.get("identities").and_then(Value::as_array) else {
             continue;
         };
@@ -506,6 +531,9 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             if !app_incarnations.contains_key(path) {
                 app_order.push(path.to_string());
             }
+            departed_caller_path
+                .entry(caller.to_string())
+                .or_insert_with(|| path.to_string());
             if seen_departed_callers.insert(caller.to_string()) {
                 *app_incarnations.entry(path.to_string()).or_insert(0) += 1;
                 *app_departed.entry(path.to_string()).or_insert(0) += 1;
@@ -1016,6 +1044,42 @@ fn convert_inventory(value: &Value) -> Result<Projection> {
             && let Some(app) = app_ref_of(app_path)
         {
             instance_caller.insert(id.to_string(), app);
+        }
+    }
+    // Folded instances keep their key joins through the departed
+    // aggregate: live rows win (labels are never reused, so the two
+    // maps never truly collide).
+    for module in arr_of(value, "modules") {
+        let (Some(id), Some(departed)) = (
+            module.get("id").and_then(str_of),
+            module.get("departed_use"),
+        ) else {
+            continue;
+        };
+        let Some(provider) = module_ref.get(id) else {
+            continue;
+        };
+        for row in arr_of(departed, "folded_instances") {
+            let (Some(row_id), Some(caller)) = (
+                row.get("id").and_then(str_of),
+                row.get("caller").and_then(str_of),
+            ) else {
+                continue;
+            };
+            instance_module
+                .entry(row_id.to_string())
+                .or_insert_with(|| provider.clone());
+            if instance_caller.contains_key(row_id) {
+                continue;
+            }
+            let path = departed_caller_path
+                .get(caller)
+                .or_else(|| caller_app.get(caller));
+            if let Some(path) = path
+                && let Some(app) = app_ref_of(path)
+            {
+                instance_caller.insert(row_id.to_string(), app);
+            }
         }
     }
 

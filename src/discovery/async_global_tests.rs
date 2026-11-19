@@ -1795,6 +1795,15 @@ fn async_global_ended_pid_retire_opens_no_coverage_window() {
         "the route needs a kept and a retired slot"
     );
     let retired = slots[1..].to_vec();
+    for slot in &retired {
+        session.scripted_stamps.insert(slot.index, 1);
+    }
+    assert!(
+        retired
+            .iter()
+            .all(|slot| session.slot_attached_at(slot.index).is_some()),
+        "premise: every retired slot is session-proven attached, so only the ended exclusion can silence the window"
+    );
     fixture.child.kill().unwrap();
     fixture.child.wait().unwrap();
     let owner = engine.views.remove(0);

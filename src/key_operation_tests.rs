@@ -767,6 +767,11 @@ struct ShapedS1 {
     /// KEM result (word, status) override (`None` = the healthy
     /// minted-output default).
     kem_result: Option<(u64, u8)>,
+    /// Validated length-trailer value for this call's END (`None` =
+    /// the base-form 632-byte END): the driver extends the END to
+    /// the 648-byte END+length form with an OK trailer carrying the
+    /// value for the call's evidence row.
+    length_value: Option<u64>,
 }
 
 impl ShapedS1 {
@@ -802,6 +807,7 @@ impl ShapedS1 {
             request_invalid_span: false,
             pair_results: None,
             kem_result: None,
+            length_value: None,
         }
     }
 }
@@ -1062,6 +1068,50 @@ fn end_bytes_kem(begin: &[u8; 224], action: u8, call: &ShapedS1) -> [u8; 632] {
     end
 }
 
+/// Extend one 632-byte END to the 648-byte END+length form with a
+/// validated OK trailer carrying `value` (keymeta Task 2 wire
+/// form): the target function reads the call's id and the kind
+/// derives from the call's evidence row, exactly as the BPF length
+/// programs emit. Panics unless the call names a length endpoint.
+fn end_with_length_trailer(end: &[u8; 632], name: &str, value: u64) -> Vec<u8> {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::evidence_table::{
+        LENGTH_KIND_SCELL, LENGTH_KIND_VSCALAR, LENGTH_STATUS_OK, LENGTH_TRAILER_VERSION,
+        evidence_position,
+    };
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_FULL_BYTES, JOURNAL_END_LENGTH_BYTES, LengthTrailer,
+    };
+    let fid = crate::kinds::function_id(name).unwrap();
+    let row = evidence_position(fid).expect("a length endpoint");
+    assert!(!row.info, "no trailer on an info endpoint");
+    let kind = if row.length_cell_arg != ARG_NONE && row.length_scalar_arg == ARG_NONE {
+        LENGTH_KIND_SCELL
+    } else if row.length_scalar_arg != ARG_NONE && row.length_cell_arg == ARG_NONE {
+        LENGTH_KIND_VSCALAR
+    } else {
+        panic!("{name} carries no single length position");
+    };
+    let mut full = *end;
+    full[24 + 108..24 + 112].copy_from_slice(&fid.to_le_bytes());
+    let trailer = LengthTrailer {
+        version: LENGTH_TRAILER_VERSION,
+        kind,
+        status: LENGTH_STATUS_OK,
+        reserved: [0; 4],
+        value,
+    };
+    // SAFETY: the frozen repr(C) trailer holds only initialized
+    // integer fields; the journal validator re-checks it on ingest.
+    let trailer_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts((&trailer as *const LengthTrailer).cast::<u8>(), 16) };
+    let mut wire = vec![0u8; JOURNAL_END_LENGTH_BYTES];
+    wire[..JOURNAL_END_FULL_BYTES].copy_from_slice(&full);
+    wire[2..4].copy_from_slice(&(JOURNAL_END_LENGTH_BYTES as u16).to_le_bytes());
+    wire[JOURNAL_END_FULL_BYTES..].copy_from_slice(trailer_bytes);
+    wire
+}
+
 /// Ingest the paired call's native records in their original order.
 fn ingest_call(scene: &mut JointScene, call: &ShapedS1, position: u64) {
     let begin = scene
@@ -1084,9 +1134,17 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1, position: u64) {
         "{} begin admits",
         call.name
     );
-    let end = end_for_call(&begin, call);
+    let base = end_for_call(&begin, call);
+    let extended;
+    let end: &[u8] = match call.length_value {
+        Some(value) => {
+            extended = end_with_length_trailer(&base, call.name, value);
+            &extended
+        }
+        None => &base,
+    };
     assert_eq!(
-        scene.ingest(&end),
+        scene.ingest(end),
         JournalDisposition::EndStaged,
         "{} end stages",
         call.name
@@ -14602,6 +14660,114 @@ fn run_rsa_ledger() -> Vec<serde_json::Value> {
     }
     std::fs::remove_dir_all(&scratch).ok();
     rows
+}
+
+/// Build, run (disposable token) and parse the keymeta size probe:
+/// real SoftHSM RSA signs with their observed (mechanism, signature
+/// length) pairs, one pair per observed terminal. A missing
+/// prerequisite is the caller's skip decision (see
+/// [`ledger_prerequisites`]); anything failing afterwards fails the
+/// lane — a real boot/loader/run failure is never a skip.
+fn run_size_probe() -> Vec<(u64, u64)> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let header = pkcs11_header_dir().expect("pkcs11.h probed present");
+    let module = [
+        "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).is_file())
+    .expect("SoftHSM module probed present");
+    let scratch = std::env::temp_dir().join(format!(
+        "p11scope-size-probe-{}-{}",
+        std::process::id(),
+        SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(scratch.join("tokens")).expect("scratch tokens dir");
+    std::fs::set_permissions(
+        &scratch,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("scratch 0700");
+    let keep_on_failure = |scratch: &std::path::Path, what: &str| -> ! {
+        eprintln!("size probe {what}; scratch kept at {}", scratch.display());
+        panic!("size probe {what}");
+    };
+    let conf = format!(
+        "directories.tokendir = {}\nobjectstore.backend = file\nlog.level = ERROR\n",
+        scratch.join("tokens").display()
+    );
+    std::fs::write(scratch.join("softhsm2.conf"), conf).expect("softhsm conf");
+    std::fs::set_permissions(
+        scratch.join("softhsm2.conf"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("conf 0600");
+    let init = std::process::Command::new("softhsm2-util")
+        .args([
+            "--init-token",
+            "--free",
+            "--label",
+            "size-probe",
+            "--so-pin",
+            "5678",
+            "--pin",
+            "1234",
+        ])
+        .env("SOFTHSM2_CONF", scratch.join("softhsm2.conf"))
+        .output()
+        .expect("spawn softhsm2-util");
+    if !init.status.success() {
+        keep_on_failure(&scratch, "token init failed");
+    }
+    let binary = scratch.join("keymeta-size-probe");
+    let build = std::process::Command::new("gcc")
+        .args([
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            header.to_str().unwrap(),
+        ])
+        .arg(root.join("tests/fixtures/key-operations/keymeta-size-probe.c"))
+        .arg("-ldl")
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("spawn gcc");
+    if !build.status.success() {
+        eprintln!("gcc stderr: {}", String::from_utf8_lossy(&build.stderr));
+        keep_on_failure(&scratch, "fixture build failed");
+    }
+    let run = std::process::Command::new(&binary)
+        .arg(module)
+        .env("SOFTHSM2_CONF", scratch.join("softhsm2.conf"))
+        .env("P11SCOPE_KEY_FIXTURE_PIN", "1234")
+        .output()
+        .expect("run size probe");
+    if !run.status.success() {
+        eprintln!("probe stderr: {}", String::from_utf8_lossy(&run.stderr));
+        keep_on_failure(&scratch, "fixture run failed");
+    }
+    let mut pairs = Vec::new();
+    for line in String::from_utf8(run.stdout)
+        .expect("probe output is UTF-8")
+        .lines()
+    {
+        let row: serde_json::Value = serde_json::from_str(line).expect("probe line parses");
+        assert_eq!(row["fn"].as_str(), Some("C_Sign"), "the probe signs only");
+        assert_eq!(row["rv"].as_u64(), Some(0), "probe calls return OK");
+        pairs.push((
+            row["mechanism"].as_u64().expect("observed mechanism"),
+            row["length"].as_u64().expect("observed length"),
+        ));
+    }
+    assert!(!pairs.is_empty(), "the probe observed terminals");
+    std::fs::remove_dir_all(&scratch).ok();
+    pairs
 }
 
 /// Replay one ledger call through the edge in ledger order:
@@ -29845,6 +30011,186 @@ fn keymeta_seal_carries_length_trailer() {
         success.prefix.settled()[0].length,
         Some(LengthOutcome::Value(256)),
         "the settled call carries its trailer"
+    );
+}
+
+/// End to end (keymeta Tasks 2+3): real SoftHSM RSA signature
+/// lengths flow from BPF-shaped 648-byte END wire records through
+/// the seal into size inference and v7 output. The (mechanism,
+/// length) pairs are observed provider outputs (the probe prints
+/// what C_Sign returned); the test never assumes a length. Each
+/// stage is pinned: the seal settles Value(observed), the reducer
+/// infers RSA with the classified size, and the v7 projection
+/// renders the inferred size at version 7. Absent build/run
+/// prerequisites skip explicitly; anything failing afterwards fails
+/// the lane.
+#[test]
+fn keymeta_softhsm_sign_lengths_flow_from_wire_to_v7() {
+    use crate::key_operation_projection::{
+        KeyAggRow, ObjectObservations, ObsStatus, inferred_size_json, key_row_json,
+        observations_version,
+    };
+    let missing = ledger_prerequisites();
+    if !missing.is_empty() {
+        eprintln!(
+            "SKIP keymeta_softhsm_sign_lengths_flow_from_wire_to_v7: missing {}",
+            missing.join(", ")
+        );
+        return;
+    }
+    let observed = run_size_probe();
+    let mechanism = observed[0].0;
+    let length = observed[0].1;
+    assert_eq!(
+        mechanism, 0x0001,
+        "the probe signs under CKM_RSA_PKCS: {observed:?}"
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|(mech, len)| (*mech, *len) == (mechanism, length)),
+        "one key signs one length: {observed:?}"
+    );
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    assert!(keyuse.key_sizes_enabled(), "sizes ride flag-on");
+    // One Init per terminal: each C_Sign completes its own machine,
+    // so every observed length attributes (a bare repeat Sign would
+    // orphan for lack of an open machine).
+    let mut calls = vec![ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)];
+    for _ in &observed {
+        calls.push(ShapedS1::shaped(
+            "C_SignInit",
+            CkRv::OK.0,
+            mechanism,
+            init_capture(),
+        ));
+        calls.push(ShapedS1 {
+            length_value: Some(length),
+            ..ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture())
+        });
+    }
+    for call in &calls {
+        prepare_call(&mut scene, &mut staging, call);
+        let success = scene.seal().expect("quantum seals");
+        assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
+        match call.length_value {
+            Some(value) => assert_eq!(
+                success.prefix.settled()[0].length,
+                Some(LengthOutcome::Value(value)),
+                "{} settles its observed length",
+                call.name
+            ),
+            None => assert_eq!(
+                success.prefix.settled()[0].length,
+                None,
+                "{} carries no trailer",
+                call.name
+            ),
+        }
+        let (outcome, refused) = staging.apply_seal(
+            &success,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut joint,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            None,
+        );
+        assert_eq!(
+            outcome,
+            SealApplyOutcome::ReplayedOne,
+            "{} replays once",
+            call.name
+        );
+        assert_eq!(refused, 0, "no bound refusal in the quantum");
+    }
+    let inferred = keyuse.inferred_map();
+    assert_eq!(inferred.len(), 1, "one sign bucket infers: {inferred:?}");
+    let (bucket, keys) = inferred.iter().next().expect("one bucket");
+    let objects = scene.model.project().objects;
+    assert_eq!(objects.len(), 1, "one operation key: {objects:?}");
+    assert_eq!(
+        bucket.object,
+        objects[0].id.as_u64(),
+        "the operation key infers"
+    );
+    assert_eq!(bucket.category, "sign");
+    assert_eq!(bucket.role, "key");
+    assert_eq!(keys.family.status, InferredStatus::Inferred);
+    assert_eq!(keys.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(keys.size.status, InferredStatus::Inferred);
+    assert_eq!(keys.size.completions, observed.len() as u64);
+    let (detail, tag) = keys.size.detail.as_ref().expect("classified size");
+    assert_eq!(*tag, EvidenceTag::SignOutput);
+    match detail {
+        SizeDetail::Rsa {
+            size_class,
+            modulus_bytes,
+        } => {
+            assert_eq!(*size_class, Some(2048), "observed RSA-2048 classifies");
+            assert_eq!(
+                *modulus_bytes, length,
+                "modulus carries the observed length"
+            );
+        }
+        other => panic!("expected an RSA size detail, got {other:?}"),
+    }
+    let rendered = inferred_size_json(&keys.size);
+    assert_eq!(
+        rendered,
+        serde_json::json!({
+            "status": "inferred",
+            "detail": {
+                "kind": "rsa",
+                "size_class": 2048,
+                "modulus_bytes": length,
+                "evidence": "sign_output",
+            },
+            "completions": observed.len() as u64,
+        }),
+        "v7 renders the inferred size"
+    );
+    let counters = keyuse
+        .aggregates()
+        .get(bucket)
+        .expect("the sign bucket aggregates");
+    let row = KeyAggRow {
+        instance: bucket.instance.label(),
+        object: bucket.object,
+        category: bucket.category,
+        role: bucket.role,
+        metadata_at_use: bucket.metadata,
+        unit: crate::semantics_key_use::unit_for(bucket.category),
+        started: counters.started,
+        completed: counters.completed,
+        failed: counters.failed,
+        cancelled: counters.cancelled,
+        unknown: counters.unknown,
+        active: counters.active,
+        key_join_lost: counters.key_join_lost,
+        inferred: Some(keys.clone()),
+    };
+    let mut observations = ObjectObservations::unavailable(1, "none");
+    observations.status = ObsStatus::Populated;
+    observations.reason = "none";
+    observations.key_operations = vec![row];
+    assert_eq!(
+        observations_version(&observations),
+        7,
+        "inferred content emits v7"
+    );
+    assert_eq!(
+        key_row_json(&observations.key_operations[0])["inferred_size"],
+        rendered,
+        "the v7 row carries the rendered size"
     );
 }
 

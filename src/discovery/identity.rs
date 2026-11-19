@@ -17145,6 +17145,36 @@ mod tests {
         );
     }
 
+    /// Twin (regression): a pin that fails only because the capture
+    /// discovery budget is exhausted must wait for a fresh budget, like
+    /// handle exhaustion does — never refuse (refusals reject the whole
+    /// key, silently dropping every live view's coverage of the file
+    /// under churn).
+    #[test]
+    fn budget_exhausted_pin_failure_waits_instead_of_refusing() {
+        let view = ProcessView::open(ProcessViewId(9), std::process::id()).unwrap();
+        let (path, key) = maps_libc_line(std::process::id());
+        let mut module = module(key);
+        module.path = path;
+        let raw = RawObjectInstance::scanned(&module, key, &module.path).unwrap();
+        let mut mounts = MountTableCache::default();
+        let mut budget = CaptureWorkBudget::with_work_ceiling(0);
+        let outcome = pin_scanned_object(
+            &view,
+            raw,
+            None,
+            None,
+            &|_| Err("test pinned identity never runs on a stopped budget".into()),
+            &mut mounts,
+            &mut budget,
+        );
+        assert!(
+            matches!(outcome, Err(PinFailure::Wait { .. })),
+            "budget exhaustion must wait (it would reject a live key): {:?}",
+            outcome.as_ref().map(|_| ()),
+        );
+    }
+
     /// Twin: a Gone pin loss files its gap without rejecting the key,
     /// so other views' live pins on the same file survive churn.
     #[test]

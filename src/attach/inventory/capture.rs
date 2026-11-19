@@ -823,6 +823,13 @@ pub(crate) struct ExtendReceipt {
     /// endpoints stay attached (their usage entries still record);
     /// the returns retry from the private pending list.
     pub info_return_deferred: u64,
+    /// Keymeta Task 7 (spec §17.4): info endpoints this extend
+    /// downgraded to usage-only because the uretprobe-vs-seccomp
+    /// admission refused (per endpoint; a dropped Multi group
+    /// counts its sites). The entries still link and record; no
+    /// return links and no `INFO_KIND` publish happens for them.
+    #[allow(dead_code)] // The enforcement commit counts this.
+    pub info_return_refused_hazard: u64,
     /// Keymeta Task 7 (spec §17.4): endpoints whose INFO kind this
     /// extend revoked (a later pass proved their names aliased).
     /// Fresh copies downgraded to usage-only, pendings purged and
@@ -1424,7 +1431,34 @@ struct CaptureBook {
     changed_objects: BTreeSet<AttachObjectId>,
     recheck_after: Option<PinnedObjectId>,
     stopping: bool,
+    /// Keymeta Task 7 (spec §17.4): the retained info-return
+    /// uretprobe-vs-seccomp approval, mirroring the Detailed
+    /// session's `return_probe_admission`. The self-probe runs at
+    /// most once per capture through this; a refusal sticks in
+    /// `info_return_refused` instead so no extend re-probes.
+    return_probe_admission: Option<crate::uretprobe_hazard::ReturnProbeAdmission>,
+    /// Keymeta Task 7 (spec §17.4): the hazard gate refused once,
+    /// so info returns stay off for this capture (sticky,
+    /// fail-closed: a kernel verdict cannot turn safe mid-capture).
+    info_return_refused: bool,
+    /// Keymeta Task 7 (spec §17.4): the hazard verdict source.
+    /// Production assesses through `uretprobe_hazard::admit`;
+    /// tests inject scripted verdicts (see `set_info_return_gate`).
+    info_return_gate: Box<InfoReturnGate>,
 }
+
+/// Keymeta Task 7 (spec §17.4): one hazard assessment — the target
+/// the trampoline would run in (`None`: any process may run it)
+/// and the operator override — over the shared
+/// `uretprobe_hazard::admit` shape, so production plugs `admit` in
+/// directly.
+type InfoReturnGate = dyn Fn(
+        Option<u32>,
+        bool,
+    ) -> std::result::Result<
+        crate::uretprobe_hazard::ReturnProbeAdmission,
+        crate::uretprobe_hazard::Action,
+    > + Send;
 
 /// The one lifecycle-ring loss rule every consumer applies (the capture
 /// book, the native binder, the lane's tally): a health read's DISCOVERY
@@ -1497,7 +1531,14 @@ impl CaptureBook {
         scope: HeldCaptureScope,
         now_ns: u64,
     ) -> Self {
-        Self::new_scoped_with_domain(NativeDomainId::mint(), budget, pair_limit, scope, now_ns)
+        // Unit harnesses admit info returns without forking the
+        // self-probe; twins that script a refusal install their own
+        // gate through `set_info_return_gate`.
+        let mut book =
+            Self::new_scoped_with_domain(NativeDomainId::mint(), budget, pair_limit, scope, now_ns);
+        book.info_return_gate =
+            Box::new(|_, _| Ok(crate::uretprobe_hazard::ReturnProbeAdmission::for_test()));
+        book
     }
 
     fn new_scoped_with_domain(
@@ -1547,12 +1588,52 @@ impl CaptureBook {
             changed_objects: BTreeSet::new(),
             recheck_after: None,
             stopping: false,
+            return_probe_admission: None,
+            info_return_refused: false,
+            info_return_gate: Box::new(crate::uretprobe_hazard::admit),
         }
     }
 
     fn with_backend(mut self, backend: AttachBackend) -> Self {
         self.backend = backend;
         self
+    }
+
+    /// Tests script one hazard verdict source: twins inject
+    /// affected, unknown or clean verdicts without a kernel. The
+    /// production gate stays `uretprobe_hazard::admit`.
+    #[cfg(test)]
+    fn set_info_return_gate(&mut self, gate: Box<InfoReturnGate>) {
+        self.info_return_gate = gate;
+    }
+
+    /// Keymeta Task 7 (spec §17.4): whether this capture may attach
+    /// info returns — the uretprobe-vs-seccomp admission every other
+    /// return-probe path takes, once per capture through the
+    /// retained approval. Any refusal (hazard, unknown kernel,
+    /// missing privilege or stale object) sticks for the capture:
+    /// info endpoints attach usage-only with the named counted gap,
+    /// never a return link or an `INFO_KIND` publish. The target is
+    /// always `None`, like every Detailed call site: on a PID scope
+    /// the trampoline still runs in a sibling that may confine
+    /// itself after attach, so no pid narrows the verdict.
+    #[allow(dead_code)] // The enforcement commit consults this.
+    fn info_returns_admitted(&mut self) -> bool {
+        if self.info_return_refused {
+            return false;
+        }
+        let gate = &self.info_return_gate;
+        let verdict = crate::uretprobe_hazard::ensure_admission_assessed(
+            &mut self.return_probe_admission,
+            |overridden| gate(None, overridden),
+        );
+        match verdict {
+            Ok(()) => true,
+            Err(_) => {
+                self.info_return_refused = true;
+                false
+            }
+        }
     }
 
     fn scope_pid(&self) -> Option<u32> {

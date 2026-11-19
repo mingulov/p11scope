@@ -7,7 +7,7 @@ section-version-8 consumer contract (v0.8.0 keymeta Task 7, spec section
 17.5; the v8 number comes from the shared section-version allocator, spec
 section 10.1); tests/fixtures/key-operations/provider-observations-v8.json
 is the hand-reviewed populated example carrying provider_info, token and
-mechanism rows, all eight named gaps, one refused (non-UTF8) string field
+mechanism rows, all nine named gaps, one refused (non-UTF8) string field
 and one proved instance attachment. These tests validate the golden
 against the schema (exact keys, enums, integer bounds and sort orders)
 with a small dependency-free checker for the frozen subset, so the
@@ -34,6 +34,7 @@ U64_MAX = 18446744073709551615
 GAP_REASONS = (
     "info_aliased_endpoint",
     "info_return_deferred",
+    "info_return_refused_hazard",
     "info_caller_unavailable",
     "mechanism_info_refused",
     "info_token_rows_refused",

@@ -4391,6 +4391,7 @@ fn render_provider_info_lines(out: &mut String, presentation: &Presentation, ver
         for (reason, count) in [
             ("info_aliased_endpoint", gaps.aliased),
             ("info_return_deferred", gaps.return_deferred),
+            ("info_return_refused_hazard", gaps.return_refused_hazard),
             ("info_caller_unavailable", gaps.caller_unavailable),
             ("mechanism_info_refused", gaps.mechanism_refused),
             ("info_token_rows_refused", gaps.tokens_refused),

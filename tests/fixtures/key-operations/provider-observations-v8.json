@@ -89,6 +89,10 @@
         "count": 2
       },
       {
+        "reason": "info_return_refused_hazard",
+        "count": 1
+      },
+      {
         "reason": "info_caller_unavailable",
         "count": 1
       },

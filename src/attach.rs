@@ -13584,6 +13584,37 @@ mod tests {
         }
         let inventory = include_str!("attach/inventory/activation.rs");
         assert!(!inventory.contains("require_return_probe_admission"));
+        // Keymeta Task 7 (spec §17.4): the inventory info returns
+        // take the same admission through the capture choke point
+        // instead of the Detailed guard — every extend consults the
+        // verdict before any return attaches, fresh endpoints
+        // downgrade, and pending retries honor it. The verdict comes
+        // from the shared backstop, never a local reimplementation.
+        let capture = include_str!("attach/inventory/capture.rs");
+        fn top_body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n}")
+                .unwrap()
+                .0
+        }
+        fn inventory_info_gate(source: &str) -> bool {
+            top_body(source, "fn extend_entries_with<").contains("info_returns_admitted()")
+                && top_body(source, "fn retry_info_returns<").contains("info_returns_admitted")
+                && top_body(source, "fn info_returns_admitted(")
+                    .contains("ensure_admission_assessed")
+        }
+        assert!(inventory_info_gate(capture));
+        {
+            let start = capture.find("fn extend_entries_with<").unwrap();
+            let tail = capture[start..].replacen("info_returns_admitted()", "true", 1);
+            assert!(
+                !inventory_info_gate(&format!("{}{}", &capture[..start], tail)),
+                "an extend that ignores the verdict must fail the contract"
+            );
+        }
         // Keymeta Task 7 (spec §17.4): info endpoints substitute the
         // inventory info entries; the inventory link set stays
         // entry-only plus the single info return (no journal

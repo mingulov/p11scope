@@ -4348,6 +4348,261 @@ fn extend_downgrades_revoked_fresh_endpoints_to_usage_only() {
     );
 }
 
+/// Keymeta Task 7 hazard admission (spec §17.4): on a kernel the
+/// self-probe reports affected — the 6.11–6.13
+/// uretprobe-vs-seccomp behavior, injected here as a verdict, never
+/// a version range (`uretprobe_hazard` proves the kernel and
+/// forbids `uname`) — an info endpoint attaches usage-only: the
+/// usage entry links, no return links, no kind publishes, and the
+/// refusal counts the named gap.
+#[test]
+fn info_returns_refused_on_affected_kernels_attach_usage_only() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(&mut fixture, "a.so", &[("C_GetTokenInfo", 0x1010)]);
+    assert!(delta.endpoints[0].info_kind.is_some());
+    let mut harness = Harness::new(64, None);
+    harness.book.set_info_return_gate(Box::new(|_, _| {
+        Err(crate::uretprobe_hazard::Action::Refuse(
+            "this kernel filters the uretprobe trampoline's syscall through seccomp \
+             (self-probe: the probe child was killed by SIGSYS) and a sibling thread \
+             may be confined or the target may install a filter after attach, so \
+             attaching a uretprobe might kill it"
+                .into(),
+        ))
+    }));
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 1);
+    assert_eq!(ids(&receipt.attached), [0], "the usage entry still links");
+    let log = harness.io.log.lock().unwrap();
+    assert_eq!(
+        log.programs.get(&0),
+        Some(&"p11_usage_entry_lp64"),
+        "a hazard-refused endpoint links the usage entry"
+    );
+    assert!(
+        !log.ops.iter().any(|op| matches!(op, Op::Return(_))),
+        "no info return links: {:?}",
+        log.ops
+    );
+    assert!(
+        !log.ops
+            .iter()
+            .any(|op| matches!(op, Op::PublishInfoKind(..))),
+        "no kind publishes: {:?}",
+        log.ops
+    );
+}
+
+/// Keymeta Task 7 hazard admission (spec §17.4): on an unknown
+/// kernel — the probe could not reach a verdict — a Multi info
+/// group downgrades every member: usage entries link in their
+/// groups, no return group links, no kind publishes, and the
+/// refusal counts one per member.
+#[test]
+fn info_returns_refused_on_unknown_kernels_skip_multi_return_groups() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[("C_GetInfo", 0x1000), ("C_GetTokenInfo", 0x1010)],
+    );
+    let mut harness = Harness::multi(64, None);
+    harness.book.set_info_return_gate(Box::new(|_, _| {
+        Err(crate::uretprobe_hazard::Action::Refuse(
+            "this kernel could not be shown to exempt the uretprobe trampoline's \
+             syscall (the probe child exited 3); a sibling thread may be confined \
+             or the target may install a filter after attach, so attaching a \
+             uretprobe might kill it"
+                .into(),
+        ))
+    }));
+    let receipt = harness.extend(delta, &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 2);
+    assert_eq!(ids(&receipt.attached), [0, 1]);
+    assert_eq!(
+        harness.group_ops(),
+        [("p11_usage_entry_lp64", vec![0, 1])],
+        "usage entries link in their group: {:?}",
+        harness.group_ops()
+    );
+    assert!(
+        !harness
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::PublishInfoKind(..))),
+        "no kind publishes: {:?}",
+        harness.ops()
+    );
+}
+
+/// Keymeta Task 7 hazard admission (spec §17.4): the first refusal
+/// sticks for the capture — later extends downgrade without
+/// re-probing, so an affected kernel sees exactly one self-probe no
+/// matter how many info endpoints arrive afterwards.
+#[test]
+fn info_return_refusal_is_sticky_and_probes_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut fixture = SetFixture::new(64);
+    let first = absorb_named(&mut fixture, "a.so", &[("C_GetTokenInfo", 0x1010)]);
+    let mut harness = Harness::new(64, None);
+    let probes = std::sync::Arc::new(AtomicUsize::new(0));
+    let counting = probes.clone();
+    harness.book.set_info_return_gate(Box::new(move |_, _| {
+        counting.fetch_add(1, Ordering::SeqCst);
+        Err(crate::uretprobe_hazard::Action::Refuse(
+            "this kernel filters the uretprobe trampoline's syscall".into(),
+        ))
+    }));
+    let receipt = harness.extend(first, &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 1);
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    // The verdict source turns clean, but the capture already
+    // refused: the next info endpoint still downgrades, with no
+    // second probe.
+    harness.book.set_info_return_gate(Box::new(|_, _| {
+        Ok(crate::uretprobe_hazard::ReturnProbeAdmission::for_test())
+    }));
+    let second = absorb_named(&mut fixture, "b.so", &[("C_GetInfo", 0x1000)]);
+    let receipt = harness.extend(second, &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 1);
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "no second probe");
+    let log = harness.io.log.lock().unwrap();
+    assert_eq!(log.programs.get(&1), Some(&"p11_usage_entry_lp64"));
+    assert!(
+        !log.ops.iter().any(|op| matches!(op, Op::Return(_))),
+        "no info return links: {:?}",
+        log.ops
+    );
+}
+
+/// Keymeta Task 7 hazard admission (spec §17.4): a Singles info
+/// return parked by EMFILE drops at its retry once the gate
+/// refuses — counted once — instead of linking.
+#[test]
+fn info_return_refusal_drops_pending_singles_returns() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(&mut fixture, "a.so", &[("C_GetTokenInfo", 0x1010)]);
+    let mut harness = Harness::new(64, None);
+    harness.io.emfile_returns.insert(0);
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    harness.io.emfile_returns.clear();
+    harness.book.set_info_return_gate(Box::new(|_, _| {
+        Err(crate::uretprobe_hazard::Action::Refuse(
+            "this kernel filters the uretprobe trampoline's syscall".into(),
+        ))
+    }));
+    let returns_before = harness
+        .ops()
+        .iter()
+        .filter(|op| matches!(op, Op::Return(_)))
+        .count();
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 1);
+    assert!(
+        harness.book.info_return_pending.is_empty(),
+        "the refused pending drops instead of retrying"
+    );
+    assert_eq!(
+        harness
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::Return(_)))
+            .count(),
+        returns_before,
+        "no return links after the refusal"
+    );
+}
+
+/// Keymeta Task 7 hazard admission (spec §17.4): a parked Multi
+/// info-return group drops whole at its retry once the gate
+/// refuses — counted per site — instead of filtering or linking.
+#[test]
+fn info_return_refusal_drops_pending_multi_groups() {
+    let mut fixture = SetFixture::new(64);
+    let delta = absorb_named(
+        &mut fixture,
+        "a.so",
+        &[
+            ("C_GetInfo", 0x1000),
+            ("C_GetTokenInfo", 0x1010),
+            ("C_GetMechanismInfo", 0x1020),
+        ],
+    );
+    let mut harness = Harness::multi(64, None);
+    for endpoint in &delta.endpoints {
+        harness.io.emfile_returns.insert(endpoint.id.0);
+    }
+    let first = harness.extend(delta, &fixture.set);
+    assert_eq!(first.info_return_deferred, 1);
+    assert_eq!(harness.book.info_return_pending.len(), 1);
+    harness.io.emfile_returns.clear();
+    harness.book.set_info_return_gate(Box::new(|_, _| {
+        Err(crate::uretprobe_hazard::Action::Refuse(
+            "this kernel filters the uretprobe trampoline's syscall".into(),
+        ))
+    }));
+    let receipt = harness.extend(TargetDelta::default(), &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 3);
+    assert!(
+        harness.book.info_return_pending.is_empty(),
+        "the refused group drops instead of retrying"
+    );
+    assert!(
+        !harness
+            .group_ops()
+            .iter()
+            .any(|(program, _)| *program == "p11_info_return"),
+        "no return group links after the refusal: {:?}",
+        harness.group_ops()
+    );
+}
+
+/// Keymeta Task 7 hazard admission (spec §17.4, control): a clean
+/// verdict links info returns and publishes kinds as before, and
+/// the retained approval serves later extends without re-probing.
+#[test]
+fn info_returns_admitted_after_clean_verdict_link_returns() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut fixture = SetFixture::new(64);
+    let first = absorb_named(&mut fixture, "a.so", &[("C_GetTokenInfo", 0x1010)]);
+    let mut harness = Harness::new(64, None);
+    let probes = std::sync::Arc::new(AtomicUsize::new(0));
+    let counting = probes.clone();
+    harness.book.set_info_return_gate(Box::new(move |_, _| {
+        counting.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::uretprobe_hazard::ReturnProbeAdmission::for_test())
+    }));
+    let receipt = harness.extend(first, &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 0);
+    assert_eq!(ids(&receipt.attached), [0]);
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "the gate is consulted");
+    let second = absorb_named(&mut fixture, "b.so", &[("C_GetInfo", 0x1000)]);
+    let receipt = harness.extend(second, &fixture.set);
+    assert_eq!(receipt.info_return_refused_hazard, 0);
+    assert_eq!(
+        probes.load(Ordering::SeqCst),
+        1,
+        "the retained approval serves the second extend"
+    );
+    let log = harness.io.log.lock().unwrap();
+    assert_eq!(log.programs.get(&0), Some(&"p11_info_entry_lp64"));
+    assert_eq!(log.programs.get(&1), Some(&"p11_info_entry_lp64"));
+    assert!(
+        log.ops.iter().any(|op| matches!(op, Op::Return(0))),
+        "info returns link on clean verdicts: {:?}",
+        log.ops
+    );
+    assert!(
+        log.ops
+            .iter()
+            .any(|op| matches!(op, Op::PublishInfoKind(0, _))),
+        "kinds publish on clean verdicts: {:?}",
+        log.ops
+    );
+}
+
 /// Keymeta Task 7 revocation authority (spec §17.4): a failed
 /// revoke write keeps the endpoint revoked userspace-side — the
 /// failure counts, the write requeues, usage stays intact, no kind

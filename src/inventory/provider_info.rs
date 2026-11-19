@@ -403,6 +403,7 @@ pub(crate) struct MechanismRow {
 pub(crate) struct ProviderGaps {
     pub aliased: u64,
     pub return_deferred: u64,
+    pub return_refused_hazard: u64,
     pub caller_unavailable: u64,
     pub mechanism_refused: u64,
     pub tokens_refused: u64,
@@ -513,6 +514,12 @@ impl InfoJoin {
     /// (attach-side count).
     pub(crate) fn note_return_deferred(&mut self) {
         self.gaps.return_deferred = self.gaps.return_deferred.saturating_add(1);
+    }
+
+    /// One info endpoint downgraded to usage-only by the
+    /// uretprobe-vs-seccomp refusal (spec §17.4).
+    pub(crate) fn note_return_refused_hazard(&mut self) {
+        self.gaps.return_refused_hazard = self.gaps.return_refused_hazard.saturating_add(1);
     }
 
     /// Queue one departed caller's rows for folding, like the
@@ -1041,6 +1048,10 @@ pub(crate) fn provider_observations_json(observations: &ProviderObservations) ->
     for (reason, count) in [
         ("info_aliased_endpoint", observations.gaps.aliased),
         ("info_return_deferred", observations.gaps.return_deferred),
+        (
+            "info_return_refused_hazard",
+            observations.gaps.return_refused_hazard,
+        ),
         (
             "info_caller_unavailable",
             observations.gaps.caller_unavailable,
@@ -2545,6 +2556,7 @@ mod tests {
             gaps: ProviderGaps {
                 aliased: 1,
                 return_deferred: 2,
+                return_refused_hazard: 9,
                 caller_unavailable: 3,
                 mechanism_refused: 4,
                 tokens_refused: 5,
@@ -2564,6 +2576,7 @@ mod tests {
             vec![
                 "info_aliased_endpoint",
                 "info_return_deferred",
+                "info_return_refused_hazard",
                 "info_caller_unavailable",
                 "mechanism_info_refused",
                 "info_token_rows_refused",
@@ -2576,7 +2589,7 @@ mod tests {
             .iter()
             .map(|gap| gap["count"].as_u64().expect("gap count"))
             .collect();
-        assert_eq!(counts, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(counts, vec![1, 2, 9, 3, 4, 5, 6, 7, 8]);
     }
 
     /// Root-crate LP64 cross-check (spec §17.1 layer 3): the shared

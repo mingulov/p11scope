@@ -212,6 +212,17 @@ impl ReturnProbeAdmission {
     pub(crate) fn override_reason(&self) -> Option<&str> {
         self.override_reason.as_deref()
     }
+
+    /// A test-only admission for the current context: twins inject
+    /// verdicts through [`ensure_admission_assessed`] without forking
+    /// a self-probe. Production always assesses through [`admit`].
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            context: AssessmentContext::current(),
+            override_reason: None,
+        }
+    }
 }
 
 pub(crate) fn admit(
@@ -246,11 +257,23 @@ pub(crate) fn admit(
 pub(crate) fn ensure_admission(
     retained: &mut Option<ReturnProbeAdmission>,
 ) -> std::result::Result<(), Action> {
+    ensure_admission_assessed(retained, |overridden| admit(None, overridden))
+}
+
+/// The shared backstop with the assessment injected: the flavor
+/// check, the live context and the retained-approval reuse are the
+/// same as [`ensure_admission`]; only the verdict source differs.
+/// The inventory capture assesses through this with its own target
+/// and an injectable gate so twins script verdicts without a kernel.
+pub(crate) fn ensure_admission_assessed(
+    retained: &mut Option<ReturnProbeAdmission>,
+    assess: impl FnOnce(bool) -> std::result::Result<ReturnProbeAdmission, Action>,
+) -> std::result::Result<(), Action> {
     if let Err(error) = crate::attach::checked_embedded_flavor() {
         return Err(Action::FlavorMismatch(format!("{error:#}")));
     }
     let context = AssessmentContext::current();
-    ensure_admission_with(retained, context, |overridden| admit(None, overridden))
+    ensure_admission_with(retained, context, assess)
 }
 
 fn ensure_admission_with(

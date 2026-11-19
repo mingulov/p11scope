@@ -4104,6 +4104,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         for _ in 0..receipt.info_return_deferred {
             self.info_join.note_return_deferred();
         }
+        // Keymeta Task 7 (spec §17.4): the attach-side counted
+        // `info_return_refused_hazard` gap rides along the same way.
+        for _ in 0..receipt.info_return_refused_hazard {
+            self.info_join.note_return_refused_hazard();
+        }
         // Failed INFO_KIND revocation writes retry on the next
         // extend; each failure still reaches the operator (the stale
         // cell keeps authorizing probe reads until the retry lands).
@@ -41708,6 +41713,20 @@ int main(void) {
         });
         let (_, observations) = scene.coordinator.info_join.snapshot();
         assert_eq!(observations.gaps.return_deferred, 2);
+    }
+
+    /// Keymeta Task 7 attach-side gaps (spec §17.4): extend receipts
+    /// forward the named counted `info_return_refused_hazard` gap
+    /// into the join beside the deferred gap.
+    #[test]
+    fn note_extend_receipt_forwards_info_return_refused_hazard() {
+        let mut scene = CaptureScene::new(2);
+        scene.coordinator.note_extend_receipt(&ExtendReceipt {
+            info_return_refused_hazard: 3,
+            ..ExtendReceipt::default()
+        });
+        let (_, observations) = scene.coordinator.info_join.snapshot();
+        assert_eq!(observations.gaps.return_refused_hazard, 3);
     }
 
     /// Keymeta Task 7 attach-side gaps (spec §17.4): absorb outcomes

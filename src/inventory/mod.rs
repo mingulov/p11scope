@@ -32565,6 +32565,131 @@ mod seal_readiness_tests {
         );
     }
 
+    /// A refused provisional sizes-arm mint followed by a seated
+    /// ordinary lane discloses no subset refusal: the arm's mint is
+    /// provisional (the ordinary path re-mints authoritatively), so a
+    /// `semantic subset refused ... without instance semantics` gap
+    /// beside a seated lane would lie about the seated lane.
+    #[test]
+    fn key_sizes_provisional_mint_refusal_seats_without_subset_gap() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        let scope = Scope::Pid(std::process::id());
+        let refused = || SubsetPreparation {
+            subset: None,
+            refusals: vec![SemanticRefusal::Unattested],
+        };
+        let (lane, starts) = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                refused(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Attachment),
+                Ok(joint_lane(WindDownIo::completing(), false)),
+            ],
+            || {
+                let lane = start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                );
+                (lane, seal_startup_test::take_starts())
+            },
+        );
+        let lane = lane.expect("the ordinary retry seats");
+        assert!(lane.is_live(), "the retry seats a live lane");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS_REFUSED.to_string()],
+            "the ordinary lane seals once, naming key operations unavailable"
+        );
+        assert_eq!(
+            starts
+                .iter()
+                .map(|start| start.key_sizes)
+                .collect::<Vec<_>>(),
+            [Some(true), None],
+            "the failed provisional mint skips the base attempt"
+        );
+        assert!(
+            gaps_for_subject(&mut coordinator, "semantic subset refused").is_empty(),
+            "no subset gap beside a seated lane"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").len(),
+            1,
+            "the sizes-start refusal is still named"
+        );
+        assert!(
+            gaps_for_subject(&mut coordinator, "key sizes unavailable").is_empty(),
+            "no sizes gap without a seated base journal"
+        );
+    }
+
+    /// Provisional and ordinary mint refusals disclose once: the
+    /// authoritative ordinary mint names its subset refusal, and the
+    /// superseded provisional attempt adds no second entry.
+    #[test]
+    fn key_sizes_double_mint_refusal_discloses_once() {
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        let scope = Scope::Pid(std::process::id());
+        let refused = || SubsetPreparation {
+            subset: None,
+            refusals: vec![SemanticRefusal::Unattested],
+        };
+        let (lane, starts) = seal_startup_test::with_start_queue(
+            vec![some_preparation(), some_preparation(), refused(), refused()],
+            vec![Err(SemanticRefusal::Attachment)],
+            || {
+                let lane = start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                );
+                (lane, seal_startup_test::take_starts())
+            },
+        );
+        assert!(lane.is_none(), "refused subsets seat no lane");
+        assert!(
+            take_sealed_for_test().is_empty(),
+            "no seal line on a refused start"
+        );
+        assert_eq!(
+            starts
+                .iter()
+                .map(|start| start.key_sizes)
+                .collect::<Vec<_>>(),
+            [Some(true)],
+            "only the sizes start ran before the mints refused"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
+            1,
+            "the authoritative mint discloses its refusal once"
+        );
+        assert_eq!(
+            gaps_with_repeats_for_subject(&mut coordinator, "semantic subset refused")
+                .iter()
+                .map(|(_, repeats)| *repeats)
+                .collect::<Vec<_>>(),
+            [1],
+            "the superseded provisional attempt adds no repeat"
+        );
+    }
+
     /// Semantic guards refuse identically under the flag: subset
     /// refusals (multi/PID/target/safety) at either mint keep their
     /// disclosures with no bypass and no journal attempt.

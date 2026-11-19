@@ -3149,6 +3149,12 @@ fn kernel_thread_fold_reason(total: u64, single_window: bool) -> String {
 /// header count stays exact; `--json` carries every item.
 const GAP_GROUPS_SHOWN: usize = 20;
 
+/// Verbose per-row key-inference lines listed before the block
+/// folds: rows could otherwise print tens of thousands of lines.
+/// The overflow line counts the hidden rows; the per-row reasons
+/// ride text only, so the line never claims `--json` has them.
+const KEY_DETAIL_ROWS_SHOWN: usize = 32;
+
 /// Fixed rank of the gap subjects that explain missing counts: they
 /// read before every other group (scope or per-object), in this
 /// order, so the run-wide reason never folds out under pid-less
@@ -4821,13 +4827,27 @@ fn render_snapshot_inner(
                     key_detail_line("unknown keys", &key_tally_segment(tally), &suffix, false)
                 );
             }
-            // Verbose per-row inference detail (all non-blank rows,
-            // primary and secondary alike).
+            // Verbose per-row inference detail (non-blank rows,
+            // primary and secondary alike), bounded with a counted
+            // overflow line.
             if verbose {
+                let mut shown = 0usize;
+                let mut hidden = 0usize;
                 for row in &observations.key_operations {
-                    if let Some(line) = inferred_row_detail(row) {
+                    let Some(line) = inferred_row_detail(row) else {
+                        continue;
+                    };
+                    if shown < KEY_DETAIL_ROWS_SHOWN {
                         let _ = writeln!(out, "{line}");
+                        shown += 1;
+                    } else {
+                        hidden += 1;
                     }
+                }
+                if hidden == 1 {
+                    let _ = writeln!(out, "  and 1 more key row (not shown)");
+                } else if hidden > 1 {
+                    let _ = writeln!(out, "  and {hidden} more key rows (not shown)");
                 }
             }
             // F16 (7.05 PQC): the PQC spotlight names proved uses per

@@ -2366,7 +2366,7 @@ pub(crate) struct FamilyState {
 /// keep-first-two-count-extras rule as families. "Same size" means
 /// same detail kind plus size params — the evidence tag does not
 /// count, and the detail keeps the first tag. `unsupported` never
-/// overwrites `inferred` and never flips to `conflicting`.
+/// overwrites `inferred` and never flips.
 /// RSA further values track exactly in a 1985-bit bitmap (64..=2048
 /// modulus octets); wrapped-material further values track exactly in
 /// an 8192-bit bitmap (0..=8191 material octets, the
@@ -2637,6 +2637,11 @@ impl SizeState {
         detail: crate::keymeta::SizeDetail,
     ) {
         use crate::keymeta::{families_compatible, same_size, size_compatible, size_family};
+        // `unsupported` pins: a later classified size never flips the
+        // row (nor its reason) to inferred or conflicting.
+        if self.status == InferredStatus::Unsupported {
+            return;
+        }
         match self.detail.as_ref() {
             None => {
                 self.detail = Some((detail.clone(), tag));

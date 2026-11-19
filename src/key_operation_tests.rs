@@ -31632,10 +31632,11 @@ fn keymeta_weaker_evidence_never_disturbs_valued() {
     assert_eq!(size.completions, 2);
 }
 
-/// Valued evidence upgrades unsupported and unknown states; unknown
-/// evidence never downgrades unsupported ones.
+/// `unsupported` pins against later valued and unknown evidence
+/// (never flips to `inferred`); unknown evidence never downgrades
+/// unsupported ones.
 #[test]
-fn keymeta_valued_upgrades_unsupported_and_unknown() {
+fn keymeta_unsupported_pins_against_valued_and_unknown() {
     use crate::semantics_key_use::{FamilyState, SizeInput, SizeState};
     let mut size = SizeState::default();
     size.accumulate_size(
@@ -31653,7 +31654,9 @@ fn keymeta_valued_upgrades_unsupported_and_unknown() {
         Some(EvidenceTag::SignOutput),
         SizeInput::Value(256),
     );
-    assert_eq!(size.status, InferredStatus::Inferred);
+    assert_eq!(size.status, InferredStatus::Unsupported);
+    assert_eq!(size.reason, Some(crate::keymeta::REASON_NO_LENGTH_MAP));
+    assert_eq!(size.detail, None);
     assert_eq!(size.completions, 2);
     let mut size = SizeState::default();
     size.accumulate_size(

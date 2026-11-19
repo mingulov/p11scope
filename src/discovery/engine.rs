@@ -42278,7 +42278,7 @@ impl Engine {
     /// The deadline most recently installed into the capture work budget by a
     /// batch apply; the end-of-batch clear does not erase it.
     pub(crate) fn installed_budget_deadline_for_test(&self) -> Option<u64> {
-        self.budget.last_installed_deadline
+        self.budget.pass_owner_ref().installed_deadline_for_test()
     }
 
     #[cfg(test)]

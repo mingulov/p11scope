@@ -71,7 +71,7 @@ const MAX_MAP_ENTRIES: usize = 1_048_576;
 const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
 // ponytail: this independent ceiling is the calibration knob if real providers hit it.
-const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
 /// Production Inventory per-pass attempted-I/O window. Calibrated 2026-11-09:
 /// the trivial nodata harness maps 16.3 MiB of sub-8-MiB objects on Fedora
 /// (14.8 MiB on dev) plus ~1 MiB of provider pin and snapshot reads, so the
@@ -243,7 +243,9 @@ fn read_retained_export_facts_budgeted(
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
-    if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) && budget.active_scan.is_none() {
+    if matches!(budget.policy(), DiscoveryPolicy::Inventory(_))
+        && !budget.pass_owner_ref().has_active_scan()
+    {
         return Err("read failed: inventory discovery requires an active scan".into());
     }
     let facts = read_elf_snapshot(file, budget)
@@ -297,77 +299,77 @@ fn read_raw_scan_facts_budgeted(
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ElfExportFacts, String> {
-    let (abi, exports, excluded_anchor_ranges, work_rest, getter_present, witness_fault) = if budget
-        .retained_mapped_identity(file)
-        .is_some()
-    {
-        let snapshot = read_elf_snapshot(file, budget)?;
-        // The snapshot read charged the bytes incrementally; spend
-        // the table entries before the parse and the remainder after.
-        let pre_entries = snapshot.table_bounds().table_entries();
-        if pre_entries > 0 {
-            budget.spend(pre_entries).map_err(str::to_string)?;
-        }
-        let facts = snapshot.raw_scan_facts(wanted)?;
-        (
-            facts.abi,
-            facts.exports,
-            facts.excluded_anchor_ranges,
-            facts.work_units.saturating_sub(pre_entries),
-            facts.getter_present,
-            facts.witness_fault,
-        )
-    } else {
-        // Both policies bound the tables before the parse and debit
-        // the remainder after; no whole-file gate is introduced for
-        // sparse objects.
-        if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) && budget.active_scan.is_none()
-        {
-            return Err("read failed: inventory discovery requires an active scan".into());
-        }
-        // The header probe refuses over-cap header tables with the named
-        // gap before any mapping, charging only the probe bytes it read.
-        // Spans are only sized there; they refuse here, against the whole
-        // production window the walk would be charged to — never a fixed
-        // per-span cap, and never the remaining bytes (a refusal cached
-        // under a drained window would skip a real file later). The
-        // refusal charges only the probe and caches per object, so a
-        // later object in the same pass still scans.
-        let (gated, probe_bytes) = p11scope_manifest::elf::read_table_bounds(file);
-        let bounds = match gated {
-            Ok(bounds) => bounds,
-            Err(reason) => {
+    let (abi, exports, excluded_anchor_ranges, work_rest, getter_present, witness_fault) =
+        if budget.retained_mapped_identity(file).is_some() {
+            let snapshot = read_elf_snapshot(file, budget)?;
+            // The snapshot read charged the bytes incrementally; spend
+            // the table entries before the parse and the remainder after.
+            let pre_entries = snapshot.table_bounds().table_entries();
+            if pre_entries > 0 {
+                budget.spend(pre_entries).map_err(str::to_string)?;
+            }
+            let facts = snapshot.raw_scan_facts(wanted)?;
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units.saturating_sub(pre_entries),
+                facts.getter_present,
+                facts.witness_fault,
+            )
+        } else {
+            // Both policies bound the tables before the parse and debit
+            // the remainder after; no whole-file gate is introduced for
+            // sparse objects.
+            if matches!(budget.policy(), DiscoveryPolicy::Inventory(_))
+                && !budget.pass_owner_ref().has_active_scan()
+            {
+                return Err("read failed: inventory discovery requires an active scan".into());
+            }
+            // The header probe refuses over-cap header tables with the named
+            // gap before any mapping, charging only the probe bytes it read.
+            // Spans are only sized there; they refuse here, against the whole
+            // production window the walk would be charged to — never a fixed
+            // per-span cap, and never the remaining bytes (a refusal cached
+            // under a drained window would skip a real file later). The
+            // refusal charges only the probe and caches per object, so a
+            // later object in the same pass still scans.
+            let (gated, probe_bytes) = p11scope_manifest::elf::read_table_bounds(file);
+            let bounds = match gated {
+                Ok(bounds) => bounds,
+                Err(reason) => {
+                    budget.record_io(usize::try_from(probe_bytes).unwrap_or(usize::MAX));
+                    return Err(reason);
+                }
+            };
+            let window_bytes = match budget.policy() {
+                DiscoveryPolicy::Inventory(_) => INVENTORY_WINDOW_IO_BYTES,
+                DiscoveryPolicy::DetailedLegacy => DETAILED_CAPTURE_IO_BYTES,
+            };
+            if let Some(reason) = bounds.span_refusal(window_bytes) {
                 budget.record_io(usize::try_from(probe_bytes).unwrap_or(usize::MAX));
                 return Err(reason);
             }
+            let pre_bytes = bounds.table_bytes();
+            if pre_bytes > 0 {
+                debit_window_io(budget, pre_bytes)?;
+            }
+            let pre_entries = bounds.table_entries();
+            if pre_entries > 0 {
+                budget.spend(pre_entries).map_err(str::to_string)?;
+            }
+            let facts =
+                p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
+            debit_window_io(budget, facts.structural_bytes.saturating_sub(pre_bytes))?;
+            (
+                facts.abi,
+                facts.exports,
+                facts.excluded_anchor_ranges,
+                facts.work_units.saturating_sub(pre_entries),
+                facts.getter_present,
+                facts.witness_fault,
+            )
         };
-        let window_bytes = match budget.policy() {
-            DiscoveryPolicy::Inventory(_) => INVENTORY_WINDOW_IO_BYTES,
-            DiscoveryPolicy::DetailedLegacy => DETAILED_CAPTURE_IO_BYTES,
-        };
-        if let Some(reason) = bounds.span_refusal(window_bytes) {
-            budget.record_io(usize::try_from(probe_bytes).unwrap_or(usize::MAX));
-            return Err(reason);
-        }
-        let pre_bytes = bounds.table_bytes();
-        if pre_bytes > 0 {
-            debit_window_io(budget, pre_bytes)?;
-        }
-        let pre_entries = bounds.table_entries();
-        if pre_entries > 0 {
-            budget.spend(pre_entries).map_err(str::to_string)?;
-        }
-        let facts = p11scope_manifest::elf::read_raw_scan_facts_bounded(file, wanted, u64::MAX)?;
-        debit_window_io(budget, facts.structural_bytes.saturating_sub(pre_bytes))?;
-        (
-            facts.abi,
-            facts.exports,
-            facts.excluded_anchor_ranges,
-            facts.work_units.saturating_sub(pre_entries),
-            facts.getter_present,
-            facts.witness_fault,
-        )
-    };
     budget.spend(work_rest).map_err(str::to_string)?;
     if let Some(reason) = budget.check_deadline_now() {
         return Err(reason.into());
@@ -417,7 +419,7 @@ pub(crate) fn read_mountinfo_with<R: Read>(
     let mut newline_count = 0usize;
     let mut chunk = vec![0; chunk_size.max(1)];
     loop {
-        if let Some(reason) = budget.scan_stop_reason {
+        if let Some(reason) = budget.stopped_reason() {
             return Err(reason.into());
         }
         if let Some(reason) = deadline(budget) {
@@ -427,7 +429,7 @@ pub(crate) fn read_mountinfo_with<R: Read>(
         let capture_left = budget.remaining_window_io().unwrap_or(0);
         if capture_left == 0 {
             if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
-                budget.set_scan_stop(IO_CEILING_REASON);
+                budget.pass_owner().set_scan_stop(IO_CEILING_REASON);
             }
             return Err(IO_CEILING_REASON.into());
         }
@@ -492,11 +494,11 @@ pub struct ScanLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryWindowLimits {
-    io_bytes: u64,
-    work_units: u64,
-    decoded_tables: usize,
-    decoded_entries: usize,
-    interfaces: usize,
+    pub(crate) io_bytes: u64,
+    pub(crate) work_units: u64,
+    pub(crate) decoded_tables: usize,
+    pub(crate) decoded_entries: usize,
+    pub(crate) interfaces: usize,
 }
 
 impl InventoryWindowLimits {
@@ -568,8 +570,8 @@ impl InventoryRetainedLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InventoryDiscoveryLimits {
-    per_operation_bytes: u64,
-    window: InventoryWindowLimits,
+    pub(crate) per_operation_bytes: u64,
+    pub(crate) window: InventoryWindowLimits,
     retained: InventoryRetainedLimits,
 }
 
@@ -612,12 +614,12 @@ impl WindowId {
 }
 
 #[derive(Debug)]
-struct BudgetDomain;
+pub(crate) struct BudgetDomain;
 
 #[derive(Debug, Clone)]
 pub struct WindowToken {
-    domain: Arc<BudgetDomain>,
-    id: WindowId,
+    pub(crate) domain: Arc<BudgetDomain>,
+    pub(crate) id: WindowId,
 }
 
 impl PartialEq for WindowToken {
@@ -630,16 +632,16 @@ impl Eq for WindowToken {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanCheckpoint {
-    token: WindowToken,
-    serial: u64,
+    pub(crate) token: WindowToken,
+    pub(crate) serial: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowReceipt {
-    id: WindowId,
-    io_bytes: u64,
-    work_units: u64,
-    stop_reason: Option<&'static str>,
+    pub(crate) id: WindowId,
+    pub(crate) io_bytes: u64,
+    pub(crate) work_units: u64,
+    pub(crate) stop_reason: Option<&'static str>,
 }
 
 impl WindowReceipt {
@@ -1152,22 +1154,22 @@ impl RetainedFileFacts {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveInventoryWindow {
-    token: WindowToken,
-    limits: InventoryWindowLimits,
-    deadline_ns: u64,
-    io_bytes: u64,
-    work_units: u64,
-    decoded_tables: usize,
-    decoded_entries: usize,
-    interfaces: usize,
-    stop_reason: Option<&'static str>,
+pub(crate) struct ActiveInventoryWindow {
+    pub(crate) token: WindowToken,
+    pub(crate) limits: InventoryWindowLimits,
+    pub(crate) deadline_ns: u64,
+    pub(crate) io_bytes: u64,
+    pub(crate) work_units: u64,
+    pub(crate) decoded_tables: usize,
+    pub(crate) decoded_entries: usize,
+    pub(crate) interfaces: usize,
+    pub(crate) stop_reason: Option<&'static str>,
 }
 
 /// Cooperative collection control and shared work, used by the cgroup
 /// serial collector. Returning false is sticky within the scan budget.
 #[derive(Clone)]
-pub(crate) struct CollectionWork(Arc<dyn Fn(u64) -> bool + Send + Sync>);
+pub(crate) struct CollectionWork(pub(crate) Arc<dyn Fn(u64) -> bool + Send + Sync>);
 impl std::fmt::Debug for CollectionWork {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         out.write_str("CollectionWork")
@@ -1198,15 +1200,16 @@ pub(crate) const CAPTURE_RETAINED_CACHE_BYTES: u64 = 64 << 20;
 
 /// One capture's concrete discovery allowance. Memory snapshots and file hashes
 /// spend the same byte total; cardinality counters stop decoded-record amplification.
+///
+/// The pass budget itself (allowances, stops, windows, cursor) lives in
+/// the owned [`super::scan_pass::ScanPassOwner`]; this struct keeps the
+/// retained caches, identity stores and disclosure tallies and delegates
+/// every budget interaction to it.
 #[derive(Debug)]
 pub struct CaptureWorkBudget {
-    collection_work: Option<CollectionWork>,
+    pass: super::scan_pass::ScanPassOwner,
     retained_mapped: crate::discovery::identity::RetainedMappedIdentities,
     kernel_anchor_exclusions: crate::discovery::kernel_identity::KernelAnchorExclusions,
-    limits: ScanLimits,
-    policy: DiscoveryPolicy,
-    domain: Option<Arc<BudgetDomain>>,
-    attempted_io_bytes: u64,
     table_candidates: usize,
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
@@ -1267,22 +1270,7 @@ pub struct CaptureWorkBudget {
     /// the pass summary discloses the count once instead of repeating one
     /// gap per thread.
     kernel_thread_absences: u64,
-    work_ceiling: u64,
-    work_units: u64,
-    active_window: Option<ActiveInventoryWindow>,
-    last_window: Option<WindowId>,
-    active_scan: Option<ScanCheckpoint>,
-    next_scan_serial: u64,
-    window_exhaustions: u64,
     retained_cache_bytes: u64,
-    deadline_ns: Option<u64>,
-    /// Test-only: the deadline most recently *installed* (a `Some` passed to
-    /// `set_deadline`). The end-of-batch `None` clear leaves it in place, so a
-    /// test can observe what a finished batch apply actually forwarded.
-    #[cfg(test)]
-    pub(crate) last_installed_deadline: Option<u64>,
-    scan_stop_reason: Option<&'static str>,
-    scan_stop_reported: bool,
     /// `--exclude-module` inputs for this capture (set once before scanning,
     /// read by every member scan). Empty means "exclude nothing".
     excludes: Vec<PathBuf>,
@@ -1496,14 +1484,10 @@ impl FileFactRetention<'_> {
 impl CaptureWorkBudget {
     pub fn new(limits: ScanLimits) -> Self {
         Self {
-            collection_work: None,
+            pass: super::scan_pass::ScanPassOwner::from_limits(limits),
             retained_mapped: crate::discovery::identity::RetainedMappedIdentities::default(),
             kernel_anchor_exclusions:
                 crate::discovery::kernel_identity::KernelAnchorExclusions::default(),
-            limits,
-            policy: DiscoveryPolicy::DetailedLegacy,
-            domain: None,
-            attempted_io_bytes: 0,
             table_candidates: 0,
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
@@ -1527,19 +1511,7 @@ impl CaptureWorkBudget {
             table_exhaustion_reported: false,
             interface_exhaustion_reported: false,
             kernel_thread_absences: 0,
-            work_ceiling: DEFAULT_WORK_CEILING,
-            work_units: 0,
-            active_window: None,
-            last_window: None,
-            active_scan: None,
-            next_scan_serial: 0,
-            window_exhaustions: 0,
             retained_cache_bytes: 0,
-            deadline_ns: None,
-            #[cfg(test)]
-            last_installed_deadline: None,
-            scan_stop_reason: None,
-            scan_stop_reported: false,
             excludes: Vec::new(),
             excluded: Vec::new(),
             forwarding: Vec::new(),
@@ -1603,7 +1575,7 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
-        self.collection_work = Some(work);
+        self.pass.set_collection_work(work);
     }
 
     pub(crate) fn with_retained_mapped_identities(
@@ -1636,40 +1608,37 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn has_collection_work(&self) -> bool {
-        self.collection_work.is_some()
+        self.pass.has_collection_work()
     }
     pub(crate) fn poll_collection(&mut self, units: u64) -> bool {
-        self.collection_checkpoint(units)
-    }
-
-    fn collection_checkpoint(&mut self, units: u64) -> bool {
-        let Some(work) = &self.collection_work else {
-            return true;
-        };
-        if self.scan_stop_reason.is_some() {
-            return false;
-        }
-        if !(work.0)(units) {
-            self.set_scan_stop(COLLECTION_STOP_REASON);
-            return false;
-        }
-        true
+        self.pass.poll_collection(units)
     }
 
     /// Set the work ceiling (tests of where a ceiling stops).
     #[cfg(test)]
     pub(crate) fn set_work_ceiling_for_test(&mut self, units: u64) {
-        self.work_ceiling = units;
+        self.pass.set_work_ceiling_for_test(units);
     }
 
     /// A default budget whose work ceiling is `units` (tests of where a
     /// ceiling stops).
     #[cfg(test)]
     pub(crate) fn with_work_ceiling(units: u64) -> Self {
-        Self {
-            work_ceiling: units,
-            ..Self::default()
-        }
+        let mut budget = Self::default();
+        budget.pass.set_work_ceiling_for_test(units);
+        budget
+    }
+
+    /// Set charged work directly (overflow tests). Tests only.
+    #[cfg(test)]
+    pub(crate) fn set_work_units_for_test(&mut self, units: u64) {
+        self.pass.set_work_units_for_test(units);
+    }
+
+    /// Set the scan serial directly (overflow tests). Tests only.
+    #[cfg(test)]
+    pub(crate) fn set_next_scan_serial_for_test(&mut self, serial: u64) {
+        self.pass.set_next_scan_serial_for_test(serial);
     }
 
     pub fn for_inventory(limits: InventoryDiscoveryLimits) -> Self {
@@ -1677,20 +1646,27 @@ impl CaptureWorkBudget {
             per_object_bytes: limits.per_operation_bytes,
             total_bytes: limits.window.io_bytes,
         });
-        budget.policy = DiscoveryPolicy::Inventory(limits);
-        budget.domain = Some(Arc::new(BudgetDomain));
+        budget.pass = super::scan_pass::ScanPassOwner::inventory(limits);
         budget
     }
 
-    pub const fn policy(&self) -> DiscoveryPolicy {
-        self.policy
+    pub fn policy(&self) -> DiscoveryPolicy {
+        self.pass.policy()
+    }
+
+    /// The owned per-pass budget: allowances, stops, windows and the
+    /// resume cursor. Pass boundaries renew through it.
+    pub(crate) fn pass_owner(&mut self) -> &mut super::scan_pass::ScanPassOwner {
+        &mut self.pass
+    }
+
+    /// The owned per-pass budget, shared read.
+    pub(crate) fn pass_owner_ref(&self) -> &super::scan_pass::ScanPassOwner {
+        &self.pass
     }
 
     pub fn begin_window(&mut self, id: WindowId, deadline_ns: u64) -> Result<WindowToken, String> {
-        let DiscoveryPolicy::Inventory(limits) = self.policy else {
-            return Err("renewable discovery windows require Inventory policy".into());
-        };
-        self.begin_window_with_limits(id, limits.window, deadline_ns)
+        self.pass.begin_window(id, deadline_ns)
     }
 
     pub fn begin_window_with_limits(
@@ -1699,182 +1675,55 @@ impl CaptureWorkBudget {
         window_limits: InventoryWindowLimits,
         deadline_ns: u64,
     ) -> Result<WindowToken, String> {
-        let DiscoveryPolicy::Inventory(limits) = self.policy else {
-            return Err("renewable discovery windows require Inventory policy".into());
-        };
-        if self.active_window.is_some() || self.active_scan.is_some() {
-            return Err("cannot renew discovery work while a window or scan is active".into());
-        }
-        if self.last_window.is_some_and(|last| id <= last) {
-            return Err("inventory discovery window ID is stale or repeated".into());
-        }
-        if window_limits.io_bytes > limits.window.io_bytes
-            || window_limits.work_units > limits.window.work_units
-            || window_limits.decoded_tables > limits.window.decoded_tables
-            || window_limits.decoded_entries > limits.window.decoded_entries
-            || window_limits.interfaces > limits.window.interfaces
-        {
-            return Err("adaptive inventory window exceeds its immutable policy maximum".into());
-        }
-        let token = WindowToken {
-            domain: Arc::clone(
-                self.domain
-                    .as_ref()
-                    .expect("Inventory policy owns a budget domain"),
-            ),
-            id,
-        };
-        self.active_window = Some(ActiveInventoryWindow {
-            token: token.clone(),
-            limits: window_limits,
-            deadline_ns,
-            io_bytes: 0,
-            work_units: 0,
-            decoded_tables: 0,
-            decoded_entries: 0,
-            interfaces: 0,
-            stop_reason: None,
-        });
-        self.last_window = Some(id);
-        self.deadline_ns = None;
-        self.scan_stop_reason = None;
-        self.scan_stop_reported = false;
-        Ok(token)
+        self.pass
+            .begin_window_with_limits(id, window_limits, deadline_ns)
     }
 
     pub fn checkpoint(&mut self, token: WindowToken) -> Result<ScanCheckpoint, String> {
-        self.validate_window_token(&token)?;
-        if self.active_scan.is_some() {
-            return Err("inventory discovery scan is already active".into());
-        }
-        let serial = self
-            .next_scan_serial
-            .checked_add(1)
-            .ok_or_else(|| "inventory discovery scan serial exhausted".to_string())?;
-        self.next_scan_serial = serial;
-        let checkpoint = ScanCheckpoint { token, serial };
-        self.active_scan = Some(checkpoint.clone());
-        Ok(checkpoint)
+        self.pass.checkpoint(token)
     }
 
     pub fn finish_scan(&mut self, checkpoint: ScanCheckpoint) -> Result<(), String> {
-        if self.active_scan.as_ref() != Some(&checkpoint) {
-            return Err("inventory discovery scan checkpoint is stale or missing".into());
-        }
-        self.validate_window_token(&checkpoint.token)?;
-        self.active_scan = None;
-        Ok(())
+        self.pass.finish_scan(checkpoint)
     }
 
     pub fn finish_window(&mut self, token: WindowToken) -> Result<WindowReceipt, String> {
-        self.validate_window_token(&token)?;
-        if self.active_scan.is_some() {
-            return Err("cannot finish an inventory discovery window during a scan".into());
-        }
-        let window = self
-            .active_window
-            .take()
-            .expect("validated inventory window exists");
-        self.deadline_ns = None;
-        self.scan_stop_reason = None;
-        self.scan_stop_reported = false;
-        Ok(WindowReceipt {
-            id: token.id,
-            io_bytes: window.io_bytes,
-            work_units: window.work_units,
-            stop_reason: window.stop_reason,
-        })
-    }
-
-    fn validate_window_token(&self, token: &WindowToken) -> Result<(), String> {
-        match self.active_window.as_ref() {
-            Some(window) if window.token == *token => Ok(()),
-            Some(_) => Err("inventory discovery window token is stale".into()),
-            None => Err("inventory discovery window token is missing".into()),
-        }
-    }
-
-    fn inventory_limits(&self) -> Option<InventoryDiscoveryLimits> {
-        match self.policy {
-            DiscoveryPolicy::DetailedLegacy => None,
-            DiscoveryPolicy::Inventory(limits) => Some(limits),
-        }
+        self.pass.finish_window(token)
     }
 
     fn may_mutate_retained_state(&self) -> bool {
-        matches!(self.policy, DiscoveryPolicy::DetailedLegacy) || self.active_scan.is_some()
+        self.pass.may_mutate_retained_state()
     }
 
     /// The byte ceiling the file-fact maps share. Capture scans
     /// (DetailedLegacy) enforce the capture ceiling; without it every
     /// distinct scanned file stayed cached forever (v070-musl-rss).
     fn retained_byte_limit(&self) -> u64 {
-        self.inventory_limits()
+        self.pass
+            .inventory_limits()
             .map_or(CAPTURE_RETAINED_CACHE_BYTES, |limits| {
                 limits.retained.cache_bytes
             })
     }
 
-    fn set_scan_stop(&mut self, reason: &'static str) {
-        if self.scan_stop_reason.is_some() {
-            return;
-        }
-        self.scan_stop_reason = Some(reason);
-        if let Some(window) = self.active_window.as_mut() {
-            window.stop_reason = Some(reason);
-            self.window_exhaustions = self.window_exhaustions.saturating_add(1);
-        }
-    }
-
     pub(crate) fn window_exhaustions(&self) -> u64 {
-        self.window_exhaustions
+        self.pass.window_exhaustions()
     }
 
     pub fn limits(&self) -> ScanLimits {
-        self.limits
+        self.pass.limits()
     }
 
     pub fn attempted_io_bytes(&self) -> u64 {
-        self.attempted_io_bytes
+        self.pass.attempted_io_bytes()
     }
 
     pub fn remaining_window_io(&self) -> Result<u64, String> {
-        match self.policy {
-            DiscoveryPolicy::DetailedLegacy => Ok(self
-                .limits
-                .total_bytes
-                .saturating_sub(self.attempted_io_bytes)),
-            DiscoveryPolicy::Inventory(_) => self
-                .active_window
-                .as_ref()
-                .map(|window| window.limits.io_bytes.saturating_sub(window.io_bytes))
-                .ok_or_else(|| "inventory discovery I/O requires an active window".into()),
-        }
+        self.pass.remaining_window_io()
     }
 
     pub(crate) fn allowed_io(&mut self, operation_bytes: u64, wanted: usize) -> usize {
-        if !self.collection_checkpoint(1) {
-            return 0;
-        }
-        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
-            return 0;
-        }
-        let operation_left = self.limits.per_object_bytes.saturating_sub(operation_bytes);
-        let capture_left = self.remaining_window_io().unwrap_or(0);
-        let allowed = wanted.min(
-            operation_left
-                .min(capture_left)
-                .try_into()
-                .unwrap_or(usize::MAX),
-        );
-        // Only a spent window stops the pass: a per-object shortfall
-        // refuses its own object (named by `io_shortfall_reason`) while
-        // the window still admits the rest of the scan.
-        if capture_left == 0 && wanted != 0 && matches!(self.policy, DiscoveryPolicy::Inventory(_))
-        {
-            self.set_scan_stop(IO_CEILING_REASON);
-        }
-        allowed
+        self.pass.allowed_io(operation_bytes, wanted)
     }
 
     /// The named gap for a zero allowance at this operation position:
@@ -1882,30 +1731,18 @@ impl CaptureWorkBudget {
     /// else the capture I/O ceiling. Agrees with `allowed_io`'s stop:
     /// the ceiling stops the pass, the per-object shortfall never does.
     pub(crate) fn io_shortfall_reason(&self, operation_bytes: u64) -> &'static str {
-        let operation_left = self.limits.per_object_bytes.saturating_sub(operation_bytes);
-        let capture_left = self.remaining_window_io().unwrap_or(0);
-        if operation_left == 0 && capture_left > 0 {
-            PER_OBJECT_ALLOWANCE_REASON
-        } else {
-            IO_CEILING_REASON
-        }
+        self.pass.io_shortfall_reason(operation_bytes)
     }
 
     /// A metadata reader could not obtain its complete proof within the
     /// allowance returned by allowed_io. Keep the actual resource refusal
     /// distinct from a target read/identity error, preserving any earlier stop.
     pub(crate) fn note_io_refusal(&mut self) {
-        self.set_scan_stop(IO_CEILING_REASON);
+        self.pass.note_io_refusal()
     }
 
     pub(crate) fn record_io(&mut self, bytes: usize) {
-        // Bound input/parse amplification as well as decoded work. Existing
-        // I/O ceilings remain independent. Checks cannot interrupt a read.
-        self.collection_checkpoint((bytes as u64).div_ceil(32));
-        self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
-        if let Some(window) = self.active_window.as_mut() {
-            window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
-        }
+        self.pass.record_io(bytes)
     }
 
     /// Window-only I/O debit for file-content reads: the demand-paged
@@ -1918,149 +1755,59 @@ impl CaptureWorkBudget {
     /// polls the collection stop (0 units) so an operator stop or
     /// deadline reaches the read without charging it.
     pub(crate) fn record_window_io(&mut self, bytes: usize) {
-        self.collection_checkpoint(0);
-        self.attempted_io_bytes = self.attempted_io_bytes.saturating_add(bytes as u64);
-        if let Some(window) = self.active_window.as_mut() {
-            window.io_bytes = window.io_bytes.saturating_add(bytes as u64);
-        }
+        self.pass.record_window_io(bytes)
     }
 
     pub fn charge(&mut self, units: u64) -> bool {
-        if self.scan_stop_reason.is_some() || !self.collection_checkpoint(units) {
-            return false;
-        }
-        if let DiscoveryPolicy::Inventory(_) = self.policy {
-            if self.active_scan.is_none() {
-                return false;
-            }
-            let Some(window) = self.active_window.as_mut() else {
-                return false;
-            };
-            let Some(next) = window.work_units.checked_add(units) else {
-                self.set_scan_stop(WORK_CEILING_REASON);
-                return false;
-            };
-            if next > window.limits.work_units {
-                self.set_scan_stop(WORK_CEILING_REASON);
-                return false;
-            }
-            window.work_units = next;
-            self.work_units = self.work_units.saturating_add(units);
-            return true;
-        }
-        let Some(next) = self.work_units.checked_add(units) else {
-            self.scan_stop_reason = Some(WORK_CEILING_REASON);
-            return false;
-        };
-        if next > self.work_ceiling {
-            self.scan_stop_reason = Some(WORK_CEILING_REASON);
-            return false;
-        }
-        self.work_units = next;
-        true
+        self.pass.charge(units)
     }
 
     pub fn set_deadline(&mut self, deadline_ns: Option<u64>) {
-        #[cfg(test)]
-        if deadline_ns.is_some() {
-            self.last_installed_deadline = deadline_ns;
-        }
-        self.deadline_ns = deadline_ns;
-        if matches!(self.policy, DiscoveryPolicy::DetailedLegacy)
-            && deadline_ns.is_none()
-            && matches!(
-                self.scan_stop_reason,
-                Some(SCAN_DEADLINE_REASON | SCAN_CLOCK_REASON)
-            )
-        {
-            self.scan_stop_reason = None;
-            self.scan_stop_reported = false;
-        }
+        self.pass.set_deadline(deadline_ns)
     }
 
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn deadline_for_test(&self) -> Option<u64> {
-        self.deadline_ns
+        self.pass.deadline_for_test()
     }
 
     /// The existing deadline, without renewing a window or hiding the
     /// absence of one. Callers retain the normal stop/clock checks.
     pub(crate) fn effective_deadline_ns(&self) -> Option<u64> {
-        let window = self.active_window.as_ref().map(|window| window.deadline_ns);
-        match (window, self.deadline_ns) {
-            (Some(window), Some(transaction)) => Some(window.min(transaction)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        }
+        self.pass.effective_deadline_ns()
     }
 
     fn check_deadline(&mut self, now: Option<u64>) -> Option<&'static str> {
-        self.collection_checkpoint(0);
-        if let Some(reason) = self.scan_stop_reason {
-            return Some(reason);
-        }
-        let window_deadline = self.active_window.as_ref().map(|window| window.deadline_ns);
-        let deadline = match (window_deadline, self.deadline_ns) {
-            (Some(window), Some(transaction)) => window.min(transaction),
-            (Some(window), None) => window,
-            (None, Some(transaction)) => transaction,
-            (None, None) => return None,
-        };
-        let reason = match now {
-            Some(now) if now < deadline => return None,
-            Some(_) => SCAN_DEADLINE_REASON,
-            None => SCAN_CLOCK_REASON,
-        };
-        self.set_scan_stop(reason);
-        Some(reason)
+        self.pass.check_deadline(now)
     }
 
     pub(crate) fn check_deadline_now(&mut self) -> Option<&'static str> {
-        if self.deadline_ns.is_some()
-            || self.active_window.is_some()
-            || self.collection_work.is_some()
-        {
-            self.check_deadline(crate::attach::monotonic_ns())
-        } else {
-            None
-        }
+        self.pass.check_deadline_now()
     }
 
     fn has_deadline(&self) -> bool {
-        self.deadline_ns.is_some() || self.active_window.is_some() || self.collection_work.is_some()
+        self.pass.has_deadline()
     }
 
     /// The capture's stop, sticky reason first and otherwise one clock poll:
     /// the single question every live admission asks before doing more work.
     pub(crate) fn stopped_now(&mut self) -> Option<&'static str> {
-        if let Some(reason) = self.scan_stop_reason {
-            return Some(reason);
-        }
-        self.check_deadline_now()
+        self.pass.stopped_now()
     }
 
     /// One charged step of live map work, refused under the budget's own stop
     /// reason so a caller publishes what actually stopped it.
     pub(crate) fn spend(&mut self, units: u64) -> Result<(), &'static str> {
-        if self.charge(units) {
-            Ok(())
-        } else {
-            Err(self.scan_stop_reason.unwrap_or(WORK_CEILING_REASON))
-        }
+        self.pass.spend(units)
     }
 
     pub(crate) fn take_scan_stop_reason(&mut self) -> Option<&'static str> {
-        let reason = self.scan_stop_reason?;
-        if self.scan_stop_reported {
-            None
-        } else {
-            self.scan_stop_reported = true;
-            Some(reason)
-        }
+        self.pass.take_scan_stop_reason()
     }
 
     fn scan_stopped(&self) -> bool {
-        self.scan_stop_reason.is_some()
+        self.pass.scan_stopped()
     }
 
     /// Window-only allowance for identity hashing: a partial digest is
@@ -2068,28 +1815,14 @@ impl CaptureWorkBudget {
     /// provider the window still admits. A spent window still stops the
     /// pass with the I/O ceiling, like `allowed_io`.
     pub(crate) fn allowed_capture_io(&mut self, wanted: usize) -> usize {
-        if !self.collection_checkpoint(1) {
-            return 0;
-        }
-        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) && self.active_scan.is_none() {
-            return 0;
-        }
-        let allowed = self
-            .remaining_window_io()
-            .unwrap_or(0)
-            .try_into()
-            .map_or(usize::MAX, |left| wanted.min(left));
-        if allowed == 0 && wanted != 0 && matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
-            self.set_scan_stop(IO_CEILING_REASON);
-        }
-        allowed
+        self.pass.allowed_capture_io(wanted)
     }
 
     /// The capture's stop, without polling the clock: the pure read behind
     /// per-scan completeness snapshots. A set stop means the scan ran (or
     /// ended) bounded — whether this scan or an earlier one set it.
     pub(crate) fn stopped_reason(&self) -> Option<&'static str> {
-        self.scan_stop_reason
+        self.pass.stopped_reason()
     }
 
     /// Sticky cardinality refusals, for per-scan completeness snapshots.
@@ -2116,7 +1849,7 @@ impl CaptureWorkBudget {
         if self.scan_stopped() {
             return false;
         }
-        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+        if matches!(self.pass.policy(), DiscoveryPolicy::Inventory(_)) {
             return true;
         }
         let Some(decoded) = self.decoded_table_entries.checked_add(entries) else {
@@ -2133,36 +1866,21 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn admit_decoded_table(&mut self, entries: usize) -> bool {
-        let DiscoveryPolicy::Inventory(_) = self.policy else {
+        let DiscoveryPolicy::Inventory(_) = self.pass.policy() else {
             return true;
         };
-        if self.active_scan.is_none() || self.scan_stopped() {
-            return false;
+        match self.pass.admit_table_decode(entries) {
+            super::scan_pass::DecodeVerdict::Admitted => {
+                self.table_candidates = self.table_candidates.saturating_add(1);
+                self.decoded_table_entries = self.decoded_table_entries.saturating_add(entries);
+                true
+            }
+            super::scan_pass::DecodeVerdict::Refused => {
+                self.table_refusals = self.table_refusals.saturating_add(1);
+                false
+            }
+            super::scan_pass::DecodeVerdict::Skipped => false,
         }
-        let Some(window) = self.active_window.as_mut() else {
-            return false;
-        };
-        let Some(tables) = window.decoded_tables.checked_add(1) else {
-            self.table_refusals = self.table_refusals.saturating_add(1);
-            self.set_scan_stop(TABLE_WINDOW_CEILING_REASON);
-            return false;
-        };
-        let Some(decoded_entries) = window.decoded_entries.checked_add(entries) else {
-            self.table_refusals = self.table_refusals.saturating_add(1);
-            self.set_scan_stop(TABLE_WINDOW_CEILING_REASON);
-            return false;
-        };
-        if tables > window.limits.decoded_tables || decoded_entries > window.limits.decoded_entries
-        {
-            self.table_refusals = self.table_refusals.saturating_add(1);
-            self.set_scan_stop(TABLE_WINDOW_CEILING_REASON);
-            return false;
-        }
-        window.decoded_tables = tables;
-        window.decoded_entries = decoded_entries;
-        self.table_candidates = self.table_candidates.saturating_add(1);
-        self.decoded_table_entries = self.decoded_table_entries.saturating_add(entries);
-        true
     }
 
     pub(crate) fn table_already_admitted(&self, id: &TableIdentity) -> bool {
@@ -2177,6 +1895,7 @@ impl CaptureWorkBudget {
             return true;
         }
         if self
+            .pass
             .inventory_limits()
             .is_some_and(|limits| self.admitted_tables.len() >= limits.retained.table_keys)
         {
@@ -2197,7 +1916,7 @@ impl CaptureWorkBudget {
         if self.admitted_runtime_tables.contains(&id) {
             return true;
         }
-        if self.inventory_limits().is_some_and(|limits| {
+        if self.pass.inventory_limits().is_some_and(|limits| {
             self.admitted_runtime_tables.len() >= limits.retained.runtime_keys
         }) {
             self.table_refusals = self.table_refusals.saturating_add(1);
@@ -2224,6 +1943,7 @@ impl CaptureWorkBudget {
         }
         let bytes = inspected_cache_bytes(&key, &value);
         let entry_limit = self
+            .pass
             .inventory_limits()
             .map(|limits| limits.retained.inspection_cache_entries)
             .or(Some(CAPTURE_INSPECTION_CACHE_ENTRIES));
@@ -2274,6 +1994,7 @@ impl CaptureWorkBudget {
         }
         let bytes = loader_cache_bytes(&key, &value);
         let entry_limit = self
+            .pass
             .inventory_limits()
             .map(|limits| limits.retained.export_cache_entries)
             .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
@@ -2329,6 +2050,7 @@ impl CaptureWorkBudget {
         }
         let bytes = table_refusal_cache_bytes(&key, &reason);
         let entry_limit = self
+            .pass
             .inventory_limits()
             .map(|limits| limits.retained.export_cache_entries)
             .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
@@ -2364,6 +2086,7 @@ impl CaptureWorkBudget {
         }
         let bytes = export_cache_bytes(&key, &value);
         let entry_limit = self
+            .pass
             .inventory_limits()
             .map(|limits| limits.retained.export_cache_entries)
             .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
@@ -2426,7 +2149,7 @@ impl CaptureWorkBudget {
                 && !self.carries_file_facts,
             "retained file facts install into a fresh budget"
         );
-        if let Some(limits) = self.inventory_limits() {
+        if let Some(limits) = self.pass.inventory_limits() {
             debug_assert!(
                 facts.inspected_files.len() <= limits.retained.inspection_cache_entries,
                 "carried inspection entries exceed the destination ceiling"
@@ -2491,7 +2214,7 @@ impl CaptureWorkBudget {
 
     #[cfg(test)]
     pub(crate) fn work_units_count(&self) -> u64 {
-        self.work_units
+        self.pass.work_units()
     }
 
     #[cfg(test)]
@@ -2533,7 +2256,7 @@ impl CaptureWorkBudget {
     fn table_exhaustion_reason(&mut self) -> Option<String> {
         if std::mem::replace(&mut self.table_exhaustion_reported, true) {
             None
-        } else if let Some(limits) = self.inventory_limits() {
+        } else if let Some(limits) = self.pass.inventory_limits() {
             Some(format!(
                 "capture retained table-key budget reached ({} file keys, {} runtime keys); remaining table data was not retained",
                 limits.retained.table_keys, limits.retained.runtime_keys
@@ -2550,7 +2273,7 @@ impl CaptureWorkBudget {
         if self.scan_stopped() {
             return false;
         }
-        if matches!(self.policy, DiscoveryPolicy::Inventory(_)) {
+        if matches!(self.pass.policy(), DiscoveryPolicy::Inventory(_)) {
             return true;
         }
         if self.interface_records == MAX_INTERFACE_RECORDS {
@@ -2562,28 +2285,20 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn admit_decoded_interface(&mut self) -> bool {
-        let DiscoveryPolicy::Inventory(_) = self.policy else {
+        let DiscoveryPolicy::Inventory(_) = self.pass.policy() else {
             return true;
         };
-        if self.active_scan.is_none() || self.scan_stopped() {
-            return false;
+        match self.pass.admit_interface_decode() {
+            super::scan_pass::DecodeVerdict::Admitted => {
+                self.interface_records = self.interface_records.saturating_add(1);
+                true
+            }
+            super::scan_pass::DecodeVerdict::Refused => {
+                self.interface_refusals = self.interface_refusals.saturating_add(1);
+                false
+            }
+            super::scan_pass::DecodeVerdict::Skipped => false,
         }
-        let Some(window) = self.active_window.as_mut() else {
-            return false;
-        };
-        let Some(next) = window.interfaces.checked_add(1) else {
-            self.interface_refusals = self.interface_refusals.saturating_add(1);
-            self.set_scan_stop(INTERFACE_WINDOW_CEILING_REASON);
-            return false;
-        };
-        if next > window.limits.interfaces {
-            self.interface_refusals = self.interface_refusals.saturating_add(1);
-            self.set_scan_stop(INTERFACE_WINDOW_CEILING_REASON);
-            return false;
-        }
-        window.interfaces = next;
-        self.interface_records = self.interface_records.saturating_add(1);
-        true
     }
 
     pub(crate) fn interface_already_admitted(&self, id: &InterfaceIdentity) -> bool {
@@ -2598,6 +2313,7 @@ impl CaptureWorkBudget {
             return true;
         }
         if self
+            .pass
             .inventory_limits()
             .is_some_and(|limits| self.admitted_interfaces.len() >= limits.retained.interface_keys)
         {
@@ -2610,7 +2326,7 @@ impl CaptureWorkBudget {
     fn interface_exhaustion_reason(&mut self) -> Option<String> {
         if std::mem::replace(&mut self.interface_exhaustion_reported, true) {
             None
-        } else if let Some(limits) = self.inventory_limits() {
+        } else if let Some(limits) = self.pass.inventory_limits() {
             Some(format!(
                 "capture retained interface-key budget reached ({} keys); remaining interface data was not retained",
                 limits.retained.interface_keys
@@ -6180,7 +5896,7 @@ fn module_refused_undecoded(
 fn undecoded_cause(budget: &CaptureWorkBudget) -> &'static str {
     if matches!(budget.stopped_reason(), Some(TABLE_WINDOW_CEILING_REASON)) {
         "discovery window table decode allowance reached"
-    } else if let Some(limits) = budget.inventory_limits() {
+    } else if let Some(limits) = budget.pass_owner_ref().inventory_limits() {
         let files_saturated = budget.admitted_tables.len() >= limits.retained.table_keys;
         let runtime_saturated =
             budget.admitted_runtime_tables.len() >= limits.retained.runtime_keys;
@@ -6506,33 +6222,19 @@ impl MapsReadBudget for CaptureWorkBudget {
 /// capture budget does, at replay.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MapsShadowBudget {
-    inventory: bool,
-    no_active_scan: bool,
-    io_left: u64,
-    deadline: Option<u64>,
-    has_deadline: bool,
-    stop: Option<&'static str>,
-    stop_reported: bool,
+    pub(crate) inventory: bool,
+    pub(crate) no_active_scan: bool,
+    pub(crate) io_left: u64,
+    pub(crate) deadline: Option<u64>,
+    pub(crate) has_deadline: bool,
+    pub(crate) stop: Option<&'static str>,
+    pub(crate) stop_reported: bool,
 }
 
 impl CaptureWorkBudget {
     /// This budget's [`MapsShadowBudget`], as it stands now.
     pub(crate) fn maps_shadow(&self) -> MapsShadowBudget {
-        let inventory = matches!(self.policy, DiscoveryPolicy::Inventory(_));
-        let window_deadline = self.active_window.as_ref().map(|window| window.deadline_ns);
-        let deadline = match (window_deadline, self.deadline_ns) {
-            (Some(window), Some(transaction)) => Some(window.min(transaction)),
-            (window, transaction) => window.or(transaction),
-        };
-        MapsShadowBudget {
-            inventory,
-            no_active_scan: inventory && self.active_scan.is_none(),
-            io_left: self.remaining_window_io().unwrap_or(0),
-            deadline,
-            has_deadline: self.has_deadline(),
-            stop: self.scan_stop_reason,
-            stop_reported: self.scan_stop_reported,
-        }
+        self.pass.maps_shadow()
     }
 
     /// A shard's private copy of this budget (C7 A5): every allowance,
@@ -6544,22 +6246,8 @@ impl CaptureWorkBudget {
     /// decides is published: the replay against this budget decides.
     pub(crate) fn shard_shadow(&self) -> Self {
         Self {
-            limits: self.limits,
-            policy: self.policy,
-            collection_work: self.collection_work.clone(),
-            domain: self.domain.clone(),
-            attempted_io_bytes: self.attempted_io_bytes,
-            work_ceiling: self.work_ceiling,
-            work_units: self.work_units,
-            active_window: self.active_window.clone(),
-            last_window: self.last_window,
-            active_scan: self.active_scan.clone(),
-            next_scan_serial: self.next_scan_serial,
-            window_exhaustions: self.window_exhaustions,
-            deadline_ns: self.deadline_ns,
-            scan_stop_reason: self.scan_stop_reason,
-            scan_stop_reported: self.scan_stop_reported,
-            ..Self::new(self.limits)
+            pass: self.pass.clone(),
+            ..Self::new(self.limits())
         }
     }
 
@@ -6567,36 +6255,21 @@ impl CaptureWorkBudget {
     /// confirmation's decisions depend on (C7 A5). The limits, deadline
     /// and policy are fixed during a confirmation stage.
     pub(crate) fn confirm_mark(&self) -> ConfirmMark {
-        ConfirmMark {
-            io_bytes: self.attempted_io_bytes,
-            work_units: self.work_units,
-            window: self
-                .active_window
-                .as_ref()
-                .map(|window| (window.io_bytes, window.work_units)),
-            stopped: self.scan_stop_reason.is_some(),
-        }
+        self.pass.confirm_mark()
     }
 
     /// The state a confirmation can change, for serial-vs-sharded equality.
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn confirm_state_for_test(&self) -> (MapsSweepBudgetState, u64) {
-        (self.maps_sweep_state_for_test(), self.work_units)
+        self.pass.confirm_state_for_test()
     }
 
     /// The state a maps sweep can change, for serial-vs-sharded equality.
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) fn maps_sweep_state_for_test(&self) -> MapsSweepBudgetState {
-        MapsSweepBudgetState {
-            attempted_io_bytes: self.attempted_io_bytes,
-            stop: self.scan_stop_reason,
-            stop_reported: self.scan_stop_reported,
-            window: self
-                .active_window
-                .as_ref()
-                .map(|window| (window.io_bytes, window.stop_reason)),
-            window_exhaustions: self.window_exhaustions,
-        }
+        self.pass.maps_sweep_state_for_test()
     }
 }
 
@@ -6604,10 +6277,10 @@ impl CaptureWorkBudget {
 /// spent I/O and work, and whether a sticky stop is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfirmMark {
-    io_bytes: u64,
-    work_units: u64,
-    window: Option<(u64, u64)>,
-    stopped: bool,
+    pub(crate) io_bytes: u64,
+    pub(crate) work_units: u64,
+    pub(crate) window: Option<(u64, u64)>,
+    pub(crate) stopped: bool,
 }
 
 impl ConfirmMark {
@@ -9258,7 +8931,7 @@ mod tests {
         ) -> std::io::Result<Box<dyn Read>> {
             self.maps_reads += 1;
             if self.maps_reads == 2 {
-                self.before_b = Some((budget.attempted_io_bytes(), budget.work_units));
+                self.before_b = Some((budget.attempted_io_bytes(), budget.work_units_count()));
             }
             self.log
                 .borrow_mut()
@@ -9909,10 +9582,12 @@ mod tests {
             1
         );
         let mut f = BracketFixture::new(8, true);
-        let mut budget = CaptureWorkBudget {
-            work_ceiling: control.before_b.map_or(measured.work_units, |b| b.1) + 1,
-            ..CaptureWorkBudget::default()
-        };
+        let mut budget = CaptureWorkBudget::with_work_ceiling(
+            control
+                .before_b
+                .map_or(measured.work_units_count(), |b| b.1)
+                + 1,
+        );
         // Data-always: a work-starved bracket over a live view keeps the
         // decoded module with the failure named, never an empty view.
         let outcome = f.run(&mut budget).unwrap();
@@ -10036,9 +9711,11 @@ mod tests {
         let mut f = BracketFixture::with_providers(8, true, &["provider2.so", "provider3.so"]);
         let mut budget = CaptureWorkBudget::default();
         saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES - 1);
-        let scan_work =
-            control.before_b.map_or(control_budget.work_units, |b| b.1) - control_sat_work;
-        budget.work_ceiling = budget.work_units_count() + scan_work + 1;
+        let scan_work = control
+            .before_b
+            .map_or(control_budget.work_units_count(), |b| b.1)
+            - control_sat_work;
+        budget.set_work_ceiling_for_test(budget.work_units_count() + scan_work + 1);
         let hints = f.provider_paths();
         let (outcome, examined) = f.run_examined_with_hints(&hints, &mut budget);
 
@@ -10252,10 +9929,7 @@ mod tests {
         f.maps_b
             .push_str(&"d000-e000 r--p 0 0:0 0\n".repeat(MAX_MAP_ENTRIES + 1));
         f.final_generation_spend = 1;
-        let mut budget = CaptureWorkBudget {
-            work_ceiling: measured.work_units,
-            ..CaptureWorkBudget::default()
-        };
+        let mut budget = CaptureWorkBudget::with_work_ceiling(measured.work_units_count());
         let outcome = f.run(&mut budget).unwrap();
         assert_eq!(
             budget.stopped_reason(),
@@ -10383,7 +10057,7 @@ mod tests {
             let mut probe = BracketFixture::with_providers(8, true, &["provider2.so"]);
             let mut budget = CaptureWorkBudget::default();
             saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
-            budget.work_ceiling = budget.work_units_count() + delta;
+            budget.set_work_ceiling_for_test(budget.work_units_count() + delta);
             let hints = probe.provider_paths();
             let outcome = probe.run_with_hints(&hints, &mut budget).unwrap();
             (outcome.modules().len() == 1
@@ -10402,7 +10076,7 @@ mod tests {
         let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
         let mut budget = CaptureWorkBudget::default();
         saturate_table_candidates(&mut budget, MAX_TABLE_CANDIDATES);
-        budget.work_ceiling = budget.work_units_count() + delta;
+        budget.set_work_ceiling_for_test(budget.work_units_count() + delta);
         let hints = f.provider_paths();
         let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
         assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
@@ -10599,10 +10273,7 @@ mod tests {
         let hints = f.provider_paths();
         let changed_path = hints[0].display().to_string();
         let kept_path = hints[1].display().to_string();
-        let mut budget = CaptureWorkBudget {
-            work_ceiling: measured.work_units - 1,
-            ..CaptureWorkBudget::default()
-        };
+        let mut budget = CaptureWorkBudget::with_work_ceiling(measured.work_units_count() - 1);
         let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
         assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
         assert!(
@@ -10672,10 +10343,7 @@ mod tests {
             }
             let path = f.path.display().to_string();
             f.final_generation_spend = 1;
-            let mut budget = CaptureWorkBudget {
-                work_ceiling: measured.work_units,
-                ..CaptureWorkBudget::default()
-            };
+            let mut budget = CaptureWorkBudget::with_work_ceiling(measured.work_units_count());
             let outcome = f.run(&mut budget).unwrap();
             assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
             assert!(
@@ -10998,7 +10666,7 @@ mod tests {
             let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
             let mut budget = CaptureWorkBudget::default();
             budget.table_candidates = MAX_TABLE_CANDIDATES;
-            budget.work_ceiling = budget.work_units_count() + delta;
+            budget.set_work_ceiling_for_test(budget.work_units_count() + delta);
             let hints = f.provider_paths();
             let Ok(outcome) = f.run_with_hints(&hints, &mut budget) else {
                 continue;
@@ -17643,13 +17311,10 @@ int main(int argc, char **argv) {
 
     #[test]
     fn work_budget_allows_exact_ceiling_and_rejects_overflow() {
-        let mut budget = CaptureWorkBudget {
-            work_ceiling: 4,
-            ..Default::default()
-        };
+        let mut budget = CaptureWorkBudget::with_work_ceiling(4);
         assert!(budget.charge(4));
         assert!(!budget.charge(1));
-        budget.work_units = u64::MAX;
+        budget.set_work_units_for_test(u64::MAX);
         assert!(!budget.charge(1));
     }
 
@@ -17664,10 +17329,7 @@ int main(int argc, char **argv) {
             snapshot[at..at + 8].copy_from_slice(&0x1500u64.to_ne_bytes());
         }
         snapshot[8 + 103 * 8..8 + 104 * 8].copy_from_slice(&0x9000u64.to_ne_bytes());
-        let mut budget = CaptureWorkBudget {
-            work_ceiling: 104,
-            ..Default::default()
-        };
+        let mut budget = CaptureWorkBudget::with_work_ceiling(104);
         let (tables, skipped) = detect_tables(&snapshot, 0x7000, &map_index, &mut budget);
         assert!(tables.is_empty());
         assert_eq!(skipped, vec![WORK_CEILING_REASON]);
@@ -17675,10 +17337,7 @@ int main(int argc, char **argv) {
 
     #[test]
     fn taking_an_empty_stop_does_not_hide_a_later_work_stop() {
-        let mut budget = CaptureWorkBudget {
-            work_ceiling: 0,
-            ..Default::default()
-        };
+        let mut budget = CaptureWorkBudget::with_work_ceiling(0);
         assert_eq!(budget.take_scan_stop_reason(), None);
         assert!(!budget.charge(1));
         assert_eq!(budget.take_scan_stop_reason(), Some(WORK_CEILING_REASON));
@@ -18338,7 +17997,11 @@ int main(int argc, char **argv) {
         );
         assert_eq!(interrupted.requests.len(), 4, "EINTR and EOF are attempts");
         assert_eq!(budget.attempted_io_bytes(), 5);
-        assert_eq!(budget.work_units, 5, "four attempts plus one observed line");
+        assert_eq!(
+            budget.work_units_count(),
+            5,
+            "four attempts plus one observed line"
+        );
 
         let mut failed = RecordingReader::new([
             ReaderStep::Bytes(b"17 1 8:1 /".to_vec()),
@@ -19816,7 +19479,7 @@ int main(int argc, char **argv) {
     fn inventory_scan_serial_overflow_refuses_without_creating_an_owner() {
         let mut budget = CaptureWorkBudget::for_inventory(inventory_limits(8, 8, 2, 136, 2, 4));
         let window = budget.begin_window(WindowId::new(1), 100).unwrap();
-        budget.next_scan_serial = u64::MAX;
+        budget.set_next_scan_serial_for_test(u64::MAX);
 
         assert!(budget.checkpoint(window.clone()).is_err());
         assert!(

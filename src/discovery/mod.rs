@@ -39,6 +39,7 @@ pub(crate) mod proof_stats;
 #[allow(dead_code)]
 pub(crate) mod retained_member;
 pub mod scan;
+pub(crate) mod scan_pass;
 pub(crate) mod scheduler;
 pub(crate) mod sweep_attribution;
 pub(crate) mod sweep_shards;

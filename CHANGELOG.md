@@ -74,6 +74,13 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Fixed
 
+- A capture under a flood of short-lived processes no longer stops
+  counting partway: a scan bracket starved of discovery work drops
+  its decoded modules with the failure named (the v0.7.0 contract)
+  instead of publishing modules whose identity checks cannot succeed
+  and tripping the fail-closed key rejection for the whole capture
+  (the v0.7.1 newcomer-flood regression). Brackets starved on other
+  budgets still publish with the failure named.
 - Atomic report handover now happens at commit, not at creation.
   The live report temp stays creator-owned `0600` for the whole
   capture; the handover decided at creation (`fchown` plus an

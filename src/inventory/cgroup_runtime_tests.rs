@@ -1167,6 +1167,7 @@ fn run_public_selection(
         None,
         false,
         false,
+        false,
     )
 }
 

@@ -1789,6 +1789,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.key_sizes_requested
     }
 
+    /// Record the run's `--provider-info` request on the attach set
+    /// (spec §17.7): later absorbs recognize info functions only
+    /// when set. Already-absorbed endpoints keep their kinds.
+    pub(crate) fn set_info_capture(&mut self, capture: bool) {
+        self.attach_set.set_info_capture(capture);
+    }
+
     /// Retains an already-validated `--prearm-module` pinning for the run's
     /// lifetime (F5). The pins hold their FDs until the coordinator drops.
     /// Their object/byte usage is also the manifest-side prior (packet 6.13

@@ -45,9 +45,13 @@ struct SetFixture {
 
 impl SetFixture {
     fn new(n: u64) -> Self {
+        // The info twins absorb info-named endpoints through this
+        // set: opt into info capture like --provider-info does.
+        let mut set = InventoryAttachSet::new(budget(n));
+        set.set_info_capture(true);
         Self {
             dir: tempfile::tempdir().unwrap(),
-            set: InventoryAttachSet::new(budget(n)),
+            set,
             paths: Vec::new(),
         }
     }

@@ -2545,9 +2545,16 @@ fn extend_entries_with<I: InventoryLinkIo>(
     // and count the named gap per endpoint. The stripped kind rides
     // into the deferred backlog too, so a resubmitted endpoint is
     // not counted twice. P0 carries no info programs, so it neither
-    // probes nor downgrades.
-    let info_admitted = if cfg!(feature = "stub-object-attributes") {
-        true
+    // probes nor downgrades. The consult is lazy: an extend with no
+    // info endpoints and no pendings reports the cached verdict
+    // without probing, so info-free captures never self-probe.
+    let info_may_attach = !book.info_return_pending.is_empty()
+        || delta
+            .endpoints
+            .iter()
+            .any(|endpoint| endpoint.info_kind.is_some());
+    let info_admitted = if cfg!(feature = "stub-object-attributes") || !info_may_attach {
+        !book.info_return_refused
     } else {
         book.info_returns_admitted()
     };

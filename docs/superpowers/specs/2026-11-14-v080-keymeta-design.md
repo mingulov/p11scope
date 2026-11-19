@@ -2273,8 +2273,9 @@ New section body (normative):
 > (owner stance 2026-11-14 — policy state, not PINs). Terminal
 > states, `CKA_ID`/payload/PIN prohibitions and every other
 > exclusion stay in force. Allowlist-v1 bytes are unchanged.
-> Task 7 ships in default inventory and CBOM, not only under
-> `--key-operations`, and independent of `--key-sizes` (§17.7).
+> Task 7 ships with `--provider-info` (off by default) in
+> inventory and CBOM, not only under `--key-operations`, and
+> independent of `--key-sizes` (§17.7).
 >
 > Required evidence before activation: the §17.6 host twins
 > (LP64+ia32 layouts, sentinel non-publication, 129th-mechanism
@@ -2579,8 +2580,8 @@ inventory flavor (the existing `read_bytes_user` is gated,
 grows from 12 to 15 entries with review in the FULL inventory
 flavors (Global and Callers); the P0 inventory flavor keeps the
 exact 12-program list (info omitted, explicit unavailability).
-No fallback to key-operations-only is needed; Task 7 ships in
-default inventory and CBOM as §17.7 requires.
+No fallback to key-operations-only is needed; Task 7 ships
+with `--provider-info` in inventory and CBOM as §17.7 requires.
 
 Refused journal start (fix8 C3 fallback): a refused journal
 start retries the ordinary lane and keeps broad inventory
@@ -2867,9 +2868,10 @@ required): SoftHSM `C_GetInfo`/`C_GetTokenInfo`/
 `C_GetMechanismInfo` positives with parsed fields matching the
 provider's own reports.
 
-### 17.7 Mode scope: default inventory and CBOM
+### 17.7 Mode scope: opt-in inventory and CBOM
 
-Task 7 rides one info lane in every native inventory mode: the
+Task 7 rides one info lane in every native inventory mode when
+the operator passes `--provider-info` (off by default): the
 inventory info pair stashes one row per in-flight info call
 (`INFO_START`: pointer + slot/mechanism/kind/layout)
 and emits the 176-B record on the `INFO` ring (§17.4), drained
@@ -2879,9 +2881,12 @@ keys off the record header's (module via endpoint, caller
 incarnation, slot[, mechanism]) (§17.5). The object lane's
 `--key-operations` gate (`src/cli.rs:828`,
 `allowlist-v3.md:108-125`) therefore does not apply:
-provider/token/mechanism info appears in DEFAULT inventory
-(JSON + concise/`-v` text) and in CBOM whenever the Task 7
-amendment rows (§17.3) are approved and the calls are observed.
+provider/token/mechanism info appears in inventory
+(JSON + concise/`-v` text) and in CBOM whenever the flag is
+passed, the Task 7 amendment rows (§17.3) are approved, and the
+calls are observed. Without the flag, info functions stay plain
+usage endpoints: no info entries, no return links, no INFO_KIND
+publication and no hazard self-probe.
 A refused journal start changes nothing for Task 7: the
 ordinary retry keeps the broad lane (and the info pair on it)
 running with an honest gap (§17.4 fallback). Cost per run: +0

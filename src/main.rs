@@ -309,6 +309,7 @@ fn run() -> Result<i32> {
                 a.caller_metadata,
                 a.key_operations,
                 a.key_sizes,
+                a.provider_info,
                 a.quiet,
             )
             .map_err(|error| {

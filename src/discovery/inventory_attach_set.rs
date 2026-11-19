@@ -406,7 +406,6 @@ pub(crate) struct InventoryAttachSet {
     /// operator passes `--provider-info`: unrecognized info
     /// functions stay plain usage endpoints. Unit harnesses enable
     /// it where they exercise the info machinery.
-    #[allow(dead_code)] // The enforcement commit reads this.
     info_capture: bool,
 }
 
@@ -1923,11 +1922,20 @@ impl InventoryAttachSet {
                 continue;
             }
             let names = slot_names.get(&(object, file_offset));
-            let info_kind = names.and_then(|names| info_kind_for_slot_names(names));
+            // Keymeta Task 7 (spec §17.7): info capture is off
+            // unless the operator opts in — unrecognized info
+            // functions stay plain usage endpoints and count no
+            // alias gap.
+            let info_kind = if self.info_capture {
+                names.and_then(|names| info_kind_for_slot_names(names))
+            } else {
+                None
+            };
             // Keymeta Task 7 (spec §17.4): names involving an info
             // function without resolving to exactly one keep the
             // usage entry and count the aliased gap.
-            if info_kind.is_none()
+            if self.info_capture
+                && info_kind.is_none()
                 && names.is_some_and(|names| {
                     names.iter().any(|name| {
                         p11scope_ebpf_common::inventory_info::info_kind_for_function(name).is_some()
@@ -5038,6 +5046,7 @@ pub(crate) mod tests {
             };
         }
         let mut set = InventoryAttachSet::new(budget(64));
+        set.set_info_capture(true);
         let outcome = set.absorb(&plan, &pins);
         assert_eq!(outcome.delta.endpoints.len(), 3);
         assert_eq!(outcome.delta.endpoints[0].info_kind, None);
@@ -5143,6 +5152,7 @@ pub(crate) mod tests {
             };
         }
         let mut set = InventoryAttachSet::new(budget(64));
+        set.set_info_capture(true);
         let first = set.absorb(&plan, &pins);
         assert_eq!(first.delta.endpoints.len(), 2);
         assert_eq!(first.delta.endpoints[0].info_kind, Some(INFO_KIND_TOKEN));

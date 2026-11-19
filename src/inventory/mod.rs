@@ -886,6 +886,11 @@ pub fn run(
     // same refusals as the CLI (below); the run records it on the
     // coordinator.
     key_sizes: bool,
+    // `--provider-info`: opt-in provider, token and mechanism info
+    // capture (spec §17). Programmatic callers face the same
+    // refusals as the CLI (below); the run records it on the
+    // coordinator.
+    provider_info: bool,
     quiet: bool,
 ) -> Result<i32> {
     if !manifests.is_empty() && capture == CaptureMode::Scan {
@@ -910,6 +915,12 @@ pub fn run(
     }
     if key_sizes && !key_operations {
         anyhow::bail!("--key-sizes requires --key-operations");
+    }
+    if provider_info && cfg!(feature = "stub-object-attributes") {
+        anyhow::bail!("--provider-info requires a FULL build (P0 omits info capture)");
+    }
+    if provider_info && capture == CaptureMode::Scan {
+        anyhow::bail!("--provider-info requires --capture auto or native");
     }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
@@ -976,6 +987,7 @@ pub fn run(
         None,
         key_operations,
         key_sizes,
+        provider_info,
     )
 }
 
@@ -1191,6 +1203,7 @@ fn run_with_terminal_diagnostics(
         &|| Ok(crate::attach::MultiCapableHost::for_test()),
         event_fault,
         None,
+        false,
         false,
         false,
     )
@@ -1513,6 +1526,10 @@ fn run_with_terminal_budget(
     // `--key-operations` at the run entry). Recorded on the
     // coordinator; the lane reads it there.
     key_sizes: bool,
+    // `--provider-info`: info capture for this run (spec §17.7;
+    // refused under scan and P0 at the run entry). Recorded on the
+    // coordinator; absorb reads it there.
+    provider_info: bool,
 ) -> Result<i32> {
     let (engine_scope, numbering) = scope.into().resolve()?;
     let scope = InventoryRunScope::from(&engine_scope);
@@ -1708,6 +1725,7 @@ fn run_with_terminal_budget(
     coordinator.set_forwarding(forwarding_modules.to_vec());
     coordinator.set_key_sizes_requested(key_sizes);
     coordinator.set_key_operations_requested(key_operations);
+    coordinator.set_info_capture(provider_info);
     // The departed-caller fold paces its planning strides against
     // the operator's live signal counter (when the run has one), so
     // a stop delivered mid-fold aborts within one stride. The
@@ -11326,6 +11344,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    false,
                 )
                 .unwrap_err();
                 assert_eq!(
@@ -11371,6 +11390,7 @@ mod tests {
             crate::cli::IdentityBackendSelection::Auto,
             false,
             crate::cli::CallerMetadataMode::None,
+            false,
             false,
             false,
             false,
@@ -11544,6 +11564,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    false,
                 )
             },
         )
@@ -11637,6 +11658,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    false,
                 )
             },
         )
@@ -11700,6 +11722,7 @@ mod tests {
                     &|| Ok(crate::attach::MultiCapableHost::for_test()),
                     None,
                     None,
+                    false,
                     false,
                     false,
                 )
@@ -12207,6 +12230,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(code, 0);
@@ -12256,6 +12280,7 @@ mod tests {
             &|| panic!("a genuine scan must not probe or load capture BPF"),
             None,
             None,
+            false,
             false,
             false,
         )
@@ -12597,6 +12622,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    false,
                 )
             },
         )
@@ -12708,6 +12734,7 @@ mod tests {
                     },
                     None,
                     None,
+                    false,
                     false,
                     false,
                 )
@@ -13041,6 +13068,7 @@ mod tests {
                     crate::cli::IdentityBackendSelection::Auto,
                     false,
                     crate::cli::CallerMetadataMode::None,
+                    false,
                     false,
                     false,
                     false,
@@ -32280,6 +32308,7 @@ mod seal_readiness_tests {
             true,
             false,
             false,
+            false,
         )
         .expect_err("colliding destinations refuse");
         let text = format!("{error:#}");
@@ -32325,6 +32354,7 @@ mod seal_readiness_tests {
             false,
             CallerMetadataMode::None,
             true,
+            false,
             false,
             false,
         )

@@ -2628,6 +2628,330 @@ fn key_sizes_off_judge_rejects_vacuous_rows() {
     );
 }
 
+#[test]
+fn key_sizes_judge_rejects_refused_run() {
+    let observations = serde_json::json!({
+        "status": "unavailable",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("want populated"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_unknown_reason_outside_race_buckets() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 2,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 2},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 2,
+                },
+            },
+        ],
+        "unknown_key_operations": [
+            {"category": "sign", "completed": 1, "reason": "stale"},
+        ],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not a known race bucket"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_family_status() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "unknown", "value": null, "completions": 0},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family status"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_family_value() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "ec", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family value is not rsa"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_family_completions() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 2},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family completions disagree"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_wrong_size_kind() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "ec", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size kind is not rsa"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_wrong_modulus_bytes() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 128, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("modulus_bytes is not 256"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_wrong_evidence() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "encrypt_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size evidence is not sign_output"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_size_completions() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 2,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size completions disagree"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_rejects_family_status() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "unknown", "value": null, "completions": 0},
+                "inferred_size": {"status": "unknown", "detail": null, "completions": 0},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family status"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_rejects_family_value() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "ec", "completions": 3},
+                "inferred_size": {"status": "unknown", "detail": null, "completions": 0},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family value is not rsa"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_rejects_family_completions() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 2},
+                "inferred_size": {"status": "unknown", "detail": null, "completions": 0},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("family completions disagree"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_rejects_nonzero_size_completions() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {"status": "unknown", "detail": null, "completions": 1},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size completions are not 0"),
+        "unexpected error: {error:#}"
+    );
+}
+
 /// Single-threaded RSA-2048 signs through real journal BPF to an
 /// inferred size in the JSON report: `inventory --pid --capture
 /// native --key-operations --key-sizes --manifest` over 1 thread x

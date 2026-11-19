@@ -596,6 +596,17 @@ A nonzero value closes that view's owned selection coverage and forces
 `PARTIAL`; it is not merged into process-tracking or generic discovery-loss
 counters.
 
+`coverage_retired_slots` is a saturating u64 count of live attached
+counting slots retired mid-capture across every `coverage_retired`
+window (scope, never a missed-call count). It is assessed at capture
+end from the engine's retire ledger: each mid-capture global
+retirement that detached attached counting probes with no same-apply
+reattach contributes its retired live slots once, whether or not the
+module later revived. A nonzero value forces `PARTIAL` through the
+`coverage_retired_slots` observation cause beside the `skipped` cause
+carried by the paired `counting coverage` row, whose interval rides
+the affected records' `unobserved_windows`.
+
 `abi_refusals` is a u64 count of scoped probe processing refused because the
 execution-mode selector is unsupported or does not match the target-width
 specialization selected from the retained pinned object. It counts refused probe invocations,
@@ -661,7 +672,9 @@ slots, so a probe replaced mid-capture moves it later; `first_attached_at_ns`
 stays at the first attach. It is absent when any endpoint never attached.
 Calls after it are observed unless another disclosed window says
 otherwise, with one known exception: a mid-capture probe replacement can
-miss calls in its detach-reattach interval, and that interval is not yet
+miss calls in its detach-reattach interval. A global retirement of live
+counting cover discloses that interval as a `coverage_retired` window
+below; a same-apply replacement's sub-apply interval is still not
 disclosed as a window (at most a `physical static probe gap` row in
 `skipped`, without times).
 It bounds the first-use gap, it is not a missed-call count. It may stand beside a
@@ -682,9 +695,17 @@ later replacement's interval missed it, as above); only
 calls entering while that first attach ran are ambiguous. Absent when no
 endpoint attached. `unobserved_windows` is a list of
 `{start_ns, end_ns, reason}` with `reason` exactly `pre_attach`,
-`late_discovery`, `mapped_unattached`, `health_loss`, or `scope_uncertain`;
-absent means undisclosed, and an explicitly empty list reads as exact only
-with an R2-D1-6 proof behind it. Key presence never proves exactness.
+`late_discovery`, `mapped_unattached`, `health_loss`, `scope_uncertain`,
+or `coverage_retired`; absent means undisclosed, and an explicitly empty
+list reads as exact only with an R2-D1-6 proof behind it. Key presence
+never proves exactness. A `coverage_retired` window opens when a
+mid-capture global retirement detaches live attached counting probes
+with no same-apply reattach (`start_ns` is the detach decision
+instant, conservative by the async worker latency) and closes when the
+module re-attaches, else it reads open-ended at capture end. Every
+window carries conservative outer bounds, never a missed-call
+estimate; the affected-slot count rides in
+`evidence.coverage_retired_slots`.
 Modules the fanotify drain staged also carry `first_loaded_by`:
 `{exe, exe_unknown_reason, pre_attach_loads}`. `exe` is the loading
 program's `/proc/<pid>/exe` link text (lossy UTF-8), read at event
@@ -1078,7 +1099,8 @@ new schema revision.
 
 Any truncation, uncovered provider, export status other than `present`,
 `legacy_absent` or historical `required_absent`, count-only tuple, successful tuple with `none` authority,
-nonzero descendant gap, nonzero rebuild gap, or nonzero
+nonzero descendant gap, nonzero rebuild gap, nonzero retired-coverage
+slot count, or nonzero
 `task_uprobe_link_losses` or `abi_refusals` forces
 `evidence.completeness` to `PARTIAL`. The ordinary terminal trace
 `EVIDENCE` object carries the same profile-lane fields and rules, plus five
@@ -1203,6 +1225,16 @@ the ten reasons below:
 No path, pid, or executable ever appears in these rows: anything else
 filed under the subject redacts to the generic `discovery subject` /
 `discovery unavailable` pair.
+
+Counting-coverage retirements file under their own subject. Each record
+is `{name: "counting coverage", reason}` with `reason` exactly:
+
+- `counting probes were retired mid-capture; calls in the retire
+  window were not observed`: a mid-capture global retirement detached
+  live attached counting probes with no same-apply reattach. Repeat
+  retirements dedupe to this one row; the affected-slot count rides in
+  `evidence.coverage_retired_slots`, and each retire interval rides the
+  affected records' `coverage_retired` unobserved window.
 
 `evidence.run_tree_handed_back` (integer, `run` documents only, required
 there) counts the handed-back survivors: measured zero when the tree

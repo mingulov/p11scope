@@ -61,6 +61,9 @@ COUNTERS = (
     "discovery_read_failures",
     "discovery_truncated",
     "task_uprobe_link_losses",
+    # Live counting cover retired mid-capture (one engine accumulator,
+    # forces PARTIAL like every counter here).
+    "coverage_retired_slots",
 )
 
 # v2-metrics is retained only for historical fixtures and compatibility reads;
@@ -202,6 +205,7 @@ ALLOWED_UNOBSERVED_REASONS = {
     "mapped_unattached",
     "health_loss",
     "scope_uncertain",
+    "coverage_retired",
 }
 # Residual 6.13 review: the watch/window shapes are closed. `since_ns` is
 # always present (null until armed); `until_ns`/`ended_by` appear only when
@@ -672,6 +676,17 @@ RUN_TREE_REASONS = {
     RUN_TREE_DEGRADED,
     RUN_TREE_MEMBERSHIP_UNKNOWN,
 }
+# Counting-coverage retirements: live attached counting slots detached by a
+# mid-capture global retire file one fixed gap row under their own subject
+# (render.rs `capture_skipped_out` coverage arm). The affected-slot count
+# rides in `evidence.coverage_retired_slots`, the interval in the record's
+# `coverage_retired` unobserved window, never in the reason.
+COVERAGE_RETIRED_SUBJECT = "counting coverage"
+COVERAGE_RETIRED_REASON = (
+    "counting probes were retired mid-capture; "
+    "calls in the retire window were not observed"
+)
+COVERAGE_RETIRED_REASONS = {COVERAGE_RETIRED_REASON}
 # Learned-file gaps (v0.7.0): a provider the fanotify drain staged files
 # one fixed first-run gap under its own subject; overflow, the
 # per-capture cap and unavailable learning file their own aggregate
@@ -2461,6 +2476,7 @@ def expected_gap_classes(evidence):
             ("discovery_read_failures", evidence["discovery_read_failures"] > 0),
             ("discovery_truncated", evidence["discovery_truncated"] > 0),
             ("task_uprobe_link_losses", evidence["task_uprobe_link_losses"] > 0),
+            ("coverage_retired_slots", evidence["coverage_retired_slots"] > 0),
             ("pause_partial", evidence["pause_partial"] > 0),
             ("pause_unavailable", evidence["pause_unavailable"] > 0),
             ("loader_discovery", not loader_discovery_complete(evidence["loader_discovery"])),
@@ -3301,8 +3317,9 @@ def bounded_skip(item):
     run_tree = item["name"] == RUN_TREE_SUBJECT
     learned = item["name"] == LEARNED_SKIP_SUBJECT
     handoff = item["name"] in HANDOFF_SUBJECTS
+    coverage_retired = item["name"] == COVERAGE_RETIRED_SUBJECT
     require(
-        entry or gated_null or run_tree or learned or handoff
+        entry or gated_null or run_tree or learned or handoff or coverage_retired
         or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
@@ -3312,6 +3329,8 @@ def bounded_skip(item):
         allowed = RUN_TREE_REASONS
     elif learned:
         allowed = LEARNED_SKIP_REASONS
+    elif coverage_retired:
+        allowed = COVERAGE_RETIRED_REASONS
     elif handoff:
         allowed = HANDOFF_REASONS_BY_SUBJECT[item["name"]]
     else:

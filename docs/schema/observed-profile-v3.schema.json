@@ -39,7 +39,7 @@
         "aliased", "async_duplicates", "async_evictions",
         "async_orphans", "async_target_failures", "attach_backend", "attach_failures",
         "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
-        "authority", "cgroup_scope_failures", "completeness", "discovery",
+        "authority", "cgroup_scope_failures", "completeness", "coverage_retired_slots", "discovery",
         "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
         "discovery_state_failures", "discovery_truncated",
         "discovery_uncorroborated", "discovery_uncorroborated_candidates",
@@ -88,6 +88,7 @@
         "cgroup_scope_failures": {"type": "integer", "minimum": 0},
         "child_still_running": {"type": "boolean"},
         "completeness": {"enum": ["COMPLETE", "PARTIAL"]},
+        "coverage_retired_slots": {"type": "integer", "minimum": 0},
         "counter_collection": {
           "description": "Optional availability of the accepted cumulative counter snapshot. Cached ticks retain its original read window; failed attempts retain its mode and generation.",
           "type": "object",
@@ -625,7 +626,8 @@
                   "the terminal counter read failed; counts are unproven",
                   "the ring-loss line could not be emitted; loss is unproven",
                   "the terminal kernel evidence read failed; loss is unproven",
-                  "the reaped child's tail drain reached its deadline; its events are unproven"
+                  "the reaped child's tail drain reached its deadline; its events are unproven",
+                  "counting probes were retired mid-capture; calls in the retire window were not observed"
                 ]
               }
             }

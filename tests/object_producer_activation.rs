@@ -3379,6 +3379,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// lines):
 /// 155241 B, measured with this same lexer on the integrated source;
 /// the previous pin matches its parent.
+/// Re-baselined for v0.8.0 keymeta Task 7 (the only BPF source
+/// change since the modeled-stamp pin: the `inventory_info` module
+/// wiring in main.rs with its FULL-only cfg gate, plus its comment
+/// lines):
+/// 155307 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3388,8 +3394,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            155241,
-            "75035fe1cdbde2b674ef3477012573c44c6989f5bd646b599e240ad3f2cf0d9b"
+            155307,
+            "685600c0c2c4c6ef3b2e27a4dda466593e3522d1b425cd56d81038f22db8084a"
         ),
         "stripped BPF dump must stay byte-identical"
     );

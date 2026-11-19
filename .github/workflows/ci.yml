@@ -296,6 +296,14 @@ jobs:
         run: |
           cargo +"$(cat .release-rust-version)" test --locked --offline -p p11scope --no-default-features --features stub-object-attributes --test exec_task_continuity -- --exact --nocapture exec_ticket_absent_from_counter_flavors | tee "$RUNNER_TEMP/exec-ticket-p0.log"
           grep -q "^test result: ok. 1 passed" "$RUNNER_TEMP/exec-ticket-p0.log"
+      # Run the P0 shape pins on the P0 feature set so the info-pair
+      # omission (exact 12-program list, absent INFO maps) stays
+      # pinned in CI, not just compiled. Same proven-pass grep as
+      # the guard above: an empty filter fails here.
+      - shell: bash
+        run: |
+          cargo +"$(cat .release-rust-version)" test --locked --offline -p p11scope --lib --no-default-features --features stub-object-attributes -- --exact --nocapture attach::object_stop::tests::capture_objects_programs_are_scanned attach::inventory::callers::tests::caller_preparation_initializes_and_freezes_native_maps_before_loading_any_program attach::inventory::tests::inventory_full_program_shape_carries_the_info_pair attach::inventory::tests::inventory_full_map_manifest_carries_the_info_ring_and_stash | tee "$RUNNER_TEMP/p0-shape.log"
+          grep -q "^test result: ok. 4 passed" "$RUNNER_TEMP/p0-shape.log"
       - name: Run feature host-admission regressions
         shell: bash
         run: |

@@ -286,6 +286,7 @@ mod tests {
         FExit,
         Iter,
         UProbe,
+        URetProbe,
     }
 
     impl ClassifiedKind {
@@ -297,6 +298,13 @@ mod tests {
                     | (Self::FEntry, Section::FEntry { sleepable: false })
                     | (Self::FExit, Section::FExit { sleepable: false })
                     | (Self::Iter, Section::Iter { sleepable: false })
+                    | (
+                        Self::URetProbe,
+                        Section::URetProbe {
+                            sleepable: false,
+                            multi: false,
+                        }
+                    )
                     | (
                         Self::UProbe,
                         Section::UProbe {
@@ -317,9 +325,10 @@ mod tests {
         reason: ClassifiedReason,
     }
 
-    /// Pinned 13-row table: every capture-object program outside the
-    /// 17-program source scan, with the object(s) holding it, its section
-    /// kind and why it needs no gate. A new program fails closed.
+    /// Pinned 16-row table (13 in P0): every capture-object program
+    /// outside the 17-program source scan, with the object(s) holding
+    /// it, its section kind and why it needs no gate. A new program
+    /// fails closed.
     const CLASSIFIED: &[ClassifiedRow] = &[
         ClassifiedRow {
             name: "task_newtask",
@@ -423,6 +432,36 @@ mod tests {
             kind: ClassifiedKind::UProbe,
             source_file: "inventory.rs",
             section_or_attr: "#[uprobe]",
+            reason: ClassifiedReason::InventoryNoStopGate,
+        },
+        // Keymeta Task 7 (spec §17.4): the inventory info pair
+        // lives outside the stop gate by the same construction.
+        // FULL only: the P0 flavors omit the pair.
+        #[cfg(not(feature = "stub-object-attributes"))]
+        ClassifiedRow {
+            name: "p11_info_entry_lp64",
+            objects: &[ClassifiedObject::Inventory, ClassifiedObject::Callers],
+            kind: ClassifiedKind::UProbe,
+            source_file: "inventory_info.rs",
+            section_or_attr: "#[uprobe]",
+            reason: ClassifiedReason::InventoryNoStopGate,
+        },
+        #[cfg(not(feature = "stub-object-attributes"))]
+        ClassifiedRow {
+            name: "p11_info_entry_ia32",
+            objects: &[ClassifiedObject::Inventory, ClassifiedObject::Callers],
+            kind: ClassifiedKind::UProbe,
+            source_file: "inventory_info.rs",
+            section_or_attr: "#[uprobe]",
+            reason: ClassifiedReason::InventoryNoStopGate,
+        },
+        #[cfg(not(feature = "stub-object-attributes"))]
+        ClassifiedRow {
+            name: "p11_info_return",
+            objects: &[ClassifiedObject::Inventory, ClassifiedObject::Callers],
+            kind: ClassifiedKind::URetProbe,
+            source_file: "inventory_info.rs",
+            section_or_attr: "#[uretprobe]",
             reason: ClassifiedReason::InventoryNoStopGate,
         },
     ];
@@ -778,7 +817,17 @@ mod tests {
             .iter()
             .map(|program| program.name.clone())
             .collect();
-        assert_eq!(CLASSIFIED.len(), 13, "the classified table pins 13 rows");
+        // Keymeta Task 7 (spec §17.4): the FULL flavors classify
+        // the info pair too (13 → 16); the P0 flavors omit it.
+        #[cfg(feature = "stub-object-attributes")]
+        let classified_expected = 13;
+        #[cfg(not(feature = "stub-object-attributes"))]
+        let classified_expected = 16;
+        assert_eq!(
+            CLASSIFIED.len(),
+            classified_expected,
+            "the classified table pins its row count"
+        );
         for row in CLASSIFIED {
             assert!(
                 !scanned.contains(row.name),
@@ -794,6 +843,13 @@ mod tests {
         let detailed_expected = 27;
         #[cfg(not(feature = "unsafe-unvalidated-metadata"))]
         let detailed_expected = 22;
+        // Keymeta Task 7 (spec §17.4): the FULL inventory flavors
+        // carry the info pair (12 → 15, 13 → 16); the P0 flavors
+        // omit it.
+        #[cfg(feature = "stub-object-attributes")]
+        let (inventory_expected, callers_expected) = (12, 13);
+        #[cfg(not(feature = "stub-object-attributes"))]
+        let (inventory_expected, callers_expected) = (15, 16);
         let objects = [
             (
                 ClassifiedObject::Detailed,
@@ -803,12 +859,12 @@ mod tests {
             (
                 ClassifiedObject::Inventory,
                 crate::EBPF_INVENTORY_OBJECT,
-                12,
+                inventory_expected,
             ),
             (
                 ClassifiedObject::Callers,
                 crate::EBPF_INVENTORY_CALLERS_OBJECT,
-                13,
+                callers_expected,
             ),
         ];
         let mut parsed = Vec::new();

@@ -945,10 +945,19 @@ fn build_variant_with_proof(
         });
     }
     // P0-only ship vehicle: the Detailed object alone carries attribute
-    // adapters, so only it takes the stub feature. Inventory flavors
-    // compile the adapters out and are unaffected either way. Counter
-    // flavors never take the stub feature, so bank bytes stay identical.
-    if stub_object_attributes && !flavor.counters() && matches!(flavor, BpfFlavor::Detailed) {
+    // adapters, so only it takes the stub feature for those. Inventory
+    // flavors compile the adapters out and are unaffected either way —
+    // except that P0 inventory flavors take the stub feature to omit
+    // the keymeta Task 7 info pair (exact 12-program list, spec
+    // §17.4). Counter flavors never take the stub feature, so bank
+    // bytes stay identical.
+    if stub_object_attributes
+        && !flavor.counters()
+        && matches!(
+            flavor,
+            BpfFlavor::Detailed | BpfFlavor::InventoryGlobal | BpfFlavor::InventoryCallers
+        )
+    {
         features.push("stub-object-attributes");
     }
     if small_ring && !inventory {

@@ -2489,3 +2489,42 @@ fn bound_image_debug_redacts_private_numbers() {
     assert!(rendered.contains("<expected>"));
     assert!(!rendered.contains("41"));
 }
+
+/// Keymeta Task 7 (spec §17.5): the INFO join keys rows by caller
+/// incarnation, so the drain reads the binder's settled
+/// image→caller bindings (proven through the witness path, never
+/// synthesized here). Bound images resolve; unknown tickets, exec
+/// sequences and domains refuse.
+#[test]
+fn bound_caller_for_image_reads_the_settled_binding() {
+    let mut run = Run::new();
+    let d = run.domain;
+    let caller = run.world.admit(T, 1, 0, 100);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 210)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![Binding::Bound(caller)]);
+    assert_eq!(
+        run.binder
+            .bound_caller_for_image(d, DomainCookie::new(d, 7), 1),
+        Some(caller)
+    );
+    assert_eq!(
+        run.binder
+            .bound_caller_for_image(d, DomainCookie::new(d, 8), 1),
+        None,
+        "unknown ticket"
+    );
+    assert_eq!(
+        run.binder
+            .bound_caller_for_image(d, DomainCookie::new(d, 7), 2),
+        None,
+        "unknown exec sequence"
+    );
+    assert_eq!(
+        run.binder
+            .bound_caller_for_image(NativeDomainId::mint(), DomainCookie::new(d, 7), 1),
+        None,
+        "unknown domain"
+    );
+}

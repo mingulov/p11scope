@@ -16931,11 +16931,16 @@ fn every_bpf_ring_emit_site_counts_its_produced_record() {
     let files = [
         "crates/ebpf/src/main.rs",
         "crates/ebpf/src/journal_roots.rs",
+        // Keymeta Task 7 (spec §17.4): the INFO ring submit pairs
+        // its emission with the PRODUCED_INFO bump like every other
+        // submit site.
+        "crates/ebpf/src/inventory_info.rs",
     ];
     let mut output_sites = Vec::new();
     let mut submit_sites = Vec::new();
     let mut events_bumps = Vec::new();
     let mut discovery_bumps = Vec::new();
+    let mut info_bumps = Vec::new();
     let mut other_outputs = Vec::new();
     let mut other_submits = Vec::new();
     for file in files {
@@ -16980,6 +16985,14 @@ fn every_bpf_ring_emit_site_counts_its_produced_record() {
                     "{file}:{number}: the PRODUCED_DISCOVERY bump belongs to the discovery submit",
                 );
             }
+            if line.contains("bump_produced(PRODUCED_INFO)") {
+                info_bumps.push(format!("{file}:{number}"));
+                assert_eq!(
+                    enclosing_bpf_fn(&lines, index),
+                    "fn emit_info_record(",
+                    "{file}:{number}: the PRODUCED_INFO bump belongs to the INFO submit",
+                );
+            }
         }
     }
     assert!(
@@ -17009,8 +17022,8 @@ fn every_bpf_ring_emit_site_counts_its_produced_record() {
     );
     assert_eq!(
         submit_sites.len(),
-        6,
-        "ring submits must stay exactly the discovery submit plus the five EVENTS submits: {submit_sites:?}",
+        7,
+        "ring submits must stay exactly the discovery submit plus the five EVENTS submits plus the INFO submit: {submit_sites:?}",
     );
     assert_eq!(
         events_bumps.len(),
@@ -17021,6 +17034,11 @@ fn every_bpf_ring_emit_site_counts_its_produced_record() {
         discovery_bumps.len(),
         1,
         "PRODUCED_DISCOVERY bumps must stay exactly the discovery submit: {discovery_bumps:?}",
+    );
+    assert_eq!(
+        info_bumps.len(),
+        1,
+        "PRODUCED_INFO bumps must stay exactly the INFO submit: {info_bumps:?}",
     );
 }
 
@@ -17201,4 +17219,363 @@ fn keymeta_task2_length_capture_off_mode_identity_and_routing() {
         read("crates/ebpf-common/src/lib.rs").contains("pub const EVIDENCE_CELLS: u32 = 11;"),
         "EVIDENCE_CELLS pins the two length cells"
     );
+}
+
+/// Task 7 dual-ABI read-list pin (spec §17.1 layer 3): the exact
+/// per-(kind, layout) spans, payload lengths, struct ranges and
+/// argument positions the BPF return reader and the userspace
+/// decoder share. Expected values are transcribed from the spec,
+/// not from the implementation consts; the shared adapter twins and
+/// the LP64 bindgen oracle stay independent checks. The
+/// compiled-path control drives the shared return adapter (the exact
+/// body the BPF return calls) and asserts its observed reads equal
+/// the pin — while a widened variant matches none of them, so the
+/// pin catches a widened read.
+#[test]
+#[allow(clippy::type_complexity)]
+fn task7_info_read_lists_pin_both_abis() {
+    use p11scope_ebpf_common::LinuxLayout::{Ilp32, Lp64};
+    use p11scope_ebpf_common::inventory_info::{
+        INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN, INFO_LAYOUT_ILP32,
+        INFO_LAYOUT_LP64, INFO_PAYLOAD_MAX, info_mechanism_arg, info_payload_len, info_pointer_arg,
+        info_read_ranges, info_slot_arg, info_span_size,
+    };
+    use p11scope_ebpf_common::object_flow::{InfoReturnVerdict, InfoStart, adapter_info_return};
+    use p11scope_ebpf_common::{FnByteReader, LinuxLayout};
+    // (kind, layout, span, payload_len, ranges in struct order,
+    // pointer arg, slot arg, mechanism arg)
+    let cases: [(
+        u8,
+        LinuxLayout,
+        u8,
+        u16,
+        u8,
+        &[(u16, u16)],
+        u8,
+        Option<u8>,
+        Option<u8>,
+    ); 6] = [
+        (
+            INFO_KIND_PROVIDER,
+            Lp64,
+            INFO_LAYOUT_LP64,
+            88,
+            76,
+            &[(0, 34), (40, 42)],
+            0,
+            None,
+            None,
+        ),
+        (
+            INFO_KIND_PROVIDER,
+            Ilp32,
+            INFO_LAYOUT_ILP32,
+            76,
+            72,
+            &[(0, 34), (36, 38)],
+            0,
+            None,
+            None,
+        ),
+        (
+            INFO_KIND_TOKEN,
+            Lp64,
+            INFO_LAYOUT_LP64,
+            208,
+            76,
+            &[(32, 48), (96, 8), (136, 16), (184, 4)],
+            1,
+            Some(0),
+            None,
+        ),
+        (
+            INFO_KIND_TOKEN,
+            Ilp32,
+            INFO_LAYOUT_ILP32,
+            160,
+            64,
+            &[(32, 48), (96, 4), (116, 8), (140, 4)],
+            1,
+            Some(0),
+            None,
+        ),
+        (
+            INFO_KIND_MECHANISM,
+            Lp64,
+            INFO_LAYOUT_LP64,
+            24,
+            24,
+            &[(0, 24)],
+            2,
+            Some(0),
+            Some(1),
+        ),
+        (
+            INFO_KIND_MECHANISM,
+            Ilp32,
+            INFO_LAYOUT_ILP32,
+            12,
+            12,
+            &[(0, 12)],
+            2,
+            Some(0),
+            Some(1),
+        ),
+    ];
+    for (kind, layout, layout_code, span, payload_len, ranges, pointer, slot, mechanism) in cases {
+        let label = format!("kind {kind} layout {layout_code}");
+        assert_eq!(info_span_size(kind, layout), Some(span), "{label}: span");
+        assert_eq!(
+            info_payload_len(kind, layout),
+            Some(payload_len),
+            "{label}: payload len"
+        );
+        let list = info_read_ranges(kind, layout).expect("{label}: ranges exist");
+        assert_eq!(list.count as usize, ranges.len(), "{label}: range count");
+        assert_eq!(&list.ranges[..ranges.len()], ranges, "{label}: ranges");
+        assert_eq!(
+            info_pointer_arg(kind),
+            Some(pointer),
+            "{label}: pointer arg"
+        );
+        assert_eq!(info_slot_arg(kind), slot, "{label}: slot arg");
+        assert_eq!(
+            info_mechanism_arg(kind),
+            mechanism,
+            "{label}: mechanism arg"
+        );
+        // Compiled path: the shared return adapter reads exactly the
+        // pinned ranges on CKR_OK.
+        let base = 0x1000u64;
+        let stash = InfoStart {
+            info_ptr: base,
+            slot: 3,
+            mechanism: 5,
+            kind,
+            layout: layout_code,
+            reserved: [0; 6],
+        };
+        let mut observed = Vec::new();
+        let mut payload = [0u8; INFO_PAYLOAD_MAX];
+        let verdict = {
+            let observed = &mut observed;
+            let mut reader = FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+                observed.push((address - base, out.len()));
+                out.fill(0xAA);
+                Ok(())
+            });
+            adapter_info_return(&stash, 0, layout, &mut payload, &mut reader)
+        };
+        assert_eq!(
+            verdict,
+            InfoReturnVerdict::Emit(payload_len),
+            "{label}: emits"
+        );
+        let observed: Vec<(u64, usize)> = observed;
+        let expected: Vec<(u64, usize)> = ranges
+            .iter()
+            .map(|(off, len)| (u64::from(*off), usize::from(*len)))
+            .collect();
+        assert_eq!(observed, expected, "{label}: adapter reads the pin");
+        // Negative control: a widened variant (one byte past the end
+        // of every range) matches none of the observed reads.
+        for (off, len) in ranges {
+            let widened = (u64::from(*off), usize::from(*len) + 1);
+            assert!(
+                !observed.contains(&widened),
+                "{label}: widened read {widened:?} is not observed"
+            );
+        }
+    }
+    // Unknown kinds refuse on both ABIs.
+    for kind in [0u8, 4, 9, 255] {
+        for layout in [Lp64, Ilp32] {
+            assert_eq!(info_span_size(kind, layout), None, "kind {kind}: no span");
+            assert_eq!(
+                info_payload_len(kind, layout),
+                None,
+                "kind {kind}: no payload"
+            );
+            assert_eq!(
+                info_read_ranges(kind, layout),
+                None,
+                "kind {kind}: no ranges"
+            );
+        }
+        assert_eq!(info_pointer_arg(kind), None, "kind {kind}: no pointer arg");
+        assert_eq!(info_slot_arg(kind), None, "kind {kind}: no slot arg");
+        assert_eq!(
+            info_mechanism_arg(kind),
+            None,
+            "kind {kind}: no mechanism arg"
+        );
+    }
+}
+
+/// Task 7 read gate (spec §17.1 layer 3): the shared return adapter
+/// — the exact body the BPF return calls — reads through a
+/// faulting memory model, so a widened read faults instead of
+/// merely missing the pin. Every (kind, layout) case emits over
+/// its exact span; a window shrunk by one byte where reads reach
+/// the span edge, a hole punched in any pinned range, and a NULL
+/// pointer each resolve unavailable. Expected spans and ranges are
+/// transcribed from the spec, not from the implementation consts.
+#[test]
+#[allow(clippy::type_complexity)]
+fn task7_info_reads_fault_outside_their_spans() {
+    use p11scope_ebpf_common::LinuxLayout::{Ilp32, Lp64};
+    use p11scope_ebpf_common::inventory_info::{
+        INFO_KIND_MECHANISM, INFO_KIND_PROVIDER, INFO_KIND_TOKEN, INFO_LAYOUT_ILP32,
+        INFO_LAYOUT_LP64, INFO_PAYLOAD_MAX,
+    };
+    use p11scope_ebpf_common::object_flow::{InfoReturnVerdict, InfoStart, adapter_info_return};
+    use p11scope_ebpf_common::{FnByteReader, LinuxLayout};
+    // (kind, layout, layout code, span, ranges in struct order,
+    // reads_reach_span_end)
+    let cases: [(u8, LinuxLayout, u8, u64, &[(u16, u16)], bool); 6] = [
+        (
+            INFO_KIND_PROVIDER,
+            Lp64,
+            INFO_LAYOUT_LP64,
+            88,
+            &[(0, 34), (40, 42)],
+            false,
+        ),
+        (
+            INFO_KIND_PROVIDER,
+            Ilp32,
+            INFO_LAYOUT_ILP32,
+            76,
+            &[(0, 34), (36, 38)],
+            false,
+        ),
+        (
+            INFO_KIND_TOKEN,
+            Lp64,
+            INFO_LAYOUT_LP64,
+            208,
+            &[(32, 48), (96, 8), (136, 16), (184, 4)],
+            false,
+        ),
+        (
+            INFO_KIND_TOKEN,
+            Ilp32,
+            INFO_LAYOUT_ILP32,
+            160,
+            &[(32, 48), (96, 4), (116, 8), (140, 4)],
+            false,
+        ),
+        (
+            INFO_KIND_MECHANISM,
+            Lp64,
+            INFO_LAYOUT_LP64,
+            24,
+            &[(0, 24)],
+            true,
+        ),
+        (
+            INFO_KIND_MECHANISM,
+            Ilp32,
+            INFO_LAYOUT_ILP32,
+            12,
+            &[(0, 12)],
+            true,
+        ),
+    ];
+    for (kind, layout, layout_code, span, ranges, reaches_end) in cases {
+        let label = format!("kind {kind} layout {layout_code}");
+        let base = 0x5000u64;
+        let stash = InfoStart {
+            info_ptr: base,
+            slot: 3,
+            mechanism: 5,
+            kind,
+            layout: layout_code,
+            reserved: [0; 6],
+        };
+        // Over the exact span: emits, and every read lands inside.
+        let mut observed = Vec::new();
+        let mut payload = [0u8; INFO_PAYLOAD_MAX];
+        let verdict = {
+            let observed = &mut observed;
+            let mut reader = FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+                let offset = address.checked_sub(base).unwrap();
+                assert!(
+                    offset + out.len() as u64 <= span,
+                    "{label}: read [{offset}, {}) escapes the {span}-byte span",
+                    offset + out.len() as u64,
+                );
+                observed.push((offset, out.len()));
+                out.fill(0xAA);
+                Ok(())
+            });
+            adapter_info_return(&stash, 0, layout, &mut payload, &mut reader)
+        };
+        assert!(
+            matches!(verdict, InfoReturnVerdict::Emit(_)),
+            "{label}: emits over its span"
+        );
+        let expected: Vec<(u64, usize)> = ranges
+            .iter()
+            .map(|(off, len)| (u64::from(*off), usize::from(*len)))
+            .collect();
+        assert_eq!(observed, expected, "{label}: reads match the pin");
+        // A window shrunk by one byte faults where reads reach the
+        // span edge: the gate catches the edge read.
+        if reaches_end {
+            let mut payload = [0u8; INFO_PAYLOAD_MAX];
+            let mut reader = FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+                let offset = address.checked_sub(base).ok_or(())?;
+                if offset + out.len() as u64 > span - 1 {
+                    return Err(());
+                }
+                out.fill(0xAA);
+                Ok(())
+            });
+            assert_eq!(
+                adapter_info_return(&stash, 0, layout, &mut payload, &mut reader),
+                InfoReturnVerdict::Unavailable,
+                "{label}: one byte past the shrunk window faults"
+            );
+        }
+        // A hole in any pinned range resolves unavailable: every
+        // pinned byte is really read.
+        for (hole_off, hole_len) in ranges {
+            let hole_off = u64::from(*hole_off);
+            let hole_end = hole_off + u64::from(*hole_len);
+            let mut payload = [0u8; INFO_PAYLOAD_MAX];
+            let mut reader = FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+                let offset = address.checked_sub(base).ok_or(())?;
+                if offset < hole_end && hole_off < offset + out.len() as u64 {
+                    return Err(());
+                }
+                out.fill(0xAA);
+                Ok(())
+            });
+            assert_eq!(
+                adapter_info_return(&stash, 0, layout, &mut payload, &mut reader),
+                InfoReturnVerdict::Unavailable,
+                "{label}: a hole in range {hole_off}+{hole_len} faults"
+            );
+        }
+        // A NULL pointer joins to nothing through the same gate.
+        let null = InfoStart {
+            info_ptr: 0,
+            ..stash
+        };
+        let mut payload = [0u8; INFO_PAYLOAD_MAX];
+        let mut reader = FnByteReader(|address: u64, _layout: LinuxLayout, out: &mut [u8]| {
+            let offset = address.checked_sub(base).ok_or(())?;
+            if offset + out.len() as u64 > span {
+                return Err(());
+            }
+            out.fill(0xAA);
+            Ok(())
+        });
+        assert_eq!(
+            adapter_info_return(&null, 0, layout, &mut payload, &mut reader),
+            InfoReturnVerdict::Unavailable,
+            "{label}: NULL reads nothing"
+        );
+    }
 }

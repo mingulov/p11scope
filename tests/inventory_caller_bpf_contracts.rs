@@ -83,6 +83,12 @@ fn caller_inventory_object_has_exact_maps_native_boundary_and_entry_controls() {
         "CALLER_EVIDENCE",
         "TASK_COOKIE",
         "COOKIE_CTL",
+        // Keymeta Task 7 (spec §17.4): the info pair references
+        // its stash, ring, kind publication and evidence cells.
+        "INFO_START",
+        "INFO",
+        "INFO_KIND",
+        "INFO_EVIDENCE",
     ] {
         assert!(
             referenced.contains(&descriptors[name]),

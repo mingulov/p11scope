@@ -16211,7 +16211,23 @@ impl Engine {
             };
             return inventory.reserve_owner(&mut self.next_view_id);
         }
-        if let Some(reused) = self.retired_view_ids.pop() {
+        // Recycled-ID holdback (merge-ownership spec §8 D1): a numeric ID
+        // whose previous generation still has a committed carried row is
+        // unavailable for admission — the retained row would otherwise ride
+        // alongside the reused-ID generation and both would file claims
+        // under one view. Held IDs stay on the free list, so they become
+        // available again on their own once the last carried row retires;
+        // with every free ID held, allocation falls through to minting (or
+        // defers at capacity) exactly as on exhaustion. The pick stays
+        // last-in-first-out among the available IDs.
+        let pick = self.retired_view_ids.iter().rposition(|id| {
+            !self
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == ProcessViewId(*id))
+        });
+        if let Some(index) = pick {
+            let reused = self.retired_view_ids.remove(index);
             return Ok(ProcessViewId(reused));
         }
         if self.next_view_id as usize >= self.max_scan_pids {

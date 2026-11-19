@@ -2626,6 +2626,365 @@ fn fold_credit_deferred_caller_revised_behind_fifo_waits_for_terminal() {
     );
 }
 
+/// Staged-authority twin: an oversized caller stages across the credit
+/// boundary while 1,022 exited siblings fold, then revises its terminal
+/// payload (same member keys) behind the capped FIFO while the live
+/// leader stays certified. The streaming wrapper excludes the staged
+/// caller from the fresh carry; the coordinator must cancel the stage
+/// without folding — the row, its sequences and its queued terminal
+/// revision all survive the pass — and the caller folds once its
+/// revision lands, with the stream carrying the terminal payloads
+/// last. Counts ride on the captured views, as in the credit-deferred
+/// twin; the binder sequences that make the caller oversized never
+/// render.
+#[test]
+fn fold_staged_caller_revised_behind_fifo_cancels_without_forgetting_terminal() {
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
+    use crate::discovery::instances::InstanceId;
+    use crate::inventory_present::Presence;
+    use p11scope_ebpf_common::ImageIdentity;
+    const SIBLINGS: u32 = 1022;
+    // Members: 65,533 sequences + 2 edges + 1 instance = 65,536 =
+    // 1,024 strides, so the caller costs 1,025 credits and stages.
+    // Pass A folds the siblings (1,022 credits) and rehearses two
+    // strides of the stage; a carry violation would drain the
+    // remaining 1,022 strides in pass B and fold.
+    const BINDER: u64 = 65_533;
+    let mut harness = harness((SIBLINGS + 2) as usize, 1);
+    let live = caller(&harness, 0);
+    let heavy = caller(&harness, SIBLINGS + 1);
+    assert!(live < heavy, "the live edge queues ahead of the staged exit");
+    let mut exited = Vec::new();
+    for index in 1..=SIBLINGS + 1 {
+        exited.push(caller(&harness, index));
+    }
+    assert_eq!(
+        exited.iter().max(),
+        Some(&heavy),
+        "the staged caller sorts last, past the credit boundary"
+    );
+    // The staged caller owns a second edge, an instance (so both
+    // instance slots gate with its edges) and the binder sequences
+    // that make it oversized.
+    let domain = NativeDomainId::try_mint().expect("fresh domain");
+    let extra = key(99);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .scripted_module_edge(extra.clone(), heavy);
+    let instance_key = InstanceKey::scripted(
+        domain,
+        ImageIdentity {
+            task_cookie: 300,
+            exec_id: 1,
+        },
+        InstanceId::from_raw(7),
+        extra,
+    );
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .note_instance(AdmittedInstance::scripted(instance_key, heavy));
+    harness.coordinator_mut().registry_mut().publish();
+    let binder_domain = NativeDomainId::try_mint().expect("fresh binder domain");
+    for sequence in 0..BINDER {
+        harness.coordinator_mut().stage_binder_cookie_for_test(
+            binder_domain,
+            100 + sequence,
+            sequence,
+            Some(heavy),
+        );
+    }
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 24, 4).unwrap();
+    let mut state = StreamState::new();
+    state.edges = EdgeEmitter::with_cap(1);
+    state.instances = InstanceEmitter::with_cap(1);
+    let mut pass = 0u64;
+    let emit_until_carried =
+        |writer: &mut EventWriter, state: &mut StreamState, view: &Presentation, pass: &mut u64| {
+            for _ in 0..100_000 {
+                *pass += 1;
+                let at = *pass;
+                emit_pass_events(writer, state, &report(*pass), view, at).unwrap();
+                if state.last_deferred.edge_events == 0
+                    && state.last_deferred.instance_events == 0
+                    && state.last_deferred.semantic_edge_events == 0
+                {
+                    return;
+                }
+            }
+            panic!("the capped FIFO never drained");
+        };
+    // Carry every initial row: the exiting edges at 2 entries.
+    let mut pass1 = presentation(&harness);
+    assert_eq!(
+        pass1.edges.len(),
+        (SIBLINGS + 3) as usize,
+        "one edge per caller plus the staged second"
+    );
+    assert_eq!(pass1.instances.len(), 1, "the instance row renders");
+    assert_eq!(pass1.semantic_edges.len(), 1, "the semantic row renders");
+    for edge in &mut pass1.edges {
+        if edge.caller != live {
+            edge.entry_count = 2;
+        }
+    }
+    emit_until_carried(&mut writer, &mut state, &pass1, &mut pass);
+
+    // The exits: every caller but the live one dies through the
+    // production reconcile path, and each edge reaches its terminal
+    // revision (exit presence, 3 entries).
+    for pid in FIRST_PID + 1..=FIRST_PID + SIBLINGS + 1 {
+        harness.source().kill(pid);
+    }
+    let observed: BTreeSet<u32> = [FIRST_PID].into_iter().collect();
+    let now = harness.now_ns();
+    let events = harness.coordinator_mut().adapter_mut().reconcile(
+        &observed,
+        &mut |_| ImageAuthority::ScanPinned,
+        now,
+    );
+    harness
+        .coordinator_mut()
+        .apply_reconcile_events(&events, now);
+    harness.advance(10);
+    for id in &exited {
+        assert!(
+            harness
+                .coordinator()
+                .adapter()
+                .record(*id)
+                .is_some_and(|record| record.retired),
+            "production reconcile retires every dead pid"
+        );
+    }
+    let mut pass_terminal = presentation(&harness);
+    for edge in &mut pass_terminal.edges {
+        if edge.caller == live {
+            edge.entry_count = 1;
+        } else {
+            assert_eq!(
+                edge.presence,
+                Presence::ProcessExited,
+                "the exit flips presence"
+            );
+            edge.entry_count = 3;
+        }
+    }
+    let terminal_seen = pass_terminal.instances[0].last_seen_ns;
+    let terminal_returns = pass_terminal.semantic_edges[0].api_returns;
+    emit_until_carried(&mut writer, &mut state, &pass_terminal, &mut pass);
+
+    // Pass A: the fold carries 1,024 credits, folds the 1,022 siblings
+    // and stages the oversized caller with the remaining two.
+    state.last_stream_view = Some(std::sync::Arc::new(pass_terminal.clone()));
+    let dummy = dir.path().join("dummy.jsonl");
+    let stream = EventLogState::new(Some(EventWriter::create(&dummy, 1 << 20, 2).unwrap()));
+    assert!(stream.emits(), "the gate runs on the streaming path");
+    let now = harness.now_ns();
+    let report_a = retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert_eq!(
+        report_a.retired,
+        u64::from(SIBLINGS),
+        "pass A folds the credited siblings"
+    );
+    assert!(
+        harness.coordinator().adapter().record(heavy).is_some(),
+        "the oversized caller waits staged"
+    );
+    assert_eq!(
+        harness.coordinator().staged_fold_complete_for_test(),
+        Some(false),
+        "pass A leaves the stage open"
+    );
+    for id in exited.iter().filter(|id| **id != heavy) {
+        assert!(
+            harness.coordinator().adapter().record(*id).is_none(),
+            "every credited row folds"
+        );
+    }
+    assert_eq!(state.edges.tracked_len(), 3, "live plus the staged pair");
+    let totals = harness.coordinator().registry().departed_totals();
+    assert_eq!(totals.edges, u64::from(SIBLINGS), "1,022 edges folded");
+
+    // The retained revision: the staged scale edge jumps a count
+    // bucket (3 to 4) and both instance slots move, while the live
+    // edge's own bump (1 to 2) queues ahead behind the unit cap.
+    // Member keys stay identical, so only the carry exclusion guards
+    // the stage.
+    let mut pass_revised = presentation(&harness);
+    assert_eq!(
+        pass_revised.edges.len(),
+        3,
+        "only the live edge and the staged pair survive the fold"
+    );
+    let m0 = pass_revised
+        .edges
+        .iter()
+        .find(|edge| edge.caller == live)
+        .expect("live edge retained")
+        .module;
+    for edge in &mut pass_revised.edges {
+        if edge.caller == live {
+            edge.entry_count = 2;
+        } else if edge.caller == heavy {
+            edge.entry_count = if edge.module == m0 { 4 } else { 3 };
+        }
+    }
+    for row in &mut pass_revised.instances {
+        row.last_seen_ns = terminal_seen + 1;
+    }
+    for row in &mut pass_revised.semantic_edges {
+        row.api_returns = Some(terminal_returns.unwrap_or(0) + 5);
+    }
+    pass += 1;
+    emit_pass_events(&mut writer, &mut state, &report(pass), &pass_revised, pass).unwrap();
+    assert_eq!(
+        state.last_deferred.edge_events, 1,
+        "the edge revision waits behind the live row"
+    );
+    assert_eq!(
+        state.last_deferred.instance_events, 0,
+        "the instance row drains"
+    );
+    assert_eq!(
+        state.last_deferred.semantic_edge_events, 1,
+        "the semantic revision waits behind the cap"
+    );
+
+    // Pass B: the fresh carry excludes the staged caller (its terminal
+    // revisions are still queued) while the live leader stays
+    // certified. The stage must cancel without folding: live state and
+    // the queued payloads survive the pass.
+    state.last_stream_view = Some(std::sync::Arc::new(pass_revised.clone()));
+    let carried_before = state.edges.carried_bytes();
+    let now = harness.now_ns();
+    let report_b = retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert_eq!(
+        report_b.retired, 0,
+        "the excluded stage folds nothing past the queued revisions"
+    );
+    assert!(
+        harness.coordinator().adapter().record(heavy).is_some(),
+        "the staged row survives the exclusion pass"
+    );
+    assert!(
+        !harness.coordinator().staged_fold_open_for_test(),
+        "the excluded stage cancels instead of folding"
+    );
+    let owners = harness.coordinator().binder_bound_owners_for_test();
+    assert_eq!(
+        owners.len(),
+        BINDER as usize,
+        "the cancelled stage keeps every sequence bound"
+    );
+    assert!(
+        owners.iter().all(|owner| *owner == heavy),
+        "no other row loses evidence to the pass"
+    );
+    assert_eq!(
+        harness.coordinator().registry().edges_of(heavy).count(),
+        2,
+        "the cancelled stage keeps every edge live"
+    );
+    assert_eq!(
+        state.edges.tracked_len(),
+        3,
+        "the waiting caller's digests survive the pass"
+    );
+    assert_eq!(
+        state.edges.carried_bytes(),
+        carried_before,
+        "no digest leaves the retention bound before its revision lands"
+    );
+
+    // The next passes drain both terminal revisions with the same
+    // terminal rows; then the fold runs.
+    emit_until_carried(&mut writer, &mut state, &pass_revised, &mut pass);
+    let edges_before = harness.coordinator().fold_edge_commit_visits_for_test();
+    let instances_before = harness
+        .coordinator()
+        .fold_instance_commit_visits_for_test();
+    state.last_stream_view = Some(std::sync::Arc::new(pass_revised));
+    let now = harness.now_ns();
+    let report_c = retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+    assert_eq!(
+        report_c.retired, 1,
+        "the published terminal revisions fold the staged caller"
+    );
+    assert!(
+        harness.coordinator().adapter().record(heavy).is_none(),
+        "the staged row folds once its revision lands"
+    );
+    assert!(
+        harness.coordinator().binder_bound_owners_for_test().is_empty(),
+        "every staged sequence clears exactly once"
+    );
+    let marks = harness
+        .coordinator()
+        .fold_identity_insert_marks_for_test();
+    assert_eq!(
+        &marks[marks.len().saturating_sub(2)..],
+        &[(edges_before + 1, instances_before), (edges_before + 2, instances_before)],
+        "the staged commit names each module while its first edge folds"
+    );
+    drop(writer);
+
+    // The stream alone proves the terminal payloads: the last record
+    // of each row kind carries the terminal revision, the folded
+    // digests leave the retention bound, and the departed aggregate
+    // counts the folded pair.
+    let all = lines(&path);
+    let last_edge = all
+        .iter()
+        .rev()
+        .find(|line| line["kind"] == "edge_observed")
+        .expect("edge records streamed");
+    assert_eq!(
+        last_edge["event"]["entries"]["count"].as_u64().unwrap(),
+        4,
+        "the terminal edge revision streams last"
+    );
+    let last_instance = all
+        .iter()
+        .rev()
+        .find(|line| line["kind"] == "instance_observed")
+        .expect("instance records streamed");
+    assert_eq!(
+        last_instance["event"]["last_seen_ns"].as_u64().unwrap(),
+        terminal_seen + 1,
+        "the terminal instance revision streams last"
+    );
+    let last_semantic = all
+        .iter()
+        .rev()
+        .find(|line| line["kind"] == "semantic_edge_observed")
+        .expect("semantic records streamed");
+    assert_eq!(
+        last_semantic["event"]["api_returns"]["count"]
+            .as_u64()
+            .unwrap(),
+        terminal_returns.unwrap_or(0) + 5,
+        "the terminal semantic revision streams last"
+    );
+    assert_eq!(state.edges.tracked_len(), 1, "one live digest retained");
+    assert!(
+        state.edges.carried_bytes() < carried_before,
+        "the folded digests leave the retention bound"
+    );
+    assert_eq!(state.instances.tracked_len(), 0, "no digest retained");
+    let totals = harness.coordinator().registry().departed_totals();
+    assert_eq!(
+        totals.edges,
+        u64::from(SIBLINGS + 2),
+        "the staged pair folds"
+    );
+}
+
 /// F1 slot twin: at the credit boundary, each instance slot vetoes
 /// independently while its edge is current. Two waiters defer past
 /// 1,024 credited folds; w1's instance row then moves alone and

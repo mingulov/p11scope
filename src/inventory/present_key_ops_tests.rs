@@ -1958,8 +1958,10 @@ fn key_ops_folded_instance_resolves_its_provider() {
         crate::cli::TextVerbosity::Concise,
         crate::cli::TextVerbosity::Verbose,
     ] {
-        let live_block = key_ops_block(&render_snapshot_with_verbosity(&live, verbosity));
-        let folded_block = key_ops_block(&render_snapshot_with_verbosity(&folded, verbosity));
+        let live_text = render_snapshot_with_verbosity(&live, verbosity);
+        let folded_text = render_snapshot_with_verbosity(&folded, verbosity);
+        let live_block = key_ops_block(&live_text);
+        let folded_block = key_ops_block(&folded_text);
         assert_eq!(
             folded_block, live_block,
             "folded renders exactly like live ({verbosity:?})"

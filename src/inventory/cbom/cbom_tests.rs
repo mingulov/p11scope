@@ -2359,11 +2359,11 @@ fn cbom_folded_instance_bounds_stay_named_unknowns() {
     let document = super::render::render_json(&projection);
     assert_eq!(
         metadata_value(&document, "p11scope:departed_folded_instances_dropped"),
-        json!(7)
+        "7"
     );
     assert_eq!(
         metadata_value(&document, "p11scope:departed_folded_instances_saturated"),
-        json!(1)
+        "1"
     );
 }
 

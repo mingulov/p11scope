@@ -199,6 +199,14 @@ fn render_metadata(projection: &Projection) -> Value {
             unknowns.departed_identities_saturated,
         ),
         (
+            "p11scope:departed_folded_instances_dropped",
+            unknowns.departed_folded_instances_dropped,
+        ),
+        (
+            "p11scope:departed_folded_instances_saturated",
+            unknowns.departed_folded_instances_saturated,
+        ),
+        (
             "p11scope:departed_mech_overflow",
             unknowns.departed_mechs_overflow,
         ),

@@ -1977,6 +1977,17 @@ fn key_provider_groups(
             .entry(instance.id.label())
             .or_insert(instance.module);
     }
+    // Folded instances keep their provider through the departed
+    // aggregate: live rows win (labels are never reused, so the two
+    // maps never truly collide).
+    for module in &presentation.modules {
+        let Some(departed) = module.departed_use.as_ref() else {
+            continue;
+        };
+        for instance in departed.folded_instances.keys() {
+            modules.entry(instance.label()).or_insert(module.id);
+        }
+    }
     // (tallies by category, instance labels, inference partitions)
     // per resolved module, plus the unidentified residual under `None`.
     type TalliesByCategory<'a> = BTreeMap<&'a str, (u64, u64, u64, &'a str)>;

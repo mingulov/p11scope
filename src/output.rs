@@ -92,6 +92,13 @@ pub struct AtomicFile {
     /// Production builds have no such field.
     #[cfg(test)]
     fail_write_with: Option<i32>,
+    /// Test-only mid-stream fault: when `fail_write_with` is `Some`
+    /// and this is `Some(remaining)`, the next `remaining`
+    /// `write_document` calls succeed (writing to the temp) before
+    /// failing. `None` fails immediately (the legacy behavior).
+    /// Production builds have no such field.
+    #[cfg(test)]
+    fail_write_after: Option<usize>,
 }
 
 /// Why one commit attempt failed: a final-name security refusal keeps
@@ -255,6 +262,8 @@ impl AtomicFile {
                         fail_sync_with: None,
                         #[cfg(test)]
                         fail_write_with: None,
+                        #[cfg(test)]
+                        fail_write_after: None,
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -282,6 +291,17 @@ impl AtomicFile {
     #[cfg(test)]
     pub(crate) fn set_fail_write_with(&mut self, errno: i32) {
         self.fail_write_with = Some(errno);
+        self.fail_write_after = None;
+    }
+
+    /// Test-only: the next `successes` `write_document` calls succeed,
+    /// then every later call fails with `errno`. Pins mid-stream
+    /// short writes (a confirmed primary prefix plus a failing tail)
+    /// without filling a disk.
+    #[cfg(test)]
+    pub(crate) fn set_fail_write_after(&mut self, successes: usize, errno: i32) {
+        self.fail_write_with = Some(errno);
+        self.fail_write_after = Some(successes);
     }
 
     /// Writes a finished in-memory document to the temp. `-o` call
@@ -292,7 +312,22 @@ impl AtomicFile {
     pub fn write_document(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         #[cfg(test)]
         if let Some(errno) = self.fail_write_with {
-            return Err(std::io::Error::from_raw_os_error(errno));
+            if let Some(remaining) = self.fail_write_after.as_mut() {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                } else {
+                    return Err(std::io::Error::from_raw_os_error(errno));
+                }
+            } else {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+        }
+        #[cfg(test)]
+        if let Some(remaining) = test_write_budget_remaining() {
+            if bytes.len() as u64 > remaining {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            test_write_budget_consume(bytes.len() as u64);
         }
         std::io::Write::write_all(&mut self.temp_file, bytes)
     }
@@ -2169,6 +2204,11 @@ pub(crate) struct RecoveryStaging {
     path: PathBuf,
     actual: PathBuf,
     finished: bool,
+    /// Test-only write fault: when `Some(errno)`, staging writes fail
+    /// with that errno instead of writing. Set from the thread-local
+    /// staging fault at creation. Production builds have no such field.
+    #[cfg(test)]
+    fail_write_with: Option<i32>,
 }
 
 impl RecoveryStaging {
@@ -2226,6 +2266,8 @@ impl RecoveryStaging {
             // SAFETY: openat succeeded, so the fd is owned.
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             let path = actual.join(&name);
+            #[cfg(test)]
+            let fail_write_with = TEST_STAGING_FAIL_WRITE.with(|flag| flag.get());
             return Ok(Self {
                 dir,
                 file,
@@ -2233,17 +2275,14 @@ impl RecoveryStaging {
                 path,
                 actual,
                 finished: false,
+                #[cfg(test)]
+                fail_write_with,
             });
         }
         Err(format!(
             "cannot allocate a unique recovery file in {}",
             actual.display()
         ))
-    }
-
-    /// The staging file, for incremental bounded writes.
-    pub(crate) fn file_mut(&mut self) -> &mut std::fs::File {
-        &mut self.file
     }
 
     /// The recovery dir actually held (the base or the fresh fallback
@@ -2287,6 +2326,31 @@ impl RecoveryStaging {
     }
 }
 
+impl std::io::Write for RecoveryStaging {
+    /// Incremental bounded writes to the staging file. Test builds
+    /// honor the thread-local staging fault and the shared write
+    /// budget before touching the file; production builds write
+    /// directly.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(errno) = self.fail_write_with {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+        #[cfg(test)]
+        if let Some(remaining) = test_write_budget_remaining() {
+            if bytes.len() as u64 > remaining {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            test_write_budget_consume(bytes.len() as u64);
+        }
+        std::io::Write::write(&mut self.file, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Drop for RecoveryStaging {
     fn drop(&mut self) {
         if !self.finished {
@@ -2313,7 +2377,7 @@ fn save_recovered_stream(
         .to_string_lossy()
         .into_owned();
     let actual = staging.actual().to_path_buf();
-    if let Err(error) = std::io::copy(reader, staging.file_mut()) {
+    if let Err(error) = std::io::copy(reader, &mut staging) {
         staging.abort();
         return Err(format!(
             "writing recovery file {name} in {} failed: {error}",
@@ -2363,6 +2427,75 @@ impl Drop for RecoveredOverrideGuard<'_> {
     }
 }
 
+// Test-only shared write budget (bytes) for the primary temp and the
+// recovery staging on this thread. When `Some`, both sinks consume
+// from the same budget and fail with ENOSPC once it cannot cover a
+// write. Pins the same-filesystem/quota case where an eager second
+// file consumes the space the primary needs. Thread-local, so
+// concurrent twins do not race; production builds have no such hook.
+#[cfg(test)]
+thread_local! {
+    static TEST_WRITE_BUDGET: std::cell::RefCell<Option<u64>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_STAGING_FAIL_WRITE: std::cell::Cell<Option<i32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn test_write_budget_remaining() -> Option<u64> {
+    TEST_WRITE_BUDGET.with(|budget| *budget.borrow())
+}
+
+#[cfg(test)]
+fn test_write_budget_consume(bytes: u64) {
+    TEST_WRITE_BUDGET.with(|budget| {
+        let mut guard = budget.borrow_mut();
+        if let Some(remaining) = guard.as_mut() {
+            *remaining = remaining.saturating_sub(bytes);
+        }
+    });
+}
+
+/// Holds a shared write budget for one twin. Clears it on drop.
+#[cfg(test)]
+pub(crate) struct WriteBudgetGuard;
+
+#[cfg(test)]
+pub(crate) fn hold_write_budget(bytes: u64) -> WriteBudgetGuard {
+    TEST_WRITE_BUDGET.with(|budget| {
+        *budget.borrow_mut() = Some(bytes);
+    });
+    WriteBudgetGuard
+}
+
+#[cfg(test)]
+impl Drop for WriteBudgetGuard {
+    fn drop(&mut self) {
+        TEST_WRITE_BUDGET.with(|budget| {
+            *budget.borrow_mut() = None;
+        });
+    }
+}
+
+/// Holds a staging write fault for one twin: every recovery staging
+/// created on this thread while the guard lives fails its writes
+/// with `errno`. Clears on drop.
+#[cfg(test)]
+pub(crate) struct StagingFailGuard;
+
+#[cfg(test)]
+pub(crate) fn hold_staging_fail_write(errno: i32) -> StagingFailGuard {
+    TEST_STAGING_FAIL_WRITE.with(|flag| flag.set(Some(errno)));
+    StagingFailGuard
+}
+
+#[cfg(test)]
+impl Drop for StagingFailGuard {
+    fn drop(&mut self) {
+        TEST_STAGING_FAIL_WRITE.with(|flag| flag.set(None));
+    }
+}
+
 #[cfg(test)]
 pub(crate) use tests::{atomic_file_test_fixture, atomic_file_test_fixture_read_only};
 
@@ -2396,6 +2529,7 @@ mod tests {
             cleanup: true,
             fail_sync_with: None,
             fail_write_with: None,
+            fail_write_after: None,
         }
     }
 

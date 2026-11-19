@@ -245,7 +245,7 @@ impl std::io::Write for StreamingTee<'_> {
         }
         let mut staging_ok = false;
         if let Some(staging) = self.staging.as_mut() {
-            match std::io::Write::write_all(staging.file_mut(), bytes) {
+            match std::io::Write::write_all(staging, bytes) {
                 Ok(()) => staging_ok = true,
                 Err(error) => {
                     // Drop the broken staging now: its partial file is
@@ -1000,6 +1000,212 @@ mod tests {
                 .is_err()
         );
         assert_eq!(std::fs::read(path).unwrap(), b"old diagnostics");
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// The healthy export for byte-for-byte comparisons: deterministic
+    /// (no timestamps in header/footer), so two runs with the same
+    /// outcome produce identical bytes. Runs without a budget or
+    /// fault, in its own dir, returning the published file's bytes.
+    fn healthy_export_bytes() -> Vec<u8> {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let destination = fixture_destination(&path, None, None);
+        destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap();
+        std::fs::read(&path).unwrap()
+    }
+
+    /// A single-copy budget (exactly the healthy export's length,
+    /// shared by the primary and any recovery staging) must still
+    /// publish the complete export byte-for-byte: the healthy write
+    /// stays on the primary, and no recovery dir is created. An eager
+    /// second file would exhaust the budget and fail.
+    #[test]
+    fn healthy_export_with_single_copy_budget_succeeds_without_recovery() {
+        let expected = healthy_export_bytes();
+        assert!(!expected.is_empty(), "the healthy export is non-empty");
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let _budget = crate::output::hold_write_budget(expected.len() as u64);
+        let destination = fixture_destination(&path, None, None);
+        let summary = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap();
+        assert_eq!(summary.records_written, 1);
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(
+            data, expected,
+            "a single-copy budget must yield the complete export byte-for-byte"
+        );
+        assert!(
+            !recovered_base.exists(),
+            "a healthy export must not create a recovery dir"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A mid-stream primary short write (ENOSPC after the header)
+    /// saves the complete export to recovery byte-for-byte equal to
+    /// the healthy export: the confirmed prefix is replayed once, the
+    /// failing record and the tail continue there, and no recovery
+    /// file exists before the failure. The destination keeps its old
+    /// bytes, and no temp litters the directory.
+    #[test]
+    fn mid_stream_short_write_replays_prefix_without_duplication() {
+        let expected = healthy_export_bytes();
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_after(1, libc::ENOSPC);
+        let mut calls = 0;
+        let mut early_staging = false;
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || {
+                calls += 1;
+                // The first two cancellation polls run before the
+                // mid-stream failure (before the header, then after
+                // the header but before the failing record): no
+                // recovery file or dir may exist yet.
+                if calls <= 2 {
+                    if recovered_base.exists() {
+                        early_staging = true;
+                    }
+                    if let Ok(entries) = std::fs::read_dir(&recovered_base) {
+                        if entries.filter_map(|entry| entry.ok()).next().is_some() {
+                            early_staging = true;
+                        }
+                    }
+                }
+                false
+            })
+            .unwrap_err();
+        assert!(
+            !early_staging,
+            "recovery must stay lazy until the primary fails"
+        );
+        assert!(
+            error.contains("capture saved to"),
+            "the error names the fallback, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "one fallback file: {saved:?}");
+        let data = std::fs::read(&saved[0]).unwrap();
+        assert_eq!(
+            data, expected,
+            "the recovery save must equal the healthy export byte-for-byte"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure plus a refused recovery setup (a
+    /// planted symlink here) reports both errors with `capture lost`:
+    /// the operator sees the primary cause and the recovery refusal,
+    /// the destination keeps its old bytes, and nothing is written
+    /// through the refused base.
+    #[test]
+    fn diagnostics_write_failure_with_refused_recovery_reports_both_errors_as_lost() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let plant = private_directory();
+        let target = plant.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = plant.path().join("p11scope-recovered");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&link);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        assert!(
+            error.contains(&primary),
+            "the error carries the primary cause, got: {error}"
+        );
+        assert!(
+            error.contains("also failed"),
+            "the error names the recovery failure, got: {error}"
+        );
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let target_files: Vec<std::path::PathBuf> = std::fs::read_dir(&target)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert!(
+            target_files.is_empty(),
+            "nothing is written through the refused link: {target_files:?}"
+        );
+        assert_no_temporary_files(directory.path());
+    }
+
+    /// A primary write failure plus a failed recovery write (EDQUOT
+    /// here) reports both errors with `capture lost`: the operator
+    /// sees both causes, the destination keeps its old bytes, and no
+    /// partial fallback file remains.
+    #[test]
+    fn diagnostics_write_failure_with_failed_recovery_write_reports_both_errors_as_lost() {
+        let directory = private_directory();
+        let path = directory.path().join("diagnostics.jsonl");
+        std::fs::write(&path, b"old diagnostics").unwrap();
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let mut destination = fixture_destination(&path, None, None);
+        destination.output.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let _staging_fail = crate::output::hold_staging_fail_write(libc::EDQUOT);
+        let error = destination
+            .deliver(finished(CaptureOutcome::Completed), &NoLabels, || false)
+            .unwrap_err();
+        let primary = std::io::Error::from_raw_os_error(libc::ENOSPC).to_string();
+        let recovery = std::io::Error::from_raw_os_error(libc::EDQUOT).to_string();
+        assert!(
+            error.contains(&primary),
+            "the error carries the primary cause, got: {error}"
+        );
+        assert!(
+            error.contains(&recovery),
+            "the error carries the recovery cause, got: {error}"
+        );
+        assert!(
+            error.contains("also failed"),
+            "the error names the recovery failure, got: {error}"
+        );
+        assert!(error.contains("capture lost"), "got: {error}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"old diagnostics",
+            "the destination keeps its old bytes"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(
+            saved.is_empty(),
+            "no partial fallback file remains on a double failure: {saved:?}"
+        );
         assert_no_temporary_files(directory.path());
     }
 }

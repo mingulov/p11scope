@@ -95444,6 +95444,17 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
 //   merge_ownership_e4_lowering_refuses_with_r_riding (GREEN)
 //   merge_ownership_e5_loader_scan_refuses_with_r_riding (GREEN)
 //   merge_ownership_e6_learned_staging_refuses_with_r_riding (GREEN)
+// Entry-outcome case table (each cell through its production entry):
+//   merge_ownership_entry_outcomes_follow_the_case_table (GREEN, 13
+//   cells: E1/E2/E4/E5/E6/E7 carried→refused with a witnessed cause,
+//   healthy→committed; E7 cells are that entry's first full-entry
+//   coverage; E3/E8/E9 named inside)
+// Fresh-scan authority-all controls: E10 `rebuild_discovered`
+// (`manifest_selection_tables_lower_during_initial_rebuild`), E11
+// `scan_reconciled_snapshot`
+// (`merge_ownership_e11_snapshot_binds_fresh_views_with_claims`), E12
+// `bind_collection` (`privileged_k1_no_route_collect_system_witness`
+// ignored privileged + `staged_count_manifest_defers_to_the_next_pass`).
 // (E4/E5/E6/E7 are choke-direct: the full entries refuse R-riding
 // candidates at live admission, so the ownership seam is each entry's
 // exact choke call with its tick events, mirrored argument-for-argument.
@@ -95553,6 +95564,25 @@ fn mo_bind_and_carry(pins: &mut PinnedObjects, modules: &[ScannedModule]) -> Vec
         "the fixture starts with R carried"
     );
     bound
+}
+
+/// How many currency-check refusals the engine recorded: a carried-riding
+/// candidate refused at the generation check records the loud `live
+/// discovery generation` marker. An entry that returns early records
+/// nothing, and a refusal for any other cause records a different
+/// marker — so the count proves the entry attempted the apply and
+/// refused for that specific cause.
+fn mo_generation_markers(engine: &Engine) -> usize {
+    engine
+        .counters
+        .object_skips
+        .iter()
+        .filter(|skip| {
+            skip.subject == "live discovery generation"
+                && skip.reason
+                    == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        })
+        .count()
 }
 
 /// The retired view owns no claims — the terminal-retirement oracle.
@@ -96365,6 +96395,11 @@ fn merge_ownership_e4_lowering_refuses_with_r_riding() {
         .position(|view| view.id() == observed)
         .expect("the engine retains the observed view");
     let slots_before = engine.plan.slots.len();
+    assert_eq!(
+        mo_generation_markers(&engine),
+        0,
+        "no refusal is recorded before the lowering"
+    );
     let outcome = engine
         .apply_pinned_lowered_module(
             lowered.clone(),
@@ -96380,6 +96415,11 @@ fn merge_ownership_e4_lowering_refuses_with_r_riding() {
     assert!(
         matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
         "the entry returns normally (refusal is an outcome, not an error)"
+    );
+    assert_eq!(
+        mo_generation_markers(&engine),
+        1,
+        "the lowering refused at the currency check"
     );
     assert!(
         engine
@@ -96541,6 +96581,11 @@ fn merge_ownership_e5_loader_scan_refuses_with_r_riding() {
     let mut session = ScriptedSession::with_records([], 0);
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
+    assert_eq!(
+        mo_generation_markers(&engine),
+        0,
+        "no refusal is recorded before the rescan"
+    );
     let outcome = e07_rescan(
         &mut engine,
         &mut session,
@@ -96551,6 +96596,11 @@ fn merge_ownership_e5_loader_scan_refuses_with_r_riding() {
     assert!(
         matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
         "the entry returns normally (refusal is an outcome, not an error)"
+    );
+    assert_eq!(
+        mo_generation_markers(&engine),
+        1,
+        "the rescan refused at the currency check"
     );
     assert!(
         engine.plan.slots.is_empty(),
@@ -96669,11 +96719,21 @@ fn merge_ownership_e6_learned_staging_refuses_with_r_riding() {
     engine.learned_unapplied = true;
     let modules_before = engine.modules.len();
     let slots_before = engine.plan.slots.len();
+    assert_eq!(
+        mo_generation_markers(&engine),
+        0,
+        "no refusal is recorded before the staging apply"
+    );
     let mut session = ScriptedSession::with_records([], 0);
     engine.apply_learned_staging(&mut session);
     assert!(
         engine.learned_unapplied,
         "the refused apply leaves the latch set for the ordinary refresh"
+    );
+    assert_eq!(
+        mo_generation_markers(&engine),
+        1,
+        "the staging apply refused at the currency check"
     );
     assert_eq!(
         engine.modules.len(),
@@ -96906,6 +96966,801 @@ fn merge_ownership_e7_selection_carried_provider_stays_claimless() {
         true,
         "selection rebuild",
     );
+}
+
+// E10–E12 authority-all controls (fresh-scan binds with no carried
+// modules — the ungated binder is honest here because no committed
+// state rides):
+//   E10 `rebuild_discovered`: initial aggregate rebuild —
+//     `manifest_selection_tables_lower_during_initial_rebuild` drives
+//     the real entry binding fresh scans (asserts the scan-sourced
+//     plan module).
+//   E11 `scan_reconciled_snapshot`: read-only snapshot rebinding current
+//     scan inputs into a fresh aggregate — the control below drives the
+//     real entry with two fresh views (no committed input exists).
+//   E12 `inspect_system` aggregation (`bind_collection`): per-member
+//     fresh scans into a fresh aggregate, offline —
+//     `privileged_k1_no_route_collect_system_witness` (ignored
+//     privileged cell) drives a real member-bearing collect through the
+//     bind, and `staged_count_manifest_defers_to_the_next_pass` drives
+//     the real `bind_collection` entry unignored.
+
+#[test]
+fn merge_ownership_e11_snapshot_binds_fresh_views_with_claims() {
+    // E11 × authority-all: the read-only snapshot rebinds current scan
+    // inputs (fresh per-scan state, never committed modules) into a
+    // fresh aggregate. Both views bind with claims.
+    let mut engine = Engine::empty();
+    for minor in [11u64, 12u64] {
+        let module = overlay_module(overlay_key(minor));
+        let mut pins = overlay_view_pin(&module, 2000 + minor, OVERLAY_SHA, 1, false);
+        record_scan_ownership(&mut pins, module.view, module.key, &module.path);
+        engine.scan_inputs.insert(
+            module.view,
+            ScanInput {
+                modules: vec![module],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+    }
+    let (modules, pinned) = engine.scan_reconciled_snapshot();
+    assert_eq!(modules.len(), 2, "both fresh views bind");
+    for view in [ProcessViewId(11), ProcessViewId(12)] {
+        assert!(
+            pinned.view_claims(view).is_some(),
+            "the fresh view owns its snapshot claims: {view:?}"
+        );
+    }
+}
+
+/// One production-entry outcome: whether the entry committed, and how
+/// many currency-check refusals it recorded. Each cell asserts its own
+/// post-state internally; the case table asserts these two bits.
+struct MoEntryOutcome {
+    committed: bool,
+    generation_markers: usize,
+}
+
+struct MoEntryCase {
+    name: &'static str,
+    run: fn() -> MoEntryOutcome,
+    expect_committed: bool,
+    expect_markers: usize,
+}
+
+/// E1 × carried, through build + apply: an unrelated refresh with R's
+/// carried row riding refuses at the currency check and commits nothing.
+fn mo_entry_e1_carried() -> MoEntryOutcome {
+    let (mut engine, object) = mo_shared_engine();
+    let modules_before = engine.modules.clone();
+    let plan_before = engine.plan.clone();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let candidate = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == ProcessViewId(MO_VIEW_R)),
+        "R's carried row rides the refresh"
+    );
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(!outcome.accepted(), "the carried-riding refresh refuses");
+    assert_eq!(
+        engine.modules, modules_before,
+        "the refusal commits no modules"
+    );
+    assert_eq!(
+        engine.plan, plan_before,
+        "the refusal leaves the plan untouched"
+    );
+    mo_assert_retired_claimless(&engine.pinned, "refused refresh");
+    mo_assert_live_owner(
+        &engine.pinned,
+        &engine.modules,
+        &engine.plan,
+        ProcessViewId(MO_VIEW_L),
+        object,
+        "refused refresh",
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E1 × retirement, through retirement + application: removing live R
+/// with carry commits — the carry installs claimless with L intact and
+/// the slot attached.
+fn mo_entry_e1_retirement() -> MoEntryOutcome {
+    let parts = mo_shared_pin_parts();
+    let mut pins = parts.pins;
+    let (bound, skipped) =
+        bind_scanned_modules(&[parts.module_r, parts.module_l.clone()], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    for view in [MO_VIEW_R, MO_VIEW_L] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(view), std::process::id()).unwrap());
+    }
+    let view_r = ProcessViewId(MO_VIEW_R);
+    let view_l = ProcessViewId(MO_VIEW_L);
+    let object = parts.object;
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let candidate = engine
+        .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(outcome.accepted(), "the removal carry commits");
+    mo_assert_retired_claimless(&engine.pinned, "committed removal carry");
+    mo_assert_live_owner(
+        &engine.pinned,
+        &engine.modules,
+        &engine.plan,
+        view_l,
+        object,
+        "committed removal carry",
+    );
+    mo_assert_carried_pin(
+        &engine.pinned,
+        &engine.modules,
+        &engine.plan,
+        object,
+        false,
+        "committed removal carry",
+    );
+    MoEntryOutcome {
+        committed: true,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// Owned-run conservative fixture: view 89 with an attached provider,
+/// listed live.
+fn mo_entry_e2_engine() -> (tempfile::TempDir, Engine, PinnedObjectId, ProcessViewId) {
+    let dir = tempfile::tempdir().expect("scope dir");
+    std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
+    let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
+    let (mut engine, _, object, _) = engine_with_overlay(89);
+    engine.scope = cgroup;
+    engine.owned_run_pid = Some(424242);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    assert!(engine.plan.is_active(0), "the fixture starts attached");
+    let view = ProcessViewId(89);
+    engine
+        .views
+        .push(ProcessView::open(view, std::process::id()).unwrap());
+    (dir, engine, object, view)
+}
+
+/// E2 × retirement, through the production replay entry: retiring live
+/// R commits the carry.
+fn mo_entry_e2_retirement() -> MoEntryOutcome {
+    let (_dir, mut engine, object, view) = mo_entry_e2_engine();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    engine.pending_retirements.insert(view);
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let outcome = engine.replay_pending_conservative(&mut session, &mut additions, &mut pending);
+    assert!(outcome.accepted(), "the retirement replay commits");
+    assert!(
+        engine.plan.is_active(0),
+        "the replay keeps the slot attached"
+    );
+    assert!(
+        engine.pinned.view_claims(view).is_none(),
+        "the replay files no claims under the retired view"
+    );
+    assert!(
+        engine.pinned.carried_ids().contains(&object),
+        "the replayed pin reads as carried coverage"
+    );
+    MoEntryOutcome {
+        committed: true,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E2 × carried, through the production replay entry: a later replay
+/// with R's carried row riding refuses at the currency check.
+fn mo_entry_e2_carried() -> MoEntryOutcome {
+    let (_dir, mut engine, object, view) = mo_entry_e2_engine();
+    let keys: BTreeSet<ObjectKey> = BTreeSet::new();
+    let carried = engine
+        .conservative_candidate(&BTreeSet::from([view]), &keys)
+        .unwrap();
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    engine.views.retain(|candidate| candidate.id() != view);
+    let modules_before = engine.modules.clone();
+    let plan_before = engine.plan.clone();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let outcome = engine.replay_pending_conservative(&mut session, &mut additions, &mut pending);
+    assert!(!outcome.accepted(), "the carried-riding replay refuses");
+    assert_eq!(
+        engine.modules, modules_before,
+        "the refusal commits no modules"
+    );
+    assert_eq!(
+        engine.plan, plan_before,
+        "the refusal leaves the plan untouched"
+    );
+    assert!(
+        engine.pinned.view_claims(view).is_none(),
+        "the refused replay files no claims under the carried view"
+    );
+    assert!(
+        engine.pinned.carried_ids().contains(&object),
+        "the carried pin still reads as carried coverage"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E4 × carried, through the production lowering entry: refuses at the
+/// currency check (the D2 guard shape, asserting the outcome bits).
+fn mo_entry_e4_carried() -> MoEntryOutcome {
+    let (mut engine, _object) = mo_shared_engine();
+    let observed = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(observed, std::process::id()).unwrap());
+    let lowered = overlay_module(overlay_key(u64::from(MO_VIEW_FRESH)));
+    let slots_before = engine.plan.slots.len();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    mo_apply_lowered(&mut engine, &lowered, 1003);
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != observed),
+        "the refused lowering commits nothing"
+    );
+    assert_eq!(
+        engine.plan.slots.len(),
+        slots_before,
+        "the refused lowering leaves the plan untouched"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E4 × healthy, through the production lowering entry: commits.
+fn mo_entry_e4_healthy() -> MoEntryOutcome {
+    let (mut engine, _object) = mo_shared_engine();
+    engine
+        .modules
+        .retain(|module| module.scanned.view != ProcessViewId(MO_VIEW_R));
+    let observed = ProcessViewId(MO_VIEW_FRESH);
+    engine
+        .views
+        .push(ProcessView::open(observed, std::process::id()).unwrap());
+    let lowered = overlay_module(overlay_key(u64::from(MO_VIEW_FRESH)));
+    assert_eq!(mo_generation_markers(&engine), 0);
+    mo_apply_lowered(&mut engine, &lowered, 1003);
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == observed),
+        "the healthy lowering commits"
+    );
+    MoEntryOutcome {
+        committed: true,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E5 × carried, through the production rescan entry: refuses at the
+/// currency check (the D2 guard shape, asserting the outcome bits).
+fn mo_entry_e5_carried() -> MoEntryOutcome {
+    let mut engine = e07_engine();
+    let parts = mo_sole_pin_parts();
+    mo_commit_into_e07(
+        &mut engine,
+        parts.pins,
+        vec![parts.module_r, parts.module_b.clone()],
+    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_B), std::process::id()).unwrap());
+    let context = e07_loader_context(&mut engine, ProcessViewId(0));
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
+        "the entry returns normally"
+    );
+    assert!(
+        engine.plan.slots.is_empty(),
+        "the refused rescan leaves the empty plan untouched"
+    );
+    assert_eq!(
+        engine.modules.len(),
+        2,
+        "the refused rescan commits no found modules"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E5 × healthy, through the production rescan entry: the rescan runs
+/// end to end and applies cleanly — no refusal, no spurious commit
+/// (this harness stages no found modules, so a healthy rescan has
+/// nothing to commit; the scan-attempt counter proves the entry ran).
+fn mo_entry_e5_healthy() -> MoEntryOutcome {
+    let mut engine = e07_engine();
+    let context = e07_loader_context(&mut engine, ProcessViewId(0));
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    assert_eq!(engine.loader_memory_scan_attempts, 0);
+    let outcome = e07_rescan(
+        &mut engine,
+        &mut session,
+        context,
+        &mut additions,
+        &mut pending,
+    );
+    assert!(
+        matches!(outcome, DiscoveryRecordOutcome::Applied { .. }),
+        "the entry returns normally"
+    );
+    assert_eq!(
+        engine.loader_memory_scan_attempts, 1,
+        "the healthy rescan ran its memory scan"
+    );
+    assert!(
+        engine.plan.slots.is_empty() && engine.modules.is_empty(),
+        "the clean rescan commits nothing spurious"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E6 × carried, through the production staging entry: refuses at the
+/// currency check (the D2 guard shape, asserting the outcome bits).
+fn mo_entry_e6_carried() -> MoEntryOutcome {
+    let (mut engine, _object) = mo_shared_engine();
+    engine.learned_unapplied = true;
+    let modules_before = engine.modules.clone();
+    let plan_before = engine.plan.clone();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let mut session = ScriptedSession::with_records([], 0);
+    engine.apply_learned_staging(&mut session);
+    assert!(
+        engine.learned_unapplied,
+        "the refused apply leaves the latch set"
+    );
+    assert_eq!(
+        engine.modules, modules_before,
+        "the refused apply commits no modules"
+    );
+    assert_eq!(
+        engine.plan, plan_before,
+        "the refused apply leaves the plan untouched"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E6 × healthy, through the production staging entry: commits (the
+/// accepted apply clears the latch itself).
+fn mo_entry_e6_healthy() -> MoEntryOutcome {
+    let (mut engine, _object) = mo_shared_engine();
+    engine
+        .modules
+        .retain(|module| module.scanned.view != ProcessViewId(MO_VIEW_R));
+    engine.learned_unapplied = true;
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let mut session = ScriptedSession::with_records([], 0);
+    engine.apply_learned_staging(&mut session);
+    assert!(
+        !engine.learned_unapplied,
+        "the healthy staging clears the latch"
+    );
+    MoEntryOutcome {
+        committed: true,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E6 × unset latch: the entry returns early, staging nothing and
+/// recording no refusal — the no-attempt control proving the witness
+/// distinguishes an attempt from an early return.
+fn mo_entry_e6_no_latch() -> MoEntryOutcome {
+    let (mut engine, _object) = mo_shared_engine();
+    let modules_before = engine.modules.clone();
+    let plan_before = engine.plan.clone();
+    let mut session = ScriptedSession::with_records([], 0);
+    engine.apply_learned_staging(&mut session);
+    assert!(
+        !engine.learned_unapplied,
+        "the latch stays unset without staging work"
+    );
+    assert_eq!(
+        engine.modules, modules_before,
+        "no staging work commits no modules"
+    );
+    assert_eq!(
+        engine.plan, plan_before,
+        "no staging work leaves the plan untouched"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// R and L sharing one real provider file: the same-open-file shape
+/// with kernel-verifiable pins, so the live assessment's
+/// `check_unchanged` passes (overlay pins fabricate their metadata and
+/// would trip it before the claim block).
+struct MoRealSharedPin {
+    module_r: ScannedModule,
+    module_l: ScannedModule,
+    pins: PinnedObjects,
+}
+
+fn mo_real_shared_pin_parts() -> (tempfile::TempDir, MoRealSharedPin) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("provider.so");
+    std::fs::copy("/usr/bin/true", &path).unwrap();
+    let mut pins = PinnedObjects::empty();
+    let mut modules = Vec::new();
+    for view in [MO_VIEW_R, MO_VIEW_L] {
+        let retained = ProcessView::open(ProcessViewId(view), std::process::id()).unwrap();
+        let key = crate::discovery::identity::view_object_key(
+            &retained,
+            &path,
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        let mut scanned = overlay_module(key);
+        scanned.view = ProcessViewId(view);
+        scanned.mount_namespace = retained.mount_namespace();
+        scanned.path = path.to_str().unwrap().into();
+        for table in &mut scanned.tables {
+            for entry in &mut table.entries {
+                entry.object = key;
+                entry.object_path = scanned.path.clone();
+            }
+        }
+        let (view_pins, skipped) = pin_scanned_view_objects(
+            &retained,
+            std::slice::from_ref(&scanned),
+            &mut CaptureWorkBudget::default(),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let absorb_skips = pins.absorb(view_pins);
+        assert!(absorb_skips.is_empty(), "{absorb_skips:?}");
+        modules.push(scanned);
+    }
+    let module_r = modules[0].clone();
+    let module_l = modules[1].clone();
+    record_scan_ownership(&mut pins, module_l.view, module_l.key, &module_l.path);
+    let object_r = pins
+        .id_for_scanned(&module_r, module_r.key, &module_r.path)
+        .expect("R's pin resolves");
+    let object_l = pins
+        .id_for_scanned(&module_l, module_l.key, &module_l.path)
+        .expect("L's pin resolves");
+    assert_eq!(object_r, object_l, "both views resolve one canonical pin");
+    assert!(
+        pins.check_unchanged().unwrap_or(false),
+        "real pins verify unchanged"
+    );
+    (
+        dir,
+        MoRealSharedPin {
+            module_r,
+            module_l,
+            pins,
+        },
+    )
+}
+
+/// A live selection record reaching the claim block: exact-standard
+/// request and result over the fixture provider's real mapping. The
+/// decoded table itself comes from the scripted session read below
+/// (the production seam for live table bytes).
+fn mo_entry_selection_record(engine: &Engine, binding: SelectionBindingFact) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = DISCOVERY_KIND_INTERFACE_RETURN;
+    record.pid_tgid = u64::from(engine.views[0].pid()) << 32;
+    record.case_id = DISCOVERY_NAME_EXACT_STANDARD;
+    record.interface_index = DISCOVERY_VERSION_V3_0;
+    record.name_class = DISCOVERY_NAME_EXACT_STANDARD;
+    record.selection_version_class = DISCOVERY_VERSION_V3_0;
+    record.table_ptr = selection_provider_address(engine, binding);
+    record.binding_id = binding.id;
+    record
+}
+
+/// Script the session's live table read (the production seam at
+/// `process_selection_record_inner`): the provider's real mapping plus
+/// a standard (3,0) table, so the record reaches the claim block.
+fn mo_entry_script_table_read(
+    engine: &Engine,
+    session: &mut ScriptedSession,
+    binding: SelectionBindingFact,
+) {
+    let provider = engine.pinned.summary(binding.object).unwrap().key;
+    let mapping =
+        parse_maps(&std::fs::read(format!("/proc/{}/maps", engine.views[0].pid())).unwrap())
+            .unwrap()
+            .into_iter()
+            .find(|mapping| ObjectKey::of(mapping) == provider)
+            .unwrap();
+    session.selection_table_read = Some((
+        mapping,
+        selection_only_table(
+            engine,
+            binding,
+            0x20,
+            &[("C_Initialize", 0x100)],
+            Vec::new(),
+        ),
+    ));
+}
+
+/// E7 × carried, through the production selection entry: the claim
+/// rebuild rides R, the apply refuses at the currency check, and no
+/// claim authorizes.
+fn mo_entry_e7_carried() -> MoEntryOutcome {
+    let (_fixture, mut engine, mut session, first_binding) = attached_selection_route();
+    let (_dir, parts) = mo_real_shared_pin_parts();
+    let skips = engine.pinned.absorb(parts.pins);
+    assert!(skips.is_empty(), "{skips:?}");
+    let bound = mo_bind_and_carry(
+        &mut engine.pinned,
+        &[parts.module_r, parts.module_l.clone()],
+    );
+    engine.modules.extend(bound);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(MO_VIEW_L), std::process::id()).unwrap());
+    mo_entry_script_table_read(&engine, &mut session, first_binding);
+    let record = mo_entry_selection_record(&engine, first_binding);
+    let modules_before = engine.modules.clone();
+    let slots_before = engine.plan.slots.clone();
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    // The production selection entry itself (dispatch routes here):
+    // driving it directly isolates selection's apply from the
+    // dispatch-level lowering, so the witness below is selection's own.
+    let outcome = engine
+        .process_selection_record_with_session(
+            &QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut additions,
+            &mut pending,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DiscoveryRecordOutcome::applied(false, true),
+        "the refused selection authorizes no claim"
+    );
+    assert!(
+        engine.selection_claims.is_empty(),
+        "the refused selection commits no claim"
+    );
+    assert_eq!(
+        engine.modules, modules_before,
+        "the refused selection commits no modules"
+    );
+    assert_eq!(
+        engine.plan.slots, slots_before,
+        "the refused selection attaches no slots"
+    );
+    mo_assert_retired_claimless(&engine.pinned, "refused selection");
+    assert!(
+        engine
+            .pinned
+            .view_claims(ProcessViewId(MO_VIEW_L))
+            .is_some(),
+        "the live co-owner keeps its claims"
+    );
+    MoEntryOutcome {
+        committed: false,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+/// E7 × healthy, through the production selection entry: the claim
+/// authorizes and commits.
+fn mo_entry_e7_healthy() -> MoEntryOutcome {
+    let (_fixture, mut engine, mut session, first_binding) = attached_selection_route();
+    mo_entry_script_table_read(&engine, &mut session, first_binding);
+    let record = mo_entry_selection_record(&engine, first_binding);
+    assert_eq!(mo_generation_markers(&engine), 0);
+    let mut additions = true;
+    let mut pending = PendingViewRetirements::new();
+    let outcome = engine
+        .process_selection_record_with_session(
+            &QueuedDiscoveryRecord {
+                record,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            },
+            &mut session,
+            &mut additions,
+            &mut pending,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DiscoveryRecordOutcome::applied(true, true),
+        "the healthy selection authorizes its claim"
+    );
+    let committed = !engine.selection_claims.is_empty();
+    assert!(committed, "the healthy selection commits its claim");
+    MoEntryOutcome {
+        committed,
+        generation_markers: mo_generation_markers(&engine),
+    }
+}
+
+#[test]
+fn merge_ownership_entry_outcomes_follow_the_case_table() {
+    // One executable case table over production entries × input shapes:
+    // every entry commits its healthy input and refuses its
+    // carried-riding input at the currency check (D2) — the refusal
+    // witnessed by the generation marker, never a silent no-op.
+    // E3/E8/E9 are named, not driven: E3's loader assembly is covered
+    // at its build boundary by the E3 custody tests; E8 commits without
+    // a generation check (`merge_ownership_e8_release_*` drive the real
+    // entry and commit); E9's reconciliation commits in the inventory
+    // harness (`merge_ownership_e9_*`).
+    let cases = [
+        MoEntryCase {
+            name: "E1 carried-riding refresh refuses",
+            run: mo_entry_e1_carried,
+            expect_committed: false,
+            expect_markers: 1,
+        },
+        MoEntryCase {
+            name: "E1 removal carry commits",
+            run: mo_entry_e1_retirement,
+            expect_committed: true,
+            expect_markers: 0,
+        },
+        MoEntryCase {
+            name: "E2 carried-riding replay refuses",
+            run: mo_entry_e2_carried,
+            expect_committed: false,
+            expect_markers: 1,
+        },
+        MoEntryCase {
+            name: "E2 retirement replay commits",
+            run: mo_entry_e2_retirement,
+            expect_committed: true,
+            expect_markers: 0,
+        },
+        MoEntryCase {
+            name: "E4 carried lowering refuses",
+            run: mo_entry_e4_carried,
+            expect_committed: false,
+            expect_markers: 1,
+        },
+        MoEntryCase {
+            name: "E4 healthy lowering commits",
+            run: mo_entry_e4_healthy,
+            expect_committed: true,
+            expect_markers: 0,
+        },
+        MoEntryCase {
+            name: "E5 carried rescan refuses",
+            run: mo_entry_e5_carried,
+            expect_committed: false,
+            expect_markers: 1,
+        },
+        MoEntryCase {
+            name: "E5 healthy rescan applies cleanly",
+            run: mo_entry_e5_healthy,
+            expect_committed: false,
+            expect_markers: 0,
+        },
+        MoEntryCase {
+            name: "E6 carried staging refuses",
+            run: mo_entry_e6_carried,
+            expect_committed: false,
+            expect_markers: 1,
+        },
+        MoEntryCase {
+            name: "E6 healthy staging commits",
+            run: mo_entry_e6_healthy,
+            expect_committed: true,
+            expect_markers: 0,
+        },
+        MoEntryCase {
+            name: "E6 unset latch stages nothing",
+            run: mo_entry_e6_no_latch,
+            expect_committed: false,
+            expect_markers: 0,
+        },
+        MoEntryCase {
+            name: "E7 carried selection refuses",
+            run: mo_entry_e7_carried,
+            expect_committed: false,
+            expect_markers: 1,
+        },
+        MoEntryCase {
+            name: "E7 healthy selection commits",
+            run: mo_entry_e7_healthy,
+            expect_committed: true,
+            expect_markers: 0,
+        },
+    ];
+    for case in cases {
+        let outcome = (case.run)();
+        assert_eq!(
+            outcome.committed, case.expect_committed,
+            "{}: commit bit",
+            case.name
+        );
+        assert_eq!(
+            outcome.generation_markers, case.expect_markers,
+            "{}: currency-refusal witness",
+            case.name
+        );
+    }
 }
 
 fn mo_merge_key() -> ObjectKey {

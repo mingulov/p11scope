@@ -13474,6 +13474,61 @@ mod tests {
     }
 
     #[test]
+    fn carried_proofs_survive_an_excepted_keep() {
+        // The except path scrubs only its dropped set: a kept id's pin
+        // stays resolvable and its proof survives the call, while the
+        // view's own claims still drop. (Over-scrubbing the keep would
+        // only force fail-closed re-proof, but the scrub set must stay
+        // exactly the removed set.)
+        let k1 = overlay(1);
+        let k2 = overlay(2);
+        let m1 = module(k1);
+        let m2 = module(k2);
+        let mut pins = image_pins(&[(k1, "aa", 1)]);
+        reconcile_scanned_modules(std::slice::from_ref(&m1), &mut pins);
+        let mut second = image_pins(&[(k2, "bb", 2)]);
+        reconcile_scanned_modules(std::slice::from_ref(&m2), &mut second);
+        assert!(pins.absorb(second).is_empty());
+        own_all_raws(&mut pins);
+        let id1 = pins
+            .id_for_scanned(&m1, k1, &m1.path)
+            .expect("view 1 resolves");
+        let id2 = pins
+            .id_for_scanned(&m2, k2, &m2.path)
+            .expect("view 2 resolves");
+        pins.proven_targets.insert((id1, 0x100));
+        pins.proven_targets.insert((id2, 0x200));
+        assert!(
+            pins.view_claims(m1.view).is_some(),
+            "the fixture files claims under view 1"
+        );
+
+        let removed = pins.remove_view_except(m1.view, &BTreeSet::from([id1]));
+        assert!(
+            removed.is_some(),
+            "the except call retires view 1 (not the empty early return)"
+        );
+        assert!(
+            pins.view_claims(m1.view).is_none(),
+            "the retired view files no claims"
+        );
+        assert!(
+            pins.by_id.contains_key(&id1),
+            "the kept pin stays resolvable"
+        );
+        assert!(
+            pins.proven_targets.contains(&(id1, 0x100)),
+            "the kept ID's proof survives the except call: {:?}",
+            pins.proven_targets
+        );
+        assert!(
+            pins.proven_targets.contains(&(id2, 0x200)),
+            "the untouched pin's proof survives: {:?}",
+            pins.proven_targets
+        );
+    }
+
+    #[test]
     fn carried_proofs_scrub_on_overlay_canonicalization() {
         // The folded-away overlay twin merges by identical bytes, so its
         // entries re-prove against the kept entry; its carried pairs

@@ -828,7 +828,6 @@ pub(crate) struct ExtendReceipt {
     /// admission refused (per endpoint; a dropped Multi group
     /// counts its sites). The entries still link and record; no
     /// return links and no `INFO_KIND` publish happens for them.
-    #[allow(dead_code)] // The enforcement commit counts this.
     pub info_return_refused_hazard: u64,
     /// Keymeta Task 7 (spec §17.4): endpoints whose INFO kind this
     /// extend revoked (a later pass proved their names aliased).
@@ -1601,9 +1600,13 @@ impl CaptureBook {
 
     /// Tests script one hazard verdict source: twins inject
     /// affected, unknown or clean verdicts without a kernel. The
-    /// production gate stays `uretprobe_hazard::admit`.
+    /// production gate stays `uretprobe_hazard::admit`. Installing a
+    /// new authority drops the retained approval — approvals don't
+    /// transfer across authorities — while a recorded refusal sticks
+    /// (fail closed).
     #[cfg(test)]
     fn set_info_return_gate(&mut self, gate: Box<InfoReturnGate>) {
+        self.return_probe_admission = None;
         self.info_return_gate = gate;
     }
 
@@ -1617,7 +1620,6 @@ impl CaptureBook {
     /// always `None`, like every Detailed call site: on a PID scope
     /// the trampoline still runs in a sibling that may confine
     /// itself after attach, so no pid narrows the verdict.
-    #[allow(dead_code)] // The enforcement commit consults this.
     fn info_returns_admitted(&mut self) -> bool {
         if self.info_return_refused {
             return false;
@@ -2048,6 +2050,25 @@ fn retry_info_returns<I: InventoryLinkIo>(
     if now() >= deadline {
         return;
     }
+    // Keymeta Task 7 (spec §17.4): the hazard gate refuses once for
+    // the capture — a parked return (or group) drops here counted,
+    // per endpoint (a Multi group counts its sites), instead of
+    // linking. The refusal sticks in `info_return_refused`, so no
+    // later extend re-probes or re-parks.
+    if !book.info_returns_admitted() {
+        let queue: VecDeque<InfoReturnPending> = std::mem::take(&mut book.info_return_pending);
+        for next in queue {
+            match next {
+                InfoReturnPending::Singles(_) => {
+                    receipt.info_return_refused_hazard += 1;
+                }
+                InfoReturnPending::Multi { sites, .. } => {
+                    receipt.info_return_refused_hazard += sites.len() as u64;
+                }
+            }
+        }
+        return;
+    }
     let mut queue: VecDeque<InfoReturnPending> = std::mem::take(&mut book.info_return_pending);
     let mut remaining = INFO_RETURN_RETRY_PER_EXTEND;
     while !queue.is_empty() {
@@ -2451,6 +2472,27 @@ fn extend_entries_with<I: InventoryLinkIo>(
     // endpoint must not attach info state or retry a pending info
     // return in this same extend.
     revoke_info_kinds(io, book, &mut delta, receipt, window.deadline);
+    // Keymeta Task 7 (spec §17.4): the uretprobe-vs-seccomp admission
+    // every other return-probe path takes, once per capture through
+    // the retained approval. On refusal the fresh info endpoints
+    // downgrade here — `info_kind` unset, so the entries link
+    // usage-only with no return link and no `INFO_KIND` publish —
+    // and count the named gap per endpoint. The stripped kind rides
+    // into the deferred backlog too, so a resubmitted endpoint is
+    // not counted twice. P0 carries no info programs, so it neither
+    // probes nor downgrades.
+    let info_admitted = if cfg!(feature = "stub-object-attributes") {
+        true
+    } else {
+        book.info_returns_admitted()
+    };
+    if !info_admitted {
+        for endpoint in &mut delta.endpoints {
+            if endpoint.info_kind.take().is_some() {
+                receipt.info_return_refused_hazard += 1;
+            }
+        }
+    }
     // Keymeta Task 7 (spec §17.4, N4): every extend retries the
     // private info-return pending list first, within the same
     // window; the endpoints stay `known`.

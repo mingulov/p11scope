@@ -17187,7 +17187,8 @@ fn watchdog_prefix_scene(row: &str) -> (MachineScene, Vec<u8>) {
     fixture.prime(2);
     let pid = std::process::id();
     // A holds a neutral call open (its late terminal excuses after a
-    // wipe instead of tainting); B completes one call behind it.
+    // wipe, never tainting — operation Inits excuse the same way via
+    // `Access`); B completes one call behind it.
     let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 3);
     let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
     for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
@@ -18781,6 +18782,372 @@ fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
         feed[0].1.0,
         FeedMode::Joint,
         "{ROW}: the parked feed leaves Joint"
+    );
+}
+
+/// Late-terminal twin, claimed shape: A holds a `C_SignInit` call
+/// open across scoped recovery while a healthy session holds the
+/// same shape, so the scoped wipe spares A's BEGIN (healthy-claimant
+/// rule) and the late terminal matches into a disclosed below-fence
+/// deferral instead of tainting. No taint lands; the held sibling
+/// seals exact at the void and a cross-image newcomer seals exact.
+#[test]
+fn watchdog_spared_late_terminal_falls_back_below_fence() {
+    const ROW: &str = "taint late terminal";
+    use crate::semantics_key_use::FeedMode;
+    use p11scope_ebpf_common::ImageIdentity;
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let pid = std::process::id();
+    // A holds a NON-NEUTRAL call open (its late terminal taints after
+    // a wipe); B completes one call behind it.
+    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.published_labeled("watchdog-taint-prefix", None);
+    let tainted = |fixture: &MachineScene, image: (u64, u64)| -> bool {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test(image)
+    };
+    assert!(!tainted(&fixture, (71, 0)), "{ROW}: the prefix taints nothing");
+    // Stuck A's quantum on file 0: drive the real commit to applied
+    // with nonzero staged work.
+    fixture.scene.push(pid, 0, "C_SignInit", 5);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 6);
+    fixture.scene.push(pid, 0, "C_SignFinal", 7);
+    watchdog_drive_to_applied(&mut fixture);
+    let stuck = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck.len(), 1, "{ROW}: one stuck incarnation");
+    let (stuck_staged, stuck_disposed) = (stuck[0].1.1, stuck[0].1.6);
+    assert!(
+        stuck_staged > 0,
+        "{ROW}: the stuck quantum stages its calls before recovery"
+    );
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    // Recovery itself is taint-free: the stuck feed empties counted,
+    // the held feed keeps staged proof.
+    let stuck = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck[0].1.1, 0, "{ROW}: the stuck feed empties");
+    assert_eq!(
+        stuck[0].1.6 - stuck_disposed,
+        stuck_staged as u64,
+        "{ROW}: the stuck loss counts exactly its staged depth"
+    );
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(held.len(), 1, "{ROW}: one held incarnation");
+    assert_eq!(held[0].1.1, 1, "{ROW}: the held call stays staged");
+    let held_reduced_post_rearm = held[0].1.2;
+    let held_disposed_post_rearm = held[0].1.6;
+    assert!(!tainted(&fixture, (71, 0)), "{ROW}: recovery taints nothing");
+    // The void consumes first (no new input): the void severs the
+    // ordering wait, so the held sibling seals on its intact history.
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the recovered lane accepts the next commit"
+    );
+    fixture.published_labeled("watchdog-taint-void", None);
+    let voids: Vec<String> = watchdog_scope_gaps(&fixture)
+        .into_iter()
+        .filter(|(_, reason)| reason.contains("joint_void_"))
+        .map(|(_, reason)| reason)
+        .collect();
+    assert!(!voids.is_empty(), "{ROW}: the Idle void ran and named its loss");
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(held.len(), 1, "{ROW}: one held incarnation at the void");
+    assert_eq!(held[0].1.1, 0, "{ROW}: the held sibling seals at the void");
+    assert_eq!(
+        held[0].1.2 - held_reduced_post_rearm,
+        1,
+        "{ROW}: the sibling seals exactly its held call"
+    );
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::Joint,
+        "{ROW}: the sibling stays Joint"
+    );
+    assert_eq!(held[0].1.7, None, "{ROW}: the sibling records no fence");
+    assert_eq!(
+        held[0].1.6, held_disposed_post_rearm,
+        "{ROW}: the sibling disposes nothing"
+    );
+    // Cross-image healthy session: a newcomer on a fresh image seals
+    // exact while the stuck image heads for its taint.
+    let _child = OwnedStoppedChild::new();
+    let new_pid = _child.id();
+    let new_caller = fixture.scene.real.bind(
+        new_pid,
+        ImageIdentity {
+            task_cookie: 73,
+            exec_id: 0,
+        },
+        0,
+    );
+    fixture.scene.push(new_pid, 0, "C_CreateObject", 100);
+    // No new begin_commit: one commit session covers the void, the
+    // newcomer and the terminal quanta (joins-helper shape).
+    fixture.published_labeled("watchdog-taint-newcomer", None);
+    let file0 = watchdog_feed_states(&fixture, 0);
+    let newcomer = file0
+        .iter()
+        .find(|(caller, _)| *caller == new_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the newcomer holds a feed on file 0"));
+    assert_eq!(
+        newcomer.1.2, 1,
+        "{ROW}: the newcomer's call seals exact cross-image"
+    );
+    assert_eq!(
+        newcomer.1.0,
+        FeedMode::Joint,
+        "{ROW}: the newcomer stays Joint"
+    );
+    // Baselines before the late terminal lands.
+    let file0_pre = watchdog_feed_states(&fixture, 0);
+    let stuck_pre = file0_pre
+        .iter()
+        .find(|(caller, _)| *caller != new_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the stuck feed is present pre-terminal"))
+        .1
+        .clone();
+    let held_pre = watchdog_feed_states(&fixture, 1);
+    let sibling_pre = held_pre
+        .iter()
+        .find(|(caller, _)| *caller != new_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the sibling feed is present pre-terminal"))
+        .1
+        .clone();
+    let gaps_pre: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
+    // The late non-neutral terminal arrives after the wipe: the spared
+    // BEGIN matches against the already-fallen-back seal and defers its
+    // resume below the void fence — disclosed, with no taint and no
+    // counter movement on any feed.
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(end_a.to_vec());
+    fixture.published_labeled("watchdog-taint-terminal", None);
+    assert!(
+        !tainted(&fixture, (71, 0)),
+        "{ROW}: the spared BEGIN matches, so no taint lands"
+    );
+    assert!(
+        !tainted(&fixture, (73, 0)),
+        "{ROW}: the cross-image newcomer never taints"
+    );
+    let file0 = watchdog_feed_states(&fixture, 0);
+    let stuck_post = file0
+        .iter()
+        .find(|(caller, _)| *caller != new_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the stuck feed is present post-terminal"))
+        .1
+        .clone();
+    assert_eq!(
+        (stuck_post.1, stuck_post.2, stuck_post.3, stuck_post.6),
+        (stuck_pre.1, stuck_pre.2, stuck_pre.3, stuck_pre.6),
+        "{ROW}: the deferred completion moves no stuck counter"
+    );
+    // The terminal's own footprint is the below-fence resume
+    // deferral (the seal already fell back at void delivery, before
+    // the terminal arrived).
+    let gaps_post: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
+    assert!(
+        !gaps_pre
+            .iter()
+            .any(|(_, pre)| pre.contains("joint_resume_deferred_below_fence")),
+        "{ROW}: no deferral before the terminal: {gaps_pre:?}"
+    );
+    assert!(
+        gaps_post
+            .iter()
+            .any(|(_, post)| post.contains("joint_resume_deferred_below_fence")),
+        "{ROW}: the terminal names its below-fence deferral: {gaps_post:?}"
+    );
+    // The sealed sibling and the newcomer are undisturbed by the
+    // terminal: shared image, no shared fate without a wipe.
+    let held = watchdog_feed_states(&fixture, 1);
+    let sibling = held
+        .iter()
+        .find(|(caller, _)| *caller != new_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the sibling feed is present post-terminal"));
+    assert_eq!(
+        (sibling.1.1, sibling.1.2, sibling.1.3, sibling.1.6),
+        (sibling_pre.1, sibling_pre.2, sibling_pre.3, sibling_pre.6),
+        "{ROW}: the sealed sibling moves no counter past the terminal"
+    );
+    assert_eq!(
+        sibling.1.0,
+        FeedMode::Joint,
+        "{ROW}: the sibling stays Joint"
+    );
+    assert_eq!(sibling.1.7, None, "{ROW}: the sibling records no fence");
+    let newcomer_post = file0
+        .iter()
+        .find(|(caller, _)| *caller == new_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the newcomer feed is present post-terminal"));
+    assert_eq!(
+        newcomer_post.1.2, 1,
+        "{ROW}: the newcomer still seals exactly one call"
+    );
+    assert!(
+        fixture.machine.disposition_reason().is_none(),
+        "{ROW}: the lane never latches"
+    );
+    drop(_child);
+}
+
+/// Late-terminal twin, sibling-shape variant: A holds a `C_SignInit`
+/// call open across scoped recovery while the healthy sibling holds
+/// a neutral shape. Like the spared twin (which differs by B's shape
+/// alone), no taint lands: operation Inits are excuse-eligible
+/// (`Access`, like the neutral set), so a wiped Init excuses at
+/// ingest — and here the BEGIN is spared and matches into the same
+/// disclosed below-fence deferral. Pins that the sibling's shape does
+/// not change A's fate.
+#[test]
+fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
+    const ROW: &str = "taint unclaimed terminal";
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let pid = std::process::id();
+    // A holds a NON-NEUTRAL call open; B completes a DIFFERENT shape
+    // behind it, so nothing healthy claims A's shape at the wipe.
+    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignUpdate", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.published_labeled("watchdog-taint2-prefix", None);
+    let tainted = |fixture: &MachineScene, image: (u64, u64)| -> bool {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test(image)
+    };
+    assert!(!tainted(&fixture, (71, 0)), "{ROW}: the prefix taints nothing");
+    fixture.scene.push(pid, 0, "C_SignInit", 5);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 6);
+    fixture.scene.push(pid, 0, "C_SignFinal", 7);
+    watchdog_drive_to_applied(&mut fixture);
+    let stuck = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck.len(), 1, "{ROW}: one stuck incarnation");
+    let (stuck_staged, stuck_disposed) = (stuck[0].1.1, stuck[0].1.6);
+    assert!(
+        stuck_staged > 0,
+        "{ROW}: the stuck quantum stages its calls before recovery"
+    );
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    let stuck = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck[0].1.1, 0, "{ROW}: the stuck feed empties");
+    assert_eq!(
+        stuck[0].1.6 - stuck_disposed,
+        stuck_staged as u64,
+        "{ROW}: the stuck loss counts exactly its staged depth"
+    );
+    assert!(!tainted(&fixture, (71, 0)), "{ROW}: recovery taints nothing");
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(held.len(), 1, "{ROW}: one held incarnation");
+    assert_eq!(held[0].1.1, 1, "{ROW}: the held call stays staged");
+    let held_reduced_post_rearm = held[0].1.2;
+    let held_disposed_post_rearm = held[0].1.6;
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the recovered lane accepts the next commit"
+    );
+    fixture.published_labeled("watchdog-taint2-void", None);
+    let voids: Vec<String> = watchdog_scope_gaps(&fixture)
+        .into_iter()
+        .filter(|(_, reason)| reason.contains("joint_void_"))
+        .map(|(_, reason)| reason)
+        .collect();
+    assert!(!voids.is_empty(), "{ROW}: the Idle void ran and named its loss");
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(held.len(), 1, "{ROW}: one held incarnation at the void");
+    assert_eq!(held[0].1.1, 0, "{ROW}: the held sibling seals at the void");
+    assert_eq!(
+        held[0].1.2 - held_reduced_post_rearm,
+        1,
+        "{ROW}: the sibling seals exactly its held call"
+    );
+    // Baselines before the late terminal lands.
+    let stuck_pre = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck_pre.len(), 1, "{ROW}: one stuck incarnation pre-terminal");
+    let stuck_pre = stuck_pre[0].1.clone();
+    let sibling_pre = watchdog_feed_states(&fixture, 1)[0].1.clone();
+    let gaps_pre: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(end_a.to_vec());
+    fixture.published_labeled("watchdog-taint2-terminal", None);
+    assert!(
+        !tainted(&fixture, (71, 0)),
+        "{ROW}: the sibling's shape changes nothing: no taint lands"
+    );
+    let stuck_post = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck_post.len(), 1, "{ROW}: one stuck incarnation post-terminal");
+    let stuck_post = stuck_post[0].1.clone();
+    assert_eq!(
+        (stuck_post.1, stuck_post.2, stuck_post.3, stuck_post.6),
+        (stuck_pre.1, stuck_pre.2, stuck_pre.3, stuck_pre.6),
+        "{ROW}: the deferred completion moves no stuck counter"
+    );
+    let gaps_post: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
+    assert!(
+        !gaps_pre
+            .iter()
+            .any(|(_, pre)| pre.contains("joint_resume_deferred_below_fence")),
+        "{ROW}: no deferral before the terminal: {gaps_pre:?}"
+    );
+    assert!(
+        gaps_post
+            .iter()
+            .any(|(_, post)| post.contains("joint_resume_deferred_below_fence")),
+        "{ROW}: the terminal names its below-fence deferral: {gaps_post:?}"
+    );
+    let sibling_post = watchdog_feed_states(&fixture, 1);
+    assert_eq!(sibling_post.len(), 1, "{ROW}: one sibling incarnation post-terminal");
+    let sibling_post = sibling_post[0].1.clone();
+    assert_eq!(
+        (sibling_post.1, sibling_post.2, sibling_post.3, sibling_post.6),
+        (sibling_pre.1, sibling_pre.2, sibling_pre.3, sibling_pre.6),
+        "{ROW}: the sealed sibling moves no counter past the terminal"
+    );
+    assert!(
+        fixture.machine.disposition_reason().is_none(),
+        "{ROW}: the lane never latches"
     );
 }
 

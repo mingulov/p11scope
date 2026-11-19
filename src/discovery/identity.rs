@@ -24286,4 +24286,155 @@ mod tests {
         }
         assert_eq!(table.len(), 4);
     }
+
+    /// Owner 1 (admission refactor), behavior table over the
+    /// identity-level entry points: an unproven observation — the view
+    /// died mid-pin, a budget stopped the pin, the identity probe was
+    /// inconclusive — files a named skip for its view and never rejects
+    /// the raw key; the failed view binds nothing through a peer's
+    /// proof. Only a PROVEN collision rejects the key (control row,
+    /// unchanged). Each fault cell is RED pre-refactor: the failure
+    /// rejects the key and nukes the proven peer, or the failed view
+    /// binds through the peer.
+    #[test]
+    fn admission_owner1_unproven_observations_never_reject_nor_bind_through_peers() {
+        use crate::discovery::scan::{IO_CEILING_REASON, WORK_CEILING_REASON};
+        // Representative production failure reasons, one per fault
+        // class (the typed classification of each real site is pinned
+        // by the companion classification table).
+        let faults = [
+            ("death", "process generation exited during discovery"),
+            ("budget-io", IO_CEILING_REASON),
+            ("budget-work", WORK_CEILING_REASON),
+            (
+                "mismatch",
+                "identity_mismatch: the mapping is unavailable but the file now opens as a different one (compared via mountinfo)",
+            ),
+        ];
+        let key = ObjectKey {
+            device: Device {
+                major: 8,
+                minor: 210,
+            },
+            inode: INODE,
+        };
+        let module_a = module(key);
+        let mut module_b = module(key);
+        module_b.view = ProcessViewId(211);
+        // The exact-raw shape: same mount namespace, key and path —
+        // only the view differs — so the aggregate lookup cannot tell
+        // the views apart without per-view proof.
+        let raw_a = RawObjectInstance::scanned(&module_a, key, PATH).unwrap();
+        let raw_b = RawObjectInstance::scanned(&module_b, key, PATH).unwrap();
+        assert_eq!(raw_a, raw_b);
+        let proven_peer = || {
+            let mut pins = view_pin(&module_a, 1, SHA, 1, false);
+            test_fixture::record_scan_ownership(&mut pins, module_a.view, key, PATH);
+            pins
+        };
+        let failed_fresh = |reason: &str| {
+            let mut fresh = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            record_scanned_candidate(
+                &mut fresh,
+                module_b.view,
+                raw_b.clone(),
+                Err(PinFailure::Refused(reason.to_string())),
+                &mut skipped,
+                true,
+            );
+            (fresh, skipped)
+        };
+
+        for (fault, reason) in faults {
+            // Row `record`: the failure files a named skip, never a
+            // key rejection. (No-nuke and fence legs are N/A here:
+            // record neither binds nor merges.)
+            let (fresh, skipped) = failed_fresh(reason);
+            assert!(
+                !fresh.rejects(key),
+                "record [{fault}]: an unproven observation must not reject the key"
+            );
+            assert!(
+                skipped.iter().any(|skip| skip.subject == PATH),
+                "record [{fault}]: the failed view keeps its named skip: {skipped:?}"
+            );
+
+            // Row `absorb`, leg A (no-nuke): the carried failure never
+            // nukes the retained proven pin.
+            let mut retained = proven_peer();
+            let (fresh, _) = failed_fresh(reason);
+            let absorb_skips = retained.absorb(fresh);
+            assert_eq!(
+                retained.pinned().count(),
+                1,
+                "absorb [{fault}]: the proven peer survives the carried failure"
+            );
+            assert!(
+                !retained.rejects(key),
+                "absorb [{fault}]: the key stays admitted"
+            );
+            assert!(
+                !absorb_skips
+                    .iter()
+                    .any(|skip| skip.reason.contains("ambiguous")),
+                "absorb [{fault}]: no ambiguity without a proven collision: {absorb_skips:?}"
+            );
+
+            // Row `bind`, leg B (fence): the failed view's module — no
+            // pin, no ownership, only a named skip — binds nothing
+            // through the peer's identical raw.
+            let mut pins = proven_peer();
+            let (bound, binding_skips) =
+                bind_scanned_modules(std::slice::from_ref(&module_b), &mut pins);
+            assert!(
+                bound.is_empty(),
+                "bind [{fault}]: the failed view must not bind through the peer ({} bound)",
+                bound.len()
+            );
+            assert!(
+                binding_skips.iter().any(|skip| skip.subject == PATH),
+                "bind [{fault}]: the unbound module stays a named skip: {binding_skips:?}"
+            );
+            // Peer control: the proving view still binds its own module.
+            let mut pins = proven_peer();
+            let (bound, _) = bind_scanned_modules(std::slice::from_ref(&module_a), &mut pins);
+            assert_eq!(bound.len(), 1, "bind [{fault}]: the peer proof still binds");
+
+            // Row `resolve`: direct `id_for_scanned` enforcement.
+            let pins = proven_peer();
+            assert!(
+                pins.id_for_scanned(&module_b, key, PATH).is_none(),
+                "resolve [{fault}]: no proof, no resolution"
+            );
+            assert!(
+                pins.id_for_scanned(&module_a, key, PATH).is_some(),
+                "resolve [{fault}]: the peer proof still resolves"
+            );
+
+            // Row `sweep`: the proven pin stays the unique raw-key
+            // match after the failed observation merges.
+            let mut pins = proven_peer();
+            let peer_id = pins.id_for_scanned(&module_a, key, PATH).unwrap();
+            let (fresh, _) = failed_fresh(reason);
+            pins.absorb(fresh);
+            assert_eq!(
+                pins.sweep_match_keys().get(&key),
+                Some(&peer_id),
+                "sweep [{fault}]: the proven pin stays routable"
+            );
+        }
+
+        // Row `collision` (control, unchanged): two proven different
+        // files under one key still reject the key globally.
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &backing_file(&dir, "first.so"));
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &backing_file(&dir, "second.so"));
+        second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+        first.absorb(second);
+        assert!(first.rejects(key), "collision: the key still rejects");
+        assert_eq!(first.pinned().count(), 0, "collision: no pin survives");
+    }
 }

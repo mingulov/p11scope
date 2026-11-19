@@ -93829,3 +93829,249 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
         "the loader scan sees a fresh budget, not the spent tick's"
     );
 }
+
+/// Owner 1 (admission refactor) staging: a failed newcomer's fresh
+/// pin set exactly as production `record_scanned_candidate` files it
+/// on the current tree — no pin, no ownership, the carried key
+/// rejection plus the named skip. (Owner 1b updates this helper to
+/// the new production shape: no pin, no ownership, no rejection,
+/// named skip only.)
+fn admission_owner1_failed_fresh(key: ObjectKey) -> (PinnedObjects, Vec<Skipped>) {
+    let mut fresh = PinnedObjects::empty();
+    let mut skips = Vec::new();
+    skips.extend(fresh.reapply_rejected_keys(&BTreeSet::from([key])));
+    assert!(fresh.rejects(key), "the fresh set carries the refusal");
+    skips.push(Skipped {
+        subject: OVERLAY_PATH.into(),
+        reason: "mapping identity unavailable".into(),
+    });
+    (fresh, skips)
+}
+
+/// Owner 1 (admission refactor) staging: a failed newcomer's fresh
+/// set with no carried rejection — no pin, no ownership, named skip
+/// only. Exactly what a handle-budget wait files on every tree, and
+/// what every unproven failure files after owner 1b.
+fn admission_owner1_unproven_fresh() -> (PinnedObjects, Vec<Skipped>) {
+    let skips = vec![Skipped {
+        subject: OVERLAY_PATH.into(),
+        reason: "mapping identity unavailable".into(),
+    }];
+    (PinnedObjects::empty(), skips)
+}
+
+/// Owner 1 (admission refactor) staging: a view that proved the
+/// provider file — pin plus scan-time ownership, exactly what
+/// `record_scanned_candidate` files on success — with synthetic
+/// entries proved so strict live binds accept the peer.
+fn admission_owner1_proven_peer(minor: u64, entries: u32) -> (ScannedModule, PinnedObjects) {
+    let key = overlay_key(minor);
+    let mut raw = overlay_module(key);
+    raw.tables[0].entries = overlay_entries(&raw, first_offsets(entries));
+    let mut pins = overlay_view_pin(&raw, 1, OVERLAY_SHA, 1, false);
+    record_scan_ownership(&mut pins, raw.view, key, OVERLAY_PATH);
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&raw));
+    (raw, pins)
+}
+
+/// Owner 1 (admission refactor), `inventory_candidate` cell: a
+/// newcomer whose own pin failed keeps the proven peer's pin alive
+/// (leg A, no-nuke) and binds nothing through the peer's identical
+/// raw (leg B, fence), on both the rejection-carrying and the
+/// rejection-free fresh shape. RED pre-refactor: leg A nukes the
+/// peer, leg B binds the newcomer through it.
+#[test]
+fn admission_owner1_inventory_candidate_keeps_peer_and_binds_no_refused_module() {
+    for leg in ["carried", "clean"] {
+        let (raw, mut pins) = admission_owner1_proven_peer(210, 4);
+        let (modules, skipped) = bind_scanned_modules(std::slice::from_ref(&raw), &mut pins);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let mut engine = Engine::empty();
+        engine.plan = plan::build_from_reconciled_modules(&modules);
+        engine.pinned = pins;
+        engine.modules = modules;
+        engine
+            .capture_facts
+            .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+            .unwrap();
+        engine.publish_current_capture_facts().unwrap();
+        assert_eq!(engine.plan.active_slot_count(), 4);
+        engine
+            .views
+            .push(ProcessView::open(raw.view, std::process::id()).unwrap());
+        let mut session = ScriptedSession::default();
+        session
+            .attach_targets(
+                &engine.plan.slots,
+                &engine.pinned,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+
+        // The newcomer: the same exact raw module under a different
+        // view, whose own pin failed — no fresh pin, no ownership
+        // claim, one named skip. Mirrors the fresh per-scan set
+        // production absorbs for the candidate.
+        let view2 = ProcessViewId(211);
+        let mut newcomer = raw.clone();
+        newcomer.view = view2;
+        let (fresh, skips) = match leg {
+            "carried" => admission_owner1_failed_fresh(raw.key),
+            _ => admission_owner1_unproven_fresh(),
+        };
+        let peer = ProcessView::open(view2, std::process::id()).unwrap();
+        let candidate = engine
+            .inventory_candidate(
+                &std::collections::BTreeSet::new(),
+                &[],
+                &[(peer, vec![newcomer], fresh)],
+                skips,
+                &std::collections::BTreeSet::new(),
+            )
+            .unwrap();
+
+        // Leg A (no-nuke): the physical pin is still the one retained
+        // object, whatever the fresh shape carried.
+        assert_eq!(
+            candidate.pinned.pinned().count(),
+            1,
+            "[{leg}] the proven peer survives the failed newcomer"
+        );
+        // Leg B (fence): the retained view's module is the only bound
+        // one; the refused newcomer module binds nothing through the
+        // peer's identical raw.
+        assert_eq!(
+            candidate.modules.len(),
+            1,
+            "[{leg}] the refused newcomer module must not bind ({} bound)",
+            candidate.modules.len()
+        );
+        assert_eq!(candidate.modules[0].scanned.view, raw.view);
+        // Zero derived claims for the refused view ...
+        let refused_claims = candidate.pinned.view_claims(view2);
+        assert!(
+            refused_claims.is_none_or(|claims| claims.tables.is_empty()
+                && claims.targets.is_empty()
+                && claims.pins.is_empty()),
+            "[{leg}] the refused view owns nothing: {refused_claims:?}"
+        );
+
+        // Applying the candidate keeps every proven slot and detaches
+        // no probe.
+        let mut additions_allowed = true;
+        engine
+            .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+            .unwrap();
+        assert_eq!(
+            engine.plan.active_slot_count(),
+            4,
+            "[{leg}] every proven slot stays active"
+        );
+        assert!(
+            session.detached_slot_indices.iter().all(Vec::is_empty),
+            "[{leg}] no probe detached: {:?}",
+            session.detached_slot_indices
+        );
+    }
+}
+
+/// Owner 1 (admission refactor), `rebuild_discovered` cell: the
+/// startup aggregate keeps the proven view's pin and binds only its
+/// module when a second view's scan of the same file failed. RED
+/// pre-refactor (the carried failure nukes the peer, or the failed
+/// view binds through it).
+#[test]
+fn admission_owner1_rebuild_keeps_peer_and_binds_no_refused_module() {
+    for leg in ["carried", "clean"] {
+        let (raw, pins) = admission_owner1_proven_peer(212, 4);
+        let mut newcomer = raw.clone();
+        newcomer.view = ProcessViewId(213);
+        let (fresh, skips) = match leg {
+            "carried" => admission_owner1_failed_fresh(raw.key),
+            _ => admission_owner1_unproven_fresh(),
+        };
+        let mut engine = Engine::empty();
+        engine.scan_inputs.insert(
+            raw.view,
+            ScanInput {
+                modules: vec![raw.clone()],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        let mut newcomer_counters = DiscoveryCounters::default();
+        newcomer_counters.object_skips = skips;
+        engine.scan_inputs.insert(
+            newcomer.view,
+            ScanInput {
+                modules: vec![newcomer],
+                pins: fresh,
+                counters: newcomer_counters,
+            },
+        );
+        rebuild_discovered(&mut engine).unwrap();
+        let bound_views: Vec<ProcessViewId> = engine
+            .modules
+            .iter()
+            .map(|module| module.scanned.view)
+            .collect();
+        assert_eq!(
+            bound_views,
+            vec![raw.view],
+            "[{leg}] only the proving view binds: {bound_views:?}"
+        );
+        assert_eq!(
+            engine.pinned.pinned().count(),
+            1,
+            "[{leg}] the proven pin survives the failed view"
+        );
+        assert!(
+            !engine.pinned.rejects(raw.key),
+            "[{leg}] the key stays admitted"
+        );
+    }
+}
+
+/// Owner 1 (admission refactor), `scan_reconciled_snapshot` cell:
+/// the snapshot binds only the proving view's module when a second
+/// view's scan of the same file failed. RED pre-refactor.
+#[test]
+fn admission_owner1_snapshot_binds_no_refused_module() {
+    for leg in ["carried", "clean"] {
+        let (raw, pins) = admission_owner1_proven_peer(214, 4);
+        let mut newcomer = raw.clone();
+        newcomer.view = ProcessViewId(215);
+        let (fresh, skips) = match leg {
+            "carried" => admission_owner1_failed_fresh(raw.key),
+            _ => admission_owner1_unproven_fresh(),
+        };
+        let mut engine = Engine::empty();
+        engine.scan_inputs.insert(
+            raw.view,
+            ScanInput {
+                modules: vec![raw.clone()],
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+        let mut newcomer_counters = DiscoveryCounters::default();
+        newcomer_counters.object_skips = skips;
+        engine.scan_inputs.insert(
+            newcomer.view,
+            ScanInput {
+                modules: vec![newcomer],
+                pins: fresh,
+                counters: newcomer_counters,
+            },
+        );
+        let (modules, pins) = engine.scan_reconciled_snapshot();
+        let bound_views: Vec<ProcessViewId> =
+            modules.iter().map(|module| module.scanned.view).collect();
+        assert_eq!(
+            bound_views,
+            vec![raw.view],
+            "[{leg}] only the proving view binds: {bound_views:?}"
+        );
+        assert!(!pins.rejects(raw.key), "[{leg}] the key stays admitted");
+    }
+}

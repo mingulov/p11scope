@@ -1550,47 +1550,6 @@ fn loader_rebind_keeps_carried_provider_claimless() {
 }
 
 #[test]
-fn dead_module_views_lists_only_unlisted_owners() {
-    // The rebind claimless-set derivation: module owners that are no
-    // longer live views, minus the kept (fresh-evidence) view. Live
-    // owners are never listed, and the kept view is excluded even when
-    // it is unlisted.
-    let mut engine = Engine::empty();
-    engine
-        .views
-        .push(ProcessView::open(ProcessViewId(0), std::process::id()).unwrap());
-    let modules = [
-        overlay_module(overlay_key(0)),
-        overlay_module(overlay_key(1)),
-        overlay_module(overlay_key(2)),
-    ];
-    assert_eq!(
-        modules[0].view,
-        ProcessViewId(0),
-        "the fixture views are the minors"
-    );
-    assert_eq!(
-        engine.dead_module_views(&modules, None),
-        BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]),
-        "unlisted owners are dead, the live owner is not"
-    );
-    assert_eq!(
-        engine.dead_module_views(&modules, Some(ProcessViewId(1))),
-        BTreeSet::from([ProcessViewId(2)]),
-        "the kept view is excluded"
-    );
-    assert_eq!(
-        engine.dead_module_views(&modules, Some(ProcessViewId(0))),
-        BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]),
-        "keeping a live view changes nothing"
-    );
-    assert!(
-        engine.dead_module_views(&[], None).is_empty(),
-        "no modules, no dead views"
-    );
-}
-
-#[test]
 fn claimless_rebuild_binds_carried_modules_without_claiming_them() {
     // The choke-point mechanism every rebind-carry site shares: modules
     // bound under a claimless view resolve their exact attached targets
@@ -1633,9 +1592,19 @@ fn claimless_rebuild_binds_carried_modules_without_claiming_them() {
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
-    let claimless = BTreeSet::from([view_a]);
+    // Tick events with view_a retired and view_b fresh: the choke denies
+    // the former and authorizes the latter (the old claimless-set shape).
+    let fresh = BTreeSet::from([view_b]);
+    let retired = BTreeSet::from([view_a]);
     let candidate = engine
-        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .live_candidate_with_events(
+            engine.pinned.clone(),
+            raw_modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &fresh,
+            &retired,
+        )
         .unwrap();
     assert_eq!(candidate.modules.len(), 2, "both modules bind");
     for object in [object_a, object_b] {
@@ -25955,17 +25924,21 @@ fn two_view_selection_claims_retire_independently() {
     let (claims, tables, pending) = engine
         .propose_selection_claim(&first_binding, provider, &first_table, &result)
         .unwrap();
+    let raw_modules: Vec<ScannedModule> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
-            engine
-                .modules
-                .iter()
-                .map(|module| module.scanned.clone())
-                .collect(),
+            raw_modules,
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .unwrap();
@@ -26059,11 +26032,13 @@ fn two_view_selection_claims_retire_independently() {
             &result,
         )
         .unwrap();
-    let raw_modules = engine
+    let raw_modules: Vec<ScannedModule> = engine
         .modules
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
@@ -26071,6 +26046,7 @@ fn two_view_selection_claims_retire_independently() {
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .unwrap();
@@ -26794,17 +26770,21 @@ fn selection_bindings_isolate_provider_attribution_and_refusal() {
         previous_claims: BTreeMap::new(),
         previous_tables: BTreeMap::new(),
     };
+    let raw_modules: Vec<ScannedModule> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
-            engine
-                .modules
-                .iter()
-                .map(|module| module.scanned.clone())
-                .collect(),
+            raw_modules,
             claims,
             [(table_key, table)].into_iter().collect(),
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .unwrap();
@@ -28489,11 +28469,13 @@ fn selection_table_partial_attach_rolls_back_the_successful_prefix() {
     let (claims, tables, pending) = engine
         .propose_selection_claim(&binding, provider, &table, &result)
         .unwrap();
-    let raw_modules = engine
+    let raw_modules: Vec<ScannedModule> = engine
         .modules
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
@@ -28501,6 +28483,7 @@ fn selection_table_partial_attach_rolls_back_the_successful_prefix() {
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .unwrap();
@@ -28560,17 +28543,21 @@ fn selection_candidate_preflight_refusal_keeps_claims_and_latch_unchanged() {
             &result,
         )
         .unwrap();
+    let raw_modules: Vec<ScannedModule> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
-            engine
-                .modules
-                .iter()
-                .map(|module| module.scanned.clone())
-                .collect(),
+            raw_modules,
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .unwrap();
@@ -28611,17 +28598,21 @@ fn selection_rollback_does_not_restore_a_latch_after_generation_loss() {
     let (claims, tables, pending) = engine
         .propose_selection_claim(&binding, provider, &table, &result)
         .unwrap();
+    let raw_modules: Vec<ScannedModule> = engine
+        .modules
+        .iter()
+        .map(|module| module.scanned.clone())
+        .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
-            engine
-                .modules
-                .iter()
-                .map(|module| module.scanned.clone())
-                .collect(),
+            raw_modules,
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .unwrap();
@@ -70670,11 +70661,13 @@ fn midfinal_res2_declined_inventory_keeps_selection_derived_slots() {
     let (claims, tables, pending) = engine
         .propose_selection_claim(&binding, provider, &table, &result)
         .expect("the consistent selection claim is proposed");
-    let raw_modules = engine
+    let raw_modules: Vec<ScannedModule> = engine
         .modules
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
@@ -70682,6 +70675,7 @@ fn midfinal_res2_declined_inventory_keeps_selection_derived_slots() {
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .expect("the selection candidate builds");
@@ -70802,11 +70796,13 @@ fn midfinal_res2_accepted_removal_retires_selection_derived_slots() {
     let (claims, tables, pending) = engine
         .propose_selection_claim(&binding, provider, &table, &result)
         .expect("the consistent selection claim is proposed");
-    let raw_modules = engine
+    let raw_modules: Vec<ScannedModule> = engine
         .modules
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
+    // Empty claimless set, preserved exactly: authorize every ridden view.
+    let fresh: BTreeSet<ProcessViewId> = raw_modules.iter().map(|module| module.view).collect();
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
@@ -70814,6 +70810,7 @@ fn midfinal_res2_accepted_removal_retires_selection_derived_slots() {
             claims,
             tables,
             pending,
+            &fresh,
             &BTreeSet::new(),
         )
         .expect("the selection candidate builds");
@@ -96111,9 +96108,16 @@ fn merge_ownership_e4_lowering_shared_pin_stays_claimless() {
         .map(|module| module.scanned.clone())
         .collect();
     merge_scanned_module(&mut raw_modules, lowered);
-    let claimless = engine.dead_module_views(&raw_modules, Some(observed));
+    let fresh = BTreeSet::from([observed]);
     let candidate = engine
-        .live_candidate_with_claimless(candidate_pins, raw_modules, skipped, &claimless)
+        .live_candidate_with_events(
+            candidate_pins,
+            raw_modules,
+            skipped,
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )
         .unwrap();
     assert!(
         candidate
@@ -96219,9 +96223,16 @@ fn merge_ownership_e4_lowering_carried_provider_stays_claimless() {
         .map(|module| module.scanned.clone())
         .collect();
     merge_scanned_module(&mut raw_modules, lowered);
-    let claimless = engine.dead_module_views(&raw_modules, Some(observed));
+    let fresh = BTreeSet::from([observed]);
     let candidate = engine
-        .live_candidate_with_claimless(candidate_pins, raw_modules, skipped, &claimless)
+        .live_candidate_with_events(
+            candidate_pins,
+            raw_modules,
+            skipped,
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )
         .unwrap();
     assert!(
         candidate
@@ -96284,9 +96295,16 @@ fn merge_ownership_e5_loader_scan_shared_pin_stays_claimless() {
         .map(|module| module.scanned.clone())
         .collect();
     assert_eq!(raw_modules.len(), 2, "R and L ride the rebuild");
-    let claimless = engine.dead_module_views(&raw_modules, Some(scanned));
+    let fresh = BTreeSet::from([scanned]);
     let candidate = engine
-        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .live_candidate_with_events(
+            engine.pinned.clone(),
+            raw_modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "loader scan rebuild");
     mo_assert_live_owner(
@@ -96373,9 +96391,16 @@ fn merge_ownership_e5_loader_scan_carried_provider_stays_claimless() {
         .map(|module| module.scanned.clone())
         .collect();
     assert_eq!(raw_modules.len(), 2, "R and B ride the rebuild");
-    let claimless = engine.dead_module_views(&raw_modules, Some(scanned));
+    let fresh = BTreeSet::from([scanned]);
     let candidate = engine
-        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .live_candidate_with_events(
+            engine.pinned.clone(),
+            raw_modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "loader scan rebuild");
     mo_assert_live_owner(
@@ -96409,9 +96434,15 @@ fn merge_ownership_e6_learned_staging_shared_pin_stays_claimless() {
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
-    let claimless = engine.dead_module_views(&raw_modules, None);
     let candidate = engine
-        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .live_candidate_with_events(
+            engine.pinned.clone(),
+            raw_modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "learned staging rebuild");
     mo_assert_live_owner(
@@ -96471,9 +96502,15 @@ fn merge_ownership_e6_learned_staging_carried_provider_stays_claimless() {
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
-    let claimless = engine.dead_module_views(&raw_modules, None);
     let candidate = engine
-        .live_candidate_with_claimless(engine.pinned.clone(), raw_modules, Vec::new(), &claimless)
+        .live_candidate_with_events(
+            engine.pinned.clone(),
+            raw_modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        )
         .unwrap();
     mo_assert_retired_claimless(&candidate.pinned, "learned staging rebuild");
     mo_assert_live_owner(
@@ -96554,7 +96591,6 @@ fn merge_ownership_e7_selection_shared_pin_stays_claimless() {
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
-    let claimless = engine.dead_module_views(&raw_modules, None);
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
@@ -96562,7 +96598,8 @@ fn merge_ownership_e7_selection_shared_pin_stays_claimless() {
             claims,
             tables,
             pending,
-            &claimless,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .unwrap();
     assert!(
@@ -96640,7 +96677,6 @@ fn merge_ownership_e7_selection_carried_provider_stays_claimless() {
         .iter()
         .map(|module| module.scanned.clone())
         .collect();
-    let claimless = engine.dead_module_views(&raw_modules, None);
     let candidate = engine
         .live_candidate_with_selection(
             engine.pinned.clone(),
@@ -96648,7 +96684,8 @@ fn merge_ownership_e7_selection_carried_provider_stays_claimless() {
             claims,
             tables,
             pending,
-            &claimless,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         )
         .unwrap();
     assert!(

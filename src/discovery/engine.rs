@@ -22,12 +22,13 @@ use crate::discovery::elf_needed;
 use crate::discovery::handle_table::{DeferredReason, Filing, HandleTable};
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
+    ClaimAuthority, ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
     InstalledPinsBacking, KernelSelfMappingProbe, ManifestPinError, ManifestPinning,
     ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId, PinnedObjects,
     PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
-    StaleManifestObject, bind_scanned_modules, bind_scanned_modules_strict,
+    StaleManifestObject, bind_scanned_modules, bind_scanned_modules_gated, bind_scanned_modules_strict,
+    bind_scanned_modules_strict_gated,
     canonicalize_scanned_overlays, open_view_executable_cached, open_view_rooted_object_cached,
     opened_file_matches_maps, pin_manifest_objects_deferred_in_views_with_budget_and_filing,
     pin_manifest_objects_deferred_in_views_with_prior_and_filing, pin_of,
@@ -12489,6 +12490,51 @@ fn same_table_redecode(known: &ScannedTable, incoming: &ScannedTable) -> bool {
         && known.unpinned == incoming.unpinned
 }
 
+/// Unlink the selected associations bound to `index`, coalescing each
+/// invalidated record with an equivalent unlinked record under the same
+/// dedup key the merge interns by (`index`, `name_class`, `flags`,
+/// `table`): repeated remaps keep one history row per distinct metadata,
+/// never one per remap (spec §6). Names merge into the survivor. Both
+/// unlink arms (remap rewrite, typed-live opaque yield) share this one
+/// helper so neither can accumulate duplicates behind the other.
+fn unlink_table_interfaces(
+    interfaces: &mut Vec<ScannedInterface>,
+    index: usize,
+    selected: impl Fn(&ScannedInterface) -> bool,
+) {
+    let mut doomed = Vec::new();
+    for (position, interface) in interfaces.iter().enumerate() {
+        if interface.table == Some(index) && selected(interface) {
+            doomed.push(position);
+        }
+    }
+    for position in doomed.into_iter().rev() {
+        let unlinked = ScannedInterface {
+            table: None,
+            ..interfaces[position].clone()
+        };
+        let survivor = interfaces.iter().enumerate().position(|(kept, known)| {
+            kept != position
+                && known.index == unlinked.index
+                && known.name_class == unlinked.name_class
+                && known.flags == unlinked.flags
+                && known.table.is_none()
+        });
+        if let Some(kept) = survivor {
+            let known = &mut interfaces[kept];
+            if known.name_lossy.is_none() {
+                known.name_lossy.clone_from(&unlinked.name_lossy);
+            }
+            if known.name_private.is_none() {
+                known.name_private.clone_from(&unlinked.name_private);
+            }
+            interfaces.remove(position);
+        } else {
+            interfaces[position].table = None;
+        }
+    }
+}
+
 /// Union `incoming` into its same-file module, or file it beside its
 /// ABI-mismatched twin. Returns how many fresh tables the per-module
 /// cap dropped (counted overflow, never silent): callers accumulate it
@@ -12550,10 +12596,23 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             existing.exports.push(export);
         }
     }
-    let mut table_indices: Vec<Option<usize>> = Vec::new();
+    // A link is bound to a (row, mapping) pair, not to a bare index: the
+    // lowering below lands an incoming association on its destination row
+    // only while that row still shows the incoming mapping's address. A
+    // later incoming row can rewrite the destination within the same union;
+    // the superseded mapping keeps its metadata as unlinked history (spec
+    // §4). The address travels in this lowering type so the check cannot
+    // be skipped by construction. A cap-dropped table lowers to no entry.
+    #[derive(Clone, Copy)]
+    struct LoweredTable {
+        index: usize,
+        address: u64,
+    }
+    let mut table_indices: Vec<Option<LoweredTable>> = Vec::new();
     let mut typed_live_tables = BTreeSet::new();
     let mut dropped = 0u64;
     for (incoming_index, table) in incoming.tables.drain(..).enumerate() {
+        let incoming_address = table.address;
         let typed_live = table.live_return
             && !table_has_only_opaque_interfaces(incoming_index, &incoming.interfaces);
         let incoming_is_static = !table.live_return;
@@ -12582,15 +12641,11 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                         && !table_has_only_opaque_interfaces(index, &existing.interfaces))
                 {
                     typed_live_tables.insert(index);
-                    for interface in &mut existing.interfaces {
-                        if interface.table == Some(index)
-                            && interface.name_class != "exact_standard"
-                        {
-                            // Keep opaque metadata without revoking the
-                            // independent typed getter's stronger name proof.
-                            interface.table = None;
-                        }
-                    }
+                    // Keep opaque metadata without revoking the
+                    // independent typed getter's stronger name proof.
+                    unlink_table_interfaces(&mut existing.interfaces, index, |interface| {
+                        interface.name_class != "exact_standard"
+                    });
                 }
                 existing.tables[index].live_return |= table.live_return;
                 existing.tables[index].manifest_supported |= table.manifest_supported;
@@ -12621,17 +12676,16 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                     // linked interfaces by absolute function-list pointer,
                     // so a retained linkage proves nothing about the fresh
                     // mapping's table. The records stay as unlinked
-                    // history; fresh associations arrive through the
-                    // incoming index map below.
-                    for interface in &mut existing.interfaces {
-                        if interface.table == Some(index) {
-                            interface.table = None;
-                        }
-                    }
+                    // history, coalesced; fresh associations arrive through
+                    // the validated incoming map below.
+                    unlink_table_interfaces(&mut existing.interfaces, index, |_| true);
                 } else {
                     existing.tables[index].extension_impossible |= table.extension_impossible;
                 }
-                Some(index)
+                Some(LoweredTable {
+                    index,
+                    address: incoming_address,
+                })
             }
             None => {
                 if existing.tables.len() >= MAX_MERGED_TABLES_PER_MODULE {
@@ -12648,7 +12702,10 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
                     if typed_live {
                         typed_live_tables.insert(index);
                     }
-                    Some(index)
+                    Some(LoweredTable {
+                        index,
+                        address: incoming_address,
+                    })
                 }
             }
         });
@@ -12657,10 +12714,22 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
         finished_before && (incoming_finished || incoming_pure_live) && !appended_static;
     for mut interface in incoming.interfaces.drain(..) {
         // A dropped table has no merged index: the interface keeps its
-        // row with no table link, like an out-of-range incoming index.
-        interface.table = interface
-            .table
-            .and_then(|index| table_indices.get(index).copied().flatten());
+        // row with no table link, like an out-of-range incoming index. A
+        // surviving link lands only while its destination row still shows
+        // the incoming mapping's address.
+        interface.table = interface.table.and_then(|index| {
+            table_indices
+                .get(index)
+                .copied()
+                .flatten()
+                .and_then(|lowered| {
+                    existing
+                        .tables
+                        .get(lowered.index)
+                        .filter(|row| row.address == lowered.address)
+                        .map(|_| lowered.index)
+                })
+        });
         if interface.name_class != "exact_standard"
             && interface
                 .table
@@ -18160,10 +18229,11 @@ impl Engine {
         }
     }
 
-    /// Test-only shorthand: every production rebuild names its carried
-    /// views explicitly (`live_candidate_with_claimless`,
-    /// `live_candidate_with_declined`), so the bare form survives only
-    /// for unit-test callers.
+    /// Test-only shorthand: every production rebuild names its tick
+    /// events explicitly (`live_candidate_with_events`,
+    /// `live_candidate_with_selection`), so the bare form survives only
+    /// for unit-test callers. It authorizes every ridden view — exactly
+    /// the old bind-everything shape.
     #[cfg(test)]
     fn live_candidate(
         &mut self,
@@ -18171,73 +18241,47 @@ impl Engine {
         raw_modules: Vec<ScannedModule>,
         skipped: Vec<Skipped>,
     ) -> Result<LiveCandidate> {
+        let ridden: BTreeSet<ProcessViewId> =
+            raw_modules.iter().map(|module| module.view).collect();
         self.live_candidate_with_pending(
             pinned,
             raw_modules,
             skipped,
             None,
             &BTreeSet::new(),
+            &ridden,
             &BTreeSet::new(),
         )
     }
 
-    /// The inventory rebuild for a tick that declined some loss reports: a
-    /// declined view is retained but known-stale, so its selection claims
-    /// and tables survive the liveness filter below instead of dropping
-    /// (which would retire their sole-owned endpoints without an accepted
-    /// removal decision).
-    fn live_candidate_with_declined(
+    /// A rebuild with explicit tick events: `fresh` names unlisted-but-live
+    /// views (admitted newcomers, the scanned/observed owner), `retired`
+    /// names views retiring on this tick, and `declined` names stale views
+    /// with no accepted removal decision (retained view, contexts, claims,
+    /// slots). The choke derives the claim authority from these plus the
+    /// engine's live views (spec §3); entry points declare tick events,
+    /// never suppression sets.
+    fn live_candidate_with_events(
         &mut self,
         pinned: PinnedObjects,
         raw_modules: Vec<ScannedModule>,
         skipped: Vec<Skipped>,
         declined: &BTreeSet<ProcessViewId>,
-        claimless: &BTreeSet<ProcessViewId>,
-    ) -> Result<LiveCandidate> {
-        self.live_candidate_with_pending(pinned, raw_modules, skipped, None, declined, claimless)
-    }
-
-    /// A rebuild whose carried views own no claims: `claimless` names the
-    /// retired views whose modules ride for still-attached objects. The
-    /// rebind files no surviving claims for them (see
-    /// `live_candidate_with_pending`); every other view binds exactly as
-    /// `live_candidate` binds it.
-    fn live_candidate_with_claimless(
-        &mut self,
-        pinned: PinnedObjects,
-        raw_modules: Vec<ScannedModule>,
-        skipped: Vec<Skipped>,
-        claimless: &BTreeSet<ProcessViewId>,
+        fresh: &BTreeSet<ProcessViewId>,
+        retired: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
         self.live_candidate_with_pending(
             pinned,
             raw_modules,
             skipped,
             None,
-            &BTreeSet::new(),
-            claimless,
+            declined,
+            fresh,
+            retired,
         )
     }
 
-    /// Module owners in `modules` that are no longer live views, minus
-    /// `keep`: the carried dead views a rebind must not file ownership
-    /// claims for. Only for assemblies that merge no not-yet-admitted
-    /// views — a newcomer is unlisted but live, so the inventory
-    /// assembly (which admits newcomers) passes its own removed set
-    /// instead of calling this.
-    fn dead_module_views(
-        &self,
-        modules: &[ScannedModule],
-        keep: Option<ProcessViewId>,
-    ) -> BTreeSet<ProcessViewId> {
-        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
-        modules
-            .iter()
-            .map(|module| module.view)
-            .filter(|view| Some(*view) != keep && !live.contains(view))
-            .collect()
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn live_candidate_with_pending(
         &mut self,
         mut pinned: PinnedObjects,
@@ -18245,7 +18289,8 @@ impl Engine {
         mut skipped: Vec<Skipped>,
         pending_selection: Option<&SelectionTableKey>,
         declined: &BTreeSet<ProcessViewId>,
-        claimless: &BTreeSet<ProcessViewId>,
+        fresh: &BTreeSet<ProcessViewId>,
+        retired: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
         self.loader_plan_cache = None;
         let merge_head_start = crate::attach::monotonic_ns();
@@ -18270,6 +18315,13 @@ impl Engine {
         let raw_before_learned = raw_modules.len();
         raw_modules.extend(self.run_learned_modules.iter().cloned());
         let raw_with_learned = raw_modules.len();
+        // Ridden views for the post-bind scrub, taken before the reject
+        // filter: a rejected module never binds, but its view's stale
+        // entries must still converge when the view is unauthorized.
+        // Taken after the learned join above so the reserved owner rides
+        // too (it is authorized below, so the scrub spares it).
+        let ridden: BTreeSet<ProcessViewId> =
+            raw_modules.iter().map(|module| module.view).collect();
         raw_modules.retain(|module| {
             !pinned.rejects(module.key)
                 && !module
@@ -18297,13 +18349,32 @@ impl Engine {
             merge_head_start,
             crate::attach::monotonic_ns(),
         );
+        // Carried custody, enforced once at this choke (spec §3): the
+        // authority derives from the engine's live views plus this
+        // rebuild's tick events. Only authorized (live) views own claims;
+        // carried modules still bind — their exact attached targets ride
+        // into the plan — but file nothing, however their pins are
+        // claimed elsewhere. The post-bind scrub converges pre-existing
+        // entries a caller left behind (and anything the pre-fix bug
+        // filed) instead of persisting them.
+        let mut live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        // The reserved run-learned owner is not a process generation, so
+        // it is never among the engine's live views — but it is a
+        // legitimate persistent owner (never retired), not a carried,
+        // dropped or unknown view: authorize it, or the bind files no
+        // claims for learned tables and the scrub below drops the
+        // alias-filed ones (E1 persistence).
+        live.insert(Self::RUN_LEARNED_VIEW_ID);
+        let authority = ClaimAuthority::candidate(&live, fresh, declined, retired);
         let bind_start = crate::attach::monotonic_ns();
         // Every scope binds strictly: an uncorroborated decode of a
         // table-mimicking provider must prove every entry is a function
         // entry (see `bind_scanned_modules_strict`) instead of planting
         // uprobes at garbage offsets. Target safety is absolute — owned
-        // run, pid, system, inventory and frame scopes alike.
-        let (modules, binding_skips) = bind_scanned_modules_strict(&raw_modules, &mut pinned);
+        // run, pid, system, inventory and frame scopes alike. Claims file
+        // only for views the rebuild authority authorizes (spec §3).
+        let (modules, binding_skips) =
+            bind_scanned_modules_strict_gated(&raw_modules, &mut pinned, &authority);
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate bind: {} raw -> {} bound ({} skips)",
@@ -18324,15 +18395,8 @@ impl Engine {
             bind_start,
             crate::attach::monotonic_ns(),
         );
-        // Carried custody: the rebind files ownership claims for every
-        // bound module, including modules carried for retired views.
-        // Claims under a retired process would break the derived carried
-        // classification (`carried_ids`), letting an unrelated later
-        // refresh purge the carried pins. The carried modules stay bound —
-        // their exact attached targets ride into the plan — but own no
-        // claims, exactly as `remove_view_except` left them.
-        for view in claimless {
-            pinned.drop_view_claims(*view);
+        for view in authority.denied(&ridden, retired) {
+            pinned.drop_view_claims(view);
         }
         let merge_mid_start = crate::attach::monotonic_ns();
         self.note_object_skips(binding_skips);
@@ -18760,15 +18824,17 @@ impl Engine {
                 .iter()
                 .map(|module| module.scanned.clone())
                 .collect();
-            // Committed carried views ride through this rebuild: keep them
-            // claimless so later purges spare their pins. The scanned view
-            // keeps its fresh claims.
-            let claimless = self.dead_module_views(&raw_modules, Some(view));
-            let mut candidate = self.live_candidate_with_claimless(
+            // The scanned view is this rebuild's fresh view; committed
+            // carried views ride through it. The choke authorizes the
+            // former and denies the latter (spec §3).
+            let fresh = BTreeSet::from([view]);
+            let mut candidate = self.live_candidate_with_events(
                 candidate_pins,
                 raw_modules,
                 skipped,
-                &claimless,
+                &BTreeSet::new(),
+                &fresh,
+                &BTreeSet::new(),
             )?;
             if candidate.delta.new.is_empty()
                 && candidate.delta.replace.is_empty()
@@ -18890,17 +18956,11 @@ impl Engine {
         // Carried views are exited: their modules ride for the still-attached
         // objects, but the views themselves must not enter currency, stale or
         // admission checks (like the inventory carry's declined-views
-        // precedent) — and the rebind must file no ownership claims under
-        // them, or an unrelated later refresh purges the carried pins the
-        // remove above deliberately kept resolvable.
-        //
-        // Claimlessness covers newly retired views and previously carried
-        // ones, like the inventory assembly: an already-carried module
-        // that rides through another replay must not regain claims.
-        // Previously carried means a committed module for a
-        // still-attached object whose pins are already claimless, from a
-        // view that is neither retiring now nor still live. Currency
-        // keeps the original newly-retired filter below.
+        // precedent). Claim authority comes from the choke (spec §3): this
+        // replay retires `retirements`, and every other non-live ridden
+        // view — newly retired or previously carried — is denied whether
+        // or not a live co-owner claims its pins. Currency keeps the
+        // original newly-retired filter below.
         let carried: BTreeSet<ProcessViewId> = self
             .modules
             .iter()
@@ -18909,22 +18969,14 @@ impl Engine {
             })
             .map(|module| module.scanned.view)
             .collect();
-        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
-        let already_carried = self.pinned.carried_ids();
-        let claimless: BTreeSet<ProcessViewId> = self
-            .modules
-            .iter()
-            .filter(|module| {
-                carry_objects.contains(&module.object)
-                    && already_carried.contains(&module.object)
-                    && !retirements.contains(&module.scanned.view)
-                    && !live.contains(&module.scanned.view)
-            })
-            .map(|module| module.scanned.view)
-            .chain(carried.iter().copied())
-            .collect();
-        let mut candidate =
-            self.live_candidate_with_claimless(pinned, raw_modules, skipped, &claimless)?;
+        let mut candidate = self.live_candidate_with_events(
+            pinned,
+            raw_modules,
+            skipped,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            retirements,
+        )?;
         candidate.views.retain(|view| !carried.contains(view));
         Ok(candidate)
     }
@@ -21651,13 +21703,19 @@ impl Engine {
             std::slice::from_ref(&lowered),
         );
         merge_scanned_module_counted(&mut raw_modules, lowered, &mut self.merge_tables_dropped);
-        // Committed carried views ride through this rebuild: keep them
-        // claimless so later purges spare their pins. The observed view
-        // keeps its fresh claims.
+        // The observed view is this rebuild's fresh view; committed
+        // carried views ride through it. The choke authorizes the former
+        // and denies the latter (spec §3).
         let observed_view = self.views[position].id();
-        let claimless = self.dead_module_views(&raw_modules, Some(observed_view));
-        let mut candidate =
-            self.live_candidate_with_claimless(candidate_pins, raw_modules, skipped, &claimless)?;
+        let fresh = BTreeSet::from([observed_view]);
+        let mut candidate = self.live_candidate_with_events(
+            candidate_pins,
+            raw_modules,
+            skipped,
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, std::slice::from_ref(&observed_module));
         self.observe_causal_timing(&observed, hook_ts_ns);
@@ -22579,12 +22637,18 @@ impl Engine {
         if pins_waited_for_handles_budget(&skipped) {
             return Ok(DiscoveryRecordOutcome::LoaderScanDeferred);
         }
-        // Committed carried views ride through this rebuild: keep them
-        // claimless so later purges spare their pins. The scanned view
-        // keeps its fresh claims.
-        let claimless = self.dead_module_views(&raw_modules, Some(view_id));
-        let mut candidate =
-            self.live_candidate_with_claimless(candidate_pins, raw_modules, skipped, &claimless)?;
+        // The scanned view is this rebuild's fresh view; committed
+        // carried views ride through it. The choke authorizes the former
+        // and denies the latter (spec §3).
+        let fresh = BTreeSet::from([view_id]);
+        let mut candidate = self.live_candidate_with_events(
+            candidate_pins,
+            raw_modules,
+            skipped,
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
         if let Some(hook_ts_ns) = hook_ts_ns {
@@ -24223,14 +24287,15 @@ impl Engine {
                 .iter()
                 .map(|module| module.scanned.clone())
                 .collect();
-            // Committed carried views ride through this rebuild: keep them
-            // claimless so later purges spare their pins.
-            let claimless = engine.dead_module_views(&raw_modules, None);
-            let candidate = engine.live_candidate_with_claimless(
+            // No tick events here: committed carried views ride through
+            // this rebuild and the choke denies them (spec §3).
+            let candidate = engine.live_candidate_with_events(
                 candidate_pins,
                 raw_modules,
                 Vec::new(),
-                &claimless,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )?;
             let mut additions_allowed = true;
             let outcome =
@@ -24682,6 +24747,7 @@ impl Engine {
         Some((claims, tables, pending))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn live_candidate_with_selection(
         &mut self,
         pinned: PinnedObjects,
@@ -24689,7 +24755,8 @@ impl Engine {
         selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
         selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
         selection_admission: PendingSelectionAdmission,
-        claimless: &BTreeSet<ProcessViewId>,
+        fresh: &BTreeSet<ProcessViewId>,
+        retired: &BTreeSet<ProcessViewId>,
     ) -> Result<LiveCandidate> {
         let old_claims = std::mem::replace(&mut self.selection_claims, selection_claims);
         let old_tables = std::mem::replace(&mut self.selection_tables, selection_tables);
@@ -24699,7 +24766,8 @@ impl Engine {
             Vec::new(),
             Some(&selection_admission.key),
             &BTreeSet::new(),
-            claimless,
+            fresh,
+            retired,
         );
         self.selection_claims = old_claims;
         self.selection_tables = old_tables;
@@ -25091,16 +25159,16 @@ impl Engine {
                 .iter()
                 .map(|module| module.scanned.clone())
                 .collect();
-            // Committed carried views ride through this rebuild: keep them
-            // claimless so later purges spare their pins.
-            let claimless = self.dead_module_views(&raw_modules, None);
+            // No tick events here: committed carried views ride through
+            // this rebuild and the choke denies them (spec §3).
             let candidate = self.live_candidate_with_selection(
                 self.pinned.clone(),
                 raw_modules,
                 claims,
                 tables,
                 pending,
-                &claimless,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )?;
             if let Some((session, additions_allowed, pending_views)) = transaction {
                 let outcome =
@@ -31546,19 +31614,11 @@ impl Engine {
         // Carried views are exited: their modules ride for the still-attached
         // objects, but the views themselves must not enter currency, stale or
         // admission checks (like declined views below, which are retained but
-        // never required) — and the rebind must file no ownership claims
-        // under them, or an unrelated later refresh purges the carried pins
-        // the remove above deliberately kept resolvable.
-        //
-        // Claimlessness covers newly retired views and previously carried
-        // ones: a carried module that rides again through an unrelated
-        // refresh would otherwise regain claims under its retired view,
-        // losing the derived carried classification on the very next
-        // rebind. Previously carried means a committed module for a
-        // still-attached object whose pins are already claimless —
-        // exact-target gated like the new retirements, and fresh views
-        // (live, refreshed, or not-yet-admitted) never qualify. Currency
-        // keeps the original newly-retired filter below.
+        // never required). Claim authority comes from the choke (spec §3):
+        // this tick retires `removed` and admits `new_views`, and every
+        // other non-live ridden view — newly retired or previously
+        // carried — is denied whether or not a live co-owner claims its
+        // pins. Currency keeps the original newly-retired filter below.
         let carried: BTreeSet<ProcessViewId> = self
             .modules
             .iter()
@@ -31567,30 +31627,15 @@ impl Engine {
             })
             .map(|module| module.scanned.view)
             .collect();
-        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
         let admitted: BTreeSet<ProcessViewId> =
             new_views.iter().map(|(view, _, _)| view.id()).collect();
-        let already_carried = self.pinned.carried_ids();
-        let claimless: BTreeSet<ProcessViewId> = self
-            .modules
-            .iter()
-            .filter(|module| {
-                carry_objects.contains(&module.object)
-                    && already_carried.contains(&module.object)
-                    && !removed.contains(&module.scanned.view)
-                    && !refreshed_ids.contains(&module.scanned.view)
-                    && !admitted.contains(&module.scanned.view)
-                    && !live.contains(&module.scanned.view)
-            })
-            .map(|module| module.scanned.view)
-            .chain(carried.iter().copied())
-            .collect();
-        let mut candidate = self.live_candidate_with_declined(
+        let mut candidate = self.live_candidate_with_events(
             candidate_pins,
             raw_modules,
             skipped,
             declined,
-            &claimless,
+            &admitted,
+            removed,
         )?;
         candidate.views.retain(|view| !carried.contains(view));
         candidate

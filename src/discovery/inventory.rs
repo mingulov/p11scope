@@ -673,11 +673,18 @@ impl Engine {
             .filter(|module| module.scanned.view != owner)
             .map(|module| module.scanned.clone())
             .collect();
-        // Retained carried views ride through this rebuild: keep them
-        // claimless so later purges spare their pins.
-        let claimless = self.dead_module_views(&modules, None);
-        let mut candidate =
-            self.live_candidate_with_claimless(pinned, modules, Vec::new(), &claimless)?;
+        // This release retires `owner` (whose modules do not ride); retained
+        // carried views ride through the rebuild and the choke denies them
+        // (spec §3).
+        let retired = BTreeSet::from([owner]);
+        let mut candidate = self.live_candidate_with_events(
+            pinned,
+            modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &retired,
+        )?;
         self.preflight_candidate_publication(&candidate)?;
         record_object_skips(
             &mut candidate.plan,
@@ -1109,12 +1116,18 @@ impl Engine {
             merge_scanned_module_counted(&mut modules, module, &mut self.merge_tables_dropped);
         }
         pins.reset_scan_pin_claims();
-        // Retained carried views ride through this rebuild: keep them
-        // claimless so later purges spare their pins. The reconciled
-        // owner keeps its fresh claims.
-        let claimless = self.dead_module_views(&modules, Some(id));
-        let candidate =
-            self.live_candidate_with_claimless(pins, modules, Vec::new(), &claimless)?;
+        // The reconciled owner is this rebuild's fresh view; retained
+        // carried views ride through it. The choke authorizes the former
+        // and denies the latter (spec §3).
+        let fresh = BTreeSet::from([id]);
+        let candidate = self.live_candidate_with_events(
+            pins,
+            modules,
+            Vec::new(),
+            &BTreeSet::new(),
+            &fresh,
+            &BTreeSet::new(),
+        )?;
         let claim_count = self.views.iter().try_fold(0usize, |total, view| {
             let Some(claims) = candidate.pinned.view_claims(view.id()) else {
                 return Ok(total);

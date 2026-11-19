@@ -3021,9 +3021,9 @@ impl PinnedObjects {
 
     /// Drops one view's ownership claims while keeping every pin
     /// resolvable: the except-carry shape (`remove_view_except` with a
-    /// keep set) without the purge. Rebinding files claims for every
-    /// bound module, so assembly sites that carry retired views' modules
-    /// call this for the carried views after the rebind — a retained
+    /// keep set) without the purge. In production only the central
+    /// post-bind scrub calls this, for views outside the claim authority
+    /// (tests shape carried fixtures with it directly) — a retained
     /// table supplies exact attached targets without filing claims under
     /// a retired process. Carried ids (resolvable, claimless) stay spared
     /// by every later purge; dropping an already claimless view is a
@@ -10285,14 +10285,82 @@ pub(crate) fn forwarded_bootstrap_verified(
             .any(|(name, offset)| name == entry.name && *offset == entry.file_offset)
 }
 
+/// Which views may own claims in one bind: the single claim-authority
+/// value for a candidate rebuild (merge-ownership spec §3). The binder —
+/// the one site that grants claims — files ownership claims for a bound
+/// module if and only if its view is authorized. Carried modules still
+/// bind (their exact attached targets ride into the plan); they file
+/// nothing, however their pins are claimed elsewhere. Suppression is
+/// per-view retirement provenance, never per-object claimed-ness: a live
+/// co-owner's claims on a shared pin neither authorize nor disturb the
+/// retired view.
+#[derive(Debug, Clone)]
+pub(crate) enum ClaimAuthority {
+    /// Fresh-scan binds with no carried modules (initial rebuild,
+    /// read-only snapshots, offline inspection): every bound view owns.
+    All,
+    /// Candidate rebuilds: exactly these views own claims.
+    Views(BTreeSet<ProcessViewId>),
+}
+
+impl ClaimAuthority {
+    /// Authority for one candidate rebuild from its tick events:
+    /// `((live ∪ fresh) − retired) ∪ declined`. Still-listed retiring
+    /// views lose to the retired set; explicitly retained declined views
+    /// win over it. Every other view — carried, dropped, unknown — owns
+    /// nothing. This constructor is the only authority derivation; entry
+    /// points declare tick events, never suppression sets.
+    pub(crate) fn candidate(
+        live: &BTreeSet<ProcessViewId>,
+        fresh: &BTreeSet<ProcessViewId>,
+        declined: &BTreeSet<ProcessViewId>,
+        retired: &BTreeSet<ProcessViewId>,
+    ) -> Self {
+        let mut authorized: BTreeSet<ProcessViewId> = live.union(fresh).copied().collect();
+        for view in retired {
+            authorized.remove(view);
+        }
+        authorized.extend(declined.iter().copied());
+        Self::Views(authorized)
+    }
+
+    pub(crate) fn authorizes(&self, view: ProcessViewId) -> bool {
+        match self {
+            Self::All => true,
+            Self::Views(views) => views.contains(&view),
+        }
+    }
+
+    /// Views whose entries the choke scrubs after the bind: ridden views
+    /// outside the authority, plus views retired by name this tick (their
+    /// entries are already gone in the usual case; the scrub converges
+    /// anything a caller forgot and anything the pre-fix bug filed).
+    /// Views that rode nothing and retired on no tick are untouched, so
+    /// manifest and pre-arm ownership outside the bind is preserved.
+    pub(crate) fn denied(
+        &self,
+        ridden: &BTreeSet<ProcessViewId>,
+        retired: &BTreeSet<ProcessViewId>,
+    ) -> Vec<ProcessViewId> {
+        ridden
+            .union(retired)
+            .copied()
+            .filter(|view| !self.authorizes(*view))
+            .collect()
+    }
+}
+
 /// Resolves every process-view-local mapping reference to its final capture-local
 /// opened identity. It does not apply overlay heuristics, so callers can bind after
 /// manifest absorption without moving manifest authority between scan peers.
+/// Files claims for every bound module: only for fresh-scan binds with no
+/// carried modules. Candidate rebuilds use
+/// [`bind_scanned_modules_strict_gated`].
 pub fn bind_scanned_modules(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
 ) -> (Vec<ReconciledModule>, Vec<Skipped>) {
-    bind_scanned_modules_inner(modules, pinned, false)
+    bind_scanned_modules_inner(modules, pinned, false, &ClaimAuthority::All)
 }
 
 /// The attach-path bind: like [`bind_scanned_modules`], but a table no
@@ -10305,19 +10373,44 @@ pub fn bind_scanned_modules(
 /// of a table-mimicking provider (haskoki's GHC static data) would
 /// otherwise plant uprobes at garbage offsets in whatever file the
 /// decode resolved into, and the target dies executing them. Corroborated
-/// tables bind exactly as below. Every engine candidate bind uses this;
-/// only the semantics snapshot keeps the default.
+/// tables bind exactly as below. The live-candidate choke uses
+/// [`bind_scanned_modules_strict_gated`] (this proof plus claim
+/// authority); only the semantics snapshot keeps the default.
 pub(crate) fn bind_scanned_modules_strict(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
 ) -> (Vec<ReconciledModule>, Vec<Skipped>) {
-    bind_scanned_modules_inner(modules, pinned, true)
+    bind_scanned_modules_inner(modules, pinned, true, &ClaimAuthority::All)
+}
+
+/// [`bind_scanned_modules`], filing ownership claims only for views the
+/// authority authorizes. Unauthorized views still bind — their exact
+/// attached targets ride — but own no claims.
+pub(crate) fn bind_scanned_modules_gated(
+    modules: &[ScannedModule],
+    pinned: &mut PinnedObjects,
+    authority: &ClaimAuthority,
+) -> (Vec<ReconciledModule>, Vec<Skipped>) {
+    bind_scanned_modules_inner(modules, pinned, false, authority)
+}
+
+/// The attach-path gated bind: the [`bind_scanned_modules_strict`]
+/// proof for uncorroborated tables plus the
+/// [`bind_scanned_modules_gated`] claim authority. Every live-candidate
+/// rebuild uses this: target safety and carried claimlessness together.
+pub(crate) fn bind_scanned_modules_strict_gated(
+    modules: &[ScannedModule],
+    pinned: &mut PinnedObjects,
+    authority: &ClaimAuthority,
+) -> (Vec<ReconciledModule>, Vec<Skipped>) {
+    bind_scanned_modules_inner(modules, pinned, true, authority)
 }
 
 fn bind_scanned_modules_inner(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
     strict_uncorroborated: bool,
+    authority: &ClaimAuthority,
 ) -> (Vec<ReconciledModule>, Vec<Skipped>) {
     pinned.bump_copy_version();
     let mut reconciled = Vec::new();
@@ -10494,15 +10587,19 @@ fn bind_scanned_modules_inner(
             entry_objects.push(ids);
             forward_verified.push(verified);
         }
-        let claims = pinned.ownership.entry(module.view).or_default();
-        claims
-            .tables
-            .extend(std::iter::repeat_n(object, scanned.tables.len()));
-        claims.pins.push(object);
-        for (table, ids) in scanned.tables.iter().zip(&entry_objects) {
-            for (entry, id) in table.entries.iter().zip(ids) {
-                claims.targets.push((*id, entry.file_offset));
-                claims.pins.push(*id);
+        // The one grant site: claims file if and only if the view is
+        // authorized. Unauthorized (carried) views still reconcile below.
+        if authority.authorizes(module.view) {
+            let claims = pinned.ownership.entry(module.view).or_default();
+            claims
+                .tables
+                .extend(std::iter::repeat_n(object, scanned.tables.len()));
+            claims.pins.push(object);
+            for (table, ids) in scanned.tables.iter().zip(&entry_objects) {
+                for (entry, id) in table.entries.iter().zip(ids) {
+                    claims.targets.push((*id, entry.file_offset));
+                    claims.pins.push(*id);
+                }
             }
         }
         let (getter_present, witness_fault) = pinned.export_witness_flags_for(object);
@@ -11884,6 +11981,91 @@ mod tests {
         assert!(
             pinned.view_claims(view).is_none() && pinned.summary(object).is_some(),
             "dropping an already claimless view is a no-op"
+        );
+    }
+
+    #[test]
+    fn claim_authority_derives_from_tick_events_once() {
+        // Spec §3: ((live ∪ fresh) − retired) ∪ declined. Still-listed
+        // retiring views lose; explicitly retained declined views win;
+        // every other view owns nothing. All authorizes everything.
+        let live = BTreeSet::from([ProcessViewId(1), ProcessViewId(2)]);
+        let fresh = BTreeSet::from([ProcessViewId(3)]);
+        let declined = BTreeSet::from([ProcessViewId(4)]);
+        let retired = BTreeSet::from([ProcessViewId(2), ProcessViewId(5)]);
+        let authority = ClaimAuthority::candidate(&live, &fresh, &declined, &retired);
+        for view in [1, 3, 4] {
+            assert!(
+                authority.authorizes(ProcessViewId(view)),
+                "live, fresh and declined views own claims: {view}"
+            );
+        }
+        for view in [2, 5, 6] {
+            assert!(
+                !authority.authorizes(ProcessViewId(view)),
+                "retired-tick and unknown views own nothing: {view}"
+            );
+        }
+        let all = ClaimAuthority::All;
+        for view in [1, 2, 5, 6] {
+            assert!(
+                all.authorizes(ProcessViewId(view)),
+                "the fresh-scan authority authorizes every view: {view}"
+            );
+        }
+        // The scrub set: ridden-but-unauthorized views plus views retired
+        // by name this tick; nothing else is touched.
+        let ridden = BTreeSet::from([ProcessViewId(1), ProcessViewId(2), ProcessViewId(6)]);
+        assert_eq!(
+            authority.denied(&ridden, &retired),
+            vec![ProcessViewId(2), ProcessViewId(5), ProcessViewId(6)],
+            "denied covers ridden-unauthorized plus retired-by-name"
+        );
+        assert!(
+            all.denied(&ridden, &retired).is_empty(),
+            "the fresh-scan authority scrubs nothing"
+        );
+    }
+
+    #[test]
+    fn gated_bind_files_claims_only_for_authorized_views() {
+        // The one grant site: an unauthorized view's module still binds
+        // (exact attached targets ride) but files no claims, while the
+        // authorized co-owner on the same pin keeps its claims.
+        let key = overlay(90);
+        let module_r = module(key);
+        let mut module_l = module(key);
+        module_l.view = ProcessViewId(91);
+        module_l.mount_namespace = crate::process::MountNamespaceId {
+            device: 1,
+            inode: 91,
+        };
+        let mut pins = view_pin(&module_l, 1000, SHA, 1, false);
+        assert!(
+            pins.absorb(view_pin(&module_r, 999, SHA, 1, false))
+                .is_empty()
+        );
+        let authority = ClaimAuthority::candidate(
+            &BTreeSet::from([ProcessViewId(91)]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::from([ProcessViewId(90)]),
+        );
+        let (bound, skipped) =
+            bind_scanned_modules_gated(&[module_r, module_l], &mut pins, &authority);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(bound.len(), 2, "both modules bind");
+        assert_eq!(
+            bound[0].object, bound[1].object,
+            "both views resolve one canonical pin"
+        );
+        assert!(
+            pins.view_claims(ProcessViewId(90)).is_none(),
+            "the unauthorized view files no claims"
+        );
+        assert!(
+            pins.view_claims(ProcessViewId(91)).is_some(),
+            "the authorized co-owner keeps its claims"
         );
     }
 

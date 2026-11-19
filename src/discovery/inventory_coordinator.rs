@@ -746,6 +746,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Caller rows a published presentation has rendered; retirement of
     /// a proven-exited row waits until it has appeared at least once.
     rendered_callers: BTreeSet<CallerId>,
+    /// The open oversized fold, if any: at most one caller stages at a
+    /// time, resuming first every pass until its completed fold
+    /// publishes.
+    staged_fold: Option<StagedFold>,
     /// Released pidfd custody awaiting its close: folds hand their
     /// pins here instead of dropping them, and the paced drain
     /// closes them one per stop check. A stop defers the remainder
@@ -1265,13 +1269,67 @@ struct PairFoldWork {
     order_pos: HashMap<PairKey, usize>,
 }
 
+/// Per-caller member sizes for fold admission, indexed once per retire
+/// call through the shared stride: edge and count-ownership summary
+/// counts by owning caller. Admission costs read these instead of
+/// scanning ranges, so sizing never runs past a stop and the summary
+/// cleanup it reserves is charged like every other member.
+struct MemberSizes {
+    edges: HashMap<CallerId, usize>,
+    summaries: HashMap<CallerId, usize>,
+}
+
+/// One oversized caller's fold in progress: a caller whose member work
+/// costs more than a whole credit window stages across passes instead
+/// of folding alone in one unbounded pass. Each pass clears a credited
+/// slice of the remaining member lists; only the completed fold
+/// publishes (the row leaves the carry, the receipt extends). Slices
+/// fold current truth per member through the same helpers as the
+/// atomic fold, so partial progress stays exact; the frozen record and
+/// layer flags are immutable for a retired row. At most one stage is
+/// ever open, and it resumes first every pass, so in-flight work
+/// completes before new work starts.
+struct StagedFold {
+    caller: CallerId,
+    record: crate::discovery::caller_registry::CallerRecord,
+    binder_keys: Vec<(usize, DomainCookie, u64)>,
+    pair_targets: Vec<PairKey>,
+    pair_recoveries: Vec<PairKey>,
+    edge_keys: Vec<(CallerId, ModuleId)>,
+    instance_ids: Vec<RegistryInstanceId>,
+    summary_keys: Vec<(CallerId, u32)>,
+    folded_edges: Vec<(CallerId, ModuleId)>,
+    folded_instances: Vec<RegistryInstanceId>,
+    entries: u64,
+    had_claims: bool,
+    edge_modules: BTreeSet<ModuleId>,
+    instance_modules: BTreeSet<ModuleId>,
+    joined: bool,
+    active: bool,
+    refused_backend: bool,
+}
+
+impl StagedFold {
+    /// True when every member list drained and the fold may commit.
+    fn is_complete(&self) -> bool {
+        self.binder_keys.is_empty()
+            && self.pair_targets.is_empty()
+            && self.pair_recoveries.is_empty()
+            && self.edge_keys.is_empty()
+            && self.instance_ids.is_empty()
+            && self.summary_keys.is_empty()
+    }
+}
+
 /// Callers folded per retire call: burst retirement drains over
 /// passes instead of delaying one publication, and the remainder
 /// resumes next pass without a re-note. One credit folds one caller
 /// plus up to [`FOLD_PLAN_STRIDE`] of its member units (cookies,
-/// pairs, edges, instances, pidfd custody); a high-fanout caller
-/// spends one extra credit per further stride, so member work paces
-/// the call instead of riding free.
+/// pairs, edges, instances, summaries, pidfd custody); a high-fanout
+/// caller spends one extra credit per further stride, so member work
+/// paces the call instead of riding free. A caller costlier than a
+/// whole window stages across passes (see [`StagedFold`]) instead of
+/// folding alone past the budget.
 const FOLD_CALLERS_PER_PUBLICATION: usize = 1024;
 
 /// Planning units between stop checks in one retire call: the
@@ -1463,6 +1521,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
             rendered_callers: BTreeSet::new(),
+            staged_fold: None,
             pending_close_queue: Vec::new(),
             retired_caller_rows: 0,
             retired_with_calls: 0,
@@ -5743,14 +5802,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn drop_caller_pairs_for_fold(&mut self, id: CallerId, pairs: &mut PairFoldWork) {
         let keys: Vec<PairKey> = pairs.targets.remove(&id).unwrap_or_default();
         for key in keys {
-            let (base, base_since) = self.pair_drop_base(&key);
-            let _ = self.take_pruned_pair_base(&key);
-            self.pair_targets
-                .insert(key, PairTarget::Dropped { base, base_since });
-            self.pair_counts.remove(&key);
-            self.recoveries.remove(&key);
-            self.placement_generations.remove(&key);
-            self.remove_fold_order_key(pairs, &key);
+            self.drop_pair_target_for_fold(key, pairs);
         }
         // Dropped or pruned pairs keep their exact base for the grace
         // prune and revival, but their recoveries name this caller and
@@ -5761,13 +5813,172 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // removes the recovery without touching the base.
         let stranded: Vec<PairKey> = pairs.recoveries.remove(&id).unwrap_or_default();
         for key in stranded {
-            let Some(recovery) = self.recoveries.remove(&key) else {
-                continue;
-            };
-            // Dropped pairs hold no read (the absorb path skips them);
-            // a held read here belongs to a revived live caller for the
-            // same key, never to this recovery, so settle does not gap it.
-            self.settle_pair_recovery(key, recovery, None, Some(pairs));
+            self.settle_stranded_recovery_for_fold(key, pairs);
+        }
+    }
+
+    /// Drop one pair target for a caller fold: its staged absolute
+    /// lands in the dropped-pair machinery (revival intact), so no
+    /// suspended pair pins the exited caller afterwards. Shared by the
+    /// atomic fold and the staged slices.
+    fn drop_pair_target_for_fold(&mut self, key: PairKey, pairs: &mut PairFoldWork) {
+        let (base, base_since) = self.pair_drop_base(&key);
+        let _ = self.take_pruned_pair_base(&key);
+        self.pair_targets
+            .insert(key, PairTarget::Dropped { base, base_since });
+        self.pair_counts.remove(&key);
+        self.recoveries.remove(&key);
+        self.placement_generations.remove(&key);
+        self.remove_fold_order_key(pairs, &key);
+    }
+
+    /// Settle one stranded recovery for a caller fold, disclosing any
+    /// withheld range. Shared by the atomic fold and the staged slices.
+    fn settle_stranded_recovery_for_fold(&mut self, key: PairKey, pairs: &mut PairFoldWork) {
+        let Some(recovery) = self.recoveries.remove(&key) else {
+            return;
+        };
+        // Dropped pairs hold no read (the absorb path skips them);
+        // a held read here belongs to a revived live caller for the
+        // same key, never to this recovery, so settle does not gap it.
+        self.settle_pair_recovery(key, recovery, None, Some(pairs));
+    }
+
+    /// Fold one caller edge into its module's departed aggregate,
+    /// through the same facts the live presentation reads. Returns the
+    /// folded entries and whether the edge carried claims; a missing
+    /// edge (already folded) contributes nothing. Shared by the atomic
+    /// fold and the staged slices.
+    fn fold_caller_edge_for_fold(
+        &mut self,
+        caller: CallerId,
+        module: ModuleId,
+        forwarding: &BTreeSet<ModuleId>,
+        claimed_children: &BTreeSet<(CallerId, ModuleId)>,
+        active_set: &BTreeSet<CallerId>,
+        refused_set: &BTreeSet<CallerId>,
+        now_ns: u64,
+    ) -> Option<(u64, bool)> {
+        let edge = self.registry.edge(caller, module)?;
+        let coverage = self.presented_coverage(edge);
+        let observation = self.registry.entry_observation_for(edge, &coverage);
+        let semantic_label = crate::inventory_present::edge_semantic_label(
+            edge.semantics.as_ref(),
+            claimed_children.contains(&(caller, module)),
+        );
+        let forwarding = crate::inventory_present::edge_layer_is_forwarding(
+            module,
+            caller,
+            forwarding,
+            active_set,
+            refused_set,
+        );
+        let stats = self.registry.fold_caller_edge(
+            caller,
+            module,
+            EdgeFoldFacts {
+                coverage,
+                observation,
+                semantic_label,
+                forwarding,
+            },
+            now_ns,
+        );
+        Some((stats.entries, stats.had_claims))
+    }
+
+    /// Fold one instance into its module's departed aggregate. Returns
+    /// its module, whether it joined (any API returns), and whether it
+    /// carried claims; a missing instance contributes nothing. Shared
+    /// by the atomic fold and the staged slices.
+    fn fold_caller_instance_for_fold(
+        &mut self,
+        instance: RegistryInstanceId,
+        now_ns: u64,
+    ) -> Option<(ModuleId, bool, bool)> {
+        let taken = self.registry.take_instance_for_fold(instance)?;
+        let joined = taken
+            .semantic
+            .as_ref()
+            .is_some_and(|row| row.api_returns.unwrap_or(0) > 0);
+        let claims = taken
+            .semantic
+            .as_ref()
+            .and_then(|row| row.semantics.as_ref())
+            .is_some_and(crate::semantics_edge::EdgeSemantics::has_claims);
+        let module = taken.record.module;
+        self.registry.fold_taken_instance(taken, now_ns);
+        Some((module, joined, claims))
+    }
+
+    /// One folded caller's Joint-terminal contributions, evaluated
+    /// under the seated subset exactly like the terminal evaluates
+    /// live rows. Shared by the atomic fold and the staged commit.
+    fn note_folded_terminal_contribution(
+        &mut self,
+        edge_modules: &BTreeSet<ModuleId>,
+        instance_modules: &BTreeSet<ModuleId>,
+        refused_mark: bool,
+        joined: bool,
+        subset_modules: Option<&BTreeSet<ModuleId>>,
+    ) {
+        let Some(subset_modules) = subset_modules else {
+            return;
+        };
+        let subset_edge = edge_modules
+            .iter()
+            .any(|module| subset_modules.contains(module));
+        let subset_instanced = instance_modules
+            .iter()
+            .any(|module| subset_modules.contains(module));
+        if subset_edge && !subset_instanced && !refused_mark {
+            self.folded_terminal_missed = self.folded_terminal_missed.saturating_add(1);
+        }
+        if subset_edge && !subset_instanced && refused_mark {
+            self.folded_terminal_refused = self.folded_terminal_refused.saturating_add(1);
+        }
+        if subset_instanced && !joined {
+            self.folded_terminal_without_joins =
+                self.folded_terminal_without_joins.saturating_add(1);
+        }
+    }
+
+    /// Fold one caller's identity into every module it touched; a
+    /// row-less caller (no edges, no instances) counts on without
+    /// naming anything, exactly like before. Shared by the atomic fold
+    /// and the staged commit.
+    fn insert_folded_caller_identities(
+        &mut self,
+        id: CallerId,
+        record: &crate::discovery::caller_registry::CallerRecord,
+        edge_modules: &BTreeSet<ModuleId>,
+        instance_modules: &BTreeSet<ModuleId>,
+    ) {
+        if edge_modules.is_empty() && instance_modules.is_empty() {
+            return;
+        }
+        let status = self
+            .caller_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.status(id));
+        for module in edge_modules.union(instance_modules) {
+            self.registry.insert_departed_identity(
+                *module,
+                DepartedIdentity {
+                    caller: id,
+                    pid: record.pid,
+                    start_time: record.start_time,
+                    incarnation: record.incarnation,
+                    exe: record.exe.clone(),
+                    authority: record.authority,
+                    lifecycle: record.lifecycle,
+                    lifecycle_reason: record.lifecycle_reason.clone(),
+                    first_seen_ns: record.first_seen_ns,
+                    last_seen_ns: record.last_seen_ns,
+                    exec_observed: record.exec_observed,
+                    metadata_status: status,
+                },
+            );
         }
     }
 
@@ -5952,19 +6163,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Bounded work: the entry gate runs before any planning, every
     /// planning scan counts its units through one shared
     /// [`FOLD_PLAN_STRIDE`] cursor and aborts on stop (planning is
-    /// pure, so the next pass rebuilds it), and a stop is checked
-    /// again where the pure plan meets the first mutation. Rows
+    /// pure, so the next pass rebuilds it), and a fresh stop check
+    /// runs where the pure plan meets the first mutation. Rows
     /// leave the carry as decided — folded, vetoed, deferred or
     /// simply not a candidate — so an abort keeps the unprocessed
-    /// suffix carried without rebuilding it. Each fold is charged
-    /// before it runs — one credit plus one per further member
+    /// suffix carried without rebuilding it. Each fold reserves its
+    /// charge before it runs — one credit plus one per further member
     /// stride — and a caller that does not fit the remaining credits
-    /// waits for a fresh window. Released pidfd custody joins a
-    /// bounded close queue serviced one pin per stop check; a stop
-    /// defers the remainder under coordinator custody. Each
-    /// single-caller fold stays atomic: an abort only defers whole
-    /// rows. The stop query covers the local flag and the wired
-    /// operator counter alike.
+    /// waits for a fresh window. A caller costlier than a whole
+    /// window stages across passes and publishes only its completed
+    /// fold; fitting callers still fold atomically. Released pidfd
+    /// custody joins a bounded close queue serviced one pin per stop
+    /// check; a stop defers the remainder under coordinator custody.
+    /// The stop query covers the local flag and the wired operator
+    /// counter alike.
     pub(crate) fn retire_rendered_callers(
         &mut self,
         now_ns: u64,
@@ -6053,6 +6265,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         stop: &dyn Fn() -> bool,
         handoff: &mut Vec<Arc<PidPin>>,
     ) -> FoldReceipt {
+        // An in-flight staged fold re-asserts its carry membership: the
+        // wrapper's wholesale commit cannot know about it, and only its
+        // completion releases the row. Certification covered the row's
+        // edges when the stage opened, and a retired row's remaining
+        // edges do not change while it waits.
+        if let Some(stage) = self.staged_fold.as_ref() {
+            let caller = stage.caller;
+            self.rendered_callers.insert(caller);
+        }
         let mut stride = FoldStride::new();
         // One referenced-caller set per call, not one scan per candidate:
         // steady state can render the whole caller budget every pass.
@@ -6108,29 +6329,75 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             self.rendered_callers.remove(&id);
         }
-        // Phase 2: one binder release plan for every candidate
-        // (skipped when no candidate exists: most passes retire
-        // nothing and must not scan). The plan is pure: an abort
-        // discards it and every candidate stays carried for the
-        // rebuild.
+        // Phase 2: the release plan, member sizes and fold indexes,
+        // built once when candidates exist or a stage waits (skipped
+        // when neither: most passes retire nothing and must not scan).
+        // Pure: an abort discards them and every row stays carried for
+        // the rebuild.
         let mut release = None;
-        if !candidates.is_empty() {
+        let mut sizes = None;
+        let mut folded: Option<FoldContext> = None;
+        let mut pairs: Option<PairFoldWork> = None;
+        if !candidates.is_empty() || self.staged_fold.is_some() {
             let Some(plan) = self.binder.plan_retired_release(|| stride.unit(stop)) else {
                 return FoldReceipt::default();
             };
+            let Some(member_sizes) = self.fold_member_sizes(|| stride.unit(stop)) else {
+                return FoldReceipt::default();
+            };
+            let Some(ctx) = self.fold_context(subset, || stride.unit(stop)) else {
+                return FoldReceipt::default();
+            };
+            let Some(work) = self.pair_fold_work(|| stride.unit(stop)) else {
+                return FoldReceipt::default();
+            };
             release = Some(plan);
+            sizes = Some(member_sizes);
+            folded = Some(ctx);
+            pairs = Some(work);
+        }
+        let mut receipt = FoldReceipt::default();
+        let mut credits = FOLD_CALLERS_PER_PUBLICATION;
+        // An open stage resumes first: in-flight work completes before
+        // new work starts, so no staged row starves behind siblings. A
+        // paused stage ends the pass; the loop below would break on its
+        // first row anyway.
+        let mut completed = None;
+        if let Some(mut stage) = self.staged_fold.take() {
+            let ctx_ref = folded.as_ref().expect("a stage implies its indexes");
+            let pairs_ref = pairs.as_mut().expect("a stage implies its indexes");
+            if self.resume_staged_fold(
+                &mut stage,
+                ctx_ref,
+                pairs_ref,
+                &mut stride,
+                stop,
+                &mut credits,
+                now_ns,
+            ) {
+                let id = stage.caller;
+                self.commit_staged_fold(
+                    stage,
+                    ctx_ref.subset_modules.as_ref(),
+                    &mut receipt,
+                    handoff,
+                );
+                completed = Some(id);
+            } else {
+                self.staged_fold = Some(stage);
+                return receipt;
+            }
         }
         // Phase 3: folds with bounded credits and stop checks. Vetoed
         // rows drop (the view re-notes them); stop and credit breaks
         // leave the unreached remainder carried for the next pass.
-        // The fold indexes build lazily on the first folding caller:
-        // most passes retire nothing.
-        let mut folded: Option<FoldContext> = None;
-        let mut pairs: Option<PairFoldWork> = None;
-        let mut receipt = FoldReceipt::default();
-        let mut credits = FOLD_CALLERS_PER_PUBLICATION;
         let rest = candidates.into_iter();
         for (id, record) in rest {
+            // A row this pass just staged and completed already left
+            // the carry with its receipt published.
+            if completed == Some(id) {
+                continue;
+            }
             // A sealed semantic gap still awaiting its finalizer pins
             // the row; the fold defers and the next pass retries. This
             // pure check runs before any clearing, so a deferred row
@@ -6146,59 +6413,76 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 break;
             }
             // A pending binder row still needs its incarnation snapshot;
-            // keep the record until that row decides. The pure veto
-            // check runs before the lazy index build, so a vetoed row
-            // never pays for indexes it will not use.
+            // keep the record until that row decides.
             let plan = release.as_ref().expect("a candidate implies a plan");
             if plan.vetoes(id) {
                 self.rendered_callers.remove(&id);
                 continue;
             }
-            if folded.is_none() {
-                let Some(ctx) = self.fold_context(subset, || stride.unit(stop)) else {
-                    // The pure index build aborted: the current row
-                    // and the unreached remainder stay carried (no
-                    // clearing ran yet for this row, so its evidence
-                    // is intact). Folds already completed keep their
-                    // receipt.
-                    break;
-                };
-                let Some(work) = self.pair_fold_work(|| stride.unit(stop)) else {
-                    break;
-                };
-                folded = Some(ctx);
-                pairs = Some(work);
-            }
-            // The pure plan meets the mutating fold here: a stop that
-            // landed during the index build aborts before the first
-            // clearing, so the row keeps its evidence for the resume.
-            if stop() {
-                break;
-            }
-            // Charge the member work before running it: cookies,
-            // pair targets and recoveries, edges, instances and pidfd
-            // custody. A caller that does not fit the remaining
-            // credits waits for a fresh window instead of spending
-            // work it was never granted; a caller costlier than a
-            // whole window still folds alone on a fresh pass, so no
-            // row starves. Clearing runs below (the veto and the
-            // handoff stop were checked above), so a folded row's
-            // evidence clears exactly once, in its own fold.
-            let pairs_ref = pairs.as_ref().expect("indexes build before the first fold");
-            let ctx_ref = folded
-                .as_ref()
-                .expect("indexes build before the first fold");
+            // Charge the member work before running it: the pre-indexed
+            // sizes make this O(1) lookups — no range scans run here —
+            // covering cookies, pair targets and recoveries, edges,
+            // instances, summaries and pidfd custody. A caller that
+            // does not fit the remaining credits waits for a fresh
+            // window instead of spending work it was never granted; a
+            // caller costlier than a whole window stages across passes
+            // instead of folding alone past the budget, so no row
+            // starves and no pass runs unbounded work.
+            let pairs_ref = pairs.as_ref().expect("indexes build before the loop");
+            let ctx_ref = folded.as_ref().expect("indexes build before the loop");
+            let sizes_ref = sizes.as_ref().expect("indexes build before the loop");
             let units = plan
                 .owned_len(id)
                 .saturating_add(pairs_ref.targets.get(&id).map_or(0, Vec::len))
                 .saturating_add(pairs_ref.recoveries.get(&id).map_or(0, Vec::len))
-                .saturating_add(self.registry.edges_of(id).count())
+                .saturating_add(sizes_ref.edges.get(&id).copied().unwrap_or(0))
                 .saturating_add(ctx_ref.instances_by_caller.get(&id).map_or(0, Vec::len))
+                .saturating_add(sizes_ref.summaries.get(&id).copied().unwrap_or(0))
                 .saturating_add(self.semantic_bindings.fold_pin_count(id));
             let cost = 1usize.saturating_add(units / FOLD_PLAN_STRIDE as usize);
-            if cost > credits && credits != FOLD_CALLERS_PER_PUBLICATION {
+            if cost > FOLD_CALLERS_PER_PUBLICATION {
+                let Some(mut stage) =
+                    self.stage_oversized_fold(id, &record, plan, pairs_ref, ctx_ref, || {
+                        stride.unit(stop)
+                    })
+                else {
+                    // The pure staging aborted: the row keeps all of
+                    // its evidence and waits carried for the resume.
+                    break;
+                };
+                let pairs_mut = pairs.as_mut().expect("indexes build before the loop");
+                if self.resume_staged_fold(
+                    &mut stage,
+                    ctx_ref,
+                    pairs_mut,
+                    &mut stride,
+                    stop,
+                    &mut credits,
+                    now_ns,
+                ) {
+                    self.commit_staged_fold(
+                        stage,
+                        ctx_ref.subset_modules.as_ref(),
+                        &mut receipt,
+                        handoff,
+                    );
+                    completed = Some(id);
+                    continue;
+                }
+                self.staged_fold = Some(stage);
                 break;
             }
+            if cost > credits {
+                break;
+            }
+            // The fresh stop check where the pure plan meets the first
+            // mutation: sizing is O(1) lookups now, so this runs
+            // immediately before the commit, and the reservation below
+            // precedes the work it pays for.
+            if stop() {
+                break;
+            }
+            credits = credits.saturating_sub(cost);
             if !self.binder.apply_retired_release(plan, id) {
                 self.rendered_callers.remove(&id);
                 continue;
@@ -6229,7 +6513,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 receipt.retired += 1;
                 receipt.folded_edges.extend(folded_caller.edges);
                 receipt.folded_instances.extend(folded_caller.instances);
-                credits = credits.saturating_sub(cost);
             }
         }
         // Every forgotten row releases its pid's incarnation counter;
@@ -6324,6 +6607,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             recoveries,
             order_pos,
         })
+    }
+
+    /// Index per-caller edge and count-ownership summary counts, one
+    /// scan of each table per retire call: admission costs read these
+    /// instead of scanning per-caller ranges. Counts every examined
+    /// row through `unit` and aborts (`None`) when it asks; the index
+    /// is pure, so the caller requeues and rebuilds.
+    fn fold_member_sizes(&self, mut unit: impl FnMut() -> bool) -> Option<MemberSizes> {
+        let mut edges: HashMap<CallerId, usize> = HashMap::new();
+        for edge in self.registry.edges() {
+            #[cfg(test)]
+            {
+                self.fold_edge_sizing_visits
+                    .set(self.fold_edge_sizing_visits.get().saturating_add(1));
+            }
+            if unit() {
+                return None;
+            }
+            *edges.entry(edge.caller).or_default() += 1;
+        }
+        let mut summaries: HashMap<CallerId, usize> = HashMap::new();
+        for key in self.count_ownership.summary_keys() {
+            #[cfg(test)]
+            {
+                self.fold_summary_sizing_visits
+                    .set(self.fold_summary_sizing_visits.get().saturating_add(1));
+            }
+            if unit() {
+                return None;
+            }
+            *summaries.entry(key.0).or_default() += 1;
+        }
+        Some(MemberSizes { edges, summaries })
     }
 
     /// Remove one key from the recovery service order through the
@@ -6504,35 +6820,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut edge_modules = BTreeSet::new();
         let mut folded_edges = Vec::new();
         for (caller, module) in edge_keys {
-            let Some(edge) = self.registry.edge(caller, module) else {
-                continue;
-            };
-            let coverage = self.presented_coverage(edge);
-            let observation = self.registry.entry_observation_for(edge, &coverage);
-            let semantic_label = crate::inventory_present::edge_semantic_label(
-                edge.semantics.as_ref(),
-                ctx.claimed_children.contains(&(caller, module)),
-            );
-            let forwarding = crate::inventory_present::edge_layer_is_forwarding(
-                module,
+            let Some((folded, claims)) = self.fold_caller_edge_for_fold(
                 caller,
+                module,
                 &ctx.forwarding,
+                &ctx.claimed_children,
                 &active_set,
                 &refused_set,
-            );
-            let stats = self.registry.fold_caller_edge(
-                caller,
-                module,
-                EdgeFoldFacts {
-                    coverage,
-                    observation,
-                    semantic_label,
-                    forwarding,
-                },
                 now_ns,
-            );
-            entries = entries.saturating_add(stats.entries);
-            had_claims = had_claims || stats.had_claims;
+            ) else {
+                continue;
+            };
+            entries = entries.saturating_add(folded);
+            had_claims = had_claims || claims;
             edge_modules.insert(module);
             folded_edges.push((caller, module));
         }
@@ -6545,79 +6845,261 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut folded_instances = Vec::new();
         let mut joined = false;
         for instance in instance_ids {
-            let Some(taken) = self.registry.take_instance_for_fold(instance) else {
+            let Some((module, joined_row, claims)) =
+                self.fold_caller_instance_for_fold(instance, now_ns)
+            else {
                 continue;
             };
-            instance_modules.insert(taken.record.module);
+            instance_modules.insert(module);
             folded_instances.push(instance);
-            if taken
-                .semantic
-                .as_ref()
-                .is_some_and(|row| row.api_returns.unwrap_or(0) > 0)
-            {
-                joined = true;
-            }
-            had_claims = had_claims
-                || taken
-                    .semantic
-                    .as_ref()
-                    .and_then(|row| row.semantics.as_ref())
-                    .is_some_and(crate::semantics_edge::EdgeSemantics::has_claims);
-            self.registry.fold_taken_instance(taken, now_ns);
+            joined = joined || joined_row;
+            had_claims = had_claims || claims;
         }
         // Joint-terminal contributions, evaluated under the seated
         // subset exactly like the terminal evaluates live rows.
         let refused_mark = self.registry.take_registration_refused(id);
-        if let Some(subset_modules) = ctx.subset_modules.as_ref() {
-            let subset_edge = edge_modules
-                .iter()
-                .any(|module| subset_modules.contains(module));
-            let subset_instanced = instance_modules
-                .iter()
-                .any(|module| subset_modules.contains(module));
-            if subset_edge && !subset_instanced && !refused_mark {
-                self.folded_terminal_missed = self.folded_terminal_missed.saturating_add(1);
-            }
-            if subset_edge && !subset_instanced && refused_mark {
-                self.folded_terminal_refused = self.folded_terminal_refused.saturating_add(1);
-            }
-            if subset_instanced && !joined {
-                self.folded_terminal_without_joins =
-                    self.folded_terminal_without_joins.saturating_add(1);
-            }
-        }
-        // The identity folds into every module the caller touched; a
-        // row-less caller (no edges, no instances) counts on without
-        // naming anything, exactly like before.
-        if !edge_modules.is_empty() || !instance_modules.is_empty() {
-            let status = self
-                .caller_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.status(id));
-            for module in edge_modules.union(&instance_modules) {
-                self.registry.insert_departed_identity(
-                    *module,
-                    DepartedIdentity {
-                        caller: id,
-                        pid: record.pid,
-                        start_time: record.start_time,
-                        incarnation: record.incarnation,
-                        exe: record.exe.clone(),
-                        authority: record.authority,
-                        lifecycle: record.lifecycle,
-                        lifecycle_reason: record.lifecycle_reason.clone(),
-                        first_seen_ns: record.first_seen_ns,
-                        last_seen_ns: record.last_seen_ns,
-                        exec_observed: record.exec_observed,
-                        metadata_status: status,
-                    },
-                );
-            }
-        }
+        self.note_folded_terminal_contribution(
+            &edge_modules,
+            &instance_modules,
+            refused_mark,
+            joined,
+            ctx.subset_modules.as_ref(),
+        );
+        self.insert_folded_caller_identities(id, record, &edge_modules, &instance_modules);
         FoldedCaller {
             with_calls: entries > 0 || had_claims,
             edges: folded_edges,
             instances: folded_instances,
+        }
+    }
+
+    /// Open a staged fold for an oversized caller: collect every member
+    /// list through the shared stride and freeze the record and layer
+    /// flags. Collection is pure (reads and clones only), so an abort
+    /// returns `None` and the caller waits with its evidence intact.
+    /// The caller already passed its vetoes; binder domain entries
+    /// release once, at commit.
+    fn stage_oversized_fold(
+        &self,
+        id: CallerId,
+        record: &crate::discovery::caller_registry::CallerRecord,
+        plan: &crate::discovery::native_binding::BinderReleasePlan,
+        pairs: &PairFoldWork,
+        ctx: &FoldContext,
+        mut unit: impl FnMut() -> bool,
+    ) -> Option<StagedFold> {
+        let mut binder_keys = Vec::new();
+        if let Some(owned) = plan.owned_keys(id) {
+            for key in owned {
+                if unit() {
+                    return None;
+                }
+                binder_keys.push(*key);
+            }
+        }
+        let mut pair_targets = Vec::new();
+        if let Some(keys) = pairs.targets.get(&id) {
+            for key in keys {
+                if unit() {
+                    return None;
+                }
+                pair_targets.push(*key);
+            }
+        }
+        let mut pair_recoveries = Vec::new();
+        if let Some(keys) = pairs.recoveries.get(&id) {
+            for key in keys {
+                if unit() {
+                    return None;
+                }
+                pair_recoveries.push(*key);
+            }
+        }
+        // One paced pass reads the edges, collects their keys and
+        // freezes the layer flags the per-edge facts need — the same
+        // read the atomic fold's activity scan does.
+        let mut edge_keys = Vec::new();
+        let mut active = false;
+        let mut refused_backend = false;
+        for edge in self.registry.edges_of(id) {
+            if unit() {
+                return None;
+            }
+            edge_keys.push((edge.caller, edge.module));
+            if !ctx.forwarding.contains(&edge.module) {
+                if edge.entry_count > 0 {
+                    active = true;
+                }
+                if self
+                    .registry
+                    .module(edge.module)
+                    .is_some_and(|module| module.admission == AdmissionState::Refused)
+                {
+                    refused_backend = true;
+                }
+            }
+        }
+        let mut instance_ids = Vec::new();
+        if let Some(members) = ctx.instances_by_caller.get(&id) {
+            for instance in members {
+                if unit() {
+                    return None;
+                }
+                instance_ids.push(*instance);
+            }
+        }
+        let summary_keys = self.count_ownership.summary_keys_for(id, &mut unit)?;
+        Some(StagedFold {
+            caller: id,
+            record: record.clone(),
+            binder_keys,
+            pair_targets,
+            pair_recoveries,
+            edge_keys,
+            instance_ids,
+            summary_keys,
+            folded_edges: Vec::new(),
+            folded_instances: Vec::new(),
+            entries: 0,
+            had_claims: false,
+            edge_modules: BTreeSet::new(),
+            instance_modules: BTreeSet::new(),
+            joined: false,
+            active,
+            refused_backend,
+        })
+    }
+
+    /// Resume one staged oversized fold within the remaining credits:
+    /// clear a credited slice of members — binder sequences, pair
+    /// targets and recoveries, edges, instances, summaries, in that
+    /// fixed order — one credit per stride, stopping early on stop or
+    /// spent credits. Each member folds through the same helper as the
+    /// atomic fold, so partial progress stays exact. Returns true when
+    /// the stage drained fully and may commit; a paused stage keeps
+    /// its remaining lists for the next pass.
+    fn resume_staged_fold(
+        &mut self,
+        stage: &mut StagedFold,
+        ctx: &FoldContext,
+        pairs: &mut PairFoldWork,
+        stride: &mut FoldStride,
+        stop: &dyn Fn() -> bool,
+        credits: &mut usize,
+        now_ns: u64,
+    ) -> bool {
+        if *credits == 0 {
+            return false;
+        }
+        // The base credit covers the first stride; each further stride
+        // reserves its credit before running.
+        *credits = credits.saturating_sub(1);
+        let active_set: BTreeSet<CallerId> =
+            stage.active.then_some(stage.caller).into_iter().collect();
+        let refused_set: BTreeSet<CallerId> = stage
+            .refused_backend
+            .then_some(stage.caller)
+            .into_iter()
+            .collect();
+        let mut units: u64 = 0;
+        while !stage.is_complete() {
+            if units > 0 && units % FOLD_PLAN_STRIDE == 0 {
+                if *credits == 0 {
+                    return false;
+                }
+                *credits = credits.saturating_sub(1);
+            }
+            if let Some(key) = stage.binder_keys.pop() {
+                self.binder.clear_owned_sequences(stage.caller, &[key]);
+            } else if let Some(key) = stage.pair_targets.pop() {
+                self.drop_pair_target_for_fold(key, pairs);
+            } else if let Some(key) = stage.pair_recoveries.pop() {
+                self.settle_stranded_recovery_for_fold(key, pairs);
+            } else if let Some((caller, module)) = stage.edge_keys.pop() {
+                if let Some((folded, claims)) = self.fold_caller_edge_for_fold(
+                    caller,
+                    module,
+                    &ctx.forwarding,
+                    &ctx.claimed_children,
+                    &active_set,
+                    &refused_set,
+                    now_ns,
+                ) {
+                    stage.entries = stage.entries.saturating_add(folded);
+                    stage.had_claims = stage.had_claims || claims;
+                    stage.edge_modules.insert(module);
+                    stage.folded_edges.push((caller, module));
+                }
+            } else if let Some(instance) = stage.instance_ids.pop() {
+                if let Some((module, joined_row, claims)) =
+                    self.fold_caller_instance_for_fold(instance, now_ns)
+                {
+                    stage.instance_modules.insert(module);
+                    stage.folded_instances.push(instance);
+                    stage.joined = stage.joined || joined_row;
+                    stage.had_claims = stage.had_claims || claims;
+                }
+            } else if let Some(key) = stage.summary_keys.pop() {
+                self.count_ownership.remove_summary(&key);
+            } else {
+                // The completion check above guards this loop, so some
+                // list always holds the next member.
+                unreachable!("a remaining member always pops");
+            }
+            units = units.saturating_add(1);
+            if stride.unit(stop) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Commit a drained staged fold: forget the caller row, release its
+    /// custody, and publish the completed fold exactly once — the same
+    /// publication as the atomic fold, in the same order. The row
+    /// leaves the carry whether the adapter still held it or not, as
+    /// before.
+    fn commit_staged_fold(
+        &mut self,
+        stage: StagedFold,
+        subset_modules: Option<&BTreeSet<ModuleId>>,
+        receipt: &mut FoldReceipt,
+        handoff: &mut Vec<Arc<PidPin>>,
+    ) {
+        let id = stage.caller;
+        debug_assert!(stage.is_complete(), "only a drained stage commits");
+        self.binder.release_caller_domains(id);
+        let refused_mark = self.registry.take_registration_refused(id);
+        self.note_folded_terminal_contribution(
+            &stage.edge_modules,
+            &stage.instance_modules,
+            refused_mark,
+            stage.joined,
+            subset_modules,
+        );
+        self.insert_folded_caller_identities(
+            id,
+            &stage.record,
+            &stage.edge_modules,
+            &stage.instance_modules,
+        );
+        self.rendered_callers.remove(&id);
+        if self.adapter.forget_caller(id) {
+            self.semantic_bindings.release_folded_caller(id, handoff);
+            self.count_ownership.forget_caller_header(id);
+            if let Some(metadata) = self.caller_metadata.as_mut() {
+                metadata.forget(id);
+            }
+            self.registry.compact_folded_caller(id);
+            self.leader_link_loss_noted.remove(&id);
+            self.staged_retirements.remove(&id);
+            self.retired_caller_rows = self.retired_caller_rows.saturating_add(1);
+            if stage.entries > 0 || stage.had_claims {
+                self.retired_with_calls = self.retired_with_calls.saturating_add(1);
+            }
+            receipt.retired += 1;
+            receipt.folded_edges.extend(stage.folded_edges);
+            receipt.folded_instances.extend(stage.folded_instances);
         }
     }
 

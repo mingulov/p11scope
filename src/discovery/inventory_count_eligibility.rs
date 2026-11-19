@@ -642,8 +642,7 @@ impl CountOwnership {
     /// are lifetime-monotonic, so retaining the slot would exhaust this
     /// map at the caller budget even while the adapter forgets rows.
     pub(super) fn forget_caller(&mut self, caller: CallerId) {
-        self.forget_live(caller);
-        self.callers.remove(&caller);
+        self.forget_caller_header(caller);
         let keys: Vec<(CallerId, u32)> = self
             .summaries
             .range((Included((caller, 0)), Included((caller, u32::MAX))))
@@ -652,6 +651,43 @@ impl CountOwnership {
         for key in keys {
             self.summaries.remove(&key);
         }
+    }
+    /// Release one forgotten caller's ownership header (live observations
+    /// and slot) without touching its summaries: the staged oversized
+    /// fold removes those in credited slices and commits the header once
+    /// they are all gone.
+    pub(super) fn forget_caller_header(&mut self, caller: CallerId) {
+        self.forget_live(caller);
+        self.callers.remove(&caller);
+    }
+    /// Remove one staged summary by key.
+    pub(super) fn remove_summary(&mut self, key: &(CallerId, u32)) {
+        self.summaries.remove(key);
+    }
+    /// Every retained `(caller, object)` summary key, for the fold's
+    /// stop-paced member pre-index.
+    pub(super) fn summary_keys(&self) -> impl Iterator<Item = &(CallerId, u32)> {
+        self.summaries.keys()
+    }
+    /// One caller's summary keys for a staged oversized fold, collected
+    /// through the shared stride: an abort returns `None` and the caller
+    /// waits, its summaries intact.
+    pub(super) fn summary_keys_for(
+        &self,
+        caller: CallerId,
+        mut unit: impl FnMut() -> bool,
+    ) -> Option<Vec<(CallerId, u32)>> {
+        let mut keys = Vec::new();
+        for key in self
+            .summaries
+            .range((Included((caller, 0)), Included((caller, u32::MAX))))
+        {
+            if unit() {
+                return None;
+            }
+            keys.push(*key.0);
+        }
+        Some(keys)
     }
     /// Test-only: count-ownership summaries retained for one caller.
     #[cfg(test)]

@@ -712,6 +712,12 @@ impl BinderReleasePlan {
     pub(crate) fn owned_len(&self, id: CallerId) -> usize {
         self.owned.get(&id).map_or(0, Vec::len)
     }
+
+    /// The cookie sequences the plan would clear for this caller, if
+    /// any: the staged oversized fold collects them into its lists.
+    pub(crate) fn owned_keys(&self, id: CallerId) -> Option<&Vec<(usize, DomainCookie, u64)>> {
+        self.owned.get(&id)
+    }
 }
 
 /// The binder: per-domain state, decisions and transitions for the
@@ -1109,28 +1115,48 @@ impl NativeBinder {
         if plan.vetoed.contains(&id) {
             return false;
         }
+        self.release_caller_domains(id);
+        if let Some(keys) = plan.owned.get(&id) {
+            self.clear_owned_sequences(id, keys);
+        }
+        true
+    }
+
+    /// Drop one retired caller's cached bindings and ended marks from
+    /// every domain. The atomic fold runs this with its clearing; the
+    /// staged oversized fold runs it once at commit, after its last
+    /// sequence slice.
+    pub(crate) fn release_caller_domains(&mut self, id: CallerId) {
         for domain in &mut self.domains {
             domain.callers.remove(&id);
             domain.ended.remove(&id);
         }
-        if let Some(keys) = plan.owned.get(&id) {
-            for (index, cookie, exec) in keys {
-                let cleared = self.domains[*index]
-                    .cookies
-                    .get_mut(cookie)
-                    .and_then(|execs| execs.get_mut(exec))
-                    .is_some_and(|seen| {
-                        if seen.bound == Some(id) {
-                            seen.bound = None;
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                debug_assert!(cleared, "the plan indexed this caller's sequence");
-            }
+    }
+
+    /// Clear cookie-sequence ownership for the given keys: each must
+    /// still name `id` (the plan indexed it). The atomic fold clears
+    /// all of the caller's sequences at once; the staged oversized
+    /// fold clears them in credited slices across passes.
+    pub(crate) fn clear_owned_sequences(
+        &mut self,
+        id: CallerId,
+        keys: &[(usize, DomainCookie, u64)],
+    ) {
+        for (index, cookie, exec) in keys {
+            let cleared = self.domains[*index]
+                .cookies
+                .get_mut(cookie)
+                .and_then(|execs| execs.get_mut(exec))
+                .is_some_and(|seen| {
+                    if seen.bound == Some(id) {
+                        seen.bound = None;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            debug_assert!(cleared, "the plan indexed this caller's sequence");
         }
-        true
     }
 
     /// Test-only: pending rows examined by retired-caller releases.

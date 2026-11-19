@@ -28620,6 +28620,83 @@ fn keymeta_unlisted_and_missing_mechanism() {
     );
 }
 
+/// The Firefox key-info shape at the reducer seam: a sign under
+/// `CKM_SHA256_HMAC` on an untyped key infers family `generic_secret`
+/// (HMAC keys are generic secrets) with one supporting completion,
+/// while its admitted length classifies unknown with the named
+/// no-length-map reason (HMAC lengths size nothing); a sign under an
+/// NSS vendor mechanism infers no family at all — unknown with the
+/// named unlisted-mechanism reason — even at an RSA-sized length, so
+/// an inferred family comes only from a mechanism that implies it.
+#[test]
+fn keymeta_hmac_sign_infers_generic_secret_vendor_sign_stays_unknown() {
+    const SHA256_HMAC: u64 = 0x0251;
+    const NSS_TLS_PRF_GENERAL_SHA256: u64 = 0xCE53_4365;
+    // HMAC arm: generic_secret inferred, size unknown with its reason.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(SHA256_HMAC), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(32)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the HMAC sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::GenericSecret));
+    assert_eq!(inferred.family.completions, 1);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_MAP)
+    );
+    assert_eq!(inferred.size.completions, 1);
+    // Vendor arm: no family from a mechanism that implies none, even
+    // at an RSA-sized length.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start(
+        "C_SignInit",
+        7,
+        Some(NSS_TLS_PRF_GENERAL_SHA256),
+        &[receipt],
+        100,
+    );
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the vendor sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.family.value, None);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    assert_eq!(inferred.family.completions, 1);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    assert_eq!(inferred.size.completions, 1);
+}
+
 /// The §6 Task 3 positive at the reducer seam: a `0x33`-created key
 /// (established block label-free) used under `CKM_CHACHA20` infers
 /// family `chacha20` while its established block stays unlabeled.

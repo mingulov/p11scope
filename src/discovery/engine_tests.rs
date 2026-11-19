@@ -95450,8 +95450,8 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
 //   healthy→committed; E7 cells are that entry's first full-entry
 //   coverage; E3/E8/E9 named inside)
 // Fresh-scan authority-all controls: E10 `rebuild_discovered`
-// (`manifest_selection_tables_lower_during_initial_rebuild`), E11
-// `scan_reconciled_snapshot`
+// (`scan_and_prearm_for_one_split_file_build_one_provider` plus
+// siblings), E11 `scan_reconciled_snapshot`
 // (`merge_ownership_e11_snapshot_binds_fresh_views_with_claims`), E12
 // `bind_collection` (`privileged_k1_no_route_collect_system_witness`
 // ignored privileged + `staged_count_manifest_defers_to_the_next_pass`).
@@ -96972,9 +96972,10 @@ fn merge_ownership_e7_selection_carried_provider_stays_claimless() {
 // modules — the ungated binder is honest here because no committed
 // state rides):
 //   E10 `rebuild_discovered`: initial aggregate rebuild —
-//     `manifest_selection_tables_lower_during_initial_rebuild` drives
-//     the real entry binding fresh scans (asserts the scan-sourced
-//     plan module).
+//     `scan_and_prearm_for_one_split_file_build_one_provider` (with
+//     the `live_scan_for_a_prearmed_split_file_joins_one_provider`
+//     and distinct-files siblings) drives the real entry binding a
+//     fresh scan (asserts the scan-sourced plan module).
 //   E11 `scan_reconciled_snapshot`: read-only snapshot rebinding current
 //     scan inputs into a fresh aggregate — the control below drives the
 //     real entry with two fresh views (no committed input exists).

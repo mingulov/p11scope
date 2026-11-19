@@ -43,6 +43,7 @@
 //! still starts its operation (mechanism unknown) under A1, where the
 //! capture-wide reducer drops the binding.
 
+use crate::keymeta::CompletionEvidence;
 use crate::semantics::{cancel_operation_mask, direct_cancel_flag};
 use p11scope_ebpf_common::{
     FUNCTION_NONE, SESSION_NONE, SlotSemantics, USER_TYPE_NONE, capture, direct, lifecycle,
@@ -192,6 +193,11 @@ struct OpMachine {
     /// this machine (H9): bound positionally at replay, fixed for
     /// the machine's life, `None` for S1Only or unassociated starts.
     key: Option<KeyReceipt>,
+    /// Per-operation corroboration slot (keymeta §5.4): the latest
+    /// retained `BUFFER_TOO_SMALL` length on this machine. Query
+    /// values never land here (dropped on arrival); failures and
+    /// cancellation clear it with the machine.
+    corroboration: Option<u64>,
 }
 
 /// Reducer-local checked operation identity: the reducer is per exact
@@ -349,6 +355,13 @@ pub(crate) enum OperationEffect {
         category: &'static str,
         outcome: OperationOutcome,
         origin: EffectOrigin,
+        /// Terminal length evidence for this completion (keymeta §9):
+        /// `Some` only on `Completed` terminals of evidence calls.
+        length: Option<crate::keymeta::LengthOutcome>,
+        /// Retained corroboration from an earlier `BUFFER_TOO_SMALL`
+        /// on this operation (§5.4): the reducer compares it against
+        /// the terminal and counts mismatches, never conflicts.
+        corroboration: Option<u64>,
     },
     DirectCompleted {
         id: OperationId,
@@ -356,6 +369,13 @@ pub(crate) enum OperationEffect {
         mechanism: Option<u64>,
         key_receipts: Vec<KeyReceipt>,
         origin: EffectOrigin,
+        /// Terminal length evidence for this direct call (keymeta
+        /// §9): `Some` on evidence calls (directs emit only on OK).
+        length: Option<crate::keymeta::LengthOutcome>,
+        /// Exact-one fresh result view for result-creating directs
+        /// (the unwrap U1 park, §5.4); `None` unless the seal proved
+        /// exactly one created view for this call.
+        fresh_view: Option<u64>,
     },
 }
 
@@ -1065,7 +1085,7 @@ impl EdgeSemantics {
         origin: &EffectOrigin,
         sink: &mut S,
     ) -> u64 {
-        self.observe_inner(call, origin, &[], sink)
+        self.observe_inner(call, origin, &[], &CompletionEvidence::NONE, sink)
     }
 
     /// Joint replay (H9): the same single pass, plus this call's
@@ -1084,7 +1104,7 @@ impl EdgeSemantics {
         keys: &[KeyReceipt],
         sink: &mut S,
     ) -> u64 {
-        self.observe_inner(call, origin, keys, sink)
+        self.observe_inner(call, origin, keys, &CompletionEvidence::NONE, sink)
     }
 
     /// Joint replay with H3 resource reservation (N14): prepares the
@@ -1100,15 +1120,16 @@ impl EdgeSemantics {
         call: &SemanticCall,
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
+        completion: &CompletionEvidence,
         sink: &mut S,
     ) -> Result<u64, SemanticResourceRefusal> {
         if self.resource_owner.is_none() {
-            return Ok(self.observe_inner(call, origin, keys, sink));
+            return Ok(self.observe_inner(call, origin, keys, completion, sink));
         }
         let prepared = self.prepare_resource_transition(call)?;
         assert!(self.resource_transition.is_none());
         self.resource_transition = Some(prepared);
-        let refused = self.observe_inner(call, origin, keys, sink);
+        let refused = self.observe_inner(call, origin, keys, completion, sink);
         drop(self.resource_transition.take());
         Ok(refused)
     }
@@ -1118,6 +1139,7 @@ impl EdgeSemantics {
         call: &SemanticCall,
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
+        completion: &CompletionEvidence,
         sink: &mut S,
     ) -> u64 {
         let dropped_before = self.dropped;
@@ -1136,7 +1158,7 @@ impl EdgeSemantics {
         } else if call.rv == CkRv::PENDING.0 {
             self.queue_pending(call, sink);
         } else {
-            self.apply_completed(call, &descriptor, origin, keys, sink);
+            self.apply_completed(call, &descriptor, origin, keys, completion, sink);
         }
         self.dropped.saturating_sub(dropped_before)
     }
@@ -1206,6 +1228,7 @@ impl EdgeSemantics {
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
+        completion: &CompletionEvidence,
         sink: &mut S,
     ) {
         if descriptor.transition == transition::INITIALIZE || descriptor.direct != direct::NONE {
@@ -1218,9 +1241,9 @@ impl EdgeSemantics {
         if descriptor.transition == transition::INITIALIZE {
             self.apply_init(call, descriptor, origin, keys, sink);
         } else if descriptor.direct == direct::NONE && descriptor.operations != 0 {
-            self.apply_operations(call, descriptor, origin, sink);
+            self.apply_operations(call, descriptor, origin, completion, sink);
         } else if descriptor.direct != direct::NONE {
-            self.apply_direct(call, descriptor, origin, keys, sink);
+            self.apply_direct(call, descriptor, origin, keys, completion, sink);
         }
     }
 
@@ -1324,8 +1347,15 @@ impl EdgeSemantics {
         if call.rv == CkRv::OPERATION_NOT_INITIALIZED.0 {
             let mut changed = false;
             for (bit, name) in crate::semantics::operation_bits(descriptor.operations) {
-                changed |=
-                    self.end_machine(call.session, bit, name, EndState::Unknown, origin, sink);
+                changed |= self.end_machine(
+                    call.session,
+                    bit,
+                    name,
+                    EndState::Unknown,
+                    origin,
+                    &CompletionEvidence::NONE,
+                    sink,
+                );
             }
             if changed {
                 self.evidence.state_reconciliations =
@@ -1534,6 +1564,7 @@ impl EdgeSemantics {
                 Self::category_name(bit),
                 EndState::Cancelled,
                 origin,
+                &CompletionEvidence::NONE,
                 sink,
             );
         }
@@ -1597,7 +1628,15 @@ impl EdgeSemantics {
                 capture::MECHANISM_NULL
                     if descriptor.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL != 0 =>
                 {
-                    self.end_machine(call.session, bit, name, EndState::Cancelled, origin, sink);
+                    self.end_machine(
+                        call.session,
+                        bit,
+                        name,
+                        EndState::Cancelled,
+                        origin,
+                        &CompletionEvidence::NONE,
+                        sink,
+                    );
                 }
                 capture::MECHANISM_NULL => {
                     self.evidence.semantic_capture_failures =
@@ -1640,7 +1679,15 @@ impl EdgeSemantics {
         let Some(generation) = self.alloc_generation() else {
             // A competing `Init` still cancels what it replaces; the
             // untrackable new operation ends unknown, never completed.
-            self.end_machine(session, bit, category, EndState::Cancelled, origin, sink);
+            self.end_machine(
+                session,
+                bit,
+                category,
+                EndState::Cancelled,
+                origin,
+                &CompletionEvidence::NONE,
+                sink,
+            );
             self.started = self.started.saturating_add(1);
             self.unknown = self.unknown.saturating_add(1);
             self.id_exhaustions = self.id_exhaustions.saturating_add(1);
@@ -1656,6 +1703,7 @@ impl EdgeSemantics {
                 state: OpState::Initialized,
                 generation,
                 key: key_receipt,
+                corroboration: None,
             },
         );
         if let Some(old) = replaced {
@@ -1669,6 +1717,10 @@ impl EdgeSemantics {
                     category,
                     outcome: OperationOutcome::Cancelled,
                     origin: origin.clone(),
+                    // A replacement names no completion: cancelled
+                    // terminals carry no length evidence.
+                    length: None,
+                    corroboration: None,
                 });
             }
         }
@@ -1701,6 +1753,7 @@ impl EdgeSemantics {
         call: &SemanticCall,
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
+        completion: &CompletionEvidence,
         sink: &mut S,
     ) {
         let mut mechanisms = BTreeSet::new();
@@ -1739,7 +1792,7 @@ impl EdgeSemantics {
                 EndState::Failed
             };
             for (bit, name) in crate::semantics::operation_bits(descriptor.operations) {
-                self.end_machine(call.session, bit, name, end, origin, sink);
+                self.end_machine(call.session, bit, name, end, origin, completion, sink);
             }
         } else {
             for (bit, _) in crate::semantics::operation_bits(descriptor.operations) {
@@ -1763,8 +1816,12 @@ impl EdgeSemantics {
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
+        completion: &CompletionEvidence,
         sink: &mut S,
     ) {
+        // RED STUB: the GREEN commit carries the terminal length and
+        // the seal's fresh view onto the direct effect.
+        let _ = completion;
         if call.rv != CkRv::OK.0 {
             return;
         }
@@ -1787,6 +1844,10 @@ impl EdgeSemantics {
                 mechanism,
                 key_receipts: keys.to_vec(),
                 origin: origin.clone(),
+                // RED STUB: the GREEN commit carries the terminal
+                // length and the seal's fresh view.
+                length: None,
+                fresh_view: None,
             });
         }
     }
@@ -1800,8 +1861,12 @@ impl EdgeSemantics {
         category: &'static str,
         end: EndState,
         origin: &EffectOrigin,
+        completion: &CompletionEvidence,
         sink: &mut S,
     ) -> bool {
+        // RED STUB: the GREEN commit carries the terminal length on
+        // Completed ends and the retained corroboration.
+        let _ = completion;
         if let Some(machine) = self.active.remove(&(session, bit)) {
             self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
             match end {
@@ -1816,6 +1881,8 @@ impl EdgeSemantics {
                     category,
                     outcome: end.outcome(),
                     origin: origin.clone(),
+                    length: None,
+                    corroboration: None,
                 });
             }
             true
@@ -1841,7 +1908,15 @@ impl EdgeSemantics {
             .collect();
         let changed = !doomed.is_empty();
         for (owner, bit) in doomed {
-            self.end_machine(owner, bit, Self::category_name(bit), end, origin, sink);
+            self.end_machine(
+                owner,
+                bit,
+                Self::category_name(bit),
+                end,
+                origin,
+                &CompletionEvidence::NONE,
+                sink,
+            );
         }
         changed
     }
@@ -1915,6 +1990,10 @@ impl EdgeSemantics {
                     category: Self::category_name(bit),
                     outcome: end.outcome(),
                     origin: origin.clone(),
+                    // Bulk-pop ends (invalidation sweeps) name no
+                    // completion: no length evidence by construction.
+                    length: None,
+                    corroboration: None,
                 });
             }
         }
@@ -2254,7 +2333,14 @@ impl EdgeSemantics {
         // starting here. Such rows are unknown-key with explicit
         // evidence (carry: modeling async completions in H8 is an
         // owner decision).
-        self.apply_completed(&completed, &descriptor, effect_origin, &[], sink);
+        self.apply_completed(
+            &completed,
+            &descriptor,
+            effect_origin,
+            &[],
+            &CompletionEvidence::NONE,
+            sink,
+        );
     }
 
     /// Oldest-first async eviction past the bound, mirroring
@@ -2331,6 +2417,7 @@ impl EdgeSemantics {
                     Self::category_name(*bit),
                     EndState::Unknown,
                     effect_origin,
+                    &CompletionEvidence::NONE,
                     sink,
                 );
             }

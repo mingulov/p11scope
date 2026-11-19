@@ -1066,6 +1066,8 @@ impl JointStaging {
         // The seal's retirements already applied above (H9 §66),
         // before this replay: a terminal the replay emits can never
         // complete a binding this seal just unproved.
+        let completion =
+            KeyUseReducer::completion_evidence_for_effects(&seal.effects.effects, &settled[0]);
         let outcome = {
             let mut tee = KeyUseTee {
                 outer: sink,
@@ -1079,6 +1081,7 @@ impl JointStaging {
                 &head.facts,
                 &head.origin,
                 &receipts,
+                &completion,
                 &mut tee,
             ) {
                 Ok(refused) => {
@@ -1196,6 +1199,7 @@ impl JointStaging {
                 }
                 self.redeemed = self.redeemed.saturating_add(1);
                 let receipts = keyuse.receipts_for_effects(effects, call, head.position);
+                let completion = KeyUseReducer::completion_evidence_for_effects(effects, call);
                 let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
                 if early_release {
                     ledger.release(head.position, head.charged_bytes());
@@ -1213,6 +1217,7 @@ impl JointStaging {
                         &head.facts,
                         &head.origin,
                         &receipts,
+                        &completion,
                         &mut tee,
                     ) {
                         Ok(count) => {
@@ -1388,8 +1393,13 @@ impl JointStaging {
                     fallback: assoc_fallback,
                     source: head.resource_origin.as_ref(),
                 };
-                match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee)
-                {
+                match reducer.observe_joint_with_resources(
+                    &head.facts,
+                    &head.origin,
+                    &[],
+                    &crate::keymeta::CompletionEvidence::NONE,
+                    &mut tee,
+                ) {
                     Ok(count) => {
                         refused = count;
                         replayed = true;
@@ -1850,8 +1860,13 @@ impl JointStaging {
                     fallback: assoc_fallback.as_deref_mut(),
                     source: head.resource_origin.as_ref(),
                 };
-                match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee)
-                {
+                match reducer.observe_joint_with_resources(
+                    &head.facts,
+                    &head.origin,
+                    &[],
+                    &crate::keymeta::CompletionEvidence::NONE,
+                    &mut tee,
+                ) {
                     Ok(head_refused) => {
                         refused = refused.saturating_add(head_refused);
                         self.reduced = self.reduced.saturating_add(1);
@@ -2299,6 +2314,88 @@ pub(crate) struct KeyUseEvidence {
     /// custody (same instance and operation identity delivered
     /// twice): counted, never an overwrite.
     pub duplicate_starts: u64,
+    /// Terminal lengths disagreeing with the operation's retained
+    /// corroboration (keymeta §5.4): counted as the named
+    /// `corroboration_mismatch` residual, never a conflict.
+    pub corroboration_mismatches: u64,
+    /// Wrapped-material parks refused past the park budget (the
+    /// aggregate capacity): counted, never silent, never a row.
+    pub parked_refused: u64,
+}
+
+/// One inferred key's lifecycle status (keymeta §10.2): unknown
+/// (no evidence, or evidence outside every map), inferred, conflicting
+/// (two distinct values, or an incompatible established fact), or
+/// unsupported (evidence exists but the subset has no map). Families
+/// never report unsupported: unlisted mechanisms are unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum InferredStatus {
+    #[default]
+    Unknown,
+    Inferred,
+    Conflicting,
+    Unsupported,
+}
+
+/// One row's inferred family accumulation (keymeta §4.4): the first
+/// value stays pinned with its supporting completions, a second
+/// distinct specific family rides the conflict pair, and further
+/// distinct values count without listing. The `secret` superclass
+/// accumulates beside any family and never flips.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct FamilyState {
+    pub status: InferredStatus,
+    pub value: Option<crate::keymeta::KeyFamily>,
+    pub completions: u64,
+    pub conflict_value: Option<crate::keymeta::KeyFamily>,
+    pub conflict_completions: u64,
+    pub further: u64,
+    pub reason: Option<&'static str>,
+}
+
+/// One row's inferred size accumulation (keymeta §5.4): same
+/// keep-first-two-count-extras rule as families. "Same size" means
+/// same detail kind plus size params — the evidence tag does not
+/// count, and the detail keeps the first tag. `unsupported` never
+/// overwrites `inferred` and never flips to `conflicting`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SizeState {
+    pub status: InferredStatus,
+    pub detail: Option<(crate::keymeta::SizeDetail, crate::keymeta::EvidenceTag)>,
+    pub completions: u64,
+    pub conflict_detail: Option<(crate::keymeta::SizeDetail, crate::keymeta::EvidenceTag)>,
+    pub further: u64,
+    pub reason: Option<&'static str>,
+}
+
+/// One proved row's inferred keys (keymeta §10.2): family (both
+/// modes) and size (flag-on lengths only).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RowInference {
+    pub family: FamilyState,
+    pub size: SizeState,
+}
+
+impl RowInference {
+    /// Whether either key is non-blank (§10.1 v7 trigger): a valued,
+    /// conflicting or unsupported state, or an unknown with a named
+    /// reason other than the off-mode hint (the hint explains the
+    /// mode, never triggers a version on its own).
+    pub(crate) fn is_v7_content(&self) -> bool {
+        // RED STUB: the GREEN commit implements the trigger.
+        let _ = (&self.family, &self.size);
+        false
+    }
+}
+
+/// One parked wrapped-material fact (keymeta §5.4 U1): evidence
+/// about a key with no sealed row yet, keyed by its view. The
+/// view's first sealed row carries it (forward-fill, never a
+/// `metadata_at_use` rewrite); invalidation drops it with the view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParkedSize {
+    pub detail: crate::keymeta::SizeDetail,
+    pub tag: crate::keymeta::EvidenceTag,
 }
 
 /// One open association's bucket: a reserved proved aggregate key
@@ -2319,6 +2416,10 @@ struct OpenAssoc {
     key: ObjectId,
     lost: bool,
     primary: bool,
+    /// The receipt's frozen established key type (§4.5 left side),
+    /// snapshotted at admission: a later query never re-opens the
+    /// compatibility comparison.
+    established: Option<crate::keymeta::EstablishedKind>,
 }
 
 /// One receipt resolved to its bucket at admission, before any
@@ -2395,6 +2496,21 @@ pub(crate) struct KeyUseReducer {
     unknown_ever_live: [bool; UNKNOWN_BUCKETS],
     capacity: usize,
     evidence: KeyUseEvidence,
+    /// Per-bucket inferred keys (keymeta §10.2): family (both modes)
+    /// and size (flag-on lengths only). Entries exist only beside
+    /// proved buckets, so the map never exceeds the aggregate bound.
+    inferred: BTreeMap<AggKey, RowInference>,
+    /// Wrapped-material parks by viewed object id (keymeta §5.4
+    /// U1): evidence about keys with no sealed row yet. Bounded by
+    /// the aggregate capacity; invalidation drops the view's park.
+    parked: BTreeMap<u64, ParkedSize>,
+    /// Whether `--key-sizes` length evidence is admitted (keymeta
+    /// §9): with the flag off the reducer drops any length trailer
+    /// unclassified (`size_inference_off`), while families join in
+    /// both modes. Defaults on: production off-mode carries no
+    /// trailers at all (the length programs never load), so the
+    /// gate is vacuous there and admitting is the safe default.
+    key_sizes: bool,
     /// Shared tickets closed while the shared ledger was absent
     /// (N1c): flushed at the next shared contact, C4-style. Bounded
     /// by the shared census — each pend holds a live shared ticket.
@@ -2429,7 +2545,27 @@ impl KeyUseReducer {
             capacity,
             evidence: KeyUseEvidence::default(),
             pending_shared_releases: Vec::new(),
+            inferred: BTreeMap::new(),
+            parked: BTreeMap::new(),
+            key_sizes: true,
         }
+    }
+
+    /// Admit (`true`) or drop (`false`, `size_inference_off`)
+    /// `--key-sizes` length evidence. Seams and harnesses pose the
+    /// off mode through this; production on-mode is the default.
+    pub(crate) fn set_key_sizes(&mut self, key_sizes: bool) {
+        self.key_sizes = key_sizes;
+    }
+
+    /// Retained per-bucket inferred keys, for the projection.
+    pub(crate) fn inferred_map(&self) -> &BTreeMap<AggKey, RowInference> {
+        &self.inferred
+    }
+
+    /// Retained key-use evidence counters, for gap publication.
+    pub(crate) fn key_use_evidence(&self) -> &KeyUseEvidence {
+        &self.evidence
     }
 
     pub(crate) fn aggregates(&self) -> &BTreeMap<AggKey, AggCounters> {
@@ -2629,6 +2765,7 @@ impl KeyUseReducer {
                         key: receipt.key,
                         lost: false,
                         primary: slot.primary,
+                        established: receipt.label.map(crate::keymeta::established_kind),
                     })
                     .collect();
                 if receipts.is_empty() {
@@ -2656,6 +2793,9 @@ impl KeyUseReducer {
                 category: _,
                 outcome,
                 origin: _,
+                // RED STUB: the GREEN commit attributes the terminal
+                // length and corroboration to the closing buckets.
+                ..
             } => {
                 let key = (instance, *id);
                 if let Some(open) = self.open.remove(&key) {
@@ -3044,6 +3184,19 @@ impl KeyUseReducer {
         position: u64,
     ) -> Vec<KeyReceipt> {
         self.receipts_for_effects(&seal.effects.effects, settled, position)
+    }
+
+    /// This replay's completion evidence (keymeta §9): the settled
+    /// call's length trailer outcome plus, for result-creating
+    /// directs, the exact-one fresh view. Fail-closed: anything but
+    /// an exact-one created view yields no fresh view, never a guess.
+    pub(crate) fn completion_evidence_for_effects(
+        _effects: &[ObjectEffect],
+        _settled: &SealedCall,
+    ) -> crate::keymeta::CompletionEvidence {
+        // RED STUB: the GREEN commit reads the seal's trailer and the
+        // created view.
+        crate::keymeta::CompletionEvidence::NONE
     }
 
     /// New H9 reads only its exact original End span. Ticket/input filtering

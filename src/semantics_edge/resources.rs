@@ -48,8 +48,11 @@ const _: () = {
     assert!(std::mem::size_of::<super::SemanticCall>() == 96);
     // H9 stores the machine's fixed key receipt (56 = 32 + 24 for
     // niche-filled `Option<KeyReceipt>`); the machine charge below
-    // still dominates the node plus entry.
-    assert!(std::mem::size_of::<super::OpMachine>() == 64);
+    // still dominates the node plus entry. Keymeta adds the
+    // per-operation corroboration slot (`Option<u64>` has no niche:
+    // +16 over the H9 layout); the machine charge doubles so the
+    // node-plus-entry invariant below still holds.
+    assert!(std::mem::size_of::<super::OpMachine>() == 80);
     assert!(std::mem::size_of::<super::EdgeMechStat>() == 104);
     // Final lease-bearing layouts, rather than the earlier probe types.
     // Each record carries its originating H0 position (`Option<u64>`
@@ -121,7 +124,10 @@ pub(crate) const SEMANTIC_RESOURCE_LIMIT: usize = 160 * 1024 * 1024;
 pub(crate) const SEMANTIC_TRANSITION_SCRATCH: usize = 1024 * 1024;
 pub(crate) const REDUCER_BASE_CHARGE: usize = 8192;
 pub(crate) const OPEN_BINDING_CHARGE: usize = 512;
-pub(crate) const ACTIVE_MACHINE_CHARGE: usize = 1024;
+// Keymeta corroboration slot: the 80-byte machine needs 1200 bytes
+// of node-plus-entry dominance (raised 1024 to 2048); 8192 machines
+// reserve 16 MiB worst case, still far under the pool limit.
+pub(crate) const ACTIVE_MACHINE_CHARGE: usize = 2048;
 pub(crate) const ASYNC_FACT_CHARGE: usize = 4096;
 pub(crate) const MECHANISM_CHARGE: usize = 2048;
 pub(crate) const CATEGORY_CHARGE: usize = 512;

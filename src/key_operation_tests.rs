@@ -82,6 +82,7 @@ fn ended(effect: &OperationEffect) -> (u64, &'static str, OperationOutcome, &Eff
             category,
             outcome,
             origin,
+            ..
         } => (id.ordinal_for_test(), category, *outcome, origin),
         other => panic!("expected Ended, got {other:?}"),
     }
@@ -125,17 +126,26 @@ fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
                 category,
                 outcome,
                 origin,
+                length,
+                corroboration,
             } => OperationEffect::Ended {
                 id: *id,
                 category,
                 outcome: *outcome,
                 origin: origin.clone(),
+                // Length evidence passes through: shape comparisons
+                // run over base ENDs (both sides None); tests with
+                // length assert effects directly.
+                length: *length,
+                corroboration: *corroboration,
             },
             OperationEffect::DirectCompleted {
                 id,
                 category,
                 mechanism,
                 origin,
+                length,
+                fresh_view,
                 ..
             } => OperationEffect::DirectCompleted {
                 id: *id,
@@ -143,6 +153,8 @@ fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
                 mechanism: *mechanism,
                 key_receipts: Vec::new(),
                 origin: origin.clone(),
+                length: *length,
+                fresh_view: *fresh_view,
             },
         })
         .collect()
@@ -10091,6 +10103,8 @@ fn key_operation_kem_conflict_and_attribution_twins() {
                 mechanism,
                 key_receipts,
                 origin,
+                length,
+                fresh_view,
             } => {
                 let mut receipts = key_receipts.clone();
                 assert_eq!(receipts.len(), 1);
@@ -10101,6 +10115,8 @@ fn key_operation_kem_conflict_and_attribution_twins() {
                     mechanism: *mechanism,
                     key_receipts: receipts,
                     origin: origin.clone(),
+                    length: *length,
+                    fresh_view: *fresh_view,
                 }
             }
             other => panic!("expected DirectCompleted, got {other:?}"),
@@ -10224,6 +10240,8 @@ fn key_operation_kem_supported_label_attribution_twins() {
                     mechanism,
                     key_receipts,
                     origin,
+                    length,
+                    fresh_view,
                 } => {
                     let mut receipts = key_receipts.clone();
                     assert_eq!(receipts.len(), 1);
@@ -10238,6 +10256,8 @@ fn key_operation_kem_supported_label_attribution_twins() {
                         mechanism: *mechanism,
                         key_receipts: receipts,
                         origin: origin.clone(),
+                        length: *length,
+                        fresh_view: *fresh_view,
                     }
                 }
                 other => panic!("expected DirectCompleted, got {other:?}"),
@@ -27112,4 +27132,1584 @@ fn key_operation_newsite_unsupported_value_alone_triggers_v6() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Keymeta Task 3 (R1 RED): join + engine twins at the reducer, edge and
+// seal seams. The GREEN commit implements the behavior; every twin
+// below fails until then (stubs carry no inference).
+// ---------------------------------------------------------------------------
+use crate::keymeta::{CompletionEvidence, EvidenceTag, KeyFamily, LengthOutcome, SizeDetail};
+use crate::semantics_key_use::{AggKey, InferredStatus, RowInference};
+use crate::semantics_objects::{KeyLabel, KeyMetadataFlags, ObjectId};
+use p11scope_ebpf_common::object_policy::SafeCurve;
+
+/// One reducer-seam driver: the real edge reducer plus the real
+/// key-use reducer, fed rebuilt effects carrying keymeta evidence
+/// (the strip-receipts idiom: `OperationId` has no test constructor,
+/// so ids come from real edge emissions).
+struct KeymetaCtx {
+    edge: EdgeSemantics,
+    sink: Vec<OperationEffect>,
+    keyuse: KeyUseReducer,
+    ledger: StagingLedger,
+    instance: crate::discovery::caller_registry::instance_input::RegistryInstanceId,
+}
+
+impl KeymetaCtx {
+    fn new() -> Self {
+        Self {
+            edge: EdgeSemantics::default(),
+            sink: Vec::new(),
+            keyuse: KeyUseReducer::new(),
+            ledger: StagingLedger::new(),
+            instance:
+                crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3),
+        }
+    }
+
+    /// Harvest `count` REAL object ids by driving creates through a
+    /// scene (H9 never mints ids from integers).
+    fn object_ids(count: usize) -> Vec<ObjectId> {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut edge = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        for _ in 0..count {
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut edge,
+                &mut keyuse,
+                &mut sink,
+                &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+            );
+        }
+        scene
+            .model
+            .project()
+            .objects
+            .iter()
+            .map(|view| view.id)
+            .collect()
+    }
+
+    /// One hand-built receipt over a real id; the caller controls the
+    /// established label exactly.
+    fn receipt(
+        key: ObjectId,
+        function: &str,
+        input: u8,
+        role: KeyRole,
+        label: Option<KeyLabel>,
+    ) -> crate::semantics_edge::KeyReceipt {
+        crate::semantics_edge::KeyReceipt {
+            key,
+            function: crate::kinds::function_id(function).unwrap(),
+            input,
+            role,
+            position: 900 + u64::from(input),
+            metadata: KeyMetadataFlags {
+                requested: 0,
+                established: 0,
+                conflicted: 0,
+            },
+            label,
+            attribution_valid: true,
+            first_observed: false,
+            lost: false,
+        }
+    }
+
+    /// Start one machine, feeding its effects to the reducer; returns
+    /// the operation's ordinal.
+    fn start(
+        &mut self,
+        init_name: &str,
+        session: u64,
+        mechanism: Option<u64>,
+        receipts: &[crate::semantics_edge::KeyReceipt],
+        ts_ns: u64,
+    ) -> u64 {
+        let c = match mechanism {
+            Some(mechanism) => init(init_name, session, mechanism, ts_ns),
+            None => SemanticCall {
+                function: init_name.into(),
+                session,
+                mechanism: 0,
+                capture: capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL,
+                ts_ns,
+                ..SemanticCall::default()
+            },
+        };
+        let origin = EffectOrigin::from(&c);
+        let before = self.sink.len();
+        self.edge
+            .observe_joint(&c, &origin, receipts, &mut self.sink);
+        assert_eq!(self.sink.len(), before + 1, "{init_name} starts");
+        for effect in self.sink[before..].to_vec() {
+            self.keyuse
+                .observe_effect(self.instance, &effect, Some(&mut self.ledger), None);
+        }
+        started(self.sink.last().expect("start emits")).0
+    }
+
+    /// End one machine with rebuilt evidence, feeding the rebuilt
+    /// terminal to the reducer; returns the rebuilt effect.
+    fn end(
+        &mut self,
+        op_name: &str,
+        session: u64,
+        rv: u64,
+        capture_bits: u32,
+        ts_ns: u64,
+        length: Option<LengthOutcome>,
+        corroboration: Option<u64>,
+    ) -> OperationEffect {
+        let mut c = op(op_name, session, ts_ns);
+        c.rv = rv;
+        c.capture = capture_bits;
+        let origin = EffectOrigin::from(&c);
+        let before = self.sink.len();
+        self.edge.observe_with_effects(&c, &origin, &mut self.sink);
+        assert_eq!(self.sink.len(), before + 1, "{op_name} ends");
+        let rebuilt = match self.sink.last().expect("end emits") {
+            OperationEffect::Ended {
+                id,
+                category,
+                outcome,
+                origin,
+                ..
+            } => OperationEffect::Ended {
+                id: *id,
+                category,
+                outcome: *outcome,
+                origin: origin.clone(),
+                length,
+                corroboration,
+            },
+            other => panic!("expected Ended, got {other:?}"),
+        };
+        self.keyuse
+            .observe_effect(self.instance, &rebuilt, Some(&mut self.ledger), None);
+        rebuilt
+    }
+
+    /// Complete one direct call with rebuilt evidence; returns the
+    /// rebuilt effect (`None` when the direct emits nothing).
+    fn direct(
+        &mut self,
+        call_name: &str,
+        session: u64,
+        mechanism: Option<u64>,
+        receipts: &[crate::semantics_edge::KeyReceipt],
+        ts_ns: u64,
+        length: Option<LengthOutcome>,
+        fresh_view: Option<u64>,
+    ) -> Option<OperationEffect> {
+        let mut c = call(call_name, session, CkRv::OK.0, ts_ns);
+        match mechanism {
+            Some(mechanism) => {
+                c.mechanism = mechanism;
+                c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+            }
+            None => {
+                c.capture = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+            }
+        }
+        let origin = EffectOrigin::from(&c);
+        let before = self.sink.len();
+        self.edge
+            .observe_joint_with_resources(
+                &c,
+                &origin,
+                receipts,
+                &CompletionEvidence::NONE,
+                &mut self.sink,
+            )
+            .expect("unresourced replay");
+        if self.sink.len() == before {
+            return None;
+        }
+        let rebuilt = match self.sink.last().expect("direct emits") {
+            OperationEffect::DirectCompleted {
+                id,
+                category,
+                mechanism,
+                key_receipts,
+                origin,
+                ..
+            } => OperationEffect::DirectCompleted {
+                id: *id,
+                category,
+                mechanism: *mechanism,
+                key_receipts: key_receipts.clone(),
+                origin: origin.clone(),
+                length,
+                fresh_view,
+            },
+            other => panic!("expected DirectCompleted, got {other:?}"),
+        };
+        self.keyuse
+            .observe_effect(self.instance, &rebuilt, Some(&mut self.ledger), None);
+        Some(rebuilt)
+    }
+
+    /// This bucket's retained inference, if the reducer attributed any.
+    fn inference(
+        &self,
+        object: u64,
+        category: &'static str,
+        role: &'static str,
+        metadata: &'static str,
+    ) -> Option<&RowInference> {
+        self.keyuse.inferred_map().get(&AggKey {
+            instance: self.instance,
+            object,
+            category,
+            role,
+            metadata,
+        })
+    }
+}
+
+/// A sign under RSA-PKCS on an untyped key infers family `rsa` with
+/// one supporting completion; the size stays unknown for lack of a
+/// length trailer.
+#[test]
+fn keymeta_sign_under_rsa_infers_family() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    let id = ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    let end = ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    assert_eq!(ended(&end).0, id);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.family.completions, 1);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+}
+
+/// Two distinct specific families conflict with both sides listed;
+/// a third counts in `further` without listing (first two pinned).
+#[test]
+fn keymeta_two_family_conflict_and_further() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    for (n, mechanism) in [0x0001u64, 0x1044, 0x1087].into_iter().enumerate() {
+        let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+        let ts = 100 + n as u64 * 100;
+        ctx.start("C_SignInit", 7, Some(mechanism), &[receipt], ts);
+        ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), ts + 50, None, None);
+    }
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Conflicting);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.family.completions, 3);
+    assert_eq!(inferred.family.conflict_value, Some(KeyFamily::Ec));
+    assert_eq!(inferred.family.conflict_completions, 1);
+    assert_eq!(inferred.family.further, 1);
+}
+
+/// First-seen order pins the conflict pair: reversed ingestion
+/// reverses value and conflict value.
+#[test]
+fn keymeta_conflict_interleave_pins_first_seen() {
+    for (first, second, value, conflict) in [
+        (0x0001u64, 0x1044u64, KeyFamily::Rsa, KeyFamily::Ec),
+        (0x1044u64, 0x0001u64, KeyFamily::Ec, KeyFamily::Rsa),
+    ] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        for (n, mechanism) in [first, second].into_iter().enumerate() {
+            let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+            let ts = 100 + n as u64 * 100;
+            ctx.start("C_SignInit", 7, Some(mechanism), &[receipt], ts);
+            ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), ts + 50, None, None);
+        }
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .expect("the sign row infers");
+        assert_eq!(inferred.family.status, InferredStatus::Conflicting);
+        assert_eq!(inferred.family.value, Some(value));
+        assert_eq!(inferred.family.conflict_value, Some(conflict));
+    }
+}
+
+/// The `secret` superclass accumulates beside any family and never
+/// flips, in either ingestion order.
+#[test]
+fn keymeta_secret_never_conflicts() {
+    for mechanisms in [[0x1082u64, 0x0360u64], [0x0360u64, 0x1082u64]] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        for (n, mechanism) in mechanisms.into_iter().enumerate() {
+            let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+            let ts = 100 + n as u64 * 100;
+            ctx.start("C_SignInit", 7, Some(mechanism), &[receipt], ts);
+            ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), ts + 50, None, None);
+        }
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .expect("the sign row infers");
+        assert_eq!(inferred.family.status, InferredStatus::Inferred);
+        assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
+        assert_eq!(inferred.family.completions, 2);
+        assert_eq!(inferred.family.conflict_value, None);
+        assert_eq!(inferred.family.further, 0);
+    }
+}
+
+/// Established/inferred compatibility at the reducer seam: an
+/// incompatible pair flips the inferred side while the established
+/// label stands; compatible pairs show both sides quietly.
+#[test]
+fn keymeta_established_compat() {
+    // RSA-established + ECDSA-inferred: conflicting, established kept.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_SignInit",
+        0,
+        KeyRole::OperationKey,
+        Some(KeyLabel::Rsa { modulus_bits: 2048 }),
+    );
+    ctx.start("C_SignInit", 7, Some(0x1044), &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "rsa_2048")
+        .expect("the established row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Conflicting);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(inferred.family.conflict_value, None);
+    // X25519 + ECDH1 derive: compatible, stands inferred.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_DeriveKey",
+        0,
+        KeyRole::BaseKey,
+        Some(KeyLabel::Ec {
+            curve: SafeCurve::X25519,
+        }),
+    );
+    ctx.direct("C_DeriveKey", 7, Some(0x1050), &[receipt], 100, None, None)
+        .expect("derive completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "derive", "base_key", "x25519")
+        .expect("the derive row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    // Generic-secret + HKDF derive: compatible (TLS 1.3 case).
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_DeriveKey",
+        0,
+        KeyRole::BaseKey,
+        Some(KeyLabel::GenericSecret { value_len: 32 }),
+    );
+    ctx.direct("C_DeriveKey", 7, Some(0x402A), &[receipt], 100, None, None)
+        .expect("derive completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "derive", "base_key", "generic_256")
+        .expect("the derive row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Hkdf));
+    // XEdDSA + Montgomery: compatible; + Edwards: conflicting.
+    for (curve, label, status) in [
+        (SafeCurve::X25519, "x25519", InferredStatus::Inferred),
+        (SafeCurve::Ed25519, "ed25519", InferredStatus::Conflicting),
+    ] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let receipt = KeymetaCtx::receipt(
+            ids[0],
+            "C_SignInit",
+            0,
+            KeyRole::OperationKey,
+            Some(KeyLabel::Ec { curve }),
+        );
+        ctx.start("C_SignInit", 7, Some(0x4029), &[receipt], 100);
+        ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", label)
+            .expect("the sign row infers");
+        assert_eq!(inferred.family.status, status, "{label}");
+        assert_eq!(inferred.family.value, Some(KeyFamily::Xeddsa));
+    }
+}
+
+/// Unlisted mechanisms infer nothing with the named reason; a call
+/// without any mechanism leaves no inference at all.
+#[test]
+fn keymeta_unlisted_and_missing_mechanism() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0500), &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.family.value, None);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    assert_eq!(inferred.family.completions, 1);
+    // No mechanism at all: no family evidence, no inference entry.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, None, &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    assert!(
+        ctx.inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .is_none_or(|inferred| {
+                inferred.family.value.is_none() && inferred.family.completions == 0
+            }),
+        "a mechanism-less completion attributes no family"
+    );
+}
+
+/// The §6 Task 3 positive at the reducer seam: a `0x33`-created key
+/// (established block label-free) used under `CKM_CHACHA20` infers
+/// family `chacha20` while its established block stays unlabeled.
+#[test]
+fn keymeta_chacha20_use_infers_family() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x1226), &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Chacha20));
+}
+
+/// The 2041-bit control: a 256-byte signature classifies RSA 2048
+/// with the byte count beside it, while `metadata_at_use` never
+/// takes `rsa_2048` (inference never labels the established key).
+#[test]
+fn keymeta_rsa_2041_control() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::Rsa {
+                size_class: Some(2048),
+                modulus_bytes: 256,
+            },
+            EvidenceTag::SignOutput,
+        ))
+    );
+    assert_eq!(inferred.size.completions, 1);
+    assert!(
+        ctx.inference(ids[0].as_u64(), "sign", "key", "rsa_2048")
+            .is_none(),
+        "inference never labels metadata_at_use"
+    );
+}
+
+/// Non-standard RSA lengths mask the class with the byte count only
+/// (no `size_class`); short/long admissions hold the bound.
+#[test]
+fn keymeta_rsa_nonstandard_masks_class() {
+    for (octets, status) in [
+        (257u64, InferredStatus::Inferred),
+        (192u64, InferredStatus::Inferred),
+    ] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+        ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+        ctx.end(
+            "C_Sign",
+            7,
+            CkRv::OK.0,
+            op_capture(),
+            200,
+            Some(LengthOutcome::Value(octets)),
+            None,
+        );
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .expect("the sign row infers");
+        assert_eq!(inferred.size.status, status);
+        assert_eq!(
+            inferred.size.detail,
+            Some((
+                SizeDetail::Rsa {
+                    size_class: None,
+                    modulus_bytes: octets,
+                },
+                EvidenceTag::SignOutput,
+            ))
+        );
+    }
+    for octets in [63u64, 2049u64] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+        ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+        ctx.end(
+            "C_Sign",
+            7,
+            CkRv::OK.0,
+            op_capture(),
+            200,
+            Some(LengthOutcome::Value(octets)),
+            None,
+        );
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .expect("the sign row infers");
+        assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+        assert_eq!(
+            inferred.size.reason,
+            Some(crate::keymeta::REASON_OUTSIDE_ADMISSION_BOUND)
+        );
+    }
+}
+
+/// Same-size rule at the reducer seam: sign and verify rows each
+/// hold one RSA-2048 size with their own first tag, never a conflict.
+#[test]
+fn keymeta_same_size_across_kinds() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let receipt = KeymetaCtx::receipt(ids[0], "C_VerifyInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_VerifyInit", 7, Some(0x0001), &[receipt], 300);
+    ctx.end(
+        "C_Verify",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        400,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    for (category, tag) in [
+        ("sign", EvidenceTag::SignOutput),
+        ("verify", EvidenceTag::VerifyInput),
+    ] {
+        let inferred = ctx
+            .inference(ids[0].as_u64(), category, "key", "unknown")
+            .expect("the row infers");
+        assert_eq!(inferred.size.status, InferredStatus::Inferred, "{category}");
+        assert_eq!(
+            inferred.size.detail,
+            Some((
+                SizeDetail::Rsa {
+                    size_class: Some(2048),
+                    modulus_bytes: 256,
+                },
+                tag,
+            )),
+            "{category}"
+        );
+    }
+}
+
+/// `unsupported` never overwrites `inferred` and never flips; a row
+/// with only unsupported evidence shows unsupported.
+#[test]
+fn keymeta_unsupported_never_flips() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0121), &[receipt], 300);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        400,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        })
+    );
+    // Unsupported-only row shows unsupported with its named reason.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0121), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unsupported);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_MAP)
+    );
+}
+
+/// Corroboration mismatch records the named residual without
+/// conflicting; the terminal still classifies.
+#[test]
+fn keymeta_corroboration_mismatch_counts() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(257)),
+        Some(256),
+    );
+    assert_eq!(ctx.keyuse.key_use_evidence().corroboration_mismatches, 1);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Rsa {
+            size_class: None,
+            modulus_bytes: 257,
+        })
+    );
+    // Agreement is silent.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        Some(256),
+    );
+    assert_eq!(ctx.keyuse.key_use_evidence().corroboration_mismatches, 0);
+}
+
+/// Over-estimate query triple: the dropped query plus the
+/// corroborating too-small plus the terminal yield exactly one
+/// completion, no conflict.
+#[test]
+fn keymeta_overestimate_query_yields_one_completion() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    // The query value (72) never reaches the reducer (dropped at the
+    // edge); the too-small (64) rides corroboration, the terminal
+    // classifies.
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        Some(64),
+    );
+    assert_eq!(ctx.keyuse.key_use_evidence().corroboration_mismatches, 0);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    assert_eq!(inferred.size.completions, 1);
+}
+
+/// RSA wrap output sizes the wrapping key; the wrapped key gains no
+/// family from the mechanism and no size from this evidence.
+#[test]
+fn keymeta_rsa_wrap_sizes_wrapping_key() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x0001),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(256)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+        .expect("the wrapping row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::Rsa {
+                size_class: Some(2048),
+                modulus_bytes: 256,
+            },
+            EvidenceTag::WrapOutput,
+        ))
+    );
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_OPERATION_KEY_ONLY)
+    );
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+}
+
+/// AES-KW wrap output sizes the wrapped key's material (L-8); the
+/// wrapping key keeps its family with no size from this evidence.
+/// Padded variants are ambiguous; the hybrid wrap sizes neither key.
+#[test]
+fn keymeta_aes_kw_wrap_sizes_wrapped_material() {
+    for (mechanism, material) in [(0x2109u64, Some(24u64))] {
+        let ids = KeymetaCtx::object_ids(2);
+        let mut ctx = KeymetaCtx::new();
+        let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+        let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+        ctx.direct(
+            "C_WrapKey",
+            7,
+            Some(mechanism),
+            &[wrapping, wrapped],
+            100,
+            Some(LengthOutcome::Value(32)),
+            None,
+        )
+        .expect("wrap completes");
+        let inferred = ctx
+            .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+            .expect("the wrapped row infers");
+        assert_eq!(
+            inferred.size.detail,
+            Some((
+                SizeDetail::WrappedMaterial {
+                    material_octets: material.expect("material"),
+                    octets: 32,
+                },
+                EvidenceTag::WrapOutput,
+            ))
+        );
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+            .expect("the wrapping row infers");
+        assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
+        assert_eq!(
+            inferred.size.reason,
+            Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+        );
+    }
+    // Padded wrap: the wrapped row names the ambiguity.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x210B),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(32)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_PADDING_AMBIGUITY)
+    );
+    // Hybrid wrap: family `rsa`, size unknown with the hybrid reason.
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x1054),
+        &[wrapping, wrapped],
+        100,
+        Some(LengthOutcome::Value(296)),
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+        .expect("the wrapping row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_HYBRID_WRAP_FORMAT)
+    );
+}
+
+/// RSA unwrap input sizes the unwrapping key with no parking; the
+/// fresh view parks nothing (RSA needs no U1).
+#[test]
+fn keymeta_rsa_unwrap_sizes_unwrapping_key() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x0001),
+        &[unwrapping],
+        100,
+        Some(LengthOutcome::Value(256)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "unwrap", "unwrapping_key", "unknown")
+        .expect("the unwrapping row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::Rsa {
+                size_class: Some(2048),
+                modulus_bytes: 256,
+            },
+            EvidenceTag::UnwrapInput,
+        ))
+    );
+    // The fresh view parked nothing: its first use without a length
+    // shows no wrapped size (and no metadata rewrite).
+    let receipt = KeymetaCtx::receipt(ids[1], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 200);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "sign", "key", "unknown")
+        .expect("the fresh view rows on first use");
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+}
+
+/// U1 forward-fill: AES-KW unwrap parks the unwrapped material on
+/// the fresh view; the view's first sealed row carries it without
+/// rewriting `metadata_at_use`.
+#[test]
+fn keymeta_unwrap_u1_forward_fills_first_row() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let unwrapping = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+    ctx.direct(
+        "C_UnwrapKey",
+        7,
+        Some(0x2109),
+        &[unwrapping],
+        100,
+        Some(LengthOutcome::Value(32)),
+        Some(ids[1].as_u64()),
+    )
+    .expect("unwrap completes");
+    assert!(
+        ctx.inference(ids[1].as_u64(), "unwrap", "unwrapping_key", "unknown")
+            .is_none(),
+        "the fresh view has no row before first use"
+    );
+    let receipt = KeymetaCtx::receipt(ids[1], "C_EncryptInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_EncryptInit", 7, Some(0x1082), &[receipt], 200);
+    ctx.end("C_Encrypt", 7, CkRv::OK.0, op_capture(), 300, None, None);
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "encrypt", "key", "unknown")
+        .expect("the first row carries the park");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::WrappedMaterial {
+                material_octets: 24,
+                octets: 32,
+            },
+            EvidenceTag::UnwrapInput,
+        ))
+    );
+    // The unwrapping key keeps its family with no size from this
+    // evidence (the length was about the fresh view).
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "unwrap", "unwrapping_key", "unknown")
+        .expect("the unwrapping row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Aes));
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+}
+
+/// KEM lengths name parameter sets on the encapsulation rows.
+#[test]
+fn keymeta_kem_lengths_name_parameter_sets() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_EncapsulateKey",
+        0,
+        KeyRole::EncapsulationKey,
+        None,
+    );
+    ctx.direct(
+        "C_EncapsulateKey",
+        7,
+        Some(0x0017),
+        &[receipt],
+        100,
+        Some(LengthOutcome::Value(1088)),
+        None,
+    )
+    .expect("encapsulate completes");
+    let inferred = ctx
+        .inference(
+            ids[0].as_u64(),
+            "encapsulate",
+            "encapsulation_key",
+            "unknown",
+        )
+        .expect("the encapsulate row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        inferred.size.detail,
+        Some((
+            SizeDetail::PqcSet {
+                parameter_set: "ml_kem_768",
+                octets: 1088,
+            },
+            EvidenceTag::EncapsulateOutput,
+        ))
+    );
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_DecapsulateKey",
+        0,
+        KeyRole::DecapsulationKey,
+        None,
+    );
+    ctx.direct(
+        "C_DecapsulateKey",
+        7,
+        Some(0x0017),
+        &[receipt],
+        100,
+        Some(LengthOutcome::Value(1088)),
+        None,
+    )
+    .expect("decapsulate completes");
+    let inferred = ctx
+        .inference(
+            ids[0].as_u64(),
+            "decapsulate",
+            "decapsulation_key",
+            "unknown",
+        )
+        .expect("the decapsulate row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        inferred
+            .size
+            .detail
+            .as_ref()
+            .map(|(detail, tag)| (detail.clone(), *tag)),
+        Some((
+            SizeDetail::PqcSet {
+                parameter_set: "ml_kem_768",
+                octets: 1088,
+            },
+            EvidenceTag::DecapsulateInput,
+        ))
+    );
+}
+
+/// Derive mechanisms type the base key only; the family joins
+/// without any length evidence.
+#[test]
+fn keymeta_derive_types_base_key_only() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_DeriveKey", 0, KeyRole::BaseKey, None);
+    ctx.direct("C_DeriveKey", 7, Some(0x1050), &[receipt], 100, None, None)
+        .expect("derive completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "derive", "base_key", "unknown")
+        .expect("the base row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Ec));
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+    assert_eq!(ctx.keyuse.inferred_map().len(), 1);
+}
+
+/// Verify-recover carries no length position, but its mechanism
+/// still infers the family.
+#[test]
+fn keymeta_verify_recover_infers_family_only() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_VerifyRecoverInit",
+        0,
+        KeyRole::OperationKey,
+        None,
+    );
+    ctx.start("C_VerifyRecoverInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_VerifyRecover",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        None,
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "verify_recover", "key", "unknown")
+        .expect("the verify_recover row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
+    );
+}
+
+/// Cross-session handle reuse never joins: two views in two sessions
+/// row separately, each with its own lengths.
+#[test]
+fn keymeta_session_reuse_never_joins() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    for (n, key) in ids.iter().enumerate() {
+        let session = 7 + n as u64;
+        let receipt = KeymetaCtx::receipt(*key, "C_SignInit", 0, KeyRole::OperationKey, None);
+        ctx.start("C_SignInit", session, Some(0x0001), &[receipt], 100);
+        ctx.end(
+            "C_Sign",
+            session,
+            CkRv::OK.0,
+            op_capture(),
+            200,
+            Some(LengthOutcome::Value(256)),
+            None,
+        );
+    }
+    assert_eq!(ctx.keyuse.inferred_map().len(), 2);
+    for key in &ids {
+        let inferred = ctx
+            .inference(key.as_u64(), "sign", "key", "unknown")
+            .expect("each view rows alone");
+        assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+        assert_eq!(inferred.size.completions, 1);
+    }
+}
+
+/// A failed Init starts nothing: no row, no family, no size anywhere.
+#[test]
+fn keymeta_failed_init_attributes_nothing() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    let mut c = init("C_SignInit", 7, 0x0001, 100);
+    c.rv = CkRv::GENERAL_ERROR.0;
+    let origin = EffectOrigin::from(&c);
+    ctx.edge
+        .observe_joint(&c, &origin, &[receipt], &mut ctx.sink);
+    assert!(ctx.sink.is_empty(), "a failed Init emits nothing");
+    let c = op("C_Sign", 7, 200);
+    let origin = EffectOrigin::from(&c);
+    ctx.edge.observe_with_effects(&c, &origin, &mut ctx.sink);
+    assert!(ctx.sink.is_empty(), "the orphan op emits nothing");
+    assert!(ctx.keyuse.aggregates().is_empty());
+    assert!(ctx.keyuse.inferred_map().is_empty());
+}
+
+/// Failed and cancelled terminals prove nothing: rows keep counters
+/// but gain no inference.
+#[test]
+fn keymeta_failed_and_cancelled_prove_nothing() {
+    // Signature-invalid verify (K2): failed, no inference.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_VerifyInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_VerifyInit", 7, Some(0x1044), &[receipt], 100);
+    let end = ctx.end(
+        "C_Verify",
+        7,
+        CkRv::SIGNATURE_INVALID.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    assert_eq!(ended(&end).2, OperationOutcome::Failed);
+    assert!(
+        ctx.inference(ids[0].as_u64(), "verify", "key", "unknown")
+            .is_none(),
+        "a failed verify infers nothing"
+    );
+    // Cancelled sign: no inference.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    // A competing Init cancels by replacement (session-close
+    // cancellation exercises the same unproved-terminal rule): the
+    // replacement emits the cancelled terminal BEFORE the new start.
+    let receipt2 = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    let c = init("C_SignInit", 7, 0x0001, 300);
+    let origin = EffectOrigin::from(&c);
+    let before = ctx.sink.len();
+    ctx.edge
+        .observe_joint(&c, &origin, &[receipt2], &mut ctx.sink);
+    assert_eq!(ctx.sink.len(), before + 2, "replacement emits end+start");
+    for effect in ctx.sink[before..].to_vec() {
+        ctx.keyuse
+            .observe_effect(ctx.instance, &effect, Some(&mut ctx.ledger), None);
+    }
+    let cancelled = ctx
+        .sink
+        .iter()
+        .find(|effect| {
+            matches!(
+                effect,
+                OperationEffect::Ended {
+                    outcome: OperationOutcome::Cancelled,
+                    ..
+                }
+            )
+        })
+        .expect("replacement cancels");
+    assert_eq!(ended(cancelled).2, OperationOutcome::Cancelled);
+    // Both replacement effects fed above; the cancelled open
+    // attributed nothing.
+    assert!(
+        ctx.inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .is_none_or(|inferred| inferred.family.value.is_none()),
+        "a cancelled open attributes no family"
+    );
+}
+
+/// Flag-off mode: a replayed length trailer drops unclassified with
+/// the off reason (never counted), while families join unchanged.
+#[test]
+fn keymeta_flag_off_drops_lengths() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    ctx.keyuse.set_key_sizes(false);
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_SIZE_INFERENCE_OFF)
+    );
+    assert_eq!(inferred.size.completions, 0);
+}
+
+/// A BPF-unavailable trailer names its reason and counts once.
+#[test]
+fn keymeta_unavailable_trailer_names_reason() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Unavailable),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_LENGTH_UNAVAILABLE)
+    );
+    assert_eq!(inferred.size.completions, 1);
+}
+
+/// Established/size compatibility: a contradicting size conflicts
+/// beside the standing label; consistent pairs stay quiet.
+#[test]
+fn keymeta_established_size_compat() {
+    // RSA-1024 established + RSA-2048 inferred: conflicting.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_SignInit",
+        0,
+        KeyRole::OperationKey,
+        Some(KeyLabel::Rsa { modulus_bits: 1024 }),
+    );
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "rsa_1024")
+        .expect("the established row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Conflicting);
+    // Non-standard established + matching bytes: compatible.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_SignInit",
+        0,
+        KeyRole::OperationKey,
+        Some(KeyLabel::Rsa { modulus_bits: 2041 }),
+    );
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(256)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "rsa_other")
+        .expect("the established row infers");
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+}
+
+/// The per-operation corroboration slot: a retained too-small
+/// stashes without emitting; the terminal carries both values.
+#[test]
+fn keymeta_edge_corroboration_slot() {
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, 0x0001, 100);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint(&c, &origin, &[], &mut sink);
+    let mut c = op("C_Sign", 7, 200);
+    c.rv = CkRv::BUFFER_TOO_SMALL.0;
+    let origin = EffectOrigin::from(&c);
+    let before = sink.len();
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(64)),
+            fresh_view: None,
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    assert_eq!(sink.len(), before, "too-small retains without emitting");
+    let c = op("C_Sign", 7, 300);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(64)),
+            fresh_view: None,
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    match sink.last().expect("terminal emits") {
+        OperationEffect::Ended {
+            outcome,
+            length,
+            corroboration,
+            ..
+        } => {
+            assert_eq!(*outcome, OperationOutcome::Completed);
+            assert_eq!(*length, Some(LengthOutcome::Value(64)));
+            assert_eq!(*corroboration, Some(64));
+        }
+        other => panic!("expected Ended, got {other:?}"),
+    }
+}
+
+/// Query values drop on arrival: a retained NULL-buffer OK stashes
+/// nothing, and the terminal carries no corroboration.
+#[test]
+fn keymeta_edge_query_value_drops() {
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, 0x0001, 100);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint(&c, &origin, &[], &mut sink);
+    let mut c = op("C_Sign", 7, 200);
+    c.capture = query_capture();
+    let origin = EffectOrigin::from(&c);
+    let before = sink.len();
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(999)),
+            fresh_view: None,
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    assert_eq!(sink.len(), before, "query retains without emitting");
+    let c = op("C_Sign", 7, 300);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(64)),
+            fresh_view: None,
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    match sink.last().expect("terminal emits") {
+        OperationEffect::Ended {
+            length,
+            corroboration,
+            ..
+        } => {
+            assert_eq!(*length, Some(LengthOutcome::Value(64)));
+            assert_eq!(*corroboration, None, "the query value never stored");
+        }
+        other => panic!("expected Ended, got {other:?}"),
+    }
+}
+
+/// Failed terminals carry no length (K2): a rejected input length is
+/// ambiguous evidence.
+#[test]
+fn keymeta_edge_failed_terminal_carries_no_length() {
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let c = init("C_VerifyInit", 7, 0x1044, 100);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint(&c, &origin, &[], &mut sink);
+    let mut c = op("C_Verify", 7, 200);
+    c.rv = CkRv::SIGNATURE_INVALID.0;
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(64)),
+            fresh_view: None,
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    match sink.last().expect("terminal emits") {
+        OperationEffect::Ended {
+            outcome,
+            length,
+            corroboration,
+            ..
+        } => {
+            assert_eq!(*outcome, OperationOutcome::Failed);
+            assert_eq!(*length, None);
+            assert_eq!(*corroboration, None);
+        }
+        other => panic!("expected Ended, got {other:?}"),
+    }
+}
+
+/// Directs carry the terminal length and the seal's fresh view
+/// through; a too-small direct emits nothing at all.
+#[test]
+fn keymeta_edge_direct_carries_completion() {
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let mut c = call("C_WrapKey", 7, CkRv::OK.0, 100);
+    c.mechanism = 0x0001;
+    c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(256)),
+            fresh_view: Some(999),
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    match sink.last().expect("direct emits") {
+        OperationEffect::DirectCompleted {
+            length, fresh_view, ..
+        } => {
+            assert_eq!(*length, Some(LengthOutcome::Value(256)));
+            assert_eq!(*fresh_view, Some(999));
+        }
+        other => panic!("expected DirectCompleted, got {other:?}"),
+    }
+    let mut c = call("C_WrapKey", 7, CkRv::BUFFER_TOO_SMALL.0, 200);
+    c.mechanism = 0x0001;
+    c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    let origin = EffectOrigin::from(&c);
+    let before = sink.len();
+    edge.observe_joint_with_resources(
+        &c,
+        &origin,
+        &[],
+        &CompletionEvidence {
+            length: Some(LengthOutcome::Value(256)),
+            fresh_view: None,
+        },
+        &mut sink,
+    )
+    .expect("replay");
+    assert_eq!(sink.len(), before, "a too-small direct emits nothing");
+}
+
+/// Without length capture the seal carries no length into the settled
+/// call (never a guess): a base-form END settles with `length: None`.
+/// The 648-byte validated-trailer twin arrives with BPF length capture.
+#[test]
+fn keymeta_seal_carries_no_length_without_capture() {
+    use p11scope_ebpf_common::object_journal::JournalRecord;
+    let mut scene = JointScene::new();
+    let fid = function_id("C_Sign");
+    let begin = begin_bytes(1, 1, fid, 0);
+    let mut full = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+    full[24 + 108..24 + 112].copy_from_slice(&fid.to_le_bytes());
+    let record = decode_journal_record(&full, &scene.descriptors).expect("END decodes");
+    let JournalRecord::End(end) = record else {
+        panic!("END input");
+    };
+    let admitted = scene
+        .fixture
+        .admit_original_event("C_Sign", end.payload_base().event);
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    scene.ingest(&begin);
+    scene.ingest(&full);
+    let success = scene.seal().expect("quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1);
+    assert_eq!(
+        success.prefix.settled()[0].length,
+        None,
+        "a base-form END settles with no length"
+    );
 }

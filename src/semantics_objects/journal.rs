@@ -4986,6 +4986,12 @@ pub(crate) struct SealedCall {
     /// [`SealedCall::matches_head`]).
     pub(crate) session: super::HandleInput<super::SessionHandle>,
     pub(crate) mechanism: super::state::MechClass,
+    /// The settled END's validated length outcome (keymeta §9):
+    /// `Some` only for 648-byte END+length forms (a read value or an
+    /// unavailable trailer). Never part of correlation
+    /// ([`SealedCall::matches_head`]); the Joint replay binds it to
+    /// the operation it measured.
+    pub(crate) length: Option<crate::keymeta::LengthOutcome>,
 }
 
 impl SealedCall {
@@ -7812,6 +7818,9 @@ impl JournalAdapter {
                         abandoned: false,
                         session,
                         mechanism,
+                        // Begin-only entry: no terminal yet, so no
+                        // trailer (terminal deltas attach below).
+                        length: None,
                     });
                 }
                 Err(_) => {
@@ -7866,6 +7875,9 @@ impl JournalAdapter {
                     abandoned,
                     session,
                     mechanism,
+                    // RED STUB: the GREEN commit reads the staged
+                    // END's validated length trailer here.
+                    length: None,
                 });
             }
         }
@@ -7894,6 +7906,9 @@ impl JournalAdapter {
                             .is_some_and(|staged| staged.ordinal <= frontier),
                         session,
                         mechanism,
+                        // RED STUB: the GREEN commit reads the staged
+                        // END's validated length trailer here.
+                        length: None,
                     }
                 });
             if !replay.freeze_calls(&mut settled, retained) {

@@ -101,6 +101,7 @@ pub(crate) mod inventory_provider_info;
 #[path = "inventory/semantics.rs"]
 pub(crate) mod inventory_semantics;
 pub(crate) mod key_operation_projection;
+pub(crate) mod keymeta;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;

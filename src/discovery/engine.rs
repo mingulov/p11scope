@@ -18741,6 +18741,21 @@ impl Engine {
             merge_tail_start,
             crate::attach::monotonic_ns(),
         );
+        if !delta.retire.is_empty() {
+            let bound_learned = modules
+                .iter()
+                .filter(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
+                .count();
+            eprintln!(
+                "p11scope: DIAG v072 retire_candidate retire={} bound_modules={} bound_learned={} raw_before_learned={} raw_with_learned={} mono_ns={:?}",
+                delta.retire.len(),
+                modules.len(),
+                bound_learned,
+                raw_before_learned,
+                raw_with_learned,
+                crate::attach::monotonic_ns(),
+            );
+        }
         Ok(LiveCandidate {
             pinned,
             modules,

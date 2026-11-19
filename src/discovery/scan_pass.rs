@@ -4,18 +4,21 @@
 //!
 //! Every scope charges work and I/O through [`ScanPassOwner`], and every
 //! pass boundary renews through [`ScanPassOwner::end_pass`]: per-pass
-//! allowances, never a constant raise. Renewable stops (work/IO
-//! ceilings, deadline, clock) renew next pass and the refused tail
-//! retries first from the [`ResumeCursor`]; collection stops and zero
-//! caps never admit. [`CaptureWorkBudget`](super::scan::CaptureWorkBudget)
+//! allowances, never a constant raise. A tripped nonzero work ceiling
+//! renews with a counted exhaustion and the refused tail retries first
+//! from the [`ResumeCursor`]; the Detailed I/O allowance renews
+//! silently (trips surface via member rows) and whole-file hashing
+//! carries its charged offset across passes; collection stops and
+//! zero caps never admit. [`CaptureWorkBudget`](super::scan::CaptureWorkBudget)
 //! keeps the retained caches, identity stores and disclosure tallies
 //! and delegates every budget interaction here.
 
 use super::scan::{
     ActiveInventoryWindow, BudgetDomain, COLLECTION_STOP_REASON, CollectionWork,
     DEFAULT_WORK_CEILING, DiscoveryPolicy, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InventoryWindowLimits, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScanCheckpoint, ScanLimits,
-    TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, WindowId, WindowReceipt, WindowToken,
+    InspectedFileKey, InventoryWindowLimits, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON,
+    ScanCheckpoint, ScanLimits, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, WindowId,
+    WindowReceipt, WindowToken,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -56,6 +59,10 @@ pub(crate) enum ChargeOutcome {
         terminal: bool,
     },
 }
+
+/// In-progress whole-file hashes the owner carries across passes:
+/// past this many the stalest entry evicts (its file restarts).
+pub(crate) const HASH_RESUME_CAP: usize = 64;
 
 /// Budget-stop passes after which a never-completing member yields
 /// to never-scanned newcomers (adopted live-proof bound).
@@ -218,7 +225,7 @@ impl ResumeCursor {
         for task in self.fresh.iter().filter(|task| live(task)) {
             tiers.retry.insert(task.0);
         }
-        for (task, streak) in self
+        for (task, _) in self
             .streaks
             .iter()
             .filter(|(task, _)| live(task))
@@ -307,6 +314,8 @@ pub(crate) struct ScanPassOwner {
     scan_stop_reason: Option<&'static str>,
     scan_stop_reported: bool,
     cursor: ResumeCursor,
+    hash_resume: BTreeMap<InspectedFileKey, (u64, u64)>,
+    hash_resume_seq: u64,
 }
 
 impl ScanPassOwner {
@@ -333,6 +342,8 @@ impl ScanPassOwner {
             scan_stop_reason: None,
             scan_stop_reported: false,
             cursor: ResumeCursor::default(),
+            hash_resume: BTreeMap::new(),
+            hash_resume_seq: 0,
         }
     }
 
@@ -376,6 +387,8 @@ impl ScanPassOwner {
             scan_stop_reason: None,
             scan_stop_reported: false,
             cursor: ResumeCursor::default(),
+            hash_resume: BTreeMap::new(),
+            hash_resume_seq: 0,
         }
     }
 
@@ -425,6 +438,60 @@ impl ScanPassOwner {
     #[cfg(test)]
     pub(crate) fn interval_exhaustions(&self) -> u64 {
         self.interval_exhaustions
+    }
+
+    /// Bytes of this file already charged in earlier passes: the
+    /// whole-file hash re-reads its prefix free and charges only new
+    /// bytes, so a file larger than one window resumes instead of
+    /// restarting at offset 0 forever. Zero for a fresh file; a
+    /// changed file carries a new pin (hence a new key) and misses.
+    pub(crate) fn hash_resume_offset(&self, key: &InspectedFileKey) -> u64 {
+        self.hash_resume
+            .get(key)
+            .map_or(0, |(consumed, _)| *consumed)
+    }
+
+    /// Notes charged hash progress (monotone: out-of-order notes never
+    /// move the offset back). Past [`HASH_RESUME_CAP`] entries the
+    /// stalest entry evicts and its file restarts.
+    pub(crate) fn note_hash_resume(&mut self, key: InspectedFileKey, consumed: u64) {
+        self.hash_resume_seq = self.hash_resume_seq.saturating_add(1);
+        let seq = self.hash_resume_seq;
+        self.hash_resume
+            .entry(key)
+            .and_modify(|entry| {
+                entry.0 = entry.0.max(consumed);
+                entry.1 = seq;
+            })
+            .or_insert((consumed, seq));
+        while self.hash_resume.len() > HASH_RESUME_CAP {
+            let stalest = self
+                .hash_resume
+                .iter()
+                .min_by_key(|(_, (_, seq))| *seq)
+                .map(|(key, _)| *key);
+            let Some(stalest) = stalest else {
+                break;
+            };
+            self.hash_resume.remove(&stalest);
+        }
+    }
+
+    /// Drops a hash resume entry: the file completed, changed, or
+    /// failed beyond budget recovery.
+    pub(crate) fn drop_hash_resume(&mut self, key: &InspectedFileKey) {
+        self.hash_resume.remove(key);
+    }
+
+    /// Partitions one hash read into already-charged prefix (re-read
+    /// free from page cache) and suffix (charged): `(prefix, suffix)`
+    /// byte counts covering `wanted` exactly.
+    pub(crate) fn hash_read_split(consumed: u64, offset: u64, wanted: usize) -> (usize, usize) {
+        if offset >= consumed {
+            return (0, wanted);
+        }
+        let prefix = (consumed - offset).min(wanted as u64) as usize;
+        (prefix, wanted - prefix)
     }
 
     pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
@@ -502,21 +569,29 @@ impl ScanPassOwner {
     /// stop. When the pass tripped the work ceiling on a nonzero
     /// allowance, count the exhaustion, reset the spent units and
     /// clear the latch; the next pass retries with a fresh allowance.
-    /// Returns the cleared stop when it was never reported, so the
-    /// driver files it against its own pass instead of losing it.
-    /// Returns `None` and changes nothing for a clean pass (spend
-    /// accumulates across clean passes, so the lifetime anti-DoS
-    /// bound holds until the first trip), an already reported stop,
-    /// an active window (windows own their renewal), any other stop
-    /// (deadlines clear at their own batch end; I/O stays
-    /// capture-lifetime), or a zero cap (re-trips instantly, so its
-    /// stop stays put).
+    /// The Detailed I/O allowance renews silently every pass (L1-5:
+    /// no capture-lifetime terminal I/O stop): bytes reset and a
+    /// tripped nonzero I/O latch heals, with no interval row of its
+    /// own because every I/O trip already surfaces via member rows.
+    /// Returns the cleared work stop when it was never reported, so
+    /// the driver files it against its own pass instead of losing
+    /// it. Returns `None` for a clean pass (work spend accumulates
+    /// across clean passes, so the lifetime anti-DoS bound holds
+    /// until the first trip), an already reported stop, an active
+    /// window (windows own their renewal), any other stop
+    /// (deadlines clear at their own batch end), or a zero cap
+    /// (re-trips instantly, so its stop stays put).
     pub(crate) fn end_pass(&mut self) -> Option<&'static str> {
         if self.active_window.is_some() {
             return None;
         }
         if !matches!(self.policy, DiscoveryPolicy::DetailedLegacy) {
             return None;
+        }
+        self.pass_io_bytes = 0;
+        if self.scan_stop_reason == Some(IO_CEILING_REASON) && self.io_allowance() > 0 {
+            self.scan_stop_reason = None;
+            self.scan_stop_reported = false;
         }
         if self.scan_stop_reason != Some(WORK_CEILING_REASON) {
             return None;
@@ -1319,8 +1394,11 @@ mod tests {
         // Detailed work × I/O ceiling: N/A (work charging never trips
         // the I/O allowance; the I/O site owns that stop below).
 
-        // Detailed I/O × I/O ceiling: stays capture-lifetime
-        // (`end_pass` never touches I/O bytes or their latch).
+        // Detailed I/O × I/O ceiling: renews silently. The per-pass
+        // allowance resets and the latch clears (L1-5 ends: no
+        // capture-lifetime terminal I/O stop); the renewal files no
+        // interval row because every I/O trip already surfaces via
+        // its member take-rows each pass.
         let mut pass = detailed(100, 64);
         assert_eq!(pass.charge_io(64), ChargeOutcome::Admitted);
         assert_eq!(
@@ -1331,17 +1409,11 @@ mod tests {
             }
         );
         assert_eq!(pass.end_pass(), None);
-        assert_eq!(pass.stopped_reason(), Some(IO_CEILING_REASON));
-        assert_eq!(
-            pass.charge_io(1),
-            ChargeOutcome::Stopped {
-                reason: IO_CEILING_REASON,
-                terminal: false,
-            }
-        );
+        assert_eq!(pass.stopped_reason(), None);
+        assert_eq!(pass.charge_io(64), ChargeOutcome::Admitted);
         // The lifetime total keeps counting for headroom reporting
         // (refused attempts record nothing).
-        assert_eq!(pass.attempted_io_bytes(), 64);
+        assert_eq!(pass.attempted_io_bytes(), 128);
 
         // Detailed I/O × collection stop: terminal.
         let mut pass = detailed(100, 64);
@@ -1454,6 +1526,83 @@ mod tests {
                 terminal: true,
             },
             "the shared stop fences every scope it guards"
+        );
+    }
+
+    /// Owner 2c table: whole-file hashing carries its charged offset
+    /// across passes, so a file larger than one window resumes instead
+    /// of restarting at offset 0 forever (L3-2). Fresh files start at
+    /// 0; noted progress extends (monotone: out-of-order notes never
+    /// move the offset back); completion drops the entry; a changed
+    /// file (new pin, hence a new key) misses and restarts; past the
+    /// cap the stalest entry evicts. The read split partitions every
+    /// request into already-charged prefix (re-read free) and suffix
+    /// (charged): pure prefix, straddle, pure suffix, exact boundary.
+    #[test]
+    fn admission_owner2c_hash_resume_carries_offsets() {
+        use crate::discovery::scan::InspectedFileKey;
+        use p11scope_manifest::maps::Device;
+        fn key_for(pin_ctime: (i64, i64), inode: u64) -> InspectedFileKey {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let pin = crate::discovery::identity::pin_of(file.as_file())
+                .unwrap()
+                .test_with_ctime(pin_ctime);
+            InspectedFileKey {
+                device: Device { major: 0, minor: 1 },
+                inode,
+                pin,
+                fd_dev: 7,
+            }
+        }
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        let key = key_for((100, 0), 11);
+        assert_eq!(pass.hash_resume_offset(&key), 0);
+        pass.note_hash_resume(key, 100);
+        assert_eq!(pass.hash_resume_offset(&key), 100);
+        pass.note_hash_resume(key, 250);
+        assert_eq!(pass.hash_resume_offset(&key), 250);
+        pass.note_hash_resume(key, 200);
+        assert_eq!(
+            pass.hash_resume_offset(&key),
+            250,
+            "out-of-order notes never move the offset back"
+        );
+        pass.drop_hash_resume(&key);
+        assert_eq!(pass.hash_resume_offset(&key), 0);
+        // A changed file carries a new pin, hence a new key: miss.
+        let changed = key_for((101, 0), 11);
+        assert_ne!(key.pin.test_parts(), changed.pin.test_parts());
+        pass.note_hash_resume(key, 100);
+        assert_eq!(pass.hash_resume_offset(&changed), 0);
+        // Past the cap the stalest entry evicts (bounded memory).
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        let first = key_for((1, 0), 1);
+        pass.note_hash_resume(first, 10);
+        let mut last = first;
+        for index in 2..=(super::HASH_RESUME_CAP as u64 + 1) {
+            last = key_for((index as i64, 0), index);
+            pass.note_hash_resume(last, 10);
+        }
+        assert_eq!(
+            pass.hash_resume_offset(&first),
+            0,
+            "the stalest entry evicted past the cap"
+        );
+        assert_eq!(pass.hash_resume_offset(&last), 10);
+        // The read split: (prefix free, suffix charged).
+        assert_eq!(ScanPassOwner::hash_read_split(100, 0, 1000), (100, 900));
+        assert_eq!(ScanPassOwner::hash_read_split(100, 100, 500), (0, 500));
+        assert_eq!(ScanPassOwner::hash_read_split(100, 50, 30), (30, 0));
+        assert_eq!(
+            ScanPassOwner::hash_read_split(100, 50, 100),
+            (50, 50),
+            "a straddling request splits at the consumed edge"
+        );
+        assert_eq!(ScanPassOwner::hash_read_split(0, 0, 10), (0, 10));
+        assert_eq!(
+            ScanPassOwner::hash_read_split(50, 200, 40),
+            (0, 40),
+            "a request past the offset charges whole"
         );
     }
 

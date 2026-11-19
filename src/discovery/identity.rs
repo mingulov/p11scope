@@ -8593,6 +8593,72 @@ pub(crate) fn pin_count_manifest_objects_in_views_with_prior_and_table(
     )
 }
 
+/// Reads one whole-file-hash chunk with cross-pass resume (owner 2c):
+/// bytes below the owner's charged offset for this file re-read free
+/// (already paid in an earlier pass, page-cache hot); bytes at and
+/// above it charge the window, and the batch when the caller passes
+/// one. Notes progress past the consumed edge; the caller drops the
+/// entry on completion. A `None` key reads everything charged: files
+/// whose inode numbers cannot name one file never resume, like the
+/// inspected-file cache above them.
+fn read_hash_chunk_with_resume(
+    file: &std::fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+    budget: &mut CaptureWorkBudget,
+    resume_key: Option<InspectedFileKey>,
+    batch_spent: Option<&mut u64>,
+) -> std::io::Result<usize> {
+    if let Some(reason) = budget.check_deadline_now() {
+        return Err(std::io::Error::other(reason));
+    }
+    let consumed = resume_key
+        .as_ref()
+        .map_or(0, |key| budget.pass_owner_ref().hash_resume_offset(key));
+    let (prefix, _) =
+        crate::discovery::scan_pass::ScanPassOwner::hash_read_split(consumed, offset, bytes.len());
+    let mut done = 0usize;
+    if prefix > 0 {
+        let read = file.read_at(&mut bytes[..prefix], offset)?;
+        done += read;
+        if read < prefix {
+            return Ok(done);
+        }
+    }
+    if done == bytes.len() {
+        return Ok(done);
+    }
+    let suffix_offset = offset + done as u64;
+    let suffix = &mut bytes[done..];
+    let batch_allowed = match batch_spent.as_deref() {
+        Some(spent) => Some(batch_byte_allowance(*spent, suffix.len())),
+        None => None,
+    };
+    let capture_allowed = budget.allowed_capture_io(suffix.len());
+    let allowed = match &batch_allowed {
+        Some(Ok(batch)) => capture_allowed.min(*batch),
+        Some(Err(_)) => 0,
+        None => capture_allowed,
+    };
+    if allowed == 0 {
+        if let Some(Err(reason)) = batch_allowed {
+            return Err(std::io::Error::other(reason));
+        }
+        return Err(std::io::Error::other(IO_CEILING_REASON));
+    }
+    let read = file.read_at(&mut suffix[..allowed], suffix_offset)?;
+    budget.record_io(read);
+    if let Some(spent) = batch_spent {
+        *spent = spent.saturating_add(read as u64);
+    }
+    if let Some(key) = resume_key {
+        budget
+            .pass_owner()
+            .note_hash_resume(key, suffix_offset + read as u64);
+    }
+    Ok(done + read)
+}
+
 fn inspect_count_manifest_file(
     file: &std::fs::File,
     before: Pin,
@@ -8616,33 +8682,23 @@ fn inspect_count_manifest_file(
     // enforce the capture allowances and the batch allowance
     // incrementally. Identity hashing charges the window only: a
     // partial digest is never trusted, so the per-object allowance must
-    // not refuse a large provider the window still admits.
+    // not refuse a large provider the window still admits. Bytes
+    // charged in earlier passes re-read free (owner resume offset).
     let inspected = inspect_file_with_reader_exporting(
         file,
         |file, bytes, offset| {
-            if let Some(reason) = budget.check_deadline_now() {
-                return Err(std::io::Error::other(reason));
-            }
-            let batch_allowed = batch_byte_allowance(*batch_spent, bytes.len());
-            let capture_allowed = budget.allowed_capture_io(bytes.len());
-            let allowed = match batch_allowed {
-                Ok(batch) => capture_allowed.min(batch),
-                // Batch exhausted; the branch below reports its gap.
-                Err(_) => 0,
-            };
-            if allowed == 0 {
-                if let Err(reason) = batch_allowed {
-                    return Err(std::io::Error::other(reason));
-                }
-                return Err(std::io::Error::other(IO_CEILING_REASON));
-            }
-            let read = file.read_at(&mut bytes[..allowed], offset)?;
-            budget.record_io(read);
-            *batch_spent = batch_spent.saturating_add(read as u64);
-            Ok(read)
+            read_hash_chunk_with_resume(
+                file,
+                bytes,
+                offset,
+                &mut *budget,
+                cacheable.then_some(cache_key),
+                Some(&mut *batch_spent),
+            )
         },
         &standard_function_names(),
     )?;
+    budget.pass_owner().drop_hash_resume(&cache_key);
     if pin_of(file)? != before {
         return Err("file changed while it was being identified".into());
     }
@@ -11130,24 +11186,24 @@ fn pin_scanned_object(
     }
     // Identity hashing charges the window only: a partial digest is
     // never trusted, so the per-object allowance must not refuse a
-    // large provider the window still admits.
+    // large provider the window still admits. Bytes charged in
+    // earlier passes re-read free (owner resume offset).
     let inspected = inspect_file_with_reader_exporting(
         &file,
         |file, bytes, offset| {
-            if let Some(reason) = budget.check_deadline_now() {
-                return Err(std::io::Error::other(reason));
-            }
-            let allowed = budget.allowed_capture_io(bytes.len());
-            if allowed == 0 {
-                return Err(std::io::Error::other(IO_CEILING_REASON));
-            }
-            let read = file.read_at(&mut bytes[..allowed], offset)?;
-            budget.record_io(read);
-            Ok(read)
+            read_hash_chunk_with_resume(
+                file,
+                bytes,
+                offset,
+                &mut *budget,
+                cacheable.then_some(cache_key),
+                None,
+            )
         },
         &standard_function_names(),
     )
     .map_err(|error| PinOutcome::for_inspect_error(&error))?;
+    budget.pass_owner().drop_hash_resume(&cache_key);
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
     // The clock read precedes the verification it timestamps.
@@ -11955,6 +12011,71 @@ mod tests {
             pins.id_for_scanned(&module, module.key, &module.path)
                 .is_some(),
             "the fixture pin resolves"
+        );
+    }
+
+    /// Owner 2c: a file larger than one I/O window resumes across
+    /// passes instead of restarting at offset 0 forever (L3-2). Each
+    /// attempt charges only not-yet-consumed bytes; the completed
+    /// digest equals the one-shot hash and every byte is charged
+    /// exactly once across all passes.
+    #[test]
+    fn whole_file_hash_resumes_past_one_window_instead_of_restarting() {
+        use crate::discovery::scan::ScanLimits;
+        let path = test_fixture::small_owned_object();
+        let file = std::fs::File::open(path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let window = len / 4;
+        assert!(
+            window >= 1024,
+            "the fixture must span several test windows: {len} bytes"
+        );
+        let mapping = p11scope_manifest::identity::mapping_file_key(&file).expect("a mapping key");
+        let before = pin_of(&file).unwrap();
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: window,
+            total_bytes: window,
+        });
+        let mut batch_spent = 0u64;
+        let mut inspected = None;
+        for _ in 0..64 {
+            match inspect_count_manifest_file(&file, before, mapping, &mut budget, &mut batch_spent)
+            {
+                Ok(done) => {
+                    inspected = Some(done);
+                    break;
+                }
+                Err(_) => {
+                    budget.pass_owner().end_pass();
+                }
+            }
+        }
+        let inspected = inspected.expect("the hash resumes past one window");
+        let direct = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        assert_eq!(
+            inspected.identity.sha256, direct.identity.sha256,
+            "the resumed read hashed exactly the file bytes"
+        );
+        assert_eq!(
+            batch_spent, len,
+            "every byte charged exactly once across all passes"
+        );
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            len,
+            "the lifetime total counts actual reads once"
+        );
+        let key = crate::discovery::scan::InspectedFileKey::for_open_file(
+            &file,
+            object_key(mapping).device,
+            object_key(mapping).inode,
+            before,
+        )
+        .unwrap();
+        assert_eq!(
+            budget.pass_owner_ref().hash_resume_offset(&key),
+            0,
+            "completion drops the resume entry"
         );
     }
 

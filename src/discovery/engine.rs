@@ -15809,10 +15809,10 @@ impl Engine {
     /// Snapshot the live attached cover `selected` is about to detach:
     /// one entry per session-proven attached selected slot, pairing the
     /// endpoint key with its module ids. Attached means a retained
-    /// attach-complete stamp, so
-    /// retiring plan-active cover that never attached (a rejected key's
-    /// slots, a conservative replay of an unattached plan) snapshots
-    /// nothing and files no phantom window. The snapshot judges no
+    /// attach-complete stamp, so retiring plan-active cover that never
+    /// attached (a rejected key's slots, a conservative replay of an
+    /// unattached plan) snapshots nothing and files no phantom window.
+    /// The snapshot judges no
     /// reattach exclusion itself: the same-apply reattach is judged on
     /// outcome at each open point (early, pending, post-replace
     /// follow-up), since a planned reattach can still fail or void.

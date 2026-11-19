@@ -2259,27 +2259,33 @@ struct CoverageRetireWindow {
 }
 
 /// The live attached cover a global detach is about to retire: one entry
-/// per session-proven attached selected slot (endpoint key + module ids),
-/// plus the detach-decision instant. Each open point aggregates the
-/// entries its outcome covers (pending: all; early: minus the planned
-/// reattach; follow-up: only stranded replace keys), so no key files
-/// twice within one apply.
+/// per session-proven attached committed slot (original index, endpoint
+/// key and module ids), the proposed replacement attempts kept separately
+/// by original index, plus the detach-decision instant. Keys and module
+/// ids always read from the committed plan: a same-index rebuild can reuse
+/// the endpoint with a different stable module id, and the window must
+/// attribute to the retired owner, not the proposal. Each open point
+/// aggregates the entries its outcome covers (pending: all; early: minus
+/// the planned new keys and the replace attempts; follow-up: only the
+/// original endpoints whose replace attempt stranded), so no endpoint
+/// files twice within one apply.
 struct CoverageRetireSnapshot {
-    attached: Vec<(plan::AttachKey, BTreeSet<plan::ModuleId>)>,
+    attached: Vec<(u32, plan::AttachKey, BTreeSet<plan::ModuleId>)>,
+    replace_attempts: BTreeSet<u32>,
     start_ns: u64,
 }
 
 impl CoverageRetireSnapshot {
     /// Aggregate attached cover into (modules, slots), keeping only the
-    /// endpoints the caller's outcome covers.
+    /// original endpoints the caller's outcome covers.
     fn cover(
-        attached: &[(plan::AttachKey, BTreeSet<plan::ModuleId>)],
-        mut keep: impl FnMut(&plan::AttachKey) -> bool,
+        attached: &[(u32, plan::AttachKey, BTreeSet<plan::ModuleId>)],
+        mut keep: impl FnMut(u32, &plan::AttachKey) -> bool,
     ) -> (BTreeSet<plan::ModuleId>, u64) {
         let mut modules = BTreeSet::new();
         let mut slots = 0u64;
-        for (key, ids) in attached {
-            if !keep(key) {
+        for (index, key, ids) in attached {
+            if !keep(*index, key) {
                 continue;
             }
             modules.extend(ids.iter().copied());
@@ -15807,12 +15813,17 @@ impl Engine {
     }
 
     /// Snapshot the live attached cover `selected` is about to detach:
-    /// one entry per session-proven attached selected slot, pairing the
-    /// endpoint key with its module ids. Attached means a retained
-    /// attach-complete stamp, so retiring plan-active cover that never
-    /// attached (a rejected key's slots, a conservative replay of an
-    /// unattached plan) snapshots nothing and files no phantom window.
-    /// The snapshot judges no
+    /// one entry per session-proven attached committed slot, pairing the
+    /// original index with the committed endpoint key and module ids.
+    /// Attached means a retained attach-complete stamp, so retiring
+    /// plan-active cover that never attached (a rejected key's slots, a
+    /// conservative replay of an unattached plan) snapshots nothing and
+    /// files no phantom window. Keys and module ids read from the
+    /// committed plan by original index, never from the proposed
+    /// replacements: a same-index rebuild can reuse the endpoint with a
+    /// different stable module id. The proposed replacements ride
+    /// separately as attempts by original index; each open point matches
+    /// their outcomes to the original endpoints. The snapshot judges no
     /// reattach exclusion itself: the same-apply reattach is judged on
     /// outcome at each open point (early, pending, post-replace
     /// follow-up), since a planned reattach can still fail or void.
@@ -15824,6 +15835,7 @@ impl Engine {
         &self,
         session: &dyn EngineSession,
         selected: &[plan::Slot],
+        replace: &[plan::Slot],
         live_global: bool,
         start_ns: Option<u64>,
     ) -> Option<CoverageRetireSnapshot> {
@@ -15831,31 +15843,48 @@ impl Engine {
             return None;
         }
         let start_ns = start_ns?;
-        let attached: Vec<(plan::AttachKey, BTreeSet<plan::ModuleId>)> = selected
-            .iter()
-            .filter(|slot| {
-                self.plan.is_active(slot.index) && session.slot_attached_at(slot.index).is_some()
-            })
-            .map(|slot| {
-                (
-                    plan::AttachKey::of(slot),
-                    slot.module_ids.iter().copied().collect(),
-                )
-            })
-            .collect();
+        let mut seen = BTreeSet::new();
+        let mut attached = Vec::new();
+        for slot in selected {
+            if !seen.insert(slot.index) {
+                continue;
+            }
+            let Some(committed) = self.plan.slots.iter().find(|own| own.index == slot.index)
+            else {
+                continue;
+            };
+            if !self.plan.is_active(committed.index) {
+                continue;
+            }
+            if session.slot_attached_at(committed.index).is_none() {
+                continue;
+            }
+            attached.push((
+                committed.index,
+                plan::AttachKey::of(committed),
+                committed.module_ids.iter().copied().collect(),
+            ));
+        }
         if attached.is_empty() {
             return None;
         }
-        Some(CoverageRetireSnapshot { attached, start_ns })
+        let replace_attempts = replace.iter().map(|slot| slot.index).collect();
+        Some(CoverageRetireSnapshot {
+            attached,
+            replace_attempts,
+            start_ns,
+        })
     }
 
-    /// Endpoints the same apply plans to reattach (`delta.new` ∪ replace).
-    fn planned_reattach_keys(candidate: &LiveCandidate) -> BTreeSet<plan::AttachKey> {
+    /// Endpoints the same apply plans to attach fresh (`delta.new`).
+    /// Replacements ride in the snapshot as attempts by original index and
+    /// match by index, not by key: a same-index rebuild reuses the
+    /// endpoint, while a pin migration reuses the index under a new key.
+    fn planned_new_keys(candidate: &LiveCandidate) -> BTreeSet<plan::AttachKey> {
         candidate
             .delta
             .new
             .iter()
-            .chain(&candidate.delta.replace)
             .map(plan::AttachKey::of)
             .collect()
     }
@@ -19683,8 +19712,13 @@ impl Engine {
         // Coverage-retire witness: snapshot the live attached cover this
         // apply may detach, before any arm mutates the plan. Opened below
         // only when a pure-live global detach commits.
-        let retire_snapshot =
-            self.coverage_retire_snapshot(&*session, &selected, live_global, detach_slots_start);
+        let retire_snapshot = self.coverage_retire_snapshot(
+            &*session,
+            &selected,
+            &candidate.delta.replace,
+            live_global,
+            detach_slots_start,
+        );
         #[cfg(feature = "h6-reexec-diagnostic")]
         let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
             d.begin(
@@ -19779,12 +19813,17 @@ impl Engine {
             && let Some(snapshot) = &retire_snapshot
         {
             if matches!(&detach_slots_outcome, Ok(report) if report.pending.is_some()) {
-                let (modules, slots) = CoverageRetireSnapshot::cover(&snapshot.attached, |_| true);
+                let (modules, slots) =
+                    CoverageRetireSnapshot::cover(&snapshot.attached, |_, _| true);
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             } else {
-                let planned = Self::planned_reattach_keys(&candidate);
-                let (modules, slots) =
-                    CoverageRetireSnapshot::cover(&snapshot.attached, |key| !planned.contains(key));
+                let planned = Self::planned_new_keys(&candidate);
+                let (modules, slots) = CoverageRetireSnapshot::cover(
+                    &snapshot.attached,
+                    |index, key| {
+                        !planned.contains(key) && !snapshot.replace_attempts.contains(&index)
+                    },
+                );
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             }
         }
@@ -20332,23 +20371,26 @@ impl Engine {
                 *additions_allowed = false;
             }
         }
-        // Coverage-retire witness (follow-up): a replace slot that ended
+        // Coverage-retire witness (follow-up): a replace attempt that ended
         // deactivated has no cover — its old links detached with `selected`
-        // above and nothing replaced them — so the outcome files for its
-        // key although intent excluded it early. Only when the detach
+        // above and nothing replaced them — so the outcome files for the
+        // original endpoint although intent excluded it early. The stranded
+        // attempt matches its original endpoint by index; the window
+        // attributes to the committed owner. Only when the detach
         // committed (a failed detach retires nothing). Replace slots only:
         // new-attach failures keep their existing accounting.
         if detach_committed && let Some(snapshot) = &retire_snapshot {
-            let stranded: BTreeSet<plan::AttachKey> = candidate
+            let stranded: BTreeSet<u32> = candidate
                 .delta
                 .replace
                 .iter()
                 .filter(|slot| !candidate.plan.is_active(slot.index))
-                .map(plan::AttachKey::of)
+                .map(|slot| slot.index)
                 .collect();
             if !stranded.is_empty() {
-                let (modules, slots) =
-                    CoverageRetireSnapshot::cover(&snapshot.attached, |key| stranded.contains(key));
+                let (modules, slots) = CoverageRetireSnapshot::cover(&snapshot.attached, |index, _| {
+                    stranded.contains(&index)
+                });
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             }
         }

@@ -77805,7 +77805,9 @@ fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
     let mut credits = 0u64;
     let mut saw_auth = false;
     let mut saw_rebind = false;
+    let mut checked_sealed = false;
     loop {
+        let phase_before = engine.collected_graph.as_ref().map(|graph| graph.phase);
         engine.graph_authority_visits = 0;
         let outcome = engine
             .service_collected_finish_records(&mut session, Vec::new(), 0, 1)
@@ -77817,9 +77819,33 @@ fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
              (credit {credits}: {} visits)",
             engine.graph_authority_visits
         );
+        if phase_before == Some(GraphPhase::Rebind) {
+            assert_eq!(
+                engine.graph_authority_visits, 0,
+                "rebind credits reuse the sealed set with no scan (credit {credits})"
+            );
+        }
         if let Some(graph) = engine.collected_graph.as_ref() {
             saw_auth |= graph.phase == GraphPhase::RebindAuth;
             saw_rebind |= graph.phase == GraphPhase::Rebind;
+            if !checked_sealed && graph.phase == GraphPhase::Rebind {
+                checked_sealed = true;
+                let Some(ClaimAuthority::Views(sealed)) = graph.rebind_authority.as_ref() else {
+                    panic!("the first rebind credit carries the sealed authority");
+                };
+                assert!(
+                    !sealed.contains(&ProcessViewId(RETIRED)),
+                    "the still-listed retiring view is absent from the sealed authority"
+                );
+                let expected: BTreeSet<ProcessViewId> = (0..VIEWS)
+                    .filter(|index| *index != RETIRED)
+                    .map(ProcessViewId)
+                    .collect();
+                assert_eq!(
+                    *sealed, expected,
+                    "the sealed authority is exactly the 64 survivors"
+                );
+            }
         }
         if !outcome.pending {
             break;

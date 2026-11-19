@@ -6126,7 +6126,7 @@ fn start_semantic_lane(
         // on the scan path, check-the-manifest when manifests were
         // supplied), since the flag asked for rows no subset can serve.
         let (attach_subset, convert_subset) =
-            match seal_mint_start_subsets(coordinator, scan_subset) {
+            match seal_mint_start_subsets(coordinator, scan_subset, true) {
                 Ok(pair) => pair,
                 Err(refusals) => {
                     note_key_operations_subset_refused(coordinator, &refusals, scan_subset);
@@ -6168,7 +6168,7 @@ fn start_semantic_lane(
                 if spec.key_sizes
                     && !stopped()
                     && let Ok((attach_subset, convert_subset)) =
-                        seal_mint_start_subsets(coordinator, scan_subset)
+                        seal_mint_start_subsets(coordinator, scan_subset, false)
                 {
                     if stopped() {
                         return None;
@@ -6219,7 +6219,8 @@ fn start_semantic_lane(
     if stopped() {
         return None;
     }
-    let Ok((attach_subset, convert_subset)) = seal_mint_start_subsets(coordinator, scan_subset)
+    let Ok((attach_subset, convert_subset)) =
+        seal_mint_start_subsets(coordinator, scan_subset, true)
     else {
         return None;
     };
@@ -6255,13 +6256,18 @@ fn start_semantic_lane(
 }
 
 /// Mint the attach + conversion subset pair over the same retained
-/// accepted sources, disclosing subset refusals; `Err` with the
-/// failing mint's codes when either mint fails (the retained inputs
-/// moved under the startup). The flag-on ordinary retry re-mints
-/// through this after the refused journal start consumed its subsets.
+/// accepted sources, disclosing subset refusals when `record_gaps`;
+/// `Err` with the failing mint's codes when either mint fails (the
+/// retained inputs moved under the startup). The flag-on ordinary
+/// retry re-mints through this after the refused journal start
+/// consumed its subsets. The sizes arm's re-mint is provisional (it
+/// falls through to the authoritative ordinary mint), so it stays
+/// quiet: recording there would leave a `without instance semantics`
+/// gap beside a lane the ordinary mint seats.
 fn seal_mint_start_subsets(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scan_subset: bool,
+    record_gaps: bool,
 ) -> Result<
     (
         crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
@@ -6270,11 +6276,13 @@ fn seal_mint_start_subsets(
     Vec<crate::inventory_semantics::SemanticRefusal>,
 > {
     let preparation = seal_prepare_subset(coordinator, scan_subset);
-    for refusal in &preparation.refusals {
-        coordinator.note_scope_gap(
-            "semantic subset refused".into(),
-            format!("{refusal}; broad inventory continues without instance semantics"),
-        );
+    if record_gaps {
+        for refusal in &preparation.refusals {
+            coordinator.note_scope_gap(
+                "semantic subset refused".into(),
+                format!("{refusal}; broad inventory continues without instance semantics"),
+            );
+        }
     }
     let attach_subset = match preparation.subset {
         Some(subset) => subset,
@@ -6287,11 +6295,13 @@ fn seal_mint_start_subsets(
     let convert_subset = match second.subset {
         Some(subset) => subset,
         None => {
-            for refusal in &second.refusals {
-                coordinator.note_scope_gap(
-                    "semantic subset refused".into(),
-                    format!("{refusal}; broad inventory continues without instance semantics"),
-                );
+            if record_gaps {
+                for refusal in &second.refusals {
+                    coordinator.note_scope_gap(
+                        "semantic subset refused".into(),
+                        format!("{refusal}; broad inventory continues without instance semantics"),
+                    );
+                }
             }
             return Err(second.refusals);
         }

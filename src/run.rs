@@ -14432,6 +14432,7 @@ pub(crate) fn evidence_for(
         vendor_interfaces: plan.vendor_interfaces,
         interface_list: plan.interface_list.clone(),
         event_loss: kernel_evidence.ring_loss,
+        coverage_retired_slots: engine.coverage_retired_slots(),
         start_insert_failures: kernel_evidence.start_insert_failures,
         unmatched_returns: kernel_evidence.unmatched_returns,
         rv_update_failures: kernel_evidence.rv_update_failures,

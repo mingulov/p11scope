@@ -1408,6 +1408,11 @@ pub struct Evidence {
     /// (`metrics::lost_events`). Zero in `--mode metrics`, which never
     /// drains the ring buffer.
     pub event_loss: u64,
+    /// Live attached counting slots retired mid-capture across every
+    /// coverage-retire window (scope, never a missed-call count). The
+    /// windows themselves ride the affected records' `unobserved_windows`
+    /// with reason `coverage_retired`.
+    pub coverage_retired_slots: u64,
     pub start_insert_failures: u64,
     pub unmatched_returns: u64,
     pub rv_update_failures: u64,
@@ -2195,6 +2200,18 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: s.reason.clone(),
         };
     }
+    // Coverage-retire gaps keep their subject and their one finite
+    // reason; the affected-slot count rides in
+    // `evidence.coverage_retired_slots`, the interval in the record's
+    // `coverage_retired` unobserved window. Anything else under the
+    // subject falls through to the fail-closed generic below instead
+    // of breaking the closed vocabulary.
+    if s.subject == COVERAGE_RETIRED_SUBJECT && s.reason.as_str() == COVERAGE_RETIRED_REASON {
+        return SkippedOut {
+            name: s.subject.clone(),
+            reason: s.reason.clone(),
+        };
+    }
     // Learned-file gaps keep their subject and their ten finite
     // reasons; the counts ride in the `evidence.learned_*` keys.
     // Anything else under the subject falls through to the fail-closed
@@ -2598,6 +2615,7 @@ impl Evidence {
             self.interface_list.starts_with("error:"),
         );
         cause(o, "event_loss", self.event_loss > 0);
+        cause(o, "coverage_retired_slots", self.coverage_retired_slots > 0);
         cause(o, "start_insert_failures", self.start_insert_failures > 0);
         cause(o, "unmatched_returns", self.unmatched_returns > 0);
         cause(o, "rv_update_failures", self.rv_update_failures > 0);
@@ -4683,7 +4701,9 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 {
                     if skip.name == DISCOVERY_SUBJECT {
                         subjects += 1;
-                    } else if skip.name == LEARNED_SKIP_SUBJECT {
+                    } else if skip.name == LEARNED_SKIP_SUBJECT
+                        || skip.name == COVERAGE_RETIRED_SUBJECT
+                    {
                         // Named by the histogram below with its count,
                         // not as a skipped function.
                     } else {
@@ -4724,6 +4744,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LEARNED_DISABLED_REASON,
                     LEARNED_MOUNT_NAMESPACE_REASON,
                     LEARNED_UNMARKED_REASON,
+                    COVERAGE_RETIRED_REASON,
                 ] {
                     let hits = ev
                         .skipped
@@ -4779,6 +4800,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             ),
             "interface_list" => "could not list interfaces".to_string(),
             "event_loss" => count(ev.event_loss, "call record lost", "call records lost"),
+            "coverage_retired_slots" => count(
+                ev.coverage_retired_slots,
+                "live counting slot retired mid-capture",
+                "live counting slots retired mid-capture",
+            ),
             "start_insert_failures" => count(
                 ev.start_insert_failures,
                 "call start not recorded",
@@ -7194,6 +7220,7 @@ pub(crate) mod tests {
             vendor_interfaces: 0,
             interface_list: "absent".into(),
             event_loss: 0,
+            coverage_retired_slots: 0,
             start_insert_failures: 0,
             unmatched_returns: 0,
             rv_update_failures: 0,

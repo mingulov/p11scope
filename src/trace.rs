@@ -1451,6 +1451,7 @@ mod tests {
             vendor_interfaces: 0,
             interface_list: "absent".into(),
             event_loss: 0,
+            coverage_retired_slots: 0,
             start_insert_failures: 0,
             unmatched_returns: 0,
             rv_update_failures: 0,

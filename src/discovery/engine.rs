@@ -15534,6 +15534,39 @@ impl Engine {
         // rides every read the same way, so a live re-projection never
         // wipes the counted gap.
         discovery.deep_scan_selection = self.deep_scan_selection;
+        // Coverage-retire windows ride every read the same way: each
+        // record appends the windows of its own module id. Open windows
+        // read open-ended at now (an unreadable clock omits them rather
+        // than fabricating an end); the stored windows stay untouched so
+        // repeated reads project identically.
+        if !self.coverage_retire_windows.is_empty() {
+            let now = crate::attach::monotonic_ns();
+            for record in discovery.modules.iter_mut() {
+                let mut extra: Vec<render::UnobservedWindow> = self
+                    .coverage_retire_windows
+                    .iter()
+                    .filter(|window| window.modules.contains(&record.id))
+                    .filter_map(|window| {
+                        let end_ns = match (window.end_ns, now) {
+                            (Some(end), _) => end,
+                            (None, Some(now)) => now,
+                            (None, None) => return None,
+                        };
+                        Some(render::UnobservedWindow {
+                            start_ns: window.start_ns,
+                            end_ns,
+                            reason: render::UnobservedReason::CoverageRetired,
+                        })
+                    })
+                    .collect();
+                if !extra.is_empty() {
+                    record
+                        .unobserved_windows
+                        .get_or_insert_with(Vec::new)
+                        .append(&mut extra);
+                }
+            }
+        }
         render::CaptureFacts {
             discovery,
             table_entries: self.plan.entries_seen,
@@ -15739,7 +15772,99 @@ impl Engine {
         self.coverage_retire_windows
             .iter()
             .map(|window| window.slots)
-            .sum()
+            .fold(0u64, |total, slots| total.saturating_add(slots))
+    }
+
+    /// Snapshot a pending coverage-retire window: the live attached
+    /// slots `selected` is about to detach, minus any module the same
+    /// apply re-attaches (same-apply replacements disclose no window;
+    /// their detach-reattach interval stays covered by the existing
+    /// replacement accounting). Attached means session-proven: only
+    /// slots with a retained attach-complete stamp count, so retiring
+    /// plan-active cover that never attached (a rejected key's slots,
+    /// a conservative replay of an unattached plan) files no phantom
+    /// window. `None` on ended/owned arms, empty cover, full reattach,
+    /// no proven attach, or an unreadable clock. Call before any arm
+    /// mutates the plan; the caller opens it once the detach commits.
+    fn coverage_retire_snapshot(
+        &self,
+        session: &dyn EngineSession,
+        selected: &[plan::Slot],
+        candidate: &LiveCandidate,
+        live_global: bool,
+        start_ns: Option<u64>,
+    ) -> Option<(BTreeSet<plan::ModuleId>, u64, u64)> {
+        if !live_global {
+            return None;
+        }
+        let start_ns = start_ns?;
+        if selected.is_empty() {
+            return None;
+        }
+        let reattached: BTreeSet<plan::ModuleId> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .flat_map(|slot| slot.module_ids.iter().copied())
+            .collect();
+        let mut modules = BTreeSet::new();
+        let mut slots = 0u64;
+        for slot in selected.iter().filter(|slot| {
+            self.plan.is_active(slot.index) && session.slot_attached_at(slot.index).is_some()
+        }) {
+            let fresh: Vec<plan::ModuleId> = slot
+                .module_ids
+                .iter()
+                .copied()
+                .filter(|id| !reattached.contains(id))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            modules.extend(fresh);
+            slots += 1;
+        }
+        if modules.is_empty() {
+            return None;
+        }
+        Some((modules, slots, start_ns))
+    }
+
+    /// Close open coverage-retire windows whose module has live cover
+    /// again (any plan slot of the module active). Runs at the end of
+    /// every apply that reaches it; a window opened earlier in the
+    /// same apply is never closed here (its detach committed without
+    /// same-apply reattach by construction, and no attach ran since).
+    /// An unreadable clock leaves windows open (fail closed: the
+    /// projection reads them open-ended instead of fabricating an end).
+    fn close_revived_coverage_windows(&mut self) {
+        if !self
+            .coverage_retire_windows
+            .iter()
+            .any(|window| window.end_ns.is_none())
+        {
+            return;
+        }
+        let Some(now) = crate::attach::monotonic_ns() else {
+            return;
+        };
+        let active: BTreeSet<plan::ModuleId> = self
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| self.plan.is_active(slot.index))
+            .flat_map(|slot| slot.module_ids.iter().copied())
+            .collect();
+        for window in self
+            .coverage_retire_windows
+            .iter_mut()
+            .filter(|window| window.end_ns.is_none())
+        {
+            if window.modules.iter().any(|id| active.contains(id)) {
+                window.end_ns = Some(now);
+            }
+        }
     }
 
     /// Whether the scope is the whole machine: only then does a pass see
@@ -19502,6 +19627,16 @@ impl Engine {
             );
         }
         let detach_slots_start = crate::attach::monotonic_ns();
+        // Coverage-retire witness: snapshot the live attached cover this
+        // apply may detach, before any arm mutates the plan. Opened below
+        // only when a pure-live global detach commits.
+        let retire_hook = self.coverage_retire_snapshot(
+            &*session,
+            &selected,
+            &candidate,
+            ended.is_none() && !owned_only,
+            detach_slots_start,
+        );
         #[cfg(feature = "h6-reexec-diagnostic")]
         let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
             d.begin(
@@ -19582,6 +19717,24 @@ impl Engine {
         #[cfg(feature = "h6-reexec-diagnostic")]
         if let Some(span) = detach_span {
             span.finish_result(&detach_slots_outcome);
+        }
+        // Coverage-retire witness: a committed pure-live global detach
+        // opens its window here, before any later early return can skip
+        // it. Revivals close at the end of their own apply; anything
+        // still open reads open-ended at capture end.
+        if detach_slots_outcome.is_ok() {
+            if let Some((modules, slots, start_ns)) = retire_hook {
+                self.coverage_retire_windows.push(CoverageRetireWindow {
+                    modules,
+                    start_ns,
+                    end_ns: None,
+                    slots,
+                });
+                self.mark_partial(
+                    crate::render::COVERAGE_RETIRED_SUBJECT,
+                    crate::render::COVERAGE_RETIRED_REASON,
+                );
+            }
         }
         self.sync_physical_gap(session);
         self.stage_timings.span(
@@ -20218,6 +20371,7 @@ impl Engine {
                     .count(),
             );
         }
+        self.close_revived_coverage_windows();
         Ok(outcome)
     }
 

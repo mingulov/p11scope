@@ -40,12 +40,14 @@ impl FileIdentity {
 /// A private temp file created beside a target path, published to that path
 /// with an identity-verified `rename(2)` on `commit`. If never committed the
 /// temp file is unlinked by `Drop`; after the capture, no failure path
-/// unlinks the temp before a fallback has been tried — a sync, handover
-/// or rename I/O failure retries once, then saves the finished capture to
-/// the recovery dir (`/var/tmp/p11scope-recovered/`, 0700 owner-only, file
-/// 0600) and fails (exit 1: the requested `-o` does not exist). Only a
-/// final-name security refusal keeps the temp beside the destination with
-/// a warning naming it, without a fallback.
+/// unlinks the temp before a fallback has been tried — a document-write
+/// failure saves the caller's complete bytes, and a sync, handover or
+/// rename I/O failure retries once, then saves the finished capture, to
+/// the per-euid recovery dir (`/var/tmp/p11scope-recovered-<euid>/`, 0700
+/// owner-only, file 0600, with a fresh unique sibling when the base is
+/// occupied) and fails (exit 1: the requested `-o` does not exist). Only
+/// a final-name security refusal keeps the temp beside the destination
+/// with a warning naming it, without a fallback.
 ///
 /// Final-name policy (RB-1/HIGH-3, superseding F-48's "never stat the final
 /// name"): `rename(2)` atomically replaces any non-directory, so renaming
@@ -282,6 +284,69 @@ impl AtomicFile {
         self.fail_write_with = Some(errno);
     }
 
+    /// Writes a finished in-memory document to the temp. `-o` call
+    /// sites with the whole document in hand write through here (not
+    /// `file()`), so a short write routes to
+    /// `fail_write_with_recovery` with the complete bytes instead of
+    /// dropping the capture.
+    pub fn write_document(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(errno) = self.fail_write_with {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+        std::io::Write::write_all(&mut self.temp_file, bytes)
+    }
+
+    /// Saves a finished in-memory document to the recovery dir after
+    /// its `-o` write failed (ENOSPC/EDQUOT at `write_document`): the
+    /// temp holds at most a partial write, so the fallback carries
+    /// the caller's complete bytes, never the temp. There is no
+    /// retry — a full destination stays full — the recovery dir on
+    /// its own filesystem is the retry. Consumes the sink; `Drop`
+    /// unlinks the partial temp, which stays this run's private file
+    /// (a short write changes no identity). Reports the same typed
+    /// failure as `commit_with_outcome` with the same operator lines,
+    /// so callers treat a saved fallback identically.
+    pub fn fail_write_with_recovery(self, bytes: &[u8], write_error: String) -> CommitFailure {
+        let base = recovered_base_dir();
+        match save_recovered_bytes(bytes, &self.final_path, &base) {
+            Ok(saved) => {
+                let euid = unsafe { libc::geteuid() } as u32;
+                let note = recovery_saved_note(euid, account_name(euid).as_deref());
+                eprintln!(
+                    "p11scope: writing {} failed: {write_error}; capture saved to {} {note}",
+                    self.final_path.display(),
+                    saved.display()
+                );
+                CommitFailure {
+                    message: format!(
+                        "writing {} failed: {write_error}; capture saved to {} {note}",
+                        self.final_path.display(),
+                        saved.display()
+                    ),
+                    kind: CommitFailureKind::SavedToRecovery,
+                    saved: Some(saved),
+                }
+            }
+            Err(e2) => {
+                eprintln!(
+                    "p11scope: writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+                    self.final_path.display(),
+                    base.display()
+                );
+                CommitFailure {
+                    message: format!(
+                        "writing {} failed: {write_error}; saving to {} also failed: {e2}; capture lost",
+                        self.final_path.display(),
+                        base.display()
+                    ),
+                    kind: CommitFailureKind::RecoveryFailed,
+                    saved: None,
+                }
+            }
+        }
+    }
+
     /// The final report path, for error and fallback lines naming it.
     pub fn path(&self) -> &Path {
         &self.final_path
@@ -308,20 +373,21 @@ impl AtomicFile {
     /// `sync_all`, handover to the target decided at creation, re-check
     /// of the final name, rename — twice: the first I/O failure retries
     /// once for transient NFS/FUSE hiccups, and a second failure saves
-    /// the finished capture to the recovery dir
-    /// (`/var/tmp/p11scope-recovered/`, 0700 owner-only, file 0600
+    /// the finished capture to the per-euid recovery dir
+    /// (`/var/tmp/p11scope-recovered-<euid>/`, 0700 owner-only, file 0600
     /// `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>`) instead of unlinking
     /// it, and fails (exit 1: the requested `-o` does not exist). Only a
     /// final-name security refusal keeps the temp beside the destination
     /// with a warning naming it, without a fallback. A tampered temp
     /// (identity check) fails closed with the temp left in place. After
     /// the capture, no failure path unlinks the temp before a fallback
-    /// has been tried; when both the `-o` save and the recovery save
-    /// fail, the error carries both failures with `capture lost`.
-    /// `commit_with_outcome` reports the same failure typed, so callers
-    /// with another delivery (the profile/metrics stdout rescue) can
-    /// tell a recovery-dir save — which must not be rescued again —
-    /// from a loss.
+    /// has been tried (document writes route through
+    /// `fail_write_with_recovery`); when both the `-o` save and the
+    /// recovery save fail, the error carries both failures with
+    /// `capture lost`. `commit_with_outcome` reports the same failure
+    /// typed, so callers with another delivery (the profile/metrics
+    /// stdout rescue) can tell a recovery-dir save — which must not be
+    /// rescued again — from a loss.
     pub fn commit(self) -> Result<(), String> {
         self.commit_with_outcome()
             .map_err(|failure| failure.into_message())
@@ -1682,15 +1748,24 @@ fn unlinkat(directory: &std::fs::File, name: &CString) -> std::io::Result<()> {
     }
 }
 
-/// The fixed recovery dir for finished captures whose `-o` commit fails.
-/// Tests override it with `P11SCOPE_TEST_RECOVERED_DIR`; production always
-/// uses `/var/tmp/p11scope-recovered` (fixed behaviour, no knob).
+/// The recovery dir for finished captures whose `-o` save fails.
+/// Tests override it with `P11SCOPE_TEST_RECOVERED_DIR`; production
+/// always uses the per-euid `/var/tmp/p11scope-recovered-<euid>`
+/// (fixed behaviour, no knob), so one user's fallback never blocks
+/// another's.
 fn recovered_base_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR") {
         return PathBuf::from(dir);
     }
-    PathBuf::from("/var/tmp/p11scope-recovered")
+    recovered_production_base(unsafe { libc::geteuid() } as u32)
+}
+
+/// The production recovery dir for one euid: a per-user name under
+/// `/var/tmp`, so an unprivileged run can never own root's fallback
+/// dir out from under it (or the reverse).
+fn recovered_production_base(euid: u32) -> PathBuf {
+    PathBuf::from(format!("/var/tmp/p11scope-recovered-{euid}"))
 }
 
 /// Opens the recovery dir, creating it `0700` when absent, and refuses a
@@ -1704,6 +1779,71 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
         .file_name()
         .ok_or_else(|| format!("recovery directory {} has no file name", base.display()))?;
     let name = c_name(name, "recovery directory name")?;
+    let (parent, _) = open_recovery_parent(base)?;
+    // SAFETY: both the dir fd and the NUL-terminated name outlive the call.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EEXIST) {
+            return Err(format!(
+                "creating recovery directory {} failed: {error}",
+                base.display()
+            ));
+        }
+    }
+    // SAFETY: same lifetime as above; O_NOFOLLOW refuses a symlink base.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(format!(
+            "opening recovery directory {} failed: {}; refusing it",
+            base.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: openat succeeded, so the fd is owned.
+    let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    verify_recovered_dir(&dir, base)?;
+    Ok(dir)
+}
+
+/// Opens the recovery dir, falling back to a fresh unique sibling
+/// when the base is occupied by a foreign object (another uid's dir,
+/// a file, a symlink, a permissive dir): the returned path is the
+/// dir actually held, which the save names. The test override pins
+/// the exact dir (no fallback), so refusal twins keep their precise
+/// base; production always falls back, so another user can never
+/// block this caller's recovery, not even by squatting its per-euid
+/// name.
+fn open_recovered_dir_or_fallback(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
+    match open_recovered_dir(base) {
+        Ok(dir) => Ok((dir, base.to_path_buf())),
+        Err(first) => {
+            #[cfg(test)]
+            if std::env::var_os("P11SCOPE_TEST_RECOVERED_DIR")
+                .is_some_and(|dir| PathBuf::from(dir) == base)
+            {
+                return Err(first);
+            }
+            let (dir, fallback) = create_fallback_recovered_dir(base)
+                .map_err(|second| format!("{first}; recovery fallback also failed: {second}"))?;
+            eprintln!(
+                "p11scope: warning: {first}; using {} instead",
+                fallback.display()
+            );
+            Ok((dir, fallback))
+        }
+    }
+}
+
+/// Opens a recovery base's parent held (no symlink traversal), for
+/// the base and fallback creators. Returns the held parent and its
+/// path (for messages).
+fn open_recovery_parent(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
     let mut parent_path = base
         .parent()
         .unwrap_or_else(|| Path::new("/"))
@@ -1733,38 +1873,20 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
         ));
     }
     // SAFETY: open succeeded, so the fd is owned.
-    let parent = unsafe { std::fs::File::from_raw_fd(parent_fd) };
-    // SAFETY: both the dir fd and the NUL-terminated name outlive the call.
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EEXIST) {
-            return Err(format!(
-                "creating recovery directory {} failed: {error}",
-                base.display()
-            ));
-        }
-    }
-    // SAFETY: same lifetime as above; O_NOFOLLOW refuses a symlink base.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd == -1 {
-        return Err(format!(
-            "opening recovery directory {} failed: {}; refusing it",
-            base.display(),
-            std::io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: openat succeeded, so the fd is owned.
-    let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+    Ok((
+        unsafe { std::fs::File::from_raw_fd(parent_fd) },
+        parent_path,
+    ))
+}
+
+/// Verifies a held recovery dir: a real directory owned by the
+/// caller with no group/other bits. `display` names the dir in
+/// refusal lines.
+fn verify_recovered_dir(dir: &std::fs::File, display: &Path) -> Result<(), String> {
     let metadata = dir.metadata().map_err(|error| {
         format!(
             "checking recovery directory {} failed: {error}; refusing it",
-            base.display()
+            display.display()
         )
     })?;
     // NB: mode bits, not the is_dir helper — the retained-directory
@@ -1772,25 +1894,115 @@ fn open_recovered_dir(base: &Path) -> Result<std::fs::File, String> {
     if metadata.mode() & libc::S_IFMT != libc::S_IFDIR {
         return Err(format!(
             "recovery directory {} is not a directory; refusing it",
-            base.display()
+            display.display()
         ));
     }
     let euid = unsafe { libc::geteuid() };
     if metadata.uid() != euid {
         return Err(format!(
             "recovery directory {} is owned by uid {}, not {euid}; refusing it",
-            base.display(),
+            display.display(),
             metadata.uid()
         ));
     }
     if metadata.mode() & 0o077 != 0 {
         return Err(format!(
             "recovery directory {} has mode {:04o} (group/other bits); refusing it",
-            base.display(),
+            display.display(),
             metadata.mode() & 0o7777
         ));
     }
-    Ok(dir)
+    Ok(())
+}
+
+/// Creates a fresh unique recovery dir beside an unusable base:
+/// `<base>.<16 hex from getrandom>`, `0700`, held and verified like
+/// the base. Random, never the pid, so another user cannot squat
+/// the name in advance; exclusive `mkdirat` retries on collision.
+fn create_fallback_recovered_dir(base: &Path) -> Result<(std::fs::File, PathBuf), String> {
+    let stem = base
+        .file_name()
+        .ok_or_else(|| format!("recovery directory {} has no file name", base.display()))?;
+    let (parent, _) = open_recovery_parent(base)?;
+    for _ in 0..128u32 {
+        let mut word = [0u8; 8];
+        let mut filled = 0;
+        while filled < word.len() {
+            // SAFETY: the slice is live and entirely writable;
+            // getrandom writes at most the remaining length.
+            let got = unsafe {
+                libc::getrandom(word[filled..].as_mut_ptr().cast(), word.len() - filled, 0)
+            };
+            if got < 0 {
+                let errno = std::io::Error::last_os_error();
+                if errno.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(format!(
+                    "reading recovery fallback randomness failed: {errno}"
+                ));
+            }
+            if got == 0 {
+                return Err(
+                    "reading recovery fallback randomness failed: getrandom returned no randomness"
+                        .to_string(),
+                );
+            }
+            filled += got as usize;
+        }
+        let text = format!(
+            "{}.{:016x}",
+            stem.to_string_lossy(),
+            u64::from_ne_bytes(word)
+        );
+        let name = CString::new(text.clone()).map_err(|_| {
+            format!(
+                "recovery directory {} has no usable file name",
+                base.display()
+            )
+        })?;
+        // SAFETY: both the dir fd and the NUL-terminated name outlive
+        // the call; mkdirat is exclusive, so a squatter only costs a
+        // retry.
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(format!(
+                "creating recovery fallback directory beside {} failed: {error}",
+                base.display()
+            ));
+        }
+        // SAFETY: same lifetime as above; O_NOFOLLOW refuses a swapped
+        // symlink (a sticky parent admits no swap by another user).
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd == -1 {
+            return Err(format!(
+                "opening recovery fallback directory beside {} failed: {}",
+                base.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: openat succeeded, so the fd is owned.
+        let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        let fallback = base.parent().unwrap_or_else(|| Path::new("/")).join(text);
+        if let Err(error) = verify_recovered_dir(&dir, &fallback) {
+            let _ = unlinkat(&parent, &name);
+            return Err(error);
+        }
+        return Ok((dir, fallback));
+    }
+    Err(format!(
+        "cannot allocate a unique recovery fallback directory beside {}",
+        base.display()
+    ))
 }
 
 /// Current UTC time as `yyyymmddThhmmssZ` for recovery names. Civil date
@@ -1867,7 +2079,38 @@ fn save_recovered_capture(
     dest: &Path,
     base: &Path,
 ) -> Result<PathBuf, String> {
-    let dir = open_recovered_dir(base)?;
+    // An independent offset via a clone, so the temp's own offset is
+    // untouched for the operator when the temp is kept.
+    let mut src = temp_file
+        .try_clone()
+        .map_err(|error| format!("reading finished capture for recovery failed: {error}"))?;
+    use std::io::{Seek as _, SeekFrom};
+    src.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("reading finished capture for recovery failed: {error}"))?;
+    save_recovered_stream(&mut src, dest, base)
+}
+
+/// Saves finished in-memory bytes to a new `0600` file in the recovery
+/// dir (same names, `O_EXCL` and `fsync` discipline as
+/// [`save_recovered_capture`]). After a failed `-o` write the temp
+/// holds at most a partial write, so the caller passes its complete
+/// document instead of the temp.
+fn save_recovered_bytes(bytes: &[u8], dest: &Path, base: &Path) -> Result<PathBuf, String> {
+    let mut src: &[u8] = bytes;
+    save_recovered_stream(&mut src, dest, base)
+}
+
+/// The shared recovery write: a new `0600` file in the held recovery
+/// dir (the base, or the fresh fallback sibling when the base is
+/// occupied), `O_EXCL`, then `fsync` of the file and the dir. A
+/// partial file on write/sync failure is unlinked again. Returns the
+/// saved path, under the dir actually held.
+fn save_recovered_stream(
+    reader: &mut dyn std::io::Read,
+    dest: &Path,
+    base: &Path,
+) -> Result<PathBuf, String> {
+    let (dir, actual) = open_recovered_dir_or_fallback(base)?;
     let ext = dest
         .extension()
         .and_then(|ext| ext.to_str())
@@ -1899,7 +2142,7 @@ fn save_recovered_capture(
             }
             return Err(format!(
                 "creating recovery file {name} in {} failed: {error}",
-                base.display()
+                actual.display()
             ));
         }
         // SAFETY: openat succeeded, so the fd is owned.
@@ -1907,45 +2150,32 @@ fn save_recovered_capture(
         let cleanup = |dir: &std::fs::File, name: &CString| {
             let _ = unlinkat(dir, name);
         };
-        // An independent offset via a clone, so the temp's own offset is
-        // untouched for the operator when the temp is kept.
-        let mut src = temp_file.try_clone().map_err(|error| {
-            cleanup(&dir, &c_name);
-            format!("reading finished capture for recovery failed: {error}")
-        })?;
-        use std::io::{Seek as _, SeekFrom};
-        if let Err(error) = src.seek(SeekFrom::Start(0)) {
-            cleanup(&dir, &c_name);
-            return Err(format!(
-                "reading finished capture for recovery failed: {error}"
-            ));
-        }
-        if let Err(error) = std::io::copy(&mut src, &mut out) {
+        if let Err(error) = std::io::copy(reader, &mut out) {
             cleanup(&dir, &c_name);
             return Err(format!(
                 "writing recovery file {name} in {} failed: {error}",
-                base.display()
+                actual.display()
             ));
         }
         if let Err(error) = out.sync_all() {
             cleanup(&dir, &c_name);
             return Err(format!(
                 "syncing recovery file {name} in {} failed: {error}",
-                base.display()
+                actual.display()
             ));
         }
         if let Err(error) = dir.sync_all() {
             cleanup(&dir, &c_name);
             return Err(format!(
                 "syncing recovery directory {} failed: {error}",
-                base.display()
+                actual.display()
             ));
         }
-        return Ok(base.join(name));
+        return Ok(actual.join(name));
     }
     Err(format!(
         "cannot allocate a unique recovery file in {}",
-        base.display()
+        actual.display()
     ))
 }
 

@@ -61,14 +61,28 @@ impl DiagnosticsDestination {
         view: &impl RetainedIdentityView,
         mut second_signal: impl FnMut() -> bool,
     ) -> Result<DiagnosticSummary, String> {
+        // Render into memory first (the export enforces its own byte
+        // bound): a short `-o` write then saves these complete bytes
+        // to the recovery dir instead of dropping the export.
+        let mut bytes = Vec::new();
         let summary = finished
-            .write_jsonl(self.output.file(), view, &mut second_signal)
+            .write_jsonl(&mut bytes, view, &mut second_signal)
             .map_err(|error| {
                 format!(
                     "writing diagnostics {} failed: {error}",
                     self.path.display()
                 )
             })?;
+        if let Err(error) = self.output.write_document(&bytes) {
+            let failure = self.output.fail_write_with_recovery(
+                &bytes,
+                format!(
+                    "writing diagnostics {} failed: {error}",
+                    self.path.display()
+                ),
+            );
+            return Err(failure.into_message());
+        }
         if second_signal() {
             return Err(format!(
                 "diagnostics export cancelled: {}",
@@ -745,6 +759,11 @@ mod tests {
         let directory = private_directory();
         let path = directory.path().join("diagnostics.jsonl");
         std::fs::write(&path, b"old diagnostics").unwrap();
+        // The failed write saves to the recovery dir: hold the
+        // override so the fallback lands in this test's own dir,
+        // never a concurrent twin's.
+        let recovered_base = directory.path().join("p11scope-recovered");
+        let _override = crate::output::hold_recovered_override(&recovered_base);
         let mut destination = fixture_destination(&path, None, None);
         crate::output::atomic_file_test_fixture_read_only(&mut destination.output);
         assert!(

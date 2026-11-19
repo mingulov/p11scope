@@ -128,10 +128,13 @@ fn write_report(
     mut sink: AtomicFile,
     before_commit: impl FnOnce(),
 ) -> Result<()> {
-    serde_json::to_writer(sink.file(), report).context("writing JSON report")?;
-    sink.file()
-        .write_all(b"\n")
-        .context("writing report newline")?;
+    let mut bytes = serde_json::to_vec(report).context("rendering JSON report")?;
+    bytes.push(b'\n');
+    if let Err(error) = sink.write_document(&bytes) {
+        let failure =
+            sink.fail_write_with_recovery(&bytes, format!("writing JSON report failed: {error}"));
+        return Err(anyhow::Error::msg(failure.into_message()));
+    }
     before_commit();
     // These descriptors are retained, even if their original names are
     // replaced. AtomicFile independently enforces trusted ancestors and

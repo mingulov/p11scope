@@ -4076,6 +4076,14 @@ pub(crate) struct CallerRegistry {
     /// One retained phase over the existing staging vector, never a second
     /// queue. New staged inputs belong to the next publication.
     joint_publication: Option<AppliedJointPublication>,
+    /// Feeds that staged calls since the last publish (per-quantum
+    /// touched set for scoped watchdog recovery): a running re-arm
+    /// disposes exactly these feeds' staged queues and records them
+    /// as the stuck session, keeping every other feed bit-identical.
+    /// Bounded by the retained instance cap; cleared at each publish
+    /// and consumed (taken) by the re-arm. A latch blocks the next
+    /// demand until re-arm or hold, so no stale read is possible.
+    quantum_touched_feeds: BTreeSet<instance_input::RegistryInstanceId>,
     /// Why an edge no producer covered reads unknown: `ScanOnly` until a
     /// native usage producer runs (Task 6 C5 sets `NotAttached`).
     uncovered_reason: UnknownReason,
@@ -4391,6 +4399,7 @@ impl CallerRegistry {
             terminal_phase: false,
             staged: Vec::new(),
             joint_publication: None,
+            quantum_touched_feeds: BTreeSet::new(),
             uncovered_reason: UnknownReason::ScanOnly,
             last_health_regression_ns: None,
             watches_ended_ns: None,

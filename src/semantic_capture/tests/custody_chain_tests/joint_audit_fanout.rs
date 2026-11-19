@@ -3315,7 +3315,7 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
                 gaps[0].1,
                 format!(
                     "6s without progress across {audited_polls} consecutive commit polls in \
-                     Audited; the semantic lane stops; \
+                     Audited; abandoning the stuck frame; \
                      h0_below=Some(3), staged_max=Some(2), floor=None"
                 ),
                 "the gap names the stall in time"
@@ -9371,9 +9371,41 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
 /// onto its stale receipt.
 #[test]
 fn joint_machine_voided_feed_refuses_below_fence_resume() {
+    use crate::inventory_semantics::JointServiceProgress;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture.refuse_at_audited(2);
+    // Applied quantum (the fence needs staged history): drive to
+    // applied, then refuse.
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the fenced quantum applies before the refusal");
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed native refusal latches the running machine"
+    );
     assert_eq!(
         fixture.rearm("semantic_unavailable"),
         Some(false),
@@ -9459,7 +9491,38 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
     use crate::semantics_objects::journal::{BirthRefusal, BootstrapReceipt, SessionBirthGrant};
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture.refuse_at_audited(2);
+    // Applied quantum (the fenced void replays staged history): drive
+    // to applied, then refuse.
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => break,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the replayed quantum applies before the refusal");
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed native refusal latches the running machine"
+    );
     assert_eq!(
         fixture.rearm("semantic_unavailable"),
         Some(false),
@@ -9502,8 +9565,8 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
     fixture.published_labeled("after running re-arm", None);
     // The recovery call replays: reduced +1, nothing disposed, and
     // the production projection reads one plain fallback row for it
-    // (the refused quantum staged nothing, so no loss row stands
-    // beside it).
+    // (the refused quantum's head was discarded under its counted
+    // gap, so no loss row stands beside it).
     assert_eq!(
         fixture.reduced_for(0),
         reduced + 1,
@@ -9527,11 +9590,17 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
         .feed;
     assert_eq!(
         crate::key_operation_projection::producer::unattributed(&[feed]),
-        vec![UnattributedRow {
-            reason: "proof_refused_fallback",
-            count: 1,
-        },],
-        "the replayed call keeps its plain fallback row"
+        vec![
+            UnattributedRow {
+                reason: "record_lost",
+                count: 1,
+            },
+            UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 1,
+            },
+        ],
+        "the discarded call rows its loss and the replayed call keeps its plain fallback row"
     );
     let (mode, fell_back, degraded_loss, _, replayed, _, _, fence) = feed_state(&fixture);
     assert_eq!(
@@ -9616,9 +9685,41 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
 /// not repeat it while the same fence stands.
 #[test]
 fn joint_machine_below_fence_deferral_discloses_once_per_feed() {
+    use crate::inventory_semantics::JointServiceProgress;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
-    fixture.refuse_at_audited(2);
+    // Applied quantum (the fence needs staged history): drive to
+    // applied, then refuse.
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the fenced quantum applies before the refusal");
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed native refusal latches the running machine"
+    );
     assert_eq!(
         fixture.rearm("semantic_unavailable"),
         Some(false),
@@ -15789,10 +15890,42 @@ impl MachineScene {
 /// (the fenced void replays the recovery as fallback).
 #[test]
 fn joint_machine_running_audited_refusal_rearms_and_next_quantum_publishes() {
+    use crate::inventory_semantics::JointServiceProgress;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
     let reduced = fixture.reduced_for(0);
-    fixture.refuse_at_audited(2);
+    // Applied quantum (the fenced void replays staged history): drive
+    // to applied, then refuse.
+    fixture
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 2);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the replayed quantum applies before the refusal");
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed native refusal latches the running machine"
+    );
     assert!(
         fixture.scene.real.scene.coordinator.publication_pending(),
         "the refused quantum's publication stands before the re-arm"
@@ -16018,11 +16151,13 @@ impl MachineScene {
 /// transient can refuse a quantum's audit before it runs (the raw
 /// ingested quantum held, its H3 disposition untaken). The re-arm
 /// disposes that quantum through the same counted paths as an
-/// Audited refusal: the unapplied publication cancels, the untaken H3
-/// slot is taken exactly as the audit takes it, the raw quantum drops,
-/// and the next collect voids every key open across it (named) and
-/// re-syncs above a fence. The next quantum publishes, and every call
-/// stays accounted: reduced plus disposed plus not-attributed direct equals the S1 returns.
+/// Audited refusal: the unapplied publication cancels (keeping its
+/// staged registry facts for the next pass), the untaken H3 slot is
+/// taken exactly as the audit takes it, and the raw quantum drops.
+/// Nothing staged, so the scoped void fences nothing and the kept
+/// facts seal exact with the recovery. The next quantum publishes,
+/// and every call stays accounted: reduced plus disposed plus
+/// not-attributed direct equals the S1 returns.
 #[test]
 fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
     let mut fixture = MachineScene::new(1);
@@ -16096,9 +16231,9 @@ fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
         baseline_returns + 4,
         "S1 joins every call including the abandoned three"
     );
-    // The cancelled publication kept its staged registry facts; they
-    // apply with the recovery after the void, so the abandoned calls
-    // count S1-direct as not attributed (never reduced as key rows).
+    // The cancelled publication kept its staged registry facts; the
+    // scoped void fenced nothing (nothing staged), so they apply with
+    // the recovery and seal exact as key rows (never S1-direct).
     assert_eq!(
         fixture.reduced_for(0) - reduced
             + (fixture.disposed_total() - disposed_prime)
@@ -16106,9 +16241,15 @@ fn joint_machine_running_auditing_refusal_rearms_and_next_quantum_publishes() {
         fixture.api_returns_total() - baseline_returns,
         "reduced, disposed and not-attributed calls cover every call across the re-arm"
     );
-    assert!(
-        fixture.direct_fallback_total() > direct_prime,
-        "the abandoned calls count as not attributed"
+    assert_eq!(
+        fixture.reduced_for(0) - reduced,
+        4,
+        "the abandoned three and the recovery call all seal exact"
+    );
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_prime,
+        "nothing counts S1-direct across the re-arm"
     );
     let unknown_after = fixture.unknown_terminals();
     assert_eq!(
@@ -16703,9 +16844,11 @@ fn joint_machine_preparation_refusal_keeps_the_latch() {
     );
 }
 
-/// Trip twin: the running no-progress wedge keeps its hold.
+/// Trip twin: the running no-progress wedge latches, then re-arms past
+/// the stuck frame (owner partial-not-stop): the trip records its cause
+/// for the re-arm's counted gaps, and the re-arm clears the latch.
 #[test]
-fn joint_machine_running_no_progress_trip_keeps_the_latch() {
+fn joint_machine_running_no_progress_trip_rearms_past_the_latch() {
     let bound = std::time::Duration::from_secs(6);
     let margin = std::time::Duration::from_millis(100);
     let mut fixture = MachineScene::new(1);
@@ -16721,15 +16864,26 @@ fn joint_machine_running_no_progress_trip_keeps_the_latch() {
         .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
     assert_eq!(fixture.service(1024), Err(SemanticRefusal::Unavailable));
     assert!(fixture.machine.audit_no_progress_trip_for_test().is_some());
-    assert_eq!(fixture.rearm("semantic_unavailable"), None);
     assert_eq!(
-        fixture.machine.rearm_refusal_for_test(),
-        Some(crate::inventory_semantics::RunningRearmRefusal::WatchdogTripped),
-        "the stop names the standing no-progress trip"
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "the trip latches the running disposition"
+    );
+    fixture.machine.pose_no_progress_poll_for_test(false);
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "the trip re-arms past the stuck frame"
+    );
+    assert_eq!(
+        fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "the re-arm clears the standing trip"
     );
     assert_eq!(
         fixture.machine.disposition_reason(),
-        Some(SemanticRefusal::Unavailable)
+        None,
+        "the re-arm clears the latch"
     );
 }
 
@@ -16850,7 +17004,7 @@ enum WatchdogRecoveryEntry {
     TransientRearm,
     /// E2: a running audit trip re-arms with the same scoped recovery.
     AuditTripRearm,
-    /// E3: the Idle void consumes a watchdog break without re-widening.
+    /// E3 guard: a genuine ingest break stays stream-wide.
     IdleScopedVoid,
     /// E4 guard: the exit hold keeps full terminal abandon.
     ExitHoldAbandon,
@@ -17032,7 +17186,9 @@ fn watchdog_prefix_scene(row: &str) -> (MachineScene, Vec<u8>) {
     let mut fixture = MachineScene::new(2);
     fixture.prime(2);
     let pid = std::process::id();
-    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    // A holds a neutral call open (its late terminal excuses after a
+    // wipe instead of tainting); B completes one call behind it.
+    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 3);
     let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
     for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
         fixture.scene.drain.source_mut().push_record(bytes);
@@ -17131,10 +17287,13 @@ fn watchdog_assert_scoped_recovery(scene: &WatchdogStuckScene, row: &str) {
     );
 }
 
-/// Pin post-recovery joining: a new caller admitted after recovery
-/// seals exact on the stuck file, the stuck call terminates, the held
-/// call seals (staged drains with nothing disposed, no fallback, no
-/// fence), and the lane stays live with no new trip.
+/// Pin post-recovery joining across two quanta (production
+/// timing: the void consumes in the first quantum, late terminals
+/// arrive in the second): a new caller admitted after recovery seals
+/// exact on the stuck file while the void lands (named), then the
+/// stuck call terminates and the held call seals (staged drains with
+/// nothing disposed, no fallback, no fence), and the lane stays live
+/// with no new trip.
 fn watchdog_assert_post_recovery_joins(scene: &mut WatchdogStuckScene, row: &str) {
     use crate::semantics_key_use::FeedMode;
     let _child = OwnedStoppedChild::new();
@@ -17145,12 +17304,6 @@ fn watchdog_assert_post_recovery_joins(scene: &mut WatchdogStuckScene, row: &str
     };
     let new_caller = scene.fixture.scene.real.bind(new_pid, new_image, 0);
     scene.fixture.scene.push(new_pid, 0, "C_CreateObject", 100);
-    scene
-        .fixture
-        .scene
-        .drain
-        .source_mut()
-        .push_record(scene.end_a.clone());
     assert!(
         scene.fixture.machine.begin_commit(false).is_ok(),
         "{row}: the recovered lane accepts the next commit"
@@ -17173,10 +17326,39 @@ fn watchdog_assert_post_recovery_joins(scene: &mut WatchdogStuckScene, row: &str
         "{row}: the newcomer stays Joint"
     );
     assert_eq!(newcomer.1.7, None, "{row}: the newcomer records no fence");
-    // The held head must reduce: staging drains while disposed stays
-    // flat, with no fallback, no degraded loss and no fence.
+    let voids: Vec<String> = watchdog_scope_gaps(&scene.fixture)
+        .into_iter()
+        .filter(|(subject, reason)| {
+            subject == crate::inventory_present::JOINT_RETAINED_S1_SUBJECT
+                && reason.contains("joint_void_")
+        })
+        .map(|(_, reason)| reason)
+        .collect();
+    assert!(
+        !voids.is_empty(),
+        "{row}: the Idle void ran and named its loss"
+    );
+    // The void severed the ordering wait (A's side is declared
+    // loss), so the held call seals on its own intact history
+    // without waiting for the stuck terminal.
     let held = watchdog_feed_states(&scene.fixture, 1);
     assert_eq!(held[0].1.1, 0, "{row}: the held call seals after recovery");
+    // Late terminal in the next quantum (same outstanding demand):
+    // the excused terminal changes nothing (the held head already
+    // reduced with nothing disposed, no fallback, no degraded loss
+    // and no fence).
+    scene
+        .fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(scene.end_a.clone());
+    scene.fixture.published_labeled("watchdog-terminal", None);
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(
+        held[0].1.1, 0,
+        "{row}: the held call stays sealed past the late terminal"
+    );
     assert_eq!(
         held[0].1.6, scene.held_disposed,
         "{row}: the held seal disposes nothing"
@@ -17334,39 +17516,31 @@ fn watchdog_entry_bounded_bulk_discard() {
     );
 }
 
-/// E3: the Idle void consumes a watchdog break without re-widening —
-/// the void runs (its gap lands) while the held session keeps staged
-/// proof, mode and fence state and seals exact.
+/// E3 guard: a genuine ingest break stays stream-wide — the next
+/// Idle collect fences every domain, wipes the open table and
+/// disposes stranded staged calls with preserved completions (the
+/// pre-existing stream contract the scoped refactor must not
+/// narrow). The watchdog-void-consume pin lives in the shared joins
+/// helper (void gap after the first post-recovery publish).
 fn watchdog_entry_idle_scoped_void() {
-    const ROW: &str = "E3 idle scoped void";
-    let mut scene = watchdog_stuck_scene(ROW);
-    scene.fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
-    assert_eq!(
-        scene.fixture.service(1),
-        Err(SemanticRefusal::Unavailable),
-        "{ROW}: the transient refusal latches"
-    );
-    assert_eq!(
-        scene.fixture.rearm("semantic_unavailable"),
-        Some(true),
-        "{ROW}: the applied quantum re-arms as published"
-    );
-    watchdog_assert_scoped_recovery(&scene, ROW);
-    // The next Idle collect consumes the recorded break: the void
-    // runs exactly once, scoped to the stuck session, while the
-    // stuck call terminates and the held call seals.
-    scene
-        .fixture
+    const ROW: &str = "E3 genuine break stays stream-wide";
+    use crate::semantics_key_use::FeedMode;
+    let (mut fixture, _end_a) = watchdog_prefix_scene(ROW);
+    fixture
         .scene
-        .drain
-        .source_mut()
-        .push_record(scene.end_a.clone());
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    let unknown_before = fixture.unknown_terminals();
     assert!(
-        scene.fixture.machine.begin_commit(false).is_ok(),
-        "{ROW}: the recovered lane accepts the next commit"
+        fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the lane accepts the post-break commit"
     );
-    scene.fixture.published_labeled("watchdog-post-void", None);
-    let voids: Vec<String> = watchdog_scope_gaps(&scene.fixture)
+    fixture.published_labeled("watchdog-genuine-void", None);
+    let voids: Vec<String> = watchdog_scope_gaps(&fixture)
         .into_iter()
         .filter(|(subject, reason)| {
             subject == crate::inventory_present::JOINT_RETAINED_S1_SUBJECT
@@ -17378,16 +17552,44 @@ fn watchdog_entry_idle_scoped_void() {
         !voids.is_empty(),
         "{ROW}: the Idle void ran and named its loss"
     );
-    let held = watchdog_feed_states(&scene.fixture, 1);
+    let held = watchdog_feed_states(&fixture, 1);
     assert_eq!(
         held[0].1.1, 0,
-        "{ROW}: the held call seals past the Idle void"
+        "{ROW}: the stream void disposes the stranded held call"
     );
     assert_eq!(
-        held[0].1.6, scene.held_disposed,
-        "{ROW}: the held seal disposes nothing"
+        held[0].1.6, 1,
+        "{ROW}: the stranded call counts as disposed history"
     );
-    assert_eq!(held[0].1.7, None, "{ROW}: the held feed records no fence");
+    assert!(
+        held[0].1.7.is_some(),
+        "{ROW}: the stream void fences every domain"
+    );
+    let unknown_after = fixture.unknown_terminals();
+    assert_eq!(
+        unknown_after,
+        [
+            unknown_before[0],
+            unknown_before[1],
+            unknown_before[2],
+            unknown_before[3] + 1
+        ],
+        "{ROW}: the stream dispose preserves the truncated open as an unknown-key row"
+    );
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::S1Only,
+        "{ROW}: the fenced feed leaves Joint"
+    );
+    assert!(
+        fixture.machine.disposition_reason().is_none(),
+        "{ROW}: the void is lossy-continue, never a latch"
+    );
+    assert_eq!(
+        fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{ROW}: no trip stands"
+    );
 }
 
 /// E6: the stuck loss is attributed exactly to the stuck consumer —
@@ -17419,7 +17621,8 @@ fn watchdog_entry_seal_cursor_park() {
 
 /// E7: a late birth flows past a stuck member — a caller admitted
 /// after the trip binds, births and seals one exact call while the
-/// stuck call stays open and the lane never stops.
+/// stuck call stays open; the stuck call then terminates and the
+/// held call seals, and the lane never stops.
 fn watchdog_entry_birth_funnel_past_stuck() {
     const ROW: &str = "E7 birth funnel past stuck";
     use crate::semantics_key_use::FeedMode;
@@ -17462,6 +17665,30 @@ fn watchdog_entry_birth_funnel_past_stuck() {
     assert!(!late.1.4, "{ROW}: the late feed never falls back");
     assert!(!late.1.5, "{ROW}: the late feed counts no degraded loss");
     assert_eq!(late.1.7, None, "{ROW}: the late feed records no fence");
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(
+        held[0].1.1, 0,
+        "{ROW}: the held call seals without waiting for the stuck call"
+    );
+    scene
+        .fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(scene.end_a.clone());
+    scene
+        .fixture
+        .published_labeled("watchdog-e7-terminal", None);
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(
+        held[0].1.1, 0,
+        "{ROW}: the held call seals past the stuck member"
+    );
+    assert_eq!(
+        held[0].1.6, scene.held_disposed,
+        "{ROW}: the held seal disposes nothing"
+    );
+    assert_eq!(held[0].1.7, None, "{ROW}: the held feed records no fence");
     assert!(
         scene.fixture.machine.disposition_reason().is_none(),
         "{ROW}: the lane never latches past the stuck member"
@@ -17679,7 +17906,6 @@ fn watchdog_entry_consumer_park_no_trip() {
 /// while the held session keeps proof and seals exact after.
 fn watchdog_entry_barrier_shed_scoped_void() {
     const ROW: &str = "E9b barrier shed in scoped void";
-    use crate::semantics_key_use::FeedMode;
     let (mut fixture, end_a) = watchdog_prefix_scene(ROW);
     let foreign = push_unbound_foreign_call(&mut fixture, 50, false);
     let pid = std::process::id();
@@ -17715,33 +17941,46 @@ fn watchdog_entry_barrier_shed_scoped_void() {
         "{ROW}: the tripped quantum re-arms as published"
     );
     watchdog_assert_scoped_recovery(&scene, ROW);
-    // A fresh stuck-file call seals post-rearm: the barrier lifted.
-    scene.fixture.scene.push(pid, 0, "C_CreateObject", 60);
+    // The void consumes first (no new input); the held call seals in
+    // the next quantum once the stuck call terminates. A standing
+    // barrier bars the held seal too, so its exact seal proves the
+    // shed.
+    assert!(
+        scene.fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the recovered lane accepts the next commit"
+    );
+    scene.fixture.published_labeled("watchdog-e9b-void", None);
+    let voids: Vec<String> = watchdog_scope_gaps(&scene.fixture)
+        .into_iter()
+        .filter(|(subject, reason)| {
+            subject == crate::inventory_present::JOINT_RETAINED_S1_SUBJECT
+                && reason.contains("joint_void_")
+        })
+        .map(|(_, reason)| reason)
+        .collect();
+    assert!(
+        !voids.is_empty(),
+        "{ROW}: the Idle void ran and named its loss"
+    );
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(
+        held[0].1.1, 0,
+        "{ROW}: the held call seals once the barrier sheds"
+    );
     scene
         .fixture
         .scene
         .drain
         .source_mut()
         .push_record(scene.end_a.clone());
-    assert!(
-        scene.fixture.machine.begin_commit(false).is_ok(),
-        "{ROW}: the recovered lane accepts the next commit"
-    );
     scene
         .fixture
-        .published_labeled("watchdog-e9b-recovery", None);
-    let stuck = watchdog_feed_states(&scene.fixture, 0);
-    assert_eq!(
-        stuck[0].1.2, 1,
-        "{ROW}: the fresh call seals exact past the shed barrier"
-    );
-    assert_eq!(
-        stuck[0].1.0,
-        FeedMode::Joint,
-        "{ROW}: the stuck file stays Joint"
-    );
+        .published_labeled("watchdog-e9b-terminal", None);
     let held = watchdog_feed_states(&scene.fixture, 1);
-    assert_eq!(held[0].1.1, 0, "{ROW}: the held call seals after recovery");
+    assert_eq!(
+        held[0].1.1, 0,
+        "{ROW}: the held call seals past the shed barrier"
+    );
     assert_eq!(
         held[0].1.6, scene.held_disposed,
         "{ROW}: the held seal disposes nothing"
@@ -17818,8 +18057,9 @@ fn watchdog_entry_unapplied_rearm_keeps_carried() {
 /// recovery (seal-refactor design §4): every recovery/void entry
 /// point degrades and counts only the stuck session while healthy
 /// sessions keep staged proof, mode, fence state and exact rows, and
-/// the lane continues. Each row runs in isolation; one run reports
-/// every failing row at once.
+/// the lane continues. Rows E3–E5 pin behavior that must NOT change
+/// (guard rows, green throughout). Each row runs in isolation; one
+/// run reports every failing row at once.
 #[test]
 fn joint_watchdog_recovery_scopes_to_the_stuck_session() {
     let rows: [(WatchdogRecoveryEntry, fn()); 11] = [
@@ -18356,6 +18596,28 @@ fn joint_machine_bound_demand_refusal_rearms_as_published() {
         "Bound",
         "the commit demand is bound before the refusal"
     );
+    // Applied quantum (the fenced void replays staged history): drive
+    // to applied, then refuse.
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => break,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the replayed quantum applies before the refusal");
     fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
     assert_eq!(
         fixture.service(1024),
@@ -18518,36 +18780,38 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
         Some(true),
         "the applied quantum re-arms as published"
     );
-    // The drain counts every staged call as disposed history and
-    // preserves its observed completion as unknown-key rows beside
-    // the loss count; staging stands empty only after that counted
-    // disposal.
+    // The discard counts every staged call as disposed history with
+    // no per-head preservation work; staging stands empty only after
+    // that counted bulk discard, and the named gap counts the stuck
+    // session's loss exactly.
     let staged_after = fixture.staged_total();
     assert_eq!(
         staged_after, 0,
-        "the drain empties staging after its counted disposal"
+        "the discard empties staging after its counted disposal"
     );
     assert_eq!(
         fixture.disposed_total() - disposed_before,
         staged_before as u64,
         "disposed history rises by exactly the staged depth"
     );
-    // The abandoned Init/Update/Final is one session-7 sign
-    // operation, preserved as exactly one unknown-key completion.
+    // The abandoned Init/Update/Final discards with no per-head
+    // completions: bulk discard preserves nothing at any depth.
     let unknown_after = fixture.unknown_terminals();
     assert_eq!(
-        unknown_after[0] - unknown_before[0],
-        1,
-        "the drain preserves the abandoned operation as one unknown-key completion"
-    );
-    assert_eq!(
         (
+            unknown_after[0] - unknown_before[0],
             unknown_after[1] - unknown_before[1],
             unknown_after[2] - unknown_before[2],
             unknown_after[3] - unknown_before[3],
         ),
-        (0, 0, 0),
-        "preservation adds no failed, cancelled or unknown outcomes"
+        (0, 0, 0, 0),
+        "bulk discard preserves no per-head completions"
+    );
+    let reasons = watchdog_rearm_gap_reasons(&fixture);
+    assert!(
+        reasons.iter().any(|reason| reason.contains("stuck session")
+            && reason.contains("discarded 3 staged calls from 1 feeds")),
+        "the re-arm gap counts the stuck session's discard: {reasons:?}"
     );
     assert_eq!(
         fixture.machine.disposition_reason(),
@@ -18612,7 +18876,7 @@ fn joint_machine_post_apply_refusal_rearms_and_next_quantum_publishes() {
     assert_eq!(
         api_returns(&fixture),
         baseline_returns + 4,
-        "S1 joins every call including the abandoned three: nothing is lost across the applied abandon"
+        "S1 observes every call including the abandoned three (discard affects rows, not observation)"
     );
     assert_eq!(
         fixture.reduced_for(0) - reduced + (fixture.disposed_total() - disposed_prime),
@@ -18676,6 +18940,28 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         claims > 0 && !proofs.is_empty(),
         "unconverted staging holds live claims (tracking open)"
     );
+    // Applied quantum (the fence needs staged history): drive to
+    // applied before the refusal.
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(crate::inventory_semantics::JointServiceProgress::Published) => break,
+            Ok(crate::inventory_semantics::JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the fenced quantum applies before the refusal");
     let proof = proofs[0].1;
     let baseline_returns = api_returns(&fixture);
     let baseline_reduced = fixture.reduced_for(0);
@@ -18705,10 +18991,11 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         "the tracked quantum re-arms (no demand was bound)"
     );
     assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
-    // The next collect voids across the abandoned quantum and re-syncs
-    // above a fence on exactly the lost window.
+    // The next collect voids the stuck session across the abandoned
+    // quantum: no re-sync (the stream stays intact), and the feed's
+    // fence is exactly the lost window.
     fixture.scene.push(pid, 0, "C_CreateObject", 5);
-    let mut resynced = false;
+    let mut fenced = false;
     for _ in 0..64 {
         fixture
             .service(1)
@@ -18720,17 +19007,23 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
             .coordinator
             .joint_capture()
             .adapter();
-        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
-            assert_eq!(
-                adapter.voided_through_for_test(),
-                lost_through,
-                "the fence is exactly the lost window"
-            );
-            resynced = true;
+        assert!(
+            !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()),
+            "a scoped void breaks nothing and invalidates nothing"
+        );
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let fence = registry
+            .instance_semantic_edges()
+            .next()
+            .expect("the provider keeps its feed")
+            .feed
+            .segment_fence_for_test();
+        if fence == Some(lost_through) {
+            fenced = true;
             break;
         }
     }
-    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert!(fenced, "the follow-up collect fences the lost window");
     // Spanned births refuse below the fence; a post-fence rebirth is not fenced.
     let generation = fixture.scene.attached.as_ref().unwrap().generation();
     let adapter = fixture
@@ -18761,22 +19054,26 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         Err(BirthRefusal::BelowVoidFence),
         "a birth at the fence resumes past the loss"
     );
-    // No row covers the lost window: neither S1 joins nor reductions include it.
+    // No row covers the lost window: only the fresh probe joins and
+    // reduces, as transitional fallback loss (its rebirth seals
+    // exact next).
     assert_eq!(
         api_returns(&fixture),
-        baseline_returns,
-        "the lost calls never join"
+        baseline_returns + 1,
+        "only the fresh probe joins, as transitional fallback loss"
     );
     assert_eq!(
         fixture.reduced_for(0),
-        baseline_reduced,
-        "the lost calls never reduce"
+        baseline_reduced + 1,
+        "only the fresh probe reduces, as transitional fallback loss"
     );
-    // Post-fence rebirth tracks cleanly: publish the new work. The seal
-    // meets the fenced history and retains S1: every call keeps its S1
-    // row (prime + fenced three + rebirth) while Joint certifies none
-    // of the lost window.
+    // Post-fence rebirth tracks cleanly: publish new work past the
+    // fence. The seal meets the fenced history and retains S1: the
+    // probe reduces direct while Joint certifies none of the lost
+    // window.
     let preparations_before = fixture.native.preparations.len();
+    let direct_before_rebirth = fixture.direct_fallback_total();
+    fixture.scene.push(pid, 0, "C_CreateObject", 6);
     fixture.published_labeled("post-fence rebirth", None);
     assert!(
         fixture.machine.disposition_reason().is_none(),
@@ -18798,18 +19095,44 @@ fn joint_machine_rearm_fences_spanned_key_tracking_for_rebirth() {
         "the fenced key never resumes Joint; its calls stay S1"
     );
     assert_eq!(
-        api_returns(&fixture),
-        baseline_returns + 4,
-        "S1 joins every call including the fenced three"
+        fixture.direct_fallback_total(),
+        direct_before_rebirth,
+        "the post-fence probe holds for rebirth instead of reducing direct"
+    );
+    assert_eq!(
+        fixture.staged_total(),
+        0,
+        "the post-fence probe holds outside the feed while its rebirth installs"
     );
     assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "the lane accepts the rebirth completion commit"
+    );
+    fixture.published_labeled("post-fence rebirth completes", None);
+    assert_eq!(
+        fixture.direct_fallback_total(),
+        direct_before_rebirth,
+        "the rebirthed probe reduces nothing direct yet"
+    );
+    fixture.scene.push(pid, 0, "C_CreateObject", 7);
+    fixture.published_labeled("post-fence rebirth seals", None);
+    assert!(
+        fixture.machine.disposition_reason().is_none(),
+        "the rebirth completion never latches"
+    );
+    assert_eq!(
         fixture
             .scene
             .real
             .scene
             .coordinator
             .registry()
-            .staged_scope_gaps_for_test()
+            .joint_feeds(),
+        0,
+        "the fenced key never resumes Joint past rebirth either"
+    );
+    assert!(
+        watchdog_scope_gaps(&fixture)
             .iter()
             .any(|(subject, _)| subject == "Joint key operations unavailable; retained S1"),
         "the S1-retained fallback is disclosed"

@@ -100,7 +100,10 @@ pub(crate) enum RunningRearmRefusal {
     NotTransient,
     /// A Finish (or its original) is already underway.
     FinishActive,
-    /// A no-progress trip (audit or finish) already stands.
+    /// A finish no-progress trip already stands. A running audit trip
+    /// never refuses: it re-arms past the stuck frame (owner
+    /// partial-not-stop), abandoning that frame's stuck session with
+    /// counted named gaps while healthy sessions continue exact.
     WatchdogTripped,
     /// The Audited phase kept no frame to abandon.
     FrameMissing,
@@ -1741,10 +1744,14 @@ impl LiveJointMachine {
 
     /// The latched shapes a running re-arm admits: an `Unavailable`
     /// refusal at the audit step, outside any Finish and without a
-    /// no-progress trip — at Audited with the retained frame still
-    /// held, or at Auditing (the audit refused before it ran, holding
-    /// the ingested quantum and its untaken H3 disposition). The
-    /// re-arm disposes exactly that custody in full (the frame through
+    /// finish no-progress trip — at Audited with the retained frame
+    /// still held, or at Auditing (the audit refused before it ran,
+    /// holding the ingested quantum and its untaken H3 disposition).
+    /// A running audit trip admits too: the stuck frame is abandoned
+    /// with counted named gaps and the lane re-arms for new frames
+    /// (owner partial-not-stop), bounded by the re-arm rate window
+    /// like any other interruption. The re-arm disposes exactly that
+    /// custody in full (the frame through
     /// `abandon_unfinished_joint_publication`; the unaudited quantum by
     /// taking its H3 slot as the audit would and dropping it); every
     /// other phase keeps Raw/H8/report custody no running path may drop
@@ -1763,7 +1770,7 @@ impl LiveJointMachine {
         if self.finish.is_some() || self.finish_original.is_some() {
             return Some(RunningRearmRefusal::FinishActive);
         }
-        if self.audit_no_progress_trip.is_some() || self.finish_no_progress_trip.is_some() {
+        if self.finish_no_progress_trip.is_some() {
             return Some(RunningRearmRefusal::WatchdogTripped);
         }
         match self.phase {
@@ -1774,16 +1781,19 @@ impl LiveJointMachine {
         }
     }
 
-    /// Re-arm a running machine past one transient refusal ("partial,
-    /// never stop"): abandon only the refused quantum through the same
-    /// named abandon the exit hold uses, break the linked journal stream
-    /// so the next Idle collect voids every key open across the
-    /// unsealed quantum (named) and re-syncs above a fence, and resume
-    /// at Idle. The refused phase is never re-run and its frame never
+    /// Re-arm a running machine past one transient refusal or running
+    /// audit trip ("partial, never stop"): abandon only the refused
+    /// quantum through the same named abandon the exit hold uses,
+    /// discard exactly the feeds that staged this quantum, and record
+    /// a scoped break so the next Idle collect voids the stuck
+    /// session's history (named) while healthy sessions keep staged
+    /// proof and re-prove above their own fences — then resume at
+    /// Idle. The refused phase is never re-run and its frame never
     /// resumes. `None` admits no re-arm and changes nothing: the latch
     /// stands for the driver's hold (any other latched shape, a Finish,
-    /// a no-progress trip, the rate bound, a lane no longer live, or
-    /// a lane whose next collect cannot re-sync).
+    /// a finish no-progress trip, the rate bound, a lane no longer live,
+    /// or a lane whose next collect cannot re-sync). A running audit
+    /// trip re-arms: its stuck frame is the abandoned quantum.
     /// A frame abandon that still leaves a publication standing also
     /// returns `None`; the hold's own abandon then finds it exactly as
     /// it would have. `Some(true)` when the abandoned publication was
@@ -1859,11 +1869,15 @@ impl LiveJointMachine {
             return None;
         }
         // An applied abandon strands staged-but-unreduced calls whose
-        // history the void fenced; dispose them as counted history
-        // (preserving their observed completions) so the recovery
-        // verifies against exactly its own history. An unapplied
-        // abandon staged nothing, so this is a no-op there.
-        coordinator.drop_abandoned_joint_staged();
+        // history the void will fence; discard exactly the feeds that
+        // staged this quantum (pure disposal: custody released
+        // exactly, no reduction, no preservation, no replay) and count
+        // them as the stuck session's named loss, so the recovery
+        // verifies against exactly its own history. Every other feed
+        // is untouched. An unapplied abandon staged nothing, so this
+        // discards zero there.
+        let (stuck_feeds, discarded_calls, discarded_feeds) =
+            coordinator.discard_stuck_session_staged();
         // A refusal at Auditing came before the audit ran: the machine
         // still holds the ingested quantum, and the coordinator its
         // untaken H3 disposition. Take that slot exactly as the audit
@@ -1886,9 +1900,7 @@ impl LiveJointMachine {
             }
         }
         if self.producers.journal_linked() {
-            coordinator
-                .joint_capture_mut()
-                .break_stream_after_running_abandon();
+            coordinator.record_scoped_watchdog_break(&stuck_feeds);
         }
         let published = matches!(self.demand, Some(Demand::Bound { .. }));
         if published {
@@ -1899,6 +1911,10 @@ impl LiveJointMachine {
         self.audit_no_progress_polls = 0;
         self.finish_no_progress_polls = 0;
         self.finish_no_progress_since = None;
+        // The re-arm consumed the stuck frame the audit trip named; a
+        // later stop must not report this trip again. (A finish trip
+        // never reaches here: the shape gate refuses it.)
+        self.audit_no_progress_trip = None;
         self.unpaid_void_yields = 0;
         // The window bounds; the total only counts, so it saturates, never wraps.
         self.running_rearms = self.running_rearms.saturating_add(1);
@@ -1917,7 +1933,7 @@ impl LiveJointMachine {
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
-                "{reason}; processes already running keep exact call counts but lose per-key rows for the rest of the run; processes started later are tracked"
+                "{reason}; discarded {discarded_calls} staged calls from {discarded_feeds} feeds of the stuck session; per-key attribution unknown for those calls; healthy sessions keep staged proof and continue exact; processes started later are tracked"
             ),
         );
         Some(published)
@@ -3370,7 +3386,7 @@ impl LiveJointMachine {
                         Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),
                     };
                     if voided {
-                        // An idle void strands staged-but-unreduced
+                        // A stream void strands staged-but-unreduced
                         // calls: a Joint feed's seal can wait
                         // (BoundNotReady) behind a long call from the
                         // same process that is still running, so its
@@ -3379,13 +3395,23 @@ impl LiveJointMachine {
                         // The void wipes their H8 and claims, and the
                         // next frame's fallback verification would
                         // trip over them, so dispose them as counted
-                        // history here, preserving their observed
-                        // completions. A no-op unless calls were
+                        // history here. A no-op unless calls were
                         // staged. Pinned by the held-call twin. (A
                         // stashed pre-void outcome is instead retained
                         // as plain S1 with a counted gap and the lane
-                        // continues; see the N1 twin.)
-                        coordinator.drop_abandoned_joint_staged();
+                        // continues; see the N1 twin.) A scoped void
+                        // strands nothing more: the re-arm already
+                        // discarded the stuck session, and healthy
+                        // history survived the void itself.
+                        let scoped = matches!(
+                            coordinator.joint_capture_mut().take_last_void_scope(),
+                            Some(
+                                crate::semantics_objects::journal::joint_driver::JointVoidScope::Scoped
+                            )
+                        );
+                        if !scoped {
+                            coordinator.drop_abandoned_joint_staged();
+                        }
                         coordinator.note_scope_gap(
                             crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
                             format!(
@@ -4035,13 +4061,19 @@ impl LiveJointMachine {
                         coordinator.disclose_birth_reoffer_exhausted(reoffer);
                     }
                 }
-                // Reseed births for voided feeds: re-arm each queued
-                // image's router retry so its next continued
-                // observation offers one more birth at/above the fence.
-                // Images the lane cannot re-arm (unknown, retired, or
-                // a shell lane with no capture) stay S1Only with
-                // their deferred gap already disclosed.
+                // Reseed births for voided feeds: clear each queued
+                // image's pinned bootstrap cuts (stale below-cut
+                // evidence would mismatch its fresh birth), then
+                // re-arm its router retry so its next continued
+                // observation offers one more birth at/above the
+                // fence. Images the lane cannot re-arm (unknown,
+                // retired, or a shell lane with no capture) stay
+                // S1Only with their deferred gap already disclosed.
                 for image in coordinator.drain_joint_reseed_queue() {
+                    coordinator
+                        .joint_capture_mut()
+                        .adapter_mut()
+                        .clear_bootstraps_for_reseed(image.task_cookie, image.exec_id);
                     lane.rearm_image_for_reseed(image);
                 }
                 (
@@ -4291,6 +4323,10 @@ impl LiveJointMachine {
                             }
                             self.demand = Some(Demand::Published(receipt));
                         }
+                        // A published quantum is sealed history, never
+                        // abandoned: its feeds leave the stuck-session
+                        // candidate set for the next quantum.
+                        coordinator.reset_quantum_touched_feeds();
                         (Phase::Idle, Ok(Step::Published))
                     }
                     Ok(Ok(JointCommitProgress::Pending)) => {
@@ -4299,9 +4335,10 @@ impl LiveJointMachine {
                         // and publishes nothing, forever. Spending and
                         // publication reset the stall clock; the bound
                         // records a named gap, latches the trip cause
-                        // for the exit hold's stderr disclosure, and
-                        // refuses, keeping the retained frame and its
-                        // audit tags for the disposition hold and
+                        // for the re-arm's counted gaps (or the exit
+                        // hold's stderr disclosure when the re-arm is
+                        // refused), and refuses, keeping the retained
+                        // frame and its audit tags for the abandon and
                         // diagnosis. The two modes share the clock but
                         // count separately; a mode flip restarts it, so
                         // a running stall and a finish stall never fuse
@@ -4357,6 +4394,42 @@ impl LiveJointMachine {
                                 let since = *self.finish_no_progress_since.get_or_insert(now);
                                 let stalled = now.duration_since(since);
                                 if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
+                                    // Watchdog park (partial, never stop):
+                                    // delivery-stuck consumers degrade
+                                    // with counted loss and the frame
+                                    // continues past them; only a frame
+                                    // no park can unblock trips into
+                                    // abandon and re-arm. A seal
+                                    // barrier skips the park: its
+                                    // stuck consumers trip into re-arm
+                                    // and scoped void (which sheds the
+                                    // barrier) instead of degrading
+                                    // every frame behind it. A fresh
+                                    // stall clock covers the resumed
+                                    // frame (forced-fallback deliveries
+                                    // take budgeted polls).
+                                    let barrier =
+                                        coordinator.joint_capture().adapter().has_seal_barrier();
+                                    let parked = if barrier {
+                                        0
+                                    } else {
+                                        frame
+                                            .as_mut()
+                                            .map_or(0, |frame| frame.park_stuck_consumers())
+                                    };
+                                    if parked > 0 {
+                                        self.audit_no_progress_polls = 0;
+                                        self.finish_no_progress_polls = 0;
+                                        self.finish_no_progress_since = None;
+                                        return (
+                                            Phase::Audited {
+                                                frame,
+                                                identity,
+                                                base,
+                                            },
+                                            Ok(Step::Yield),
+                                        );
+                                    }
                                     let polls = self.audit_no_progress_polls;
                                     let watermarks = frame
                                         .as_ref()
@@ -4367,7 +4440,7 @@ impl LiveJointMachine {
                                         "joint audit made no progress".to_string(),
                                         format!(
                                             "{}s without progress across {} consecutive commit polls in \
-                                             Audited; the semantic lane stops; \
+                                             Audited; abandoning the stuck frame; \
                                              h0_below={:?}, staged_max={:?}, floor={:?}",
                                             stalled.as_secs(),
                                             polls,

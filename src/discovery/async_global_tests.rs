@@ -1778,6 +1778,89 @@ fn async_global_unattached_retire_opens_no_coverage_window() {
     );
 }
 
+/// Retiring only a later committed slot snapshots that slot's committed
+/// endpoint by index: the window attributes to the retired slot's
+/// modules with a one-slot count, never to the surviving prefix.
+/// (Guards the dense index-position lookup in the retire snapshot.)
+#[test]
+fn async_global_retire_of_later_slot_snapshots_that_slot_by_index() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let peer = peer_candidate(&mut engine, &modules);
+    let mut additions = true;
+    engine
+        .apply_candidate(
+            &mut ScriptedSession::default(),
+            peer,
+            &mut additions,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        engine.plan.slots.len(),
+        2,
+        "premise: both providers hold a slot"
+    );
+    let first = engine.plan.slots[0].index;
+    let second = engine.plan.slots[1].index;
+    assert_ne!(first, second, "premise: distinct slot indices");
+    let kept_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[1].module_ids.iter().copied().collect();
+    assert_ne!(
+        kept_modules, retired_modules,
+        "premise: the retired slot's owner differs from the survivor's"
+    );
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(&engine.views[0], &modules));
+    let mut retire = engine
+        .live_candidate(pins, modules.to_vec(), skipped)
+        .expect("the intact pins offer a candidate");
+    assert!(
+        retire.delta.new.is_empty() && retire.delta.replace.is_empty(),
+        "premise: the retire is pure (no same-apply reattach)"
+    );
+    retire.delta.retire.push(engine.plan.slots[1].clone());
+    retire.plan.deactivate(second);
+    let mut session = ScriptedSession::default();
+    session.scripted_stamps.insert(second, 1);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, retire, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the scripted detach commits"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| slots == &vec![second]),
+        "premise: only the later slot detached: {:?}",
+        session.detached_slot_indices
+    );
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "the retired later slot files its window"
+    );
+    let window = &engine.coverage_retire_windows[0];
+    assert_eq!(window.modules, retired_modules);
+    assert_eq!(window.slots, 1);
+    assert_eq!(window.end_ns, None, "nothing revived it yet");
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+                && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+        }),
+        "the paired finite gap row files: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// Retiring a dead owner's slots (ended-PID path) opens no coverage
 /// window: the dead process can run no calls, so there is no gap.
 #[test]

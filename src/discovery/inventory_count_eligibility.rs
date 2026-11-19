@@ -649,6 +649,9 @@ impl CountOwnership {
     /// bounded discard accounting as an abandoned observation. Caller IDs
     /// are lifetime-monotonic, so retaining the slot would exhaust this
     /// map at the caller budget even while the adapter forgets rows.
+    /// Test-only: the folds clear indexed summaries and the header
+    /// separately.
+    #[cfg(test)]
     pub(super) fn forget_caller(&mut self, caller: CallerId) {
         self.forget_caller_header(caller);
         let keys: Vec<(CallerId, u32)> = self
@@ -689,25 +692,11 @@ impl CountOwnership {
     pub(super) fn summary_keys(&self) -> impl Iterator<Item = &(CallerId, u32)> {
         self.summaries.keys()
     }
-    /// One caller's summary keys for a staged oversized fold, collected
-    /// through the shared stride: an abort returns `None` and the caller
-    /// waits, its summaries intact.
-    pub(super) fn summary_keys_for(
-        &self,
-        caller: CallerId,
-        mut unit: impl FnMut() -> bool,
-    ) -> Option<Vec<(CallerId, u32)>> {
-        let mut keys = Vec::new();
-        for key in self
-            .summaries
-            .range((Included((caller, 0)), Included((caller, u32::MAX))))
-        {
-            if unit() {
-                return None;
-            }
-            keys.push(*key.0);
-        }
-        Some(keys)
+    /// Whether one summary still exists: the staged oversized fold
+    /// rehearses its lists read-only and the commit revalidates them,
+    /// so neither trusts a stale key.
+    pub(super) fn has_summary(&self, key: &(CallerId, u32)) -> bool {
+        self.summaries.contains_key(key)
     }
     /// Test-only: count-ownership summaries touched while folding.
     #[cfg(test)]

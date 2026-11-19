@@ -895,6 +895,19 @@ fn gap_reason_names_pid(reason: &str, pid: u32) -> bool {
     })
 }
 
+/// Per-request signal outcomes for twins: the `fail_pid` request, when
+/// set, returns the kernel's `-1/ESRCH` for the already-reaped
+/// `dead_probe_pid`; every other request is a non-delivering
+/// `kill(pid, 0)` probe returning 0 while the fixture lives. Twins run
+/// the live branch (`signal_outcome: None`) over owned fixtures passing
+/// the real executable checks, so both shimmed requests execute and
+/// combine exactly like live `SIGTERM` requests. No signal is delivered.
+#[derive(Clone, Copy)]
+struct SignalShim {
+    fail_pid: Option<u32>,
+    dead_probe_pid: u32,
+}
+
 /// Condition driver for the churn test: tails the observer's `--event-log`
 /// while it runs, births churn-C when the first pass publishes, and kills
 /// the anchor plus churn-A once churn-A's admission publishes. No fixed
@@ -921,6 +934,8 @@ struct ChurnCondition {
     kill_signalled: bool,
     kill_baseline_exited: BTreeSet<u32>,
     signal_outcome: Option<bool>,
+    signal_shim: Option<SignalShim>,
+    signal_requests: Vec<(u32, libc::c_int)>,
     birth_fired: bool,
     last_pass: Option<u64>,
     kill_admitting_pass: Option<u64>,
@@ -1028,7 +1043,9 @@ impl ChurnCondition {
             // requests for BOTH fixtures, not just the attempt above.
             // The scripted path injects the outcome so twins stay
             // deterministic over dead pids; the live path checks the
-            // fixture identity it already holds.
+            // fixture identity it already holds and issues both
+            // requests through the per-request seam (twins inject
+            // per-request outcomes through that same seam).
             let signalled = match self.signal_outcome {
                 Some(outcome) => outcome,
                 None => {
@@ -1036,10 +1053,8 @@ impl ChurnCondition {
                         && pid_is_driver(churn_a, &self.driver_exe)
                         && pid_is_driver(anchor, &self.driver_exe)
                     {
-                        unsafe {
-                            libc::kill(churn_a as i32, libc::SIGTERM);
-                            libc::kill(anchor as i32, libc::SIGTERM);
-                        }
+                        self.request_signal(churn_a);
+                        self.request_signal(anchor);
                         true
                     } else {
                         false
@@ -1077,6 +1092,25 @@ impl ChurnCondition {
                 (self.kill_admitting_pass, self.exit_observing_pass),
                 (Some(admitting), Some(observing)) if observing > admitting
             )
+    }
+
+    /// One signal request, returning the raw `kill(2)` status (`0` on
+    /// success). Every request is logged in order, including failures:
+    /// a failing first request must not skip the second fixture.
+    fn request_signal(&mut self, pid: u32) -> libc::c_int {
+        let rc = match self.signal_shim {
+            Some(shim) if Some(pid) == shim.fail_pid => unsafe {
+                // The kernel's own result for a reaped pid: -1/ESRCH.
+                libc::kill(shim.dead_probe_pid as i32, libc::SIGTERM)
+            },
+            Some(_) => unsafe {
+                // Non-delivering existence probe: 0 while the fixture lives.
+                libc::kill(pid as i32, 0)
+            },
+            None => unsafe { libc::kill(pid as i32, libc::SIGTERM) },
+        };
+        self.signal_requests.push((pid, rc));
+        rc
     }
 
     fn handle_pass_marker(&mut self, payload: &Value) {
@@ -1241,6 +1275,8 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         kill_signalled: false,
         kill_baseline_exited: BTreeSet::new(),
         signal_outcome: None,
+        signal_shim: None,
+        signal_requests: Vec::new(),
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
@@ -1554,6 +1590,8 @@ fn scripted_churn_condition(dir: &Path) -> ChurnCondition {
         kill_signalled: false,
         kill_baseline_exited: BTreeSet::new(),
         signal_outcome: Some(true),
+        signal_shim: None,
+        signal_requests: Vec::new(),
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
@@ -2024,6 +2062,326 @@ fn churn_pump_trips_rotation_tripwire_on_rename_regrow() {
         condition.rotated,
         "a rename with regrow to the consumed offset latches rotated"
     );
+}
+
+// ---------------------------------------------------------------------------
+// E2 review twins: failed signal requests, same-tick admitting markers,
+// and mixed pre/post-request exits.
+// ---------------------------------------------------------------------------
+
+fn live_admitted_line(pid: u32, exe: &str) -> String {
+    format!(
+        "{{\"kind\":\"caller_event\",\"event\":{{\"event\":\"admitted\",\"identity_context\":{{\"caller\":{{\"pid\":{pid},\"executable\":{{\"path\":\"{exe}\"}}}}}}}}}}\n"
+    )
+}
+
+fn live_exit_line(pid: u32, exe: &str) -> String {
+    format!(
+        "{{\"kind\":\"caller_event\",\"event\":{{\"event\":\"exited\",\"identity_context\":{{\"caller\":{{\"pid\":{pid},\"executable\":{{\"path\":\"{exe}\"}}}}}}}}}}\n"
+    )
+}
+
+/// An owned `sleep` fixture that dies with the test process and is
+/// reaped on drop, so a failing twin leaks neither processes nor zombies.
+fn spawn_owned_sleep() -> support::ChildGuard {
+    let mut cmd = Command::new("sleep");
+    cmd.arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.die_with_parent();
+    support::ChildGuard::new(cmd.spawn().expect("sleep fixture spawns"))
+}
+
+/// A fully reaped pid whose `SIGTERM` request returns the kernel's
+/// `-1/ESRCH`. Nothing spawns between the reap and the pump, so the pid
+/// cannot be recycled underneath the probe.
+fn reaped_probe_pid() -> u32 {
+    let mut probe = Command::new("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("probe spawns");
+    let pid = probe.id();
+    let status = probe.wait().expect("probe reaps");
+    assert!(status.success());
+    let premise = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    assert_eq!(premise, -1, "a reaped pid refuses signals");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH),
+        "a reaped pid fails with ESRCH"
+    );
+    pid
+}
+
+/// Drive one live-branch signal-request case over owned `sleep`
+/// fixtures: the request tick admits churn-A under pass 0, both exit
+/// rows arrive under pass 1, and `fail` selects the request returning
+/// the kernel's `-1/ESRCH` (`Some(true)` fails churn-A's first request,
+/// `Some(false)` fails the anchor's second request, `None` succeeds
+/// both as the positive control).
+fn signal_request_case(case: &str, fail: Option<bool>) {
+    let dir = tmp(&format!("inventory-churn-review-{case}"));
+    let anchor = spawn_owned_sleep();
+    let churn_a = spawn_owned_sleep();
+    let churn_b = spawn_owned_sleep();
+    let churn_c = spawn_owned_sleep();
+    let anchor_pid = anchor.child.id();
+    let churn_a_pid = churn_a.child.id();
+    let churn_b_pid = churn_b.child.id();
+    let churn_c_pid = churn_c.child.id();
+    let sleep_exe = std::fs::read_link(format!("/proc/{anchor_pid}/exe"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        pid_is_driver(anchor_pid, &sleep_exe) && pid_is_driver(churn_a_pid, &sleep_exe),
+        "{case}: both signalled fixtures pass the real executable checks"
+    );
+    let fail_pid = match fail {
+        Some(true) => Some(churn_a_pid),
+        Some(false) => Some(anchor_pid),
+        None => None,
+    };
+    let mut condition = scripted_churn_condition(&dir);
+    for (name, pid) in [
+        ("anchor.ready", anchor_pid),
+        ("churn-a.ready", churn_a_pid),
+        ("churn-b.ready", churn_b_pid),
+        ("churn-c.ready", churn_c_pid),
+    ] {
+        std::fs::write(condition.ready.join(name), format!("READY {pid}\n")).unwrap();
+    }
+    condition.driver_exe = sleep_exe.clone();
+    condition.signal_outcome = None;
+    condition.signal_shim = Some(SignalShim {
+        fail_pid,
+        dead_probe_pid: reaped_probe_pid(),
+    });
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}",
+            live_admitted_line(churn_a_pid, &sleep_exe),
+            guard_pass_marker_line(0)
+        ),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(
+        condition.killed,
+        "{case}: kill latch fires on churn-A admission"
+    );
+    assert_eq!(condition.kill_admitting_pass, Some(0));
+    assert!(
+        condition.churn_c.is_some(),
+        "{case}: churn-C birth is visible"
+    );
+    let expected_requests = match fail {
+        Some(true) => vec![(churn_a_pid, -1), (anchor_pid, 0)],
+        Some(false) => vec![(churn_a_pid, 0), (anchor_pid, -1)],
+        None => vec![(churn_a_pid, 0), (anchor_pid, 0)],
+    };
+    assert_eq!(
+        condition.signal_requests, expected_requests,
+        "{case}: both requests run in order with their own outcomes"
+    );
+    let mut later = std::fs::read_to_string(&condition.events).unwrap();
+    later.push_str(&live_exit_line(anchor_pid, &sleep_exe));
+    later.push_str(&live_exit_line(churn_a_pid, &sleep_exe));
+    later.push_str(&guard_pass_marker_line(1));
+    std::fs::write(&condition.events, &later).unwrap();
+    condition.pump();
+    assert!(
+        condition.exited.contains(&anchor_pid) && condition.exited.contains(&churn_a_pid),
+        "{case}: both exit rows are consumed under the later marker"
+    );
+    assert_eq!(
+        condition.last_pass,
+        Some(1),
+        "{case}: the later marker commits"
+    );
+    if fail.is_some() {
+        assert!(
+            !condition.kill_signalled,
+            "{case}: a failed request vetoes stop eligibility"
+        );
+        assert_eq!(
+            condition.exit_observing_pass, None,
+            "{case}: no exit-observing pass latches without eligibility"
+        );
+        assert!(
+            !condition.settled_for_stop(),
+            "{case}: a failed request must not stop"
+        );
+    } else {
+        assert!(
+            condition.kill_signalled,
+            "{case}: two successful requests grant stop eligibility"
+        );
+        assert_eq!(
+            condition.exit_observing_pass,
+            Some(1),
+            "{case}: the later marker commits both post-request exits"
+        );
+        assert!(
+            condition.settled_for_stop(),
+            "{case}: two successful requests plus the committed exits stop the run"
+        );
+    }
+}
+
+#[test]
+fn review_churn_a_request_failed() {
+    // Twin: churn-A's (first) signal request fails with the kernel's
+    // -1/ESRCH — the fixture exits between the identity check and its
+    // syscall — while the anchor's (second) request succeeds. Both
+    // requests still run in order, and the failure vetoes stop
+    // eligibility: no exit-pass latch and no progress stop once both
+    // exit rows arrive under the later ordinary marker.
+    signal_request_case("churn-a-request-failed", Some(true));
+}
+
+#[test]
+fn review_anchor_request_failed() {
+    // Twin: the anchor's (second) signal request fails with the
+    // kernel's -1/ESRCH while churn-A's (first) request succeeds. The
+    // failure vetoes stop eligibility exactly like a failed first
+    // request: no exit-pass latch and no progress stop.
+    signal_request_case("anchor-request-failed", Some(false));
+}
+
+#[test]
+fn review_both_requests_succeed() {
+    // Positive control: both live-branch requests succeed, so stop
+    // eligibility latches and the later ordinary marker commits both
+    // post-request exits into a progress stop.
+    signal_request_case("both-requests-succeed", None);
+}
+
+#[test]
+fn review_preceding_marker_in_admission_tick() {
+    // Twin: the admission tick's own read already holds an earlier
+    // ordinary marker (pass 0 admitted the anchor) before churn-A's
+    // admission row. The admitting pass resolves at the admission row
+    // from the most recent preceding marker — pass 1 — not from the
+    // pre-tick snapshot (pass 0) the fallback would derive.
+    let dir = tmp("inventory-churn-review-preceding-marker");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}{}{}",
+            guard_admitted_line(GUARD_ANCHOR),
+            guard_pass_marker_line(0),
+            guard_admitted_line(GUARD_CHURN_A),
+            guard_pass_marker_line(1)
+        ),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert_eq!(condition.last_pass, Some(1));
+    assert_eq!(
+        condition.kill_admitting_pass,
+        Some(1),
+        "same-tick preceding marker admits churn-A at pass 1, not the pre-tick snapshot"
+    );
+}
+
+#[test]
+fn review_mixed_pre_and_post_request_exits() {
+    // Twin: one fixture's exit is already consumed when the kill
+    // request fires while the other's arrives under a later ordinary
+    // marker, in both orientations. Scripted success keeps eligibility
+    // true, so only the per-fixture baseline refusal vetoes the latch:
+    // each orientation pins one predicate, and removing either single
+    // predicate latches the other fixture's post-request exit.
+    for (pre, post, slug, label) in [
+        (
+            GUARD_ANCHOR,
+            GUARD_CHURN_A,
+            "anchor-pre",
+            "anchor pre-request, churn-A post-request",
+        ),
+        (
+            GUARD_CHURN_A,
+            GUARD_ANCHOR,
+            "churn-a-pre",
+            "churn-A pre-request, anchor post-request",
+        ),
+    ] {
+        let dir = tmp(&format!("inventory-churn-review-mixed-{slug}"));
+        let mut condition = scripted_churn_condition(&dir);
+        std::fs::write(
+            &condition.events,
+            format!(
+                "{}{}{}",
+                guard_admitted_line(GUARD_ANCHOR),
+                guard_pass_marker_line(0),
+                guard_exit_line(pre)
+            ),
+        )
+        .unwrap();
+        condition.pump();
+        assert!(
+            !condition.killed,
+            "({label}) admission without churn-A leaves the kill latch clear"
+        );
+        std::fs::write(
+            condition.ready.join("churn-c.ready"),
+            format!("READY {}\n", GUARD_CHURN_C),
+        )
+        .unwrap();
+        let mut tick = std::fs::read_to_string(&condition.events).unwrap();
+        tick.push_str(&guard_admitted_line(GUARD_CHURN_A));
+        tick.push_str(&guard_pass_marker_line(1));
+        std::fs::write(&condition.events, &tick).unwrap();
+        condition.pump();
+        assert!(
+            condition.killed,
+            "({label}) kill latch fires on churn-A admission"
+        );
+        assert_eq!(condition.kill_admitting_pass, Some(1));
+        assert!(
+            condition.kill_signalled,
+            "({label}) scripted success keeps stop eligibility"
+        );
+        assert!(
+            condition.churn_c.is_some(),
+            "({label}) churn-C birth is visible"
+        );
+        tick.push_str(&guard_exit_line(post));
+        tick.push_str(&guard_pass_marker_line(2));
+        std::fs::write(&condition.events, &tick).unwrap();
+        condition.pump();
+        assert!(
+            condition.exited.contains(&pre) && condition.exited.contains(&post),
+            "({label}) both exits are consumed under the later marker"
+        );
+        assert_eq!(
+            condition.last_pass,
+            Some(2),
+            "({label}) the later marker commits"
+        );
+        assert_eq!(
+            condition.exit_observing_pass, None,
+            "({label}) the pre-request exit vetoes the latch"
+        );
+        assert!(
+            !condition.settled_for_stop(),
+            "({label}) a pre-request exit must not stop"
+        );
+        tick.push_str(&guard_pass_marker_line(3));
+        std::fs::write(&condition.events, &tick).unwrap();
+        condition.pump();
+        assert!(
+            !condition.settled_for_stop(),
+            "({label}) a bare later marker must not commit the pre-request exit"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -299,6 +299,17 @@ recovery.
   becomes truthful for the continuing path (`abandoning the stuck
   frame`; the hold path keeps its stopped wording when a re-arm is
   actually refused).
+- Gap-pressure contract: the per-trip re-arm row and the
+  per-consumer park row are best-effort under a full `--max-gaps`
+  budget (first-N-wins retention; the generic `gaps_suppressed`
+  counter discloses the suppression, and distinct per-trip counts
+  row separately). The loss counts always survive independent of
+  the budget: re-arm discards in per-feed `history_disposed`
+  (rendered as unattributed `record_lost`), parked calls as S1 rows
+  plus `proof_refused_fallback` tallies. A reserved watchdog-loss
+  slot that survives a full cap needs an owner retention-policy
+  ruling; until then the gap-pressure twins pin this fallback
+  contract.
 - No new gap identity fields: caller/module/PID stay `None` on these
   gaps, as today. No schema, wire or JSON shape change.
 

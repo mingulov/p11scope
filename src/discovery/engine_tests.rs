@@ -95430,6 +95430,7 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
 //
 // Ownership cells (retired R claimless, live owners intact, pins resolvable):
 //   E1 inventory × shared-pin      → merge_ownership_e1_inventory_shared_pin_stays_claimless (RED)
+//   E1 inventory × view-id reuse   → merge_ownership_e1_reused_view_id_holds_while_carried_row_rides (RED)
 //   E1 inventory × shared decay    → merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry (GREEN guard)
 //   E1 inventory × carried         → generational_removal_carry_stays_claimless_across_unrelated_refresh (pre-existing, GREEN)
 //   E2 conservative × shared-pin   → merge_ownership_e2_conservative_shared_pin_stays_claimless (RED)
@@ -95821,6 +95822,202 @@ fn merge_ownership_e1_inventory_shared_pin_stays_claimless() {
         false,
         "stale retirement",
     );
+}
+
+#[test]
+fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
+    // E1 × view-id reuse: R retires live alongside L with carry, so R's
+    // numeric ID returns to the free list while its carried row stays
+    // committed. A later admission must NOT hand that ID to a new
+    // generation: the retained row would ride alongside the reused-ID
+    // generation and both would file claims under one numeric view. The
+    // ID becomes available again once the carried row retires.
+    let parts = mo_shared_pin_parts();
+    let mut pins = parts.pins;
+    // R stays live here (both views file claims); the retirement below
+    // carries R through the production removal path.
+    let (bound, skipped) =
+        bind_scanned_modules(&[parts.module_r, parts.module_l.clone()], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(bound.len(), 2, "both live views bind");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.next_view_id = 100;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    for view in [MO_VIEW_R, MO_VIEW_L] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(view), std::process::id()).unwrap());
+    }
+    let view_r = ProcessViewId(MO_VIEW_R);
+    let view_l = ProcessViewId(MO_VIEW_L);
+    let object = parts.object;
+    assert!(
+        engine.pinned.view_claims(view_r).is_some(),
+        "R starts live with its own claims"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && slot.object == object),
+        "the fixture starts attached"
+    );
+    // Commit R's retirement with carry, then release the ID exactly as
+    // the tick does after an accepted apply.
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let carried = engine
+        .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    mo_assert_retired_claimless(&carried.pinned, "removal carry");
+    mo_assert_live_owner(
+        &carried.pinned,
+        &carried.modules,
+        &carried.plan,
+        view_l,
+        object,
+        "removal carry",
+    );
+    mo_assert_carried_pin(
+        &carried.pinned,
+        &carried.modules,
+        &carried.plan,
+        object,
+        false,
+        "removal carry",
+    );
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    engine.views.retain(|view| view.id() != view_r);
+    engine.release_view_id(view_r);
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view_r),
+        "R's carried row stays committed after the release"
+    );
+    // The real admission path skips the held ID even though it sits on
+    // the free list.
+    let me = std::process::id();
+    let max_scan_pids = engine.max_scan_pids;
+    let (new_views, _, _) = engine.admit_inventory_new_views(
+        vec![me],
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
+        max_scan_pids,
+        &mut || Some(0),
+    );
+    let admitted = new_views
+        .iter()
+        .find(|(view, _, _)| view.pid() == me)
+        .expect("the admission staged the member");
+    assert_ne!(
+        admitted.0.id(),
+        view_r,
+        "the held ID is not reused while its carried row rides"
+    );
+    // The replacement generation is admitted on another ID and files
+    // exactly its own rows' claims; R stays claimless with both slots
+    // attached.
+    let fresh = engine.allocate_view_id_for_newcomer(me).unwrap();
+    assert_ne!(fresh, view_r, "allocation skips the held ID");
+    let fresh_view = ProcessView::open(fresh, me).unwrap();
+    let module_n = overlay_module(overlay_key(u64::from(fresh.0)));
+    assert_eq!(module_n.view, fresh);
+    let mut pins_n = overlay_view_pin(&module_n, 1004, OVERLAY_SHA, 4, false);
+    record_scan_ownership(&mut pins_n, fresh, module_n.key, &module_n.path);
+    let candidate = engine
+        .inventory_candidate(
+            &empty,
+            &[],
+            &[(fresh_view, vec![module_n], pins_n)],
+            Vec::new(),
+            &empty,
+        )
+        .unwrap();
+    assert!(
+        candidate
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view_r),
+        "R's carried row still rides beside the replacement generation"
+    );
+    let object_n = candidate
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == fresh)
+        .expect("the replacement generation's row rides")
+        .object;
+    assert_ne!(object_n, object, "the generations cover distinct objects");
+    let fresh_claims = candidate
+        .pinned
+        .view_claims(fresh)
+        .expect("the replacement generation files claims");
+    assert!(
+        !fresh_claims.pins.contains(&object)
+            && !fresh_claims.tables.contains(&object)
+            && !fresh_claims.targets.iter().any(|(id, _)| *id == object),
+        "the replacement generation files only its own rows' claims"
+    );
+    mo_assert_retired_claimless(&candidate.pinned, "replacement admission");
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        view_l,
+        object,
+        "replacement admission",
+    );
+    mo_assert_live_owner(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        fresh,
+        object_n,
+        "replacement admission",
+    );
+    mo_assert_carried_pin(
+        &candidate.pinned,
+        &candidate.modules,
+        &candidate.plan,
+        object,
+        false,
+        "replacement admission",
+    );
+    // Retiring the carried row frees the numeric ID for admission.
+    let mut session = ScriptedSession::default();
+    let mut outcome = super::ApplyOutcome::default();
+    let mut staled = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.retire_stale_candidate_sources(
+        &mut session,
+        &mut staled,
+        &BTreeSet::from([view_r]),
+        &mut outcome,
+    );
+    assert!(
+        staled
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != view_r),
+        "stale retirement drops the live-co-owned carried module as redundant"
+    );
+    engine.plan = staled.plan;
+    engine.pinned = staled.pinned;
+    engine.modules = staled.modules;
+    let reused = engine.allocate_view_id().unwrap();
+    assert_eq!(reused, view_r, "the retired row's ID returns to admission");
 }
 
 #[test]

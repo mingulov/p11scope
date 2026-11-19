@@ -18450,6 +18450,340 @@ fn joint_machine_rearm_gaps_publish_one_row_with_repeats() {
     );
 }
 
+/// Gap-pressure twin: the gap budget is filled past its bound
+/// before a stuck-session re-arm. The per-trip named loss is
+/// best-effort under pressure (first-N-wins retention suppresses the
+/// re-arm row with the generic counter), while the loss counts
+/// survive exactly at feed level (`history_disposed`, rendered as
+/// unattributed `record_lost` rows independent of the gap budget).
+#[test]
+fn watchdog_rearm_loss_under_a_full_gap_cap_is_counted_not_named() {
+    const ROW: &str = "gap-pressure re-arm";
+    use crate::discovery::caller_registry::{RegistryGap, DEFAULT_MAX_GAPS};
+    use crate::semantics_key_use::FeedMode;
+    let mut scene = watchdog_stuck_scene(ROW);
+    let (cap, retained_before, suppressed_before) = {
+        let coordinator = &mut scene.fixture.scene.real.scene.coordinator;
+        let cap = coordinator.registry().limits().max_gaps;
+        assert_eq!(
+            cap, DEFAULT_MAX_GAPS,
+            "{ROW}: the scene runs the default gap bound"
+        );
+        let retained = coordinator.registry().gaps().len();
+        let suppressed = coordinator.registry().gaps_suppressed();
+        // Overfill past any bound the scene already consumed: 9000
+        // distinct rows guarantee a full cap whatever staged before.
+        for n in 0..9000 {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("gap-pressure-filler-{n}"),
+                reason: format!("filler row {n}"),
+                budget: None,
+            });
+        }
+        (cap, retained, suppressed)
+    };
+    scene.fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        scene.fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    let staged_gaps = scene
+        .fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test()
+        .len();
+    // Probe soundness: applying the staged rows must not move feed
+    // state (the discard already ran at re-arm time).
+    let staged_total_before = scene.fixture.staged_total();
+    let disposed_total_before = scene.fixture.disposed_total();
+    scene
+        .fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .publish();
+    assert_eq!(
+        scene.fixture.staged_total(),
+        staged_total_before,
+        "{ROW}: the probe publish moves no staged calls"
+    );
+    assert_eq!(
+        scene.fixture.disposed_total(),
+        disposed_total_before,
+        "{ROW}: the probe publish moves no disposed history"
+    );
+    let registry = scene.fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(
+        registry.gaps().len(),
+        cap,
+        "{ROW}: the cap stays full"
+    );
+    assert_eq!(
+        registry.gaps_suppressed() - suppressed_before,
+        (retained_before + staged_gaps - cap) as u64,
+        "{ROW}: every row past the bound counts suppressed exactly"
+    );
+    assert!(
+        !registry.gaps().iter().any(|gap| gap.subject == QUANTUM_ABANDONED
+            && gap.reason.contains("stuck session")),
+        "{ROW}: the per-trip named loss does not survive a full cap"
+    );
+    // The loss counts survive exactly at feed level, where the
+    // projection renders them as unattributed `record_lost` rows.
+    let stuck = watchdog_feed_states(&scene.fixture, 0);
+    assert_eq!(stuck.len(), 1, "{ROW}: one stuck incarnation");
+    assert_eq!(
+        stuck[0].1.1, 0,
+        "{ROW}: the stuck feed empties after its counted disposal"
+    );
+    assert_eq!(
+        stuck[0].1.6 - scene.stuck_disposed,
+        scene.stuck_staged as u64,
+        "{ROW}: the stuck loss counts exactly its staged depth"
+    );
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(held.len(), 1, "{ROW}: one held incarnation");
+    assert_eq!(
+        held[0].1.1, scene.held_staged,
+        "{ROW}: the held feed keeps its staged call across recovery"
+    );
+    assert_eq!(
+        held[0].1.6, scene.held_disposed,
+        "{ROW}: the held feed disposes nothing"
+    );
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::Joint,
+        "{ROW}: the held feed stays Joint"
+    );
+    assert_eq!(held[0].1.7, None, "{ROW}: the held feed records no fence");
+}
+
+/// Gap-pressure twin, park site: the gap budget is filled past its
+/// bound before a consumer parks. The per-consumer named loss is
+/// best-effort under pressure (first-N-wins retention suppresses the
+/// park row with the generic counter), while the parked calls keep
+/// their S1 counts and land exactly in the unattributed
+/// `proof_refused_fallback` tallies (rows and tallies are independent
+/// of the gap budget) and the frame still completes with no trip and
+/// no re-arm.
+#[test]
+fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
+    const ROW: &str = "gap-pressure park";
+    use crate::discovery::caller_registry::{RegistryGap, DEFAULT_MAX_GAPS};
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    watchdog_drive_to_applied(&mut fixture);
+    let target = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+        .next()
+        .expect("one stuck target")
+        .0;
+    let failure = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .scripted_failure(
+            JournalGap::BoundNotReady,
+            target.bootstrap(),
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+    fixture.machine.pose_frame_failure_for_test(failure);
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        assert_eq!(
+            coordinator.registry().limits().max_gaps,
+            DEFAULT_MAX_GAPS,
+            "{ROW}: the scene runs the default gap bound"
+        );
+        for n in 0..9000 {
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("gap-pressure-filler-{n}"),
+                reason: format!("filler row {n}"),
+                budget: None,
+            });
+        }
+    }
+    let degraded_direct_total = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.degraded_loss_direct())
+            .sum()
+    };
+    let fallback_replayed_total = |fixture: &MachineScene| -> u64 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|record| record.feed.fallback_replayed())
+            .sum()
+    };
+    let staged_before = fixture.staged_total();
+    let disposed_before = fixture.disposed_total();
+    let degraded_before = degraded_direct_total(&fixture);
+    let replayed_before = fallback_replayed_total(&fixture);
+    let mut published = false;
+    for _ in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(JointServiceProgress::Pending) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(published, "{ROW}: the frame completes past its parked consumer");
+    assert_eq!(
+        fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{ROW}: no trip stands"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        0,
+        "{ROW}: no rearm consumed"
+    );
+    // Probe soundness: applying the staged rows must not move feed
+    // state (the park already degraded the feed during the loop).
+    let staged_after_loop = fixture.staged_total();
+    let disposed_after_loop = fixture.disposed_total();
+    let degraded_after_loop = degraded_direct_total(&fixture);
+    let cap = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .limits()
+        .max_gaps;
+    let retained_probe = fixture.scene.real.scene.coordinator.registry().gaps().len();
+    let suppressed_probe = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps_suppressed();
+    let staged_probe = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test()
+        .len();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .publish();
+    assert_eq!(
+        fixture.staged_total(),
+        staged_after_loop,
+        "{ROW}: the probe publish moves no staged calls"
+    );
+    assert_eq!(
+        fixture.disposed_total(),
+        disposed_after_loop,
+        "{ROW}: the probe publish moves no disposed history"
+    );
+    assert_eq!(
+        degraded_direct_total(&fixture),
+        degraded_after_loop,
+        "{ROW}: the probe publish moves no degraded loss"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(registry.gaps().len(), cap, "{ROW}: the cap stays full");
+    assert_eq!(
+        registry.gaps_suppressed() - suppressed_probe,
+        (retained_probe + staged_probe - cap) as u64,
+        "{ROW}: every row past the bound counts suppressed exactly"
+    );
+    assert!(
+        !registry
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "joint stuck consumer parked"),
+        "{ROW}: the per-consumer named loss does not survive a full cap"
+    );
+    // The forced fallback replays every staged head S1-direct: the
+    // calls keep their S1 counts and land in the unattributed
+    // `proof_refused_fallback` tallies (no per-key row can be proved),
+    // while no head is disposed or degraded-lost.
+    assert_eq!(staged_after_loop, 0, "{ROW}: the parked feed stages nothing after");
+    assert_eq!(
+        fallback_replayed_total(&fixture) - replayed_before,
+        staged_before as u64,
+        "{ROW}: the fallback replays exactly the parked depth S1-direct"
+    );
+    assert_eq!(
+        disposed_after_loop - disposed_before,
+        0,
+        "{ROW}: the fallback disposes nothing"
+    );
+    assert_eq!(
+        degraded_after_loop - degraded_before,
+        0,
+        "{ROW}: the fallback degrades nothing as loss"
+    );
+    let feed = watchdog_feed_states(&fixture, 0);
+    assert_eq!(feed.len(), 1, "{ROW}: one stuck incarnation");
+    assert_ne!(
+        feed[0].1.0,
+        FeedMode::Joint,
+        "{ROW}: the parked feed leaves Joint"
+    );
+}
+
 /// Audit twin: the recovery past a re-arm audits again without an
 /// audit refusal. The latched quantum's audit passed before the native
 /// refusal, the re-arm notes itself, and the recovery quantum audits

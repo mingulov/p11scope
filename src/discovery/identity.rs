@@ -11116,6 +11116,12 @@ fn pin_scanned_object(
                 // views keep refusing (fail closed where forgery evidence
                 // is possible).
                 Err(PinFailure::Gone { reason })
+            } else if crate::discovery::scan::names_capture_budget_stop(&reason) {
+                // Budget pressure is transient resource exhaustion, like
+                // handle exhaustion — never file evidence. Wait for a
+                // fresh budget instead of rejecting the key, so a
+                // starved tick cannot nuke every live view's coverage.
+                Err(PinFailure::Wait { reason })
             } else {
                 Err(PinFailure::Refused(reason))
             }

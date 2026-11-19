@@ -177,24 +177,22 @@ versioned separately and are opaque, exact dispatch keys.
   held in the established exit retention instead of closing in the
   teardown drop.
 - Fold planning sizes every caller's edges and count-ownership
-  summaries once per pass through the shared stop-checked stride,
-  reserves the work before mutating, and stages a caller costlier
-  than a whole credit window across passes, publishing only its
-  completed fold.
+  summaries once per pass through the shared stop-checked stride and
+  reserves the work before mutating, keeping every fold atomic.
 - Terminal certification paces the caller-ID copy, the membership
   reads, the identity build with its path scan, and the carry stage
   through the shared stop-checked stride, committing the carry
   wholesale once it is complete; every declared module match costs
   a planning unit even against an empty module table.
-- Oversized caller folds rehearse their member lists read-only across
-  passes and publish each completed fold as one coherent revision, so
-  a paused fold never exposes partially folded edges, aggregates or
-  receipts and a stop between slices keeps the last coherent view; a
-  stage whose members or certification changed underneath cancels and
-  restages from current truth. Fold commits read every member exactly
-  once from the stop-paced per-pass index, matching the admitted cost,
-  and every staged mutation entry and the publication gate itself
-  check the live stop signal.
+- A caller costlier than a whole fold window stays live and unfolded
+  with its data kept instead of folding past the budget: no window
+  can reserve it, so each pass leaves it carried under a counted
+  `fold deferred: caller exceeds one pass's fold budget` gap while
+  fitting siblings fold around it. Fold commits read every member
+  exactly once from the stop-paced per-pass index, matching the
+  admitted cost, and each touched module's departed identity lands
+  inside that same member traversal, so no separate module pass runs
+  uncharged.
 
 ## [0.7.1] - 2026-11-17
 

@@ -487,6 +487,12 @@ pub(super) struct CountOwnership {
     stale_index: Option<MembershipIndex>,
     summaries: BTreeMap<(CallerId, u32), CandidateSummary>,
     summary_after: Option<(CallerId, u32)>,
+    /// Count-ownership summaries touched while folding (test count):
+    /// every per-summary pass of the commit counts, so the admitted
+    /// preflight (one unit per summary) holds only when each clears
+    /// once.
+    #[cfg(test)]
+    summary_fold_visits: u64,
 }
 impl CountOwnership {
     pub(super) fn new(limits: RegistryLimits) -> Self {
@@ -502,6 +508,8 @@ impl CountOwnership {
             stale_index: None,
             summaries: BTreeMap::new(),
             summary_after: None,
+            #[cfg(test)]
+            summary_fold_visits: 0,
         }
     }
     pub(super) fn begin_catalog_pass(&mut self) {
@@ -648,7 +656,15 @@ impl CountOwnership {
             .range((Included((caller, 0)), Included((caller, u32::MAX))))
             .map(|(&key, _)| key)
             .collect();
+        #[cfg(test)]
+        {
+            self.summary_fold_visits = self.summary_fold_visits.saturating_add(keys.len() as u64);
+        }
         for key in keys {
+            #[cfg(test)]
+            {
+                self.summary_fold_visits = self.summary_fold_visits.saturating_add(1);
+            }
             self.summaries.remove(&key);
         }
     }
@@ -662,6 +678,10 @@ impl CountOwnership {
     }
     /// Remove one staged summary by key.
     pub(super) fn remove_summary(&mut self, key: &(CallerId, u32)) {
+        #[cfg(test)]
+        {
+            self.summary_fold_visits = self.summary_fold_visits.saturating_add(1);
+        }
         self.summaries.remove(key);
     }
     /// Every retained `(caller, object)` summary key, for the fold's
@@ -689,6 +709,12 @@ impl CountOwnership {
         }
         Some(keys)
     }
+    /// Test-only: count-ownership summaries touched while folding.
+    #[cfg(test)]
+    pub(super) fn summary_fold_visits_for_test(&self) -> u64 {
+        self.summary_fold_visits
+    }
+
     /// Test-only: count-ownership summaries retained for one caller.
     #[cfg(test)]
     pub(super) fn summary_count_for_test(&self, caller: CallerId) -> usize {

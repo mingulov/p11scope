@@ -753,6 +753,9 @@ pub(crate) struct NativeBinder {
     /// Cookie sequences examined by retired-caller releases (test count).
     #[cfg(test)]
     release_cookie_visits: u64,
+    /// Cookie sequences cleared by caller folds (test count).
+    #[cfg(test)]
+    fold_sequence_visits: u64,
 }
 
 impl NativeBinder {
@@ -774,6 +777,8 @@ impl NativeBinder {
             release_pending_visits: 0,
             #[cfg(test)]
             release_cookie_visits: 0,
+            #[cfg(test)]
+            fold_sequence_visits: 0,
         }
     }
 
@@ -1143,6 +1148,10 @@ impl NativeBinder {
         keys: &[(usize, DomainCookie, u64)],
     ) {
         for (index, cookie, exec) in keys {
+            #[cfg(test)]
+            {
+                self.fold_sequence_visits = self.fold_sequence_visits.saturating_add(1);
+            }
             let cleared = self.domains[*index]
                 .cookies
                 .get_mut(cookie)
@@ -1169,6 +1178,12 @@ impl NativeBinder {
     #[cfg(test)]
     pub(crate) fn release_cookie_visits_for_test(&self) -> u64 {
         self.release_cookie_visits
+    }
+
+    /// Test-only: cookie sequences cleared by caller folds.
+    #[cfg(test)]
+    pub(crate) fn fold_sequence_visits_for_test(&self) -> u64 {
+        self.fold_sequence_visits
     }
 
     /// Test-only: stage one cookie sequence bound to `bound` (or

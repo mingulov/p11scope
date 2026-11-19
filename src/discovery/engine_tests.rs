@@ -95811,6 +95811,10 @@ fn mo_shared_pin_parts() -> MoSharedPin {
     let object_l = pins.id_for_scanned(&module_l, key, &module_l.path);
     assert_eq!(object_r, object_l, "both views resolve one canonical pin");
     let object = object_r.expect("the shared pin resolves");
+    // Strict-bind evidence: the synthetic entries use fake offsets no
+    // real ELF proves, so backfill function-start proof for the rebuild
+    // choke (which binds strictly); claim authority is unaffected.
+    pins.prove_scanned_entries_for_test(&[module_r.clone(), module_l.clone()]);
     MoSharedPin {
         module_r,
         module_l,
@@ -95842,6 +95846,8 @@ fn mo_sole_pin_parts() -> MoSolePin {
         .id_for_scanned(&module_b, module_b.key, &module_b.path)
         .expect("B's pin resolves");
     assert_ne!(object_r, object_b, "sole pins stay distinct objects");
+    // Strict-bind evidence, as in the shared-pin parts above.
+    pins.prove_scanned_entries_for_test(&[module_r.clone(), module_b.clone()]);
     MoSolePin {
         module_r,
         module_b,
@@ -96386,6 +96392,8 @@ fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
     assert_eq!(module_n.view, fresh);
     let mut pins_n = overlay_view_pin(&module_n, 1004, OVERLAY_SHA, 4, false);
     record_scan_ownership(&mut pins_n, fresh, module_n.key, &module_n.path);
+    // Strict-bind evidence for the rebuild choke (see the shared-pin parts).
+    pins_n.prove_scanned_entries_for_test(std::slice::from_ref(&module_n));
     let candidate = engine
         .inventory_candidate(
             &empty,
@@ -98537,6 +98545,8 @@ fn mo_merge_engine(
     let committed = mo_merge_module(view, key, path, tables, interfaces);
     let mut pins = overlay_view_pin(&committed, 999, OVERLAY_SHA, 1, false);
     record_scan_ownership(&mut pins, view, key, path);
+    // Strict-bind evidence for the rebuild choke (see the shared-pin parts).
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&committed));
     let (bound, skipped) = bind_scanned_modules(std::slice::from_ref(&committed), &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(bound.len(), 1);
@@ -98558,6 +98568,8 @@ fn mo_merge_engine(
 fn mo_refresh_pins(module: &ScannedModule, mount_id: u64) -> PinnedObjects {
     let mut pins = overlay_view_pin(module, mount_id, OVERLAY_SHA, 1, false);
     record_scan_ownership(&mut pins, module.view, module.key, &module.path);
+    // Strict-bind evidence for the rebuild choke (see the shared-pin parts).
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(module));
     pins
 }
 
@@ -98691,6 +98703,8 @@ fn merge_ownership_e1_repeated_refresh_coalesces_history() {
 fn mo_apply_lowered(engine: &mut Engine, lowered: &ScannedModule, mount_id: u64) {
     let mut pins = overlay_view_pin(lowered, mount_id, OVERLAY_SHA, 1, false);
     record_scan_ownership(&mut pins, lowered.view, lowered.key, &lowered.path);
+    // Strict-bind evidence for the rebuild choke (see the shared-pin parts).
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(lowered));
     let mut session = ScriptedSession::with_records([], 0);
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();

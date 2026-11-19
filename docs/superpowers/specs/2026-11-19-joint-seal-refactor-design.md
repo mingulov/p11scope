@@ -75,10 +75,11 @@ Goals:
 - G2. One owner for the watchdog: `LiveJointMachine` owns trip latch,
   stuck-set derivation, park, scoped recovery, re-arm gate and
   disclosure as one lifecycle.
-- G3. Recovery is bounded: per-session discard by bulk free with a
-  counted named gap (no per-head work), O(1) bookkeeping per affected
-  feed. Any future per-head preservation goes through 64-unit strided
-  cursors charged to the machine budget.
+- G3. Recovery is bounded: per-session discard by pure disposal with
+  a counted named gap (no per-head reduction or preservation;
+  per-head ledger custody release is memory-only), O(1) bookkeeping
+  per affected feed. Any future per-head preservation goes through
+  64-unit strided cursors charged to the machine budget.
 - G4. The birth funnel never stalls behind a stuck member: parked
   consumers no longer pin the cursor; births for healthy members flow
   past them; any member without progress across the watchdog bound is
@@ -222,18 +223,19 @@ survive the scoped wipe, so healthy destroys match and never taint.
 
 ### 3.5 Bounded recovery: per-session discard with a counted named gap
 
-Scoped recovery discards the stuck set's staged queues by bulk free:
-no reduction, no replay, no per-head ledger contact. Per feed: O(1)
-bookkeeping (depth read once, frontier jump, disposed-history count)
-plus the queue's bulk free; one bulk ledger release for the stuck
-set's staged charges (new, mirroring the existing `release_all_h8open`
-shape). Under INV-2 as amended by the owner (2026-11-13), a
-memory-only bulk free bounded by product limits is not a finding, so
-the 64-unit bound holds at any staged depth. Each feed's depth counts
-as disposed history; the re-arm gap names the discarded total, the
-stuck feed count and the per-key-unknown attribution. Live reducers,
-S1 counts and minted associations are untouched; feed modes still
-fall back on the fenced void delivery.
+Scoped recovery discards the stuck set's staged queues by pure
+disposal: no reduction, no replay, no per-head preservation. Per
+feed: O(1) bookkeeping (depth read once, frontier jump,
+disposed-history count) plus the queue's bulk free, with per-head
+memory-only ledger custody release for the stuck set's staged
+charges (the same primitive as the pre-existing stream-void path,
+not a new bulk primitive). Under INV-2 as amended by the owner
+(2026-11-13), memory-only frees bounded by product limits are not a
+finding, so the 64-unit bound holds at any staged depth. Each feed's
+depth counts as disposed history; the re-arm gap names the discarded
+total, the stuck feed count and the per-key-unknown attribution. Live
+reducers, S1 counts and minted associations are untouched; feed modes
+still fall back on the fenced void delivery.
 
 Contract for the future: if per-head preservation ever returns, it
 goes through explicit feed/payload/domain cursors in 64-unit strides
@@ -317,8 +319,11 @@ recovery.
   slot that survives a full cap needs an owner retention-policy
   ruling; until then the gap-pressure twins pin this fallback
   contract.
-- No new gap identity fields: caller/module/PID stay `None` on these
-  gaps, as today. No schema, wire or JSON shape change.
+- No new gap identity fields: the park gap carries caller
+  attribution (a capture-local `cN` id, as recorded at the forced
+  fallback); the re-arm gap stays unattributed (caller/module/PID
+  `None`, as today). No schema, wire or JSON shape change (the
+  fields pre-exist).
 
 ## 6. Privacy
 

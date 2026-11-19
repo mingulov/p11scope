@@ -23100,7 +23100,8 @@ fn key_operation_pending_key_h3_loss_degrades_view_per_key() {
     );
     let degraded = commit(34, &[&staging], &projected, &keyuse);
     assert_eq!(
-        degraded.status, ObsStatus::Partial,
+        degraded.status,
+        ObsStatus::Partial,
         "one pending key's loss degrades the view, never voids it to unavailable"
     );
     assert_eq!(degraded.reason, "authority_lost");

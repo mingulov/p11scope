@@ -6697,6 +6697,32 @@ impl JournalAdapter {
                 effects
                     .effects
                     .extend(self.fence_void(model, self.consumed_through).effects);
+                if gap == JournalGap::H3Loss {
+                    // Pending keys never sealed, so the fence above
+                    // fenced them without a model gap (unregistered).
+                    // Record one OutcomeLost per pending key here, so
+                    // the loss degrades per key with a named gap
+                    // instead of voiding the whole view silently. The
+                    // global fence and wipe still hold for safety.
+                    let pending: Vec<(JournalDomainKey, u64)> = self
+                        .keys
+                        .iter()
+                        .filter(|(_, state)| state.bootstraps.is_empty())
+                        .map(|(key, state)| (*key, state.era))
+                        .collect();
+                    for (key, era) in pending {
+                        let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
+                        let _ = model.register_domain(domain);
+                        let lost = model.outcome_lost(
+                            super::LostOutcome::Voided(
+                                domain,
+                                RefCut::sealed(ConsumptionOrdinal(self.consumed_through)),
+                            ),
+                            &mut self.ledger,
+                        );
+                        effects.effects.extend(lost.effects);
+                    }
+                }
                 // Keyrows B1: the failure records the void's fence, so
                 // the feed it closes refuses below-fence receipts.
                 fence = Some(self.consumed_through);

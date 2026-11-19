@@ -16838,6 +16838,781 @@ fn joint_machine_sparse_rearms_over_a_long_run_never_stop() {
     fixture.assert_recovers("after sparse re-arms", 2 + rounds as u64);
 }
 
+/// Recovery entry points for the per-session watchdog table (§4 of the
+/// seal-refactor design): every path that can reach joint recovery or
+/// void. One table-driven test drives all rows; each row names its
+/// entry point in every assert. Rows E1–E3 and E6–E8 pin localized
+/// recovery (RED until the refactor lands); rows E4–E5 pin terminal
+/// behavior that must NOT change (guard rows, green throughout).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WatchdogRecoveryEntry {
+    /// E1: a running transient re-arm degrades only the stuck session.
+    TransientRearm,
+    /// E2: a running audit trip re-arms with the same scoped recovery.
+    AuditTripRearm,
+    /// E3: the Idle void consumes a watchdog break without re-widening.
+    IdleScopedVoid,
+    /// E4 guard: the exit hold keeps full terminal abandon.
+    ExitHoldAbandon,
+    /// E5 guard: a finish trip still refuses re-arm.
+    FinishTripRefusal,
+    /// E6: the seal cursor advances past a parked stuck consumer, and
+    /// the stuck loss is attributed exactly to the stuck consumer.
+    SealCursorPark,
+    /// E7: a late birth flows past a stuck member and seals exact.
+    BirthFunnelPastStuck,
+    /// E8: scoped recovery discards by bulk free with a counted gap —
+    /// no per-head preservation work at any staged depth.
+    BoundedBulkDiscard,
+}
+
+/// One feed's observable recovery state: mode, staged depth, reduced
+/// rows, fallback replays, fell-back flag, degraded loss, disposed
+/// history, segment fence.
+type WatchdogFeedState = (
+    crate::semantics_key_use::FeedMode,
+    usize,
+    u64,
+    u64,
+    bool,
+    bool,
+    u64,
+    Option<u64>,
+);
+
+/// Every H9 feed on one provider file with its caller: multi-caller
+/// files (stuck + newcomer sharing a module) need per-caller states,
+/// not the single-incarnation assumption.
+fn watchdog_feed_states(
+    fixture: &MachineScene,
+    file: usize,
+) -> Vec<(
+    crate::discovery::caller_registry::CallerId,
+    WatchdogFeedState,
+)> {
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let module = registry
+        .modules()
+        .find(|module| module.key == fixture.scene.real.modules[file].0)
+        .unwrap()
+        .id;
+    registry
+        .instance_semantic_edges()
+        .filter(|record| record.module == module)
+        .map(|record| {
+            let feed = &record.feed;
+            (
+                record.caller,
+                (
+                    feed.mode(),
+                    feed.staged_len(),
+                    feed.reduced(),
+                    feed.fallback_replayed(),
+                    feed.fell_back(),
+                    feed.degraded_loss(),
+                    feed.history_disposed(),
+                    feed.segment_fence_for_test(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Every scope gap on the scene, staged or published: scope gaps
+/// stage separately and flush at commit, so one probe must read both
+/// tables whatever the row's publish state.
+fn watchdog_scope_gaps(fixture: &MachineScene) -> Vec<(String, String)> {
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut gaps: Vec<(String, String)> = registry.staged_scope_gaps_for_test();
+    gaps.extend(
+        registry
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone())),
+    );
+    gaps
+}
+
+/// The re-arm gap reasons on the scene (`QUANTUM_ABANDONED` subject):
+/// the named loss the recovery counts.
+fn watchdog_rearm_gap_reasons(fixture: &MachineScene) -> Vec<String> {
+    watchdog_scope_gaps(fixture)
+        .into_iter()
+        .filter(|(subject, _)| subject == QUANTUM_ABANDONED)
+        .map(|(_, reason)| reason)
+        .collect()
+}
+
+/// Drive one bound commit to applied with nonzero staged work and a
+/// still-pending unfinished publication: the real pre-recovery shape.
+fn watchdog_drive_to_applied(fixture: &mut MachineScene) {
+    use crate::inventory_semantics::JointServiceProgress;
+    fixture.machine.begin_commit(true).unwrap();
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(
+        applied,
+        "the stuck quantum applies before recovery is posed"
+    );
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "the unfinished publication still pends"
+    );
+}
+
+/// Pose a genuine running audit stall and trip the wall-time bound.
+fn watchdog_pose_audit_trip(fixture: &mut MachineScene) {
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    fixture.machine.pose_no_progress_poll_for_test(true);
+    assert!(fixture.service(1024).is_ok(), "the posed stall pends");
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the over-bound stall trips"
+    );
+    assert!(
+        fixture.machine.audit_no_progress_trip_for_test().is_some(),
+        "the trip records its cause"
+    );
+    fixture.machine.pose_no_progress_poll_for_test(false);
+}
+
+/// The shared multi-session pre-recovery scene: stuck A (own pid,
+/// file 0, one call held open plus an applied quantum) and held B
+/// (own pid, file 1, one complete call staged behind A's open call).
+/// A's END bytes are retained so rows can terminate the stuck call
+/// after recovery and watch B seal. Newcomers bind post-recovery on
+/// file 0 through caller admission (the proven newcomer shape).
+struct WatchdogStuckScene {
+    fixture: MachineScene,
+    end_a: Vec<u8>,
+    stuck_staged: usize,
+    stuck_disposed: u64,
+    held_staged: usize,
+    held_disposed: u64,
+}
+
+/// Build the multi-session scene through the applied stuck quantum,
+/// recording every baseline the scoped-recovery asserts compare.
+fn watchdog_stuck_scene(row: &str) -> WatchdogStuckScene {
+    use crate::semantics_key_use::FeedMode;
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let pid = std::process::id();
+    // A stays running (BEGIN-only) while B completes one call; the
+    // prefix publishes with B staged behind A.
+    let (begin_a, end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.published_labeled("watchdog-held-prefix", None);
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(held.len(), 1, "{row}: one held incarnation on file 1");
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::Joint,
+        "{row}: the held call stays on a Joint feed"
+    );
+    assert_eq!(
+        held[0].1.1, 1,
+        "{row}: the held call stays staged while its seal waits"
+    );
+    assert_eq!(held[0].1.6, 0, "{row}: nothing disposed yet");
+    assert_eq!(held[0].1.7, None, "{row}: no fence yet");
+    // Stuck A's quantum on file 0: drive the real commit to applied
+    // with nonzero staged work.
+    fixture.scene.push(pid, 0, "C_SignInit", 5);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 6);
+    fixture.scene.push(pid, 0, "C_SignFinal", 7);
+    watchdog_drive_to_applied(&mut fixture);
+    let stuck = watchdog_feed_states(&fixture, 0);
+    assert_eq!(stuck.len(), 1, "{row}: one stuck incarnation");
+    let (stuck_staged, stuck_disposed) = (stuck[0].1.1, stuck[0].1.6);
+    let held_staged = watchdog_feed_states(&fixture, 1)[0].1.1;
+    let held_disposed = watchdog_feed_states(&fixture, 1)[0].1.6;
+    assert!(
+        stuck_staged > 0,
+        "{row}: the stuck quantum stages its calls before recovery"
+    );
+    assert_eq!(
+        held_staged, 1,
+        "{row}: the held call is still staged at recovery"
+    );
+    WatchdogStuckScene {
+        fixture,
+        end_a: end_a.to_vec(),
+        stuck_staged,
+        stuck_disposed,
+        held_staged,
+        held_disposed,
+    }
+}
+
+/// Pin the scoped-recovery end state: the stuck feed empties with
+/// its loss counted exactly, the held feed keeps staged proof, mode
+/// and fence state, and the named gap counts the stuck session's
+/// discard.
+fn watchdog_assert_scoped_recovery(scene: &WatchdogStuckScene, row: &str) {
+    use crate::semantics_key_use::FeedMode;
+    let fixture = &scene.fixture;
+    let stuck = watchdog_feed_states(fixture, 0);
+    assert_eq!(stuck.len(), 1, "{row}: one stuck incarnation");
+    assert_eq!(
+        stuck[0].1.1, 0,
+        "{row}: the stuck feed empties after its counted disposal"
+    );
+    assert_eq!(
+        stuck[0].1.6 - scene.stuck_disposed,
+        scene.stuck_staged as u64,
+        "{row}: the stuck loss counts exactly its staged depth"
+    );
+    let held = watchdog_feed_states(fixture, 1);
+    assert_eq!(held.len(), 1, "{row}: one held incarnation");
+    assert_eq!(
+        held[0].1.1, scene.held_staged,
+        "{row}: the held feed keeps its staged call across recovery"
+    );
+    assert_eq!(
+        held[0].1.6, scene.held_disposed,
+        "{row}: the held feed disposes nothing"
+    );
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::Joint,
+        "{row}: the held feed stays Joint"
+    );
+    assert_eq!(held[0].1.7, None, "{row}: the held feed records no fence");
+    let reasons = watchdog_rearm_gap_reasons(fixture);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("stuck session")),
+        "{row}: the re-arm gap names the stuck session's loss: {reasons:?}"
+    );
+}
+
+/// Pin post-recovery joining: a new caller admitted after recovery
+/// seals exact on the stuck file, the stuck call terminates, the held
+/// call seals (staged drains with nothing disposed, no fallback, no
+/// fence), and the lane stays live with no new trip.
+fn watchdog_assert_post_recovery_joins(scene: &mut WatchdogStuckScene, row: &str) {
+    use crate::semantics_key_use::FeedMode;
+    let _child = OwnedStoppedChild::new();
+    let new_pid = _child.id();
+    let new_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    let new_caller = scene.fixture.scene.real.bind(new_pid, new_image, 0);
+    scene.fixture.scene.push(new_pid, 0, "C_CreateObject", 100);
+    scene
+        .fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(scene.end_a.clone());
+    assert!(
+        scene.fixture.machine.begin_commit(false).is_ok(),
+        "{row}: the recovered lane accepts the next commit"
+    );
+    scene
+        .fixture
+        .published_labeled("watchdog-post-recovery", None);
+    let file0 = watchdog_feed_states(&scene.fixture, 0);
+    let newcomer = file0
+        .iter()
+        .find(|(caller, _)| *caller == new_caller)
+        .unwrap_or_else(|| panic!("{row}: the newcomer holds a feed on file 0"));
+    assert_eq!(
+        newcomer.1.2, 1,
+        "{row}: the newcomer's post-recovery call seals exact"
+    );
+    assert_eq!(
+        newcomer.1.0,
+        FeedMode::Joint,
+        "{row}: the newcomer stays Joint"
+    );
+    assert_eq!(newcomer.1.7, None, "{row}: the newcomer records no fence");
+    // The held head must reduce: staging drains while disposed stays
+    // flat, with no fallback, no degraded loss and no fence.
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(held[0].1.1, 0, "{row}: the held call seals after recovery");
+    assert_eq!(
+        held[0].1.6, scene.held_disposed,
+        "{row}: the held seal disposes nothing"
+    );
+    assert_eq!(
+        held[0].1.0,
+        FeedMode::Joint,
+        "{row}: the held feed stays Joint"
+    );
+    assert!(!held[0].1.4, "{row}: the held feed never falls back");
+    assert!(!held[0].1.5, "{row}: the held feed counts no degraded loss");
+    assert_eq!(held[0].1.7, None, "{row}: the held feed records no fence");
+    assert!(
+        scene.fixture.machine.disposition_reason().is_none(),
+        "{row}: the recovered lane never latches"
+    );
+    assert_eq!(
+        scene.fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{row}: no new trip stands after healthy work"
+    );
+    drop(_child);
+}
+
+/// E1: a running transient re-arm degrades and counts only the stuck
+/// session; the held session keeps staged proof, mode and fence
+/// state and seals exact once the stuck call ends, and new callers
+/// join.
+fn watchdog_entry_transient_rearm() {
+    const ROW: &str = "E1 transient re-arm";
+    let mut scene = watchdog_stuck_scene(ROW);
+    scene.fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        scene.fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    watchdog_assert_post_recovery_joins(&mut scene, ROW);
+}
+
+/// E2: a running audit trip re-arms with the same scoped recovery:
+/// the trip clears, only the stuck session degrades, and the lane
+/// continues for healthy and new callers.
+fn watchdog_entry_audit_trip_rearm() {
+    const ROW: &str = "E2 audit-trip re-arm";
+    let mut scene = watchdog_stuck_scene(ROW);
+    watchdog_pose_audit_trip(&mut scene.fixture);
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the tripped quantum re-arms as published"
+    );
+    assert_eq!(
+        scene.fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{ROW}: the re-arm consumes the trip"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    watchdog_assert_post_recovery_joins(&mut scene, ROW);
+}
+
+/// E8: scoped recovery discards by bulk free with a counted gap —
+/// a 25-operation stuck quantum disposes exactly its depth with no
+/// per-head preservation work (preservation is per-head reduction;
+/// discard does none) at any staged depth.
+fn watchdog_entry_bounded_bulk_discard() {
+    const ROW: &str = "E8 bounded bulk discard";
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    // Twenty-five full sign operations (75 heads, past one
+    // 64-unit credit): each preserves one unknown-key completion
+    // under per-head disposal, so the no-preservation assert below
+    // pins the absence of per-head work.
+    for op in 0..25 {
+        let seq = 2 + op as u64 * 3;
+        fixture.scene.push(pid, 0, "C_SignInit", seq);
+        fixture.scene.push(pid, 0, "C_SignUpdate", seq + 1);
+        fixture.scene.push(pid, 0, "C_SignFinal", seq + 2);
+    }
+    fixture.machine.begin_commit(true).unwrap();
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..2048 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "{ROW}: the 25-operation quantum applies");
+    let staged_before = fixture.staged_total();
+    assert!(
+        staged_before > 64,
+        "{ROW}: the stuck quantum stages more than one credit: {staged_before}"
+    );
+    let disposed_before = fixture.disposed_total();
+    let unknown_before = fixture.unknown_terminals();
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    assert_eq!(
+        fixture.staged_total(),
+        0,
+        "{ROW}: the discard empties staging"
+    );
+    assert_eq!(
+        fixture.disposed_total() - disposed_before,
+        staged_before as u64,
+        "{ROW}: disposed history rises by exactly the staged depth"
+    );
+    let unknown_after = fixture.unknown_terminals();
+    assert_eq!(
+        (
+            unknown_after[0] - unknown_before[0],
+            unknown_after[1] - unknown_before[1],
+            unknown_after[2] - unknown_before[2],
+            unknown_after[3] - unknown_before[3],
+        ),
+        (0, 0, 0, 0),
+        "{ROW}: bulk discard preserves no per-head completions"
+    );
+    let reasons = watchdog_rearm_gap_reasons(&fixture);
+    assert!(
+        reasons
+            .iter()
+            .any(|reason| reason.contains("stuck session") && reason.contains("discarded")),
+        "{ROW}: the re-arm gap counts the stuck session's discard: {reasons:?}"
+    );
+}
+
+/// E3: the Idle void consumes a watchdog break without re-widening —
+/// the void runs (its gap lands) while the held session keeps staged
+/// proof, mode and fence state and seals exact.
+fn watchdog_entry_idle_scoped_void() {
+    const ROW: &str = "E3 idle scoped void";
+    let mut scene = watchdog_stuck_scene(ROW);
+    scene.fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        scene.fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    // The next Idle collect consumes the recorded break: the void
+    // runs exactly once, scoped to the stuck session, while the
+    // stuck call terminates and the held call seals.
+    scene
+        .fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(scene.end_a.clone());
+    assert!(
+        scene.fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the recovered lane accepts the next commit"
+    );
+    scene.fixture.published_labeled("watchdog-post-void", None);
+    let voids: Vec<String> = watchdog_scope_gaps(&scene.fixture)
+        .into_iter()
+        .filter(|(subject, reason)| {
+            subject == crate::inventory_present::JOINT_RETAINED_S1_SUBJECT
+                && reason.contains("joint_void_")
+        })
+        .map(|(_, reason)| reason)
+        .collect();
+    assert!(
+        !voids.is_empty(),
+        "{ROW}: the Idle void ran and named its loss"
+    );
+    let held = watchdog_feed_states(&scene.fixture, 1);
+    assert_eq!(
+        held[0].1.1, 0,
+        "{ROW}: the held call seals past the Idle void"
+    );
+    assert_eq!(
+        held[0].1.6, scene.held_disposed,
+        "{ROW}: the held seal disposes nothing"
+    );
+    assert_eq!(held[0].1.7, None, "{ROW}: the held feed records no fence");
+}
+
+/// E6: the stuck loss is attributed exactly to the stuck consumer —
+/// the lane-wide disposed total rises by exactly the stuck depth, so
+/// no healthy head is swept into the stuck count.
+fn watchdog_entry_seal_cursor_park() {
+    const ROW: &str = "E6 seal cursor park";
+    let mut scene = watchdog_stuck_scene(ROW);
+    scene.fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        scene.fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    let disposed_before = scene.fixture.disposed_total();
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms as published"
+    );
+    assert_eq!(
+        scene.fixture.disposed_total() - disposed_before,
+        scene.stuck_staged as u64,
+        "{ROW}: the lane-wide disposed total counts exactly the stuck depth"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    watchdog_assert_post_recovery_joins(&mut scene, ROW);
+}
+
+/// E7: a late birth flows past a stuck member — a caller admitted
+/// after the trip binds, births and seals one exact call while the
+/// stuck call stays open and the lane never stops.
+fn watchdog_entry_birth_funnel_past_stuck() {
+    const ROW: &str = "E7 birth funnel past stuck";
+    use crate::semantics_key_use::FeedMode;
+    let mut scene = watchdog_stuck_scene(ROW);
+    watchdog_pose_audit_trip(&mut scene.fixture);
+    assert_eq!(
+        scene.fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the tripped quantum re-arms as published"
+    );
+    watchdog_assert_scoped_recovery(&scene, ROW);
+    let _hchild = OwnedStoppedChild::new();
+    let h_pid = _hchild.id();
+    let h_image = ImageIdentity {
+        task_cookie: 77,
+        exec_id: 0,
+    };
+    let h_caller = scene.fixture.scene.real.bind(h_pid, h_image, 0);
+    scene.fixture.scene.push(h_pid, 0, "C_CreateObject", 200);
+    assert!(
+        scene.fixture.machine.begin_commit(false).is_ok(),
+        "{ROW}: the recovered lane accepts the late birth's commit"
+    );
+    scene.fixture.published_labeled("watchdog-late-birth", None);
+    let file0 = watchdog_feed_states(&scene.fixture, 0);
+    let late = file0
+        .iter()
+        .find(|(caller, _)| *caller == h_caller)
+        .unwrap_or_else(|| panic!("{ROW}: the late caller holds a feed on file 0"));
+    assert_eq!(late.1.2, 1, "{ROW}: the late birth seals one exact call");
+    assert_eq!(
+        late.1.1, 0,
+        "{ROW}: the late feed stages nothing after its seal"
+    );
+    assert_eq!(
+        late.1.0,
+        FeedMode::Joint,
+        "{ROW}: the late feed stays Joint"
+    );
+    assert!(!late.1.4, "{ROW}: the late feed never falls back");
+    assert!(!late.1.5, "{ROW}: the late feed counts no degraded loss");
+    assert_eq!(late.1.7, None, "{ROW}: the late feed records no fence");
+    assert!(
+        scene.fixture.machine.disposition_reason().is_none(),
+        "{ROW}: the lane never latches past the stuck member"
+    );
+    drop(_hchild);
+}
+
+/// E4 guard: the exit hold keeps full terminal abandon — the
+/// standing publication clears with its named gap, the frame is
+/// consumed exactly once, and a second abandon with nothing pending
+/// is a quiet no-op. The refactor must not narrow terminal behavior.
+fn watchdog_entry_exit_hold_abandon() {
+    const ROW: &str = "E4 exit-hold abandon";
+    let mut scene = watchdog_stuck_scene(ROW);
+    assert!(
+        scene
+            .fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .publication_pending(),
+        "{ROW}: the unfinished publication stands before the hold"
+    );
+    let frame = scene.fixture.machine.take_abandoned_frame();
+    assert!(
+        frame.is_some(),
+        "{ROW}: the Audited phase retains its frame"
+    );
+    {
+        let real = &mut scene.fixture.scene.real;
+        real.scene.coordinator.abandon_unfinished_joint_publication(
+            &mut real.lane,
+            frame,
+            "test abandon".to_string(),
+        );
+    }
+    assert!(
+        !scene
+            .fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .publication_pending(),
+        "{ROW}: the hold's abandon clears the publication"
+    );
+    let abandoned: Vec<String> = watchdog_scope_gaps(&scene.fixture)
+        .into_iter()
+        .filter(|(subject, _)| subject == "unfinished joint publication abandoned")
+        .map(|(_, reason)| reason)
+        .collect();
+    assert_eq!(
+        abandoned.len(),
+        1,
+        "{ROW}: the abandon stages exactly its named gap"
+    );
+    assert!(
+        scene.fixture.machine.take_abandoned_frame().is_none(),
+        "{ROW}: the frame is consumed exactly once"
+    );
+    let gaps_before = watchdog_scope_gaps(&scene.fixture).len();
+    {
+        let real = &mut scene.fixture.scene.real;
+        real.scene.coordinator.abandon_unfinished_joint_publication(
+            &mut real.lane,
+            None,
+            "test abandon".to_string(),
+        );
+    }
+    assert_eq!(
+        watchdog_scope_gaps(&scene.fixture).len(),
+        gaps_before,
+        "{ROW}: a second abandon with nothing pending is a quiet no-op"
+    );
+}
+
+/// E5 guard: a finish no-progress trip still refuses re-arm — the
+/// latch stands for the hold with the trip named, the publication is
+/// left for the hold's own abandon, and no re-arm gap lands.
+fn watchdog_entry_finish_trip_refusal() {
+    const ROW: &str = "E5 finish-trip refusal";
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.refuse_at_audited(2);
+    fixture.machine.pose_finish_no_progress_trip_for_test();
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        None,
+        "{ROW}: the finish trip keeps the latch"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        Some(crate::inventory_semantics::RunningRearmRefusal::WatchdogTripped),
+        "{ROW}: the stop names the standing finish trip"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable),
+        "{ROW}: the latch stands for the hold"
+    );
+    assert!(
+        fixture.scene.real.scene.coordinator.publication_pending(),
+        "{ROW}: the publication is left for the hold's own abandon"
+    );
+    assert!(
+        !fixture
+            .all_gap_subjects()
+            .iter()
+            .any(|seen| seen == QUANTUM_ABANDONED),
+        "{ROW}: no re-arm gap lands"
+    );
+}
+
+/// Table-driven entry-point coverage for per-session watchdog
+/// recovery (seal-refactor design §4): every recovery/void entry
+/// point degrades and counts only the stuck session while healthy
+/// sessions keep staged proof, mode, fence state and exact rows, and
+/// the lane continues. Each row runs in isolation; one run reports
+/// every failing row at once.
+#[test]
+fn joint_watchdog_recovery_scopes_to_the_stuck_session() {
+    let rows: [(WatchdogRecoveryEntry, fn()); 8] = [
+        (
+            WatchdogRecoveryEntry::TransientRearm,
+            watchdog_entry_transient_rearm,
+        ),
+        (
+            WatchdogRecoveryEntry::AuditTripRearm,
+            watchdog_entry_audit_trip_rearm,
+        ),
+        (
+            WatchdogRecoveryEntry::IdleScopedVoid,
+            watchdog_entry_idle_scoped_void,
+        ),
+        (
+            WatchdogRecoveryEntry::ExitHoldAbandon,
+            watchdog_entry_exit_hold_abandon,
+        ),
+        (
+            WatchdogRecoveryEntry::FinishTripRefusal,
+            watchdog_entry_finish_trip_refusal,
+        ),
+        (
+            WatchdogRecoveryEntry::SealCursorPark,
+            watchdog_entry_seal_cursor_park,
+        ),
+        (
+            WatchdogRecoveryEntry::BirthFunnelPastStuck,
+            watchdog_entry_birth_funnel_past_stuck,
+        ),
+        (
+            WatchdogRecoveryEntry::BoundedBulkDiscard,
+            watchdog_entry_bounded_bulk_discard,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (entry, run) in rows {
+        if std::panic::catch_unwind(run).is_err() {
+            failures.push(entry);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "watchdog recovery rows failing: {failures:?}"
+    );
+}
+
 /// Storm twin: a dense burst of re-arms back to back still stops.
 /// Thirty-two re-arms at one posed instant spend the window; the
 /// next refusal keeps the latch and names the spent rate bound.

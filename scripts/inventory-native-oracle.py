@@ -5616,6 +5616,48 @@ def self_test():
             return {"events": _account(ev, +2)}
         case("jsonl-edge-folded-module-only", "AGREE-EDGE-EVENTS",
              folded_edge_module_only)
+        zero_record_module = []
+        def folded_edge_zero_record_module(s, d, dash):
+            # One folded edge with an exact module summary (m0), plus a
+            # second module (m1) carrying a positive departed summary
+            # with zero matching stream records. The global total stays
+            # correct, so only the module guard's seeding of
+            # zero-record modules can fire — and it must name m1.
+            gone = "c900"
+            d["budgets"]["callers"].update(retired=1, late_refused=0)
+            d["budgets"].setdefault("edges", {}).update(folded=1)
+            extra = [("caller_event", {"event": "admitted", "caller": gone}),
+                     ("caller_event", {"event": "retired", "caller": gone,
+                                       "reason": "synthetic retirement"})]
+            ev = s.events(d, True, extra)
+            model = next(e for e in ev if e["kind"] == "edge_observed")
+            at = next(i for i, e in enumerate(ev) if e["kind"] == "edge_observed")
+            staged = _deep(model)
+            staged["event"]["caller"] = gone
+            ev.insert(at + 1, staged)
+            exact = next(m for m in d["modules"] if m["id"] == staged["event"]["module"])
+            exact["departed_use"] = {
+                "edges": 1,
+                "entries": {"count": staged["event"]["entries"]["count"], "saturated": 0}}
+            other = next(m for m in d["modules"] if m["id"] != staged["event"]["module"])
+            other["departed_use"] = {
+                "edges": 1,
+                "entries": {"count": 5, "saturated": 0}}
+            zero_record_module.append(other["id"])
+            return {"events": _account(ev, +1)}
+        zero_record_res = case("jsonl-edge-folded-zero-record-module", "AGREE-EDGE-EVENTS",
+                               folded_edge_zero_record_module)
+        zero_record_details = [r["detail"] for r in zero_record_res.failed()] \
+            if zero_record_res is not None else []
+        zero_record_want = f"0 streamed folded edges for module {zero_record_module[0]}" \
+            if zero_record_module else None
+        if zero_record_want is None or not any(
+                zero_record_want in detail for detail in zero_record_details):
+            print(f"self-test FAIL jsonl-edge-folded-zero-record-module-diagnostic: "
+                  f"want {zero_record_want!r} in {zero_record_details[:2]}")
+            failures.append("jsonl-edge-folded-zero-record-module-diagnostic")
+        else:
+            print("self-test ok   jsonl-edge-folded-zero-record-module-diagnostic")
         case("jsonl-edge-folded-unaccounted", "AGREE-EDGE-EVENTS",
              lambda s, d, dash: folded_edge(s, d, dash, folded=0))
         case("jsonl-edge-folded-overcounted", "AGREE-EDGE-EVENTS",

@@ -1674,6 +1674,24 @@ impl LiveJointMachine {
         });
     }
 
+    /// Pose a seal failure on the retained Audited frame (the stuck-
+    /// consumer twin's stand-in for any production Retry-pin): the next
+    /// delivery serves this failure instead of sealing. The posed
+    /// failure carries no buffers, so it needs no storage lease.
+    #[cfg(test)]
+    pub(crate) fn pose_frame_failure_for_test(
+        &mut self,
+        failure: crate::semantics_objects::journal::SealFailure,
+    ) {
+        let Some(Phase::Audited { frame, .. }) = self.phase.as_mut() else {
+            panic!("the frame-failure pose needs the Audited phase");
+        };
+        let Some(frame) = frame.as_mut() else {
+            panic!("the frame-failure pose needs the retained frame");
+        };
+        frame.set_posed_failure_for_test(failure);
+    }
+
     /// The current transaction's Collected, across every phase that
     /// carries one (the same coverage as `h0_guard_trip_for_test`).
     #[cfg(test)]

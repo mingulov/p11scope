@@ -1027,6 +1027,16 @@ impl IngestedJointQuantum {
             .max_by_key(|failure| failure_rank(failure))
     }
 
+    /// Pose a seal failure as this frame's recorded failure (the
+    /// stuck-consumer twin's stand-in): the next delivery serves it
+    /// instead of sealing. Test-only; the posed failure carries no
+    /// buffers, so no storage lease is retained for it.
+    #[cfg(test)]
+    pub(crate) fn set_posed_failure_for_test(&mut self, failure: SealFailure) {
+        self.active = None;
+        self.failure = Some(failure);
+    }
+
     #[cfg(test)]
     pub(crate) fn original_failures_for_test(&self) -> impl Iterator<Item = &SealFailure> {
         self.original_failures()

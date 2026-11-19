@@ -2186,6 +2186,147 @@ fn cbom_excludes_inferred_facts() {
     }
 }
 
+/// One proved key use on instance `i0`: the folded-instance twin's
+/// key material, shared by the alive control and the folded case.
+fn folded_key_observations() -> Value {
+    json!({
+        "version": 1, "revision": 1, "status": "populated", "reason": "none",
+        "sessions": [{"session": 0, "origin": "opened", "status": "live"}],
+        "objects": [
+            {
+                "object": 0, "session": 0, "origin": "created",
+                "creation": "generate", "birth": {"start_ns": 1, "end_ns": 2},
+                "lifetime": "live", "lifetime_reason": null,
+                "attribution": "valid", "attribution_reason": null,
+                "requested": metadata_block(Some(4), Some(31), Some(16)),
+                "established": metadata_block(Some(4), Some(31), Some(16)),
+                "queries": {"class": "established", "key_type": "established",
+                            "token": "established", "value_len": "established",
+                            "modulus_bits": "not_queried", "ec_params": "not_queried"},
+                "label": "aes_128",
+                "successful_references": 3, "successful_key_references": 3,
+                "accessing_sessions": 1
+            }
+        ],
+        "key_operations": [
+            {"instance": "i0", "object": 0, "category": "encrypt", "role": "key",
+             "metadata_at_use": "aes_128", "unit": "operations",
+             "started": 3, "completed": 3, "failed": 0, "cancelled": 0,
+             "unknown": 0, "active": 0, "key_join_lost": 0}
+        ],
+        "unknown_key_operations": [],
+        "gaps": {"rows": [], "suppressed": 0},
+        "budgets": {
+            "key_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+            "object_rows": {"limit": 65536, "occupied": 1, "refused": 0},
+            "unknown_rows": {"occupied": 0},
+            "encoded_bytes": 100, "allocation_refused": false, "refusal_reason": "none"
+        }
+    })
+}
+
+/// A key row whose instance folded out of `instances[]` still joins
+/// its provider and application through the departed aggregate's
+/// folded-instance map: same edges as the alive control, nothing
+/// unjoinable.
+#[test]
+fn cbom_folded_instance_rejoins_key_to_provider_and_application() {
+    let mut control: Value = serde_json::from_slice(&inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"c".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+    ))
+    .unwrap();
+    control["instances"] = json!([
+        {"id": "i0", "caller": "c0", "module": "m0", "state": "observed",
+         "reason": null, "first_seen_ns": 110, "last_seen_ns": 190}
+    ]);
+    control["object_observations"] = folded_key_observations();
+    let control = parse_input(&serde_json::to_vec(&control).unwrap()).unwrap();
+    assert!(control.dependencies.contains(&(
+        "p11scope:key:0".to_string(),
+        "p11scope:module:0".to_string()
+    )));
+    assert!(control.dependencies.contains(&(
+        "p11scope:key:0".to_string(),
+        "p11scope:caller:0".to_string()
+    )));
+    assert_eq!(control.unknowns.keys_unjoinable, 0);
+    let mut departed = departed_use(
+        1,
+        1,
+        json!([]),
+        vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    departed["folded_instances"] = json!([{"id": "i0", "caller": "c0"}]);
+    departed["folded_instances_saturated"] = json!(false);
+    departed["folded_instances_dropped"] = json!(0);
+    let mut folded: Value = serde_json::from_slice(&inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"c".repeat(64),
+            departed,
+        )],
+        vec![],
+    ))
+    .unwrap();
+    folded["object_observations"] = folded_key_observations();
+    let folded = parse_input(&serde_json::to_vec(&folded).unwrap()).unwrap();
+    assert!(folded.dependencies.contains(&(
+        "p11scope:key:0".to_string(),
+        "p11scope:module:0".to_string()
+    )));
+    assert!(folded.dependencies.contains(&(
+        "p11scope:key:0".to_string(),
+        "p11scope:caller:0".to_string()
+    )));
+    assert_eq!(folded.unknowns.keys_unjoinable, 0);
+}
+
+/// Folded-instance rows convert like live rows, so they count the
+/// same way toward the input row bound.
+#[test]
+fn cbom_folded_instance_rows_count_toward_the_row_bound() {
+    let mut departed = departed_use(
+        1,
+        1,
+        json!([]),
+        vec![departed_identity("c0", Some("/bin/driver"), "exited")],
+        false,
+        0,
+        departed_overflow(0, 0, 0),
+    );
+    departed["folded_instances"] = json!([
+        {"id": "i0", "caller": "c0"},
+        {"id": "i1", "caller": "c0"},
+    ]);
+    let bytes = inventory_document(
+        vec![],
+        vec![module_with_departed(
+            "m0",
+            "/lib/p.so",
+            &"c".repeat(64),
+            departed,
+        )],
+        vec![],
+    );
+    // 1 module + 1 folded identity + 2 folded instances = 4 rows.
+    let limits = crate::inventory_diff::input::InputLimits {
+        rows: 3,
+        ..crate::inventory_diff::input::InputLimits::default()
+    };
+    let error = parse_input_with_limits(&bytes, limits)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("inventory row limit exceeded"), "{error}");
+    assert!(parse_input(&bytes).is_ok());
+}
+
 /// A CBOM `-o` write failure (ENOSPC here) saves the rendered
 /// document to the recovery dir instead of dropping it: the error
 /// names the fallback, the saved bytes are the complete document

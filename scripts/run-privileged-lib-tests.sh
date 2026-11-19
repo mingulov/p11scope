@@ -304,6 +304,9 @@ attach::object_stop::tests::object_stop_scrubs_real_retained_map_after_q
 attach::object_stop::tests::object_stop_refuses_real_unproven_q_without_mutation
 attach::object_stop::tests::object_stop_reports_real_scrub_failure
 attach::object_stop::tests::evidence_stop_scrubs_real_stash_after_q
+# Keymeta Task 7 teardown scrub: the stop phase zero-verify-removes every
+# INFO_START row on the loaded Inventory object and leaves the map empty.
+attach::inventory::activation::privileged_tests::info_stop_scrubs_real_info_start_and_leaves_the_map_empty
 # R1 native-retirement cells over a real Detailed Session with an owned
 # provider child (each well under a minute): Multi close at Q then mint,
 # Singles deferral to the terminal detach, and the partial-group guards.

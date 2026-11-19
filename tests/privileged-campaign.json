@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 275,
+  "default_floor": 276,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -88,6 +88,7 @@
     "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n512_lp64",
     "attach::inventory::activation::privileged_tests::privileged_task4_inventory_n513_lp64",
     "attach::inventory::activation::privileged_tests::privileged_task4_inventory_physical_identity_controls",
+    "attach::inventory::activation::privileged_tests::info_stop_scrubs_real_info_start_and_leaves_the_map_empty",
     "attach::inventory::capture::privileged_tests::privileged_inventory_capture_active_spawn_exec_ticket_without_provider_call_lp64",
     "attach::inventory::capture::privileged_tests::privileged_inventory_capture_cookie_query_matches_row_and_changes_on_nonleader_exec_lp64",
     "attach::inventory::capture::privileged_tests::privileged_inventory_capture_extend_late_provider_lp64",

@@ -380,6 +380,12 @@
     },
     {
       "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::info_stop_scrubs_real_info_start_and_leaves_the_map_empty",
+      "reason": "root-owned BPF lane; real INFO_START rows scrubbed on the loaded Inventory object",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::inventory_sweep_test!",
       "reason": "root-owned BPF lane; bounded physical Inventory sweep",
       "cell": "privileged"

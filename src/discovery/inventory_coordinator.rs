@@ -5849,6 +5849,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// folded entries and whether the edge carried claims; a missing
     /// edge (already folded) contributes nothing. Shared by the atomic
     /// fold and the staged slices.
+    #[allow(clippy::too_many_arguments)]
     fn fold_caller_edge_for_fold(
         &mut self,
         caller: CallerId,
@@ -6981,6 +6982,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// atomic fold, so partial progress stays exact. Returns true when
     /// the stage drained fully and may commit; a paused stage keeps
     /// its remaining lists for the next pass.
+    #[allow(clippy::too_many_arguments)]
     fn resume_staged_fold(
         &mut self,
         stage: &mut StagedFold,
@@ -7006,7 +7008,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .collect();
         let mut units: u64 = 0;
         while !stage.is_complete() {
-            if units > 0 && units % FOLD_PLAN_STRIDE == 0 {
+            if units > 0 && units.is_multiple_of(FOLD_PLAN_STRIDE) {
                 if *credits == 0 {
                     return false;
                 }

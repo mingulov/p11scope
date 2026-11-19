@@ -819,14 +819,18 @@ counts.
 
 `tests/run_tree.rs` (`first_use_window_end`) honors only
 `pre_attach`/`late_discovery` windows: the oracle currently gives
-retirement windows no credit and keeps failing exact accounting, so a
-miss inside a `coverage_retired` retire window lands in the
-"unexplained miss" arm and fails the suite — fail-closed, so nothing
-is masked. An individual miss counts as explained only with separate
-evidence placing it inside the relevant provider's window and covering
-the affected call; a post-window or other-record loss fails
-identically. Honoring the window is deferred pending an owner ruling;
-until it lands, existing test behavior stands.
+retirement windows no credit and runs its existing exact-accounting
+classifications unchanged — zero observed calls take the "probe loss"
+arm, a partial miss with a replace witness (a second slot row or a
+failed replacement) that fits the calls before the last re-attach
+takes the "undisclosed miss" arm, and anything else takes the
+"unexplained miss" arm — so a miss inside a `coverage_retired` retire
+window still fails the suite, fail-closed, with nothing masked. An
+individual miss counts as explained only with separate evidence
+placing it inside the relevant provider's window and covering the
+affected call; a post-window or other-record loss fails identically.
+Honoring the window is deferred pending an owner ruling; until it
+lands, existing test behavior stands.
 
 ### System captures past 1024 processes share one deep examination per library set
 

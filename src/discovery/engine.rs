@@ -19611,21 +19611,6 @@ impl Engine {
             && selected
                 .iter()
                 .all(|slot| self.slot_owned_by_run(slot, &candidate));
-        // Temporary loss forensics (reverted before landing): every
-        // apply's deltas plus the arm inputs (ended/owned_only), joined
-        // by order with the tail line below (applies never nest).
-        if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some_and(|value| !value.is_empty()) {
-            eprintln!(
-                "p11scope: fix1apply head retire={} replace={} new={} views={} selected={} ended={} owned_only={}",
-                candidate.delta.retire.len(),
-                candidate.delta.replace.len(),
-                candidate.delta.new.len(),
-                candidate.views.len(),
-                selected.len(),
-                ended.is_some(),
-                owned_only,
-            );
-        }
         let detach_slots_start = crate::attach::monotonic_ns();
         // Coverage-retire witness: snapshot the live attached cover this
         // apply may detach, before any arm mutates the plan. Opened below
@@ -20353,22 +20338,6 @@ impl Engine {
                 outcome.static_failures.len(),
                 outcome.detach_failed,
                 outcome.changed,
-            );
-        }
-        // Temporary loss forensics (reverted before landing): every
-        // apply's outcome, joined by order with the head line above.
-        if std::env::var_os("P11SCOPE_FIX1_EVLOG").is_some_and(|value| !value.is_empty()) {
-            eprintln!(
-                "p11scope: fix1apply tail accepted={} disposition={:?} detach_failed={} changed={} active_slots={}",
-                outcome.accepted(),
-                outcome.disposition,
-                outcome.detach_failed,
-                outcome.changed,
-                self.plan
-                    .slots
-                    .iter()
-                    .filter(|slot| self.plan.is_active(slot.index))
-                    .count(),
             );
         }
         self.close_revived_coverage_windows();

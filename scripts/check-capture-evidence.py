@@ -641,6 +641,15 @@ LOADER_SCAN_LEDGER_EXCEEDED = (
     "a deferred loader memory scan exceeded the bounded loader-context ledger"
 )
 LOADER_ARM_LEDGER_FULL = "the bounded loader-arm catch-up ledger was full"
+# Renewing work ceiling (ruling 11:38): an interval that exhausts the
+# discovery work budget files this one fixed row and retries next
+# interval (render.rs `capture_skipped_out` work-ceiling arm). Fixed
+# product wording with no target-derived data; repeat filings dedupe
+# to the same row. The validator must accept what the producer emits.
+DISCOVERY_WORK_CEILING_DEFERRED = (
+    "capture discovery work ceiling reached; "
+    "the interval's remaining work was deferred to the next interval"
+)
 # View-collapse fix1: the deep-scan selection cap names its limit with one
 # finite sentence (render.rs `capture_skipped_out` scan-cap arm). The three
 # engine forms (initial, live, deferred) carry only digit counts plus fixed
@@ -826,6 +835,7 @@ DISCOVERY_REASONS = {
     LOADER_CONTEXT_CHILD_RESERVE,
     LOADER_SCAN_LEDGER_EXCEEDED,
     LOADER_ARM_LEDGER_FULL,
+    DISCOVERY_WORK_CEILING_DEFERRED,
     MANIFEST_OBJECT_UNAVAILABLE,
     PREARM_OBJECT_UNAVAILABLE,
     DISCOVERY_TRANSPORT_UNAVAILABLE,

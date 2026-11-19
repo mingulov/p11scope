@@ -1982,6 +1982,12 @@ const LOADER_CONTEXT_CHILD_RESERVE: &str = "loader contexts 249-256 are reserved
 const LOADER_SCAN_LEDGER_EXCEEDED: &str =
     "a deferred loader memory scan exceeded the bounded loader-context ledger";
 const LOADER_ARM_LEDGER_FULL: &str = "the bounded loader-arm catch-up ledger was full";
+/// The renewing work-ceiling gap's finite public reason (controller
+/// ruling 11:38): the engine's fixed internal sentence, copied here
+/// so public output never drifts with internal rewording. Matches
+/// the exact static producer pair only; path-bearing lookalikes
+/// keep the generic fallback.
+const DISCOVERY_WORK_CEILING_DEFERRED: &str = "capture discovery work ceiling reached; the interval's remaining work was deferred to the next interval";
 const MANIFEST_OBJECT_UNAVAILABLE: &str = "manifest object unavailable";
 const PREARM_OBJECT_UNAVAILABLE: &str = "prearm object unavailable";
 const DISCOVERY_TRANSPORT_UNAVAILABLE: &str = "discovery transport unavailable";
@@ -2113,6 +2119,9 @@ fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
     }
     if subject == "post-arm provider discovery" && reason == LOADER_ARM_LEDGER_FULL {
         return Some(LOADER_ARM_LEDGER_FULL);
+    }
+    if subject == "live discovery work budget" && reason == DISCOVERY_WORK_CEILING_DEFERRED {
+        return Some(DISCOVERY_WORK_CEILING_DEFERRED);
     }
     if is_scan_cap_selection(reason) {
         return Some(DEEP_SCAN_SELECTION_CAPPED);
@@ -4637,6 +4646,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LOADER_CONTEXT_CHILD_RESERVE,
                     LOADER_SCAN_LEDGER_EXCEEDED,
                     LOADER_ARM_LEDGER_FULL,
+                    DISCOVERY_WORK_CEILING_DEFERRED,
                     LEARNED_FIRST_RUN_REASON,
                     LEARNED_OVERFLOW_REASON,
                     LEARNED_CAP_REASON,
@@ -19138,6 +19148,117 @@ pub(crate) mod tests {
         ] {
             assert!(text.contains(fragment), "{text}");
         }
+    }
+
+    /// The renewing work-ceiling gap names its limit: the exact static
+    /// producer pair projects to the finite public work-ceiling reason
+    /// (a published schema enum), one named row with PARTIAL and its
+    /// text count — never the generic discovery pair. The input pair
+    /// is read off the engine's own constants, so an internal reword
+    /// fails here instead of drifting public output silently.
+    #[test]
+    fn work_ceiling_gap_names_the_limit_with_a_single_deduped_row() {
+        use crate::discovery::engine::{WORK_INTERVAL_GAP_REASON, WORK_INTERVAL_GAP_SUBJECT};
+        use crate::discovery::scan::Skipped;
+        let internal = Skipped {
+            subject: WORK_INTERVAL_GAP_SUBJECT.into(),
+            reason: WORK_INTERVAL_GAP_REASON.into(),
+        };
+        let projected = capture_skipped_out(&internal);
+        assert_eq!(projected.name, "discovery subject");
+        assert_eq!(projected.reason, DISCOVERY_WORK_CEILING_DEFERRED);
+        assert!(
+            !projected.reason.contains('/'),
+            "no path can hide in the finite reason: {:?}",
+            projected.reason
+        );
+        let enums = schema_skip_reason_enums();
+        assert!(!enums.is_empty(), "the schema names its skip reasons");
+        for allowed in &enums {
+            assert!(
+                allowed.contains(&projected.reason),
+                "{:?} is not a schema skip reason",
+                projected.reason
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = vec![projected.clone()];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.gap_classes.observation.causes, ["skipped"]);
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            document["evidence"]["skipped"],
+            serde_json::json!([
+                {"name": "discovery subject", "reason": DISCOVERY_WORK_CEILING_DEFERRED},
+            ])
+        );
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("1 discovery step unavailable"), "{text}");
+        assert!(
+            text.contains(&format!("{DISCOVERY_WORK_CEILING_DEFERRED}: 1")),
+            "{text}"
+        );
+    }
+
+    /// Twins: the same work-budget subject with target-derived reasons,
+    /// and the ceiling sentence under any other subject, stay redacted
+    /// — the allowlist matches the exact static pair only.
+    #[test]
+    fn work_ceiling_lookalikes_stay_redacted() {
+        use crate::discovery::engine::{WORK_INTERVAL_GAP_REASON, WORK_INTERVAL_GAP_SUBJECT};
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                WORK_INTERVAL_GAP_SUBJECT,
+                "capture discovery work ceiling reached for /private/PATH_BUDGET: budget spent",
+            ),
+            (
+                WORK_INTERVAL_GAP_SUBJECT,
+                "capture discovery work ceiling reached; the interval's remaining work was deferred to the next interval (pid /private/X)",
+            ),
+            ("live discovery drain", WORK_INTERVAL_GAP_REASON),
+            ("discovery subject", WORK_INTERVAL_GAP_REASON),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let rendered = document.to_string();
+        assert!(!rendered.contains("PRIVATE_"), "{rendered}");
+        assert!(!rendered.contains("/private/"), "{rendered}");
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!text.contains("PRIVATE_"), "{text}");
+        assert!(text.contains("4 discovery steps unavailable"), "{text}");
     }
 
     /// Twins: the same subjects with target-derived reasons stay redacted —

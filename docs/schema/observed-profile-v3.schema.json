@@ -598,6 +598,7 @@
                   "loader contexts 249-256 are reserved for the run's own command; a descendant arm past 248 was refused",
                   "a deferred loader memory scan exceeded the bounded loader-context ledger",
                   "the bounded loader-arm catch-up ledger was full",
+                  "capture discovery work ceiling reached; the interval's remaining work was deferred to the next interval",
                   "manifest object unavailable",
                   "prearm object unavailable",
                   "discovery transport unavailable",

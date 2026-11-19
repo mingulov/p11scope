@@ -1126,6 +1126,19 @@ exactly:
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
 
+Work-ceiling deferral gaps file under the discovery subject with one
+finite reason (in addition to the v2 list and the rows above).
+The record is `{name: "discovery subject", reason}` with `reason`
+exactly:
+
+- `capture discovery work ceiling reached; the interval's remaining
+  work was deferred to the next interval`: a capture interval
+  exhausted the renewing discovery work budget and deferred its
+  remaining work to the next interval. Repeat filings dedupe to the
+  same row, however many intervals exhaust; the exhaustion count
+  stays behind the test-only `interval_exhaustions` counter, never
+  in the reason.
+
 Run-tree scope gaps file under their own subject. Each record is
 `{name: "run process tree", reason}` with `reason` exactly one of:
 

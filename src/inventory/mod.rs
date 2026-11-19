@@ -8877,6 +8877,8 @@ fn stream_view_guarded(
 /// paces against the same INV-2 stride as fold planning.
 fn cert_unit(units: &mut u64, stop: &dyn Fn() -> bool) -> bool {
     *units = units.saturating_add(1);
+    #[cfg(test)]
+    crate::discovery::engine::inventory_coordinator::test_visit_hook::fire(*units);
     units.is_multiple_of(crate::discovery::engine::inventory_coordinator::FOLD_PLAN_STRIDE)
         && stop()
 }
@@ -8905,19 +8907,20 @@ pub(crate) struct CertificationReport {
 /// whose process is proven ended. The presentation already owns the row's
 /// facts; the coordinator only drops state that no later render can need.
 /// The final view is captured after this, so every caller still present
-/// there keeps its row.
+/// there keeps its row. Reports how far certification reached, like the
+/// explicit-query form below.
 fn retire_rendered_callers<Source: ProcessSource>(
     coordinator: &mut InventoryCoordinator<Source>,
     subset: Option<&crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset>,
     stream: &EventLogState,
     state: &mut StreamState,
     now_ns: u64,
-) {
+) -> CertificationReport {
     // The certification below scans and hashes before the fold's own
     // entry gate runs, so it paces against the same live stop query:
     // a stopped pass certifies nothing and notes nothing.
     let stop = coordinator.stop_query();
-    retire_rendered_callers_with_stop(coordinator, subset, stream, state, now_ns, stop.as_ref());
+    retire_rendered_callers_with_stop(coordinator, subset, stream, state, now_ns, stop.as_ref())
 }
 
 /// [`retire_rendered_callers`] with an explicit stop query, reporting

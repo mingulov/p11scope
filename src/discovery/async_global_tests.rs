@@ -2167,8 +2167,7 @@ fn async_global_owned_with_true_descendant_pure_retire_opens_a_counted_coverage_
     );
     let guards = e06_spawn_sleeps(1);
     let descendant_pid = guards[0].pid();
-    let status =
-        std::fs::read_to_string(format!("/proc/{descendant_pid}/status")).unwrap();
+    let status = std::fs::read_to_string(format!("/proc/{descendant_pid}/status")).unwrap();
     let ppid = status
         .lines()
         .find_map(|line| {

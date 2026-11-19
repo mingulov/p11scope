@@ -15849,8 +15849,7 @@ impl Engine {
             if !seen.insert(slot.index) {
                 continue;
             }
-            let Some(committed) = self.plan.slots.iter().find(|own| own.index == slot.index)
-            else {
+            let Some(committed) = self.plan.slots.iter().find(|own| own.index == slot.index) else {
                 continue;
             };
             if !self.plan.is_active(committed.index) {
@@ -19818,12 +19817,10 @@ impl Engine {
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             } else {
                 let planned = Self::planned_new_keys(&candidate);
-                let (modules, slots) = CoverageRetireSnapshot::cover(
-                    &snapshot.attached,
-                    |index, key| {
+                let (modules, slots) =
+                    CoverageRetireSnapshot::cover(&snapshot.attached, |index, key| {
                         !planned.contains(key) && !snapshot.replace_attempts.contains(&index)
-                    },
-                );
+                    });
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             }
         }
@@ -20388,9 +20385,10 @@ impl Engine {
                 .map(|slot| slot.index)
                 .collect();
             if !stranded.is_empty() {
-                let (modules, slots) = CoverageRetireSnapshot::cover(&snapshot.attached, |index, _| {
-                    stranded.contains(&index)
-                });
+                let (modules, slots) =
+                    CoverageRetireSnapshot::cover(&snapshot.attached, |index, _| {
+                        stranded.contains(&index)
+                    });
                 self.open_coverage_retire_window(modules, slots, snapshot.start_ns);
             }
         }

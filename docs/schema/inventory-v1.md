@@ -1432,11 +1432,15 @@ never imply S1 loss.
   and fresh-view unwrap inputs infer wrapped-key material L−8
   through 8191 material octets (L 8..=8199), about the wrapped
   key. On a proved wrapped-key row a larger observed value
-  refuses directly (`unsupported` with reason
-  `outside_admission_bound`): it counts its completion, publishes
-  no size, parks nothing and forward-fills nothing; under `-v`
-  the row reads `size unsupported (outside admission bound)`. On
-  a rowless wrap or fresh-view unwrap the above-bound observation
+  contributes no new size: it counts its completion, parks
+  nothing and forward-fills nothing. The row reports
+  `unsupported` with reason `outside_admission_bound` only when
+  its prior size state has no stronger size evidence (a weak
+  unknown); existing inferred or conflicting size evidence
+  remains, as does any stronger unknown, and under `-v` the row
+  reads `size unsupported (outside admission bound)` only when
+  that reason is set. On a rowless wrap or fresh-view unwrap
+  the above-bound observation
   leaves no park and contributes no wrapped-size evidence to the
   subsequent row.
 - `unknown_key_operations[]` (sorted by category and reason) holds

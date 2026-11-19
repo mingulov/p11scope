@@ -1779,10 +1779,14 @@ Limits that matter in pods:
   token-reported sizes still shown)`. Wrapped-key sizes from plain
   AES-KW wrap outputs and fresh-view unwrap inputs infer through
   8191 material octets (8199 observed). On a proved wrapped-key
-  row a larger observed value publishes no size (`-v` shows `size
-  unsupported (outside admission bound)`); on a rowless wrap or
-  fresh-view unwrap it leaves no park and contributes no
-  wrapped-size evidence to the subsequent row.
+  row a larger observed value contributes no new size but counts
+  its completion; the row reports `unsupported`
+  (`outside_admission_bound`) only when it has no stronger size
+  evidence, existing inferred, conflicting, or stronger unknown
+  state remains, and `-v` shows `size unsupported (outside
+  admission bound)` only then; on a rowless wrap or fresh-view
+  unwrap it leaves no park and contributes no wrapped-size
+  evidence to the subsequent row.
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.

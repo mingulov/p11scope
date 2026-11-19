@@ -10351,6 +10351,16 @@ impl ClaimAuthority {
         Self::Views(authorized)
     }
 
+    /// Reserved bytes for a terminal authority over `views` live views
+    /// (merge-ownership spec §7 E13): the value plus the worst-case
+    /// tree nodes, under the same node accounting as the pin-selection
+    /// bound. The sealed set only shrinks after the build, so a
+    /// reservation for the live count covers every smaller sealed set.
+    pub(crate) fn storage_bound(views: usize) -> Option<usize> {
+        std::mem::size_of::<Self>()
+            .checked_add(conservative_pin_tree_bytes::<ProcessViewId, ()>(views)?)
+    }
+
     pub(crate) fn authorizes(&self, view: ProcessViewId) -> bool {
         match self {
             Self::All => true,

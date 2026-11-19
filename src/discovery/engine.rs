@@ -5413,6 +5413,7 @@ enum GraphPhase {
     Selection,
     Pins,
     RawCopy,
+    RebindAuth,
     Rebind,
     Plan,
     Facts,
@@ -5958,6 +5959,11 @@ struct CollectedGraph {
     raw_rows: Vec<ScannedModule>,
     raw_storage: Option<ResourceLease>,
     raw: Option<RetainedScannedInputs>,
+    auth_index: usize,
+    auth_set: BTreeSet<ProcessViewId>,
+    auth_storage: Option<ResourceLease>,
+    auth_retired_after: Option<ProcessViewId>,
+    rebind_authority: Option<ClaimAuthority>,
     rebind: ScannedRebindCursor,
     plan: plan::ConservativePlanCursor,
     facts: CollectedFacts,
@@ -6020,6 +6026,11 @@ impl CollectedGraph {
             raw_rows: Vec::new(),
             raw_storage: None,
             raw: None,
+            auth_index: 0,
+            auth_set: BTreeSet::new(),
+            auth_storage: None,
+            auth_retired_after: None,
+            rebind_authority: None,
             rebind: ScannedRebindCursor::new(),
             plan: plan::ConservativePlanCursor::new(),
             facts: CollectedFacts::new(),
@@ -35710,6 +35721,7 @@ impl Engine {
                 | GraphPhase::Selection
                 | GraphPhase::Pins
                 | GraphPhase::RawCopy
+                | GraphPhase::RebindAuth
                 | GraphPhase::Rebind
                 | GraphPhase::Plan
                 | GraphPhase::Facts
@@ -35741,6 +35753,7 @@ impl Engine {
             GraphPhase::Selection => self.step_graph_selection(graph, reserve),
             GraphPhase::Pins => self.step_graph_pins(graph, reserve),
             GraphPhase::RawCopy => self.step_graph_raw_copy(graph, reserve),
+            GraphPhase::RebindAuth => self.step_graph_rebind_auth(graph, reserve),
             GraphPhase::Rebind => self.step_graph_rebind(graph, reserve),
             GraphPhase::Plan => self.step_graph_plan(graph, reserve),
             GraphPhase::Facts => self.step_graph_facts(graph, reserve),
@@ -36097,7 +36110,7 @@ impl Engine {
             match RetainedScannedInputs::from_reserved_originals(rows, storage) {
                 Ok(raw) => {
                     graph.raw = Some(raw);
-                    graph.phase = GraphPhase::Rebind;
+                    graph.phase = GraphPhase::RebindAuth;
                 }
                 Err(refusal) => {
                     let (rows, storage) = refusal.into_originals();
@@ -36108,6 +36121,106 @@ impl Engine {
             }
             return Self::graph_idle(true);
         }
+        graph.phase = GraphPhase::RebindAuth;
+        Self::graph_idle(true)
+    }
+
+    /// RebindAuth (§1.6, spec §7 E13): one strided build credit for the
+    /// sealed terminal authority — the live views minus this
+    /// transaction's retirements — under the graph epoch and a
+    /// reservation taken up front. Each credit inserts or subtracts at
+    /// most `GRAPH_STRIDE` views; every Rebind credit then reuses the
+    /// sealed set with no scan. Any reservation or custody failure
+    /// refuses before native mutation, exactly like the Selection build.
+    fn step_graph_rebind_auth(
+        &mut self,
+        graph: &mut CollectedGraph,
+        reserve: &SemanticResourceReserver,
+    ) -> GraphService {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if graph.selection.is_none() {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        if graph.auth_storage.is_none() {
+            let storage = ClaimAuthority::storage_bound(self.views.len())
+                .and_then(|bytes| reserve.reserve(bytes).ok());
+            let Some(storage) = storage else {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            };
+            graph.auth_storage = Some(storage);
+            graph.auth_index = 0;
+            graph.auth_retired_after = None;
+            return Self::graph_idle(true);
+        }
+        // Insert pass: up to one stride of live views per credit. The
+        // epoch fence freezes the live list while this runs: any
+        // view-set mutation refuses the next credit before it reads.
+        if graph.auth_index < self.views.len() {
+            let until = self
+                .views
+                .len()
+                .min(graph.auth_index.saturating_add(GRAPH_STRIDE));
+            for position in graph.auth_index..until {
+                graph.auth_set.insert(self.views[position].id());
+                #[cfg(test)]
+                {
+                    self.graph_authority_visits = self.graph_authority_visits.saturating_add(1);
+                }
+            }
+            graph.auth_index = until;
+            return Self::graph_idle(true);
+        }
+        // Subtract pass: up to one stride of retirements per credit.
+        let subtracted = {
+            let Some(selection) = graph.selection.as_ref() else {
+                self.refuse_graph_before_native(graph);
+                return Self::graph_idle(true);
+            };
+            let mut finished = false;
+            let mut leaves = 0;
+            while leaves < GRAPH_STRIDE {
+                let next = match graph.auth_retired_after {
+                    None => selection.retired().first().copied(),
+                    Some(after) => selection
+                        .retired()
+                        .range((Excluded(after), Unbounded))
+                        .next()
+                        .copied(),
+                };
+                let Some(next) = next else {
+                    finished = true;
+                    break;
+                };
+                graph.auth_retired_after = Some(next);
+                graph.auth_set.remove(&next);
+                #[cfg(test)]
+                {
+                    self.graph_authority_visits = self.graph_authority_visits.saturating_add(1);
+                }
+                leaves += 1;
+            }
+            finished
+        };
+        if !subtracted {
+            return Self::graph_idle(true);
+        }
+        // Seal: the set only shrank since the reservation, so the
+        // live-count reservation covers it; refuse closed otherwise.
+        let set = std::mem::take(&mut graph.auth_set);
+        let sealed = ClaimAuthority::storage_bound(set.len()).is_some_and(|bytes| {
+            graph
+                .auth_storage
+                .as_ref()
+                .is_some_and(|storage| reserve.covers(storage, bytes))
+        });
+        if !sealed {
+            graph.auth_set = set;
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        }
+        graph.rebind_authority = Some(ClaimAuthority::Views(set));
         graph.phase = GraphPhase::Rebind;
         Self::graph_idle(true)
     }
@@ -36123,30 +36236,13 @@ impl Engine {
         // Terminal ownership (merge-ownership spec §7 E13): the rebind
         // files claims only for live views outside this transaction's
         // retirements. Carried rows still reconcile (their exact attached
-        // targets ride into the terminal plan) but own nothing — the same
-        // constructor as the live choke, with no newcomers and no
-        // declined views at Finish.
-        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
-        #[cfg(test)]
-        {
-            // The live-list scan: one visit per retained view.
-            self.graph_authority_visits = self.graph_authority_visits.saturating_add(live.len());
-        }
-        let empty = BTreeSet::new();
-        let retired = graph
-            .selection
-            .as_ref()
-            .map(ConservativePinSelection::retired)
-            .unwrap_or(&empty);
-        let authority = ClaimAuthority::candidate(&live, &empty, &empty, retired);
-        #[cfg(test)]
-        {
-            // The union scan plus the retirement removals inside the
-            // constructor: one visit per live view, one per retirement.
-            self.graph_authority_visits = self
-                .graph_authority_visits
-                .saturating_add(live.len().saturating_add(retired.len()));
-        }
+        // targets ride into the terminal plan) but own nothing — the
+        // sealed authority the RebindAuth phase built once under this
+        // graph's epoch, reused by every credit with no scan.
+        let Some(authority) = graph.rebind_authority.as_ref() else {
+            self.refuse_graph_before_native(graph);
+            return Self::graph_idle(true);
+        };
         match graph.pins.poll_scanned_rebind(
             &mut graph.raw,
             &mut graph.rebind,

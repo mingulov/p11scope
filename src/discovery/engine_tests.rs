@@ -77803,6 +77803,7 @@ fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
     // credits: no single credit may visit more than one stride.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut credits = 0u64;
+    let mut saw_auth = false;
     let mut saw_rebind = false;
     loop {
         engine.graph_authority_visits = 0;
@@ -77816,12 +77817,9 @@ fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
              (credit {credits}: {} visits)",
             engine.graph_authority_visits
         );
-        if engine
-            .collected_graph
-            .as_ref()
-            .is_some_and(|graph| graph.phase == GraphPhase::Rebind)
-        {
-            saw_rebind = true;
+        if let Some(graph) = engine.collected_graph.as_ref() {
+            saw_auth |= graph.phase == GraphPhase::RebindAuth;
+            saw_rebind |= graph.phase == GraphPhase::Rebind;
         }
         if !outcome.pending {
             break;
@@ -77838,6 +77836,10 @@ fn terminal_rebind_authority_credit_stays_bounded_over_many_live_views() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    assert!(
+        saw_auth,
+        "the drive built the sealed authority before rebinding"
+    );
     assert!(saw_rebind, "the drive ran terminal rebind credits");
     assert!(engine.pending_retirements.is_empty());
     assert_eq!(engine.collected_graphs_created, 1);

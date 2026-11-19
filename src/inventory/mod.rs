@@ -6459,7 +6459,9 @@ fn seal_start_live(
     }
     #[cfg(test)]
     if let Some(verdict) = seal_startup_test::take_start_verdict() {
-        seal_startup_test::record_start_scope(scope);
+        // The requested journal mode is not observed yet (the seam
+        // records it); every scripted start reads as ordinary.
+        seal_startup_test::record_start(scope, None);
         return verdict;
     }
     crate::inventory_semantics::AttestedSemanticLane::start_live(
@@ -6489,12 +6491,22 @@ mod seal_startup_test {
     /// A boundary stimulus: runs once when its scripted event is
     /// consumed, before the production caller sees the value.
     type StartupHook = Box<dyn FnOnce()>;
+    /// One scripted live-start request: the attach scope plus the
+    /// requested journal mode (`None` = ordinary start, `Some(sizes)`
+    /// = journal start with the sizes flag as given). Twins drain
+    /// these through `take_starts` to prove the retry runs the base
+    /// journal (scope alone cannot tell a sizes retry from a base one).
+    #[derive(Debug, Clone)]
+    pub(super) struct StartRecord {
+        pub(super) scope: Scope,
+        pub(super) key_sizes: Option<bool>,
+    }
     thread_local! {
         static PREPARE: std::cell::RefCell<VecDeque<Preparation>> =
             const { std::cell::RefCell::new(VecDeque::new()) };
         static START: std::cell::RefCell<VecDeque<StartVerdict>> =
             const { std::cell::RefCell::new(VecDeque::new()) };
-        static START_SCOPES: std::cell::RefCell<Vec<Scope>> =
+        static STARTS: std::cell::RefCell<Vec<StartRecord>> =
             const { std::cell::RefCell::new(Vec::new()) };
         // Late-stop probes (F1): one hook per consumed scripted
         // boundary event, in order. A peek hook latches the run
@@ -6517,15 +6529,24 @@ mod seal_startup_test {
         }
         verdict
     }
-    /// Record one scripted start's attach scope, in order. Twins
-    /// drain it through `take_start_scopes` to prove the lane
-    /// started over the run's scope (a cgroup seal must carry the
-    /// cgroup's BPF membership gate, never a widened system scope).
-    pub(super) fn record_start_scope(scope: &Scope) {
-        START_SCOPES.with(|recorded| recorded.borrow_mut().push(scope.clone()));
+    /// Record one scripted start's attach scope and requested
+    /// journal mode, in order. Twins drain the records through
+    /// `take_starts` to prove the lane started over the run's scope
+    /// (a cgroup seal must carry the cgroup's BPF membership gate,
+    /// never a widened system scope) in the requested journal mode.
+    pub(super) fn record_start(scope: &Scope, key_sizes: Option<bool>) {
+        STARTS.with(|recorded| {
+            recorded.borrow_mut().push(StartRecord {
+                scope: scope.clone(),
+                key_sizes,
+            })
+        });
+    }
+    pub(super) fn take_starts() -> Vec<StartRecord> {
+        STARTS.with(|recorded| recorded.take())
     }
     pub(super) fn take_start_scopes() -> Vec<Scope> {
-        START_SCOPES.with(|recorded| recorded.take())
+        take_starts().into_iter().map(|start| start.scope).collect()
     }
     pub(super) fn with<R>(
         prepares: Vec<Preparation>,
@@ -6547,7 +6568,7 @@ mod seal_startup_test {
             fn drop(&mut self) {
                 PREPARE.with(|queued| queued.borrow_mut().clear());
                 START.with(|queued| queued.borrow_mut().clear());
-                START_SCOPES.with(|recorded| recorded.borrow_mut().clear());
+                STARTS.with(|recorded| recorded.borrow_mut().clear());
                 START_HOOKS.with(|queued| queued.borrow_mut().clear());
             }
         }
@@ -31769,6 +31790,24 @@ mod seal_readiness_tests {
             .collect()
     }
 
+    /// One subject's gap reasons with their repeat counts, in order.
+    /// The registry aggregates identical emissions as repeats, so a
+    /// distinct-row count alone cannot tell one emission from many.
+    fn gaps_with_repeats_for_subject(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        subject: &str,
+    ) -> Vec<(String, u64)> {
+        coordinator.registry_mut().publish();
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .zip(coordinator.registry().gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == subject)
+            .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+            .collect()
+    }
+
     #[test]
     fn seal_line_present_once_on_sealed_path() {
         // Isolate from lines other tests on this thread noted: the
@@ -32350,14 +32389,16 @@ mod seal_readiness_tests {
     /// A refused `--key-sizes` journal start retries the base journal
     /// before giving up key operations: the base lane seats, one `key
     /// sizes unavailable` gap names the sizes refusal, and no `key
-    /// operations unavailable` gap is recorded.
+    /// operations unavailable` gap is recorded. The recorded start
+    /// modes prove the retry ran the base journal, not a second
+    /// sizes start.
     #[test]
     fn key_sizes_journal_refusal_retries_base_journal_with_named_gap() {
         take_sealed_for_test();
         let mut coordinator = coordinator();
         coordinator.set_key_sizes_requested(true);
         let scope = Scope::Pid(std::process::id());
-        let lane = seal_startup_test::with_start_queue(
+        let (lane, starts) = seal_startup_test::with_start_queue(
             vec![
                 some_preparation(),
                 some_preparation(),
@@ -32369,22 +32410,43 @@ mod seal_readiness_tests {
                 Ok(joint_lane(WindDownIo::completing(), false)),
             ],
             || {
-                start_semantic_lane(
+                let lane = start_semantic_lane(
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
                     None,
-                )
+                );
+                (lane, seal_startup_test::take_starts())
             },
         );
         let lane = lane.expect("the base journal retry seats");
         assert!(lane.is_live(), "the retry seats a live lane");
         assert_eq!(
-            take_sealed_for_test().len(),
-            1,
-            "the reseated lane seals once"
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS.to_string()],
+            "the reseated lane seals once, still recording key operations"
+        );
+        assert_eq!(
+            starts.len(),
+            2,
+            "the sizes start and its base retry both ran"
+        );
+        assert_eq!(
+            starts
+                .iter()
+                .map(|start| start.key_sizes)
+                .collect::<Vec<_>>(),
+            [Some(true), Some(false)],
+            "the retry runs the base journal, not a second sizes start"
+        );
+        let pid = std::process::id();
+        assert!(
+            starts
+                .iter()
+                .all(|start| matches!(start.scope, Scope::Pid(candidate) if candidate == pid)),
+            "both starts run over the run's scope: {starts:?}"
         );
         let gaps = gaps_for_subject(&mut coordinator, "key sizes unavailable");
         assert_eq!(gaps.len(), 1, "the sizes refusal is named once");
@@ -32406,6 +32468,14 @@ mod seal_readiness_tests {
             "the degraded mode is named: {}",
             gaps[0].1
         );
+        assert_eq!(
+            gaps_with_repeats_for_subject(&mut coordinator, "key sizes unavailable")
+                .iter()
+                .map(|(_, repeats)| *repeats)
+                .collect::<Vec<_>>(),
+            [1],
+            "the sizes gap is one emission, not an aggregated repeat"
+        );
         assert!(
             gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
             "key operations stay available"
@@ -32419,14 +32489,16 @@ mod seal_readiness_tests {
     /// Sizes and base journal refusals fall through to the ordinary
     /// retry: the ordinary lane seats with the `key operations
     /// unavailable` gap and no `key sizes unavailable` gap (sizes
-    /// degrade only when the base journal seats).
+    /// degrade only when the base journal seats). The recorded start
+    /// modes prove the sizes start, its base retry, and the ordinary
+    /// fallback each ran in its own journal mode.
     #[test]
     fn key_sizes_double_journal_refusal_falls_back_to_ordinary() {
         take_sealed_for_test();
         let mut coordinator = coordinator();
         coordinator.set_key_sizes_requested(true);
         let scope = Scope::Pid(std::process::id());
-        let lane = seal_startup_test::with_start_queue(
+        let (lane, starts) = seal_startup_test::with_start_queue(
             vec![
                 some_preparation(),
                 some_preparation(),
@@ -32441,25 +32513,54 @@ mod seal_readiness_tests {
                 Ok(joint_lane(WindDownIo::completing(), false)),
             ],
             || {
-                start_semantic_lane(
+                let lane = start_semantic_lane(
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
                     None,
-                )
+                );
+                (lane, seal_startup_test::take_starts())
             },
         );
         let lane = lane.expect("the ordinary retry seats");
         assert!(lane.is_live(), "the retry seats a live lane");
         assert_eq!(
-            take_sealed_for_test().len(),
-            1,
-            "the reseated lane seals once"
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS_REFUSED.to_string()],
+            "the reseated lane seals once, naming key operations unavailable"
+        );
+        assert_eq!(
+            starts.len(),
+            3,
+            "the sizes start, its base retry, and the ordinary fallback all ran"
+        );
+        assert_eq!(
+            starts
+                .iter()
+                .map(|start| start.key_sizes)
+                .collect::<Vec<_>>(),
+            [Some(true), Some(false), None],
+            "the fallback runs an ordinary start, not a third journal start"
+        );
+        let pid = std::process::id();
+        assert!(
+            starts
+                .iter()
+                .all(|start| matches!(start.scope, Scope::Pid(candidate) if candidate == pid)),
+            "all starts run over the run's scope: {starts:?}"
         );
         let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
         assert_eq!(gaps.len(), 1, "the journal reason is named once");
+        assert_eq!(
+            gaps_with_repeats_for_subject(&mut coordinator, "key operations unavailable")
+                .iter()
+                .map(|(_, repeats)| *repeats)
+                .collect::<Vec<_>>(),
+            [1],
+            "the operations gap is one emission, not an aggregated repeat"
+        );
         assert!(
             gaps_for_subject(&mut coordinator, "key sizes unavailable").is_empty(),
             "no sizes gap without a seated base journal"

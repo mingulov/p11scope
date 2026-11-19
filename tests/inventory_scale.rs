@@ -918,6 +918,9 @@ struct ChurnCondition {
     admitted: BTreeSet<u32>,
     exited: BTreeSet<u32>,
     killed: bool,
+    kill_signalled: bool,
+    kill_baseline_exited: BTreeSet<u32>,
+    signal_outcome: Option<bool>,
     birth_fired: bool,
     last_pass: Option<u64>,
     kill_admitting_pass: Option<u64>,
@@ -1009,34 +1012,58 @@ impl ChurnCondition {
             // signalled on a later tick, and the document assertions
             // below stay loud about the missed kill.
             self.killed = true;
-            // Admitted events precede their pass marker in the commit
-            // batch, so the admitting pass is one past the last marker
-            // seen before this tick (pass 0 when none seen yet); the
-            // kill-cadence assert below needs a later pass observing the
-            // deaths.
-            self.kill_admitting_pass = Some(
-                pass_before_tick
-                    .map(|pass| pass.saturating_add(1))
-                    .unwrap_or(0),
-            );
-            if let (Some(churn_a), Some(anchor)) = (self.churn_a, self.anchor)
-                && pid_is_driver(churn_a, &self.driver_exe)
-                && pid_is_driver(anchor, &self.driver_exe)
-            {
-                unsafe {
-                    libc::kill(churn_a as i32, libc::SIGTERM);
-                    libc::kill(anchor as i32, libc::SIGTERM);
+            if self.kill_admitting_pass.is_none() {
+                // Fallback when the admission bypassed event lines (a
+                // twin pre-seeding `admitted` directly): one past the
+                // last marker seen before this tick. The row-time
+                // resolution in the admitted handler already covered
+                // every streamed admission.
+                self.kill_admitting_pass = Some(
+                    pass_before_tick
+                        .map(|pass| pass.saturating_add(1))
+                        .unwrap_or(0),
+                );
+            }
+            // Eligibility for the progress stop needs successful
+            // requests for BOTH fixtures, not just the attempt above.
+            // The scripted path injects the outcome so twins stay
+            // deterministic over dead pids; the live path checks the
+            // fixture identity it already holds.
+            let signalled = match self.signal_outcome {
+                Some(outcome) => outcome,
+                None => {
+                    if let (Some(churn_a), Some(anchor)) = (self.churn_a, self.anchor)
+                        && pid_is_driver(churn_a, &self.driver_exe)
+                        && pid_is_driver(anchor, &self.driver_exe)
+                    {
+                        unsafe {
+                            libc::kill(churn_a as i32, libc::SIGTERM);
+                            libc::kill(anchor as i32, libc::SIGTERM);
+                        }
+                        true
+                    } else {
+                        false
+                    }
                 }
+            };
+            if signalled {
+                self.kill_signalled = true;
+                // Refuse every death already consumed before these
+                // requests: only post-request observations committed by
+                // a later ordinary marker can satisfy the stop.
+                self.kill_baseline_exited = self.exited.clone();
             }
         }
     }
 
-    /// Progress stop: the conditioned kill has fired, a nonterminal pass
-    /// past the admitting pass carried both exit observations, and
-    /// churn-C's birth is visible. A later pass alone proves nothing: a
-    /// descheduled pump can consume pre-kill markers in one tick, and a
-    /// pass published after the kill request may have scanned before the
-    /// signals landed. The run then ends on progress instead of the wall
+    /// Progress stop: the kill was attempted AND successfully requested
+    /// for both fixtures, a nonterminal pass past the admitting pass
+    /// committed both post-request exit observations, and churn-C's
+    /// birth is visible. A later pass alone proves nothing: a
+    /// descheduled pump can consume pre-kill markers in one tick, a pass
+    /// published after the kill request may have scanned before the
+    /// signals landed, and fixtures can exit independently while a batch
+    /// is buffered. The run then ends on progress instead of the wall
     /// clock; the `--duration` backstop only bounds a stalled observer.
     /// Waiting for churn-C's ready file too keeps an early stop from
     /// racing its birth: the birth trigger fired at the first pass, so by
@@ -1044,6 +1071,7 @@ impl ChurnCondition {
     /// residual lag just runs one more pass.
     fn settled_for_stop(&self) -> bool {
         self.killed
+            && self.kill_signalled
             && self.churn_c.is_some()
             && matches!(
                 (self.kill_admitting_pass, self.exit_observing_pass),
@@ -1074,11 +1102,18 @@ impl ChurnCondition {
             self.last_pass = Some(self.last_pass.map_or(pass, |last| last.max(pass)));
             // Caller events precede their pass marker in the commit batch,
             // so both conditioned exits being present at marker time means
-            // this pass carried them. The first such pass gates the stop.
-            if self.exit_observing_pass.is_none()
+            // this pass carried them — but only once the kill was
+            // successfully requested for both fixtures, and only for
+            // deaths observed after those requests. A death already
+            // consumed before the requests is refused, so the first
+            // qualifying pass gates the stop.
+            if self.kill_signalled
+                && self.exit_observing_pass.is_none()
                 && let (Some(anchor), Some(churn_a)) = (self.anchor, self.churn_a)
                 && self.exited.contains(&anchor)
                 && self.exited.contains(&churn_a)
+                && !self.kill_baseline_exited.contains(&anchor)
+                && !self.kill_baseline_exited.contains(&churn_a)
             {
                 self.exit_observing_pass = Some(pass);
             }
@@ -1111,7 +1146,21 @@ impl ChurnCondition {
         }
         match (payload["event"].as_str(), pid) {
             (Some("admitted"), Some(pid)) => {
+                // Resolve the admitting pass at the churn-A admission
+                // row, from the most recent preceding ordinary marker
+                // (pass 0 when none seen yet). Admitted events precede
+                // their pass marker in one sequential byte stream, so
+                // this stays accurate when the first admitting row
+                // follows other completed passes within one pump read.
+                let first_churn_a = self.churn_a.is_some_and(|a| a == pid)
+                    && !self.admitted.contains(&pid)
+                    && self.kill_admitting_pass.is_none();
                 self.admitted.insert(pid);
+                if first_churn_a {
+                    self.kill_admitting_pass = Some(
+                        self.last_pass.map(|pass| pass.saturating_add(1)).unwrap_or(0),
+                    );
+                }
             }
             (Some("exited") | Some("retired"), Some(pid)) => {
                 self.exited.insert(pid);
@@ -1187,6 +1236,9 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         admitted: BTreeSet::new(),
         exited: BTreeSet::new(),
         killed: false,
+        kill_signalled: false,
+        kill_baseline_exited: BTreeSet::new(),
+        signal_outcome: None,
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
@@ -1469,7 +1521,9 @@ const GUARD_CHURN_C: u32 = 4_190_308;
 const GUARD_DRIVER: &str = "/nonexistent/churn-guard-driver";
 
 /// Scripted `ChurnCondition` over dead pids and a fake driver path: the
-/// kill latch fires on the admitted event, but no signal is ever sent.
+/// kill latch fires on the admitted event with a successful signal
+/// outcome injected, but no signal is ever sent. Twins covering a
+/// refused kill override `signal_outcome` with `Some(false)`.
 fn scripted_churn_condition(dir: &Path) -> ChurnCondition {
     let ready = dir.join("ready");
     std::fs::create_dir_all(&ready).unwrap();
@@ -1495,6 +1549,9 @@ fn scripted_churn_condition(dir: &Path) -> ChurnCondition {
         admitted: BTreeSet::new(),
         exited: BTreeSet::new(),
         killed: false,
+        kill_signalled: false,
+        kill_baseline_exited: BTreeSet::new(),
+        signal_outcome: Some(true),
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
@@ -1614,8 +1671,9 @@ fn churn_pump_trips_rotation_tripwire_on_shrink() {
 
 #[test]
 fn churn_settled_for_stop_needs_kill_and_later_pass_and_birth() {
-    // Twin: the progress stop fires only when the kill has fired, a later
-    // pass carrying both exit observations published past the admitting
+    // Twin: the progress stop fires only when the kill was attempted and
+    // successfully requested for both fixtures, a later pass carrying
+    // both post-request exit observations published past the admitting
     // pass, and churn-C's birth is visible. Each missing leg vetoes the
     // stop on its own. A later pass without the exits never stops, even
     // with the kill and the birth.
@@ -1634,6 +1692,11 @@ fn churn_settled_for_stop_needs_kill_and_later_pass_and_birth() {
         "exit pass plus birth without the kill never stop"
     );
     condition.killed = true;
+    assert!(
+        !condition.settled_for_stop(),
+        "a kill attempt without successful requests for both fixtures never stops"
+    );
+    condition.kill_signalled = true;
     condition.exit_observing_pass = None;
     assert!(
         !condition.settled_for_stop(),
@@ -1804,56 +1867,75 @@ fn churn_stop_refuses_exits_buffered_before_kill_request() {
     // Twin: both exits land buffered in the same tick as the admitting
     // row, before any kill request. The attempt latch fires, but the
     // pre-request deaths must not satisfy the stop, and a later marker
-    // with no new observations must not commit them either.
-    let dir = tmp("inventory-churn-guard-stop-buffered");
-    let mut condition = scripted_churn_condition(&dir);
-    std::fs::write(
-        &condition.events,
-        format!(
-            "{}{}",
-            guard_admitted_line(GUARD_ANCHOR),
-            guard_pass_marker_line(0)
-        ),
-    )
-    .unwrap();
-    condition.pump();
-    assert!(
-        !condition.killed,
-        "anchor admission alone leaves the kill latch clear"
-    );
-    assert_eq!(condition.last_pass, Some(0));
-    std::fs::write(
-        condition.ready.join("churn-c.ready"),
-        format!("READY {}\n", GUARD_CHURN_C),
-    )
-    .unwrap();
-    let mut buffered = std::fs::read_to_string(&condition.events).unwrap();
-    buffered.push_str(&guard_admitted_line(GUARD_CHURN_A));
-    buffered.push_str(&guard_pass_marker_line(1));
-    buffered.push_str(&guard_exit_line(GUARD_ANCHOR));
-    buffered.push_str(&guard_exit_line(GUARD_CHURN_A));
-    buffered.push_str(&guard_pass_marker_line(2));
-    std::fs::write(&condition.events, &buffered).unwrap();
-    condition.pump();
-    assert!(condition.killed, "kill latch fires on churn-A admission");
-    assert_eq!(condition.kill_admitting_pass, Some(1));
-    assert!(condition.churn_c.is_some(), "churn-C birth is visible");
-    assert!(
-        condition.exited.contains(&GUARD_ANCHOR)
-            && condition.exited.contains(&GUARD_CHURN_A),
-        "both buffered exits are consumed in the request tick"
-    );
-    assert!(
-        !condition.settled_for_stop(),
-        "exits committed before the kill request must not stop"
-    );
-    buffered.push_str(&guard_pass_marker_line(3));
-    std::fs::write(&condition.events, &buffered).unwrap();
-    condition.pump();
-    assert!(
-        !condition.settled_for_stop(),
-        "a later marker with no new observations must not commit pre-request deaths"
-    );
+    // with no new observations must not commit them either — whether
+    // the fixture identity check refuses the signals or (scripted)
+    // reports success. The refused leg pins eligibility; the success
+    // leg pins the pre-request baseline refusal.
+    for signal_outcome in [false, true] {
+        let dir = tmp(&format!(
+            "inventory-churn-guard-stop-buffered-{signal_outcome}"
+        ));
+        let mut condition = scripted_churn_condition(&dir);
+        condition.signal_outcome = Some(signal_outcome);
+        std::fs::write(
+            &condition.events,
+            format!(
+                "{}{}",
+                guard_admitted_line(GUARD_ANCHOR),
+                guard_pass_marker_line(0)
+            ),
+        )
+        .unwrap();
+        condition.pump();
+        assert!(
+            !condition.killed,
+            "anchor admission alone leaves the kill latch clear (signals {signal_outcome})"
+        );
+        assert_eq!(condition.last_pass, Some(0));
+        std::fs::write(
+            condition.ready.join("churn-c.ready"),
+            format!("READY {}\n", GUARD_CHURN_C),
+        )
+        .unwrap();
+        let mut buffered = std::fs::read_to_string(&condition.events).unwrap();
+        buffered.push_str(&guard_admitted_line(GUARD_CHURN_A));
+        buffered.push_str(&guard_pass_marker_line(1));
+        buffered.push_str(&guard_exit_line(GUARD_ANCHOR));
+        buffered.push_str(&guard_exit_line(GUARD_CHURN_A));
+        buffered.push_str(&guard_pass_marker_line(2));
+        std::fs::write(&condition.events, &buffered).unwrap();
+        condition.pump();
+        assert!(
+            condition.killed,
+            "kill latch fires on churn-A admission (signals {signal_outcome})"
+        );
+        assert_eq!(condition.kill_admitting_pass, Some(1));
+        assert_eq!(
+            condition.kill_signalled, signal_outcome,
+            "eligibility tracks the injected signal outcome"
+        );
+        assert!(condition.churn_c.is_some(), "churn-C birth is visible");
+        assert!(
+            condition.exited.contains(&GUARD_ANCHOR)
+                && condition.exited.contains(&GUARD_CHURN_A),
+            "both buffered exits are consumed in the request tick"
+        );
+        assert_eq!(
+            condition.exit_observing_pass, None,
+            "no pass observes post-request exits yet (signals {signal_outcome})"
+        );
+        assert!(
+            !condition.settled_for_stop(),
+            "exits committed before the kill request must not stop (signals {signal_outcome})"
+        );
+        buffered.push_str(&guard_pass_marker_line(3));
+        std::fs::write(&condition.events, &buffered).unwrap();
+        condition.pump();
+        assert!(
+            !condition.settled_for_stop(),
+            "a later marker with no new observations must not commit pre-request deaths (signals {signal_outcome})"
+        );
+    }
 }
 
 #[test]

@@ -528,6 +528,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// only: the snapshot distinguishes "requested but unavailable"
     /// from "off"). Set once at run setup; harnesses leave it false.
     key_operations_requested: bool,
+    /// Whether `--key-sizes` was requested for this run (v0.8.0
+    /// keymeta Task 3 userspace): the Joint key-use reducer admits
+    /// length evidence and the text renderer shows sizes. Set once at
+    /// run setup beside `key_operations_requested`; harnesses leave
+    /// it false. Task 2 BPF length capture is pending: until it
+    /// lands, flag-on runs observe no lengths.
+    key_sizes_requested: bool,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
     /// Inventory capture. Proved offsets lower into the run's attach set
@@ -1301,6 +1308,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scan_mint_sources: None,
             count_manifests: Vec::new(),
             key_operations_requested: false,
+            key_sizes_requested: false,
             prearm: None,
             prearm_prior: (0, 0),
             prearm_state: crate::prearm_module::PrearmState::empty(),
@@ -1451,6 +1459,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Whether `--key-operations` was requested for this run.
     pub(crate) fn key_operations_requested(&self) -> bool {
         self.key_operations_requested
+    }
+
+    /// Record the run's `--key-sizes` request for the userspace
+    /// inference lane (Task 3 without Task 2 BPF: the reducer and
+    /// text gates; length programs arrive with Task 2).
+    pub(crate) fn set_key_sizes_requested(&mut self, requested: bool) {
+        self.key_sizes_requested = requested;
+    }
+
+    /// Whether `--key-sizes` was requested for this run.
+    pub(crate) fn key_sizes_requested(&self) -> bool {
+        self.key_sizes_requested
     }
 
     /// Retains an already-validated `--prearm-module` pinning for the run's

@@ -308,6 +308,7 @@ fn run() -> Result<i32> {
                 a.identity_backend_explicit,
                 a.caller_metadata,
                 a.key_operations,
+                a.key_sizes,
                 a.quiet,
             )
             .map_err(|error| {

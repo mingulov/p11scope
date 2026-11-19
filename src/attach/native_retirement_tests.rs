@@ -624,6 +624,17 @@ fn yield_to_worker(poll: usize) {
     }
 }
 
+/// Yields only while a close/disposal cursor makes no foreground progress.
+/// Disposal polls that shrink the backing drain drive at full speed; only
+/// polls that purely wait on the worker sleep. Close loops carry a
+/// wall-clock deadline, and unconditional sleeps cannot keep a many-item
+/// disposal ahead of it while the worker idles.
+fn yield_while_waiting(poll: usize, progressed: bool) {
+    if !progressed {
+        yield_to_worker(poll);
+    }
+}
+
 fn collected_case(
     count: usize,
     closer: super::fixture::Closer,
@@ -703,12 +714,18 @@ fn collected_close(
     ticket: &CollectedRetirementTicket,
 ) -> RetainedRetirementInput {
     let deadline = Instant::now() + Duration::from_secs(2);
-    for _ in 0..COLLECTED_CREDITS {
+    let mut backing = native.foreground_backing_items();
+    for poll in 0..COLLECTED_CREDITS {
         assert!(Instant::now() < deadline, "original close did not settle");
         let progress = native.poll(q, ticket, 1).unwrap();
         assert_eq!(progress.used, 1);
         match progress.state {
-            CollectedRetirementState::Pending => std::thread::yield_now(),
+            CollectedRetirementState::Pending => {
+                let now = native.foreground_backing_items();
+                let progressed = now < backing;
+                backing = now;
+                yield_while_waiting(poll, progressed);
+            }
             CollectedRetirementState::Closed(input) => return input,
             _ => panic!("healthy original batch produced no exact closure result"),
         }
@@ -1281,12 +1298,12 @@ fn collected_retirement_cancel_before_and_after_first_mutation() {
         assert!(zero.ticket.is_none());
         assert_eq!((native.reads_and_transfers(), pool.snapshot()), before);
         let mut returned = None;
-        for _ in 0..COLLECTED_CREDITS {
+        for poll in 0..COLLECTED_CREDITS {
             let progress = native.cancel(input.as_ref(), ticket.as_ref(), 1).unwrap();
             assert_eq!(progress.used, 1);
             match progress.state {
                 CollectedRetirementState::Yielded if !post_take => break,
-                CollectedRetirementState::Preparing => std::thread::yield_now(),
+                CollectedRetirementState::Preparing => yield_to_worker(poll),
                 CollectedRetirementState::RefusedUntouched(input) => {
                     returned = Some(input);
                     break;
@@ -1533,7 +1550,7 @@ fn collected_retirement_failed_batch_keeps_custody_and_unproved_completion() {
     let links = native.original_links();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut refused = false;
-    for _ in 0..COLLECTED_CREDITS {
+    for poll in 0..COLLECTED_CREDITS {
         assert!(
             Instant::now() < deadline,
             "a failed original batch must refuse, not hang"
@@ -1541,7 +1558,7 @@ fn collected_retirement_failed_batch_keeps_custody_and_unproved_completion() {
         let progress = native.poll(&q, &ticket, 1).unwrap();
         assert_eq!(progress.used, 1);
         match progress.state {
-            CollectedRetirementState::Pending => std::thread::yield_now(),
+            CollectedRetirementState::Pending => yield_to_worker(poll),
             CollectedRetirementState::RefusedRetained => {
                 refused = true;
                 break;
@@ -1679,7 +1696,7 @@ fn collected_retirement_metadata_release_respects_one_credit() {
     );
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut closed = false;
-    for _ in 0..COLLECTED_CREDITS {
+    for poll in 0..COLLECTED_CREDITS {
         assert!(Instant::now() < deadline);
         let before = native.foreground_backing_items();
         let progress = native.poll(&q, &ticket, 1).unwrap();
@@ -1689,7 +1706,9 @@ fn collected_retirement_metadata_release_respects_one_credit() {
             "one credit cannot dispose multiple foreground cursor items"
         );
         match progress.state {
-            CollectedRetirementState::Pending => {}
+            CollectedRetirementState::Pending => {
+                yield_while_waiting(poll, native.foreground_backing_items() < before);
+            }
             CollectedRetirementState::Closed(input) => {
                 drop(input);
                 closed = true;
@@ -2098,7 +2117,8 @@ fn collected_retirement_final_file_and_exports_release_on_original_worker() {
     let charged = pool.snapshot().charged_bytes;
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut executing = None;
-    for _ in 0..COLLECTED_CREDITS {
+    let mut backing = native.foreground_backing_items();
+    for poll in 0..COLLECTED_CREDITS {
         assert!(Instant::now() < deadline);
         let progress = native.poll(&q, &ticket, 1).unwrap();
         assert_eq!(progress.used, 1);
@@ -2107,7 +2127,10 @@ fn collected_retirement_final_file_and_exports_release_on_original_worker() {
             executing = Some(thread);
             break;
         }
-        std::thread::yield_now();
+        let now = native.foreground_backing_items();
+        let progressed = now < backing;
+        backing = now;
+        yield_while_waiting(poll, progressed);
     }
     let executing = executing.expect("actual retained-owner release reached original worker");
     assert_ne!(executing, std::thread::current().id());
@@ -2196,11 +2219,11 @@ fn collected_retirement_boxed_q_survives_owner_moves() {
         input: &mut Option<RetainedRetirementInput>,
         reserve: &SemanticResourceReserver,
     ) -> anyhow::Result<CollectedRetirementTicket> {
-        for _ in 0..COLLECTED_CREDITS {
+        for poll in 0..COLLECTED_CREDITS {
             let progress = fixture.collected_prepare(input, reserve, 1)?;
             assert_eq!(progress.used, 1);
             match progress.state {
-                CollectedRetirementState::Preparing => {}
+                CollectedRetirementState::Preparing => yield_to_worker(poll),
                 CollectedRetirementState::Prepared(ticket) => return Ok(ticket),
                 _ => anyhow::bail!("unexpected collected preparation phase"),
             }
@@ -2212,11 +2235,11 @@ fn collected_retirement_boxed_q_survives_owner_moves() {
         fixture: &mut RetirementFixture,
         ticket: &CollectedRetirementTicket,
     ) {
-        for _ in 0..COLLECTED_CREDITS {
+        for poll in 0..COLLECTED_CREDITS {
             let progress = fixture.collected_begin(ticket, 1).unwrap();
             assert_eq!(progress.used, 1);
             match progress.state {
-                CollectedRetirementState::Transferring => {}
+                CollectedRetirementState::Transferring => yield_to_worker(poll),
                 CollectedRetirementState::Pending => return,
                 _ => panic!("boxed ownership did not reach its own worker"),
             }
@@ -2377,14 +2400,17 @@ fn collected_retirement_input_measure_covers_preflight() {
     ));
     let mut preflight_need = None;
     let ticket = (0..COLLECTED_CREDITS)
-        .find_map(|_| {
+        .find_map(|poll| {
             let progress = native.prepare(&q, &mut input, &reserve, 1).unwrap();
             assert_eq!(progress.used, 1);
             if native.preflight_at_input_coverage() && preflight_need.is_none() {
                 preflight_need = native.preflight_checkpoint().map(|checkpoint| checkpoint.3);
             }
             match progress.state {
-                CollectedRetirementState::Preparing => None,
+                CollectedRetirementState::Preparing => {
+                    yield_to_worker(poll);
+                    None
+                }
                 CollectedRetirementState::Prepared(ticket) => Some(ticket),
                 _ => panic!("spare-measured input did not prepare"),
             }
@@ -2419,12 +2445,12 @@ fn collected_retirement_input_measure_covers_preflight() {
         let retained = native.retained_slots();
         let mut ticket = None;
         let mut failure = None;
-        for _ in 0..COLLECTED_CREDITS {
+        for poll in 0..COLLECTED_CREDITS {
             match native.prepare(&q, &mut input, &reserve, 1) {
                 Ok(progress) => {
                     assert_eq!(progress.used, 1);
                     match progress.state {
-                        CollectedRetirementState::Preparing => {}
+                        CollectedRetirementState::Preparing => yield_to_worker(poll),
                         CollectedRetirementState::Prepared(found) => {
                             ticket = Some(found);
                             break;

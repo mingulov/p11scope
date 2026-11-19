@@ -8120,6 +8120,103 @@ fn demotion_retirement_round5_folded_instances_saturate_past_the_bound() {
     assert_eq!(departed["folded_instances_dropped"], 1);
 }
 
+/// Five providers each under the per-module folded-instance bound
+/// still hit the run-wide bound: 16,384 rows retained, the rest
+/// counted on the provider that overflowed, and the next new row
+/// raises its own provider's drop/saturation fields.
+#[test]
+fn demotion_retirement_round5_folded_instances_saturate_run_wide_across_providers() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::discovery::caller_registry::{
+        CallerId, CallerRegistry, MAX_FOLDED_INSTANCES_GLOBAL, MAX_FOLDED_INSTANCES_PER_MODULE,
+        ModuleKey, RegistryLimits,
+    };
+    const PER_MODULE: usize = 3500;
+    assert!(PER_MODULE < MAX_FOLDED_INSTANCES_PER_MODULE);
+    assert!(5 * PER_MODULE > MAX_FOLDED_INSTANCES_GLOBAL);
+    let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+    let caller = CallerId(7);
+    let mut modules = Vec::new();
+    for index in 0..5u32 {
+        let key = ModuleKey::physical(
+            8,
+            1,
+            100 + u64::from(index),
+            None,
+            &format!("/lib/p{index}.so"),
+        );
+        modules.push(registry.scripted_module_edge(key, caller));
+    }
+    for (module_index, module) in modules.iter().enumerate() {
+        for row in 0..PER_MODULE as u32 {
+            let id = RegistryInstanceId::from_raw(module_index as u32 * 10_000 + row);
+            registry.insert_folded_instance(*module, id, CallerId(row));
+        }
+    }
+    let retained: usize = modules
+        .iter()
+        .map(|module| {
+            registry
+                .module(*module)
+                .expect("scripted module retained")
+                .departed_use
+                .as_ref()
+                .expect("folded module has departed use")
+                .folded_instances
+                .len()
+        })
+        .sum();
+    assert_eq!(retained, MAX_FOLDED_INSTANCES_GLOBAL);
+    for (index, module) in modules.iter().enumerate() {
+        let departed = registry
+            .module(*module)
+            .expect("scripted module retained")
+            .departed_use
+            .as_ref()
+            .expect("folded module has departed use");
+        if index < 4 {
+            assert_eq!(departed.folded_instances.len(), PER_MODULE);
+            assert_eq!(departed.folded_instances_dropped, 0);
+            assert!(!departed.folded_instances_saturated);
+        } else {
+            let expected = MAX_FOLDED_INSTANCES_GLOBAL - 4 * PER_MODULE;
+            assert_eq!(departed.folded_instances.len(), expected);
+            assert_eq!(
+                departed.folded_instances_dropped,
+                (PER_MODULE - expected) as u64
+            );
+            assert!(departed.folded_instances_saturated);
+        }
+    }
+    registry.insert_folded_instance(
+        modules[0],
+        RegistryInstanceId::from_raw(90_000),
+        CallerId(99),
+    );
+    let retained_after: usize = modules
+        .iter()
+        .map(|module| {
+            registry
+                .module(*module)
+                .expect("scripted module retained")
+                .departed_use
+                .as_ref()
+                .expect("folded module has departed use")
+                .folded_instances
+                .len()
+        })
+        .sum();
+    assert_eq!(retained_after, MAX_FOLDED_INSTANCES_GLOBAL);
+    let first = registry
+        .module(modules[0])
+        .expect("scripted module retained")
+        .departed_use
+        .as_ref()
+        .expect("folded module has departed use");
+    assert_eq!(first.folded_instances_dropped, 1);
+    assert!(first.folded_instances_saturated);
+}
+
 /// Item 1: an exec-retired caller with calls folds exactly, and live
 /// operations still open at the fold end unknown with explicit
 /// accounting — never silently completed, never silently dropped.

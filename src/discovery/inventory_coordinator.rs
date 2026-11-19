@@ -731,6 +731,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// fold and servicing removals share it).
     #[cfg(test)]
     recovery_order_search_visits: u64,
+    /// Edges examined while sizing fold admission (test count): the
+    /// stop-paced member pre-index, never a per-caller range scan.
+    #[cfg(test)]
+    fold_edge_sizing_visits: std::cell::Cell<u64>,
+    /// Count-ownership summaries examined while sizing fold admission
+    /// (test count): the stop-paced member pre-index.
+    #[cfg(test)]
+    fold_summary_sizing_visits: std::cell::Cell<u64>,
     /// The next pending-count handle (P3): minted in staging order.
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
@@ -1447,6 +1455,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             fold_pair_recovery_visits: 0,
             #[cfg(test)]
             recovery_order_search_visits: 0,
+            #[cfg(test)]
+            fold_edge_sizing_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            fold_summary_sizing_visits: std::cell::Cell::new(0),
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
@@ -5836,6 +5848,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn set_exec_pruned_cap_for_test(&mut self, cap: usize) {
         self.exec_pruned_cap = cap;
+    }
+
+    /// Test-only: edges examined while sizing fold admission.
+    #[cfg(test)]
+    pub(crate) fn fold_edge_sizing_visits_for_test(&self) -> u64 {
+        self.fold_edge_sizing_visits.get()
+    }
+
+    /// Test-only: count-ownership summaries examined while sizing fold
+    /// admission.
+    #[cfg(test)]
+    pub(crate) fn fold_summary_sizing_visits_for_test(&self) -> u64 {
+        self.fold_summary_sizing_visits.get()
     }
 
     /// Test-only: pair targets examined by departed-caller folds.
@@ -26438,6 +26463,430 @@ exit 0
             native.scene.coordinator.adapter.record(id).is_none(),
             "the real row folds exactly once"
         );
+    }
+
+    /// Edge-sizing twin: one caller with 200 edges sorts last behind
+    /// 1,023 single-credit siblings. A stop inside the edge sizing
+    /// must abort the plan partway — bounded sizing visits with the
+    /// waiter's evidence intact — and the quiet resumes defer it past
+    /// the credit boundary first, then fold it exactly once.
+    #[test]
+    fn fold_edge_heavy_last_caller_sizing_aborts_and_defers_exact() {
+        const EDGES: u64 = 200;
+        const SIBLINGS: u32 = 1023;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut ids = Vec::new();
+        for caller in 0..SIBLINGS {
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                10_000 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        let heavy = stage_exited_caller(&mut native, 5030 + SIBLINGS, 100);
+        for edge in 0..EDGES {
+            native
+                .scene
+                .coordinator
+                .registry_mut()
+                .scripted_module_edge(
+                    ModuleKey::physical(8, 1, 7000 + edge, None, "/fold/edge-heavy.so"),
+                    heavy,
+                );
+        }
+        ids.push(heavy);
+        assert_eq!(
+            ids.iter().max(),
+            Some(&heavy),
+            "the edge-heavy caller sorts last, past its affordable window"
+        );
+        native.scene.coordinator.note_rendered_callers(&ids);
+        // Quiet through the entry gate and the 47 scan laps (1,024
+        // rendered + 1,024 candidates + 1,023 cookies), tripped at the
+        // next check: the second sizing lap over the 200 edges.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 49
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            0,
+            "a stop inside the edge sizing folds nothing"
+        );
+        let visits = native.scene.coordinator.fold_edge_sizing_visits_for_test();
+        assert!(
+            (1..EDGES).contains(&visits),
+            "the sizing scan aborts partway on stop, after {visits} of {EDGES}"
+        );
+        assert_eq!(checks.get(), 50, "the trip fires at the second sizing lap");
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "no row folds on the aborted pass"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            EDGES as usize,
+            "the waiter's edges stay live past the trip"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1024,
+            "every row waits out the stop in the carry"
+        );
+        // The quiet resume folds the siblings and defers the heavy
+        // caller past the credit boundary with its evidence intact.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            u64::from(SIBLINGS),
+            "one remaining credit does not admit 4 credits of edge work"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the edge-heavy caller waits past the credit boundary"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            EDGES as usize,
+            "the waiting row keeps its edges"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "exactly one row waits past the cap"
+        );
+        // The final resume folds it exactly once.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(500, None)
+                .retired,
+            1,
+            "the remainder resumes without a re-note"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every heavy edge folds"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            0,
+            "no row waits past the resume"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_caller_rows_for_test(),
+            1024,
+            "every row publishes exactly once"
+        );
+    }
+
+    /// Summary-sizing twin: one caller with 500 count-ownership
+    /// summaries sorts last behind 1,023 single-credit siblings. The
+    /// admission cost must count the summaries: the waiter defers past
+    /// the credit boundary with its summaries intact, then folds
+    /// exactly once with every summary removed.
+    #[test]
+    fn fold_summary_heavy_last_caller_defers_and_cleans_exact() {
+        const SUMMARIES: u32 = 500;
+        const SIBLINGS: u32 = 1023;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let mut ids = Vec::new();
+        for caller in 0..SIBLINGS {
+            let id = stage_exited_caller(&mut native, 5030 + caller, 100);
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                10_000 + u64::from(caller),
+                0,
+                Some(id),
+            );
+            ids.push(id);
+        }
+        let heavy = stage_exited_caller(&mut native, 5030 + SIBLINGS, 100);
+        for object in 0..SUMMARIES {
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .count_ownership
+                    .register_pair(heavy, object),
+                "the summary fits"
+            );
+        }
+        ids.push(heavy);
+        assert_eq!(
+            ids.iter().max(),
+            Some(&heavy),
+            "the summary-heavy caller sorts last, past its affordable window"
+        );
+        native.scene.coordinator.note_rendered_callers(&ids);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            u64::from(SIBLINGS),
+            "one remaining credit does not admit 8 credits of summary work"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the summary-heavy caller waits past the credit boundary"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            SUMMARIES as usize,
+            "the waiting row keeps its summaries"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "exactly one row waits past the cap"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .fold_summary_sizing_visits_for_test(),
+            u64::from(SUMMARIES),
+            "planning sizes every summary"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the remainder resumes without a re-note"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "the fold removes every summary"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            0,
+            "no row waits past the resume"
+        );
+        assert_eq!(
+            native.scene.coordinator.retired_caller_rows_for_test(),
+            1024,
+            "every row publishes exactly once"
+        );
+    }
+
+    /// Oversized-staging twin: one caller with 70,000 binder sequences
+    /// plus edges, a pair, a recovery, instances and summaries costs
+    /// more than a whole credit window. No single pass folds it: each
+    /// pass clears a credited slice, the row waits carried with its
+    /// receipt unpublished, and the final slice publishes the
+    /// completed fold exactly once.
+    #[test]
+    fn fold_oversized_caller_stages_across_credited_windows() {
+        const SEQUENCES: u64 = 70_000;
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let heavy = stage_exited_caller(&mut native, 5030, 100);
+        for sequence in 0..SEQUENCES {
+            native.scene.coordinator.binder.stage_cookie_for_test(
+                domain,
+                100 + sequence,
+                sequence,
+                Some(heavy),
+            );
+        }
+        // A few members of every other kind ride the same stage.
+        for edge in 0..50u64 {
+            native
+                .scene
+                .coordinator
+                .registry_mut()
+                .scripted_module_edge(
+                    ModuleKey::physical(8, 1, 7000 + edge, None, "/fold/staged.so"),
+                    heavy,
+                );
+        }
+        let target = PairKey::scripted(domain, 500, 0, 0);
+        native.scene.coordinator.pair_targets.insert(
+            target,
+            PairTarget::scripted_bound(
+                heavy,
+                ModuleKey::physical(8, 1, 7000, None, "/fold/pair.so"),
+                0,
+                10,
+                10,
+            ),
+        );
+        let stalled = PairKey::scripted(domain, 1500, 0, 0);
+        native
+            .scene
+            .coordinator
+            .recoveries
+            .insert(stalled, PairRecovery::scripted(heavy, 0, ModuleId(3)));
+        native.scene.coordinator.recovery_order.push(target);
+        native.scene.coordinator.recovery_order.push(stalled);
+        for object in 0..3u32 {
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .count_ownership
+                    .register_pair(heavy, object),
+                "the summary fits"
+            );
+        }
+        for (slot, cookie) in [(7u64, 300u64), (8, 301)] {
+            let instance = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+                domain,
+                p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 1,
+                },
+                crate::discovery::instances::InstanceId::from_raw(slot),
+                ModuleKey::physical(8, 1, 7000, None, "/fold/staged.so"),
+            );
+            native.scene.coordinator.registry_mut().note_instance(
+                crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(
+                    instance, heavy,
+                ),
+            );
+        }
+        native.scene.coordinator.registry_mut().publish();
+        native.scene.coordinator.note_rendered_callers(&[heavy]);
+        // Pass 1 clears a credited slice and publishes nothing.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired,
+            0,
+            "an oversized caller publishes no partial fold"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_some(),
+            "the staged row waits carried"
+        );
+        let bound = native
+            .scene
+            .coordinator
+            .binder
+            .cookie_bound_owners_for_test();
+        assert!(
+            !bound.is_empty() && bound.len() < SEQUENCES as usize,
+            "the first slice clears a bounded prefix of the sequences"
+        );
+        assert!(
+            bound.iter().all(|owner| *owner == heavy),
+            "no other row loses evidence to the slice"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            1,
+            "the staged row waits past the slice"
+        );
+        // Pass 2 completes the stage and publishes exactly once.
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the completed stage publishes once"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(heavy).is_none(),
+            "the heavy row eventually folds"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .cookie_bound_owners_for_test()
+                .is_empty(),
+            "every sequence clears exactly once"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry().edges_of(heavy).count(),
+            0,
+            "every staged edge folds"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry()
+                .instances()
+                .filter(|record| record.caller == heavy)
+                .count(),
+            0,
+            "every staged instance folds"
+        );
+        assert!(
+            native.scene.coordinator.recoveries.is_empty(),
+            "no stalled recovery survives its caller"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .count_ownership
+                .summary_count_for_test(heavy),
+            0,
+            "every staged summary clears"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            0,
+            "no row waits past the completed stage"
+        );
+        let dropped_base: u64 = native
+            .scene
+            .coordinator
+            .pair_targets
+            .values()
+            .map(|target| match target {
+                PairTarget::Dropped { base, .. } => *base,
+                PairTarget::Bound { .. }
+                | PairTarget::Pending { .. }
+                | PairTarget::Suspended { .. } => 0,
+            })
+            .sum();
+        assert_eq!(dropped_base, 10, "the staged base lands exactly once");
     }
 
     /// Twin: an exec newcomer the next pass enumerates and admits is

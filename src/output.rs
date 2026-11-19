@@ -2172,16 +2172,23 @@ pub(crate) struct RecoveryStaging {
 
 impl RecoveryStaging {
     /// Creates an empty private staging file for `dest` (whose
-    /// extension names the suffix, `json` when absent) in the recovery
-    /// dir held for `base`. The file is `0600`, `O_EXCL`, unique over
-    /// 128 sequence retries.
+    /// extension names the bounded suffix, `json` when absent) in the
+    /// recovery dir held for `base`. The file is `0600`, `O_EXCL`,
+    /// unique over 128 sequence retries.
     pub(crate) fn create(dest: &Path, base: &Path) -> Result<Self, String> {
         let (dir, actual) = open_recovered_dir_or_fallback(base)?;
+        // Bound the suffix to 32 chars: a valid 255-byte destination
+        // basename can carry a 253-byte extension, which would push
+        // the timestamped recovery name past `NAME_MAX` (`ENAMETOOLONG`).
+        // The prefix is at most 38 bytes, so 32 keeps the name safely
+        // within 255 on every filesystem.
         let ext = dest
             .extension()
             .and_then(|ext| ext.to_str())
             .filter(|ext| !ext.is_empty() && !ext.contains('/') && !ext.contains('\0'))
-            .unwrap_or("json");
+            .map(|ext| ext.chars().take(32).collect::<String>())
+            .filter(|ext| !ext.is_empty())
+            .unwrap_or_else(|| "json".to_string());
         let timestamp = fallback_timestamp();
         let pid = std::process::id();
         for seq in 0..128u32 {

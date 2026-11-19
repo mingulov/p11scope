@@ -5889,6 +5889,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.rendered_callers.extend(ids.iter().copied());
     }
 
+    /// Test-only: caller rows currently carried for retirement.
+    #[cfg(test)]
+    pub(crate) fn rendered_len_for_test(&self) -> usize {
+        self.rendered_callers.len()
+    }
+
     /// Drop carried rows the current publication did not certify. A
     /// credit-deferred row's old membership must not authorize its
     /// fold once its terminal payload changed while a revision waits
@@ -26356,6 +26362,73 @@ exit 0
         assert!(
             pins.iter().all(|pin| pin.upgrade().is_none()),
             "the retention release closes the tail exactly once"
+        );
+    }
+
+    /// Staged-drops twin: 200 carried rows whose records are gone drop
+    /// in one pass beside a real exited caller. A stop tripping at the
+    /// first shared-stride lap past the candidate scans must abort the
+    /// staged removals partway — the unreached drops stay carried —
+    /// and the resume drops the rest and folds the real row exactly
+    /// once.
+    #[test]
+    fn fold_staged_drops_abort_partway_on_stop_and_resume_exact() {
+        let (mut native, _live) = NativeScene::new();
+        let domain = native.domain;
+        let id = stage_exited_caller(&mut native, 5020, 100);
+        native
+            .scene
+            .coordinator
+            .binder
+            .stage_cookie_for_test(domain, 100, 0, Some(id));
+        let mut noted = vec![id];
+        for row in 0..200u32 {
+            noted.push(CallerId(9000 + row));
+        }
+        native.scene.coordinator.note_rendered_callers(&noted);
+        // Quiet through the entry gate and the six scan laps (201
+        // rendered + 201 candidates), tripped at the next check: past
+        // the scans, inside the staged removals.
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 7
+        };
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers_with_stop(300, None, &stop)
+                .retired,
+            0,
+            "a stop inside the staged removals folds nothing"
+        );
+        assert_eq!(checks.get(), 8, "the trip fires at the first removal lap");
+        assert!(
+            native.scene.coordinator.rendered_len_for_test() > 1,
+            "unreached drops stay carried past the trip"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_some(),
+            "no row folds on the aborted pass"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired,
+            1,
+            "the resume drops the rest and folds the real row"
+        );
+        assert_eq!(
+            native.scene.coordinator.rendered_len_for_test(),
+            0,
+            "no drop waits past the resume"
+        );
+        assert!(
+            native.scene.coordinator.adapter.record(id).is_none(),
+            "the real row folds exactly once"
         );
     }
 

@@ -2072,6 +2072,250 @@ fn fold_streaming_wrapper_checks_stop_before_certifying_terminal_rows() {
     drop(writer);
 }
 
+/// Stage a 70-caller stream scene with one exited caller, one extra
+/// module edge and three instances on the first live caller: every
+/// row carried, the exit terminal, so the wrapper certifies 70 rows
+/// through the caller copy, the membership scans, the identity build
+/// and the carry stage. Returns the harness, an emitting stream, the
+/// stream state, the exiting caller, the tempdir holding the logs and
+/// the wired stop counter (quiet).
+fn stage_cert_scene() -> (
+    Harness,
+    EventLogState,
+    StreamState,
+    CallerId,
+    tempfile::TempDir,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::instance_input::{AdmittedInstance, InstanceKey};
+    use crate::discovery::instances::InstanceId;
+    use p11scope_ebpf_common::ImageIdentity;
+    const CALLERS: u32 = 70;
+    let mut harness = harness(CALLERS as usize, 2);
+    let live = caller(&harness, 0);
+    let exiting = caller(&harness, CALLERS - 1);
+    // One extra edge plus three instances on the first live caller,
+    // so the membership scans examine edges and instances alike.
+    let domain = NativeDomainId::try_mint().expect("fresh domain");
+    let extra = key(99);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .scripted_module_edge(extra.clone(), live);
+    for (slot, cookie) in [7u64, 8, 9].into_iter().zip([300u64, 301, 302]) {
+        let instance = InstanceKey::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(slot),
+            extra.clone(),
+        );
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .note_instance(AdmittedInstance::scripted(instance, live));
+    }
+    harness.coordinator_mut().registry_mut().publish();
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 24, 4).unwrap();
+    let mut state = StreamState::new();
+    let mut pass = 0u64;
+    let mut emit_until_carried =
+        |writer: &mut EventWriter, state: &mut StreamState, view: &Presentation| {
+            for _ in 0..100_000 {
+                pass += 1;
+                let at = pass;
+                emit_pass_events(writer, state, &report(pass), view, at).unwrap();
+                if state.last_deferred.edge_events == 0
+                    && state.last_deferred.instance_events == 0
+                    && state.last_deferred.semantic_edge_events == 0
+                {
+                    return;
+                }
+            }
+            panic!("the capped FIFO never drained");
+        };
+    // Carry every initial row: the exiting edges at 2 entries.
+    let mut pass1 = presentation(&harness);
+    for edge in &mut pass1.edges {
+        if edge.caller == exiting {
+            edge.entry_count = 2;
+        }
+    }
+    emit_until_carried(&mut writer, &mut state, &pass1);
+    // The exit: the caller dies and its edges reach their terminal
+    // revision (exit presence, 3 entries).
+    let exiting_pid = FIRST_PID + CALLERS - 1;
+    let survivors: Vec<u32> = (FIRST_PID..FIRST_PID + CALLERS - 1).collect();
+    kill_pid(&mut harness, exiting_pid, &survivors);
+    let mut pass2 = presentation(&harness);
+    for edge in &mut pass2.edges {
+        if edge.caller == exiting {
+            assert_eq!(
+                edge.presence,
+                crate::inventory_present::Presence::ProcessExited,
+                "the exit flips presence"
+            );
+            edge.entry_count = 3;
+        }
+    }
+    emit_until_carried(&mut writer, &mut state, &pass2);
+    state.last_stream_view = Some(std::sync::Arc::new(pass2));
+    drop(writer);
+    let dummy = dir.path().join("dummy.jsonl");
+    let stream = EventLogState::new(Some(EventWriter::create(&dummy, 1 << 20, 2).unwrap()));
+    assert!(stream.emits(), "the gate runs on the streaming path");
+    let wired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    harness
+        .coordinator_mut()
+        .set_stop_source(std::sync::Arc::clone(&wired));
+    (harness, stream, state, exiting, dir, wired)
+}
+
+/// Certification-stride twin: trip the wired operator counter after a
+/// nonzero stride inside the caller copy, the identity build and the
+/// carry stage in turn. Each trip aborts the pass — nothing folds and
+/// the carry stays intact — and clearing the counter resumes to an
+/// exact fold of the exited row with every live row surviving.
+#[test]
+fn fold_certification_aborts_and_resumes_at_every_stride_phase() {
+    for (trip_after, phase) in [(1u64, "copy"), (5, "identity"), (6, "carry")] {
+        let (mut harness, stream, mut state, exiting, _dir, wired) = stage_cert_scene();
+        if phase == "carry" {
+            // A credit-deferred row the commit would replace: the
+            // aborted carry stage must leave it untouched.
+            harness
+                .coordinator_mut()
+                .note_rendered_callers(&[CallerId(999_999)]);
+        }
+        let checks = std::cell::Cell::new(0u64);
+        let stop = || {
+            checks.set(checks.get() + 1);
+            if checks.get() > trip_after {
+                wired.store(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            wired.load(std::sync::atomic::Ordering::SeqCst) > 0
+        };
+        let now = harness.now_ns();
+        let report = retire_rendered_callers_with_stop(
+            harness.coordinator_mut(),
+            None,
+            &stream,
+            &mut state,
+            now,
+            &stop,
+        );
+        assert_eq!(
+            checks.get(),
+            trip_after + 1,
+            "{phase}: the trip fires exactly once past the threshold"
+        );
+        assert_eq!(
+            wired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{phase}: the abort observes the wired counter"
+        );
+        assert_eq!(
+            report.retired, 0,
+            "{phase}: a mid-certification stop folds nothing"
+        );
+        assert!(
+            !report.committed,
+            "{phase}: the aborted pass commits no carry"
+        );
+        match phase {
+            "copy" => {
+                assert!(
+                    !report.identity_built,
+                    "copy: the identity index never builds"
+                );
+                assert!(
+                    (1..70).contains(&report.callers_copied),
+                    "copy: the ID copy aborts partway, past a nonzero stride"
+                );
+                assert_eq!(report.certified, 0, "copy: nothing certifies");
+            }
+            "identity" => {
+                assert!(
+                    !report.identity_built,
+                    "identity: the index build aborts before completing"
+                );
+                assert_eq!(
+                    report.callers_copied, 70,
+                    "identity: the ID copy completed first"
+                );
+            }
+            "carry" => {
+                assert!(
+                    report.identity_built,
+                    "carry: certification completed before the trip"
+                );
+                assert_eq!(
+                    report.certified, 70,
+                    "carry: every row certified before the trip"
+                );
+                assert_eq!(
+                    harness.coordinator().rendered_len_for_test(),
+                    1,
+                    "carry: the aborted stage leaves the prior carry untouched"
+                );
+            }
+            _ => unreachable!("the loop above names every phase"),
+        }
+        if phase != "carry" {
+            assert_eq!(
+                harness.coordinator().rendered_len_for_test(),
+                0,
+                "{phase}: the aborted pass notes nothing"
+            );
+        }
+        assert!(
+            harness.coordinator().adapter().record(exiting).is_some(),
+            "{phase}: no row folds on the aborted pass"
+        );
+        // Clearing the counter resumes to an exact fold.
+        wired.store(0, std::sync::atomic::Ordering::SeqCst);
+        if phase != "carry" {
+            // The aborted pass noted nothing: a quiet bare retirement
+            // finds no carry.
+            let now = harness.now_ns();
+            assert_eq!(
+                harness
+                    .coordinator_mut()
+                    .retire_rendered_callers(now, None)
+                    .retired,
+                0,
+                "{phase}: the aborted pass notes nothing into the carry"
+            );
+        }
+        let now = harness.now_ns();
+        retire_rendered_callers(harness.coordinator_mut(), None, &stream, &mut state, now);
+        assert!(
+            harness.coordinator().adapter().record(exiting).is_none(),
+            "{phase}: the resume folds the exited row"
+        );
+        assert_eq!(
+            harness.coordinator().retired_caller_rows_for_test(),
+            1,
+            "{phase}: the resume publishes the row once"
+        );
+        for index in 0..69u32 {
+            assert!(
+                harness
+                    .coordinator()
+                    .adapter()
+                    .record(caller(&harness, index))
+                    .is_some(),
+                "{phase}: live rows survive the resume"
+            );
+        }
+    }
+}
+
 /// F1 credit-boundary twin (fix2): 1,025 exited callers share one
 /// publication while the fold carries 1,024 credits, so the last
 /// caller (the largest id) waits at the credit boundary. A retained

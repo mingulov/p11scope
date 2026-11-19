@@ -8881,6 +8881,26 @@ fn cert_unit(units: &mut u64, stop: &dyn Fn() -> bool) -> bool {
         && stop()
 }
 
+/// What one streaming-wrapper certification pass examined: the shared
+/// stride units plus how far each scan reached. Tests trip the wired
+/// stop source mid-pass and assert the reach freezes, the carry stays
+/// intact, and the resume folds every row exactly once.
+#[derive(Default)]
+pub(crate) struct CertificationReport {
+    /// Stride units counted before the pass stopped or completed.
+    pub(crate) units: u64,
+    /// Caller IDs copied from the emitted view.
+    pub(crate) callers_copied: usize,
+    /// The identity index completed (built only for exit candidates).
+    pub(crate) identity_built: bool,
+    /// Callers certified foldable when the carry stage began.
+    pub(crate) certified: usize,
+    /// The carry committed (replaced) this pass.
+    pub(crate) committed: bool,
+    /// Rows the fold retired after the commit.
+    pub(crate) retired: u64,
+}
+
 /// Retire caller rows the last published pass presentation rendered and
 /// whose process is proven ended. The presentation already owns the row's
 /// facts; the coordinator only drops state that no later render can need.
@@ -8897,14 +8917,31 @@ fn retire_rendered_callers<Source: ProcessSource>(
     // entry gate runs, so it paces against the same live stop query:
     // a stopped pass certifies nothing and notes nothing.
     let stop = coordinator.stop_query();
+    retire_rendered_callers_with_stop(coordinator, subset, stream, state, now_ns, stop.as_ref());
+}
+
+/// [`retire_rendered_callers`] with an explicit stop query, reporting
+/// how far certification reached: tests trip the wired stop source
+/// mid-pass through it. The plain entry builds the live query from
+/// the wired sources itself.
+fn retire_rendered_callers_with_stop<Source: ProcessSource>(
+    coordinator: &mut InventoryCoordinator<Source>,
+    subset: Option<&crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset>,
+    stream: &EventLogState,
+    state: &mut StreamState,
+    now_ns: u64,
+    stop: &dyn Fn() -> bool,
+) -> CertificationReport {
+    let mut report = CertificationReport::default();
     if stop() {
-        return;
+        return report;
     }
     let Some(view) = state.last_stream_view.as_ref() else {
-        return;
+        return report;
     };
     let ids: Vec<crate::discovery::caller_registry::CallerId> =
         view.callers.iter().map(|caller| caller.id).collect();
+    report.callers_copied = ids.len();
     // Fold only callers whose every edge and instance already
     // streamed (or every caller when no log runs): a
     // folded-never-streamed edge or instance would leave the stream
@@ -8930,8 +8967,9 @@ fn retire_rendered_callers<Source: ProcessSource>(
                 .entry(record.caller)
                 .or_default()
                 .push(record.id);
-            if cert_unit(&mut units, stop.as_ref()) {
-                return;
+            if cert_unit(&mut units, stop) {
+                report.units = units;
+                return report;
             }
         }
         // The emitted view's identity index, built once and only when
@@ -8940,8 +8978,9 @@ fn retire_rendered_callers<Source: ProcessSource>(
         let mut identities: Option<IdentityIndex<'_>> = None;
         let mut foldable = Vec::new();
         for id in ids {
-            if cert_unit(&mut units, stop.as_ref()) {
-                return;
+            if cert_unit(&mut units, stop) {
+                report.units = units;
+                return report;
             }
             let candidate = coordinator.adapter().record(id).is_some_and(|record| {
                 record.retired
@@ -8970,10 +9009,12 @@ fn retire_rendered_callers<Source: ProcessSource>(
                 continue;
             }
             let index = identities.get_or_insert_with(|| IdentityIndex::new(view));
+            report.identity_built = true;
             let mut edges_terminal = true;
             for edge in coordinator.registry().edges_of(id) {
-                if cert_unit(&mut units, stop.as_ref()) {
-                    return;
+                if cert_unit(&mut units, stop) {
+                    report.units = units;
+                    return report;
                 }
                 let terminal = view
                     .edges
@@ -8997,8 +9038,9 @@ fn retire_rendered_callers<Source: ProcessSource>(
             let mut instances_terminal = true;
             if let Some(members) = instances_by_caller.get(&id) {
                 for instance in members {
-                    if cert_unit(&mut units, stop.as_ref()) {
-                        return;
+                    if cert_unit(&mut units, stop) {
+                        report.units = units;
+                        return report;
                     }
                     let (Some(in_at), Some(edge_at)) = (
                         view.instances
@@ -9025,6 +9067,7 @@ fn retire_rendered_callers<Source: ProcessSource>(
                 foldable.push(id);
             }
         }
+        report.units = units;
         foldable
     } else {
         ids
@@ -9035,14 +9078,17 @@ fn retire_rendered_callers<Source: ProcessSource>(
     // keeps its row (and its queued update) until the revision lands.
     // Still-eligible rows are re-noted every pass, so the
     // intersection only defers, never strands.
+    report.certified = foldable.len();
     let certified: BTreeSet<crate::discovery::caller_registry::CallerId> =
         foldable.iter().copied().collect();
     coordinator.retain_rendered_callers(&certified);
     coordinator.note_rendered_callers(&foldable);
+    report.committed = true;
     // The fold paces its planning strides against the live stop
     // query (the local flag plus the operator counter, when wired),
     // so a stop delivered mid-fold aborts within one stride.
     let receipt = coordinator.retire_rendered_callers(now_ns, subset);
+    report.retired = receipt.retired;
     // Folded rows left the snapshot: drop their stream digests so the
     // emitters stay bounded by live rows.
     for (caller, module) in receipt.folded_edges {
@@ -9051,6 +9097,7 @@ fn retire_rendered_callers<Source: ProcessSource>(
     for instance in receipt.folded_instances {
         state.instances.forget(instance);
     }
+    report
 }
 
 /// The dashboard pass views: `None` while a publication pends

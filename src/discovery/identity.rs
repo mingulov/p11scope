@@ -11090,6 +11090,36 @@ fn pin_scanned_object(
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<ProvedEntry, PinFailure> {
+    match pin_scanned_object_inner(
+        view,
+        raw,
+        scanned,
+        pre_open,
+        pinned_identity,
+        mounts,
+        budget,
+    ) {
+        Err(PinFailure::Refused(reason)) if view.original_exited() == Ok(true) => {
+            // The view died mid-pin (its per-PID paths vanished): loss,
+            // not forgery evidence. Downgrade to Gone so the key's live
+            // pins survive churn; gaps already count the member. Live
+            // views keep refusing (fail closed where forgery evidence
+            // is possible).
+            Err(PinFailure::Gone { reason })
+        }
+        outcome => outcome,
+    }
+}
+
+fn pin_scanned_object_inner(
+    view: &ProcessView,
+    raw: RawObjectInstance,
+    scanned: Option<FileIdentity>,
+    pre_open: Option<u32>,
+    pinned_identity: ReadPinnedIdentity<'_>,
+    mounts: &mut MountTableCache,
+    budget: &mut CaptureWorkBudget,
+) -> Result<ProvedEntry, PinFailure> {
     // A pre-copy-up raw reopens its proven mount-table candidate, not the
     // merged path: the candidate list is recomputed from the same target
     // table the scan proved against, and the scanned check below binds

@@ -398,6 +398,28 @@ fn length_stash_acquires_only_through_the_shared_masked_call() {
         !contract(&format!("{}{}", &SOURCE[..start], tail)),
         "an unmasked stash must fail the contract"
     );
+    // A widened mask in the invocation (descriptor 31/C_Encrypt:
+    // authorized [3, 4] becomes [3, 4, 6]) must fail the contract.
+    let tail = SOURCE[start..].replacen(
+        "acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present);",
+        "acquire_length_entry_args!(arg_u64, ctx, layout, mask | 64, words, present);",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "a widened mask in the shared call must fail the contract"
+    );
+    // An equivalent parenthesized spelling of a direct fetch beside
+    // the shared call must fail the contract.
+    let tail = SOURCE[start..].replacen(
+        "        let mut fetch = ",
+        "        let _ = (arg_u64)(ctx, 6, layout);\n        let mut fetch = ",
+        1,
+    );
+    assert!(
+        !contract(&format!("{}{}", &SOURCE[..start], tail)),
+        "an equivalent parenthesized direct fetch must fail the contract"
+    );
 }
 
 /// Shared length acquisition (v0.8.0 keymeta Task 2): the

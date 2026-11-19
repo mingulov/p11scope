@@ -401,8 +401,9 @@ green. Full lib green before each owner commits.
   ceiling renews next pass with a fresh allowance, a counted
   exhaustion and cursor resume; clean passes accumulate spend;
   collection stop and zero cap never admit; deadlines clear at
-  their own batch end and I/O stays capture-lifetime. No constant
-  moves (ruling 11:38, no capture-lifetime sticky work ceiling).
+  their own batch end; Detailed I/O renews silently per pass
+  with hash-offset resume (L1-5 ends). No constant moves
+  (ruling 11:38, no capture-lifetime sticky work ceiling).
 - Owner 3 table: queues (refresh, loader fallback, RT_ADD,
   RT_CONSISTENT, survivor acquisition) × outcomes (`Wait`, `Gone`,
   genuine failure, exit proof). `Wait` never retires, never drops;

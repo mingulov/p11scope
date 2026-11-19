@@ -5405,6 +5405,33 @@ def self_test():
     ):
         rejected(lambda bad=bad: exact_ring_accounting(bad))
     print("ring_accounting pins its closed shape and remainder identity: OK")
+    # Counting-coverage retirements pair with mid-list causes: the checker
+    # mirrors the producer's cause order gate for gate (render.rs
+    # Evidence::gap_classes), so the retired-slots cause rides immediately
+    # after event_loss, ahead of every later cause.
+    retired = copy.deepcopy(clean)
+    retired["evidence"].update(
+        event_loss=1,
+        coverage_retired_slots=3,
+        start_insert_failures=1,
+        task_uprobe_link_losses=2,
+        completeness="PARTIAL",
+        verdict_detail="concrete_gap",
+    )
+    settle_fixture_verdict(retired)
+    require(
+        retired["evidence"]["gap_classes"]["observation"]["causes"]
+        == [
+            "event_loss",
+            "coverage_retired_slots",
+            "start_insert_failures",
+            "task_uprobe_link_losses",
+        ]
+        and retired["evidence"]["verdict_detail"] == "concrete_gap",
+        "the retired-slots cause must follow event_loss in producer order",
+    )
+    exact_metrics_schema(retired)
+    print("coverage_retired_slots pairs with mid-list causes in producer order: OK")
     halted = copy.deepcopy(clean)
     halted["evidence"]["kernel_control"].update(
         capture_halted=True, owner_poison=["refund_failed"])

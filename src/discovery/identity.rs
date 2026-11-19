@@ -31,8 +31,10 @@ use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
 use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, Held, TableHandle};
 use crate::discovery::scan::{
-    CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
-    read_maps_or_refuse, read_mountinfo, standard_function_names,
+    COLLECTION_STOP_REASON, CaptureWorkBudget, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
+    InspectedFileKey, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
+    Skipped, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo,
+    standard_function_names,
 };
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{
@@ -9688,6 +9690,7 @@ fn pin_scanned_view_objects_with(
                 raw,
                 wanted.by_ref(),
                 &mut skipped,
+                WaitCause::ReserveStop,
                 PIN_RESERVE_STOP_DETAIL,
                 retries,
             );
@@ -9708,6 +9711,7 @@ fn pin_scanned_view_objects_with(
                 raw,
                 wanted.by_ref(),
                 &mut skipped,
+                WaitCause::BudgetStop,
                 PIN_BUDGET_STOP_DETAIL,
                 retries,
             );
@@ -9742,6 +9746,7 @@ fn pin_scanned_view_objects_with(
                                     raw,
                                     wanted.by_ref(),
                                     &mut skipped,
+                                    WaitCause::BudgetStop,
                                     PIN_BUDGET_STOP_DETAIL,
                                     retries,
                                 );
@@ -9789,7 +9794,7 @@ pub(crate) const PIN_WAIT_SUBJECT: &str = "library file open";
 /// so nothing about the file is claimed — it waits for the next tick
 /// with the whole view, exactly like a fix6 A3 open-exhaustion wait
 /// but without any open ever failing. Recorded under
-/// [`PIN_WAIT_SUBJECT`] through the same [`PinFailure::Wait`] arm (no
+/// [`PIN_WAIT_SUBJECT`] through the same [`PinOutcome::Wait`] arm (no
 /// key rejection); the admission loops match this detail to file the
 /// reserve tail instead of the fd-table-exhausted tail.
 pub(crate) const PIN_RESERVE_STOP_DETAIL: &str =
@@ -9800,65 +9805,289 @@ pub(crate) const PIN_RESERVE_STOP_DETAIL: &str =
 /// [`PIN_RESERVE_STOP_DETAIL`], the pin was never attempted, so nothing
 /// about the file is claimed — it waits for the next tick with the
 /// whole view. Recorded under [`PIN_WAIT_SUBJECT`] through the same
-/// [`PinFailure::Wait`] arm (no key rejection); the admission loops
+/// [`PinOutcome::Wait`] arm (no key rejection); the admission loops
 /// match this detail to file the budget tail instead of the
 /// fd-table-exhausted tail.
 pub(crate) const PIN_BUDGET_STOP_DETAIL: &str =
     "capture library-handle budget exhausted; the pin was not attempted";
 
-/// How one scan pin failed (fix6 A3, owner 20:25): an ordinary refusal —
-/// recorded with today's reason and key rejection — or handle
-/// exhaustion, which waits for the next tick instead (a counted named
-/// gap, never a rejection). Every pre-existing `Err(reason)` site
-/// converts through `From`, so only the library-open sites name the
-/// distinction.
+/// How one scan pin attempt concluded (admission owner 1): the
+/// identity owner's authoritative typed outcome. Every failure site
+/// names its closed cause through one of the constructors below; the
+/// human-readable `reason` keeps today's exact gap text. There is no
+/// stringly catch-all: a site that cannot name its cause does not
+/// compile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PinFailure {
-    Refused(String),
-    Wait { reason: String },
+pub(crate) enum PinOutcome {
+    /// Nothing was proven about the file for this view: the open
+    /// failed, the identity was unreadable or inconclusive, the
+    /// proof was missing, the file changed mid-read. Per-view
+    /// missing evidence.
+    Unproven {
+        cause: UnprovenCause,
+        reason: String,
+    },
+    /// A retryable stop: the pin waits for a fresh budget or a free
+    /// handle and the retry owner re-attempts it. Never a verdict
+    /// about the file.
+    Wait {
+        cause: WaitCause,
+        retry: RetryOwner,
+        reason: String,
+    },
+    /// The view died mid-pin, proved at classification time by the
+    /// owning view no longer comparing same-generation. Missing
+    /// evidence, not a suspicious file.
+    Gone {
+        evidence: ExitEvidence,
+        reason: String,
+    },
 }
 
-impl PinFailure {
-    /// Classifies a mapping-open failure: handle exhaustion waits,
-    /// everything else refuses with today's reason, byte-identical.
-    fn from_mapped_open_error(failure: &MappedOpenError) -> Self {
-        if failure
-            .errno
-            .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
-        {
-            Self::Wait {
-                reason: failure.gap_reason(),
-            }
-        } else {
-            Self::Refused(failure.gap_reason())
+/// Why a pin proved nothing (one closed cause per failure class).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnprovenCause {
+    /// The library file could not be opened (non-exhaustion errno,
+    /// live view).
+    OpenFailed,
+    /// An identity fact could not be read: mount table, mapping key,
+    /// fstat.
+    IdentityUnreadable,
+    /// The reopened file is observably not the scanned one.
+    IdentityMismatch,
+    /// A pre-copy-up pin without its proof-time candidate or identity.
+    ProofMissing,
+    /// The file changed while its bytes were read.
+    ChangedMidRead,
+    /// The identity bytes could not be read or parsed (non-stop).
+    InspectFailed,
+    /// The map_files fallback could not determine the file.
+    FallbackUnproven,
+    /// The map_files fallback determined not to serve the file.
+    FallbackRefused,
+    /// The collection stopped before the bytes were read: never
+    /// retried, never a verdict.
+    CollectionStopped,
+}
+
+/// Why a pin waits for a fresh pass (one closed cause per stop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitCause {
+    /// open(2) failed with EMFILE/ENFILE (fix6 A3).
+    HandleExhaustion,
+    /// The tick's fd-reserve snapshot cannot cover the next open.
+    ReserveStop,
+    /// The capture library-handle budget cannot cover the pin.
+    BudgetStop,
+    /// [`IO_CEILING_REASON`].
+    IoCeiling,
+    /// [`WORK_CEILING_REASON`].
+    WorkCeiling,
+    /// [`SCAN_DEADLINE_REASON`].
+    Deadline,
+    /// [`SCAN_CLOCK_REASON`].
+    ClockUnavailable,
+    /// [`TABLE_WINDOW_CEILING_REASON`].
+    TableWindowCeiling,
+    /// [`INTERFACE_WINDOW_CEILING_REASON`].
+    InterfaceWindowCeiling,
+}
+
+/// Who re-attempts a waited pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryOwner {
+    /// The admission loops defer the whole view; the next pass
+    /// retries the full scan. (Owner 3 refines this into the
+    /// refresh/loader queues.)
+    ViewRescan,
+}
+
+/// How a mid-pin view death was proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitEvidence {
+    /// The owning view no longer compares same-generation at
+    /// classification time: the process generation exited mid-pin.
+    ProcessGenerationExited,
+}
+
+impl PinOutcome {
+    fn unproven(cause: UnprovenCause, reason: String) -> Self {
+        Self::Unproven { cause, reason }
+    }
+
+    fn wait(cause: WaitCause, reason: String) -> Self {
+        Self::Wait {
+            cause,
+            retry: RetryOwner::ViewRescan,
+            reason,
         }
     }
-}
 
-impl From<String> for PinFailure {
-    fn from(reason: String) -> Self {
-        Self::Refused(reason)
+    fn gone(reason: String) -> Self {
+        Self::Gone {
+            evidence: ExitEvidence::ProcessGenerationExited,
+            reason,
+        }
     }
-}
 
-impl From<&str> for PinFailure {
-    fn from(reason: &str) -> Self {
-        Self::Refused(reason.to_string())
+    /// The outcome's human-readable reason: today's exact gap text,
+    /// preserved byte for byte by every constructor.
+    fn reason(&self) -> &str {
+        match self {
+            Self::Unproven { reason, .. }
+            | Self::Wait { reason, .. }
+            | Self::Gone { reason, .. } => reason,
+        }
     }
-}
 
-impl From<OpenObjectError> for PinFailure {
-    fn from(error: OpenObjectError) -> Self {
+    /// A pre-copy-up pin without its proof-time candidate index.
+    fn for_pre_proof_missing(reason: &str) -> Self {
+        Self::unproven(UnprovenCause::ProofMissing, reason.to_string())
+    }
+
+    /// A pre-copy-up pin whose target mount table is unreadable.
+    fn for_mountinfo_unreadable() -> Self {
+        Self::unproven(
+            UnprovenCause::IdentityUnreadable,
+            "the target mount table is unreadable; the pre-copy-up pin was refused".to_string(),
+        )
+    }
+
+    /// A pre-copy-up pin whose proven lower candidate diverged.
+    fn for_pre_candidate_diverged() -> Self {
+        Self::unproven(
+            UnprovenCause::ProofMissing,
+            "the proven lower candidate is not in the target's mount table; the pin was refused"
+                .to_string(),
+        )
+    }
+
+    /// Classifies a library-open failure: handle exhaustion waits,
+    /// an open under a dead view is gone, everything else is missing
+    /// evidence — each with today's reason, byte-identical.
+    fn for_open_object_error(view: &ProcessView, error: OpenObjectError) -> Self {
         if error
             .errno
             .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
         {
-            Self::Wait {
-                reason: error.reason,
-            }
-        } else {
-            Self::Refused(error.reason)
+            return Self::wait(WaitCause::HandleExhaustion, error.reason);
         }
+        if !view.still_the_same() {
+            return Self::gone(error.reason);
+        }
+        Self::unproven(UnprovenCause::OpenFailed, error.reason)
+    }
+
+    /// A mapping identity that could not be read from the held fd.
+    fn for_mapping_unavailable(error: String) -> Self {
+        Self::unproven(
+            UnprovenCause::IdentityUnreadable,
+            format!("mapping identity unavailable: {error}"),
+        )
+    }
+
+    /// Classifies a view-level read failure: gone under a dead view,
+    /// missing evidence under a live one.
+    fn for_view_error(view: &ProcessView, error: String) -> Self {
+        if !view.still_the_same() {
+            return Self::gone(error);
+        }
+        Self::unproven(UnprovenCause::IdentityUnreadable, error)
+    }
+
+    /// The map_files fallback's typed arms, preserving its exact gap
+    /// composition: only a handle-exhaustion wait keeps the outer
+    /// gap prefix; unproven and refused arms keep their own text.
+    fn for_map_files_refusal(gap_reason: String, refusal: PinMapFilesRefusal) -> Self {
+        match refusal {
+            PinMapFilesRefusal::Wait(detail) => Self::wait(
+                WaitCause::HandleExhaustion,
+                format!("{gap_reason} (map_files fallback: {detail})"),
+            ),
+            PinMapFilesRefusal::Unproven(detail) => Self::unproven(
+                UnprovenCause::FallbackUnproven,
+                format!("{gap_reason} (map_files fallback: {detail})"),
+            ),
+            PinMapFilesRefusal::Refused(reason) => {
+                Self::unproven(UnprovenCause::FallbackRefused, reason)
+            }
+        }
+    }
+
+    /// Classifies a mapping-open failure: handle exhaustion waits,
+    /// an open under a dead view is gone, everything else is missing
+    /// evidence — each with today's reason, byte-identical.
+    fn for_mapped_open_error(view: &ProcessView, failure: &MappedOpenError) -> Self {
+        if failure
+            .errno
+            .is_some_and(crate::fd_budget::is_handle_exhaustion_errno)
+        {
+            return Self::wait(WaitCause::HandleExhaustion, failure.gap_reason());
+        }
+        if !view.still_the_same() {
+            return Self::gone(failure.gap_reason());
+        }
+        Self::unproven(UnprovenCause::OpenFailed, failure.gap_reason())
+    }
+
+    /// A reopened file observably different from the maps key.
+    fn for_identity_mismatch(maps: ObjectKey, path: &str, opened: ObjectKey) -> Self {
+        Self::unproven(
+            UnprovenCause::IdentityMismatch,
+            format!(
+                "identity_mismatch: the mapping is {maps:?} but {path} now opens as {opened:?} \
+                 (compared via mountinfo)"
+            ),
+        )
+    }
+
+    /// An fstat-family read that failed on the held fd.
+    fn for_fstat_error(error: String) -> Self {
+        Self::unproven(UnprovenCause::IdentityUnreadable, error)
+    }
+
+    /// A scanned-vs-pinned identity comparison that disagreed.
+    fn for_scanned_check(error: String) -> Self {
+        Self::unproven(UnprovenCause::IdentityMismatch, error)
+    }
+
+    /// A pin proof assembly that failed on the held fd.
+    fn for_prove_error(error: String) -> Self {
+        Self::unproven(UnprovenCause::IdentityUnreadable, error)
+    }
+
+    /// The identity-inspection boundary: reader stops classify by
+    /// exact match against the closed stop vocabulary (the reader
+    /// manufactures io errors from typed facts, which stringify
+    /// here); anything else is a failed read or parse. A collection
+    /// stop is never retried, so it is missing evidence, not a wait.
+    fn for_inspect_error(error: &str) -> Self {
+        if let Some(stop) = error.strip_prefix("read failed: ") {
+            let cause = match stop {
+                IO_CEILING_REASON => Some(WaitCause::IoCeiling),
+                WORK_CEILING_REASON => Some(WaitCause::WorkCeiling),
+                SCAN_DEADLINE_REASON => Some(WaitCause::Deadline),
+                SCAN_CLOCK_REASON => Some(WaitCause::ClockUnavailable),
+                TABLE_WINDOW_CEILING_REASON => Some(WaitCause::TableWindowCeiling),
+                INTERFACE_WINDOW_CEILING_REASON => Some(WaitCause::InterfaceWindowCeiling),
+                _ => None,
+            };
+            if let Some(cause) = cause {
+                return Self::wait(cause, error.to_string());
+            }
+            if stop == COLLECTION_STOP_REASON {
+                return Self::unproven(UnprovenCause::CollectionStopped, error.to_string());
+            }
+        }
+        Self::unproven(UnprovenCause::InspectFailed, error.to_string())
+    }
+
+    /// A file that changed while its bytes were read.
+    fn for_changed_mid_read() -> Self {
+        Self::unproven(
+            UnprovenCause::ChangedMidRead,
+            "file changed while it was being identified - retry".to_string(),
+        )
     }
 }
 
@@ -9872,12 +10101,11 @@ fn record_pin_stop(
     raw: RawObjectInstance,
     remaining: impl Iterator<Item = RawObjectInstance>,
     skipped: &mut Vec<Skipped>,
+    cause: WaitCause,
     detail: &str,
     retries: bool,
 ) {
-    let stop = || PinFailure::Wait {
-        reason: detail.into(),
-    };
+    let stop = || PinOutcome::wait(cause, detail.to_string());
     record_scanned_candidate(pinned, view, raw, Err(stop()), skipped, retries);
     for raw in remaining {
         record_scanned_candidate(pinned, view, raw, Err(stop()), skipped, retries);
@@ -9888,7 +10116,7 @@ fn record_scanned_candidate(
     pinned: &mut PinnedObjects,
     view: ProcessViewId,
     raw: RawObjectInstance,
-    candidate: Result<Entry, PinFailure>,
+    candidate: Result<Entry, PinOutcome>,
     skipped: &mut Vec<Skipped>,
     retries: bool,
 ) {
@@ -9899,7 +10127,16 @@ fn record_scanned_candidate(
                 pinned.raw_ownership.entry(view).or_default().insert(raw);
             }
         }
-        Err(PinFailure::Wait { reason }) => {
+        // Handle-class waits keep the wait arm exactly as before.
+        // (1a behavior preservation: budget/deadline/clock waits
+        // below keep today's refusal routing; 1b routes every `Wait`
+        // through the wait arm and drops the split.)
+        Err(PinOutcome::Wait { cause, reason, .. })
+            if matches!(
+                cause,
+                WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop
+            ) =>
+        {
             // Out of handles: the open waits for the next tick — or
             // names the terminal wait when the lane never retries
             // (one-shot inspect). No key rejection — nothing was
@@ -9916,7 +10153,7 @@ fn record_scanned_candidate(
                 reason: format!("{}: {reason}; {tail}", raw.path),
             });
         }
-        Err(PinFailure::Refused(reason)) => {
+        Err(outcome) => {
             // A missing mapping identity or digest makes every equal raw-key
             // observation incomparable. Remember the failed member so a candidate
             // from another process view cannot become receiver-wins authority.
@@ -9928,7 +10165,7 @@ fn record_scanned_candidate(
             }
             skipped.push(Skipped {
                 subject: raw.path,
-                reason,
+                reason: outcome.reason().to_string(),
             });
         }
     }
@@ -10694,21 +10931,21 @@ fn pin_scanned_object(
     pinned_identity: ReadPinnedIdentity<'_>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
-) -> Result<ProvedEntry, PinFailure> {
+) -> Result<ProvedEntry, PinOutcome> {
     // A pre-copy-up raw reopens its proven mount-table candidate, not the
     // merged path: the candidate list is recomputed from the same target
     // table the scan proved against, and the scanned check below binds
     // the reopened file to the proof. Any divergence refuses the pin.
     let pre_path: Option<PathBuf> = if raw.pre_copy_up {
         let Some(index) = pre_open else {
-            return Err("a pre-copy-up pin without a proven candidate index was refused".into());
+            return Err(PinOutcome::for_pre_proof_missing(
+                "a pre-copy-up pin without a proven candidate index was refused",
+            ));
         };
         let text = match view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget) {
             Ok(((), text)) => text,
             Err(_) => {
-                return Err(
-                    "the target mount table is unreadable; the pre-copy-up pin was refused".into(),
-                );
+                return Err(PinOutcome::for_mountinfo_unreadable());
             }
         };
         let candidates =
@@ -10716,10 +10953,7 @@ fn pin_scanned_object(
         match candidates.get(index as usize) {
             Some(candidate) => Some(candidate.clone()),
             None => {
-                return Err(
-                    "the proven lower candidate is not in the target's mount table; the pin was refused"
-                        .into(),
-                );
+                return Err(PinOutcome::for_pre_candidate_diverged());
             }
         }
     } else {
@@ -10734,45 +10968,38 @@ fn pin_scanned_object(
     // from the target's table by construction).
     let (file, found) = match &pre_path {
         Some(candidate) => {
-            let file = open_object_errno(candidate)?;
-            let found = mapping_file_key(&file)
-                .map_err(|error| format!("mapping identity unavailable: {error}"))?;
+            let file = open_object_errno(candidate)
+                .map_err(|error| PinOutcome::for_open_object_error(view, error))?;
+            let found = mapping_file_key(&file).map_err(PinOutcome::for_mapping_unavailable)?;
             (file, found)
         }
         None => {
-            let (open, mountinfo) = view.open_then_cached_mountinfo(
-                |filesystem| Ok(filesystem.open_mapped_object(Path::new(&raw.path))),
-                mounts,
-                budget,
-            )?;
+            let (open, mountinfo) = view
+                .open_then_cached_mountinfo(
+                    |filesystem| Ok(filesystem.open_mapped_object(Path::new(&raw.path))),
+                    mounts,
+                    budget,
+                )
+                .map_err(|error| PinOutcome::for_view_error(view, error))?;
             match open {
                 Ok(file) => {
                     let first = identity_of_in_mountinfo(&file, mountinfo);
-                    let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
+                    let found = identity_in_cached_table(view, &file, first, mounts, budget)
+                        .map_err(|error| PinOutcome::for_view_error(view, error))?;
                     (file, found)
                 }
                 Err(failure) if pin_map_files_fallback_triggered(&failure) => {
                     match pin_map_files_fallback(view, &raw, mounts, pinned_identity, budget) {
                         Ok(served) => served,
-                        Err(PinMapFilesRefusal::Wait(detail)) => {
-                            return Err(PinFailure::Wait {
-                                reason: format!(
-                                    "{} (map_files fallback: {detail})",
-                                    failure.gap_reason()
-                                ),
-                            });
+                        Err(refusal) => {
+                            return Err(PinOutcome::for_map_files_refusal(
+                                failure.gap_reason(),
+                                refusal,
+                            ));
                         }
-                        Err(PinMapFilesRefusal::Unproven(detail)) => {
-                            return Err(format!(
-                                "{} (map_files fallback: {detail})",
-                                failure.gap_reason()
-                            )
-                            .into());
-                        }
-                        Err(PinMapFilesRefusal::Refused(reason)) => return Err(reason.into()),
                     }
                 }
-                Err(failure) => return Err(PinFailure::from_mapped_open_error(&failure)),
+                Err(failure) => return Err(PinOutcome::for_mapped_open_error(view, &failure)),
             }
         }
     };
@@ -10792,26 +11019,29 @@ fn pin_scanned_object(
             &KernelSelfMappingProbe,
         )
     {
-        return Err(PinFailure::Refused(format!(
-            "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
-             (compared via mountinfo)",
+        return Err(PinOutcome::for_identity_mismatch(
             raw.key,
-            raw.path,
+            &raw.path,
             object_key(found),
-        )));
+        ));
     }
-    let before = pin_of(&file)?;
+    let before = pin_of(&file).map_err(PinOutcome::for_fstat_error)?;
     let mapped = budget
         .retained_mapped_identity(&file)
         .map(Ok)
         .unwrap_or_else(|| pinned_identity(&file));
     if raw.pre_copy_up && mapped.is_err() {
-        return Err("the pre-copy-up pin cannot read its vm_file identity; it was refused".into());
+        return Err(PinOutcome::for_pre_proof_missing(
+            "the pre-copy-up pin cannot read its vm_file identity; it was refused",
+        ));
     }
     if let Some(scanned) = scanned {
-        check_same_scanned_file(scanned, mapped.clone().map(|mapped| mapped.identity))?;
+        check_same_scanned_file(scanned, mapped.clone().map(|mapped| mapped.identity))
+            .map_err(PinOutcome::for_scanned_check)?;
     } else if raw.pre_copy_up {
-        return Err("the pre-copy-up pin has no proof-time identity; it was refused".into());
+        return Err(PinOutcome::for_pre_proof_missing(
+            "the pre-copy-up pin has no proof-time identity; it was refused",
+        ));
     }
     let mapped = mapped.ok();
     // v0.8.0: no per-file size gate here. Admission happens incrementally
@@ -10824,7 +11054,8 @@ fn pin_scanned_object(
     // reads. The key's (device, inode) is the mountinfo-validated identity above.
     let validated = object_key(found);
     let cache_key =
-        InspectedFileKey::for_open_file(&file, validated.device, validated.inode, before)?;
+        InspectedFileKey::for_open_file(&file, validated.device, validated.inode, before)
+            .map_err(PinOutcome::for_fstat_error)?;
     // On filesystems without unique inode numbers the key cannot name one
     // file, so the inspection is never cached there: always read, never store.
     let cacheable = file_inodes_are_unique(&file);
@@ -10833,7 +11064,7 @@ fn pin_scanned_object(
         // `before`; only the still-unchanged file may reuse the cached value.
         // The clock read precedes the verification it timestamps.
         let verified_ns = crate::attach::monotonic_ns();
-        if pin_of(&file)? == before {
+        if pin_of(&file).map_err(PinOutcome::for_fstat_error)? == before {
             return ProvedEntry::prove(
                 file,
                 before,
@@ -10844,7 +11075,7 @@ fn pin_scanned_object(
                 mapped,
                 verified_ns,
             )
-            .map_err(PinFailure::from);
+            .map_err(PinOutcome::for_prove_error);
         }
     }
     // Identity hashing charges the window only: a partial digest is
@@ -10865,13 +11096,14 @@ fn pin_scanned_object(
             Ok(read)
         },
         &standard_function_names(),
-    )?;
+    )
+    .map_err(|error| PinOutcome::for_inspect_error(&error))?;
     // The pin was taken before the bytes were hashed; a write that lands during the
     // hash must not become the baseline the capture trusts.
     // The clock read precedes the verification it timestamps.
     let verified_ns = crate::attach::monotonic_ns();
-    if pin_of(&file)? != before {
-        return Err("file changed while it was being identified - retry".into());
+    if pin_of(&file).map_err(PinOutcome::for_fstat_error)? != before {
+        return Err(PinOutcome::for_changed_mid_read());
     }
     // Only the stable read lands here: a file that changed mid-read is never cached.
     if cacheable {
@@ -10887,7 +11119,7 @@ fn pin_scanned_object(
         mapped,
         verified_ns,
     )
-    .map_err(PinFailure::from)
+    .map_err(PinOutcome::for_prove_error)
 }
 
 /// Test-only count of whole raw-map walks made to answer per-object
@@ -14845,9 +15077,10 @@ mod tests {
                 &mut pins,
                 ProcessViewId(*view as u32),
                 raw.clone(),
-                Err(PinFailure::Refused(format!(
-                    "/private/view-{view}.so: unavailable"
-                ))),
+                Err(PinOutcome::Unproven {
+                    cause: UnprovenCause::IdentityUnreadable,
+                    reason: format!("/private/view-{view}.so: unavailable"),
+                }),
                 &mut skipped,
                 true,
             );
@@ -16404,7 +16637,10 @@ mod tests {
                     &mut pinned,
                     ProcessViewId(0),
                     raw.clone(),
-                    Err("mapping identity unavailable".into()),
+                    Err(PinOutcome::Unproven {
+                        cause: UnprovenCause::IdentityUnreadable,
+                        reason: "mapping identity unavailable".to_string(),
+                    }),
                     &mut skipped,
                     true,
                 );
@@ -16422,7 +16658,10 @@ mod tests {
                     &mut pinned,
                     ProcessViewId(0),
                     raw,
-                    Err("mapping identity unavailable".into()),
+                    Err(PinOutcome::Unproven {
+                        cause: UnprovenCause::IdentityUnreadable,
+                        reason: "mapping identity unavailable".to_string(),
+                    }),
                     &mut skipped,
                     true,
                 );
@@ -16469,9 +16708,10 @@ mod tests {
                 &mut pins,
                 ProcessViewId(view as u32),
                 raw,
-                Err(PinFailure::Refused(format!(
-                    "/private/view-{view}.so: ROUND1_UNAVAILABLE_ERROR_{view}"
-                ))),
+                Err(PinOutcome::Unproven {
+                    cause: UnprovenCause::IdentityUnreadable,
+                    reason: format!("/private/view-{view}.so: ROUND1_UNAVAILABLE_ERROR_{view}"),
+                }),
                 &mut skipped,
                 true,
             );
@@ -24299,16 +24539,40 @@ mod tests {
     #[test]
     fn admission_owner1_unproven_observations_never_reject_nor_bind_through_peers() {
         use crate::discovery::scan::{IO_CEILING_REASON, WORK_CEILING_REASON};
-        // Representative production failure reasons, one per fault
+        // Representative production failure outcomes, one per fault
         // class (the typed classification of each real site is pinned
         // by the companion classification table).
         let faults = [
-            ("death", "process generation exited during discovery"),
-            ("budget-io", IO_CEILING_REASON),
-            ("budget-work", WORK_CEILING_REASON),
+            (
+                "death",
+                PinOutcome::Gone {
+                    evidence: ExitEvidence::ProcessGenerationExited,
+                    reason: "process generation exited during discovery".to_string(),
+                },
+            ),
+            (
+                "budget-io",
+                PinOutcome::Wait {
+                    cause: WaitCause::IoCeiling,
+                    retry: RetryOwner::ViewRescan,
+                    reason: IO_CEILING_REASON.to_string(),
+                },
+            ),
+            (
+                "budget-work",
+                PinOutcome::Wait {
+                    cause: WaitCause::WorkCeiling,
+                    retry: RetryOwner::ViewRescan,
+                    reason: WORK_CEILING_REASON.to_string(),
+                },
+            ),
             (
                 "mismatch",
-                "identity_mismatch: the mapping is unavailable but the file now opens as a different one (compared via mountinfo)",
+                PinOutcome::Unproven {
+                    cause: UnprovenCause::IdentityMismatch,
+                    reason: "identity_mismatch: the mapping is unavailable but the file now opens as a different one (compared via mountinfo)"
+                        .to_string(),
+                },
             ),
         ];
         let key = ObjectKey {
@@ -24332,25 +24596,25 @@ mod tests {
             test_fixture::record_scan_ownership(&mut pins, module_a.view, key, PATH);
             pins
         };
-        let failed_fresh = |reason: &str| {
+        let failed_fresh = |outcome: &PinOutcome| {
             let mut fresh = PinnedObjects::empty();
             let mut skipped = Vec::new();
             record_scanned_candidate(
                 &mut fresh,
                 module_b.view,
                 raw_b.clone(),
-                Err(PinFailure::Refused(reason.to_string())),
+                Err(outcome.clone()),
                 &mut skipped,
                 true,
             );
             (fresh, skipped)
         };
 
-        for (fault, reason) in faults {
+        for (fault, outcome) in &faults {
             // Row `record`: the failure files a named skip, never a
             // key rejection. (No-nuke and fence legs are N/A here:
             // record neither binds nor merges.)
-            let (fresh, skipped) = failed_fresh(reason);
+            let (fresh, skipped) = failed_fresh(outcome);
             assert!(
                 !fresh.rejects(key),
                 "record [{fault}]: an unproven observation must not reject the key"
@@ -24363,7 +24627,7 @@ mod tests {
             // Row `absorb`, leg A (no-nuke): the carried failure never
             // nukes the retained proven pin.
             let mut retained = proven_peer();
-            let (fresh, _) = failed_fresh(reason);
+            let (fresh, _) = failed_fresh(outcome);
             let absorb_skips = retained.absorb(fresh);
             assert_eq!(
                 retained.pinned().count(),
@@ -24416,7 +24680,7 @@ mod tests {
             // match after the failed observation merges.
             let mut pins = proven_peer();
             let peer_id = pins.id_for_scanned(&module_a, key, PATH).unwrap();
-            let (fresh, _) = failed_fresh(reason);
+            let (fresh, _) = failed_fresh(outcome);
             pins.absorb(fresh);
             assert_eq!(
                 pins.sweep_match_keys().get(&key),
@@ -24436,5 +24700,293 @@ mod tests {
         first.absorb(second);
         assert!(first.rejects(key), "collision: the key still rejects");
         assert_eq!(first.pinned().count(), 0, "collision: no pin survives");
+    }
+
+    /// Owner 1 (admission refactor), classification table: every pin
+    /// failure site names its closed cause. Each row feeds a site's
+    /// classifier the exact production input and pins the cause plus
+    /// the preserved reason text. Behavior preservation is proved by
+    /// the unchanged suite staying green: every existing pin-failure
+    /// test exercises its site through the new typed path and
+    /// asserts identical skips and verdicts.
+    #[test]
+    fn admission_owner1_every_pin_failure_site_names_its_closed_cause() {
+        use crate::discovery::scan::{
+            COLLECTION_STOP_REASON, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
+            SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, TABLE_WINDOW_CEILING_REASON,
+            WORK_CEILING_REASON,
+        };
+
+        // Inspect boundary: the closed stop vocabulary classifies
+        // exactly; the reason text is preserved byte for byte.
+        for (stop, cause) in [
+            (IO_CEILING_REASON, WaitCause::IoCeiling),
+            (WORK_CEILING_REASON, WaitCause::WorkCeiling),
+            (SCAN_DEADLINE_REASON, WaitCause::Deadline),
+            (SCAN_CLOCK_REASON, WaitCause::ClockUnavailable),
+            (TABLE_WINDOW_CEILING_REASON, WaitCause::TableWindowCeiling),
+            (
+                INTERFACE_WINDOW_CEILING_REASON,
+                WaitCause::InterfaceWindowCeiling,
+            ),
+        ] {
+            let error = format!("read failed: {stop}");
+            assert_eq!(
+                PinOutcome::for_inspect_error(&error),
+                PinOutcome::Wait {
+                    cause,
+                    retry: RetryOwner::ViewRescan,
+                    reason: error.clone(),
+                },
+                "inspect [{stop}] waits for a fresh pass"
+            );
+        }
+        // A collection stop is never retried: missing evidence, not
+        // a wait.
+        let stopped = format!("read failed: {COLLECTION_STOP_REASON}");
+        assert_eq!(
+            PinOutcome::for_inspect_error(&stopped),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::CollectionStopped,
+                reason: stopped.clone(),
+            },
+            "inspect [collection stop] is unproven, never a wait"
+        );
+        // Any other read or parse failure is missing evidence with
+        // its exact text preserved.
+        for error in [
+            "read failed: Input/output error (os error 5)",
+            "read failed: synthetic stop nobody latches",
+            "metadata failed: stale handle",
+            "not a regular file",
+            "short read: 3 of 9 bytes",
+            "ELF parse: corrupt segment ranges",
+        ] {
+            assert_eq!(
+                PinOutcome::for_inspect_error(error),
+                PinOutcome::Unproven {
+                    cause: UnprovenCause::InspectFailed,
+                    reason: error.to_string(),
+                },
+                "inspect [{error}] is missing evidence"
+            );
+        }
+
+        // Opens: handle exhaustion waits whatever the view's
+        // liveness; any other open failure on a dead view is Gone,
+        // on a live view Unproven — with identical reason text.
+        let live = ProcessView::open(ProcessViewId(240), std::process::id()).unwrap();
+        assert!(live.still_the_same());
+        let dead =
+            crate::process::reused_process_view_for_test(ProcessViewId(241), std::process::id())
+                .unwrap();
+        assert!(!dead.still_the_same());
+        let mapped = |errno: Option<i32>| MappedOpenError {
+            reason: "opening object: probe".into(),
+            foreign_target_root: None,
+            errno,
+        };
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            for view in [&live, &dead] {
+                let failure = mapped(Some(errno));
+                assert_eq!(
+                    PinOutcome::for_mapped_open_error(view, &failure),
+                    PinOutcome::Wait {
+                        cause: WaitCause::HandleExhaustion,
+                        retry: RetryOwner::ViewRescan,
+                        reason: failure.gap_reason(),
+                    },
+                    "mapped open [errno {errno}] waits"
+                );
+            }
+        }
+        let ordinary = mapped(Some(libc::ENOENT));
+        assert_eq!(
+            PinOutcome::for_mapped_open_error(&live, &ordinary),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: ordinary.gap_reason(),
+            },
+            "mapped open [live] is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_mapped_open_error(&dead, &ordinary),
+            PinOutcome::Gone {
+                evidence: ExitEvidence::ProcessGenerationExited,
+                reason: ordinary.gap_reason(),
+            },
+            "mapped open [dead] is gone"
+        );
+        let object = |errno: Option<i32>| OpenObjectError {
+            reason: "open failed: probe".into(),
+            errno,
+        };
+        assert_eq!(
+            PinOutcome::for_open_object_error(&live, object(Some(libc::EMFILE))),
+            PinOutcome::Wait {
+                cause: WaitCause::HandleExhaustion,
+                retry: RetryOwner::ViewRescan,
+                reason: "open failed: probe".into(),
+            },
+            "object open [exhausted] waits"
+        );
+        assert_eq!(
+            PinOutcome::for_open_object_error(&live, object(Some(libc::EACCES))),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::OpenFailed,
+                reason: "open failed: probe".into(),
+            },
+            "object open [live] is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_open_object_error(&dead, object(None)),
+            PinOutcome::Gone {
+                evidence: ExitEvidence::ProcessGenerationExited,
+                reason: "open failed: probe".into(),
+            },
+            "object open [dead] is gone"
+        );
+
+        // View-level read failures pair with the liveness proof.
+        assert_eq!(
+            PinOutcome::for_view_error(&live, "mount table unreadable".into()),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "mount table unreadable".into(),
+            },
+            "view error [live] is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_view_error(&dead, "mount table unreadable".into()),
+            PinOutcome::Gone {
+                evidence: ExitEvidence::ProcessGenerationExited,
+                reason: "mount table unreadable".into(),
+            },
+            "view error [dead] is gone"
+        );
+
+        // Map-files fallback arms keep their typed meaning.
+        assert_eq!(
+            PinOutcome::for_map_files_refusal(
+                "gap".into(),
+                PinMapFilesRefusal::Wait("handles out".into())
+            ),
+            PinOutcome::Wait {
+                cause: WaitCause::HandleExhaustion,
+                retry: RetryOwner::ViewRescan,
+                reason: "gap (map_files fallback: handles out)".into(),
+            },
+            "fallback [wait] waits"
+        );
+        assert_eq!(
+            PinOutcome::for_map_files_refusal(
+                "gap".into(),
+                PinMapFilesRefusal::Unproven("no range".into())
+            ),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::FallbackUnproven,
+                reason: "gap (map_files fallback: no range)".into(),
+            },
+            "fallback [unproven] is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_map_files_refusal(
+                "gap".into(),
+                PinMapFilesRefusal::Refused("two files".into())
+            ),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::FallbackRefused,
+                reason: "two files".into(),
+            },
+            "fallback [refused] is missing evidence"
+        );
+
+        // Single-cause sites own their exact production text.
+        let key = ObjectKey {
+            device: Device {
+                major: 8,
+                minor: 210,
+            },
+            inode: INODE,
+        };
+        assert_eq!(
+            PinOutcome::for_pre_proof_missing(
+                "a pre-copy-up pin without a proven candidate index was refused"
+            ),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::ProofMissing,
+                reason: "a pre-copy-up pin without a proven candidate index was refused".into(),
+            },
+            "pre-copy-up without a candidate has no proof"
+        );
+        assert_eq!(
+            PinOutcome::for_mountinfo_unreadable(),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "the target mount table is unreadable; the pre-copy-up pin was refused"
+                    .into(),
+            },
+            "unreadable mount table is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_pre_candidate_diverged(),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::ProofMissing,
+                reason: "the proven lower candidate is not in the target's mount table; the pin was refused"
+                    .into(),
+            },
+            "diverged lower candidate has no proof"
+        );
+        assert_eq!(
+            PinOutcome::for_mapping_unavailable("fstat failed".into()),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "mapping identity unavailable: fstat failed".into(),
+            },
+            "unavailable mapping identity is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_identity_mismatch(key, PATH, key),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityMismatch,
+                reason: format!(
+                    "identity_mismatch: the mapping is {key:?} but {PATH} now opens as {key:?} \
+                     (compared via mountinfo)"
+                ),
+            },
+            "mismatching reopen is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_fstat_error("fstat failed: bad fd".into()),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "fstat failed: bad fd".into(),
+            },
+            "fstat failure is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_scanned_check("identity_mismatch: probe".into()),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityMismatch,
+                reason: "identity_mismatch: probe".into(),
+            },
+            "scanned-check mismatch is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_prove_error("fstatfs failed: probe".into()),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::IdentityUnreadable,
+                reason: "fstatfs failed: probe".into(),
+            },
+            "proof error is missing evidence"
+        );
+        assert_eq!(
+            PinOutcome::for_changed_mid_read(),
+            PinOutcome::Unproven {
+                cause: UnprovenCause::ChangedMidRead,
+                reason: "file changed while it was being identified - retry".into(),
+            },
+            "mid-read change is missing evidence"
+        );
     }
 }

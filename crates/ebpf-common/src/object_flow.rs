@@ -789,6 +789,64 @@ pub enum LengthReturnVerdict {
 /// bind. `fetch_arg` supplies entry argument scalars (probe
 /// registers/stack on BPF, a spy on host); `reader` reads one target
 /// word: the entry capacity, S-cells only.
+///
+/// Shared guarded length-argument acquisition (spec §5.1, §8.2):
+/// fetch each masked word through `$fetch` into the caller's
+/// `$words` slots beside its `$present` mask. The BPF stash invokes
+/// this with `arg_u64`, expanding to the literal index calls the
+/// verifier requires; host twins invoke it with a spy, so the exact
+/// fetch sequence is asserted on the production expression itself.
+/// Every index is a compile-time-constant literal under its own
+/// mask bit: a dynamic index would become register-offset pt_regs
+/// arithmetic (`ctx += reg`), which the verifier rejects
+/// ("dereference of modified ctx ptr" on 6.6/6.12/7.0). Index 0 is
+/// never an approved length position and is never fetched. A failed
+/// fetch leaves its slot zero and its presence bit unset. A zero
+/// mask fetches nothing. A macro, not a function: the expansion is
+/// the historical inline fetch block verbatim, so the BPF bytes and
+/// frames do not move.
+#[macro_export]
+macro_rules! acquire_length_entry_args {
+    ($fetch:path, $ctx:expr, $layout:expr, $mask:expr, $words:ident, $present:ident) => {
+        if $mask & 0x02 != 0 {
+            if let Ok(word) = $fetch($ctx, 1, $layout) {
+                $words[1] = word;
+                $present |= 0x02;
+            }
+        }
+        if $mask & 0x04 != 0 {
+            if let Ok(word) = $fetch($ctx, 2, $layout) {
+                $words[2] = word;
+                $present |= 0x04;
+            }
+        }
+        if $mask & 0x08 != 0 {
+            if let Ok(word) = $fetch($ctx, 3, $layout) {
+                $words[3] = word;
+                $present |= 0x08;
+            }
+        }
+        if $mask & 0x10 != 0 {
+            if let Ok(word) = $fetch($ctx, 4, $layout) {
+                $words[4] = word;
+                $present |= 0x10;
+            }
+        }
+        if $mask & 0x20 != 0 {
+            if let Ok(word) = $fetch($ctx, 5, $layout) {
+                $words[5] = word;
+                $present |= 0x20;
+            }
+        }
+        if $mask & 0x40 != 0 {
+            if let Ok(word) = $fetch($ctx, 6, $layout) {
+                $words[6] = word;
+                $present |= 0x40;
+            }
+        }
+    };
+}
+
 #[inline(always)]
 pub fn adapter_length_entry(
     out: &mut EvidenceStart,
@@ -4429,9 +4487,9 @@ mod tests {
 
     /// Production-boundary acquisition twin (§5.1, §8.2): the BPF
     /// stash acquires through the shared
-    /// `acquire_length_entry_args`, so this spy exercises the actual
-    /// guarded fetch expression — no downstream seam stands between
-    /// the spy and the reads. For every length row on both ABIs the
+    /// `acquire_length_entry_args!` macro, so this spy exercises the
+    /// actual guarded fetch expression — no downstream seam stands
+    /// between the spy and the reads. For every length row on both ABIs the
     /// fetch sequence is exactly the mask's indices in ascending
     /// order, every masked slot is populated with its own word, and
     /// the presence mask equals the entry-fetch mask. Every refusal
@@ -4442,26 +4500,26 @@ mod tests {
     /// still observed while its slot stays zero and unset.
     #[test]
     fn length_entry_acquisition_fetches_exactly_masked_positions() {
-        use super::acquire_length_entry_args;
-        use crate::MAX_DESCRIPTORS;
+        // No import for the macro: `macro_rules!` textual scope
+        // already carries it past its definition in this crate.
         use crate::evidence_table::length_entry_fetch_mask;
-        // Scripted acquisition run: index-tagged words, so a swapped
-        // slot fails loudly instead of hiding behind a constant.
-        // `fail` scripts one failed fetch attempt.
+        use crate::MAX_DESCRIPTORS;
+        // Scripted acquisition run: the production macro with a spy
+        // fetch, and index-tagged words, so a swapped slot fails
+        // loudly instead of hiding behind a constant. `fail` scripts
+        // one failed fetch attempt.
         let run = |layout: LinuxLayout, mask: u8, fail: Option<u8>| {
             let mut fetches = Vec::new();
-            let (words, present) = acquire_length_entry_args(
-                &(),
-                layout,
-                mask,
-                |_: &(), index: u8, _: LinuxLayout| -> Result<u64, ()> {
-                    fetches.push(index);
-                    if fail == Some(index) {
-                        return Err(());
-                    }
-                    Ok(0x1_0000 + u64::from(index))
-                },
-            );
+            let mut fetch = |_: &(), index: u8, _: LinuxLayout| -> Result<u64, ()> {
+                fetches.push(index);
+                if fail == Some(index) {
+                    return Err(());
+                }
+                Ok(0x1_0000 + u64::from(index))
+            };
+            let mut words = [0u64; 7];
+            let mut present: u8 = 0;
+            acquire_length_entry_args!(fetch, &(), layout, mask, words, present);
             (fetches, words, present)
         };
         let s_rows: [(&str, [u8; 2]); 6] = [
@@ -4480,9 +4538,26 @@ mod tests {
             ("C_DecapsulateKey", 6),
         ];
         // The Tier-2 RED controls name these descriptors exactly:
-        // 31/C_Encrypt authorizes [3, 4], 35/C_Decrypt authorizes [2].
+        // 31/C_Encrypt authorizes [3, 4] (an extra seventh-argument
+        // fetch reads [3, 4, 6]); 35/C_Decrypt authorizes [2]
+        // (swapped bits 1/2 read [1]). Asserted first so a
+        // regression fails here with the exact specified signature.
         assert_eq!(length_descriptor("C_Encrypt"), 31);
         assert_eq!(length_descriptor("C_Decrypt"), 35);
+        for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+            let (fetches, _, _) = run(layout, length_entry_fetch_mask(31), None);
+            assert_eq!(
+                fetches.as_slice(),
+                &[3u8, 4],
+                "descriptor 31 (C_Encrypt) {layout:?}"
+            );
+            let (fetches, _, _) = run(layout, length_entry_fetch_mask(35), None);
+            assert_eq!(
+                fetches.as_slice(),
+                &[2u8],
+                "descriptor 35 (C_Decrypt) {layout:?}"
+            );
+        }
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             for (name, sequence) in s_rows {
                 let descriptor = length_descriptor(name);
@@ -4507,8 +4582,7 @@ mod tests {
                         0
                     };
                     assert_eq!(
-                        words[index as usize],
-                        expected,
+                        words[index as usize], expected,
                         "{name} {layout:?}: slot {index}"
                     );
                 }
@@ -4536,8 +4610,7 @@ mod tests {
                         0
                     };
                     assert_eq!(
-                        words[index as usize],
-                        expected,
+                        words[index as usize], expected,
                         "{name} {layout:?}: slot {index}"
                     );
                 }
@@ -4606,8 +4679,7 @@ mod tests {
                     "descriptor {descriptor} {layout:?}: zero presence"
                 );
                 assert_eq!(
-                    words,
-                    [0u64; 7],
+                    words, [0u64; 7],
                     "descriptor {descriptor} {layout:?}: zero words"
                 );
             }

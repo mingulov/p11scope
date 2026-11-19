@@ -566,6 +566,7 @@ pub(super) mod program {
     // (pinned by the Task 2 contracts case).
     #[cfg(not(feature = "stub-object-attributes"))]
     use core::ffi::c_void;
+    use p11scope_ebpf_common::acquire_length_entry_args;
     #[cfg(not(feature = "stub-object-attributes"))]
     use p11scope_ebpf_common::evidence_table::length_entry_descriptor;
     use p11scope_ebpf_common::evidence_table::{
@@ -639,9 +640,10 @@ pub(super) mod program {
     /// Acquisition is bounded by the row's entry-fetch mask: a zero
     /// mask (count-only, narrowed, unlisted, corrupt, info) deletes
     /// any stale row and returns before the first fetch, and every
-    /// fetched index is a compile-time-constant literal guarded by
-    /// its mask bit. Index 0 is never an approved length position
-    /// and is never fetched.
+    /// fetch runs through the shared `acquire_length_entry_args`
+    /// with a compile-time-constant literal index guarded by its
+    /// mask bit. Index 0 is never an approved length position and
+    /// is never fetched.
     #[cfg_attr(feature = "stub-object-attributes", allow(dead_code))]
     #[inline(never)]
     fn stash_length_entry(
@@ -660,11 +662,11 @@ pub(super) mod program {
         }
         let start_ts_ns = unsafe { p11_owner_start_get(key, 0).as_ref() }.map(|start| start.ts_ns);
         let mut row = EvidenceStart::default();
-        // Fetch only masked positions, each with a
-        // compile-time-constant index. The adapter selects positions
-        // at runtime, but a dynamic index into `arg_u64` becomes
-        // register-offset pt_regs arithmetic (`ctx += reg`), which
-        // the verifier rejects ("dereference of modified ctx ptr" on
+        // One shared guarded fetch expression: each masked position
+        // arrives with a compile-time-constant literal index (a
+        // dynamic index into `arg_u64` becomes register-offset
+        // pt_regs arithmetic, `ctx += reg`, which the verifier
+        // rejects with "dereference of modified ctx ptr" on
         // 6.6/6.12/7.0). Slots 1..=5 are the LP64 registers; 6 is
         // the SP+8 stack slot (spec §8.2). Words start zeroed
         // beside a validity mask: a `None` payload is undef, and
@@ -673,42 +675,7 @@ pub(super) mod program {
         // indexes these arrays, never `arg_u64`.
         let mut words = [0u64; 7];
         let mut present: u8 = 0;
-        if mask & 0x02 != 0 {
-            if let Ok(word) = arg_u64(ctx, 1, layout) {
-                words[1] = word;
-                present |= 0x02;
-            }
-        }
-        if mask & 0x04 != 0 {
-            if let Ok(word) = arg_u64(ctx, 2, layout) {
-                words[2] = word;
-                present |= 0x04;
-            }
-        }
-        if mask & 0x08 != 0 {
-            if let Ok(word) = arg_u64(ctx, 3, layout) {
-                words[3] = word;
-                present |= 0x08;
-            }
-        }
-        if mask & 0x10 != 0 {
-            if let Ok(word) = arg_u64(ctx, 4, layout) {
-                words[4] = word;
-                present |= 0x10;
-            }
-        }
-        if mask & 0x20 != 0 {
-            if let Ok(word) = arg_u64(ctx, 5, layout) {
-                words[5] = word;
-                present |= 0x20;
-            }
-        }
-        if mask & 0x40 != 0 {
-            if let Ok(word) = arg_u64(ctx, 6, layout) {
-                words[6] = word;
-                present |= 0x40;
-            }
-        }
+        acquire_length_entry_args!(arg_u64, ctx, layout, mask, words, present);
         let mut fetch = |index: u8| {
             if index < 7 && present & (1 << index) != 0 {
                 Some(words[index as usize])

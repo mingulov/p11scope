@@ -10,20 +10,24 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Added
 
-- Finished `-o` reports survive destination I/O failures: a sync,
+- Finished `-o` reports survive destination I/O failures: a
+  document-write failure (a full disk, a quota) saves the complete
+  in-memory bytes straight to the recovery dir, and a sync,
   handover or rename failure retries the commit once, then saves the
-  capture to the recovery dir `/var/tmp/p11scope-recovered/` (created
-  `0700` owner-only; a planted symlink, foreign-owned or permissive
-  dir is refused) as a `0600`
-  `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>` file, with one stderr
-  line naming the `-o` error and the saved path; the command exits 1
-  because the requested `-o` does not exist. When the recovery save
-  fails too, one stderr line carries both errors with `capture lost`
-  and the command exits 1. Before the capture, one advisory stderr
-  line warns when the destination filesystem holds less than 1 MiB
-  (`may not fit`); the capture still starts. Final-name security
-  refusals still keep the temp beside the destination without a
-  fallback.
+  finished capture there. The recovery dir is per-user
+  (`/var/tmp/p11scope-recovered-<euid>/`, created `0700`
+  owner-only), so one user's fallback never blocks another's; when
+  the base name is occupied by a foreign object, the save falls
+  back to a fresh unique sibling with one warning naming both.
+  Files are `0600` `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>`,
+  with one stderr line naming the `-o` error and the saved path;
+  the command exits 1 because the requested `-o` does not exist.
+  When the recovery save fails too, one stderr line carries both
+  errors with `capture lost` and the command exits 1. Before the
+  capture, one advisory stderr line warns when the destination
+  filesystem holds less than 1 MiB (`may not fit`); the capture
+  still starts. Final-name security refusals still keep the temp
+  beside the destination without a fallback.
 
 - R2 new-site key metadata on `--key-operations` object views
   (section version 6): a successful creation return promotes its own

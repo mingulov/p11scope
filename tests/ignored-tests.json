@@ -1410,6 +1410,18 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory/manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size",
+      "reason": "privileged: live RSA-2048 signs through real journal BPF report an inferred size",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size",
+      "reason": "privileged: live RSA-2048 signs without --key-sizes report no size",
+      "cell": "privileged"
+    },
+    {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",

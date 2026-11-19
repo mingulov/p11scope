@@ -1725,8 +1725,8 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 272 + 2.
-        self.assertIn("default (274)", result.stdout)
+        # exactly one), so the default section shows 274 + 2.
+        self.assertIn("default (276)", result.stdout)
         self.assertIn("btrfs (18, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (14, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
@@ -1734,7 +1734,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (349 tests)",
+        self.assertIn("verify: curation matches the binary (351 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1931,7 +1931,7 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=272",
+            "DEFAULT_TESTS=274",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=17",
             "BTRFS_TESTS=18",
@@ -2358,10 +2358,10 @@ class Full512CurationTests(unittest.TestCase):
             result = run_runner("--list", "--full-512", str(binary))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        # DEFAULT 272 minus the 17 wide members, plus both load-gate
+        # DEFAULT 274 minus the 17 wide members, plus both load-gate
         # alternatives the fake lists (a real binary has exactly one);
         # LONG 17 minus the 4 wide members.
-        self.assertIn("default (257)", result.stdout)
+        self.assertIn("default (259)", result.stdout)
         self.assertIn("long (13, --include-long only)", result.stdout)
         for name in WIDE_ONLY_EXPECTED:
             self.assertNotIn(name, result.stdout)

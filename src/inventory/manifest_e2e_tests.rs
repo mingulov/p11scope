@@ -2235,3 +2235,518 @@ fn mt_key_judge_rejects_a_different_refusal() {
         "unexpected error: {error:#}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Key-sizes live verdicts: the judges behind the two privileged cells
+// below. Shared sign accounting (rows plus named race buckets equal
+// the LEDGER exactly, at least one sign proved) with per-row size
+// verdicts: the sizes judge requires RSA-2048 from `sign_output`
+// evidence, the off judge requires unknown sizes beside inferred
+// families.
+// ---------------------------------------------------------------------------
+
+/// Shared sign accounting behind both sizes judges: populated only
+/// (sizes prove nothing on a refused run), proved sign rows plus the
+/// named single-thread race buckets equal the LEDGER exactly, and at
+/// least one sign lands in a proved row. Returns the proved sign rows
+/// with their completed counts.
+fn key_sizes_sign_totals(
+    observations: &serde_json::Value,
+    ledger_signs: u64,
+    tag: &str,
+) -> Result<(Vec<serde_json::Value>, u64, u64)> {
+    let status = observations
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .context("object_observations status")?;
+    ensure!(
+        status == "populated",
+        "{tag}: object_observations status is {status}, want populated (sizes prove only on a populated run)"
+    );
+    let rows = observations
+        .get("key_operations")
+        .and_then(serde_json::Value::as_array)
+        .context("key_operations rows")?;
+    let sign_rows: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|row| row.get("category").and_then(serde_json::Value::as_str) == Some("sign"))
+        .cloned()
+        .collect();
+    let rows_done: u64 = sign_rows
+        .iter()
+        .map(|row| {
+            row.get("completed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum();
+    let unknown = observations
+        .get("unknown_key_operations")
+        .and_then(serde_json::Value::as_array)
+        .context("unknown_key_operations")?;
+    let mut unknown_done = 0u64;
+    for bucket in unknown
+        .iter()
+        .filter(|bucket| bucket.get("category").and_then(serde_json::Value::as_str) == Some("sign"))
+    {
+        let reason = bucket
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .context("unknown sign reason")?;
+        ensure!(
+            reason == "key_join_lost" || reason == "unbound",
+            "{tag}: unknown sign bucket {reason} is not a known race bucket"
+        );
+        unknown_done += bucket
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+    }
+    ensure!(
+        rows_done + unknown_done == ledger_signs,
+        "{tag}: observer-vs-ledger sign mismatch: rows {rows_done} + unknown {unknown_done} != ledger {ledger_signs}"
+    );
+    ensure!(
+        rows_done > 0,
+        "{tag}: no sign landed in a key row: rows 0 + unknown {unknown_done} is vacuous"
+    );
+    Ok((sign_rows, rows_done, unknown_done))
+}
+
+/// Judge `object_observations` for the sizes run: exact sign
+/// accounting, every completed sign row infers RSA-2048 from
+/// `sign_output` evidence with exact completions, and families infer
+/// RSA as the control.
+fn judge_key_sizes_observations(
+    observations: &serde_json::Value,
+    ledger_signs: u64,
+) -> Result<String> {
+    let (sign_rows, rows_done, unknown_done) =
+        key_sizes_sign_totals(observations, ledger_signs, "KEYSIZE")?;
+    for row in &sign_rows {
+        let completed = row
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if completed == 0 {
+            continue;
+        }
+        let object = row.get("object").and_then(serde_json::Value::as_u64);
+        let family = row
+            .get("inferred_family")
+            .context("sign row inferred_family")?;
+        ensure!(
+            family.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
+            "KEYSIZE: object {object:?} family status is {}, want inferred",
+            family.get("status").unwrap_or(&serde_json::Value::Null)
+        );
+        ensure!(
+            family.get("value").and_then(serde_json::Value::as_str) == Some("rsa"),
+            "KEYSIZE: object {object:?} family value is not rsa: {family}"
+        );
+        ensure!(
+            family
+                .get("completions")
+                .and_then(serde_json::Value::as_u64)
+                == Some(completed),
+            "KEYSIZE: object {object:?} family completions disagree with completed {completed}: {family}"
+        );
+        let size = row.get("inferred_size").context("sign row inferred_size")?;
+        ensure!(
+            size.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
+            "KEYSIZE: object {object:?} size status is {}, want inferred",
+            size.get("status").unwrap_or(&serde_json::Value::Null)
+        );
+        let detail = size.get("detail").context("inferred size detail")?;
+        ensure!(
+            detail.get("kind").and_then(serde_json::Value::as_str) == Some("rsa"),
+            "KEYSIZE: object {object:?} size kind is not rsa: {detail}"
+        );
+        ensure!(
+            detail.get("size_class").and_then(serde_json::Value::as_u64) == Some(2048),
+            "KEYSIZE: object {object:?} size_class is not 2048: {detail}"
+        );
+        ensure!(
+            detail
+                .get("modulus_bytes")
+                .and_then(serde_json::Value::as_u64)
+                == Some(256),
+            "KEYSIZE: object {object:?} modulus_bytes is not 256: {detail}"
+        );
+        ensure!(
+            detail.get("evidence").and_then(serde_json::Value::as_str) == Some("sign_output"),
+            "KEYSIZE: object {object:?} size evidence is not sign_output: {detail}"
+        );
+        ensure!(
+            size.get("completions").and_then(serde_json::Value::as_u64) == Some(completed),
+            "KEYSIZE: object {object:?} size completions disagree with completed {completed}: {size}"
+        );
+    }
+    Ok(format!(
+        "rows={rows_done} unknown={unknown_done} total={ledger_signs} size=rsa2048"
+    ))
+}
+
+/// Judge `object_observations` for the no-sizes twin: exact sign
+/// accounting, every completed sign row carries unknown sizes (null
+/// detail, zero completions), and families still infer RSA.
+fn judge_key_sizes_off_observations(
+    observations: &serde_json::Value,
+    ledger_signs: u64,
+) -> Result<String> {
+    let (sign_rows, rows_done, unknown_done) =
+        key_sizes_sign_totals(observations, ledger_signs, "KEYSIZE_OFF")?;
+    for row in &sign_rows {
+        let completed = row
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if completed == 0 {
+            continue;
+        }
+        let object = row.get("object").and_then(serde_json::Value::as_u64);
+        let family = row
+            .get("inferred_family")
+            .context("sign row inferred_family")?;
+        ensure!(
+            family.get("status").and_then(serde_json::Value::as_str) == Some("inferred"),
+            "KEYSIZE_OFF: object {object:?} family status is {}, want inferred",
+            family.get("status").unwrap_or(&serde_json::Value::Null)
+        );
+        ensure!(
+            family.get("value").and_then(serde_json::Value::as_str) == Some("rsa"),
+            "KEYSIZE_OFF: object {object:?} family value is not rsa: {family}"
+        );
+        ensure!(
+            family
+                .get("completions")
+                .and_then(serde_json::Value::as_u64)
+                == Some(completed),
+            "KEYSIZE_OFF: object {object:?} family completions disagree with completed {completed}: {family}"
+        );
+        let size = row.get("inferred_size").context("sign row inferred_size")?;
+        ensure!(
+            size.get("status").and_then(serde_json::Value::as_str) == Some("unknown"),
+            "KEYSIZE_OFF: object {object:?} size status is {}, want unknown",
+            size.get("status").unwrap_or(&serde_json::Value::Null)
+        );
+        ensure!(
+            size.get("detail").is_none_or(|detail| detail.is_null()),
+            "KEYSIZE_OFF: object {object:?} size detail is not null: {size}"
+        );
+        ensure!(
+            size.get("completions").and_then(serde_json::Value::as_u64) == Some(0),
+            "KEYSIZE_OFF: object {object:?} size completions are not 0: {size}"
+        );
+    }
+    Ok(format!(
+        "rows={rows_done} unknown={unknown_done} total={ledger_signs} size=off"
+    ))
+}
+
+#[test]
+fn key_sizes_judge_accepts_exact_rsa2048_row() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    assert_eq!(
+        judge_key_sizes_observations(&observations, 3).unwrap(),
+        "rows=3 unknown=0 total=3 size=rsa2048"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_missing_size() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {"status": "unknown", "detail": null, "completions": 0},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("want inferred"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_wrong_size_class() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 3072, "modulus_bytes": 384, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("size_class"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_judge_rejects_ledger_mismatch() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 2,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 2},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 2,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("observer-vs-ledger sign mismatch"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_accepts_unsized_row() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {"status": "unknown", "detail": null, "completions": 0},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    assert_eq!(
+        judge_key_sizes_off_observations(&observations, 3).unwrap(),
+        "rows=3 unknown=0 total=3 size=off"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_rejects_present_size() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output"},
+                    "completions": 3,
+                },
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("want unknown"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn key_sizes_off_judge_rejects_vacuous_rows() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [],
+        "unknown_key_operations": [
+            {"category": "sign", "completed": 3, "reason": "unbound"},
+        ],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("vacuous"),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// Single-threaded RSA-2048 signs through real journal BPF to an
+/// inferred size in the JSON report: `inventory --pid --capture
+/// native --key-operations --key-sizes --manifest` over 1 thread x
+/// 3 `mt_sign` signs lands the signs in a key row with
+/// `inferred_size` RSA-2048 from `sign_output` evidence. No
+/// hand-built wire records anywhere on the path: lengths arrive in
+/// real END records from the length pair. Needs an observer binary
+/// via `P11SCOPE_E2E_OBSERVER` or a `p11scope` sibling of this test
+/// binary. Prints KEYSIZE lines. Root BPF lane, serial, about a
+/// minute.
+#[test]
+#[ignore = "privileged: live RSA-2048 signs through real journal BPF report an inferred size"]
+fn privileged_inventory_pid_key_sizes_live_sign_reports_size() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = E2eWorkload::build_with(&module, &mt_sign_source(), "mt_sign", "keysize")?;
+    let outcome = key_sizes_inner(&workload, &module, &observer, true);
+    keep_workload_on_failure(workload, outcome, "KEYSIZE")
+}
+
+/// Twin without `--key-sizes`: the identical run reports the same
+/// sign rows with no sizes (unknown status, null detail, zero
+/// completions) while families still infer RSA. Prints KEYSIZE_OFF
+/// lines. Root BPF lane, serial, about a minute.
+#[test]
+#[ignore = "privileged: live RSA-2048 signs without --key-sizes report no size"]
+fn privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = E2eWorkload::build_with(&module, &mt_sign_source(), "mt_sign", "keysize")?;
+    let outcome = key_sizes_inner(&workload, &module, &observer, false);
+    keep_workload_on_failure(workload, outcome, "KEYSIZE_OFF")
+}
+
+fn key_sizes_inner(
+    workload: &E2eWorkload,
+    module: &str,
+    observer: &Path,
+    key_sizes: bool,
+) -> Result<()> {
+    let tag = if key_sizes { "KEYSIZE" } else { "KEYSIZE_OFF" };
+    let manifest = live_manifest(workload, module, MT_SIGN_FUNCTIONS, "keysize-live.json")?;
+    let out = workload.path("inv.json");
+    let event_log = workload.path("events.jsonl");
+    let gate = workload.path("gate");
+    let workload_out = workload.path("mt_sign.out");
+    let observer_out = workload.path("observer.out");
+    let mut target = workload.spawn_mt_sign(&workload_out, module, &gate, 1, 3)?;
+    target.wait_for("READY ", Duration::from_secs(30))?;
+    let pid = target.child.id();
+    println!("{tag} workload spawned pid={pid} gate={}", gate.display());
+    let observer_log = std::fs::File::create(&observer_out)?;
+    let mut command = Command::new(observer);
+    command.args([
+        "inventory",
+        "--pid",
+        &pid.to_string(),
+        "--capture",
+        "native",
+        "--key-operations",
+    ]);
+    if key_sizes {
+        command.arg("--key-sizes");
+    }
+    command
+        .args([
+            "--manifest",
+            manifest.to_str().context("manifest path")?,
+            "--event-log",
+            event_log.to_str().context("event log path")?,
+            "--duration",
+            "30",
+            "--json",
+            "-o",
+            out.to_str().context("out path")?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(observer_log.try_clone()?)
+        .stderr(observer_log)
+        .die_with_parent();
+    let mut child = command.spawn().context("spawning observer")?;
+    println!("{tag} observer spawned pid={}", child.id());
+    let needle_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let active = std::fs::read_to_string(&observer_out).is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.contains("native usage lane active"))
+        });
+        if active {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the observer exited before the usage lane activated: {}",
+                observer_evidence(&observer_out, &out, &format!("exited {status}"))
+            );
+        }
+        target.ensure_alive("before the usage lane activated")?;
+        ensure!(
+            Instant::now() < needle_deadline,
+            "usage lane never activated (observer pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let transcript = std::fs::read_to_string(&workload_out)?;
+    mt_key_wait_matched(&event_log, &transcript, pid)?;
+    std::fs::write(&gate, b"open\n")?;
+    println!("{tag} gate opened");
+    target.wait_for("LEDGER ", Duration::from_secs(120))?;
+    let transcript = std::fs::read_to_string(&workload_out)?;
+    let ledger_signs = mt_sign_ledger_signs(&transcript)?;
+    target.ensure_alive("after LEDGER before the observer stopped")?;
+    let stop_deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        ensure!(
+            Instant::now() < stop_deadline,
+            "the observer did not stop: {}",
+            observer_evidence(&observer_out, &out, "still running")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    ensure!(
+        status.success(),
+        "the observer exited with {status}: {}",
+        observer_evidence(&observer_out, &out, &format!("exited {status}"))
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out)?).context("observer report json")?;
+    let observations = report
+        .get("object_observations")
+        .context("object_observations")?;
+    let verdict = if key_sizes {
+        judge_key_sizes_observations(observations, ledger_signs)?
+    } else {
+        judge_key_sizes_off_observations(observations, ledger_signs)?
+    };
+    println!("{tag} {verdict} ledger={ledger_signs}");
+    Ok(())
+}

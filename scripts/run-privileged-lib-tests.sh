@@ -561,6 +561,14 @@ inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_so
 # the LEDGER exactly. A build without the journal pins the
 # journal_unavailable refusal. Prints MTKEY lines (about a minute).
 inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact
+# Key-sizes live positive plus its off twin: inventory --pid
+# --capture native --key-operations [--key-sizes] --manifest over
+# 1 thread x 3 RSA-2048 mt_sign signs. Real journal BPF (no
+# hand-built wire records) through to inferred_size RSA-2048 from
+# sign_output evidence; the twin reports the same rows with no
+# sizes. Prints KEYSIZE / KEYSIZE_OFF lines (about a minute each).
+inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_live_sign_reports_size
+inventory::manifest_e2e_tests::privileged_inventory_pid_key_sizes_off_live_sign_reports_no_size
 # Reload-disclosure cells: installed inventory captures over the owned
 # fixture pair. The churn run publishes the disclosure naming the
 # churned identity with exact counts; the clean control omits the key

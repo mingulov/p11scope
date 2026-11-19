@@ -2591,6 +2591,28 @@ fn key_sizes_off_judge_rejects_present_size() {
 }
 
 #[test]
+fn key_sizes_off_judge_rejects_missing_detail() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {
+                "category": "sign",
+                "completed": 3,
+                "object": 3,
+                "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3},
+                "inferred_size": {"status": "unknown", "completions": 0},
+            },
+        ],
+        "unknown_key_operations": [],
+    });
+    let error = judge_key_sizes_off_observations(&observations, 3).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("detail"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
 fn key_sizes_off_judge_rejects_vacuous_rows() {
     let observations = serde_json::json!({
         "status": "populated",

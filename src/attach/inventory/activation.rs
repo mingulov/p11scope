@@ -2202,19 +2202,20 @@ pub(super) fn read_info_produced(ebpf: &Ebpf) -> Result<u64> {
 }
 
 /// Keymeta Task 7 (spec §17.4): one bounded `INFO_EVIDENCE`
-/// group read — all four cells, or the yield when the window
+/// group read — all five cells, or the yield when the window
 /// expired mid-group (the caller keeps its previous full sample
 /// and stages incomplete, never a partial group).
 pub(super) enum InfoEvidenceRead {
-    Done(Result<[u64; 4], String>),
+    Done(Result<[u64; 5], String>),
     Yielded,
 }
 
-/// Keymeta Task 7 (spec §17.4): the four `INFO_EVIDENCE` cells —
-/// insert failures, unmatched returns, nested overwrites and stash
-/// mismatches — summed over CPUs. No cell lookup starts at or past
-/// the quantum deadline: a mid-group expiry yields with no partial
-/// sample. FULL objects only; P0 carries no such map and never
+/// Keymeta Task 7 (spec §17.4): the five `INFO_EVIDENCE` cells —
+/// insert failures, unmatched returns, nested overwrites, stash
+/// mismatches and INFO ring losses — summed over CPUs. No cell
+/// lookup starts at or past the quantum deadline: a mid-group
+/// expiry yields with no partial sample. FULL objects only; P0
+/// carries no such map and never
 /// calls this (the caller gates on the INFO reader).
 pub(super) fn read_info_evidence(
     ebpf: &Ebpf,
@@ -2239,7 +2240,7 @@ pub(super) fn read_info_evidence(
     })
 }
 
-/// The four-cell evidence loop over one cell reader: no cell starts
+/// The five-cell evidence loop over one cell reader: no cell starts
 /// at or past the deadline, and a failed cell ends the group with
 /// its cause (later cells never start, like the `?` before it).
 fn read_evidence_cells(
@@ -2248,15 +2249,16 @@ fn read_evidence_cells(
     mut read_cell: impl FnMut(u32) -> Result<u64, String>,
 ) -> InfoEvidenceRead {
     use p11scope_ebpf_common::{
-        INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES,
+        INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES, INFO_EVIDENCE_RING_LOSS,
         INFO_EVIDENCE_STASH_MISMATCHES, INFO_EVIDENCE_UNMATCHED_RETURNS,
     };
-    let mut cells = [0u64; 4];
+    let mut cells = [0u64; 5];
     for (cell, index) in cells.iter_mut().zip([
         INFO_EVIDENCE_INSERT_FAILURES,
         INFO_EVIDENCE_UNMATCHED_RETURNS,
         INFO_EVIDENCE_NESTED_OVERWRITES,
         INFO_EVIDENCE_STASH_MISMATCHES,
+        INFO_EVIDENCE_RING_LOSS,
     ]) {
         if now() >= deadline {
             return InfoEvidenceRead::Yielded;

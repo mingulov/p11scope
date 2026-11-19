@@ -587,3 +587,90 @@ fn info_return_enforces_live_kind_before_reading_or_counting() {
         "a gate whose delete and return cannot execute"
     );
 }
+
+/// Task 7 INFO ring loss (spec §17.4): a full INFO ring submits
+/// nothing, so the loss counts in its own `INFO_EVIDENCE` cell —
+/// never in the shared discovery ring-loss counter, which feeds
+/// lifecycle-loss demotion for the whole capture. The
+/// reserve-failure arm of `emit_info_record` bumps
+/// `INFO_EVIDENCE_RING_LOSS` and returns early, and the info BPF
+/// references no discovery loss counter at all.
+#[test]
+fn info_ring_reserve_failure_counts_its_own_evidence_cell() {
+    fn body_of(source: &str) -> &str {
+        let start = source
+            .find("fn emit_info_record(")
+            .expect("emit_info_record exists");
+        let tail = &source[start..];
+        let end = tail.find("\n}\n").expect("emit_info_record ends") + "\n}".len();
+        &tail[..end]
+    }
+    fn is_code(line: &str) -> bool {
+        !line.trim_start().starts_with("//")
+    }
+    fn contract(source: &str) -> bool {
+        // The discovery ring-loss counter is for discovery
+        // records only: neither a bump nor its import may remain
+        // in the info BPF.
+        if source
+            .lines()
+            .any(|line| is_code(line) && line.contains("DISCOVERY_COUNTER_RING_LOSS"))
+        {
+            return false;
+        }
+        let lines: Vec<&str> = body_of(source).lines().collect();
+        let Some(reserve) = lines.iter().position(|line| {
+            is_code(line) && line.contains("INFO.reserve::<[u8; INFO_RECORD_LEN]>(0) else {")
+        }) else {
+            return false;
+        };
+        // The refused arm counts the INFO ring loss and returns
+        // early as its direct statements, in order.
+        let Some((statements, _)) = refusal_block_statements(&lines, reserve) else {
+            return false;
+        };
+        statements == ["bump_info_evidence(INFO_EVIDENCE_RING_LOSS);", "return 0;"]
+    }
+    let source =
+        std::fs::read_to_string("crates/ebpf/src/inventory_info.rs").expect("read info BPF source");
+    assert!(
+        contract(&source),
+        "an INFO reserve failure must count INFO_EVIDENCE_RING_LOSS, never discovery ring loss"
+    );
+    // A reserve failure counted as discovery loss must fail.
+    let tail = source.replacen(
+        "bump_info_evidence(INFO_EVIDENCE_RING_LOSS)",
+        "bump_discovery_counter(DISCOVERY_COUNTER_RING_LOSS)",
+        1,
+    );
+    assert!(!contract(&tail), "an INFO loss counted as discovery loss");
+    // A reserve failure counted in the wrong evidence cell must fail.
+    let tail = source.replacen(
+        "bump_info_evidence(INFO_EVIDENCE_RING_LOSS)",
+        "bump_info_evidence(INFO_EVIDENCE_STASH_MISMATCHES)",
+        1,
+    );
+    assert!(!contract(&tail), "an INFO loss counted as a stash mismatch");
+    // A reserve failure that counts nothing must fail.
+    let tail = source.replacen(
+        "        bump_info_evidence(INFO_EVIDENCE_RING_LOSS);\n",
+        "",
+        1,
+    );
+    assert!(!contract(&tail), "an INFO loss that counts nothing");
+    // A reserve failure without the early return must fail.
+    let tail = source.replacen(
+        "        bump_info_evidence(INFO_EVIDENCE_RING_LOSS);\n        return 0;",
+        "        bump_info_evidence(INFO_EVIDENCE_RING_LOSS);",
+        1,
+    );
+    assert!(
+        !contract(&tail),
+        "an INFO loss arm without the early return"
+    );
+    // A leftover discovery import must fail even with the right bump.
+    let import = source.find("INFO_EVIDENCE_RING_LOSS").unwrap();
+    let mut tail = source.to_string();
+    tail.insert_str(import, "DISCOVERY_COUNTER_RING_LOSS, ");
+    assert!(!contract(&tail), "a leftover discovery import");
+}

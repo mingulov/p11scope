@@ -1346,13 +1346,16 @@ pub const EVIDENCE_LENGTH_STASH_MISMATCHES: u32 = 10;
 pub const EVIDENCE_CELLS: u32 = 11;
 
 /// Keymeta Task 7 (spec §17.4): the `INFO_EVIDENCE` cells — insert
-/// failures, unmatched returns, nested overwrites and stash
-/// mismatches. Never silent, never folded into `EVIDENCE`.
+/// failures, unmatched returns, nested overwrites, stash
+/// mismatches and INFO ring losses (a full ring submits nothing,
+/// so the loss counts here, never in the shared ring-loss
+/// counter). Never silent, never folded into `EVIDENCE`.
 pub const INFO_EVIDENCE_INSERT_FAILURES: u32 = 0;
 pub const INFO_EVIDENCE_UNMATCHED_RETURNS: u32 = 1;
 pub const INFO_EVIDENCE_NESTED_OVERWRITES: u32 = 2;
 pub const INFO_EVIDENCE_STASH_MISMATCHES: u32 = 3;
-pub const INFO_EVIDENCE_CELLS: u32 = 4;
+pub const INFO_EVIDENCE_RING_LOSS: u32 = 4;
+pub const INFO_EVIDENCE_CELLS: u32 = 5;
 
 /// Hash-map capacities. The opt-in induced-gap build shrinks both maps so
 /// their independent failure counters can be exercised deterministically.
@@ -3377,15 +3380,17 @@ mod tests {
     }
 
     /// Keymeta Task 7 (spec §17.4): the `INFO_EVIDENCE` cells —
-    /// insert failures, unmatched returns, nested overwrites and
-    /// stash mismatches — never silent, never folded into EVIDENCE.
+    /// insert failures, unmatched returns, nested overwrites,
+    /// stash mismatches and INFO ring losses — never silent, never
+    /// folded into EVIDENCE.
     #[test]
-    fn info_evidence_cells_pin_the_four_counters() {
+    fn info_evidence_cells_pin_the_five_counters() {
         assert_eq!(INFO_EVIDENCE_INSERT_FAILURES, 0);
         assert_eq!(INFO_EVIDENCE_UNMATCHED_RETURNS, 1);
         assert_eq!(INFO_EVIDENCE_NESTED_OVERWRITES, 2);
         assert_eq!(INFO_EVIDENCE_STASH_MISMATCHES, 3);
-        assert_eq!(INFO_EVIDENCE_CELLS, 4);
+        assert_eq!(INFO_EVIDENCE_RING_LOSS, 4);
+        assert_eq!(INFO_EVIDENCE_CELLS, 5);
     }
 
     fn discovery_record(kind: u8) -> DiscoveryRecord {

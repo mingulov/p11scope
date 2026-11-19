@@ -5667,7 +5667,7 @@ impl super::InfoQuantumSource for CountingInfoSource {
     ) -> Option<super::super::activation::InfoEvidenceRead> {
         self.evidence_calls.set(self.evidence_calls.get() + 1);
         Some(super::super::activation::InfoEvidenceRead::Done(Ok([
-            1, 0, 0, 0,
+            1, 0, 0, 0, 0,
         ])))
     }
 }
@@ -5754,10 +5754,10 @@ impl super::InfoQuantumSource for CellCrossingInfoSource {
         &self,
         deadline: Instant,
     ) -> Option<super::super::activation::InfoEvidenceRead> {
-        // The production loop issues four native lookups, each gated
+        // The production loop issues five native lookups, each gated
         // on the window; this mimic records the same shape so the
         // twin pins the per-cell gating.
-        for cell in 0..4 {
+        for cell in 0..5 {
             if Instant::now() >= deadline {
                 return Some(super::super::activation::InfoEvidenceRead::Yielded);
             }
@@ -5767,14 +5767,14 @@ impl super::InfoQuantumSource for CellCrossingInfoSource {
             }
         }
         Some(super::super::activation::InfoEvidenceRead::Done(Ok([
-            1, 0, 0, 0,
+            1, 0, 0, 0, 0,
         ])))
     }
 }
 
 /// Keymeta Task 7 stop window (spec §17.4): a quantum whose window
 /// deadline passes inside the first evidence lookup starts no
-/// further evidence cell — each of the four native lookups gates on
+/// further evidence cell — each of the five native lookups gates on
 /// the window — and stages incomplete instead of a clean cut over a
 /// partially read group.
 #[test]
@@ -5841,28 +5841,56 @@ fn info_ring_accounting_counts_produced_minus_consumed_per_quantum() {
 #[test]
 fn info_evidence_deltas_span_failures_and_p0() {
     let mut book = test_book(8, 16, None);
-    let quantum = |book: &mut CaptureBook, evidence: Option<Result<[u64; 4], String>>| {
+    let quantum = |book: &mut CaptureBook, evidence: Option<Result<[u64; 5], String>>| {
         book.finish_info_quantum(Vec::new(), 0, None, true, None, evidence)
     };
-    let first = quantum(&mut book, Some(Ok([2, 1, 0, 3])));
-    assert_eq!(first.evidence_delta, [2, 1, 0, 3]);
+    let first = quantum(&mut book, Some(Ok([2, 1, 0, 3, 0])));
+    assert_eq!(first.evidence_delta, [2, 1, 0, 3, 0]);
     assert!(first.evidence_error.is_none());
-    let second = quantum(&mut book, Some(Ok([2, 4, 1, 3])));
-    assert_eq!(second.evidence_delta, [0, 3, 1, 0]);
+    let second = quantum(&mut book, Some(Ok([2, 4, 1, 3, 0])));
+    assert_eq!(second.evidence_delta, [0, 3, 1, 0, 0]);
     assert!(second.evidence_error.is_none());
     let failed = quantum(&mut book, Some(Err("cells broke".into())));
-    assert_eq!(failed.evidence_delta, [0; 4]);
+    assert_eq!(failed.evidence_delta, [0; 5]);
     assert_eq!(failed.evidence_error.as_deref(), Some("cells broke"));
     // The failed read kept the last cells: the next success reports
     // everything since the second quantum.
-    let third = quantum(&mut book, Some(Ok([5, 4, 1, 4])));
-    assert_eq!(third.evidence_delta, [3, 0, 0, 1]);
+    let third = quantum(&mut book, Some(Ok([5, 4, 1, 4, 0])));
+    assert_eq!(third.evidence_delta, [3, 0, 0, 1, 0]);
     assert!(third.evidence_error.is_none());
     // P0: no reading, zero deltas, no error.
     let mut p0 = test_book(8, 16, None);
     let idle = quantum(&mut p0, None);
-    assert_eq!(idle.evidence_delta, [0; 4]);
+    assert_eq!(idle.evidence_delta, [0; 5]);
     assert!(idle.evidence_error.is_none());
+}
+
+/// Keymeta Task 7 INFO ring loss (spec §17.4): a reserve failure on
+/// the INFO ring lands in the fifth evidence cell — the quantum
+/// differences it like the others — while the lifecycle ring-loss
+/// count and custody stay untouched. Control: a risen discovery
+/// counter still demotes, so the quiet above is the routing, not a
+/// deaf twin.
+#[test]
+fn info_ring_loss_routes_to_evidence_not_lifecycle() {
+    let mut book = test_book(8, 16, None);
+    let batch =
+        book.finish_info_quantum(Vec::new(), 0, None, true, None, Some(Ok([0, 0, 0, 0, 7])));
+    assert_eq!(batch.evidence_delta, [0, 0, 0, 0, 7]);
+    assert_eq!(book.ring_loss, 0);
+    assert!(book.lifecycle_lost.is_none());
+    book.observe_lifecycle(&CaptureHealth {
+        discovery_counters: Some([0; 5]),
+        ..CaptureHealth::default()
+    });
+    assert!(book.lifecycle_lost.is_none());
+    // Control: the lifecycle machinery still hears discovery loss.
+    book.observe_lifecycle(&CaptureHealth {
+        discovery_counters: Some([3, 0, 0, 0, 0]),
+        ..CaptureHealth::default()
+    });
+    assert!(book.lifecycle_lost.is_some());
+    assert_eq!(book.ring_loss, 3);
 }
 
 /// Keymeta Task 7 ring gate, drain half (5k zero-loss): five thousand

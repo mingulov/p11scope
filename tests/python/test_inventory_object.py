@@ -33,7 +33,7 @@ MAPS = {name: checker.map_def(*shape) for name, shape in {
     "INFO_START": (1, 16, 32, 1024),
     "INFO": (27, 0, 0, 64 * 1024),
     "INFO_KIND": (2, 4, 8, 1, 128),
-    "INFO_EVIDENCE": (6, 4, 8, 4),
+    "INFO_EVIDENCE": (6, 4, 8, 5),
 }.items()}
 PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",

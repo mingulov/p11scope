@@ -606,7 +606,7 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// four INFO evidence cells, reported once per nonzero category
     /// at the terminal cut — through the terminal gap headroom, so
     /// a saturated generic log never loses them.
-    info_evidence_totals: [u64; 4],
+    info_evidence_totals: [u64; 5],
     /// Keymeta Task 7 (spec §17.5): the stop already disclosed its
     /// queued-but-unfolded departed INFO folds, once per run.
     info_fold_deferred_disclosed: bool,
@@ -1599,7 +1599,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_targets: TargetDelta::default(),
             info_revoked: BTreeSet::new(),
             info_attribution_probes: 0,
-            info_evidence_totals: [0; 4],
+            info_evidence_totals: [0; 5],
             info_fold_deferred_disclosed: false,
             info_last_cut: None,
             info_observed_any: false,
@@ -41148,7 +41148,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -41204,7 +41204,7 @@ int main(void) {
             loss: 2,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -41231,7 +41231,7 @@ int main(void) {
             loss: 2,
             terminal: true,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -41270,7 +41270,7 @@ int main(void) {
             loss: 2,
             terminal: true,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -41317,7 +41317,7 @@ int main(void) {
                 loss: produced.saturating_sub(consumed),
                 terminal: true,
                 failure,
-                evidence_delta: [0; 4],
+                evidence_delta: [0; 5],
                 evidence_error: None,
                 complete,
                 produced_fresh: fresh,
@@ -41403,7 +41403,7 @@ int main(void) {
             loss: 2,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: false,
             produced_fresh: true,
@@ -41438,7 +41438,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: Some("ring read broke".into()),
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: false,
             produced_fresh: true,
@@ -41472,7 +41472,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [2, 1, 0, 3],
+            evidence_delta: [2, 1, 0, 3, 0],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -41508,7 +41508,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: Some("cells broke".into()),
             complete: true,
             produced_fresh: true,
@@ -41526,7 +41526,70 @@ int main(void) {
         );
     }
 
-    /// Keymeta Task 7 evidence totals (spec §17.4): the four stash
+    /// Keymeta Task 7 INFO ring loss (spec §17.4): a full INFO ring
+    /// submits nothing, so the loss counts in its own evidence cell
+    /// and reaches the operator as a named info gap — per quantum
+    /// and once in the terminal run totals — never as
+    /// lifecycle-ring loss.
+    #[test]
+    fn ingest_info_batch_reports_ring_loss_as_a_named_info_gap() {
+        let (mut native, _caller) = NativeScene::new();
+        let domain = native.domain;
+        let batch = crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: false,
+            failure: None,
+            evidence_delta: [0, 0, 0, 0, 5],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: false,
+        };
+        native.stage(NativeBatch::Info(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap.reason.contains("info evidence: 5 info ring loss(s)")),
+            "ring loss notes a named info gap: {gaps:?}"
+        );
+        // The terminal cut reports the run total once beside the cut.
+        native.scene.coordinator.enter_terminal_phase();
+        let terminal = crate::attach::capture::InfoBatch {
+            domain,
+            records: Vec::new(),
+            malformed: 0,
+            produced: 0,
+            consumed: 0,
+            loss: 0,
+            terminal: true,
+            failure: None,
+            evidence_delta: [0; 5],
+            evidence_error: None,
+            complete: true,
+            produced_fresh: true,
+            produced_error: None,
+            retired: true,
+        };
+        native.stage(NativeBatch::Info(terminal));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter().any(|gap| gap.subject.contains("provider info")
+                && gap
+                    .reason
+                    .contains("info evidence run total: 5 info ring loss(s)")),
+            "the terminal cut reports the ring-loss run total: {gaps:?}"
+        );
+    }
+
+    /// Keymeta Task 7 evidence totals (spec §17.4): the five stash
     /// cells accumulate saturating run totals, and the terminal cut
     /// reports each nonzero category once — through the terminal
     /// headroom, so a saturated generic gap log loses per-quantum
@@ -41553,7 +41616,7 @@ int main(void) {
             "the flood saturates the generic log"
         );
         let domain = native.domain;
-        let quantum = |delta: [u64; 4], error: Option<String>, terminal: bool| {
+        let quantum = |delta: [u64; 5], error: Option<String>, terminal: bool| {
             crate::attach::capture::InfoBatch {
                 domain,
                 records: Vec::new(),
@@ -41571,18 +41634,18 @@ int main(void) {
                 retired: terminal,
             }
         };
-        native.stage(NativeBatch::Info(quantum([2, 1, 0, 3], None, false)));
+        native.stage(NativeBatch::Info(quantum([2, 1, 0, 3, 0], None, false)));
         native.scene.coordinator.commit_batch(false).unwrap();
         native.stage(NativeBatch::Info(quantum(
-            [0; 4],
+            [0; 5],
             Some("cells broke".into()),
             false,
         )));
         native.scene.coordinator.commit_batch(false).unwrap();
-        native.stage(NativeBatch::Info(quantum([5, 0, 1, 0], None, false)));
+        native.stage(NativeBatch::Info(quantum([5, 0, 1, 0, 0], None, false)));
         native.scene.coordinator.commit_batch(false).unwrap();
         native.scene.coordinator.enter_terminal_phase();
-        native.stage(NativeBatch::Info(quantum([1, 1, 1, 1], None, true)));
+        native.stage(NativeBatch::Info(quantum([1, 1, 1, 1, 0], None, true)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let gaps = native.scene.coordinator.registry.gaps();
         let info_gaps: Vec<(&str, &str)> = gaps
@@ -41666,7 +41729,7 @@ int main(void) {
                 loss: 0,
                 terminal: true,
                 failure: None,
-                evidence_delta: [0; 4],
+                evidence_delta: [0; 5],
                 evidence_error: None,
                 complete: true,
                 produced_fresh: true,
@@ -41807,7 +41870,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -41855,7 +41918,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -42147,7 +42210,7 @@ int main(void) {
     fn unsettled_finish_reports_evidence_totals_and_the_unsettled_cut() {
         let (mut native, _caller) = NativeScene::new();
         let domain = native.domain;
-        let quantum = |delta: [u64; 4], loss: u64| crate::attach::capture::InfoBatch {
+        let quantum = |delta: [u64; 5], loss: u64| crate::attach::capture::InfoBatch {
             domain,
             records: Vec::new(),
             malformed: 0,
@@ -42163,9 +42226,9 @@ int main(void) {
             produced_error: None,
             retired: false,
         };
-        native.stage(NativeBatch::Info(quantum([2, 1, 0, 3], 0)));
+        native.stage(NativeBatch::Info(quantum([2, 1, 0, 3, 0], 0)));
         native.scene.coordinator.commit_batch(false).unwrap();
-        native.stage(NativeBatch::Info(quantum([5, 0, 1, 0], 7)));
+        native.stage(NativeBatch::Info(quantum([5, 0, 1, 0, 0], 7)));
         native.scene.coordinator.commit_batch(false).unwrap();
         native.stage(NativeBatch::Finish { domain });
         native.scene.coordinator.commit_batch(false).unwrap();
@@ -42214,7 +42277,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [1, 0, 0, 0],
+            evidence_delta: [1, 0, 0, 0, 0],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -42234,7 +42297,7 @@ int main(void) {
             loss: 0,
             terminal: true,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: false,
             produced_fresh: false,
@@ -42278,7 +42341,7 @@ int main(void) {
             loss: 0,
             terminal: true,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -42317,7 +42380,7 @@ int main(void) {
             loss: 0,
             terminal,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: false,
@@ -42368,7 +42431,7 @@ int main(void) {
         );
         let domain = native.domain;
         let quantum =
-            |delta: [u64; 4], loss: u64, terminal: bool| crate::attach::capture::InfoBatch {
+            |delta: [u64; 5], loss: u64, terminal: bool| crate::attach::capture::InfoBatch {
                 domain,
                 records: Vec::new(),
                 malformed: 0,
@@ -42390,13 +42453,13 @@ int main(void) {
         for n in 0..20u64 {
             let base = n * 4;
             native.stage(NativeBatch::Info(quantum(
-                [base + 1, base + 2, base + 3, base + 4],
+                [base + 1, base + 2, base + 3, base + 4, 0],
                 0,
                 false,
             )));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
-        native.stage(NativeBatch::Info(quantum([0; 4], 5, true)));
+        native.stage(NativeBatch::Info(quantum([0; 5], 5, true)));
         native.scene.coordinator.commit_batch(false).unwrap();
         let gaps = native.scene.coordinator.registry.gaps();
         let info_gaps: Vec<&str> = gaps
@@ -42488,7 +42551,7 @@ int main(void) {
         native.scene.coordinator.info_join.enqueue_fold(caller);
         let domain = native.domain;
         let quantum =
-            |delta: [u64; 4], loss: u64, terminal: bool| crate::attach::capture::InfoBatch {
+            |delta: [u64; 5], loss: u64, terminal: bool| crate::attach::capture::InfoBatch {
                 domain,
                 records: Vec::new(),
                 malformed: 0,
@@ -42508,18 +42571,18 @@ int main(void) {
         for n in 0..20u64 {
             let base = n * 4;
             native.stage(NativeBatch::Info(quantum(
-                [base + 1, base + 2, base + 3, base + 4],
+                [base + 1, base + 2, base + 3, base + 4, 0],
                 0,
                 false,
             )));
             native.scene.coordinator.commit_batch(false).unwrap();
         }
         // One stop-time failure diagnostic beside the capped detail.
-        let mut failed = quantum([0; 4], 0, false);
+        let mut failed = quantum([0; 5], 0, false);
         failed.evidence_error = Some("cells broke".into());
         native.stage(NativeBatch::Info(failed));
         native.scene.coordinator.commit_batch(false).unwrap();
-        native.stage(NativeBatch::Info(quantum([0; 4], 5, true)));
+        native.stage(NativeBatch::Info(quantum([0; 5], 5, true)));
         native.scene.coordinator.commit_batch(false).unwrap();
         native.stage(NativeBatch::Finish { domain });
         native.scene.coordinator.commit_batch(false).unwrap();
@@ -42715,7 +42778,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -42766,7 +42829,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,
@@ -42809,7 +42872,7 @@ int main(void) {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: true,

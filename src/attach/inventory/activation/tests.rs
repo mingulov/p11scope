@@ -1857,16 +1857,16 @@ fn scrub_poll_resumed_at_remove_counts_against_the_row_batch() {
 }
 
 /// Keymeta Task 7 stop window (spec §17.4): the evidence group
-/// read gates each of its four cell lookups on the quantum
+/// read gates each of its five cell lookups on the quantum
 /// deadline — a clock already past the window yields before the
 /// first cell, and a deadline crossed inside the first cell starts
 /// no further cell. A failed cell ends the group with its cause
-/// and starts no later cell; a healthy group reads all four cells
+/// and starts no later cell; a healthy group reads all five cells
 /// in index order.
 #[test]
 fn evidence_group_read_gates_each_cell_on_the_quantum_deadline() {
     use p11scope_ebpf_common::{
-        INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES,
+        INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES, INFO_EVIDENCE_RING_LOSS,
         INFO_EVIDENCE_STASH_MISMATCHES, INFO_EVIDENCE_UNMATCHED_RETURNS,
     };
     use std::cell::RefCell;
@@ -1875,6 +1875,7 @@ fn evidence_group_read_gates_each_cell_on_the_quantum_deadline() {
         INFO_EVIDENCE_UNMATCHED_RETURNS,
         INFO_EVIDENCE_NESTED_OVERWRITES,
         INFO_EVIDENCE_STASH_MISMATCHES,
+        INFO_EVIDENCE_RING_LOSS,
     ];
     // An already-expired window yields with zero cell starts.
     let starts = RefCell::new(Vec::new());
@@ -1921,7 +1922,7 @@ fn evidence_group_read_gates_each_cell_on_the_quantum_deadline() {
         "only the first cell starts: {:?}",
         starts.borrow()
     );
-    // A healthy group reads all four cells in index order.
+    // A healthy group reads all five cells in index order.
     let starts = RefCell::new(Vec::new());
     let mut now = || start;
     let read = read_evidence_cells(deadline, &mut now, |index| {
@@ -1929,7 +1930,7 @@ fn evidence_group_read_gates_each_cell_on_the_quantum_deadline() {
         Ok(u64::from(index) + 1)
     });
     let InfoEvidenceRead::Done(Ok(cells)) = read else {
-        panic!("a healthy group reads all four cells");
+        panic!("a healthy group reads all five cells");
     };
     assert_eq!(
         *starts.borrow(),
@@ -1937,7 +1938,7 @@ fn evidence_group_read_gates_each_cell_on_the_quantum_deadline() {
         "cells read in index order: {:?}",
         starts.borrow()
     );
-    assert_eq!(cells, [1, 2, 3, 4]);
+    assert_eq!(cells, [1, 2, 3, 4, 5]);
     // A failed cell ends the group with its cause: later cells
     // never start.
     let starts = RefCell::new(Vec::new());

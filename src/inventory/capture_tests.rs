@@ -1023,7 +1023,7 @@ struct Scene {
     /// Every staged INFO batch's record count, in staging order.
     staged_info_records: Vec<usize>,
     /// Every staged INFO batch's evidence delta, in staging order.
-    staged_info_evidence: Vec<[u64; 4]>,
+    staged_info_evidence: Vec<[u64; 5]>,
     /// Acquisition domains the loop forwarded to commit polls, in order.
     poll_acquisitions: Vec<Option<NativeDomainId>>,
     /// Acquisition domains the loop forwarded to ticks, in order.
@@ -2720,7 +2720,7 @@ fn cooperative_stop_drains_pending_info_before_finish() {
     let mut lane = ScriptedLane::new(&log);
     let mut stop_quantum = InfoBatch::empty(lane.domain);
     stop_quantum.records = vec![[0xAB; 176]];
-    stop_quantum.evidence_delta = [0, 0, 0, 1];
+    stop_quantum.evidence_delta = [0, 0, 0, 1, 0];
     stop_quantum.complete = true;
     stop_quantum.produced_fresh = true;
     lane.staged_info.push_back(stop_quantum);
@@ -2759,7 +2759,7 @@ fn cooperative_stop_drains_pending_info_before_finish() {
     );
     assert_eq!(
         scene.staged_info_evidence.last(),
-        Some(&[0, 0, 0, 1]),
+        Some(&[0, 0, 0, 1, 0]),
         "the stop-time evidence cell stages: {:?}",
         scene.staged_info_evidence
     );
@@ -2785,7 +2785,7 @@ fn classic_stop_stages_late_info_content_on_the_terminal_cut() {
     lane.staged_info.push_back(InfoBatch::empty(domain));
     let mut stop_quantum = InfoBatch::empty(domain);
     stop_quantum.records = vec![[0xAB; 176]];
-    stop_quantum.evidence_delta = [1, 0, 0, 0];
+    stop_quantum.evidence_delta = [1, 0, 0, 0, 0];
     stop_quantum.complete = true;
     stop_quantum.produced_fresh = true;
     lane.staged_info.push_back(stop_quantum);
@@ -2799,7 +2799,7 @@ fn classic_stop_stages_late_info_content_on_the_terminal_cut() {
     );
     assert_eq!(
         scene.staged_info_evidence.last(),
-        Some(&[1, 0, 0, 0]),
+        Some(&[1, 0, 0, 0, 0]),
         "the terminal cut carries the late evidence: {:?}",
         scene.staged_info_evidence
     );

@@ -2422,7 +2422,7 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "INFO_START": map_def(1, 16, 32, 1024),
     "INFO": map_def(27, 0, 0, 64 * 1024),
     "INFO_KIND": map_def(2, 4, 8, 1, 128),
-    "INFO_EVIDENCE": map_def(6, 4, 8, 4),
+    "INFO_EVIDENCE": map_def(6, 4, 8, 5),
 }
 INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}
                       - INSTANCE_PROGRAMS - SELECTED_PROGRAMS) | {
@@ -2604,7 +2604,7 @@ def self_test():
     assert INVENTORY_MAPS["INFO_START"] == map_def(1, 16, 32, 1024)
     assert INVENTORY_MAPS["INFO"] == map_def(27, 0, 0, 64 * 1024)
     assert INVENTORY_MAPS["INFO_KIND"] == map_def(2, 4, 8, 1, 128)
-    assert INVENTORY_MAPS["INFO_EVIDENCE"] == map_def(6, 4, 8, 4)
+    assert INVENTORY_MAPS["INFO_EVIDENCE"] == map_def(6, 4, 8, 5)
     assert "p11_info_entry_lp64" in INVENTORY_PROGRAMS
     assert "p11_info_entry_ia32" in INVENTORY_PROGRAMS
     assert "p11_info_return" in INVENTORY_PROGRAMS

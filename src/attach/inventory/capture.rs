@@ -1193,9 +1193,10 @@ pub(crate) struct InfoBatch {
     pub failure: Option<String>,
     /// Keymeta Task 7 evidence deltas (spec §17.4): INFO_EVIDENCE
     /// cells observed since the last quantum — insert failures,
-    /// unmatched returns, nested overwrites, stash mismatches —
-    /// indexed by the INFO_EVIDENCE_* consts. Zeros for P0.
-    pub evidence_delta: [u64; 4],
+    /// unmatched returns, nested overwrites, stash mismatches and
+    /// INFO ring losses — indexed by the INFO_EVIDENCE_* consts.
+    /// Zeros for P0.
+    pub evidence_delta: [u64; 5],
     /// The INFO_EVIDENCE read failed this quantum (FULL only): the
     /// cause. Counts are not updated on a failed read, so a later
     /// success reports the full delta since the last success.
@@ -1227,7 +1228,7 @@ impl InfoBatch {
             loss: 0,
             terminal: false,
             failure: None,
-            evidence_delta: [0; 4],
+            evidence_delta: [0; 5],
             evidence_error: None,
             complete: true,
             produced_fresh: false,
@@ -1376,7 +1377,7 @@ struct CaptureBook {
     malformed_info: u64,
     /// Keymeta Task 7 (spec §17.4): last observed INFO_EVIDENCE
     /// cells, for per-quantum deltas.
-    last_info_evidence: [u64; 4],
+    last_info_evidence: [u64; 5],
     /// Keymeta Task 7 (spec §17.4): revoked endpoints whose INFO_KIND
     /// cell writes still pend, oldest first. The queue persists
     /// across extends: each extend pops from the front up to its
@@ -1563,7 +1564,7 @@ impl CaptureBook {
             info_accounting: InfoRingAccounting::default(),
             info_consumed: 0,
             malformed_info: 0,
-            last_info_evidence: [0; 4],
+            last_info_evidence: [0; 5],
             pending_info_revoke: VecDeque::new(),
             pending_info_revoke_step: BTreeMap::new(),
             info_revoked: BTreeSet::new(),
@@ -1826,7 +1827,7 @@ impl CaptureBook {
         failure: Option<String>,
         complete: bool,
         produced: Option<Result<u64, String>>,
-        evidence: Option<Result<[u64; 4], String>>,
+        evidence: Option<Result<[u64; 5], String>>,
     ) -> InfoBatch {
         self.info_consumed = self.info_consumed.saturating_add(records.len() as u64);
         self.malformed_info = self.malformed_info.saturating_add(malformed);
@@ -1840,9 +1841,9 @@ impl CaptureBook {
             None => (false, None),
         };
         let (evidence_delta, evidence_error) = match evidence {
-            None => ([0; 4], None),
+            None => ([0; 5], None),
             Some(Ok(cells)) => {
-                let mut delta = [0u64; 4];
+                let mut delta = [0u64; 5];
                 for (slot, (now, was)) in delta
                     .iter_mut()
                     .zip(cells.iter().zip(self.last_info_evidence.iter()))
@@ -1852,7 +1853,7 @@ impl CaptureBook {
                 self.last_info_evidence = cells;
                 (delta, None)
             }
-            Some(Err(error)) => ([0; 4], Some(error)),
+            Some(Err(error)) => ([0; 5], Some(error)),
         };
         InfoBatch {
             domain: self.domain,

@@ -5,7 +5,7 @@
 Status: binding model for the Mode-B merge-ownership repair. Base:
 `task/v080-modeb-bpf` at `55be66b9e`. All line anchors are at that
 revision unless a later commit is named. The holdback, terminal-entry,
-and executable-matrix additions anchor at `3524d9e3a`.
+and executable-matrix additions anchor at `13a841fed`.
 
 Three tier-2 review rounds found one blocker class: retired views
 regaining claims, and interface links surviving an address change
@@ -321,7 +321,7 @@ One table-driven suite over entry points × invariants:
   and unlinked-row accumulation each have a dedicated failing assert.
 - Entry outcomes are executable from one case table
   (`merge_ownership_entry_outcomes_follow_the_case_table`,
-  `engine_tests.rs:95178`): E1/E2/E4/E5/E6/E7 × {carried→refused at
+  `engine_tests.rs:95179`): E1/E2/E4/E5/E6/E7 × {carried→refused at
   the currency check with the generation marker witnessed,
   healthy→committed with no refusal}. E7 runs through the production
   selection entry with the session's scripted table read; E7 carried
@@ -334,7 +334,7 @@ One table-driven suite over entry points × invariants:
   (`merge_ownership_e1_reused_view_id_holds_while_carried_row_rides`,
   `engine_tests.rs:93375`); E11 has its snapshot control
   (`merge_ownership_e11_snapshot_binds_fresh_views_with_claims`,
-  `engine_tests.rs:94506`); E10/E12 name their real-entry controls in
+  `engine_tests.rs:94507`); E10/E12 name their real-entry controls in
   the matrix comment. D2 refusal guards assert the currency-check
   marker (`mo_generation_markers`), so an early return fails instead
   of passing.

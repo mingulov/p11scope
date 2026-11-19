@@ -14211,11 +14211,20 @@ mod tests {
     fn real_probe_refuses_when_the_budget_is_exhausted() {
         let (_dir, file) = probe_tempfile();
         let mut budget = CaptureWorkBudget::default();
-        assert!(!budget.charge(u64::MAX), "the ceiling must be sticky");
+        assert!(
+            !budget.charge(u64::MAX),
+            "an oversized charge trips the ceiling"
+        );
         assert_eq!(
             KernelSelfMappingProbe.kernel_maps_key(&file, &mut super::BudgetAdapter(&mut budget)),
             None
         );
+        // Ruling 11:38: the tripped interval renews — the probe
+        // admits again instead of stalling permanently.
+        assert_eq!(budget.pass_owner().end_pass(), Some(WORK_CEILING_REASON));
+        KernelSelfMappingProbe
+            .kernel_maps_key(&file, &mut super::BudgetAdapter(&mut budget))
+            .expect("the renewed interval readmits the probe");
     }
 
     /// H-3: one cache reads a view's mount table once and serves every later

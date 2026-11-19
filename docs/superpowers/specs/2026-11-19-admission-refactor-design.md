@@ -397,10 +397,12 @@ green. Full lib green before each owner commits.
   fix4 B1, fix5 F2/F3 as instances).
 - Owner 2 table: scopes (Detailed legacy, Detailed I/O, Inventory,
   cgroup inventory, whole-file hash) × stops (work ceiling, I/O
-  ceiling, collection stop, zero cap). Stops with headroom left
-  renew next pass with cursor resume; collection stop, zero cap
-  and exhausted capture-lifetime ceilings stay terminal (Detailed
-  work persists across passes; no constant moves, no refill).
+  ceiling, collection stop, zero cap). A tripped nonzero work
+  ceiling renews next pass with a fresh allowance, a counted
+  exhaustion and cursor resume; clean passes accumulate spend;
+  collection stop and zero cap never admit; deadlines clear at
+  their own batch end and I/O stays capture-lifetime. No constant
+  moves (ruling 11:38, no capture-lifetime sticky work ceiling).
 - Owner 3 table: queues (refresh, loader fallback, RT_ADD,
   RT_CONSISTENT, survivor acquisition) × outcomes (`Wait`, `Gone`,
   genuine failure, exit proof). `Wait` never retires, never drops;

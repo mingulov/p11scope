@@ -1353,6 +1353,11 @@ const CAPACITY_NO_VICTIM_REASON: &str = "capture process-view capacity was exhau
 /// path — a fatal arm, a stop, a staging/backlog/publish failure, and the
 /// clean post-ready window — files under this one subject.
 const INITIAL_ARMING_SUBJECT: &str = "initial loader arming";
+/// Named gap for a capture work interval that exhausted the renewing
+/// work ceiling (controller ruling 11:38): fixed text, so the
+/// published output keeps one entry however many intervals exhaust.
+pub(crate) const WORK_INTERVAL_GAP_SUBJECT: &str = "live discovery work budget";
+pub(crate) const WORK_INTERVAL_GAP_REASON: &str = "capture discovery work ceiling reached; the interval's remaining work was deferred to the next interval";
 
 /// Minimum spacing between discovery batches serviced between initial
 /// loader arms: a late provider arriving during post-ready arming is
@@ -32730,15 +32735,6 @@ impl Engine {
         });
         let mut new_views = Vec::new();
         self.inventory_passes = self.inventory_passes.saturating_add(1);
-        // Renew the pass budget for this tick: renewable stops clear and
-        // the refused tail retries first from the cursor. An unreported
-        // cleared stop files against its own pass instead of vanishing.
-        if let Some(reason) = self.budget.pass_owner().end_pass() {
-            self.base_counters.object_skips.push(Skipped {
-                subject: "capture discovery".into(),
-                reason: reason.into(),
-            });
-        }
         // One shared teardown-deferral budget for this tick: at most 1 s of
         // teardown waiting in total across every scan the tick runs.
         self.begin_teardown_pass();
@@ -39069,6 +39065,17 @@ impl Engine {
     ) -> Result<DiscoveryBatchOutcome> {
         self.note_graph_inputs_mutated();
         self.continuity_deferred = false;
+        // Renew the capture work interval at this batch boundary
+        // (controller ruling 11:38): the work ceiling is a renewing
+        // budget, never a capture-lifetime sticky stop. When the
+        // previous interval exhausted it, file the one deduped named
+        // gap; the new interval retries with a fresh allowance.
+        if self.budget.pass_owner().end_pass().is_some() {
+            self.note_object_skips(vec![Skipped {
+                subject: WORK_INTERVAL_GAP_SUBJECT.into(),
+                reason: WORK_INTERVAL_GAP_REASON.into(),
+            }]);
+        }
         self.budget.set_deadline(deadline);
         let result = self.apply_discovery_batch_inner(
             session,

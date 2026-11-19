@@ -682,9 +682,10 @@ fn dequeued_discovery_work_is_charged_to_the_capture_budget() {
 }
 
 /// Past the ceiling the records are already off the ring, so they are
-/// still applied — dropping them would be silent loss — and the sticky
-/// stop the refused charge leaves is what the lowering and the next scan
-/// refuse on and publish.
+/// still applied — dropping them would be silent loss — and the stop the
+/// refused charge latches is published as a named counted gap. The next
+/// batch renews the interval with a fresh allowance instead of stalling
+/// (controller ruling 11:38: no capture-lifetime sticky work ceiling).
 #[test]
 fn a_drain_past_the_work_ceiling_still_applies_the_dequeued_records() {
     let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
@@ -699,7 +700,23 @@ fn a_drain_past_the_work_ceiling_still_applies_the_dequeued_records() {
         engine.malformed_discovery, 3,
         "dequeued records are never dropped"
     );
-    assert!(!engine.budget.charge(1), "the ceiling stays sticky");
+    assert!(
+        engine.budget.charge(1),
+        "the tripped interval renewed with a fresh allowance"
+    );
+    assert_eq!(
+        engine.budget.pass_owner_ref().interval_exhaustions(),
+        1,
+        "one tripped interval counted"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery drain"
+                && skip.reason == crate::discovery::scan::WORK_CEILING_REASON
+        }),
+        "the tripped interval filed its named counted gap: {:?}",
+        engine.counters.object_skips
+    );
 }
 
 /// Task 11 fix round 3 (writer A1 follow-ups 1 and 2). A1's drain quantum
@@ -28533,10 +28550,12 @@ fn rt_add_deferral_context_retirement_settles_pending_as_loss() {
     }));
 }
 
-/// Mutation caught: a sticky work-ceiling stop must resolve the pending
-/// ledger to loss instead of preserving an impossible fallback.
+/// Mutation caught: a tripped work ceiling renews next interval, so the
+/// pending loader scan is retried with the fresh allowance (controller
+/// ruling 11:38) instead of settling as loss; the trip files its named
+/// counted gap.
 #[test]
-fn rt_add_deferral_budget_exhaustion_settles_pending_as_loss() {
+fn rt_add_deferral_budget_exhaustion_retries_pending_next_interval() {
     let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
     record.announced_count = 1;
     apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
@@ -28545,9 +28564,15 @@ fn rt_add_deferral_budget_exhaustion_settles_pending_as_loss() {
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
 
     assert!(engine.pending_loader_scans.is_empty());
-    assert_eq!(engine.loader_memory_scan_attempts, 0);
+    assert_eq!(engine.loader_memory_scan_attempts, 1);
+    assert_eq!(
+        engine.budget.pass_owner_ref().interval_exhaustions(),
+        1,
+        "one tripped interval counted"
+    );
     assert!(engine.counters.object_skips.iter().any(|skip| {
-        skip.subject == "live loader memory discovery" && skip.reason.contains("budget exhaustion")
+        skip.subject == crate::discovery::engine::WORK_INTERVAL_GAP_SUBJECT
+            && skip.reason == crate::discovery::engine::WORK_INTERVAL_GAP_REASON
     }));
 }
 
@@ -28754,9 +28779,11 @@ fn rt_add_settle_consults_the_exit_predicate_in_order() {
 }
 
 /// The exit-only split counts nothing on the loss routes: an
-/// exec-refresh retirement, budget exhaustion, capture shutdown,
-/// and a full scan ledger all grow the existing total without
-/// touching the exit-only count.
+/// exec-refresh retirement, capture shutdown, and a full scan
+/// ledger all grow the existing total without touching the
+/// exit-only count. Budget exhaustion renews next interval
+/// (controller ruling 11:38), so its pending scan retries and
+/// counts neither loss nor exit-only.
 #[test]
 fn loader_scan_loss_routes_do_not_count_exit_only() {
     // Exec-refresh retirement settles the pending scan as loss.
@@ -28775,7 +28802,8 @@ fn loader_scan_loss_routes_do_not_count_exit_only() {
         assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
         assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
     }
-    // Budget exhaustion settles the pending scan as loss.
+    // Budget exhaustion renews next interval: the pending scan is
+    // retried, counting neither loss nor exit-only.
     {
         let (_fixture, mut engine, _context, mut record, mut session) = armed_seed_route(1);
         record.announced_count = 1;
@@ -28784,7 +28812,8 @@ fn loader_scan_loss_routes_do_not_count_exit_only() {
         let before = engine.capture_facts().discovery_losses()[3];
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(engine.pending_loader_scans.is_empty());
-        assert_eq!(engine.capture_facts().discovery_losses()[3], before + 1);
+        assert_eq!(engine.loader_memory_scan_attempts, 1);
+        assert_eq!(engine.capture_facts().discovery_losses()[3], before);
         assert_eq!(engine.capture_facts().exit_ended_truncations(), 0);
     }
     // Capture shutdown settles every pending scan as loss.

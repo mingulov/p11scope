@@ -1588,6 +1588,91 @@
       "identical": [],
       "lane": "keymeta Task 7 BPF INFO ring-loss evidence cell",
       "rationale": "Cumulative v0.6.0-anchored shape after the INFO ring-loss cell. Lane delta over transition 16: the Detailed object is byte-identical in every section size (no Task 7 code); both Inventory flavors keep every code size except uretprobe +16 on inventory only (p11_info_return 9464->9480, two instructions for the INFO_EVIDENCE ring-loss bump; all other symbols byte-identical, callers inlines unchanged); debug drift is .debug_info -2 both inventory flavors and .debug_line +10 inventory; maps, .text, .symtab, .strtab and section sets identical, no added or removed section. Same-size content changes disclosed: INFO_EVIDENCE max_entries 4->5 (the ring-loss cell) changes one maps field at unchanged size like Task 2 EVIDENCE 9->11, and the bump swap changes immediates/relocations at unchanged .text. String families byte-identical at identical paths; a second layout (same candidate, different work path) reproduces the known work-path string drift and only there. Verifier budgets stand: +2 straight-line instructions against the 15% pin margin (fix round 3 grew +32 without a re-pin)."
+    },
+    {
+      "baseline_revision": "v0.8.0 integration batch 6d tip (4c804127bea3a5eeca20fd98f99c1eb61b448ad5; the reviewed tree without the Task 7 BPF half)",
+      "candidate_revision": "v0.8.0 keymeta Task 7 BPF-half integration onto 6d with fix8 riding (0230f69c65263b0aff1043a37140361a9cf2874f; the record pins the run-independent diff shape)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "removed": [],
+          "deltas": {
+            ".debug_abbrev": -11,
+            ".debug_line": 32
+          }
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "removed": [],
+          "deltas": {
+            ".strtab": 166,
+            ".text": 1992,
+            ".rel.text": 160,
+            "uprobe": 3360,
+            ".reluprobe": 480,
+            "uretprobe": 9480,
+            ".reluretprobe": 368,
+            "maps": 112,
+            ".debug_loclists": 10429,
+            ".debug_abbrev": 172,
+            ".debug_info": 22914,
+            ".rel.debug_info": 5984,
+            ".debug_rnglists": 1853,
+            ".debug_str_offsets": 676,
+            ".rel.debug_str_offsets": 2704,
+            ".debug_str": 9897,
+            ".debug_addr": 1984,
+            ".rel.debug_addr": 3968,
+            ".BTF": 1132,
+            ".rel.BTF": 64,
+            ".BTF.ext": 6736,
+            ".rel.BTF.ext": 6768,
+            ".debug_frame": 96,
+            ".rel.debug_frame": 128,
+            ".debug_line": 4422,
+            ".rel.debug_line": 176,
+            ".debug_line_str": 134,
+            ".symtab": 192
+          }
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "removed": [],
+          "deltas": {
+            ".strtab": 166,
+            ".text": 1992,
+            ".rel.text": 160,
+            "uprobe": 5792,
+            ".reluprobe": 768,
+            "uretprobe": 10456,
+            ".reluretprobe": 400,
+            "maps": 112,
+            ".debug_loclists": 13324,
+            ".debug_abbrev": 132,
+            ".debug_info": 27338,
+            ".rel.debug_info": 7168,
+            ".debug_rnglists": 2526,
+            ".debug_str_offsets": 628,
+            ".rel.debug_str_offsets": 2512,
+            ".debug_str": 9683,
+            ".debug_addr": 2480,
+            ".rel.debug_addr": 4960,
+            ".BTF": 1132,
+            ".rel.BTF": 64,
+            ".BTF.ext": 8336,
+            ".rel.BTF.ext": 8368,
+            ".debug_frame": 96,
+            ".rel.debug_frame": 128,
+            ".debug_line": 5754,
+            ".rel.debug_line": 176,
+            ".debug_line_str": 134,
+            ".symtab": 192
+          }
+        }
+      },
+      "identical": [],
+      "lane": "v0.8.0 keymeta Task 7 BPF-half integration onto 6d (fix8 riding)",
+      "rationale": "The INFO pair (p11_info_entry_lp64/ia32, p11_info_return with INFO_START/INFO/INFO_KIND/INFO_EVIDENCE) lands in the two inventory objects only; the default object differs in debug sections alone (line-number drift from the shared-source union, no .text/maps/probe change). No section added or removed. Composed against the 6d tip because 6d has no info maps/programs to diff feature-by-feature; the lane-relative records 13-17 stay as history."
     }
   ],
   "version": 1

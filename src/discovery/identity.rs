@@ -6883,6 +6883,7 @@ mod conservative_copy {
                 &mut self,
                 pins: &mut PinnedObjects,
                 old_pin_prefix: &mut Option<(ProcessViewId, std::vec::IntoIter<PinnedObjectId>)>,
+                authority: &ClaimAuthority,
             ) -> Result<(), GraphRefusal> {
                 match self.phase {
                     BindPhase::Reset => self.reset_one(pins),
@@ -7165,6 +7166,18 @@ mod conservative_copy {
                     }
                     BindPhase::ClaimTables => {
                         let module = self.module.as_ref().ok_or(GraphRefusal::Identity)?;
+                        if !authority.authorizes(module.view) {
+                            // A denied (carried) row reconciles without
+                            // filing: walk the tables exactly as the filing
+                            // arms would, one per credit, so the bounded
+                            // per-credit work is unchanged.
+                            if self.table_pos < module.tables.len() {
+                                self.table_pos += 1;
+                            } else {
+                                self.phase = BindPhase::ClaimModule;
+                            }
+                            return Ok(());
+                        }
                         let growth = self
                             .growth
                             .get(&module.view)
@@ -7192,11 +7205,15 @@ mod conservative_copy {
                     }
                     BindPhase::ClaimModule => {
                         let view = self.module.as_ref().ok_or(GraphRefusal::Identity)?.view;
-                        pins.ownership
-                            .get_mut(&view)
-                            .ok_or(GraphRefusal::Identity)?
-                            .pins
-                            .push(self.object.ok_or(GraphRefusal::Identity)?);
+                        // A denied row files nothing (its ownership entry was
+                        // never created); traversal still advances below.
+                        if authority.authorizes(view) {
+                            pins.ownership
+                                .get_mut(&view)
+                                .ok_or(GraphRefusal::Identity)?
+                                .pins
+                                .push(self.object.ok_or(GraphRefusal::Identity)?);
+                        }
                         self.table_pos = 0;
                         self.item_pos = 0;
                         self.phase = BindPhase::ClaimEntries;
@@ -7210,12 +7227,16 @@ mod conservative_copy {
                                     .get(self.table_pos)
                                     .and_then(|ids| ids.get(self.item_pos))
                                     .ok_or(GraphRefusal::Identity)?;
-                                let claims = pins
-                                    .ownership
-                                    .get_mut(&module.view)
-                                    .ok_or(GraphRefusal::Identity)?;
-                                claims.targets.push((id, entry.file_offset));
-                                claims.pins.push(id);
+                                // A denied row files nothing; traversal still
+                                // advances below.
+                                if authority.authorizes(module.view) {
+                                    let claims = pins
+                                        .ownership
+                                        .get_mut(&module.view)
+                                        .ok_or(GraphRefusal::Identity)?;
+                                    claims.targets.push((id, entry.file_offset));
+                                    claims.pins.push(id);
+                                }
                                 self.item_pos += 1;
                             } else {
                                 self.table_pos += 1;
@@ -7250,12 +7271,17 @@ mod conservative_copy {
         }
 
         impl PinnedConservativeCursor {
+            /// Terminal rebind with claim authority (merge-ownership spec §7
+            /// E13): rows whose view the authority denies still reconcile —
+            /// their exact attached targets ride into the terminal plan —
+            /// but file no claims, exactly like the live gated binder.
             pub(crate) fn poll_scanned_rebind(
                 &mut self,
                 input: &mut Option<RetainedScannedInputs>,
                 cursor: &mut ScannedRebindCursor,
                 reserve: &SemanticResourceReserver,
                 work: usize,
+                authority: &ClaimAuthority,
             ) -> Result<GraphStep, GraphRefusal> {
                 if work == 0 {
                     return Ok(GraphStep::Yielded);
@@ -7309,6 +7335,7 @@ mod conservative_copy {
                             cursor.bind_one(
                                 self.output.as_mut().ok_or(GraphRefusal::Identity)?,
                                 &mut self.rebind_old_pins,
+                                authority,
                             )?;
                             if cursor.phase == BindPhase::Ready {
                                 self.rebind_complete = true;
@@ -20497,7 +20524,11 @@ mod tests {
         reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
     ) {
         for _ in 0..4096 {
-            if pins.poll_scanned_rebind(input, rebind, reserve, 1).unwrap() == GraphStep::Ready {
+            if pins
+                .poll_scanned_rebind(input, rebind, reserve, 1, &ClaimAuthority::All)
+                .unwrap()
+                == GraphStep::Ready
+            {
                 return;
             }
         }
@@ -20571,7 +20602,7 @@ mod tests {
         let held = pool.snapshot().charged_bytes;
         let mut rebind = ScannedRebindCursor::new();
         let (zero, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
-            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 0)
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 0, &ClaimAuthority::All)
         });
         assert_eq!(zero.unwrap(), GraphStep::Yielded);
         assert_eq!((allocations, bytes), (0, 0));
@@ -20588,7 +20619,7 @@ mod tests {
                     *count = Arc::strong_count(&entry.exports);
                 }
                 let step = pins
-                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                    .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1, &ClaimAuthority::All)
                     .unwrap();
                 let after_claims = rebind_claim_lengths(&pins);
                 let changed = before_claims
@@ -20678,7 +20709,18 @@ mod tests {
         finish_conservative_copy(&source, &mut pins, &selection, &reserve);
         let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
         let mut rebind = ScannedRebindCursor::new();
-        finish_scanned_rebind(&mut pins, &mut input, &mut rebind, &reserve);
+        // The terminal authority authorizes the live views only — the
+        // carried view's row rides the rebind but files nothing.
+        let authority = ClaimAuthority::Views(BTreeSet::from([ProcessViewId(2), ProcessViewId(3)]));
+        for _ in 0..4096 {
+            if pins
+                .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1, &authority)
+                .unwrap()
+                == GraphStep::Ready
+            {
+                break;
+            }
+        }
         let modules = rebind
             .modules()
             .expect("the carried row still reaches structural readiness");
@@ -20929,8 +20971,14 @@ mod tests {
             let mut rebind = ScannedRebindCursor::new();
             for _ in 0..4096 {
                 assert_ne!(
-                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                        .unwrap(),
+                    pins.poll_scanned_rebind(
+                        &mut input,
+                        &mut rebind,
+                        &reserve,
+                        1,
+                        &ClaimAuthority::All
+                    )
+                    .unwrap(),
                     GraphStep::Ready
                 );
                 if pins
@@ -20976,7 +21024,13 @@ mod tests {
             if exit == 1 {
                 rebind.cancel();
                 assert!(matches!(
-                    pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                    pins.poll_scanned_rebind(
+                        &mut input,
+                        &mut rebind,
+                        &reserve,
+                        1,
+                        &ClaimAuthority::All
+                    ),
                     Err(GraphRefusal::Cancelled)
                 ));
                 assert!(pins.pinned().is_none());
@@ -21100,7 +21154,13 @@ mod tests {
         let mut invalid = ScannedRebindCursor::new();
         let mut refused = false;
         for _ in 0..4096 {
-            match pins.poll_scanned_rebind(&mut short, &mut invalid, &reserve, 1) {
+            match pins.poll_scanned_rebind(
+                &mut short,
+                &mut invalid,
+                &reserve,
+                1,
+                &ClaimAuthority::All,
+            ) {
                 Err(GraphRefusal::Identity) => {
                     refused = true;
                     break;
@@ -21131,7 +21191,7 @@ mod tests {
 
         let (mut input, _) = retained_rebind_inputs(&pool, &raw, false);
         let mut rebind = ScannedRebindCursor::new();
-        pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+        pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1, &ClaimAuthority::All)
             .unwrap();
         assert!(input.is_some());
         // Equal-valued pins from the SAME original source remain a different
@@ -21140,7 +21200,13 @@ mod tests {
         finish_conservative_copy(&source, &mut foreign_pins, &selection, &reserve);
         let held = pool.snapshot().charged_bytes;
         assert!(matches!(
-            foreign_pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+            foreign_pins.poll_scanned_rebind(
+                &mut input,
+                &mut rebind,
+                &reserve,
+                1,
+                &ClaimAuthority::All
+            ),
             Err(GraphRefusal::Identity)
         ));
         assert!(input.is_some());
@@ -21156,7 +21222,13 @@ mod tests {
         );
         assert!(
             matches!(
-                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                pins.poll_scanned_rebind(
+                    &mut input,
+                    &mut rebind,
+                    &reserve,
+                    1,
+                    &ClaimAuthority::All
+                ),
                 Err(GraphRefusal::Identity)
             ),
             "consuming/re-wrapping the SAME allocation cannot inherit an earlier sizing cursor"
@@ -21171,7 +21243,13 @@ mod tests {
         let before_rebind = pool.snapshot().charged_bytes;
         let other = SemanticResourcePool::default();
         let (foreign, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
-            pins.poll_scanned_rebind(&mut input, &mut rebind, &other.reserver(), 1)
+            pins.poll_scanned_rebind(
+                &mut input,
+                &mut rebind,
+                &other.reserver(),
+                1,
+                &ClaimAuthority::All,
+            )
         });
         assert!(matches!(foreign, Err(GraphRefusal::Identity)));
         assert_eq!((allocations, bytes), (0, 0));
@@ -21182,8 +21260,14 @@ mod tests {
                 break;
             }
             assert_ne!(
-                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                    .unwrap(),
+                pins.poll_scanned_rebind(
+                    &mut input,
+                    &mut rebind,
+                    &reserve,
+                    1,
+                    &ClaimAuthority::All
+                )
+                .unwrap(),
                 GraphStep::Ready
             );
         }
@@ -21192,7 +21276,13 @@ mod tests {
         pool.reference_set_limit(before_rebind.checked_add(required).unwrap() - 1);
         let mut refused = false;
         for _ in 0..4096 {
-            match pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1) {
+            match pins.poll_scanned_rebind(
+                &mut input,
+                &mut rebind,
+                &reserve,
+                1,
+                &ClaimAuthority::All,
+            ) {
                 Err(GraphRefusal::Storage(_)) => {
                     refused = true;
                     break;
@@ -21247,7 +21337,13 @@ mod tests {
                 for _ in 0..4096 {
                     let before = crate::test_alloc::armed_requested_snapshot();
                     let step = pins
-                        .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .poll_scanned_rebind(
+                            &mut input,
+                            &mut rebind,
+                            &reserve,
+                            1,
+                            &ClaimAuthority::All,
+                        )
                         .unwrap();
                     let after = crate::test_alloc::armed_requested_snapshot();
                     let actual = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
@@ -21310,8 +21406,14 @@ mod tests {
                         // Normal binding still advances: ownerless refusal did not switch the
                         // original live transfer into its reclaim phase.
                         assert_eq!(
-                            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                                .unwrap(),
+                            pins.poll_scanned_rebind(
+                                &mut input,
+                                &mut rebind,
+                                &reserve,
+                                1,
+                                &ClaimAuthority::All
+                            )
+                            .unwrap(),
                             GraphStep::Advanced
                         );
                         let current = &pins.reference_rebind_claims_for_test(view).unwrap().pins;
@@ -21342,7 +21444,13 @@ mod tests {
                         assert_eq!(pool.snapshot(), held);
                         assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
                         assert!(matches!(
-                            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                            pins.poll_scanned_rebind(
+                                &mut input,
+                                &mut rebind,
+                                &reserve,
+                                1,
+                                &ClaimAuthority::All
+                            ),
                             Err(GraphRefusal::Cancelled)
                         ));
                         break;
@@ -21451,7 +21559,13 @@ mod tests {
                 for _ in 0..4096 {
                     let before = crate::test_alloc::armed_requested_snapshot();
                     let step = pins
-                        .poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+                        .poll_scanned_rebind(
+                            &mut input,
+                            &mut rebind,
+                            &reserve,
+                            1,
+                            &ClaimAuthority::All,
+                        )
                         .unwrap();
                     let after = crate::test_alloc::armed_requested_snapshot();
                     if let Some((capacity, actual)) = rebind.reference_current_unpinned_for_test() {
@@ -21514,8 +21628,14 @@ mod tests {
                             // Normal binding still advances: ownerless refusal did not switch the
                             // original live transfer into its reclaim phase.
                             assert_eq!(
-                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                                    .unwrap(),
+                                pins.poll_scanned_rebind(
+                                    &mut input,
+                                    &mut rebind,
+                                    &reserve,
+                                    1,
+                                    &ClaimAuthority::All
+                                )
+                                .unwrap(),
                                 GraphStep::Advanced
                             );
                             let (capacity, current) =
@@ -21545,7 +21665,13 @@ mod tests {
                             assert_eq!(pool.snapshot(), held);
                             assert_eq!(crate::test_alloc::armed_requested_snapshot(), allocated);
                             assert!(matches!(
-                                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1),
+                                pins.poll_scanned_rebind(
+                                    &mut input,
+                                    &mut rebind,
+                                    &reserve,
+                                    1,
+                                    &ClaimAuthority::All
+                                ),
                                 Err(GraphRefusal::Cancelled)
                             ));
                             break;
@@ -21772,7 +21898,7 @@ mod tests {
             if input.is_none() {
                 break;
             }
-            pins.poll_scanned_rebind(&mut input, &mut aborted, &reserve, 1)
+            pins.poll_scanned_rebind(&mut input, &mut aborted, &reserve, 1, &ClaimAuthority::All)
                 .unwrap();
         }
         assert!(input.is_none(), "admit takes the input before cancel");
@@ -21801,7 +21927,7 @@ mod tests {
         ));
         assert_eq!(pool.snapshot().charged_bytes, charged);
         pins2
-            .poll_scanned_rebind(&mut input2, &mut rebind, &reserve, 1)
+            .poll_scanned_rebind(&mut input2, &mut rebind, &reserve, 1, &ClaimAuthority::All)
             .unwrap();
         let charged = pool.snapshot().charged_bytes;
         assert!(matches!(
@@ -22380,8 +22506,14 @@ mod tests {
                 break;
             }
             assert_ne!(
-                pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
-                    .unwrap(),
+                pins.poll_scanned_rebind(
+                    &mut input,
+                    &mut rebind,
+                    &reserve,
+                    1,
+                    &ClaimAuthority::All
+                )
+                .unwrap(),
                 GraphStep::Ready
             );
         }
@@ -22393,7 +22525,7 @@ mod tests {
         );
         // One more bind credit keeps the loan visible.
         assert_ne!(
-            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1)
+            pins.poll_scanned_rebind(&mut input, &mut rebind, &reserve, 1, &ClaimAuthority::All)
                 .unwrap(),
             GraphStep::Ready
         );

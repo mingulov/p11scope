@@ -36112,11 +36112,26 @@ impl Engine {
         graph: &mut CollectedGraph,
         reserve: &SemanticResourceReserver,
     ) -> GraphService {
+        // Terminal ownership (merge-ownership spec §7 E13): the rebind
+        // files claims only for live views outside this transaction's
+        // retirements. Carried rows still reconcile (their exact attached
+        // targets ride into the terminal plan) but own nothing — the same
+        // constructor as the live choke, with no newcomers and no
+        // declined views at Finish.
+        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let empty = BTreeSet::new();
+        let retired = graph
+            .selection
+            .as_ref()
+            .map(ConservativePinSelection::retired)
+            .unwrap_or(&empty);
+        let authority = ClaimAuthority::candidate(&live, &empty, &empty, retired);
         match graph.pins.poll_scanned_rebind(
             &mut graph.raw,
             &mut graph.rebind,
             reserve,
             GRAPH_STRIDE,
+            &authority,
         ) {
             Ok(GraphStep::Ready) => {
                 graph.phase = GraphPhase::Plan;

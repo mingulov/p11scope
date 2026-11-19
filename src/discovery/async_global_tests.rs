@@ -2028,3 +2028,103 @@ fn async_global_owned_leader_with_descendant_pure_retire_opens_a_counted_coverag
     assert_eq!(window.slots, 2);
     assert_eq!(engine.coverage_retired_slots(), 2);
 }
+
+/// A same-module mixed retire discloses the darkened endpoint: S1 of M
+/// retires with no cover while S2 of the same M re-attaches in the same
+/// apply. Exclusion is per endpoint ({object, offset}), not per module,
+/// so S1's key files its window + count + row. (The module-granular
+/// close still ends the window in the same apply — S2 keeps M
+/// plan-active — so the tail rides the count and the row, not the
+/// interval.)
+#[test]
+fn async_global_same_module_mixed_retire_discloses_the_dark_endpoint() {
+    let (_child, mut engine, modules) = engine_with_one_accepted_provider();
+    let mut second = modules[0].clone();
+    second.tables[0].entries.push(ScannedEntry {
+        name: "C_GetSlotList",
+        object: second.key,
+        object_path: second.path.clone(),
+        file_offset: 0x2000,
+    });
+    let mut pins = engine.pinned.clone();
+    let skipped = pins.absorb(pin_test_modules(
+        &engine.views[0],
+        std::slice::from_ref(&second),
+    ));
+    // Absorb drops incoming entry proofs (fail-closed): re-prove the grown
+    // module's entries on the merged set so the strict bind keeps the new
+    // endpoint.
+    pins.prove_scanned_entries_for_test(std::slice::from_ref(&second));
+    let mut candidate = engine
+        .live_candidate(pins, vec![second], skipped)
+        .expect("the new endpoint offers a candidate");
+    assert_eq!(
+        candidate.delta.new.len(),
+        1,
+        "premise: the second endpoint allocates exactly one slot"
+    );
+    assert!(
+        candidate.delta.replace.is_empty(),
+        "premise: nothing replaces"
+    );
+    candidate
+        .delta
+        .retire
+        .push(engine.plan.slots[0].clone());
+    candidate.plan.deactivate(0);
+    let retired_key = crate::plan::AttachKey::of(&engine.plan.slots[0]);
+    let fresh_key = crate::plan::AttachKey::of(&candidate.delta.new[0]);
+    assert_ne!(retired_key, fresh_key, "premise: distinct endpoints");
+    let retired_modules: std::collections::BTreeSet<crate::plan::ModuleId> =
+        engine.plan.slots[0].module_ids.iter().copied().collect();
+    assert_eq!(
+        candidate.delta.new[0]
+            .module_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        retired_modules,
+        "premise: the reattach shares the retired slot's module"
+    );
+    let fresh_index = candidate.delta.new[0].index;
+    let mut session = ScriptedSession::default();
+    session
+        .scripted_stamps
+        .insert(engine.plan.slots[0].index, 1);
+    let mut additions = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions, false, &[])
+        .unwrap();
+    assert!(
+        !outcome.detach_failed,
+        "premise: the scripted detach commits"
+    );
+    assert!(
+        engine.plan.is_active(fresh_index),
+        "premise: the sibling endpoint re-attached"
+    );
+    assert_eq!(
+        engine.coverage_retire_windows.len(),
+        1,
+        "the dark endpoint files its window"
+    );
+    let window = &engine.coverage_retire_windows[0];
+    assert_eq!(window.modules, retired_modules);
+    assert_eq!(window.slots, 1);
+    assert_eq!(engine.coverage_retired_slots(), 1);
+    let end = window
+        .end_ns
+        .expect("the module-active sibling closes it in the same apply");
+    assert!(
+        end >= window.start_ns,
+        "the closed window keeps sane bounds"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == crate::render::COVERAGE_RETIRED_SUBJECT
+                && skip.reason == crate::render::COVERAGE_RETIRED_REASON
+        }),
+        "the paired finite gap row files: {:?}",
+        engine.counters.object_skips
+    );
+}

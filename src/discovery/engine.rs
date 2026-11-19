@@ -4696,11 +4696,6 @@ impl EngineSession for Session {
         objects: &PinnedObjects,
         ended: &BTreeSet<plan::AttachKey>,
     ) -> Result<TargetAttachResult> {
-        eprintln!(
-            "p11scope: DIAG v072 attach targets={} mono_ns={:?}",
-            targets.len(),
-            crate::attach::monotonic_ns(),
-        );
         Session::attach_targets(self, targets, objects, ended)
     }
 
@@ -4731,22 +4726,12 @@ impl EngineSession for Session {
     }
 
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
-        eprintln!(
-            "p11scope: DIAG v072 detach_slots n={} mono_ns={:?}",
-            slots.len(),
-            crate::attach::monotonic_ns(),
-        );
         Session::detach_slots(self, slots)
     }
     fn begin_global_static_retirement(
         &mut self,
         slots: &[plan::Slot],
     ) -> Result<Option<RetirementTicket>> {
-        eprintln!(
-            "p11scope: DIAG v072 begin_global_retirement n={} mono_ns={:?}",
-            slots.len(),
-            crate::attach::monotonic_ns(),
-        );
         Session::begin_global_static_retirement(self, slots)
     }
     fn global_retirement_blocking(&self) -> bool {
@@ -4764,12 +4749,6 @@ impl EngineSession for Session {
         owner: &ProcessView,
         ended: &crate::attach::EndedPidRetirement,
     ) -> Result<DetachOutcome> {
-        eprintln!(
-            "p11scope: DIAG v072 detach_ended_pid n={} owner_pid={} mono_ns={:?}",
-            slots.len(),
-            owner.pid(),
-            crate::attach::monotonic_ns(),
-        );
         Session::detach_ended_pid_slots(self, slots, owner, ended)
     }
 
@@ -18400,7 +18379,6 @@ impl Engine {
         // too (it is authorized below, so the scrub spares it).
         let ridden: BTreeSet<ProcessViewId> =
             raw_modules.iter().map(|module| module.view).collect();
-        let raw_pre_reject = raw_modules.len();
         raw_modules.retain(|module| {
             !pinned.rejects(module.key)
                 && !module
@@ -18409,14 +18387,6 @@ impl Engine {
                     .flat_map(|table| &table.entries)
                     .any(|entry| pinned.rejects(entry.object))
         });
-        if raw_modules.len() != raw_pre_reject {
-            eprintln!(
-                "p11scope: DIAG v072 reject_filter dropped={} kept={} mono_ns={:?}",
-                raw_pre_reject - raw_modules.len(),
-                raw_modules.len(),
-                crate::attach::monotonic_ns(),
-            );
-        }
         if crate::run::capture_diagnostics_on() && raw_with_learned > raw_before_learned {
             eprintln!(
                 "p11scope: candidate scan inputs: {} frame + {} run-learned, {} survive rejects",
@@ -18750,21 +18720,6 @@ impl Engine {
             merge_tail_start,
             crate::attach::monotonic_ns(),
         );
-        if !delta.retire.is_empty() {
-            let bound_learned = modules
-                .iter()
-                .filter(|module| module.scanned.view == Self::RUN_LEARNED_VIEW_ID)
-                .count();
-            eprintln!(
-                "p11scope: DIAG v072 retire_candidate retire={} bound_modules={} bound_learned={} raw_before_learned={} raw_with_learned={} mono_ns={:?}",
-                delta.retire.len(),
-                modules.len(),
-                bound_learned,
-                raw_before_learned,
-                raw_with_learned,
-                crate::attach::monotonic_ns(),
-            );
-        }
         Ok(LiveCandidate {
             pinned,
             modules,
@@ -19011,107 +18966,6 @@ impl Engine {
         preserve
     }
 
-    /// Whether file-probe coverage must survive view retirement right
-    /// now: an owned run-tree capture may gain new mappers at any time,
-    /// and admission lags short-lived members, so a transiently empty
-    /// view set must not retire attached file probes. Fail closed:
-    /// retain unless the owned child is proven dead with no live
-    /// generation left (an exec handoff keeps retaining); terminal
-    /// cleanup still retires once the run is over.
-    fn owned_scope_retains_file_probes(&self) -> bool {
-        let Some(owned) = self.owned_run_pid else {
-            return false;
-        };
-        if !matches!(self.scope, Scope::Cgroup { .. }) {
-            return false;
-        }
-        let mut live = false;
-        let mut dead = false;
-        for view in self.views.iter().filter(|view| view.pid() == owned) {
-            match view.original_generation_state() {
-                Ok(OriginalGenerationState::Current) => live = true,
-                Ok(OriginalGenerationState::Exited | OriginalGenerationState::Reused) => {
-                    dead = true;
-                }
-                Err(_) => {}
-            }
-        }
-        !dead || live
-    }
-
-    /// Re-own retiring views' file-probe modules and pins to the reserved
-    /// run-learned owner instead of dropping them, while owned scope
-    /// lives (see [`Self::owned_scope_retains_file_probes`]). Without
-    /// this, the last mapper's retirement in an inter-wave gap retires
-    /// every slot and detaches the file probes while later members still
-    /// need them; admission lag means no reattach lands in time, so
-    /// post-attach calls are lost silently with no replace witness. Only
-    /// modules backing live plan slots are retained (loader and
-    /// unattached state still retires normally); the reserved owner is
-    /// never a process generation, so retained modules never trip
-    /// staleness checks. Call before removing `retiring` views from
-    /// `pins` / filtering them out of `raw_modules`: aliasing needs
-    /// their live pin identities.
-    fn retain_owned_live_file_modules(
-        &self,
-        pins: &mut PinnedObjects,
-        raw_modules: &mut Vec<ScannedModule>,
-        retiring: &BTreeSet<ProcessViewId>,
-    ) {
-        eprintln!(
-            "p11scope: DIAG v072 retain_entry owned_live={} retiring={:?} committed_modules={} raw_in={} mono_ns={:?}",
-            self.owned_scope_retains_file_probes(),
-            retiring.iter().map(|id| id.0).collect::<Vec<_>>(),
-            self.modules.len(),
-            raw_modules.len(),
-            crate::attach::monotonic_ns(),
-        );
-        if !self.owned_scope_retains_file_probes() {
-            return;
-        }
-        for module in self
-            .modules
-            .iter()
-            .filter(|module| retiring.contains(&module.scanned.view))
-        {
-            let Some(id) =
-                pins.id_for_scanned(&module.scanned, module.scanned.key, &module.scanned.path)
-            else {
-                continue;
-            };
-            let live = self
-                .plan
-                .slots
-                .iter()
-                .any(|slot| slot.object == id && self.plan.is_active(slot.index));
-            if !live {
-                continue;
-            }
-            let already = raw_modules.iter().any(|known| {
-                known.view == Self::RUN_LEARNED_VIEW_ID
-                    && known.mount_namespace == module.scanned.mount_namespace
-                    && known.key == module.scanned.key
-                    && known.path == module.scanned.path
-                    && known.pre_copy_up == module.scanned.pre_copy_up
-            });
-            if already {
-                continue;
-            }
-            let mut retained = module.scanned.clone();
-            retained.view = Self::RUN_LEARNED_VIEW_ID;
-            for table in &mut retained.tables {
-                table.address = 0;
-            }
-            pins.alias_scanned_module_under(&retained, Self::RUN_LEARNED_VIEW_ID);
-            raw_modules.push(retained);
-            eprintln!(
-                "p11scope: DIAG v072 retained path={} mono_ns={:?}",
-                module.scanned.path,
-                crate::attach::monotonic_ns(),
-            );
-        }
-    }
-
     fn conservative_candidate(
         &mut self,
         retirements: &BTreeSet<ProcessViewId>,
@@ -19141,17 +18995,19 @@ impl Engine {
             BTreeSet::new()
         };
         let mut pinned = self.pinned.clone();
-        let mut raw_modules: Vec<_> = self
-            .modules
-            .iter()
-            .map(|module| module.scanned.clone())
-            .collect();
-        self.retain_owned_live_file_modules(&mut pinned, &mut raw_modules, retirements);
         for view in retirements {
             pinned.remove_view_except(*view, &carry_objects);
         }
-        raw_modules.retain(|module| !retirements.contains(&module.view));
         let skipped = pinned.reapply_rejected_keys(keys);
+        let raw_modules = self
+            .modules
+            .iter()
+            .filter(|module| {
+                !retirements.contains(&module.scanned.view)
+                    || carry_objects.contains(&module.object)
+            })
+            .map(|module| module.scanned.clone())
+            .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "conservative_assemble",
@@ -21493,16 +21349,6 @@ impl Engine {
         let retired = candidate
             .plan
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
-        if !retired.is_empty() {
-            eprintln!(
-                "p11scope: DIAG v072 retire_unpinned n={} stale_views={} owned_run={:?} scope_cgroup={} mono_ns={:?}",
-                retired.len(),
-                stale_views.len(),
-                self.owned_run_pid,
-                matches!(self.scope, Scope::Cgroup { .. }),
-                crate::attach::monotonic_ns(),
-            );
-        }
         let detach_retired_start = crate::attach::monotonic_ns();
         let detach_retired_outcome = session.detach_slots(&retired);
         self.sync_physical_gap(session);
@@ -23760,12 +23606,6 @@ impl Engine {
     /// first-map stop holds resume with table probes attached
     /// instead of at their bound.
     fn harvest_run_learned_tables(&mut self, pins: &mut PinnedObjects, proof: &OwnedLearnProof) {
-        eprintln!(
-            "p11scope: DIAG v072 harvest_attempt path={} tables={} mono_ns={:?}",
-            proof.path,
-            proof.module.tables.len(),
-            crate::attach::monotonic_ns(),
-        );
         if proof.module.tables.is_empty() && proof.module.interfaces.is_empty() {
             return;
         }
@@ -23909,13 +23749,6 @@ impl Engine {
                 );
             }
         }
-        eprintln!(
-            "p11scope: DIAG v072 harvest_store path={} tables={} store={} mono_ns={:?}",
-            proof.path,
-            proof.module.tables.len(),
-            self.run_learned_modules.len(),
-            crate::attach::monotonic_ns(),
-        );
         if self.run_learned_modules == before {
             return;
         }
@@ -31802,18 +31635,26 @@ impl Engine {
         // pins for still-attached objects; the full path additionally carries
         // removed views' modules below.
         let mut candidate_pins = self.pinned.clone();
+        for view in removed {
+            candidate_pins.remove_view_except(*view, &carry_objects);
+        }
         let mut raw_modules: Vec<_> = self
             .modules
             .iter()
+            .filter(|module| {
+                !removed.contains(&module.scanned.view)
+                    && !refreshed_ids.contains(&module.scanned.view)
+                    || (removed.contains(&module.scanned.view)
+                        && carry_objects.contains(&module.object))
+                    // A rescanned-empty view's modules ride only in owned
+                    // runs (see `preserve_modules_refreshed` above):
+                    // elsewhere the rescan authoritatively dropped them.
+                    || (preserve_modules_refreshed
+                        && refreshed_ids.contains(&module.scanned.view)
+                        && carry_objects.contains(&module.object))
+            })
             .map(|module| module.scanned.clone())
             .collect();
-        self.retain_owned_live_file_modules(&mut candidate_pins, &mut raw_modules, removed);
-        for view in removed {
-            candidate_pins.remove_view(*view);
-        }
-        raw_modules.retain(|module| {
-            !removed.contains(&module.view) && !refreshed_ids.contains(&module.view)
-        });
         for (view, modules, pins) in refreshed {
             skipped.extend(candidate_pins.replace_view_pins_without_claims(
                 *view,

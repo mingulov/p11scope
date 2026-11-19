@@ -10430,7 +10430,9 @@ pub(crate) fn bind_scanned_modules_strict(
 
 /// [`bind_scanned_modules`], filing ownership claims only for views the
 /// authority authorizes. Unauthorized views still bind — their exact
-/// attached targets ride — but own no claims.
+/// attached targets ride — but own no claims. Test-only: production
+/// rebuilds use [`bind_scanned_modules_strict_gated`].
+#[cfg(test)]
 pub(crate) fn bind_scanned_modules_gated(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,
@@ -10440,9 +10442,9 @@ pub(crate) fn bind_scanned_modules_gated(
 }
 
 /// The attach-path gated bind: the [`bind_scanned_modules_strict`]
-/// proof for uncorroborated tables plus the
-/// [`bind_scanned_modules_gated`] claim authority. Every live-candidate
-/// rebuild uses this: target safety and carried claimlessness together.
+/// proof for uncorroborated tables plus the [`ClaimAuthority`] claim
+/// authority. Every live-candidate rebuild uses this: target safety and
+/// carried claimlessness together.
 pub(crate) fn bind_scanned_modules_strict_gated(
     modules: &[ScannedModule],
     pinned: &mut PinnedObjects,

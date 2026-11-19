@@ -15736,6 +15736,75 @@ mod tests {
         );
     }
 
+    /// An `-o` write failure (ENOSPC here) saves the finished
+    /// in-memory capture to the recovery dir instead of dropping it:
+    /// the command still fails (exit 1, the requested `-o` does not
+    /// exist), the failure names the fallback, the saved bytes are
+    /// the complete document, and no temp litters the destination.
+    #[test]
+    fn finish_output_write_failure_saves_the_capture_to_recovery() {
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let dir = private_tempdir();
+        let out = dir.path().join("report.json");
+        let recovered_parent = private_tempdir();
+        let recovered_base = recovered_parent.path().join("p11scope-recovered");
+        let mut sink = AtomicFile::create(&out).unwrap();
+        sink.set_fail_write_with(libc::ENOSPC);
+        let _override = crate::output::hold_recovered_override(&recovered_base);
+        let mut stdout = Vec::new();
+        let outcome = finish_output(
+            Some(sink),
+            &mut EventLogState::new(None),
+            &mut StreamState::new(),
+            &presentation,
+            false,
+            true,
+            &mut WriterStdout(&mut stdout),
+            None,
+            None,
+        );
+        assert_eq!(outcome.exit_code(), 1, "a failed -o fails the command");
+        assert!(!out.exists(), "the requested -o does not exist");
+        let failures = outcome.failures();
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("capture saved to")),
+            "the failure names the fallback, got: {failures:?}"
+        );
+        let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(saved.len(), 1, "one fallback file: {saved:?}");
+        let expected = render_json_from_presentation(&presentation);
+        let mut expected_bytes = serde_json::to_vec_pretty(&expected).unwrap();
+        expected_bytes.push(b'\n');
+        assert_eq!(
+            std::fs::read(&saved[0]).unwrap(),
+            expected_bytes,
+            "the fallback holds the complete document"
+        );
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains(&saved[0].display().to_string())),
+            "the failure names the fallback path, got: {failures:?}"
+        );
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            assert!(
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".p11scope."),
+                "no temp litters the destination"
+            );
+        }
+    }
+
     /// D3d: the fixed target-run-limit detail renders as
     /// `fd_headroom: target_run_limit`, still finite.
     #[test]

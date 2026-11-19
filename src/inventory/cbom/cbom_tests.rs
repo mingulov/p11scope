@@ -2185,3 +2185,63 @@ fn cbom_excludes_inferred_facts() {
         );
     }
 }
+
+/// A CBOM `-o` write failure (ENOSPC here) saves the rendered
+/// document to the recovery dir instead of dropping it: the error
+/// names the fallback, the saved bytes are the complete document
+/// plus its newline, and no temp litters the destination.
+#[test]
+fn cbom_out_write_failure_saves_the_document_to_recovery() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let input = dir.path().join("input.json");
+    let bytes = inventory_document(
+        vec![caller("c0", Some("/bin/driver"))],
+        vec![module("m0", "/lib/p.so", Some(&"c".repeat(64)))],
+        vec![edge("c0", "m0", None)],
+    );
+    std::fs::write(&input, &bytes).unwrap();
+    let out = dir.path().join("out.cdx.json");
+    let recovered_base = dir.path().join("p11scope-recovered");
+    let loaded = super::input::read_input(&input).unwrap();
+    let input_path = super::normalized_path(&input).unwrap();
+    let document = super::render::render_json(&loaded.projection);
+    let mut sink = crate::output::AtomicFile::create(&out).unwrap();
+    sink.set_fail_write_with(libc::ENOSPC);
+    let _override = crate::output::hold_recovered_override(&recovered_base);
+    let error =
+        super::write_sink(&out, &input_path, &loaded.source, &document, sink, || {}).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("capture saved to"),
+        "the error names the fallback, got: {message}"
+    );
+    assert!(!out.exists(), "the requested -o does not exist");
+    let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1, "one fallback file: {saved:?}");
+    let mut expected = serde_json::to_vec(&document).unwrap();
+    expected.push(b'\n');
+    assert_eq!(
+        std::fs::read(&saved[0]).unwrap(),
+        expected,
+        "the fallback holds the complete document"
+    );
+    assert!(
+        message.contains(&saved[0].display().to_string()),
+        "the error names the fallback path, got: {message}"
+    );
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        assert!(
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".p11scope."),
+            "no temp litters the destination"
+        );
+    }
+}

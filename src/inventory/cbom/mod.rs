@@ -90,19 +90,15 @@ fn run_inner(
     let document = render::render_json(&loaded.projection);
     if let Some(path) = &args.out {
         check_output_alias(path, &input_path, &loaded.source)?;
-        let mut sink = AtomicFile::create(path).map_err(anyhow::Error::msg)?;
-        serde_json::to_writer(sink.file(), &document).context("writing CBOM JSON")?;
-        sink.file()
-            .write_all(b"\n")
-            .context("writing CBOM newline")?;
-        before_commit();
-        // The descriptor is retained even if its original name is
-        // replaced. AtomicFile independently enforces trusted ancestors
-        // and final-name checks. The same-owner check/rename race stays
-        // within its documented trusted-directory boundary; this is not
-        // a path lock.
-        check_output_alias(path, &input_path, &loaded.source)?;
-        sink.commit().map_err(anyhow::Error::msg)?;
+        let sink = AtomicFile::create(path).map_err(anyhow::Error::msg)?;
+        write_sink(
+            path,
+            &input_path,
+            &loaded.source,
+            &document,
+            sink,
+            before_commit,
+        )?;
     }
     let mut bytes = Vec::new();
     if args.json {
@@ -118,6 +114,31 @@ fn run_inner(
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(error) => Err(error).context("writing CBOM stdout"),
     }
+}
+
+/// The `-o` write plus atomic commit, split from `run_inner` so the
+/// write-failure twin injects a hooked sink directly.
+fn write_sink(
+    path: &Path,
+    input_path: &PathBuf,
+    source: &File,
+    document: &serde_json::Value,
+    mut sink: AtomicFile,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
+    serde_json::to_writer(sink.file(), document).context("writing CBOM JSON")?;
+    sink.file()
+        .write_all(b"\n")
+        .context("writing CBOM newline")?;
+    before_commit();
+    // The descriptor is retained even if its original name is
+    // replaced. AtomicFile independently enforces trusted ancestors
+    // and final-name checks. The same-owner check/rename race stays
+    // within its documented trusted-directory boundary; this is not
+    // a path lock.
+    check_output_alias(path, input_path, source)?;
+    sink.commit().map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf> {

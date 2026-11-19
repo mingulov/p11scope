@@ -99,18 +99,8 @@ fn run_inner(
     let report = compare::compare(&before.snapshot, &after.snapshot);
     if let Some(path) = &args.out {
         check_output_alias(path, &input_paths, sources)?;
-        let mut sink = AtomicFile::create(path).map_err(anyhow::Error::msg)?;
-        serde_json::to_writer(sink.file(), &report).context("writing JSON report")?;
-        sink.file()
-            .write_all(b"\n")
-            .context("writing report newline")?;
-        before_commit();
-        // These descriptors are retained, even if their original names are
-        // replaced. AtomicFile independently enforces trusted ancestors and
-        // final-name checks. The same-owner check/rename race stays within its
-        // documented trusted-directory boundary; this is not a path lock.
-        check_output_alias(path, &input_paths, sources)?;
-        sink.commit().map_err(anyhow::Error::msg)?;
+        let sink = AtomicFile::create(path).map_err(anyhow::Error::msg)?;
+        write_report(path, &input_paths, sources, &report, sink, before_commit)?;
     }
     let mut bytes = Vec::new();
     if args.json {
@@ -126,6 +116,30 @@ fn run_inner(
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         Err(error) => Err(error).context("writing inventory diff stdout"),
     }
+}
+
+/// The `-o` write plus atomic commit, split from `run_inner` so the
+/// write-failure twin injects a hooked sink directly.
+fn write_report(
+    path: &Path,
+    input_paths: &[PathBuf; 2],
+    sources: [&File; 2],
+    report: &model::DiffReport,
+    mut sink: AtomicFile,
+    before_commit: impl FnOnce(),
+) -> Result<()> {
+    serde_json::to_writer(sink.file(), report).context("writing JSON report")?;
+    sink.file()
+        .write_all(b"\n")
+        .context("writing report newline")?;
+    before_commit();
+    // These descriptors are retained, even if their original names are
+    // replaced. AtomicFile independently enforces trusted ancestors and
+    // final-name checks. The same-owner check/rename race stays within its
+    // documented trusted-directory boundary; this is not a path lock.
+    check_output_alias(path, input_paths, sources)?;
+    sink.commit().map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 fn normalized_path(path: &Path) -> Result<PathBuf> {

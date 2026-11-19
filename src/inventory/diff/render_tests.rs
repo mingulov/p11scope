@@ -868,3 +868,58 @@ fn concise_unchanged_diff_says_so_briefly() {
     assert!(!text.contains("absence_is_not_removal"), "{text}");
     assert!(text.lines().count() < 30, "concise must stay short: {text}");
 }
+
+/// A diff `-o` write failure (ENOSPC here) saves the rendered
+/// report to the recovery dir instead of dropping it: the error
+/// names the fallback, the saved bytes are the complete report
+/// plus its newline, and no temp litters the destination.
+#[test]
+fn diff_out_write_failure_saves_the_report_to_recovery() {
+    let (dir, args) = args();
+    let before = super::input::read_snapshot(&args.before).unwrap();
+    let after = super::input::read_snapshot(&args.after).unwrap();
+    let input_paths = [
+        super::normalized_path(&args.before).unwrap(),
+        super::normalized_path(&args.after).unwrap(),
+    ];
+    let sources = [&before.source, &after.source];
+    let report = super::compare::compare(&before.snapshot, &after.snapshot);
+    let out = dir.path().join("report.json");
+    let recovered_base = dir.path().join("p11scope-recovered");
+    let mut sink = crate::output::AtomicFile::create(&out).unwrap();
+    sink.set_fail_write_with(libc::ENOSPC);
+    let _override = crate::output::hold_recovered_override(&recovered_base);
+    let error = super::write_report(&out, &input_paths, sources, &report, sink, || {}).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("capture saved to"),
+        "the error names the fallback, got: {message}"
+    );
+    assert!(!out.exists(), "the requested -o does not exist");
+    let saved: Vec<std::path::PathBuf> = std::fs::read_dir(&recovered_base)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(saved.len(), 1, "one fallback file: {saved:?}");
+    let mut expected = serde_json::to_vec(&report).unwrap();
+    expected.push(b'\n');
+    assert_eq!(
+        std::fs::read(&saved[0]).unwrap(),
+        expected,
+        "the fallback holds the complete report"
+    );
+    assert!(
+        message.contains(&saved[0].display().to_string()),
+        "the error names the fallback path, got: {message}"
+    );
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        assert!(
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".p11scope."),
+            "no temp litters the destination"
+        );
+    }
+}

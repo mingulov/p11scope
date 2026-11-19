@@ -1989,8 +1989,7 @@ fn departed_tail_names_folded_instances_past_the_bound() {
         folded_instances_dropped: 7,
         ..DepartedUse::default()
     });
-    let text =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let text = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
         text.contains("(+7 instances past the bound)"),
         "the tail names the dropped instances:\n{text}"

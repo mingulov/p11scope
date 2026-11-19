@@ -13,9 +13,20 @@ use super::scheduler::MAX_PENDING_REFRESH;
 use crate::process::{ProcessView, ProcessViewId};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Fair-queue relief examinations per pass: one full sweep at most,
+/// never an unbounded `/proc` scan per arrival.
+pub(crate) const RELIEF_SCAN_PER_PASS: u32 = 256;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshRequest {
     pub(crate) first_seen_ns: Option<u64>,
+    /// Latest renewal evidence: the arrival clock of the most recent
+    /// (re-)queue for this pid. Queue age (`first_seen_ns`)
+    /// schedules; this stamp proves generation: an exit reclaims the
+    /// entry only when every stamp predates it, so a successor's
+    /// renewal keeps the request alive across a deferred old exit.
+    /// Unknown clocks keep the work (fail-closed).
+    pub(crate) renewed_ns: Option<u64>,
     pub(crate) serial: u64,
     pub(crate) owner: Option<ProcessViewId>,
     pub(crate) exec_binding: Option<crate::attach::ExecBinding>,
@@ -55,15 +66,33 @@ pub(crate) enum RefreshIntake {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct RefreshQueue {
     queue: BTreeMap<u32, RefreshRequest>,
     last_serial: u64,
+    relief_allowance: u32,
 }
 
 impl RefreshQueue {
-    /// Queues (or re-queues) one refresh intent: existing entries
-    /// keep their age and flags, renewals take a fresh serial, and a
+    /// A fresh queue with a full relief sweep.
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: BTreeMap::new(),
+            last_serial: 0,
+            relief_allowance: RELIEF_SCAN_PER_PASS,
+        }
+    }
+
+    /// A new pass restores the relief sweep.
+    pub(crate) fn begin_pass(&mut self) {
+        self.relief_allowance = RELIEF_SCAN_PER_PASS;
+    }
+
+    /// Queues (or re-queues) one refresh intent: consumed records
+    /// renew (fresh serial, restamped renewal clock) so completion
+    /// drops exactly the snapshot set, while retry re-queues are
+    /// idempotent signals (no new state: the exec re-arm protocol
+    /// pins prepared serials, so retries must not churn them). A
     /// full queue relieves one departed ownerless entry for a live
     /// waiter before refusing. `views` resolves owners and judges
     /// liveness; `collected_finish` tells whether the stop-time
@@ -86,36 +115,7 @@ impl RefreshQueue {
             };
         }
         if existing.is_none() && self.queue.len() >= MAX_PENDING_REFRESH {
-            // Fair-queue relief: a live waiter's request evicts one departed,
-            // ownerless queue entry instead of refusing. Departed entries can
-            // never be serviced; without relief a full queue of short-lived
-            // dead pids starves a late provider's holder unboundedly. Only
-            // entries with no retained owner, no view, and no /proc directory
-            // are evicted, so live pressure waiters keep their pinned
-            // retention. A departed newcomer never triggers relief (it would
-            // only churn the queue). A zombie leader keeps its /proc entry
-            // while a worker still runs, so path liveness retains the whole
-            // live group. Relief is live-operation only: during the
-            // collected finish at stop no refresh service pass runs, so an
-            // admitted head would sit unserviced with no loss record; refuse
-            // it below with the explicit loss instead.
-            let newcomer_live = views.iter().any(|view| view.pid() == pid)
-                || std::path::Path::new(&format!("/proc/{pid}")).exists();
-            let victim = if newcomer_live && !collected_finish {
-                self.queue
-                    .iter()
-                    .find(|(qpid, request)| {
-                        request.owner.is_none()
-                            && !views.iter().any(|view| view.pid() == **qpid)
-                            && !std::path::Path::new(&format!("/proc/{qpid}")).exists()
-                    })
-                    .map(|(qpid, _)| *qpid)
-            } else {
-                None
-            };
-            if let Some(victim) = victim {
-                self.queue.remove(&victim);
-            } else {
+            if self.relieve_one(pid, views, collected_finish).is_none() {
                 return RefreshIntake::QueueFull { consumed };
             }
         }
@@ -138,6 +138,7 @@ impl RefreshQueue {
                 first_seen_ns: existing
                     .as_ref()
                     .map_or(now_ns, |request| request.first_seen_ns),
+                renewed_ns: now_ns,
                 serial,
                 owner,
                 exec_binding: None,
@@ -155,6 +156,75 @@ impl RefreshQueue {
             owner,
             inserted: true,
         }
+    }
+
+    /// Fair-queue relief: a live waiter's request evicts one departed,
+    /// ownerless queue entry instead of refusing. Departed entries can
+    /// never be serviced; without relief a full queue of short-lived
+    /// dead pids starves a late provider's holder unboundedly. Only
+    /// entries with no retained owner, no view, and no /proc directory
+    /// are evicted, so live pressure waiters keep their pinned
+    /// retention. A departed newcomer never triggers relief (it would
+    /// only churn the queue). A zombie leader keeps its /proc entry
+    /// while a worker still runs, so path liveness retains the whole
+    /// live group. Relief is live-operation only: during the
+    /// collected finish at stop no refresh service pass runs, so an
+    /// admitted head would sit unserviced; refuse it instead. The
+    /// sweep spends the per-pass allowance one `/proc` examination at
+    /// a time and stops at zero, so arrivals past one full sweep per
+    /// pass refuse without scanning; the refused work defers (it is
+    /// never dropped as loss) and retries next pass.
+    pub(crate) fn relieve_one(
+        &mut self,
+        waiter: u32,
+        views: &[ProcessView],
+        collected_finish: bool,
+    ) -> Option<u32> {
+        if collected_finish || self.relief_allowance == 0 {
+            return None;
+        }
+        let waiter_live = views.iter().any(|view| view.pid() == waiter);
+        let newcomer_live = waiter_live || {
+            self.relief_allowance -= 1;
+            std::path::Path::new(&format!("/proc/{waiter}")).exists()
+        };
+        if !newcomer_live {
+            return None;
+        }
+        let mut victim = None;
+        for (qpid, request) in self.queue.iter() {
+            if request.owner.is_some() || views.iter().any(|view| view.pid() == *qpid) {
+                continue;
+            }
+            if self.relief_allowance == 0 {
+                break;
+            }
+            self.relief_allowance -= 1;
+            if !std::path::Path::new(&format!("/proc/{qpid}")).exists() {
+                victim = Some(*qpid);
+                break;
+            }
+        }
+        if let Some(victim) = victim {
+            self.queue.remove(&victim);
+        }
+        victim
+    }
+
+    /// Reclaims the bounded slot of an ownerless request whose every
+    /// stamp predates a matched exit: that generation ended and the
+    /// entry can never be serviced. A successor's renewal, unknown
+    /// clocks and owned entries keep the work (fail-closed).
+    pub(crate) fn reclaim_on_exit(&mut self, pid: u32, hook_ts: u64) -> bool {
+        let reclaims = self.queue.get(&pid).is_some_and(|request| {
+            request.owner.is_none()
+                && request.first_seen_ns.is_some_and(|seen| seen < hook_ts)
+                && request.renewed_ns.is_some_and(|renewed| renewed < hook_ts)
+        });
+        if reclaims {
+            self.queue.remove(&pid);
+        }
+        reclaims
     }
 
     /// Drops the queued refresh for `pid` when it belongs to `view`
@@ -248,6 +318,18 @@ impl RefreshQueue {
         self.last_serial = serial;
     }
 
+    /// Test-only relief allowance inspection.
+    #[cfg(test)]
+    pub(crate) fn relief_allowance_for_test(&self) -> u32 {
+        self.relief_allowance
+    }
+
+    /// Test-only relief allowance staging (bound twins).
+    #[cfg(test)]
+    pub(crate) fn set_relief_allowance_for_test(&mut self, allowance: u32) {
+        self.relief_allowance = allowance;
+    }
+
     /// Test-only staging: retains entries matching the predicate.
     #[cfg(test)]
     pub(crate) fn retain_for_test(&mut self, mut keep: impl FnMut(&u32, &RefreshRequest) -> bool) {
@@ -268,12 +350,12 @@ mod tests {
     use super::*;
 
     /// Move pin (3a1): intake/complete/snapshot/clear round-trip
-    /// through the seam with base serial semantics preserved (retry
-    /// re-queues retain without a new serial; consumed renewals bump;
-    /// completion drops exactly the serviced set).
+    /// through the seam (consumed renewals take a fresh serial,
+    /// retries are idempotent; completion drops exactly the serviced
+    /// set).
     #[test]
     fn refresh_queue_round_trip() {
-        let mut queue = RefreshQueue::default();
+        let mut queue = RefreshQueue::new();
         assert!(queue.is_empty());
         let views: Vec<ProcessView> = Vec::new();
         let intake = queue.request(10, Some(100), false, None, &views, false);
@@ -282,7 +364,7 @@ mod tests {
             RefreshIntake::Accepted {
                 serial: 1,
                 owner: None,
-                inserted: true
+                inserted: true,
             }
         ));
         let intake = queue.request(10, Some(200), false, None, &views, false);
@@ -332,7 +414,7 @@ mod tests {
     /// deterministically.)
     #[test]
     fn refresh_queue_relief_and_serial_exhaustion() {
-        let mut queue = RefreshQueue::default();
+        let mut queue = RefreshQueue::new();
         let views: Vec<ProcessView> = Vec::new();
         for offset in 0..MAX_PENDING_REFRESH {
             let pid = 4_000_000 + offset as u32;
@@ -357,5 +439,116 @@ mod tests {
             matches!(intake, RefreshIntake::SerialsExhausted { .. }),
             "exhausted serials refuse"
         );
+    }
+
+    /// Owner 3a2 table: one queue, one serial rule, one reclaim rule,
+    /// one relief bound. Consumed records renew (fresh serial, so
+    /// completion drops exactly the snapshot set) while retry
+    /// re-queues are idempotent (the exec re-arm protocol pins
+    /// prepared serials); every insert stamps the renewal clock; a
+    /// matched exit reclaims only ownerless entries whose every stamp
+    /// predates it (a successor's renewal and unknown clocks keep the
+    /// work); relief examines at most one full sweep per pass; the
+    /// cap stays 256.
+    #[test]
+    fn admission_owner3a2_queue_invariants() {
+        // Serials: a consumed re-queue bumps, so a request renewed
+        // during service survives that service's completion; a retry
+        // re-queue is an idempotent signal the service consumes.
+        let mut queue = RefreshQueue::new();
+        let views: Vec<ProcessView> = Vec::new();
+        queue.request(10, Some(100), false, None, &views, false);
+        let snap = queue.snapshot();
+        queue.request(10, Some(100), true, None, &views, false);
+        assert_eq!(
+            queue.snapshot().get(&10),
+            Some(&2),
+            "a consumed re-queue takes a fresh serial"
+        );
+        queue.complete(&snap, &BTreeSet::new());
+        assert!(
+            queue.get(&10).is_some(),
+            "renewed-during-service survives completion"
+        );
+        queue.request(10, Some(100), false, None, &views, false);
+        assert_eq!(
+            queue.snapshot().get(&10),
+            Some(&2),
+            "a retry re-queue adds no new serial"
+        );
+        queue.complete(&queue.snapshot(), &BTreeSet::new());
+        assert!(
+            queue.get(&10).is_none(),
+            "an unrenewed retry is consumed by service"
+        );
+        // Renewal stamps: inserts stamp now; re-queues restamp the
+        // renewal clock but keep the scheduling age.
+        let mut queue = RefreshQueue::new();
+        queue.request(10, Some(100), false, None, &views, false);
+        assert_eq!(queue.get(&10).unwrap().renewed_ns, Some(100));
+        queue.request(10, Some(200), true, None, &views, false);
+        let renewed = queue.get(&10).unwrap();
+        assert_eq!(renewed.first_seen_ns, Some(100));
+        assert_eq!(renewed.renewed_ns, Some(200));
+        // Reclaim: only ownerless entries whose every stamp predates
+        // the matched exit go; successors, unknown clocks and owned
+        // entries stay.
+        let mut queue = RefreshQueue::new();
+        queue.request(11, Some(100), false, None, &views, false);
+        assert!(queue.reclaim_on_exit(11, 200));
+        assert!(queue.get(&11).is_none());
+        let mut queue = RefreshQueue::new();
+        queue.request(12, Some(100), false, None, &views, false);
+        queue.request(12, Some(300), true, None, &views, false);
+        assert!(
+            !queue.reclaim_on_exit(12, 200),
+            "a successor's renewal keeps the request across a deferred old exit"
+        );
+        assert!(queue.get(&12).is_some());
+        let mut queue = RefreshQueue::new();
+        queue.request(13, None, false, None, &views, false);
+        assert!(
+            !queue.reclaim_on_exit(13, 200),
+            "unknown clocks keep the work"
+        );
+        let mut queue = RefreshQueue::new();
+        queue.request(14, Some(100), false, Some(ProcessViewId(7)), &views, false);
+        assert!(
+            !queue.reclaim_on_exit(14, 200),
+            "owned entries retire with their view"
+        );
+        // Relief bound: one full sweep per pass; exhaustion refuses
+        // even with a victim present; the next pass restores.
+        assert_eq!(
+            super::RELIEF_SCAN_PER_PASS,
+            256,
+            "the relief sweep covers the queue once per pass"
+        );
+        assert_eq!(
+            MAX_PENDING_REFRESH, 256,
+            "the queue cap stays 256 (pressure #136/#137)"
+        );
+        let mut queue = RefreshQueue::new();
+        assert_eq!(queue.relief_allowance_for_test(), 256);
+        // Self sorts first (real pids < 5M fake floor): ownerless,
+        // viewless, present in /proc — examined, never evicted.
+        let live = std::process::id();
+        queue.request(live, Some(100), false, None, &views, false);
+        queue.request(5_000_000, Some(100), false, None, &views, false);
+        queue.set_relief_allowance_for_test(1);
+        assert_eq!(
+            queue.relieve_one(1, &views, false),
+            None,
+            "an exhausted sweep leaves even a present victim unexamined"
+        );
+        assert_eq!(queue.relief_allowance_for_test(), 0);
+        queue.begin_pass();
+        assert_eq!(queue.relief_allowance_for_test(), 256);
+        assert_eq!(
+            queue.relieve_one(1, &views, false),
+            Some(5_000_000),
+            "the next pass examines and evicts the victim"
+        );
+        assert!(queue.get(&5_000_000).is_none());
     }
 }

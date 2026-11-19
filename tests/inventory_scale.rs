@@ -896,16 +896,34 @@ fn gap_reason_names_pid(reason: &str, pid: u32) -> bool {
 }
 
 /// Per-request signal outcomes for twins: the `fail_pid` request, when
-/// set, returns the kernel's `-1/ESRCH` for the already-reaped
-/// `dead_probe_pid`; every other request is a non-delivering
-/// `kill(pid, 0)` probe returning 0 while the fixture lives. Twins run
-/// the live branch (`signal_outcome: None`) over owned fixtures passing
-/// the real executable checks, so both shimmed requests execute and
-/// combine exactly like live `SIGTERM` requests. No signal is delivered.
+/// set, returns the kernel's `-1/ESRCH` for an unallocatable pid via a
+/// non-delivering `kill(pid, 0)` probe; every other request is a
+/// non-delivering `kill(pid, 0)` probe returning 0 while the fixture
+/// lives. Twins run the live branch (`signal_outcome: None`) over owned
+/// fixtures passing the real executable checks, so both shimmed requests
+/// execute and combine exactly like live `SIGTERM` requests. No signal
+/// is delivered.
 #[derive(Clone, Copy)]
 struct SignalShim {
     fail_pid: Option<u32>,
-    dead_probe_pid: u32,
+}
+
+/// A pid the kernel can never allocate: positive and above Linux's
+/// supported pid range (`PID_MAX_LIMIT` is 2^22), so a signal-0 probe
+/// always fails with `-1/ESRCH` and never delivers, even when other
+/// tests recycle numeric pids around the request tick.
+const UNALLOCATABLE_PROBE_PID: libc::pid_t = i32::MAX;
+
+/// Premise for the failing signal-request branch: the unallocatable
+/// probe refuses with the kernel's own `-1/ESRCH`.
+fn assert_unallocatable_probe_refuses() {
+    let premise = unsafe { libc::kill(UNALLOCATABLE_PROBE_PID, 0) };
+    assert_eq!(premise, -1, "an unallocatable pid refuses signals");
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH),
+        "an unallocatable pid fails with ESRCH"
+    );
 }
 
 /// Condition driver for the churn test: tails the observer's `--event-log`
@@ -1104,8 +1122,9 @@ impl ChurnCondition {
     fn request_signal(&mut self, pid: u32) -> libc::c_int {
         let rc = match self.signal_shim {
             Some(shim) if Some(pid) == shim.fail_pid => unsafe {
-                // The kernel's own result for a reaped pid: -1/ESRCH.
-                libc::kill(shim.dead_probe_pid as i32, libc::SIGTERM)
+                // The kernel's own result for an unallocatable pid:
+                // -1/ESRCH, never delivered.
+                libc::kill(UNALLOCATABLE_PROBE_PID, 0)
             },
             Some(_) => unsafe {
                 // Non-delivering existence probe: 0 while the fixture lives.
@@ -2097,29 +2116,6 @@ fn spawn_owned_sleep() -> support::ChildGuard {
     support::ChildGuard::new(cmd.spawn().expect("sleep fixture spawns"))
 }
 
-/// A fully reaped pid whose `SIGTERM` request returns the kernel's
-/// `-1/ESRCH`. Nothing spawns between the reap and the pump, so the pid
-/// cannot be recycled underneath the probe.
-fn reaped_probe_pid() -> u32 {
-    let mut probe = Command::new("true")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("probe spawns");
-    let pid = probe.id();
-    let status = probe.wait().expect("probe reaps");
-    assert!(status.success());
-    let premise = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-    assert_eq!(premise, -1, "a reaped pid refuses signals");
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH),
-        "a reaped pid fails with ESRCH"
-    );
-    pid
-}
-
 /// Drive one live-branch signal-request case over owned `sleep`
 /// fixtures: the request tick admits churn-A under pass 0, both exit
 /// rows arrive under pass 1, and `fail` selects the request returning
@@ -2160,10 +2156,8 @@ fn signal_request_case(case: &str, fail: Option<bool>) {
     }
     condition.driver_exe = sleep_exe.clone();
     condition.signal_outcome = None;
-    condition.signal_shim = Some(SignalShim {
-        fail_pid,
-        dead_probe_pid: reaped_probe_pid(),
-    });
+    condition.signal_shim = Some(SignalShim { fail_pid });
+    assert_unallocatable_probe_refuses();
     std::fs::write(
         &condition.events,
         format!(
@@ -2322,10 +2316,9 @@ fn review_mixed_pre_and_post_request_exits() {
         std::fs::write(
             &condition.events,
             format!(
-                "{}{}{}",
+                "{}{}",
                 guard_admitted_line(GUARD_ANCHOR),
-                guard_pass_marker_line(0),
-                guard_exit_line(pre)
+                guard_pass_marker_line(0)
             ),
         )
         .unwrap();
@@ -2335,7 +2328,10 @@ fn review_mixed_pre_and_post_request_exits() {
             "({label}) admission without churn-A leaves the kill latch clear"
         );
         assert!(
-            condition.exited.iter().all(|pid| condition.admitted.contains(pid)),
+            condition
+                .exited
+                .iter()
+                .all(|pid| condition.admitted.contains(pid)),
             "({label}) fixture feed emitted an exit before its admission"
         );
         std::fs::write(
@@ -2343,9 +2339,17 @@ fn review_mixed_pre_and_post_request_exits() {
             format!("READY {}\n", GUARD_CHURN_C),
         )
         .unwrap();
+        // The request tick buffers churn-A's admission and its marker
+        // first, then the selected pre-request exit and the next marker:
+        // the exit is consumed after its admission but before the kill
+        // check runs past the drain, so the request-time baseline refuses
+        // it — the real backlog shape, where churn-A is admitted first
+        // and exits before the request tick can issue signals.
         let mut tick = std::fs::read_to_string(&condition.events).unwrap();
         tick.push_str(&guard_admitted_line(GUARD_CHURN_A));
         tick.push_str(&guard_pass_marker_line(1));
+        tick.push_str(&guard_exit_line(pre));
+        tick.push_str(&guard_pass_marker_line(2));
         std::fs::write(&condition.events, &tick).unwrap();
         condition.pump();
         assert!(
@@ -2361,8 +2365,15 @@ fn review_mixed_pre_and_post_request_exits() {
             condition.churn_c.is_some(),
             "({label}) churn-C birth is visible"
         );
+        assert!(
+            condition
+                .exited
+                .iter()
+                .all(|pid| condition.admitted.contains(pid)),
+            "({label}) the request tick admits before it exits"
+        );
         tick.push_str(&guard_exit_line(post));
-        tick.push_str(&guard_pass_marker_line(2));
+        tick.push_str(&guard_pass_marker_line(3));
         std::fs::write(&condition.events, &tick).unwrap();
         condition.pump();
         assert!(
@@ -2371,7 +2382,7 @@ fn review_mixed_pre_and_post_request_exits() {
         );
         assert_eq!(
             condition.last_pass,
-            Some(2),
+            Some(3),
             "({label}) the later marker commits"
         );
         assert_eq!(
@@ -2382,7 +2393,7 @@ fn review_mixed_pre_and_post_request_exits() {
             !condition.settled_for_stop(),
             "({label}) a pre-request exit must not stop"
         );
-        tick.push_str(&guard_pass_marker_line(3));
+        tick.push_str(&guard_pass_marker_line(4));
         std::fs::write(&condition.events, &tick).unwrap();
         condition.pump();
         assert!(

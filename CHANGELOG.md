@@ -172,6 +172,20 @@ versioned separately and are opaque, exact dispatch keys.
   decided so an abort keeps its suffix without rebuilding it, and
   released pidfd custody closes through a bounded queue serviced
   one pin per stop check.
+- Deferred pidfd closes drain through the terminal path after output
+  attempts, one close per further-stop check, with any remainder
+  held in the established exit retention instead of closing in the
+  teardown drop.
+- Fold planning sizes every caller's edges and count-ownership
+  summaries once per pass through the shared stop-checked stride,
+  reserves the work before mutating, and stages a caller costlier
+  than a whole credit window across passes, publishing only its
+  completed fold.
+- Terminal certification paces the caller-ID copy, the membership
+  reads, the identity build with its path scan, and the carry stage
+  through the shared stop-checked stride, committing the carry
+  wholesale once it is complete; every declared module match costs
+  a planning unit even against an empty module table.
 
 ## [0.7.1] - 2026-11-17
 

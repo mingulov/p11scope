@@ -17,10 +17,10 @@ use p11scope_ebpf_common::object_flow::{
     InfoReturnVerdict, InfoStart, adapter_info_entry, adapter_info_return,
 };
 use p11scope_ebpf_common::{
-    DISCOVERY_COUNTER_RING_LOSS, EVIDENCE_ABI_REFUSALS, INFO_EVIDENCE_CELLS,
-    INFO_EVIDENCE_INSERT_FAILURES, INFO_EVIDENCE_NESTED_OVERWRITES,
-    INFO_EVIDENCE_STASH_MISMATCHES, INFO_EVIDENCE_UNMATCHED_RETURNS, INVENTORY_INFO_BYTES,
-    ImageIdentity, InfoByteReader, LinuxLayout, PRODUCED_INFO, StartKey, inventory_cookie_endpoint,
+    EVIDENCE_ABI_REFUSALS, INFO_EVIDENCE_CELLS, INFO_EVIDENCE_INSERT_FAILURES,
+    INFO_EVIDENCE_NESTED_OVERWRITES, INFO_EVIDENCE_RING_LOSS, INFO_EVIDENCE_STASH_MISMATCHES,
+    INFO_EVIDENCE_UNMATCHED_RETURNS, INVENTORY_INFO_BYTES, ImageIdentity, InfoByteReader,
+    LinuxLayout, PRODUCED_INFO, StartKey, inventory_cookie_endpoint,
 };
 
 /// In-flight info-call stash (spec §17.4): one 32-byte row per
@@ -45,8 +45,8 @@ static INFO: RingBuf = RingBuf::with_byte_size(INVENTORY_INFO_BYTES, 0);
 static INFO_KIND: Array<u64> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 
 /// Info evidence cells (spec §17.4): insert failures, unmatched
-/// returns, nested overwrites and stash mismatches — never silent,
-/// never folded into `EVIDENCE`.
+/// returns, nested overwrites, stash mismatches and INFO ring
+/// losses — never silent, never folded into `EVIDENCE`.
 #[map]
 static INFO_EVIDENCE: PerCpuArray<u64> =
     PerCpuArray::with_max_entries(INFO_EVIDENCE_CELLS, 0);
@@ -289,9 +289,10 @@ pub fn p11_info_return(ctx: RetProbeContext) -> u32 {
 
 /// Build the record header (identity via `p11_link_current_identity`
 /// in the Callers flavor, zero in the Global flavor) and emit the
-/// shared encoding on the INFO ring. A failed reservation counts the
-/// session ring loss; a submitted record bumps `PRODUCED_INFO`, the
-/// kernel half of the drain cross-check.
+/// shared encoding on the INFO ring. A failed reservation counts
+/// the INFO ring loss in its own evidence cell (never the shared
+/// discovery ring loss); a submitted record bumps `PRODUCED_INFO`,
+/// the kernel half of the drain cross-check.
 #[inline(always)]
 fn emit_info_record(
     endpoint: u32,
@@ -328,7 +329,7 @@ fn emit_info_record(
         mechanism: stash.mechanism,
     };
     let Some(mut entry) = INFO.reserve::<[u8; INFO_RECORD_LEN]>(0) else {
-        bump_discovery_counter(DISCOVERY_COUNTER_RING_LOSS);
+        bump_info_evidence(INFO_EVIDENCE_RING_LOSS);
         return 0;
     };
     let raw = entry.as_mut_ptr();

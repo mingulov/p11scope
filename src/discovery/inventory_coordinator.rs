@@ -9527,6 +9527,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             Some(p11scope_ebpf_common::INFO_EVIDENCE_UNMATCHED_RETURNS) => Some("unmatched return"),
             Some(p11scope_ebpf_common::INFO_EVIDENCE_NESTED_OVERWRITES) => Some("nested overwrite"),
             Some(p11scope_ebpf_common::INFO_EVIDENCE_STASH_MISMATCHES) => Some("stash mismatch"),
+            Some(p11scope_ebpf_common::INFO_EVIDENCE_RING_LOSS) => Some("info ring loss"),
             _ => None,
         }
     }

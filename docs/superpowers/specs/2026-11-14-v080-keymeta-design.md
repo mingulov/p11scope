@@ -2384,11 +2384,12 @@ both stop drivers. Callback quiescence
 itself is unproven under D3, so even a complete scrub is
 best-effort hygiene, not a proof — plus fresh maps per
 preparation, so no row survives the session either way.
-Full-map insert failures, unmatched returns and nested
-overwrites each land in their own `INFO_EVIDENCE` PerCpuArray
-cell (new map, 4 cells: insert failures, unmatched returns,
-nested overwrites, stash mismatches — never silent, never
-folded into `EVIDENCE`). The coordinator keeps a saturating run
+Full-map insert failures, unmatched returns, nested
+overwrites, stash mismatches and INFO ring losses each land in
+their own `INFO_EVIDENCE` PerCpuArray cell (new map, 5 cells:
+insert failures, unmatched returns, nested overwrites, stash
+mismatches, ring losses — never silent, never folded into
+`EVIDENCE`). The coordinator keeps a saturating run
 total per cell and reports each nonzero total once at the
 terminal cut, through the terminal gap headroom, so a saturated
 generic log loses per-quantum rows but never the totals.
@@ -2551,11 +2552,12 @@ discloses the last provisional cut with the run totals once, only when
 retirement never settled (a terminal classification already handled its
 cut, quiet included). Observation presence is run-wide: an expired
 final quantum never erases an earlier observation from the cut. Reserve
-failures (a full ring submits nothing, so no produced bump)
-land in the session's shared ring-loss counter beside
-`DISCOVERY` losses: a full INFO ring means the session's drains
-stalled, which the lifecycle-loss machinery already treats as
-unproven custody.
+failures (a full ring submits nothing, so no produced bump) land
+in their own `INFO_EVIDENCE` ring-loss cell: a full INFO ring is
+a named info gap with its own run total, never lifecycle-ring
+loss — a mechanism-enumeration burst can fill the 64 KiB ring
+between healthy drains, and custody must not demote for it. The
+shared ring-loss counter stays for `DISCOVERY` records only.
 
 Feasibility inside the inventory-only build: the info pair needs
 none of the compiled-out items. It brings its own stash/kind

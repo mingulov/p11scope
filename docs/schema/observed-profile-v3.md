@@ -704,9 +704,14 @@ with no same-apply reattach (`start_ns` is the detach decision
 instant, conservative by the async worker latency) and closes when
 every module in the window re-attaches, else it reads open-ended at
 capture end. An owned-run retirement composed with same-apply
-reattach — the paused ExecRefresh/static-to-exact generation turnover
-— files no window; a pure owned retire with no same-apply reattach
-files one like any live retire. Finalize-time stale-generation cleanup
+reattach files no window; a pure owned retire with no same-apply
+reattach files one like any live retire. The intended silence is the
+paused ExecRefresh/static-to-exact generation turnover, whose reattach
+carries the new generation while the owned child is stopped. The
+implemented exclusion is apply-wide: any non-empty `delta.new` or
+`delta.replace` silences an all-owned retire, including a reattach on
+an unrelated endpoint or provider — narrowing to the turnover awaits
+an owner ruling. Finalize-time stale-generation cleanup
 is outside this witness: when a process generation changes after link
 mutation, its orphaned targets detach with only the generic `live
 discovery generation` row (and, when unpublished additions are left

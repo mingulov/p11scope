@@ -1930,8 +1930,16 @@ impl LiveJointMachine {
         // The re-arm consumed the latch; a later stop must not show its code.
         self.audit_refusal = None;
         self.audit_refusal_detail = None;
-        let call_word = if discarded_calls == 1 { "call" } else { "calls" };
-        let feed_word = if discarded_feeds == 1 { "feed" } else { "feeds" };
+        let call_word = if discarded_calls == 1 {
+            "call"
+        } else {
+            "calls"
+        };
+        let feed_word = if discarded_feeds == 1 {
+            "feed"
+        } else {
+            "feeds"
+        };
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(

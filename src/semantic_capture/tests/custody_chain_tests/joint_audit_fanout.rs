@@ -19251,8 +19251,7 @@ fn joint_watchdog_recovery_scopes_to_the_stuck_session() {
 // must describe the scoped behavior the table above pins — loss
 // scoped to the stuck session, running audit trips re-arming, and
 // the parked-consumer gap — never the pre-refactor whole-view stop.
-const WATCHDOG_KNOWN_LIMITATIONS_MD: &str =
-    include_str!("../../../../docs/known-limitations.md");
+const WATCHDOG_KNOWN_LIMITATIONS_MD: &str = include_str!("../../../../docs/known-limitations.md");
 
 #[test]
 fn known_limitations_scopes_watchdog_loss_to_the_stuck_session() {
@@ -19586,7 +19585,7 @@ fn joint_machine_rearm_gaps_publish_one_row_with_repeats() {
 #[test]
 fn watchdog_rearm_loss_under_a_full_gap_cap_is_counted_not_named() {
     const ROW: &str = "gap-pressure re-arm";
-    use crate::discovery::caller_registry::{RegistryGap, DEFAULT_MAX_GAPS};
+    use crate::discovery::caller_registry::{DEFAULT_MAX_GAPS, RegistryGap};
     use crate::semantics_key_use::FeedMode;
     let mut scene = watchdog_stuck_scene(ROW);
     let (cap, retained_before, suppressed_before) = {
@@ -19655,19 +19654,17 @@ fn watchdog_rearm_loss_under_a_full_gap_cap_is_counted_not_named() {
         "{ROW}: the probe publish moves no disposed history"
     );
     let registry = scene.fixture.scene.real.scene.coordinator.registry();
-    assert_eq!(
-        registry.gaps().len(),
-        cap,
-        "{ROW}: the cap stays full"
-    );
+    assert_eq!(registry.gaps().len(), cap, "{ROW}: the cap stays full");
     assert_eq!(
         registry.gaps_suppressed() - suppressed_before,
         (retained_before + staged_gaps - cap) as u64,
         "{ROW}: every row past the bound counts suppressed exactly"
     );
     assert!(
-        !registry.gaps().iter().any(|gap| gap.subject == QUANTUM_ABANDONED
-            && gap.reason.contains("stuck session")),
+        !registry
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == QUANTUM_ABANDONED && gap.reason.contains("stuck session")),
         "{ROW}: the per-trip named loss does not survive a full cap"
     );
     // The loss counts survive exactly at feed level, where the
@@ -19712,7 +19709,7 @@ fn watchdog_rearm_loss_under_a_full_gap_cap_is_counted_not_named() {
 #[test]
 fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
     const ROW: &str = "gap-pressure park";
-    use crate::discovery::caller_registry::{RegistryGap, DEFAULT_MAX_GAPS};
+    use crate::discovery::caller_registry::{DEFAULT_MAX_GAPS, RegistryGap};
     use crate::inventory_semantics::JointServiceProgress;
     use crate::semantics_key_use::FeedMode;
     use crate::semantics_objects::journal::JournalGap;
@@ -19806,7 +19803,10 @@ fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
             Err(_) => break,
         }
     }
-    assert!(published, "{ROW}: the frame completes past its parked consumer");
+    assert!(
+        published,
+        "{ROW}: the frame completes past its parked consumer"
+    );
     assert_eq!(
         fixture.machine.audit_no_progress_trip_for_test(),
         None,
@@ -19886,7 +19886,10 @@ fn watchdog_park_loss_under_a_full_gap_cap_is_counted_not_named() {
     // calls keep their S1 counts and land in the unattributed
     // `proof_refused_fallback` tallies (no per-key row can be proved),
     // while no head is disposed or degraded-lost.
-    assert_eq!(staged_after_loop, 0, "{ROW}: the parked feed stages nothing after");
+    assert_eq!(
+        staged_after_loop, 0,
+        "{ROW}: the parked feed stages nothing after"
+    );
     assert_eq!(
         fallback_replayed_total(&fixture) - replayed_before,
         staged_before as u64,
@@ -19943,7 +19946,10 @@ fn watchdog_spared_late_terminal_falls_back_below_fence() {
             .adapter()
             .image_tainted_for_test(image)
     };
-    assert!(!tainted(&fixture, (71, 0)), "{ROW}: the prefix taints nothing");
+    assert!(
+        !tainted(&fixture, (71, 0)),
+        "{ROW}: the prefix taints nothing"
+    );
     // Stuck A's quantum on file 0: drive the real commit to applied
     // with nonzero staged work.
     fixture.scene.push(pid, 0, "C_SignInit", 5);
@@ -19982,7 +19988,10 @@ fn watchdog_spared_late_terminal_falls_back_below_fence() {
     assert_eq!(held[0].1.1, 1, "{ROW}: the held call stays staged");
     let held_reduced_post_rearm = held[0].1.2;
     let held_disposed_post_rearm = held[0].1.6;
-    assert!(!tainted(&fixture, (71, 0)), "{ROW}: recovery taints nothing");
+    assert!(
+        !tainted(&fixture, (71, 0)),
+        "{ROW}: recovery taints nothing"
+    );
     // The void consumes first (no new input): the void severs the
     // ordering wait, so the held sibling seals on its intact history.
     assert!(
@@ -19995,7 +20004,10 @@ fn watchdog_spared_late_terminal_falls_back_below_fence() {
         .filter(|(_, reason)| reason.contains("joint_void_"))
         .map(|(_, reason)| reason)
         .collect();
-    assert!(!voids.is_empty(), "{ROW}: the Idle void ran and named its loss");
+    assert!(
+        !voids.is_empty(),
+        "{ROW}: the Idle void ran and named its loss"
+    );
     let held = watchdog_feed_states(&fixture, 1);
     assert_eq!(held.len(), 1, "{ROW}: one held incarnation at the void");
     assert_eq!(held[0].1.1, 0, "{ROW}: the held sibling seals at the void");
@@ -20064,11 +20076,7 @@ fn watchdog_spared_late_terminal_falls_back_below_fence() {
     // BEGIN matches against the already-fallen-back seal and defers its
     // resume below the void fence — disclosed, with no taint and no
     // counter movement on any feed.
-    fixture
-        .scene
-        .drain
-        .source_mut()
-        .push_record(end_a.to_vec());
+    fixture.scene.drain.source_mut().push_record(end_a.to_vec());
     fixture.published_labeled("watchdog-taint-terminal", None);
     assert!(
         !tainted(&fixture, (71, 0)),
@@ -20171,7 +20179,10 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
             .adapter()
             .image_tainted_for_test(image)
     };
-    assert!(!tainted(&fixture, (71, 0)), "{ROW}: the prefix taints nothing");
+    assert!(
+        !tainted(&fixture, (71, 0)),
+        "{ROW}: the prefix taints nothing"
+    );
     fixture.scene.push(pid, 0, "C_SignInit", 5);
     fixture.scene.push(pid, 0, "C_SignUpdate", 6);
     fixture.scene.push(pid, 0, "C_SignFinal", 7);
@@ -20201,7 +20212,10 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         stuck_staged as u64,
         "{ROW}: the stuck loss counts exactly its staged depth"
     );
-    assert!(!tainted(&fixture, (71, 0)), "{ROW}: recovery taints nothing");
+    assert!(
+        !tainted(&fixture, (71, 0)),
+        "{ROW}: recovery taints nothing"
+    );
     let held = watchdog_feed_states(&fixture, 1);
     assert_eq!(held.len(), 1, "{ROW}: one held incarnation");
     assert_eq!(held[0].1.1, 1, "{ROW}: the held call stays staged");
@@ -20217,7 +20231,10 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         .filter(|(_, reason)| reason.contains("joint_void_"))
         .map(|(_, reason)| reason)
         .collect();
-    assert!(!voids.is_empty(), "{ROW}: the Idle void ran and named its loss");
+    assert!(
+        !voids.is_empty(),
+        "{ROW}: the Idle void ran and named its loss"
+    );
     let held = watchdog_feed_states(&fixture, 1);
     assert_eq!(held.len(), 1, "{ROW}: one held incarnation at the void");
     assert_eq!(held[0].1.1, 0, "{ROW}: the held sibling seals at the void");
@@ -20228,22 +20245,26 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
     );
     // Baselines before the late terminal lands.
     let stuck_pre = watchdog_feed_states(&fixture, 0);
-    assert_eq!(stuck_pre.len(), 1, "{ROW}: one stuck incarnation pre-terminal");
+    assert_eq!(
+        stuck_pre.len(),
+        1,
+        "{ROW}: one stuck incarnation pre-terminal"
+    );
     let stuck_pre = stuck_pre[0].1.clone();
     let sibling_pre = watchdog_feed_states(&fixture, 1)[0].1.clone();
     let gaps_pre: Vec<(String, String)> = watchdog_scope_gaps(&fixture);
-    fixture
-        .scene
-        .drain
-        .source_mut()
-        .push_record(end_a.to_vec());
+    fixture.scene.drain.source_mut().push_record(end_a.to_vec());
     fixture.published_labeled("watchdog-taint2-terminal", None);
     assert!(
         !tainted(&fixture, (71, 0)),
         "{ROW}: the sibling's shape changes nothing: no taint lands"
     );
     let stuck_post = watchdog_feed_states(&fixture, 0);
-    assert_eq!(stuck_post.len(), 1, "{ROW}: one stuck incarnation post-terminal");
+    assert_eq!(
+        stuck_post.len(),
+        1,
+        "{ROW}: one stuck incarnation post-terminal"
+    );
     let stuck_post = stuck_post[0].1.clone();
     assert_eq!(
         (stuck_post.1, stuck_post.2, stuck_post.3, stuck_post.6),
@@ -20264,10 +20285,19 @@ fn watchdog_spared_late_terminal_ignores_the_sibling_shape() {
         "{ROW}: the terminal names its below-fence deferral: {gaps_post:?}"
     );
     let sibling_post = watchdog_feed_states(&fixture, 1);
-    assert_eq!(sibling_post.len(), 1, "{ROW}: one sibling incarnation post-terminal");
+    assert_eq!(
+        sibling_post.len(),
+        1,
+        "{ROW}: one sibling incarnation post-terminal"
+    );
     let sibling_post = sibling_post[0].1.clone();
     assert_eq!(
-        (sibling_post.1, sibling_post.2, sibling_post.3, sibling_post.6),
+        (
+            sibling_post.1,
+            sibling_post.2,
+            sibling_post.3,
+            sibling_post.6
+        ),
         (sibling_pre.1, sibling_pre.2, sibling_pre.3, sibling_pre.6),
         "{ROW}: the sealed sibling moves no counter past the terminal"
     );

@@ -298,8 +298,8 @@ recovery.
   gap and exact loss count) — a fix (previously this loss tripped
   the whole lane or never surfaced per consumer). Reason texts
   change only where behavior changes: the re-arm reason names the
-  scoped discard (`discarded {calls} staged calls from {feeds}
-  feeds of the stuck session; per-key attribution unknown for those
+  scoped discard (`discarded {calls} staged call(s) from {feeds}
+  feed(s) of the stuck session; per-key attribution unknown for those
   calls`) and drops the stream-wide "lose per-key rows for the rest
   of the run" claim for healthy sessions (false after this lands).
 - The audit-trip gap text on this base (`the semantic lane stops`)

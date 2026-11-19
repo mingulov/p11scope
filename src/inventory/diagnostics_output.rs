@@ -2,8 +2,11 @@
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Independent, atomic delivery of the completed inventory diagnostics.
 
-use crate::inventory_diagnostics::{DiagnosticSummary, FinishedDiagnostics, RetainedIdentityView};
+use crate::inventory_diagnostics::{
+    DiagnosticSummary, ExportError, FinishedDiagnostics, RetainedIdentityView,
+};
 use crate::output::AtomicFile;
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io;
 use std::os::unix::fs::MetadataExt as _;
@@ -57,13 +60,21 @@ impl DiagnosticsDestination {
     /// Called after primary report attempts. Cancellation is the second signal.
     ///
     /// The export streams each line (fixed 8 KiB scratch, cancellation
-    /// checked between records) to both the `-o` temp and a private
-    /// disk-backed recovery staging, with bounded heap: no in-memory
-    /// copy of the complete file while the rings and export indexes
-    /// are live. A short `-o` write then finishes the staging instead
-    /// of dropping the export. Cancellation is checked before
-    /// starting recovery; a cancelled export aborts its staging and
-    /// leaves the old destination intact.
+    /// checked between records) to the `-o` temp, with bounded heap:
+    /// no in-memory copy of the complete file while the rings and
+    /// export indexes are live. The primary keeps priority: no
+    /// recovery file or dir is created while it stays healthy, so a
+    /// staging cannot consume the space the primary needs. On the
+    /// first primary write error the export checks cancellation, then
+    /// lazily opens a private disk-backed recovery staging and replays
+    /// the confirmed prefix (tracked before each attempted record, so
+    /// a partial write cannot duplicate) from the held readable
+    /// primary FD with bounded scratch and cancellation checks; the
+    /// failing record and the tail then continue there. A short `-o`
+    /// write finishes the staging instead of dropping the export.
+    /// Cancellation is checked before starting recovery; a cancelled
+    /// export aborts its staging and leaves the old destination
+    /// intact.
     pub(crate) fn deliver(
         mut self,
         finished: FinishedDiagnostics,
@@ -71,43 +82,46 @@ impl DiagnosticsDestination {
         mut second_signal: impl FnMut() -> bool,
     ) -> Result<DiagnosticSummary, String> {
         let base = crate::output::recovered_base_dir();
-        let (staging, creation_error) =
-            match crate::output::RecoveryStaging::create(&self.path, &base) {
-                Ok(staging) => (Some(staging), None),
-                // No staging: the primary may still succeed, and a
-                // primary failure then reports both errors as lost.
-                Err(error) => (None, Some(error)),
-            };
-        // Stream the export through the tee; the tee borrows the `-o`
-        // temp only for this block, so the tail below reclaims it.
+        // Stream the export through the lazy writer; it borrows the
+        // `-o` temp only for this block, so the tail below reclaims
+        // it. The writer and `write_jsonl` share the cancellation
+        // closure through the cell (never called reentrantly: record
+        // writes and record-boundary polls strictly alternate).
         let (export, primary_failed, primary_error, staging, creation_error, staging_error) = {
-            let mut tee = StreamingTee {
+            let cancel: RefCell<&mut dyn FnMut() -> bool> = RefCell::new(&mut second_signal);
+            let mut writer = LazyRecoveryWriter {
                 output: &mut self.output,
-                staging,
-                creation_error,
-                staging_error: None,
+                dest: self.path.clone(),
+                base: base.clone(),
+                confirmed: 0,
                 primary_failed: false,
                 primary_error: None,
+                staging: None,
+                creation_error: None,
+                staging_error: None,
+                cancel: &cancel,
             };
-            let export = finished.write_jsonl(&mut tee, view, &mut second_signal);
+            let export = finished.write_jsonl(&mut writer, view, || (*cancel.borrow_mut())());
             (
                 export,
-                tee.primary_failed,
-                tee.primary_error,
-                tee.staging.take(),
-                tee.creation_error,
-                tee.staging_error,
+                writer.primary_failed,
+                writer.primary_error,
+                writer.staging.take(),
+                writer.creation_error,
+                writer.staging_error,
             )
         };
-        // From here the tee is gone; `self.output` and `staging` are
-        // usable again.
+        // From here the writer is gone; `second_signal`,
+        // `self.output` and `staging` are usable again.
         match export {
             Ok(summary) => {
                 if primary_failed {
                     let Some(staging) = staging else {
-                        // Primary failed with no staging (creation
-                        // failed up front, or a staging write failed
-                        // mid-export): both errors, as lost.
+                        // Primary failed with no surviving staging
+                        // (creation failed, or a staging write failed
+                        // mid-export but the export still returned
+                        // success, which the lazy writer never does):
+                        // both errors, as lost.
                         if second_signal() {
                             return Err(format!(
                                 "diagnostics export cancelled: {}",
@@ -144,22 +158,37 @@ impl DiagnosticsDestination {
                     );
                     return Err(failure.into_message());
                 }
-                // Primary holds the complete export; the staging (if
-                // any) is unneeded. Dropping it unlinks it.
+                // Primary holds the complete export; no staging was
+                // created. Dropping the (absent) staging is a no-op.
                 drop(staging);
                 // Fall through with `summary` to the publication tail.
                 Self::publish_tail(self, summary, &mut second_signal)
             }
             Err(error) => {
-                // The tee failed both sinks (or the primary with no
-                // staging), or the export was cancelled, or a line
-                // could not serialize. Abort any partial staging and
-                // leave the old destination intact.
+                // The lazy writer failed both sinks (the primary, then
+                // the recovery setup or write), or the export was
+                // cancelled, or a line could not serialize. Abort any
+                // partial staging and leave the old destination intact.
                 drop(staging);
                 if second_signal() {
                     return Err(format!(
                         "diagnostics export cancelled: {}",
                         self.path.display()
+                    ));
+                }
+                // A primary I/O failure plus a failed recovery setup or
+                // write reports both causes with the loss outcome, as
+                // the buffered sites do. Cancellation and serialization
+                // stay distinct.
+                if primary_failed && matches!(error, ExportError::Io(_)) {
+                    let second = creation_error
+                        .or(staging_error)
+                        .unwrap_or_else(|| "unknown error".to_string());
+                    return Err(format!(
+                        "writing diagnostics {} failed: {}; saving to {} also failed: {second}; capture lost",
+                        self.path.display(),
+                        primary_error.unwrap_or_else(|| "unknown error".to_string()),
+                        base.display(),
                     ));
                 }
                 Err(format!(
@@ -217,56 +246,170 @@ impl DiagnosticsDestination {
     }
 }
 
-/// Streams each export line to both the `-o` temp and the recovery
-/// staging with bounded heap. A failed sink is retried no further;
-/// the export continues to the surviving sink, so a short `-o` write
-/// still yields a complete staging. Both sinks failed is an I/O
-/// error; at least one success is a full write.
-struct StreamingTee<'a> {
-    output: &'a mut AtomicFile,
+/// Streams each export line to the `-o` temp with bounded heap.
+/// The primary keeps priority: no recovery file or dir exists while
+/// it stays healthy. On the first primary write error the writer
+/// checks cancellation, lazily opens a recovery staging, replays the
+/// confirmed prefix from the held readable primary FD, and continues
+/// the failing record plus the tail there. The confirmed prefix is
+/// tracked before each attempted record, so a partial primary write
+/// cannot duplicate. Both sinks failed is an I/O error carrying the
+/// primary cause; the recovery cause travels in `creation_error` or
+/// `staging_error` for the delivery boundary to report both as lost.
+struct LazyRecoveryWriter<'cell, 'signal> {
+    output: &'cell mut AtomicFile,
+    dest: PathBuf,
+    base: PathBuf,
+    confirmed: u64,
+    primary_failed: bool,
+    primary_error: Option<String>,
     staging: Option<crate::output::RecoveryStaging>,
     creation_error: Option<String>,
     staging_error: Option<String>,
-    primary_failed: bool,
-    primary_error: Option<String>,
+    cancel: &'cell RefCell<&'signal mut dyn FnMut() -> bool>,
 }
 
-impl std::io::Write for StreamingTee<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        let mut primary_ok = false;
-        if !self.primary_failed {
-            match self.output.write_document(bytes) {
-                Ok(()) => primary_ok = true,
-                Err(error) => {
-                    self.primary_failed = true;
-                    self.primary_error = Some(error.to_string());
-                }
+/// Why a confirmed-prefix replay failed: cancellation (the delivery
+/// boundary reports `cancelled`) or an I/O cause (reported as the
+/// recovery side of a double failure).
+enum ReplayOutcome {
+    Cancelled,
+    Failed(String),
+}
+
+impl LazyRecoveryWriter<'_, '_> {
+    /// Fails over to recovery after a primary write error: checks
+    /// cancellation, lazily opens the staging, replays the confirmed
+    /// prefix, and writes the failing record's bytes there. Returns
+    /// the full length on success; on any failure records the cause
+    /// and returns the primary error for the export to abort with.
+    fn fail_over(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if (*self.cancel.borrow_mut())() {
+            return Err(self.primary_io_error());
+        }
+        match crate::output::RecoveryStaging::create(&self.dest, &self.base) {
+            Ok(staging) => {
+                self.staging = Some(staging);
+            }
+            Err(error) => {
+                self.creation_error = Some(error);
+                return Err(self.primary_io_error());
             }
         }
-        let mut staging_ok = false;
-        if let Some(staging) = self.staging.as_mut() {
-            match std::io::Write::write_all(staging, bytes) {
-                Ok(()) => staging_ok = true,
-                Err(error) => {
-                    // Drop the broken staging now: its partial file is
-                    // unlinked, and the export continues primary-only.
-                    // A later primary failure then reports both errors.
-                    let staging = self.staging.take();
-                    drop(staging);
-                    self.staging_error = Some(error.to_string());
-                }
+        match self.replay_prefix() {
+            Ok(()) => {}
+            Err(ReplayOutcome::Cancelled) => {
+                return Err(self.primary_io_error());
+            }
+            Err(ReplayOutcome::Failed(error)) => {
+                self.staging_error = Some(error);
+                self.staging = None;
+                return Err(self.primary_io_error());
             }
         }
-        if primary_ok || staging_ok {
-            Ok(bytes.len())
-        } else {
-            // Both sinks failed (or the primary with no staging):
-            // abort the export with the primary error.
-            Err(std::io::Error::other(
-                self.primary_error
-                    .clone()
-                    .unwrap_or_else(|| "diagnostics write failed".to_string()),
+        let write_result = match self.staging.as_mut() {
+            Some(staging) => std::io::Write::write_all(staging, bytes),
+            None => unreachable!("a replayed staging accepts the failing record"),
+        };
+        match write_result {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.staging_error = Some(error.to_string());
+                self.staging = None;
+                Err(self.primary_io_error())
+            }
+        }
+    }
+
+    /// Replays the confirmed prefix from the held readable primary FD
+    /// into the staging with fixed 8 KiB scratch, checking
+    /// cancellation between chunks. The primary is abandoned after
+    /// failover, so moving its shared offset is harmless.
+    fn replay_prefix(&mut self) -> Result<(), ReplayOutcome> {
+        let Some(staging) = self.staging.as_mut() else {
+            return Err(ReplayOutcome::Failed(
+                "recovery staging is gone".to_string(),
+            ));
+        };
+        let mut src = self.output.file().try_clone().map_err(|error| {
+            ReplayOutcome::Failed(format!(
+                "reading confirmed prefix for recovery failed: {error}"
             ))
+        })?;
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        src.seek(SeekFrom::Start(0)).map_err(|error| {
+            ReplayOutcome::Failed(format!(
+                "reading confirmed prefix for recovery failed: {error}"
+            ))
+        })?;
+        let mut remaining = self.confirmed;
+        let mut scratch = [0u8; 8 * 1024];
+        while remaining > 0 {
+            if (*self.cancel.borrow_mut())() {
+                return Err(ReplayOutcome::Cancelled);
+            }
+            let want = std::cmp::min(remaining, scratch.len() as u64) as usize;
+            let got = src.read(&mut scratch[..want]).map_err(|error| {
+                ReplayOutcome::Failed(format!(
+                    "reading confirmed prefix for recovery failed: {error}"
+                ))
+            })?;
+            if got == 0 {
+                return Err(ReplayOutcome::Failed(
+                    "reading confirmed prefix for recovery failed: unexpected end of file"
+                        .to_string(),
+                ));
+            }
+            std::io::Write::write_all(staging, &scratch[..got])
+                .map_err(|error| ReplayOutcome::Failed(error.to_string()))?;
+            remaining -= got as u64;
+        }
+        Ok(())
+    }
+
+    /// Writes directly to the surviving staging after failover. A
+    /// staging failure drops it (unlinking the partial file) and
+    /// aborts the export with the primary cause; the recovery cause
+    /// stays in `staging_error` for the double-failure line.
+    fn write_to_staging(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let write_result = match self.staging.as_mut() {
+            Some(staging) => std::io::Write::write_all(staging, bytes),
+            None => return Err(self.primary_io_error()),
+        };
+        match write_result {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.staging_error = Some(error.to_string());
+                self.staging = None;
+                Err(self.primary_io_error())
+            }
+        }
+    }
+
+    fn primary_io_error(&self) -> std::io::Error {
+        std::io::Error::other(
+            self.primary_error
+                .clone()
+                .unwrap_or_else(|| "diagnostics write failed".to_string()),
+        )
+    }
+}
+
+impl std::io::Write for LazyRecoveryWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.primary_failed {
+            return self.write_to_staging(bytes);
+        }
+        match self.output.write_document(bytes) {
+            Ok(()) => {
+                self.confirmed += bytes.len() as u64;
+                Ok(bytes.len())
+            }
+            Err(error) => {
+                self.primary_failed = true;
+                self.primary_error = Some(error.to_string());
+                self.fail_over(bytes)
+            }
         }
     }
 
@@ -1080,10 +1223,10 @@ mod tests {
                     if recovered_base.exists() {
                         early_staging = true;
                     }
-                    if let Ok(entries) = std::fs::read_dir(&recovered_base) {
-                        if entries.filter_map(|entry| entry.ok()).next().is_some() {
-                            early_staging = true;
-                        }
+                    if let Ok(entries) = std::fs::read_dir(&recovered_base)
+                        && entries.filter_map(|entry| entry.ok()).next().is_some()
+                    {
+                        early_staging = true;
                     }
                 }
                 false

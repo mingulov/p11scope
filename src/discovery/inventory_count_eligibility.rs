@@ -692,12 +692,6 @@ impl CountOwnership {
     pub(super) fn summary_keys(&self) -> impl Iterator<Item = &(CallerId, u32)> {
         self.summaries.keys()
     }
-    /// Whether one summary still exists: the staged oversized fold
-    /// rehearses its lists read-only and the commit revalidates them,
-    /// so neither trusts a stale key.
-    pub(super) fn has_summary(&self, key: &(CallerId, u32)) -> bool {
-        self.summaries.contains_key(key)
-    }
     /// Test-only: count-ownership summaries touched while folding.
     #[cfg(test)]
     pub(super) fn summary_fold_visits_for_test(&self) -> u64 {

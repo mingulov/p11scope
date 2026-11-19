@@ -3197,21 +3197,8 @@ impl CallerRegistry {
     /// per-caller refused-call count move with the row: the latter
     /// joins the folded counter the key projection sums, so the
     /// projection stays exact without one entry per folded caller.
-    /// Read one instance row plus its semantic row without taking
-    /// them: the staged oversized fold rehearses its lists read-only
-    /// and the commit takes only revalidated members.
-    pub(crate) fn peek_instance_for_fold(
-        &self,
-        id: RegistryInstanceId,
-    ) -> Option<(&InstanceRecord, Option<&InstanceSemanticRecord>)> {
-        let record = self.instance_state.records.get(&id)?;
-        let semantic = self.instance_state.semantics.get(&id);
-        Some((record, semantic))
-    }
-
     /// One taken instance's fold marks — its module, whether it joined
-    /// (any API returns), and whether it carried claims — shared by the
-    /// take-and-fold commit and the read-only rehearsal.
+    /// (any API returns), and whether it carried claims.
     pub(crate) fn taken_instance_marks(
         module: ModuleId,
         semantic: Option<&InstanceSemanticRecord>,

@@ -1491,13 +1491,19 @@ Limits that matter in pods:
   destination filesystem holds less than a rough report size class
   (1 MiB), one advisory stderr line warns the report may not fit;
   the capture still starts. After the capture, a finished report is
-  never deleted before a fallback has been tried: a sync, handover
-  or rename I/O failure (a full disk, a quota, a read-only remount,
-  a refused `fchown`) retries the commit once, then saves the
-  capture to the recovery dir `/var/tmp/p11scope-recovered/` —
-  created `0700` owner-only (a planted symlink, foreign-owned or
-  permissive dir is refused), file `0600`
-  `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>`, fsynced file and dir —
+  never deleted before a fallback has been tried: a document-write
+  failure (a full disk, a quota) saves the complete in-memory bytes
+  straight to the recovery dir, and a sync, handover or rename I/O
+  failure (a read-only remount, a refused `fchown`) retries the
+  commit once, then saves the finished capture there. The recovery
+  dir is per-user — `/var/tmp/p11scope-recovered-<euid>/`, created
+  `0700` owner-only — so one user's fallback never blocks
+  another's; when the base name is occupied by a foreign object (a
+  planted symlink, another user's dir, a file, a permissive dir),
+  the save falls back to a fresh unique sibling
+  `<base>.<16 hex>` with one warning naming both, instead of
+  failing. Files are `0600`
+  `p11scope-<yyyymmddThhmmssZ>-<pid>.<ext>`, fsynced file and dir,
   with one stderr line naming the `-o` error and the saved path,
   and the command exits 1 because the requested `-o` does not
   exist. When the recovery save fails too, one stderr line carries

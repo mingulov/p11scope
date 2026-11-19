@@ -6014,11 +6014,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             );
         // Key rows outlive their instance row: keep the join keys
         // so text and CBOM still resolve provider and program.
-        self.registry.insert_folded_instance(
-            taken.record.module,
-            instance,
-            taken.record.caller,
-        );
+        self.registry
+            .insert_folded_instance(taken.record.module, instance, taken.record.caller);
         self.registry.fold_taken_instance(taken, now_ns);
         Some((module, joined, claims))
     }

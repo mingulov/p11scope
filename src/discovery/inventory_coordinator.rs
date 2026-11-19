@@ -6121,6 +6121,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Record caller rows that a presentation has rendered. Retirement is
     /// only allowed after this, so a row still shown keeps its facts.
+    /// Tests-only: production commits the certified set wholesale (see
+    /// [`Self::set_rendered_callers`]).
+    #[cfg(test)]
     pub(crate) fn note_rendered_callers(&mut self, ids: &[CallerId]) {
         self.rendered_callers.extend(ids.iter().copied());
     }

@@ -264,6 +264,18 @@ pub(crate) const ADMITTED_CALLERS_WITHOUT_JOINS_SUBJECT: &str =
 /// verbatim by the semantics tests.
 pub(crate) const CALLERS_REFUSED_ADMISSION_SUBJECT: &str = "callers refused admission";
 
+/// Gap subject for a caller the departed fold defers: over one
+/// window's member budget, so no pass can reserve it. Pinned verbatim
+/// by the admission-table test below.
+pub(crate) const FOLD_DEFERRED_OVERSIZED_SUBJECT: &str =
+    "fold deferred: caller exceeds one pass's fold budget";
+
+/// Gap reason for a deferred oversized fold: constant, so every
+/// deferral of one caller folds into its row's repeats. Pinned
+/// verbatim by the admission-table test below.
+pub(crate) const FOLD_DEFERRED_OVERSIZED_REASON: &str =
+    "the caller stays live and unfolded with its data kept and retries next pass";
+
 /// Terminal wording for the short-lived never-scanned count: `confirmed`
 /// programs were never enumerated twice in a row or were listed only as
 /// exited before their scan, so no scan ever examined them; `untracked`
@@ -30346,6 +30358,263 @@ exit 0
             (3, 2),
             "the fold aggregates every edge and instance"
         );
+    }
+
+    /// Admission table: every fold entry point through the real
+    /// retire. A fitting caller folds atomically; a caller past the
+    /// remaining credits waits carried without a gap and folds next
+    /// pass; a caller costlier than a whole window (65,536 member
+    /// units and up — no window can reserve it) stays live and
+    /// unfolded with its data kept under a counted named gap. The
+    /// boundary rows pin both sides of the 65,536-unit edge, and the
+    /// tiny row pins the module-identity charge inside the member
+    /// traversal.
+    #[test]
+    fn fold_admission_table_folds_waits_and_defers_oversized() {
+        struct AdmissionRow {
+            name: &'static str,
+            members: (u64, u64, u64, u64, u64, u32),
+            fillers: u32,
+            folds_pass1: bool,
+            gaps_pass2: u64,
+            marks: &'static [(u64, u64)],
+        }
+        const ROWS: &[AdmissionRow] = &[
+            // 2 + 1 + 1 + 3 + 2 + 1 = 10 units = 1 credit; the 3
+            // edges name distinct modules and both instances share
+            // the first edge's module.
+            AdmissionRow {
+                name: "tiny folds",
+                members: (2, 1, 1, 3, 2, 1),
+                fillers: 0,
+                folds_pass1: true,
+                gaps_pass2: 0,
+                marks: &[(1, 0), (2, 0), (3, 0)],
+            },
+            // 65,535 units = exactly 1,024 credits: the costliest
+            // fitting caller.
+            AdmissionRow {
+                name: "boundary fits",
+                members: (65_535, 0, 0, 0, 0, 0),
+                fillers: 0,
+                folds_pass1: true,
+                gaps_pass2: 0,
+                marks: &[],
+            },
+            // 65,536 units = 1,025 credits: no window reserves it.
+            AdmissionRow {
+                name: "boundary defers",
+                members: (65_536, 0, 0, 0, 0, 0),
+                fillers: 0,
+                folds_pass1: false,
+                gaps_pass2: 2,
+                marks: &[],
+            },
+            // Strictly above 65,536 units.
+            AdmissionRow {
+                name: "oversized defers",
+                members: (70_000, 0, 0, 0, 0, 0),
+                fillers: 0,
+                folds_pass1: false,
+                gaps_pass2: 2,
+                marks: &[],
+            },
+            // 200 + 1 + 1 = 202 units = 4 credits against the 3 the
+            // fillers leave: waits carried, then folds.
+            AdmissionRow {
+                name: "credit waits",
+                members: (200, 1, 1, 0, 0, 0),
+                fillers: 1021,
+                folds_pass1: false,
+                gaps_pass2: 0,
+                marks: &[],
+            },
+        ];
+        for row in ROWS {
+            let (mut native, _live) = NativeScene::new();
+            let domain = native.domain;
+            let mut ids = Vec::new();
+            for filler in 0..row.fillers {
+                let id = stage_exited_caller(&mut native, 4000 + filler, 100);
+                native.scene.coordinator.binder.stage_cookie_for_test(
+                    domain,
+                    10_000 + u64::from(filler),
+                    0,
+                    Some(id),
+                );
+                ids.push(id);
+            }
+            let (binder, targets, recoveries, edges, instances, summaries) = row.members;
+            let heavy = stage_cutoff_caller(
+                &mut native,
+                5030,
+                binder,
+                targets,
+                recoveries,
+                edges,
+                instances,
+                summaries,
+            );
+            ids.push(heavy);
+            assert_eq!(
+                ids.iter().max(),
+                Some(&heavy),
+                "{}: the heavy caller sorts last",
+                row.name
+            );
+            native.scene.coordinator.registry_mut().publish();
+            native.scene.coordinator.note_rendered_callers(&ids);
+            // Pass 1: the fillers fold and the heavy caller folds
+            // exactly when it fits.
+            let retired = native
+                .scene
+                .coordinator
+                .retire_rendered_callers(300, None)
+                .retired;
+            assert_eq!(
+                retired,
+                u64::from(row.fillers) + if row.folds_pass1 { 1 } else { 0 },
+                "{}: pass 1 retires the fillers plus the heavy caller iff it fits",
+                row.name
+            );
+            assert_eq!(
+                native.scene.coordinator.adapter.record(heavy).is_none(),
+                row.folds_pass1,
+                "{}: the heavy row leaves exactly when it folds",
+                row.name
+            );
+            native.scene.coordinator.registry_mut().publish();
+            if row.folds_pass1 {
+                assert_eq!(
+                    native
+                        .scene
+                        .coordinator
+                        .fold_identity_insert_marks_for_test(),
+                    row.marks,
+                    "{}: the module identities land inside the member traversal",
+                    row.name
+                );
+            } else if row.gaps_pass2 > 0 {
+                // Data kept: every member waits live behind the
+                // deferral and nothing folds partially.
+                let bound = native.scene.coordinator.binder_bound_owners_for_test();
+                assert_eq!(
+                    bound.len(),
+                    binder as usize,
+                    "{}: every deferred sequence stays bound",
+                    row.name
+                );
+                assert!(
+                    bound.iter().all(|owner| *owner == heavy),
+                    "{}: no other row loses evidence to the deferral",
+                    row.name
+                );
+                assert_eq!(
+                    native.scene.coordinator.registry().edges_of(heavy).count(),
+                    edges as usize,
+                    "{}: every deferred edge stays live",
+                    row.name
+                );
+                assert_eq!(
+                    native
+                        .scene
+                        .coordinator
+                        .count_ownership
+                        .summary_count_for_test(heavy),
+                    summaries as usize,
+                    "{}: every deferred summary waits",
+                    row.name
+                );
+                let totals = native.scene.coordinator.registry().departed_totals();
+                assert_eq!(
+                    (totals.edges, totals.instances_folded),
+                    (0, 0),
+                    "{}: the deferral folds nothing",
+                    row.name
+                );
+            }
+            // Pass 2 without a re-note: a carried row retries on its
+            // kept carry. Deferred rows gap again (repeats count the
+            // run's deferrals); the credit waiter folds; folded rows
+            // stay folded.
+            let retired = native
+                .scene
+                .coordinator
+                .retire_rendered_callers(400, None)
+                .retired;
+            let expect_pass2 = if !row.folds_pass1 && row.gaps_pass2 == 0 {
+                1
+            } else {
+                0
+            };
+            assert_eq!(
+                retired, expect_pass2,
+                "{}: pass 2 folds only the credit waiter",
+                row.name
+            );
+            native.scene.coordinator.registry_mut().publish();
+            let registry = &native.scene.coordinator.registry;
+            let found = registry.gaps().iter().enumerate().find(|(_, gap)| {
+                gap.subject == FOLD_DEFERRED_OVERSIZED_SUBJECT && gap.caller == Some(heavy)
+            });
+            if row.gaps_pass2 > 0 {
+                let Some((index, gap)) = found else {
+                    panic!(
+                        "{}: the deferred caller gaps under its counted row: {:?}",
+                        row.name,
+                        native.gap_subjects()
+                    );
+                };
+                assert_eq!(
+                    gap.reason, FOLD_DEFERRED_OVERSIZED_REASON,
+                    "{}: the deferral names the kept data",
+                    row.name
+                );
+                assert_eq!(
+                    registry.gap_repeats()[index],
+                    row.gaps_pass2,
+                    "{}: repeats count the run's deferrals",
+                    row.name
+                );
+                assert!(
+                    native.scene.coordinator.adapter.record(heavy).is_some(),
+                    "{}: the deferred row stays live past two passes",
+                    row.name
+                );
+                assert_eq!(
+                    native
+                        .scene
+                        .coordinator
+                        .binder_bound_owners_for_test()
+                        .len(),
+                    binder as usize,
+                    "{}: every deferred sequence stays bound past two passes",
+                    row.name
+                );
+            } else {
+                assert!(
+                    found.is_none(),
+                    "{}: fitting and waiting callers gap nothing",
+                    row.name
+                );
+                if !row.folds_pass1 {
+                    assert!(
+                        native.scene.coordinator.adapter.record(heavy).is_none(),
+                        "{}: the credit waiter folds on pass 2",
+                        row.name
+                    );
+                }
+            }
+            assert_eq!(
+                native
+                    .scene
+                    .coordinator
+                    .fold_identity_insert_marks_for_test(),
+                row.marks,
+                "{}: no pass inserts identities outside the traversal",
+                row.name
+            );
+        }
     }
 
     /// Tombstone-occupancy fixture: fold seven callers with semantic

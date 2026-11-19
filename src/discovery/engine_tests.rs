@@ -1218,6 +1218,10 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
     let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
     overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
     assert!(pins.absorb(pins_b).is_empty());
+    // Strict-bind evidence: the synthetic entries use fake offsets no
+    // real ELF proves, so backfill function-start proof for the rebuild
+    // choke (which binds strictly); claim authority is unaffected.
+    pins.prove_scanned_entries_for_test(&[raw_a.clone(), raw_b.clone()]);
     let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_ne!(
@@ -1568,6 +1572,10 @@ fn claimless_rebuild_binds_carried_modules_without_claiming_them() {
     let mut pins_b = overlay_pins(&[(raw_b.key, OVERLAY_SHA, 2)]);
     overlay_reback(&mut pins_b, &overlay_backing_file(&dir, "b.so"));
     assert!(pins.absorb(pins_b).is_empty());
+    // Strict-bind evidence: the synthetic entries use fake offsets no
+    // real ELF proves, so backfill function-start proof for the rebuild
+    // choke (which binds strictly); claim authority is unaffected.
+    pins.prove_scanned_entries_for_test(&[raw_a.clone(), raw_b.clone()]);
     let (modules, skipped) = bind_scanned_modules(&[raw_a, raw_b], &mut pins);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_ne!(

@@ -166,16 +166,40 @@ fn ready_pid(ready_file: &Path) -> u32 {
 /// `--system` run emits hundreds of kilobytes of progress, which
 /// deadlocks a 64 KiB pipe nobody drains mid-run.
 fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Output, u64) {
-    spawn_with_peak_pumping(cmd, stderr_log, &mut || {})
+    spawn_with_peak_pumping(cmd, stderr_log, &mut || false)
+}
+
+/// Default for `P11SCOPE_TEST_TIME_SCALE`, matching the contract suite.
+const DEFAULT_TEST_TIME_SCALE: f64 = 5.0;
+
+/// A SLACK hang-guard bound in whole seconds: `base` scaled by
+/// `P11SCOPE_TEST_TIME_SCALE`. Use only where expiry can mean nothing but
+/// failure: the churn run stops on progress, so a healthy run never waits
+/// this out and only a stalled host approaches it.
+fn slack_secs(base: u64) -> u64 {
+    let scale = match std::env::var("P11SCOPE_TEST_TIME_SCALE") {
+        Ok(raw) if !raw.trim().is_empty() => raw.trim().parse::<f64>().unwrap_or(f64::NAN),
+        _ => DEFAULT_TEST_TIME_SCALE,
+    };
+    assert!(
+        scale.is_finite() && scale >= 1.0,
+        "P11SCOPE_TEST_TIME_SCALE must be a finite number >= 1"
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = (base as f64 * scale).ceil() as u64;
+    scaled
 }
 
 /// `spawn_with_peak` with a hook the churn test uses to tail the
 /// observer's event log while it runs. The hook must be infallible and
-/// cheap: it runs every 5 ms until the child exits.
+/// cheap: it runs every 5 ms until the child exits. It returns true once
+/// the run has reached the progress the test needs; the child then gets
+/// exactly one SIGTERM (its graceful stop path still writes every sink)
+/// and the loop keeps pumping and draining until it exits.
 fn spawn_with_peak_pumping(
     cmd: &mut Command,
     stderr_log: &Path,
-    pump: &mut dyn FnMut(),
+    pump: &mut dyn FnMut() -> bool,
 ) -> (std::process::Output, u64) {
     cmd.stderr(std::fs::File::create(stderr_log).unwrap());
     cmd.die_with_parent();
@@ -198,6 +222,11 @@ fn spawn_with_peak_pumping(
         bytes
     });
     let mut peak = 0u64;
+    // Latched: the observer ends its run on the first signal and exits at
+    // once on a second one, so progress may request the stop any number of
+    // times but the signal goes out exactly once. The pid cannot be reused
+    // here: the child is our live unreaped descendant until the wait below.
+    let mut stop_signalled = false;
     loop {
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
             for line in status.lines() {
@@ -211,7 +240,15 @@ fn spawn_with_peak_pumping(
                 }
             }
         }
-        pump();
+        if pump() && !stop_signalled {
+            stop_signalled = true;
+            // SAFETY: signalling our live child, whose pid stays ours until
+            // reaped; SIGTERM runs its graceful stop path, which still
+            // writes the report and event sinks.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
         match child.try_wait().unwrap() {
             Some(_) => break,
             None => std::thread::sleep(Duration::from_millis(5)),
@@ -884,6 +921,7 @@ struct ChurnCondition {
     birth_fired: bool,
     last_pass: Option<u64>,
     kill_admitting_pass: Option<u64>,
+    rotated: bool,
 }
 
 impl ChurnCondition {
@@ -917,6 +955,18 @@ impl ChurnCondition {
             Ok(file) => file,
             Err(_) => return,
         };
+        // Rotation tripwire: the run disables rotation (wide threshold), so
+        // a shrink below the consumed offset means the tail lost markers and
+        // must fail loudly below instead of evaluating guards on a partial
+        // stream. Nothing else truncates this file.
+        if file
+            .metadata()
+            .map(|meta| meta.len())
+            .is_ok_and(|len| len < self.offset)
+        {
+            self.rotated = true;
+            return;
+        }
         if file.seek(std::io::SeekFrom::Start(self.offset)).is_err() {
             return;
         }
@@ -965,6 +1015,23 @@ impl ChurnCondition {
                 }
             }
         }
+    }
+
+    /// Progress stop: the conditioned kill has fired, a later pass has
+    /// published past the admitting pass, and churn-C's birth is visible.
+    /// The run then ends on progress instead of the wall clock; the
+    /// `--duration` backstop only bounds a stalled observer. Waiting for
+    /// churn-C's ready file too keeps an early stop from racing its birth:
+    /// the birth trigger fired at the first pass, so by a later pass the
+    /// spawner has had a full pass to fork it, and any residual lag just
+    /// runs one more pass.
+    fn settled_for_stop(&self) -> bool {
+        self.killed
+            && self.churn_c.is_some()
+            && matches!(
+                (self.kill_admitting_pass, self.last_pass),
+                (Some(admitting), Some(last)) if last > admitting
+            )
     }
 
     fn handle_pass_marker(&mut self, payload: &Value) {
@@ -1050,13 +1117,27 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let scratch = trusted_scratch("inventory-churn-e2-events");
     let events = scratch.join("events.jsonl");
     let stderr_log = dir.join("stderr.log");
+    // The run ends on progress (the conditioned kill plus a later pass
+    // published past it), so the duration is a SLACK hang guard a healthy
+    // run never waits out, not the bound the settlement needs.
+    let hang = slack_secs(30);
+    let duration = format!("{hang}s");
     let mut cmd = Command::new("sh");
     cmd.arg(fixture_source("inventory-churn-observe.sh"))
         .arg("--system")
-        .args(["--json", "--duration", "14s", "--max-scan-pids", "4096"])
+        .args(["--json", "--duration"])
+        .arg(duration)
+        .args(["--max-scan-pids", "4096"])
         .args(system_capture_args())
         .arg("--event-log")
         .arg(&events)
+        // No rotation (wide threshold): the condition pump tails this file
+        // by byte offset while the run is live, and a rotation blinds it to
+        // every later marker; past the retained files the evidence is even
+        // deleted, which no pump could recover. Mid-run birth/kill triggers
+        // need the complete stream; rotation itself is covered by its
+        // dedicated cells.
+        .args(["--event-rotate-bytes", "1024M"])
         .env("INV_DRIVER", &driver)
         .env("INV_PROV", &prov)
         .env("INV_READY", &ready)
@@ -1082,8 +1163,12 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
+        rotated: false,
     };
-    let (output, peak) = spawn_with_peak_pumping(&mut cmd, &stderr_log, &mut || condition.pump());
+    let (output, peak) = spawn_with_peak_pumping(&mut cmd, &stderr_log, &mut || {
+        condition.pump();
+        condition.settled_for_stop()
+    });
     // Final tail: the last pass may have published between the final
     // pump tick and the child's exit.
     condition.pump();
@@ -1107,6 +1192,14 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     );
     assert!(output.stdout.is_empty());
     assert_stderr_honest(&stderr);
+    // The run disables rotation; a shrink means the tail lost markers and
+    // every guard below would evaluate a partial stream. This fires before
+    // the pid expects so rotation is diagnosed as rotation, not as a
+    // missing birth or a stuck guard.
+    assert!(
+        !condition.rotated,
+        "event log rotated mid-run; the offset tail cannot see rotated markers"
+    );
     let anchor_pid = condition.anchor.expect("helper readied the anchor");
     let churn_a_pid = condition.churn_a.expect("helper readied churn-A");
     let churn_b_pid = condition.churn_b.expect("helper readied churn-B");
@@ -1128,7 +1221,7 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
     let passes = doc["observation"]["passes"].as_u64().unwrap();
     assert!(
         passes >= 2,
-        "churn settlement needs an admitting pass plus a later pass observing the mid-run deaths; got {passes} published passes in 14s"
+        "churn settlement needs an admitting pass plus a later pass observing the mid-run deaths; got {passes} published passes (hang guard {hang}s)"
     );
     // Kill-cadence guard: the conditioned kill needs a pass AFTER the
     // admitting pass observing the deaths. `passes >= 2` alone does
@@ -1333,6 +1426,7 @@ fn churn_anchor_and_churners_settle_through_real_binary() {
 const GUARD_ANCHOR: u32 = 4_190_305;
 const GUARD_CHURN_A: u32 = 4_190_306;
 const GUARD_CHURN_B: u32 = 4_190_307;
+const GUARD_CHURN_C: u32 = 4_190_308;
 const GUARD_DRIVER: &str = "/nonexistent/churn-guard-driver";
 
 /// Scripted `ChurnCondition` over dead pids and a fake driver path: the
@@ -1365,6 +1459,7 @@ fn scripted_churn_condition(dir: &Path) -> ChurnCondition {
         birth_fired: false,
         last_pass: None,
         kill_admitting_pass: None,
+        rotated: false,
     }
 }
 
@@ -1425,6 +1520,78 @@ fn churn_kill_guard_records_admitting_pass_on_split_ticks() {
         condition.kill_admitting_pass,
         Some(0),
         "marker tick keeps the admitting pass"
+    );
+}
+
+#[test]
+fn churn_pump_trips_rotation_tripwire_on_shrink() {
+    // Twin: the live run disables rotation, so a file that shrinks below
+    // the consumed offset (rename replaced it with a shorter one) must
+    // latch `rotated` instead of silently evaluating a partial stream.
+    // Truncation stands in for the rename: the tripwire keys on the
+    // shrink, not the mechanism.
+    let dir = tmp("inventory-churn-guard-rotation");
+    let mut condition = scripted_churn_condition(&dir);
+    std::fs::write(
+        &condition.events,
+        format!(
+            "{}{}",
+            guard_admitted_line(GUARD_CHURN_A),
+            guard_pass_marker_line(0)
+        ),
+    )
+    .unwrap();
+    condition.pump();
+    assert!(condition.killed, "kill latch fires on churn-A admission");
+    assert!(!condition.rotated, "a growing stream trips nothing");
+    std::fs::write(&condition.events, guard_pass_marker_line(1)).unwrap();
+    condition.pump();
+    assert!(
+        condition.rotated,
+        "a shrink below the consumed offset latches rotated"
+    );
+    assert_eq!(
+        condition.last_pass,
+        Some(0),
+        "the post-shrink tick consumes nothing further"
+    );
+}
+
+#[test]
+fn churn_settled_for_stop_needs_kill_and_later_pass_and_birth() {
+    // Twin: the progress stop fires only when the kill has fired, a later
+    // pass published past the admitting pass, and churn-C's birth is
+    // visible. Each missing leg vetoes the stop on its own.
+    let dir = tmp("inventory-churn-guard-stop");
+    let mut condition = scripted_churn_condition(&dir);
+    condition.kill_admitting_pass = Some(0);
+    condition.last_pass = Some(1);
+    condition.churn_c = Some(GUARD_CHURN_C);
+    assert!(
+        !condition.settled_for_stop(),
+        "passes plus birth without the kill never stop"
+    );
+    condition.killed = true;
+    condition.last_pass = Some(0);
+    assert!(
+        !condition.settled_for_stop(),
+        "the kill without a later pass never stops"
+    );
+    condition.last_pass = Some(1);
+    condition.churn_c = None;
+    assert!(
+        !condition.settled_for_stop(),
+        "the kill plus a later pass without churn-C's birth never stops"
+    );
+    condition.churn_c = Some(GUARD_CHURN_C);
+    assert!(
+        condition.settled_for_stop(),
+        "kill plus later pass plus birth stop the run"
+    );
+    condition.kill_admitting_pass = None;
+    assert!(
+        !condition.settled_for_stop(),
+        "a kill without its admitting pass never stops"
     );
 }
 

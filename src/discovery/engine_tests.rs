@@ -95884,6 +95884,52 @@ fn mo_assert_live_owner(
     );
 }
 
+/// The exact fresh grant for one bound row: tables name the row's object
+/// once per table, targets pair each kept entry's object with its file
+/// offset, and pins append the module object plus each kept entry's
+/// object after the caller-supplied scan layer. A denied row files none
+/// of it, so every conjunct fails under a deny-all mutation.
+fn mo_assert_exact_row_claims(
+    pinned: &PinnedObjects,
+    module: &ReconciledModule,
+    scan_prefix: &[PinnedObjectId],
+    what: &str,
+) {
+    let view = module.scanned.view;
+    let claims = pinned
+        .view_claims(view)
+        .unwrap_or_else(|| panic!("the live view owns its row claims ({what})"));
+    assert_eq!(
+        claims.tables,
+        vec![module.object; module.scanned.tables.len()],
+        "the row grant names its object once per table ({what})"
+    );
+    let expected_targets: Vec<(PinnedObjectId, u64)> = module
+        .scanned
+        .tables
+        .iter()
+        .zip(&module.entry_objects)
+        .flat_map(|(table, ids)| {
+            table
+                .entries
+                .iter()
+                .zip(ids)
+                .map(|(entry, id)| (*id, entry.file_offset))
+        })
+        .collect();
+    assert_eq!(
+        claims.targets, expected_targets,
+        "the row grant pairs each kept entry with its offset ({what})"
+    );
+    let mut expected_pins = scan_prefix.to_vec();
+    expected_pins.push(module.object);
+    expected_pins.extend(module.entry_objects.iter().flatten().copied());
+    assert_eq!(
+        claims.pins, expected_pins,
+        "the row grant appends its pins after the scan layer ({what})"
+    );
+}
+
 /// A carried pin stays resolvable. A sole-carried pin reads as carried
 /// coverage; a live-co-owned pin is owned, never carried — the object
 /// predicate and the per-view retirement it must not stand in for.
@@ -97237,10 +97283,14 @@ fn merge_ownership_e7_selection_carried_provider_stays_claimless() {
 //     real entry with two fresh views (no committed input exists).
 //   E12 `inspect_system` aggregation (`bind_collection`): per-member
 //     fresh scans into a fresh aggregate, offline —
+//     `aimed_inventory_capture_admits_heuristic_module_first_come`
+//     drives a member-bearing collect through the bind (32 admitted
+//     endpoints), `bind_collection_populated_member_files_exact_derived_claims`
+//     asserts its exact derived claims, and
 //     `privileged_k1_no_route_collect_system_witness` (ignored
-//     privileged cell) drives a real member-bearing collect through the
-//     bind, and `staged_count_manifest_defers_to_the_next_pass` drives
-//     the real `bind_collection` entry unignored.
+//     privileged cell) drives a real member-bearing collect.
+//     `staged_count_manifest_defers_to_the_next_pass` drives the entry
+//     with zero members, so the module binder is not reached there.
 
 #[test]
 fn merge_ownership_e11_snapshot_binds_fresh_views_with_claims() {
@@ -97268,6 +97318,19 @@ fn merge_ownership_e11_snapshot_binds_fresh_views_with_claims() {
             pinned.view_claims(view).is_some(),
             "the fresh view owns its snapshot claims: {view:?}"
         );
+    }
+    // The fresh-entry grant itself, not just row availability: each bound
+    // row files its exact table object, its exact (object, offset)
+    // targets, and its pins after the one recorded scan pin (the scan pin
+    // names the row's own key and path, so it resolves to the same
+    // object). A deny-all mutation at the snapshot caller files none of
+    // this while both rows still reconcile.
+    for view in [ProcessViewId(11), ProcessViewId(12)] {
+        let module = modules
+            .iter()
+            .find(|module| module.scanned.view == view)
+            .unwrap_or_else(|| panic!("the fresh row bound: {view:?}"));
+        mo_assert_exact_row_claims(&pinned, module, &[module.object], "snapshot bind");
     }
 }
 
@@ -97919,7 +97982,12 @@ fn merge_ownership_entry_outcomes_follow_the_case_table() {
     // One executable case table over production entries × input shapes:
     // every entry commits its healthy input and refuses its
     // carried-riding input at the currency check (D2) — the refusal
-    // witnessed by the generation marker, never a silent no-op.
+    // witnessed by the generation marker, never a silent no-op. E5's
+    // healthy cell is the empty-scan control (the rescan runs — its
+    // memory-scan attempt is witnessed — and honestly commits nothing
+    // because the harness stages no found modules); the committing E5
+    // positive is `late_provider_loader_rescans_keep_stable_slots`,
+    // which rescans a real dlopen'd provider through the same entry.
     // E3/E8/E9 are named, not driven: E3's loader assembly is covered
     // at its build boundary by the E3 custody tests; E8 commits without
     // a generation check (`merge_ownership_e8_release_*` drive the real

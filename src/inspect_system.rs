@@ -8720,6 +8720,65 @@ int main(int argc, char **argv) {
         }
 
         #[test]
+        fn bind_collection_populated_member_files_exact_derived_claims() {
+            // E12 × authority-all, member-bearing: the populated
+            // collection binds its provider row through the real
+            // `bind_collection` entry and files the row's exact derived
+            // claims — its table object, its (object, offset) targets
+            // and its pins. The member pins carry no recorded
+            // ownership, so the grant stands alone with no scan layer.
+            // A deny-all mutation at the collection binder still
+            // reconciles the row while filing none of this.
+            let mut collection = over_cap(&[]);
+            collection.members[0].modules = vec![heuristic_provider(1, 32)];
+            let bound = bind_collection(&mut collection);
+            assert_eq!(
+                bound.reconciled.len(),
+                1,
+                "the member row reaches the module binder"
+            );
+            assert_eq!(
+                bound.unresolved.len(),
+                0,
+                "the member row binds without loss"
+            );
+            let (pid, view, module) = &bound.reconciled[0];
+            assert_eq!((*pid, *view), (10_000, ProcessViewId(0)));
+            let claims = bound
+                .aggregate
+                .view_claims(*view)
+                .unwrap_or_else(|| panic!("the member view owns its derived claims: {view:?}"));
+            assert_eq!(
+                claims.tables,
+                vec![module.object; module.scanned.tables.len()],
+                "the grant names its object once per table"
+            );
+            let expected_targets: Vec<(PinnedObjectId, u64)> = module
+                .scanned
+                .tables
+                .iter()
+                .zip(&module.entry_objects)
+                .flat_map(|(table, ids)| {
+                    table
+                        .entries
+                        .iter()
+                        .zip(ids)
+                        .map(|(entry, id)| (*id, entry.file_offset))
+                })
+                .collect();
+            assert_eq!(
+                claims.targets, expected_targets,
+                "the grant pairs each kept entry with its offset"
+            );
+            let mut expected_pins = vec![module.object];
+            expected_pins.extend(module.entry_objects.iter().flatten().copied());
+            assert_eq!(
+                claims.pins, expected_pins,
+                "the grant files its pins with no scan layer"
+            );
+        }
+
+        #[test]
         fn inspect_aimed_system_capture_admits_heuristic_prefix_first_come() {
             // `inspect --system` lowers under the Detailed policy with the
             // same aim rule the capture engine keeps: an aimed capture

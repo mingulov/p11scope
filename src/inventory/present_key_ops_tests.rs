@@ -1974,6 +1974,29 @@ fn key_ops_folded_instance_resolves_its_provider() {
     }
 }
 
+/// A module with folded instances past the bound names the dropped
+/// count on its verbose `departed use:` tail, beside the identities
+/// and mechanisms tails. (Per-module detail is verbose-only by
+/// position; concise returns above it.)
+#[test]
+fn departed_tail_names_folded_instances_past_the_bound() {
+    use crate::discovery::caller_registry::DepartedUse;
+    let mut presentation = key_ops_presentation(populated(3));
+    presentation.modules[0].departed_use = Some(DepartedUse {
+        callers: 2,
+        edges: 3,
+        entries: 5,
+        folded_instances_dropped: 7,
+        ..DepartedUse::default()
+    });
+    let text =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        text.contains("(+7 instances past the bound)"),
+        "the tail names the dropped instances:\n{text}"
+    );
+}
+
 /// Verbose instance labels are projection strings: controls escape
 /// like every other snapshot field, so one row can never forge a
 /// second output line.

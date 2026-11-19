@@ -4,7 +4,8 @@
 
 Status: binding model for the Mode-B merge-ownership repair. Base:
 `task/v080-modeb-bpf` at `55be66b9e`. All line anchors are at that
-revision unless a later commit is named.
+revision unless a later commit is named. The holdback, terminal-entry,
+and executable-matrix additions anchor at `3524d9e3a`.
 
 Three tier-2 review rounds found one blocker class: retired views
 regaining claims, and interface links surviving an address change
@@ -86,11 +87,17 @@ co-owner keeps its claims, the carried view keeps none, and the shared
 pin stays resolvable for both. Suppression is per-VIEW (retirement
 provenance), never per-OBJECT (claimed-ness of the pin).
 
-A new generation reusing an old numeric view id is a DIFFERENT view
-(LIVE), not a resurrection: id reuse is owned by the separate
-view-id-reuse lifecycle follow-up, which must clear carriedness on
-admission. Within one assembly this model assumes generation-unique
-view ids (deviation D1).
+A new generation reusing an old numeric view id would be a DIFFERENT
+view (LIVE), not a resurrection — but reuse while the previous
+generation's rows still ride is forbidden: recycled-ID holdback at
+allocation (`allocate_view_id_inner`, `engine.rs:15877`) keeps a
+numeric ID unavailable for admission while any committed carried row
+still uses it, so within one assembly a numeric view id names one
+generation (deviation D1, enforced). Held IDs stay on the free list
+and become available again on their own once the last carried row
+retires; with every free ID held, allocation mints fresh or defers at
+capacity exactly as on exhaustion. The Inventory allocator
+(`reserve_owner`) mints without recycling, so it needs no holdback.
 
 ## 3. Claim authority
 
@@ -214,6 +221,24 @@ binds/scans once. The test-only `live_candidate` (`:17824-17843`,
 `#[cfg(test)]`, zero production callers) keeps authority-all so unit
 harnesses bind freely; production coverage comes from E1–E9.
 
+### 7.1a Terminal rebind (E13)
+
+| # | Entry point | Merge? | Tick-fresh | Tick-retired | Carried input |
+| --- | --- | --- | --- | --- | --- |
+| E13 | terminal Finish rebind (`step_graph_rebind`, `engine.rs:35321`) | NO: rebinds the sealed raw copy of committed modules minus selection-retired (`graph_module_retained`) | {} | selection-retired (`pending_retirements`) | committed carried ride; the cursor files claims only for authorized views |
+
+E13's authority comes from the same constructor (§3) with no newcomers
+and no declined views at Finish:
+`ClaimAuthority::candidate(live, {}, {}, selection.retired)`. The
+cursor's three claim phases (`ClaimTables`/`ClaimModule`/`ClaimEntries`,
+`identity.rs:6935+`) file only for authorized views; denied rows still
+reconcile (their exact attached targets ride into the terminal plan)
+and still advance one table/entry per credit, so the bounded
+per-credit work is unchanged. Measure/grow/reset are untouched: they
+preserve pre-existing (manifest, pre-arm) ownership, never file. The
+terminal install then swaps the rebound pins/modules/plan into
+committed state exactly as before.
+
 ### 7.2 Binds without carry (fresh scans only — authority-all honest)
 
 - E10 `rebuild_discovered` (`engine.rs:11069`, bind `:11390`):
@@ -262,9 +287,13 @@ harnesses bind freely; production coverage comes from E1–E9.
 
 ## 8. Recorded deviations (NOT changed by this model)
 
-- D1 View-id reuse: a recycled numeric id aliasing a carried row is
-  owned by the view-id-reuse lifecycle follow-up (admission must clear
-  carriedness). This model assumes generation-unique ids per assembly.
+- D1 View-id reuse: ENFORCED by recycled-ID holdback (see §2). A
+  recycled numeric id can never alias a committed carried row within
+  one assembly: the id is unavailable for admission until its last
+  carried row retires. No per-row generation marking is needed while
+  the holdback stands; if the holdback is ever relaxed, the merge
+  (which matches on the numeric view id), the binder, and the scrub
+  must all become generation-qualified first.
 - D2 Previously-carried currency: newly retired views leave
   `candidate.views`; previously carried views still enter it (preserved
   fix3 behavior; the stale-refusal follow-up owns it). Ownership
@@ -290,3 +319,22 @@ One table-driven suite over entry points × invariants:
   predicted assert (RED-first, committed before the fix), and every
   case passes after. Shared-pin resurrection, cross-mapping linkage,
   and unlinked-row accumulation each have a dedicated failing assert.
+- Entry outcomes are executable from one case table
+  (`merge_ownership_entry_outcomes_follow_the_case_table`,
+  `engine_tests.rs:95178`): E1/E2/E4/E5/E6/E7 × {carried→refused at
+  the currency check with the generation marker witnessed,
+  healthy→committed with no refusal}. E7 runs through the production
+  selection entry with the session's scripted table read; E7 carried
+  inputs use real-file shared pins (overlay pins fabricate metadata
+  and trip the live assessment's `check_unchanged`). E3/E8/E9 are named
+  in the table (E3 build boundary, E8/E9 committing inventory-harness
+  tests). The terminal E13 gate has its cursor regression
+  (`scanned_rebind_cursor_denies_carried_views_but_reconciles_their_rows`,
+  `identity.rs:19019`); view-id holdback has its admission regression
+  (`merge_ownership_e1_reused_view_id_holds_while_carried_row_rides`,
+  `engine_tests.rs:93375`); E11 has its snapshot control
+  (`merge_ownership_e11_snapshot_binds_fresh_views_with_claims`,
+  `engine_tests.rs:94506`); E10/E12 name their real-entry controls in
+  the matrix comment. D2 refusal guards assert the currency-check
+  marker (`mo_generation_markers`), so an early return fails instead
+  of passing.

@@ -1581,9 +1581,10 @@ pub struct Evidence {
     /// Fresh mid-run admissions inside `pid_descendant_gaps`: members the
     /// capture admitted (and scanned) whose pre-admission life is still
     /// unobserved. Never above `pid_descendant_gaps`; the remainder
-    /// (exits, prune and finish sweeps, sentinels) was never observed.
-    /// Manually serialized beside the gap counts; never part of shares
-    /// or verdicts.
+    /// (exits, prune and finish sweeps, sentinels, removal-boundary
+    /// gaps, and the lifecycle floor) was never observed. Manually
+    /// serialized beside the gap counts; never part of shares or
+    /// verdicts.
     #[serde(skip)]
     pub pid_descendant_gaps_admitted: u64,
     /// Run-tree provider mappers the member-stop backstop held until
@@ -4687,8 +4688,10 @@ fn ring_unexplained(account: &Option<RingAccountEvidence>) -> u64 {
 /// benignly (covering the pause-exempt owned child), and the
 /// member-stop backstop held at least one provider mapper until
 /// attach with none resumed unattached and no learned-file row
-/// anywhere. The verdict and the JSON causes never fold, only the
-/// text rows.
+/// anywhere. The backstop proof is at-least-one per capture, not per
+/// counted load: the folded row's count rides `pause_partial` while
+/// proven holds are counted separately in `member_stop_attached`. The
+/// verdict and the JSON causes never fold, only the text rows.
 fn pause_loader_backstop_fold(ev: &Evidence) -> bool {
     if ev.pause_partial == 0 || ev.loader_discovery.complete() {
         return false;

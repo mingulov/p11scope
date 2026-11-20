@@ -524,12 +524,12 @@ Replays and further unremembered keys do not increment again.
 `pid_descendant_gaps_admitted` is the fresh mid-run admissions inside
 `pid_descendant_gaps`: members the capture admitted (and scanned) whose
 pre-admission life is still unobserved. Never above the total; the
-remainder (exits, prune and finish sweeps, sentinels) was never
-observed — members sighted in a walk but never scanned land in the
-remainder too. The text row splits the count (`<total> short-lived
-process gaps (<admitted> admitted/scanned, <rest> never observed)`);
-the total still gates the verdict, and the split never feeds shares,
-verdicts, or completeness.
+remainder (exits, prune and finish sweeps, sentinels, removal-boundary
+gaps, and the lifecycle floor) was never observed — members sighted in
+a walk but never scanned land in the remainder too. The text row splits
+the count (`<total> short-lived process gaps (<admitted>
+admitted/scanned, <rest> never observed)`); the total still gates the
+verdict, and the split never feeds shares, verdicts, or completeness.
 
 `member_stop_attached` counts run-tree provider mappers the member-stop
 backstop held until their probes attached; `member_stop_unattached`
@@ -541,7 +541,10 @@ unconfirmed hold's unproven timing, and no learned-file row exists,
 the text folds the partly-paused-load row and the unconfirmed
 loader-tracking row into one (`<n> load(s) held only by the member-stop
 backstop`); the verdict stays `PARTIAL` and JSON keeps both causes.
-The counts never feed shares, verdicts, or completeness.
+The backstop proof is at-least-one per capture, not per counted load:
+the row count rides `pause_partial` while proven holds are counted
+separately in `member_stop_attached`. The counts never feed shares,
+verdicts, or completeness.
 
 `gap_exe_hints` is present if and only if the capture armed extensive
 mode (`--track-short-lived`) over a `--cgroup`/`--system` scope;

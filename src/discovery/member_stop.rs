@@ -224,7 +224,9 @@ pub(crate) struct MemberStopStats {
 /// `attached` counts provider mappers held until their probes attached.
 /// `unattached` counts provider mappers resumed before attach — every
 /// one of which filed the named first-use row, so `unattached == 0`
-/// with `attached > 0` proves every stopped mapper attached. All
+/// with `attached > 0` proves every stopped mapper that reached a
+/// counted end during the window attached; end-release resumes are
+/// post-window by design and intentionally uncounted. All
 /// other ends are neutral here: provider-free releases, members that
 /// exited while held (they never ran unattached), proven non-members,
 /// still-stopped retries, cap overflows (whose staging files the row

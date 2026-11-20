@@ -1031,9 +1031,9 @@ pub struct Engine {
     exec_rearm_views: BTreeMap<ProcessViewId, Option<u64>>,
     pid_descendant_gaps: u64,
     /// Fresh mid-run admissions inside `pid_descendant_gaps`: the gap
-    /// sites for exits, prune and finish sweeps, sentinels and the
-    /// lifecycle floor never bump this. Read alongside the total; the
-    /// remainder was never observed.
+    /// sites for exits, prune and finish sweeps, sentinels,
+    /// removal-boundary gaps and the lifecycle floor never bump this.
+    /// Read alongside the total; the remainder was never observed.
     pid_descendant_gaps_admitted: u64,
     /// Handed-back run-tree survivors measured at run end. Run-lane only;
     /// annotation beside the paired `run process tree` skip, which carries

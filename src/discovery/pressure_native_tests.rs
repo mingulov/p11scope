@@ -4558,7 +4558,10 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         .find(|view| view.pid() == head_pid && view.still_the_same())
         .unwrap_or_else(|| panic!("{WHAT}: the admitted head holds a live view"));
     assert!(
-        engine.loader_registry.ids_for_view(head_view.id()).is_empty(),
+        engine
+            .loader_registry
+            .ids_for_view(head_view.id())
+            .is_empty(),
         "{WHAT}: the admitted head holds no loader context"
     );
     assert_eq!(

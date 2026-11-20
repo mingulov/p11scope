@@ -269,6 +269,9 @@ if name=='observer':
     rows=json.loads((root/'rows.json').read_text())[mode]
     for row in rows: os.write(9,(json.dumps(row)+'\n').encode())
     os.write(9,(json.dumps({'record':'probe-summary','pid':111,'records':len(rows),'write_failures':0,'overflow':False})+'\n').encode())
+    corrupt=os.environ.get('FAKE_PROBE_CORRUPT')
+    if corrupt=='nul': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}\x00trailing\n')
+    elif corrupt=='printable': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}trailing\n')
     texts=json.loads((root/'texts.json').read_text())
     sys.stdout.write(texts[mode]['text'])
     sys.exit(texts[mode]['rc'])
@@ -338,6 +341,8 @@ class JournalGateTests(unittest.TestCase):
             "timeout": [],
             "crash": rows,
             "refusal-515": [],
+            "refusal-515-loaded": rows,
+            "refused-noseal-loaded": rows,
         }))
         (self.work / "texts.json").write_text(json.dumps({
             "linked": {"rc": 0, "text": LINKED_TEXT},
@@ -420,6 +425,15 @@ class JournalGateTests(unittest.TestCase):
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object; broad inventory continues "
                 "with S1 mechanisms and API results\n"},
+            "refused-noseal-loaded": {"rc": 0, "text":
+                "p11scope: key operations unavailable: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"
+                "gap [key operations unavailable] "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
             "refused-hard": {"rc": 1, "text":
                 "p11scope: inventory --system: "
                 "journal-pair-unavailable-in-build: this build omits the "
@@ -438,6 +452,10 @@ class JournalGateTests(unittest.TestCase):
                 "p11scope: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness\n"},
+            "refusal-515-loaded": {"rc": 1, "text":
+                "p11scope: live capture unavailable: loading p11scope's BPF "
+                "programs is not supported on this host; run 'p11scope doctor' "
+                "for host readiness\n"},
         }))
         tool = self.bin / "tool"
         tool.write_text("#!" + sys.executable + "\n" + TOOL_SOURCE)
@@ -452,7 +470,7 @@ class JournalGateTests(unittest.TestCase):
         self.manifest.write_text('{"schema": "owned-test"}\n')
 
     def run_gate(self, *kernels, mode="linked", budgets=None, extra=None,
-                 object_name=None, key_sizes=None):
+                 object_name=None, key_sizes=None, expect_journal=None):
         out = self.work / "out"
         out.mkdir()
         env = {**os.environ,
@@ -470,6 +488,8 @@ class JournalGateTests(unittest.TestCase):
             command += ["--object", object_name]
         if key_sizes is not None:
             command += ["--key-sizes", key_sizes]
+        if expect_journal is not None:
+            command += ["--expect-journal", expect_journal]
         command += [str(self.bin / "observer"), str(self.probe),
                     str(self.manifest), str(out), *kernels]
         result = subprocess.run(command, capture_output=True, text=True,
@@ -1102,6 +1122,69 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "failed")
         self.assertIn("live-capture", row["detail"])
         self.assertIn("journal pair loaded", row["detail"])
+
+    def test_refusal_control_with_loaded_rows_fails(self):
+        # Pre-Multi valid loaded: the same finite refusal text and rc 1
+        # with the journal pair loaded fails naming the load.
+        result, out = self.run_gate(CONTROL_KERNEL,
+                                    mode="refusal-515-loaded")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("journal pair loaded", row["detail"])
+
+    def test_refusal_control_with_corrupt_probe_fails(self):
+        # Pre-Multi corrupt: loaded rows plus a malformed suffix must
+        # refuse qualification and preserve the confirmed load
+        # evidence, never qualify as no loads.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515-loaded",
+            extra={"FAKE_PROBE_CORRUPT": "nul"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertIn("journal pair loaded", row["detail"])
+
+    def test_omitted_build_refusal_passes(self):
+        # Omitted-build valid no-load: the exact finite refusal with
+        # rc 0, no journal loads and no crash qualifies.
+        result, out = self.run_gate(KERNEL, mode="refused-noseal",
+                                    expect_journal="0")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
+        self.assertIn("journal-pair-unavailable-in-build", row["detail"])
+        self.assertIn("no journal loads", row["detail"])
+
+    def test_omitted_build_with_loaded_rows_fails(self):
+        # Omitted-build valid loaded: the same refusal text and rc 0
+        # with the journal pair loaded fails naming the load.
+        result, out = self.run_gate(KERNEL, mode="refused-noseal-loaded",
+                                    expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("although the build omits the object", row["detail"])
+
+    def test_omitted_build_with_corrupt_probe_fails(self):
+        # Omitted-build corrupt: loaded rows plus printable trailing
+        # bytes must refuse qualification and preserve the confirmed
+        # load evidence, never qualify as no loads.
+        result, out = self.run_gate(
+            KERNEL, mode="refused-noseal-loaded",
+            extra={"FAKE_PROBE_CORRUPT": "printable"},
+            expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertIn("although the build omits the object", row["detail"])
 
     def test_observer_timeout_fails(self):
         result, out = self.run_gate(KERNEL, mode="timeout")

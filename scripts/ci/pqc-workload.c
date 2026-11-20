@@ -9,15 +9,19 @@
  * The user PIN comes from --pin, else $P11TEST_PIN, else the default
  * throwaway 1234.
  *
- * Sequence: write READY (the process exists so the observer can attach
- * and prearm the provider file), wait for the GO file, then dlopen the
- * provider and run every operation. No PKCS#11 call happens before GO,
- * so an observer started after READY sees the whole stream. --settle S
- * sleeps S seconds after login before the first operation, giving the
- * observer's semantic lane time to admit the freshly loaded provider.
- * Each set is generated once and used once (DSA: sign + verify; KEM:
- * encapsulate + decapsulate); keys are destroyed after use. Ground
- * truth, observed lengths and the exit verdict print on stdout:
+ * Sequence: dlopen the provider first (mapped, but zero PKCS#11 calls),
+ * write READY so the observer attaches to the already-mapped provider,
+ * wait for the GO file, then initialize and run every operation. No
+ * PKCS#11 call happens before GO, so an observer started after READY
+ * sees the whole stream; mapping before the observer is required (Joint
+ * births pre-existing processes attach-observed at the cut, and a
+ * provider that first maps after observer start loses entry capture —
+ * the prearm/late-dlopen gap). --settle S sleeps S seconds after login
+ * before the first operation, giving the observer's semantic lane time
+ * to admit the watched provider. Each set is generated once and used
+ * once (DSA: sign + verify; KEM: encapsulate + decapsulate); keys are
+ * destroyed after use. Ground truth, observed lengths and the exit
+ * verdict print on stdout:
  *
  *   GROUND_TRUTH mldsa_gen=3 mldsa_sign=3 mldsa_verify=3
  *                mlkem_gen=3 mlkem_enc=3 mlkem_dec=3
@@ -187,6 +191,9 @@ int main(int argc, char**argv){
   if(pace<0) pace=0;
   if(post_sleep<0) post_sleep=0;
   if(settle<0) settle=0;
+  void*h=dlopen(module,RTLD_NOW);
+  if(!h){fprintf(stderr,"dlopen %s: %s\n",module,dlerror()); return 1;}
+  printf("MAPPED %s\n",module); fflush(stdout);
   FILE*f=fopen(ready,"w"); if(f){fprintf(f,"%lu\n",(unsigned long)getpid()); fclose(f);}
   printf("READY %s waiting for %s\n",ready,go); fflush(stdout);
   for(int waited=0;waited<600;waited++){
@@ -195,8 +202,6 @@ int main(int argc, char**argv){
     if(waited==599){fprintf(stderr,"GO file never appeared: %s\n",go); return 1;}
   }
   printf("GO\n"); fflush(stdout);
-  void*h=dlopen(module,RTLD_NOW);
-  if(!h){fprintf(stderr,"dlopen %s: %s\n",module,dlerror()); return 1;}
   C_GetFunctionList_t g=(C_GetFunctionList_t)dlsym(h,"C_GetFunctionList");
   if(!g){fprintf(stderr,"no C_GetFunctionList\n"); return 1;}
   struct CK_FUNCTION_LIST*fl=NULL;

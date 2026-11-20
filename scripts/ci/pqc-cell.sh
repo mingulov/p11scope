@@ -105,10 +105,12 @@ echo "$rc" >"$OUT/build.exit"
 set -e
 [ "$rc" = 0 ] || { echo "pqc-cell: workload build failed (see build.log)" >&2; exit 2; }
 chmod a+rx "$OUT/pqc-workload" || exit 2
-# One leg: workload waits for GO with no provider loaded; the observer
-# starts with the kryoptic file prearmed; a sleeper releases GO after
-# the attach wait; the workload settles 10 s past login, runs the six
-# sets, and exits before the observer's duration ends.
+# One leg: the workload maps the provider, then waits for GO with zero
+# PKCS#11 calls made; the observer attaches to the already-mapped
+# provider (no prearm: a provider that first maps after observer start
+# loses entry capture, the prearm/late-dlopen gap); a sleeper releases
+# GO after the attach wait; the workload settles 10 s past login, runs
+# the six sets, and exits before the observer's duration ends.
 run_leg() {
   leg=$1; shift
   READY=$OUT/$leg.ready
@@ -140,11 +142,11 @@ run_leg() {
   SLEEPER=$!
   set +e
   if [ "$ROOTMODE" = yes ]; then
-    "$P" inventory --pid "$WPID" --duration 90 --key-operations "$@" --prearm-module "$PKCS11_MODULE" -v -o "$OUT/$leg.json" \
+    "$P" inventory --pid "$WPID" --duration 90 --key-operations "$@" -v -o "$OUT/$leg.json" \
       >"$OUT/$leg.verbose.txt" 2>"$OUT/$leg.stderr.log"
   else
     # shellcheck disable=SC2086
-    $OBS_SUDO "$P" inventory --pid "$WPID" --duration 90 --key-operations "$@" --prearm-module "$PKCS11_MODULE" -v -o "$OUT/$leg.json" \
+    $OBS_SUDO "$P" inventory --pid "$WPID" --duration 90 --key-operations "$@" -v -o "$OUT/$leg.json" \
       >"$OUT/$leg.verbose.txt" 2>"$OUT/$leg.stderr.log"
   fi
   rc=$?

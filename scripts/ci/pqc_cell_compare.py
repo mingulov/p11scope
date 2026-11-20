@@ -169,15 +169,25 @@ def check_key_rows(fail, leg, inv, sizes):
             fail.add(leg, f"unknown row {row!r}, want 6 not_applicable keygens")
 
 
+def gap_reasons(holders):
+    reasons = []
+    for gaps in holders:
+        rows = gaps.get("rows", []) if isinstance(gaps, dict) else gaps
+        for gap in rows or []:
+            if isinstance(gap, dict):
+                reasons.append(str(gap.get("reason", "")))
+            else:
+                reasons.append(str(gap))
+    return reasons
+
+
 def check_gaps(fail, leg, inv):
     holders = [inv.get("gaps", []),
                inv.get("object_observations", {}).get("gaps", [])]
-    for gaps in holders:
-        for gap in gaps:
-            reason = gap.get("reason", "")
-            if "before_semantic_boundary" in reason:
-                fail.add(leg, "before_semantic_boundary gap present: "
-                              "ops ran before attach")
+    for reason in gap_reasons(holders):
+        if "before_semantic_boundary" in reason:
+            fail.add(leg, "before_semantic_boundary gap present: "
+                          "ops ran before attach")
 
 
 def check_text(fail, leg, text_path, sizes):
@@ -206,17 +216,20 @@ def check_text(fail, leg, text_path, sizes):
 
 
 def judge_leg(fail, leg, args, sizes):
-    inv = load_inventory(fail, leg, args[f"{leg}_inventory"],
-                         int(args[f"{leg}_inventory_exit"]))
-    if inv is None:
-        return
-    check_mechanisms(fail, leg, inv)
-    check_key_rows(fail, leg, inv, sizes)
-    check_gaps(fail, leg, inv)
+    # A judge bug must fail loudly with results written, never as a bare
+    # traceback with no results file (the wrapper then reports only that
+    # the file is missing).
     try:
+        inv = load_inventory(fail, leg, args[f"{leg}_inventory"],
+                             int(args[f"{leg}_inventory_exit"]))
+        if inv is None:
+            return
+        check_mechanisms(fail, leg, inv)
+        check_key_rows(fail, leg, inv, sizes)
+        check_gaps(fail, leg, inv)
         check_text(fail, leg, args[f"{leg}_text"], sizes)
-    except OSError as exc:
-        fail.add(leg, f"text unreadable: {exc}")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        fail.add(leg, f"judge error: {exc!r}")
 
 
 def parse_args(argv):

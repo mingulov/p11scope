@@ -1638,6 +1638,8 @@ pub(crate) struct SemanticCapture {
     /// receipt was stale but current truth still names its
     /// instance): diagnostic only, counted under shared borrows.
     take_drift_tolerated: AtomicU64,
+    /// TEMPORARY take-trace sequence (debug commit, reverted).
+    take_debug_seq: AtomicU64,
     /// Partition refreshes a raced take requested, by
     /// (task cookie, exec id, file slot): the next tick re-observes
     /// these keys through the normal joined sweep, so the router
@@ -1755,6 +1757,7 @@ impl SemanticCapture {
             hook_misses: 0,
             miss_raises: 0,
             take_drift_tolerated: AtomicU64::new(0),
+            take_debug_seq: AtomicU64::new(0),
             refresh_interests: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             last_tick_scans_for_test: 0,
@@ -1892,6 +1895,14 @@ impl SemanticCapture {
     /// drift (diagnostic only).
     fn note_take_drift_tolerated(&self) {
         self.take_drift_tolerated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// TEMPORARY wall clock for the take trace (debug commit, reverted).
+    fn take_debug_wall() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
     }
 
     /// Request a partition refresh for a key whose take raced live
@@ -2156,6 +2167,7 @@ impl SemanticCapture {
     ) -> Result<bool, crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
         use crate::discovery::instances::BirthPartitionStanding;
+        let seq = self.take_debug_seq.fetch_add(1, Ordering::Relaxed);
         if candidate.capture != self.identity {
             return Err(Refusal::CaptureDrift);
         }
@@ -2178,7 +2190,25 @@ impl SemanticCapture {
         }
         let mut tolerated = false;
         let mut effective = receipt.epochs;
-        match self.birth_standing(receipt) {
+        let standing1 = self.birth_standing(receipt);
+        eprintln!(
+            "TAKEDBG seq={seq} t={:.3} retained={retained} site=standing1 rcpt=({},{},{},{},{}) standing={}",
+            Self::take_debug_wall(),
+            receipt.epochs.local,
+            receipt.epochs.global,
+            receipt.epochs.fault,
+            receipt.epochs.sticky,
+            receipt.epochs.record_flags,
+            match &standing1 {
+                BirthPartitionStanding::Current => "Current".to_string(),
+                BirthPartitionStanding::Continuous { epochs } => format!(
+                    "Continuous({},{},{})",
+                    epochs.local, epochs.global, epochs.fault
+                ),
+                BirthPartitionStanding::Broken => "Broken".to_string(),
+            }
+        );
+        match standing1 {
             BirthPartitionStanding::Current => {}
             BirthPartitionStanding::Continuous { epochs } if retained => {
                 tolerated = true;
@@ -2217,16 +2247,37 @@ impl SemanticCapture {
                 receipt.attachment_slot,
                 deadline,
             )
-            .map_err(|refusal| match refusal {
-                CurrentReceiptRefusal::Custody => Refusal::CustodyLost,
-                CurrentReceiptRefusal::Attachment => Refusal::AttachmentMismatch,
-                CurrentReceiptRefusal::Epoch => Refusal::EpochDrift,
-                CurrentReceiptRefusal::Deadline => Refusal::TakeDeadline,
-                // A failed native read stays unclassified: unknown,
-                // not negative. Domain, Partition and Stopped cannot
-                // come out of a receipt-state read.
-                _ => Refusal::CurrentPartition,
+            .map_err(|refusal| {
+                eprintln!(
+                    "TAKEDBG seq={seq} t={:.3} retained={retained} site=receipt_state_err kind={refusal:?}",
+                    Self::take_debug_wall(),
+                );
+                match refusal {
+                    CurrentReceiptRefusal::Custody => Refusal::CustodyLost,
+                    CurrentReceiptRefusal::Attachment => Refusal::AttachmentMismatch,
+                    CurrentReceiptRefusal::Epoch => Refusal::EpochDrift,
+                    CurrentReceiptRefusal::Deadline => Refusal::TakeDeadline,
+                    // A failed native read stays unclassified: unknown,
+                    // not negative. Domain, Partition and Stopped cannot
+                    // come out of a receipt-state read.
+                    _ => Refusal::CurrentPartition,
+                }
             })?;
+        eprintln!(
+            "TAKEDBG seq={seq} t={:.3} retained={retained} site=live live=({},{},{},{},{}) effective=({},{},{},{},{}) imgeq={}",
+            Self::take_debug_wall(),
+            state.epochs.local,
+            state.epochs.global,
+            state.epochs.fault,
+            state.epochs.sticky,
+            state.epochs.record_flags,
+            effective.local,
+            effective.global,
+            effective.fault,
+            effective.sticky,
+            effective.record_flags,
+            state.image == receipt.image,
+        );
         self.birth_health_with(io)?;
         if io.now() >= deadline {
             return Err(Refusal::TakeDeadline);
@@ -2250,6 +2301,10 @@ impl SemanticCapture {
             BirthPartitionStanding::Broken => return Err(Refusal::WitnessStale),
         };
         if moved {
+            eprintln!(
+                "TAKEDBG seq={seq} t={:.3} retained={retained} site=moved_race",
+                Self::take_debug_wall(),
+            );
             return Err(Refusal::EpochDrift);
         }
         if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
@@ -2261,6 +2316,10 @@ impl SemanticCapture {
         {
             return Err(Refusal::AttachmentMismatch);
         }
+        eprintln!(
+            "TAKEDBG seq={seq} t={:.3} retained={retained} site=ok tolerated={tolerated}",
+            Self::take_debug_wall(),
+        );
         Ok(tolerated)
     }
 
@@ -2434,6 +2493,19 @@ impl SemanticCapture {
             }
             Err(_) => return Err(Refusal::AbsenceHistory),
         };
+        eprintln!(
+            "BIRTHDBG t={:.3} image=({},{}) file={} kind={:?} rcpt=({},{},{},{},{})",
+            Self::take_debug_wall(),
+            candidate.receipt.image.task_cookie,
+            candidate.receipt.image.exec_id,
+            candidate.receipt.endpoint.file_slot,
+            receipt.birth(),
+            candidate.receipt.epochs.local,
+            candidate.receipt.epochs.global,
+            candidate.receipt.epochs.fault,
+            candidate.receipt.epochs.sticky,
+            candidate.receipt.epochs.record_flags,
+        );
         Ok(RetainedBirthWitness {
             candidate,
             admission,

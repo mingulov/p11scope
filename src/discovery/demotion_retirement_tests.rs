@@ -2664,6 +2664,159 @@ fn demotion_retirement_round4_noncompeting_module_keeps_ordinary_growth() {
     receipts.assert_bounded();
 }
 
+/// Mapping learned late, then a revision churns the epoch scan:
+/// the seed places, one flap runs the ownership sequence past the
+/// recovery's checkpoint, and growth addressed to the resolving scan
+/// must stage instead of gap-flushing. Fenced growth whose proof
+/// never completes still discloses (binder-proof domain); unfenced
+/// post-scan growth stages at the first same-carrier resolution and
+/// later revisions must neither double-stage nor re-gap it. (Live
+/// the whole window gaps and the edge freezes: the churned tags
+/// never match the resolving scan, so no fence ever sets.)
+#[test]
+fn demotion_retirement_late_mapping_stages_withheld_growth() {
+    let receipts = WorkReceipts::begin();
+    let (mut native, caller) = NativeScene::new();
+    native
+        .scene
+        .coordinator
+        .binder
+        .set_current_binding_clock(query_clock);
+    let a = native.scene.path.clone();
+    let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+    let pins = fx::pass_pins(&[(&a, "sha-a"), (&b, "sha-b")]);
+    let generation = crate::inspect_system::MemberGeneration {
+        start_time: Some(500),
+        exe: native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .unwrap()
+            .exe
+            .clone(),
+    };
+    let mut scene = Scene {
+        native,
+        caller,
+        a,
+        b,
+        pins,
+        generation,
+    };
+    let object = scene.native.scene.delta.endpoints[0].object.index();
+    let victim = &[(7, caller, 41)];
+    let mut admission = round4_noncompeting_b_catalog(&scene, 80);
+    admission.processes[0].complete_scan = None;
+    scene.apply(admission, 80);
+    scene.apply(members_catalog_paths(&scene, victim, &[&scene.a], 100), 100);
+    scene.native.answer(7, 500, 41);
+    let row = scene.native.row(41, 1, 7, 100, 0);
+    scene.native.witness(vec![row]);
+    scene.count(1);
+    assert_eq!(edge_count(&scene.native, caller, "a.so"), 1);
+    round4_finish_sole(&mut scene, "a.so");
+    let checkpoint = scene
+        .native
+        .scene
+        .coordinator
+        .recoveries
+        .values()
+        .next()
+        .map(|recovery| recovery.ordinary_checkpoint)
+        .unwrap();
+    // First flap stales the checkpoint; incomplete scans keep
+    // absences uncertain so the edge survives the Unknown phase.
+    let mut unmapped = members_catalog_paths(&scene, victim, &[], 200);
+    unmapped.processes[0].complete_scan = None;
+    scene.apply(unmapped, 200);
+    for _ in 0..128 {
+        let coordinator = &scene.native.scene.coordinator;
+        if !coordinator.count_ownership.deferred(caller, object)
+            && coordinator.count_ownership.sole(caller, object).is_none()
+        {
+            break;
+        }
+        round4_native_service(&mut scene);
+    }
+    scene.apply(members_catalog_paths(&scene, victim, &[&scene.a], 250), 250);
+    round4_finish_sole(&mut scene, "a.so");
+    let sequence = scene
+        .native
+        .scene
+        .coordinator
+        .count_ownership
+        .ordinary_view(caller, object)
+        .sequence;
+    assert_ne!(
+        sequence, checkpoint,
+        "flapping must stale the checkpoint for the wedge shape"
+    );
+    // Withheld growth absorbed (not yet reconciled) under the old
+    // epoch. Absorb without committing so no reconcile fences the
+    // reads against the stale scan first.
+    for (absolute, pre, post) in [(7, 500, 501), (12, 3000, 3001)] {
+        QUERY_CLOCK.with(|clock| clock.set(scene.native.stamps.tick()));
+        let NativeBatch::Witness(mut batch) =
+            scene.native.stamps.read(scene.native.domain, Vec::new())
+        else {
+            unreachable!()
+        };
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: scene.native.scene.delta.endpoints[0].object,
+            count: absolute,
+        }];
+        batch.counts_read_ns = pre;
+        batch.rows_read_ns = post;
+        scene.native.stage(NativeBatch::Witness(batch));
+    }
+    assert_eq!(edge_count(&scene.native, caller, "a.so"), 1);
+    let mut unmapped = members_catalog_paths(&scene, victim, &[], 2400);
+    unmapped.processes[0].complete_scan = None;
+    scene.apply(unmapped, 2400);
+    for _ in 0..128 {
+        let coordinator = &scene.native.scene.coordinator;
+        if !coordinator.count_ownership.deferred(caller, object)
+            && coordinator.count_ownership.sole(caller, object).is_none()
+        {
+            break;
+        }
+        round4_native_service(&mut scene);
+    }
+    scene.apply(
+        members_catalog_paths(&scene, victim, &[&scene.a], 2000),
+        2000,
+    );
+    round4_finish_sole(&mut scene, "a.so");
+    for _ in 0..64 {
+        scene.horizons();
+    }
+    assert_eq!(edge_count(&scene.native, caller, "a.so"), 6);
+    let gaps: Vec<String> = scene
+        .native
+        .scene
+        .coordinator
+        .registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED)
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert!(
+        gaps.iter().any(|reason| reason.contains("(1, 7]")),
+        "predating growth discloses, got: {gaps:?}"
+    );
+    assert!(
+        gaps.iter().all(|reason| !reason.contains("(1, 12]")),
+        "eligible growth must stage, not gap, got: {gaps:?}"
+    );
+    receipts.assert_bounded();
+}
+
 fn round4_queued_catalog(
     scene: &Scene,
     extras: &[PathBuf],

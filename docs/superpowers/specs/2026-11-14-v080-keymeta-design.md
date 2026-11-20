@@ -256,8 +256,21 @@ attributed completion.
 
 ### 4.2 Finite family sets (full-width equality, explicit members)
 
+> Amended 2026-11-20 (owner direction: Firefox post-quantum key
+> exchange is the demo): four NSS vendor ids are the deliberate
+> exception to the vendor-infers-nothing rule below —
+> `CKM_NSS_ML_KEM_KEY_PAIR_GEN` (`0xCE534380`) and
+> `CKM_NSS_KYBER_KEY_PAIR_GEN` (`0xCE53437D`) infer ML-KEM
+> family-only, `CKM_NSS_ML_KEM` (`0xCE534381`) infers ML-KEM with
+> the §5.2 length map, and
+> `CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN` (`0xCE53437F`)
+> infers EC family-only (see `src/keymeta.rs`
+> `NSS_VENDOR_KEYGEN_FAMILY_ONLY_IDS`). Every other vendor id
+> still infers nothing.
+
 Unlisted ids (including every vendor id `>= 0x8000_0000` and every
-NSS `CKM_NSS_*`) infer nothing. `_KEY_PAIR_GEN`/`_KEY_GEN`/
+NSS `CKM_NSS_*`, except the four amended ids above) infer nothing.
+`_KEY_PAIR_GEN`/`_KEY_GEN`/
 `_PARAMETER_GEN` ids infer nothing (creation families are covered by
 §6 templates, not by mechanism). The implementation lane expands
 these name lists to exhaustive `u64` const tables with a coverage

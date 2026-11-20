@@ -1799,9 +1799,15 @@ Limits that matter in pods:
   admission bound)` only then; on a rowless wrap or fresh-view
   unwrap it leaves no park and contributes no wrapped-size
   evidence to the subsequent row.
-  In v0.6.0 key-operation rows name only registered mechanisms: the
-  journal lane keeps withholding unregistered ids, which appear with
-  counts in the profile and trace mechanism tables instead.
+  Listed vendor mechanism ids publish by number in every lane: the
+  journal lane admits the same 53 listed vendor ids (NSS, CloudHSM,
+  YubiHSM, Luna) the profile and trace mechanism tables name, so a
+  vendor key-creation call such as NSS
+  `CKM_NSS_ML_KEM_KEY_PAIR_GEN` reaches the key-operation tables by
+  number and by name. Unlisted ids still withhold in the journal
+  lane (their occurrences count in the evidence totals) while the
+  profile and trace tables keep publishing them by number with
+  counts.
   Operations the observer cannot attribute with certainty are counted
   in named `not attributed` reasons instead of ending the view. A
   linked capture whose key-operation tracking never starts reads
@@ -1858,6 +1864,54 @@ Limits that matter in pods:
   usage entries only and count the `info_return_refused_hazard`
   gap. Inventory does not accept the
   `--allow-uretprobe-on-confined-target` override.
+
+  Post-quantum key exchange in Firefox: with a default Firefox
+  (hybrid TLS on, no preference changes) visiting a
+  post-quantum server, NSS vendor key creation and ML-KEM use show
+  up by number and by name (counts vary by run):
+
+  ```sh
+  p11scope inventory --pid "$firefox_pid" --manifest softoken.json --key-operations --key-sizes -v -o firefox-pqc.json
+  ```
+
+  ```text
+  key operations: 100 keys on 1 provider; rev 42 partial; 42 sessions
+    key proof refused; plain counts only (reason: proof_refused_fallback)
+    /usr/lib64/firefox/libsoftokn3.so: decapsulate 1 completed, 0 returned errors, 0 active operations (probably ML-KEM-768: 1) (i0)
+    unknown keys: generate_key_pair 7 completed, 0 returned errors, 0 active operations (not_applicable)
+    key row i0 object 16 decapsulate decapsulation_key (unknown): probably ML-KEM (from mechanism); ML-KEM-768 (from ciphertext length)
+    unknown key row generate_key_pair/not_applicable: CKM_NSS_ML_KEM_KEY_PAIR_GEN terminals=7
+  ```
+
+  `--json` carries the same rows: the decapsulate row infers
+  `ml_kem`/`ml_kem_768` from the standard mechanism id plus the
+  1088-octet ciphertext, while the unknown keygen row keeps the
+  vendor id by number (`3461563264` = `0xCE534380`,
+  `CKM_NSS_ML_KEM_KEY_PAIR_GEN`):
+
+  ```json
+  {"category": "decapsulate", "completed": 1, "object": 16,
+   "role": "decapsulation_key", "metadata_at_use": "unknown",
+   "inferred_family": {"status": "inferred", "value": "ml_kem",
+                       "completions": 1},
+   "inferred_size": {"status": "inferred",
+    "detail": {"kind": "pqc_set", "parameter_set": "ml_kem_768",
+               "evidence": "decapsulate_input", "octets": 1088},
+    "completions": 1}}
+  {"category": "generate_key_pair", "reason": "not_applicable",
+   "completed": 7, "mechanisms": [{"mechanism": 3461563264,
+                                   "terminals": 7}]}
+  ```
+
+  Inferred versus proven: the `probably ML-KEM` family and the
+  `ML-KEM-768` parameter set are inferences, labeled as such — the
+  key's type and parameter set were never established (proof
+  refused), so no proven `pqc keys` spotlight names this use. The
+  mechanism ids, names and counts are observed facts. Limits:
+  ML-DSA is absent because Firefox TLS offers no ML-DSA signature
+  schemes today, so a handshake needing one dies during
+  negotiation before any verification can be observed; NSS also
+  exposes no ML-DSA mechanisms to observe.
 
   The fixture PID and IDs vary by run. Mapping alone does not prove use;
   `At least N entries observed` counts entries, a lower bound, rather than

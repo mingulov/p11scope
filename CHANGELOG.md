@@ -65,6 +65,21 @@ versioned separately and are opaque, exact dispatch keys.
   readings are never captured; without a clean uretprobe-hazard
   safety assessment the run leaves usage entries only with a named
   gap. Versions 1–7 stay frozen.
+- NSS vendor post-quantum key exchange on `--key-operations` rows
+  (section version 9): the journal lane publishes the 53 listed
+  vendor mechanism ids by number (previously withheld), so Firefox
+  TLS key creation through `CKM_NSS_ML_KEM_KEY_PAIR_GEN`
+  (`0xCE534380`) reaches the tables by number and by name; the NSS
+  ML-KEM ids infer the ML-KEM family (the encapsulate/decapsulate
+  id also sizes parameter sets from ciphertext lengths, keygen ids
+  stay family-only), legacy Kyber keygen infers ML-KEM under its
+  own note, and the NSS ECDHE keygen id infers EC. Unknown-key rows
+  keep by-number terminal counts per observed mechanism id
+  (`mechanisms`, sorted, at most 8 per row, further ids refused
+  into the `unknown_mechanism_rows_refused` gap), with `-v`
+  per-row lines; mechanism-less terminals keep no entry and row
+  counters stay exact. Version 8 is taken by the separate Task 7
+  provider section; versions 1–7 stay frozen and byte-stable.
 
 ### Changed
 

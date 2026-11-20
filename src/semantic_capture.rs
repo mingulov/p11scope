@@ -1675,6 +1675,11 @@ pub(crate) struct SemanticCapture {
     /// stuck-transaction diagnostic only. Test-visible.
     #[cfg(test)]
     last_refusal_by_key_for_test: BTreeMap<(u64, u64, u32), ImageQueryRefusal>,
+    /// Entries visited by whole-table walks (pending-job prune and
+    /// the pin's prior-binding walk), for the budgeted cadence twins
+    /// only. Test-visible; production behavior never reads it.
+    #[cfg(test)]
+    walk_units_for_test: usize,
     /// First failed collected quantum's audit, latched for the
     /// stuck-transaction diagnostic only. Later (usually empty,
     /// healthy) quanta must not overwrite the failure that shed.
@@ -1784,6 +1789,8 @@ impl SemanticCapture {
             last_tick_refusals_for_test: Vec::new(),
             #[cfg(test)]
             last_refusal_by_key_for_test: BTreeMap::new(),
+            #[cfg(test)]
+            walk_units_for_test: 0,
             #[cfg(test)]
             first_failed_quantum_audit_for_test: None,
         })
@@ -3982,6 +3989,10 @@ impl SemanticCapture {
         )
     }
     fn prune_jobs(&mut self) {
+        #[cfg(test)]
+        {
+            self.walk_units_for_test += self.awaiting.len() + self.jobs.len();
+        }
         let keys: std::collections::BTreeSet<_> =
             self.awaiting.values().map(Self::pending_key).collect();
         self.jobs.retain(|job| keys.contains(&job.key()));
@@ -4178,6 +4189,10 @@ impl SemanticCapture {
             );
         }
         if accepted && !self.exhausted {
+            #[cfg(test)]
+            {
+                self.walk_units_for_test += self.bindings.len();
+            }
             let prior: Vec<_> = self
                 .bindings
                 .values()

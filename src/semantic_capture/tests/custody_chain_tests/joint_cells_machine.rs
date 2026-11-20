@@ -4782,6 +4782,7 @@ fn joint_audited_retry_preserves_refresh_on_exhausted_credit() {
     }
     let scans_before = scene.scene.real.h0.0.borrow().capture.take_refresh_scans();
     let io_before = scene.scene.real.h0.0.borrow().io.scan_results.len();
+    let leaves_before = scene.scene.real.h0.0.borrow().io.script.spy.leaves();
     for _ in 0..2 {
         let outcome = scene
             .service(1)
@@ -4810,6 +4811,11 @@ fn joint_audited_retry_preserves_refresh_on_exhausted_credit() {
             held.io.scan_results.len(),
             io_before,
             "exhausted credit does zero new I/O"
+        );
+        assert_eq!(
+            held.io.script.spy.leaves(),
+            leaves_before,
+            "exhausted credit reads no storage, health or custody"
         );
     }
     assert_eq!(phase_of(&scene), "Audited");
@@ -4895,6 +4901,7 @@ fn joint_audited_retry_preserves_refresh_on_past_deadline() {
     }
     let scans_before = scene.scene.real.h0.0.borrow().capture.take_refresh_scans();
     let io_before = scene.scene.real.h0.0.borrow().io.scan_results.len();
+    let leaves_before = scene.scene.real.h0.0.borrow().io.script.spy.leaves();
     let past = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .expect("a past service deadline");
@@ -4926,6 +4933,11 @@ fn joint_audited_retry_preserves_refresh_on_past_deadline() {
             held.io.scan_results.len(),
             io_before,
             "a past deadline does zero new I/O"
+        );
+        assert_eq!(
+            held.io.script.spy.leaves(),
+            leaves_before,
+            "a past deadline reads no storage, health or custody"
         );
     }
     assert_eq!(phase_of(&scene), "Audited");

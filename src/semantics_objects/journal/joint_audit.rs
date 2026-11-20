@@ -83,6 +83,10 @@ pub(crate) struct IngestedJointQuantum {
     // seal or delivery reads it.
     audit_fill: Option<u64>,
     raw_fill: Option<u64>,
+    // Bound while an original was still filling: some consumers carry a
+    // provisional all-key classification that the exact scope must
+    // reconcile before any seal or delivery reads a consumer.
+    provisional: bool,
     // A seal outcome whose failure waits on its own deferred rejection
     // (a seal-time audit void or key doom), with its prepaid storage.
     parked: Option<ParkedSeal>,
@@ -345,6 +349,12 @@ struct FrameConsumer {
     /// The last failure gap that streaked this consumer, for the
     /// park gap's named cause.
     last_stuck_gap: Option<super::JournalGap>,
+    /// This target's feed mode, for reconciling a provisional state.
+    mode: FeedMode,
+    /// Classified Pending only by a still-filling original's all-key
+    /// bound (no exact failure named it yet): reconciled once the
+    /// fills finish, with its binding checked if it stays positive.
+    provisional: bool,
 }
 struct ActiveSeal {
     consumer: usize,
@@ -828,6 +838,27 @@ fn lookup_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> {
         Err(_) => Some(0),
     }
 }
+/// The current-binding check a fresh positive seal needs: the target's
+/// caller still binds this exact key (caller, image and domain tag).
+fn check_positive_binding(
+    bindings: &crate::discovery::engine::inventory_coordinator::semantics::SemanticBindingSet,
+    target: &JointFeedTarget,
+) -> Result<(), RawQuantumRefusal> {
+    let binding = bindings
+        .get(target.caller())
+        .ok_or(RawQuantumRefusal::Admission)?;
+    let key = target.bootstrap().proof().key;
+    let image = binding.image();
+    if key.caller != binding.caller().0
+        || key.cookie != image.task_cookie
+        || key.exec != image.exec_id
+        || key.domain_tag != binding.domain().journal_tag()
+    {
+        return Err(RawQuantumRefusal::Admission);
+    }
+    Ok(())
+}
+
 /// Take the owner's pending ingest-break void: its failure, its prepaid
 /// lease and the bytes that lease paid.
 fn take_void(owner: &mut JointCaptureOwner) -> (Option<SealFailure>, Option<ResourceLease>, usize) {
@@ -966,6 +997,7 @@ impl IngestedJointQuantum {
             _void_storage: void_storage,
             audit_fill,
             raw_fill,
+            provisional: false,
             parked: None,
         };
         assert!(
@@ -1089,6 +1121,7 @@ impl IngestedJointQuantum {
             _void_storage: void_storage,
             audit_fill,
             raw_fill,
+            provisional: false,
             parked: None,
         };
         assert!(
@@ -1266,6 +1299,11 @@ impl IngestedJointQuantum {
     #[cfg(test)]
     pub(crate) fn audit_for_test(&self) -> &JournalAuditReceipt {
         &self.audit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn awaits_fill_for_test(&self) -> bool {
+        self.audit_fill.is_some() || self.raw_fill.is_some()
     }
 
     #[cfg(test)]
@@ -1839,18 +1877,7 @@ impl IngestedJointQuantum {
             {
                 continue;
             }
-            let binding = bindings
-                .get(target.caller())
-                .ok_or(RawQuantumRefusal::Admission)?;
-            let key = target.bootstrap().proof().key;
-            let image = binding.image();
-            if key.caller != binding.caller().0
-                || key.cookie != image.task_cookie
-                || key.exec != image.exec_id
-                || key.domain_tag != binding.domain().journal_tag()
-            {
-                return Err(RawQuantumRefusal::Admission);
-            }
+            check_positive_binding(bindings, &target)?;
         }
         let bytes = allocation_bytes::<FrameConsumer>(count).ok_or(RawQuantumRefusal::Capacity)?;
         let storage = owner
@@ -1868,8 +1895,13 @@ impl IngestedJointQuantum {
         {
             return Err(RawQuantumRefusal::Capacity);
         }
+        let mut provisional = false;
         consumers.extend(registry.joint_history_targets().map(|(target, mode)| {
             let affects = self.failure_affects(owner.adapter(), &target);
+            // Pending only under a still-filling original's all-key
+            // bound: the exact scope reconciles it after the fill.
+            let tentative = affects && !self.exactly_affects(&target);
+            provisional |= tentative;
             FrameConsumer {
                 target,
                 state: if mode == FeedMode::Joint || affects {
@@ -1881,6 +1913,8 @@ impl IngestedJointQuantum {
                 stuck_streak: 0,
                 parked: false,
                 last_stuck_gap: None,
+                mode,
+                provisional: tentative,
             }
         }));
         // One charged snapshot, no duplicate-domain hash table or queue.
@@ -1902,7 +1936,63 @@ impl IngestedJointQuantum {
             .unwrap_or(consumers.len());
         self.consumers = consumers;
         self.targets_storage = Some(storage);
+        self.provisional = provisional;
         self.bound = true;
+        Ok(())
+    }
+
+    /// Whether an original failure's exact (filled) scope names this
+    /// target, without a still-filling original's all-key bound.
+    fn exactly_affects(&self, target: &JointFeedTarget) -> bool {
+        let domain = target.bootstrap().domain();
+        self.original_failures()
+            .any(|failure| failure.affects_domain(domain))
+    }
+
+    /// Once every original has filled, settle each provisional consumer
+    /// against the exact scope exactly as binding would have: one the
+    /// filled failures name stays Pending for its negative; a disjoint
+    /// S1-only history becomes negative-only; a disjoint Joint history
+    /// stays positive and must hold its current binding (the check the
+    /// provisional bound waived). Nothing read or delivered a consumer
+    /// while the fills ran.
+    fn reconcile_provisional(
+        &mut self,
+        ports: &JointPublicationPorts<'_>,
+    ) -> Result<(), RawQuantumRefusal> {
+        if !self.provisional || self.audit_fill.is_some() || self.raw_fill.is_some() {
+            return Ok(());
+        }
+        let (_, _, bindings, _) = ports.read();
+        for index in 0..self.consumers.len() {
+            let consumer = &self.consumers[index];
+            if !consumer.provisional || self.exactly_affects(&consumer.target) {
+                continue;
+            }
+            if consumer.mode == FeedMode::Joint {
+                check_positive_binding(bindings, &consumer.target)?;
+            }
+        }
+        for index in 0..self.consumers.len() {
+            if !self.consumers[index].provisional {
+                continue;
+            }
+            self.consumers[index].provisional = false;
+            let target = self.consumers[index].target;
+            if self.consumers[index].mode != FeedMode::Joint
+                && !self.exactly_affects(&target)
+                && self.consumers[index].state == ConsumerState::Pending
+            {
+                self.consumers[index].state = ConsumerState::NegativeOnly;
+                self.pending -= 1;
+            }
+        }
+        self.provisional = false;
+        self.cursor = self
+            .consumers
+            .iter()
+            .position(|consumer| consumer.state == ConsumerState::Pending)
+            .unwrap_or(self.consumers.len());
         Ok(())
     }
 
@@ -2042,6 +2132,7 @@ impl IngestedJointQuantum {
             if !self.complete_rejections(adapter, model, remaining) {
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
+            self.reconcile_provisional(ports)?;
             if let Some(parked) = self.parked.take() {
                 return Ok(self.settle_outcome(
                     ports,
@@ -2078,6 +2169,11 @@ impl IngestedJointQuantum {
         if let FrameIngress::Disposed(reason) = self.ingress {
             let _ = reason; // Retain the original reason, never positive authority.
             return Ok(QuantumSealProgress::DeliveryReady);
+        }
+        // Only a Joint history seals positively: an S1-only consumer is
+        // Pending solely for a failure that names it (served above).
+        if self.consumers[index].mode != FeedMode::Joint || self.consumers[index].provisional {
+            return Err(RawQuantumRefusal::DispositionMismatch);
         }
         // An unrelated raw-only image negative does not replace the actual
         // clean collection audit for this disjoint selected Joint target.
@@ -2265,6 +2361,7 @@ impl IngestedJointQuantum {
                 diagnosis.note_other();
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
+            self.reconcile_provisional(ports)?;
             if let Some(parked) = self.parked.take() {
                 diagnosis.note_other();
                 return Ok(self.settle_outcome(

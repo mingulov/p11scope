@@ -16794,6 +16794,524 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn seal_chain_plus_discard_voids_with_discard() {
+        // Mixed chain + discard: a between-collection fault move must not
+        // absorb across a reader-consumed discard. The discard is lost
+        // history with its own named gap and fence; the absorb must deny
+        // and the seal must void with Discarded (never Ok).
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        assert_eq!(scene.adapter.last_fault, Some(7));
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        reaudit.discarded_delta = 1;
+        let failure = scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("chain plus discard must not absorb");
+        assert_eq!(failure.gap, JournalGap::Discarded);
+        assert!(failure.fence.is_some(), "the discard void fences");
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 1, "the discard voids");
+        assert_eq!(after.audit_discarded, 1, "the named discard bucket counts");
+        assert_eq!(
+            after.audit_fault_absorbed_chain, 0,
+            "no chain absorb across a discard"
+        );
+        assert_eq!(
+            after.audit_fault_absorbed_reread, 0,
+            "no reread absorb across a discard"
+        );
+    }
+
+    #[test]
+    fn seal_chain_plus_malformed_voids_with_malformed() {
+        // Mixed chain + malformed: like the discard twin above, a
+        // malformed record denies the chain absorb and voids with its
+        // own named gap.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        reaudit.malformed_delta = 1;
+        let failure = scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("chain plus malformed must not absorb");
+        assert_eq!(failure.gap, JournalGap::Malformed);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 1);
+        assert_eq!(after.audit_malformed, 1);
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn seal_chain_plus_counter_voids_with_counter() {
+        // Mixed chain + counter: an unprovable counter denies the chain
+        // absorb and voids with CounterUnprovable.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        reaudit.counter_error = true;
+        let failure = scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("chain plus counter must not absorb");
+        assert_eq!(failure.gap, JournalGap::CounterUnprovable);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 1);
+        assert_eq!(after.audit_counter_unprovable, 1);
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn seal_reread_plus_h3_loss_voids_with_h3_loss() {
+        // Mixed reread + H3 loss: a seal-time fault move must not absorb
+        // across lost H3 history. The loss voids with H3Loss, fences at
+        // the consumed watermark and acknowledges H0 below it.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.h0_below = 8;
+        reaudit.h3 = H3DispositionEvidence::scripted_loss(7);
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("reread plus H3 loss must not absorb");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert!(failure.fence.is_some(), "the H3 loss void fences");
+        assert_eq!(
+            failure.h3_voided,
+            Some(8),
+            "the void acknowledges H0 below the watermark"
+        );
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 1);
+        assert_eq!(after.audit_h3_loss, 1);
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn seal_reread_plus_h3_pending_refuses_without_void() {
+        // Mixed reread + H3 pending: undisposed H3 history denies the
+        // reread absorb and refuses with H3Pending (no void, no fence).
+        // The frame keeps its staged custody: a clean retry seals the
+        // same inputs, proving the first attempt converted nothing.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.h0_below = 8;
+        reaudit.h3 = H3DispositionEvidence::scripted_clean_pending(3, Some(4));
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("reread plus H3 pending must not absorb");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        assert_eq!(failure.fence, None, "pending fences nothing");
+        assert!(
+            scene.adapter.last_audit_failure.is_some(),
+            "audit-level pending trips the absence chain (domain-level would not)"
+        );
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "pending voids nothing");
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+        // Custody retained: the same frontier seals once H3 disposes.
+        let clean = scene.audit();
+        scene
+            .seal_explicit(
+                &clean,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect("kept inputs seal after H3 disposes");
+    }
+
+    #[test]
+    fn seal_reread_plus_h3_exhausted_stops() {
+        // Mixed reread + H3 exhaustion: a dead H0 allocator denies the
+        // absorb and stops the adapter (no future history certifies).
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.h3 = H3DispositionEvidence::scripted_exhausted();
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("reread plus exhaustion must not absorb");
+        assert_eq!(failure.gap, JournalGap::H3Exhausted);
+        assert!(scene.adapter.stopped, "exhaustion stops the adapter");
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn seal_reread_plus_resource_voids_with_resource() {
+        // Mixed reread + resource refusal: the refused collection denies
+        // the absorb and voids with ResourceUnavailable.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.resource_refused = true;
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("reread plus resource must not absorb");
+        assert_eq!(failure.gap, JournalGap::ResourceUnavailable);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 1);
+        assert_eq!(after.audit_resource_unavailable, 1);
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn seal_reread_plus_closure_refuses_without_void() {
+        // Mixed reread + stale closure: a replaced endpoint set denies
+        // the absorb and refuses with ClosureStale (no void).
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.closure_generation = reaudit.closure_generation.wrapping_add(1);
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect_err("reread plus stale closure must not absorb");
+        assert_eq!(failure.gap, JournalGap::ClosureStale);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "stale closure voids nothing");
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn seal_chain_plus_saturation_stops_with_saturated() {
+        // Chain-before-saturation priority: a between-collection move
+        // must not shadow a broken seal-time reader. The saturation
+        // stops the adapter with FaultSaturated (never FaultChanged,
+        // never Ok).
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        let saturated = ScriptedFaultCell::steady(u64::from(u32::MAX) + 1);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &saturated,
+            )
+            .expect_err("chain plus saturation must stop");
+        assert_eq!(failure.gap, JournalGap::FaultSaturated);
+        assert!(
+            scene.adapter.stopped,
+            "saturation stops even with a moved chain"
+        );
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+    }
+
+    #[test]
+    fn void_wiped_wrong_descriptor_end_taints() {
+        // Mismatched late END after a global void wipe: the release
+        // excuses the missing BEGIN (loss of model continuity), never a
+        // contradicting function. A separately valid END for another
+        // descriptor is independent mismatch evidence and must taint
+        // with EndBeginMismatch, like the retained-BEGIN path does.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let foreign = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&foreign, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch),
+            "a wrong-descriptor END after a wipe must contradict, not dispose"
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "the function mismatch must taint the image"
+        );
+        let diagnosis = scene.adapter.contradiction_diagnosis();
+        assert_eq!(
+            diagnosis.end_begin_mismatch, 1,
+            "the mismatch counts its own telemetry"
+        );
+        assert_eq!(
+            diagnosis.terminal_before_begin, 0,
+            "no TerminalBeforeBegin excuse for a mismatching END"
+        );
+    }
+
+    #[test]
+    fn scoped_wipe_wrong_descriptor_end_taints() {
+        // Scoped twin of the global wrong-descriptor twin above: a
+        // watchdog-scoped wipe releases the BEGIN the same way, so a
+        // wrong-descriptor late END must still taint.
+        use super::joint_driver::JointVoidScope;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let sign = function_id("C_Sign");
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, sign, 0);
+        let proof = harness.attest();
+        harness.ingest(&begin);
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(harness.owner.void_ingest_break(), Ok(true));
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped)
+        );
+        let foreign = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&foreign, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        assert_eq!(
+            harness.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch),
+            "a wrong-descriptor END after a scoped wipe must contradict"
+        );
+        assert!(
+            harness.owner.adapter().image_refused((COOKIE, EXEC)),
+            "the scoped mismatch must taint the image"
+        );
+    }
+
+    #[test]
     fn audit_void_gaps_cover_every_void_arm_gap_in_order() {
         // The drain's gap order is load-bearing: it drives disclosure
         // and parallels the coordinator baseline. It must name exactly

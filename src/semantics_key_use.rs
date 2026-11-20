@@ -4499,7 +4499,10 @@ impl FeedDisposalCursor {
                 debug_assert!(self.assoc_queue.is_empty());
                 debug_assert!(self.assoc_release.is_none());
                 let preserved = self.preserved.take().expect("joint finalizes once");
-                let _throwaway = self.throwaway.take().expect("joint finalizes once");
+                // The throwaway stays (resourceless, drained: drop timing
+                // is unobservable) so post-finalize read accounting keeps
+                // its counter; the cursor drop frees it with the void.
+                assert!(self.throwaway.is_some(), "joint finalizes once");
                 keyuse.absorb_preserved(preserved);
                 self.finalized = true;
                 return true;

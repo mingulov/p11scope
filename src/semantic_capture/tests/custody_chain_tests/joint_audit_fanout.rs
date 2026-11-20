@@ -30172,16 +30172,22 @@ fn assert_original_replay_partition(seal: &crate::semantics_objects::journal::Se
         assert_eq!(borrowed.as_ptr(), original.as_ptr(), "no cloned facts");
         if matches!(
             step.phase(),
-            SealReplayPhase::Begin | SealReplayPhase::End | SealReplayPhase::BoundedLoss
+            SealReplayPhase::Begin
+                | SealReplayPhase::End
+                | SealReplayPhase::BoundedLoss
+                | SealReplayPhase::CallLoss
         ) {
             let call = seal
                 .prefix
                 .call_for_step(step)
                 .expect("original call index");
             assert!(seal.prefix.replay_calls().contains(call));
-            if step.phase() == SealReplayPhase::BoundedLoss {
+            if matches!(
+                step.phase(),
+                SealReplayPhase::BoundedLoss | SealReplayPhase::CallLoss
+            ) {
                 assert!(call.abandoned && call.end_cut.is_none());
-                assert!(step.cut().is_some(), "actual corroborated loss bound");
+                assert!(step.cut().is_some(), "actual loss subject cut");
             } else {
                 assert_eq!(
                     step.cut(),
@@ -31120,9 +31126,7 @@ fn stage_neutral_abandonment(
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let (target, pid) = fixture.replay_target();
     let proof = target.bootstrap().proof();
-    let (open, ordinary) = fixture
-        .scene
-        .encoded_with_rv(pid, 0, "C_SignUpdate", 2, rv);
+    let (open, ordinary) = fixture.scene.encoded_with_rv(pid, 0, "C_SignUpdate", 2, rv);
     let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
     let image = fixture
         .scene
@@ -31206,6 +31210,10 @@ fn joint_neutral_abandonment_loss_reaches_terminal_on_frame() {
             .iter()
             .find(|step| step.effect_range().contains(&lost[0]))
             .expect("an original replay step owns the per-call loss effect");
+        assert_eq!(
+            owner.phase(),
+            crate::semantics_objects::journal::SealReplayPhase::CallLoss
+        );
         let call = seal
             .prefix
             .call_for_step(owner)

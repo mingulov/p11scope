@@ -1423,6 +1423,12 @@ struct OpenEntry {
     end: Option<StagedEnd>,
     abandon: Option<StagedAbandon>,
     corroborated_return: Option<u64>,
+    /// The return value the call's observed return reported: the
+    /// corroborating ordinary CALL, or the admitted claim at conversion
+    /// (the claim leaves the store there). Evidence an abandonment's
+    /// per-call disposal must not erase (see
+    /// [`JournalAdapter::abandonment_disposes_here`]).
+    returned_rv: Option<u64>,
     converted_ticket: Option<CallToken>,
     converted_for: Option<JournalDomainKey>,
     end_converted: bool,
@@ -2694,6 +2700,7 @@ impl JournalAdapter {
                 end: None,
                 abandon: None,
                 corroborated_return: None,
+                returned_rv: None,
                 converted_ticket: None,
                 converted_for: None,
                 end_converted: false,
@@ -2967,10 +2974,9 @@ impl JournalAdapter {
             return JournalDisposition::Contradiction(JournalContradiction::AmbiguousReturn);
         }
         if let Some((key, _, _)) = matches.first() {
-            self.open
-                .get_mut(key)
-                .expect("matched open entry")
-                .corroborated_return = Some(ordinal);
+            let entry = self.open.get_mut(key).expect("matched open entry");
+            entry.corroborated_return = Some(ordinal);
+            entry.returned_rv = Some(event.rv);
             return JournalDisposition::ReturnObserved;
         }
         if let Some(index) = refused_matches.first() {
@@ -6215,12 +6221,8 @@ impl JournalAdapter {
         {
             return false;
         }
-        if !matches!(
-            super::state::return_class(entry.function, admitted.s1_facts().rv, false),
-            super::state::Outcome::Ok
-                | super::state::Outcome::Partial
-                | super::state::Outcome::Failed
-        ) {
+        if !super::state::return_leaves_no_lifecycle_effect(entry.function, admitted.s1_facts().rv)
+        {
             return false;
         }
         let (_, image, _, _) = admitted.journal_binding();
@@ -7725,7 +7727,7 @@ impl JournalAdapter {
             }) {
                 continue;
             }
-            if abandonment_disposes_per_call(entry.function) {
+            if self.abandonment_disposes_here(entry) {
                 // Effect-free abandonments carry no continuing
                 // object effects: the void fence suffices, so the
                 // wipe preserves no doom and taints no image for
@@ -8120,6 +8122,35 @@ impl JournalAdapter {
         entry: &OpenEntry,
     ) -> bool {
         self.converts_here(key, live, entry) || entry.converted_for == Some(key)
+    }
+
+    /// The single per-call disposal rule for one staged unbounded
+    /// abandonment (seal partition, batch and sliced preservation, scoped
+    /// wipe). The function must be effect-free
+    /// ([`abandonment_disposes_per_call`]) AND no return evidence already
+    /// observed for this exact invocation may carry negative authority:
+    /// the corroborating ordinary CALL, the converted claim and every
+    /// still-queued admitted claim for its identity must each leave no
+    /// lifecycle effect ([`super::state::return_leaves_no_lifecycle_effect`]).
+    /// A read that already reported an invalid session or handle, or
+    /// `CKR_CRYPTOKI_NOT_INITIALIZED`, proved something its disposal would
+    /// erase, so it keeps the whole-key doom (fail closed). A genuinely
+    /// missing return disposes.
+    fn abandonment_disposes_here(&self, entry: &OpenEntry) -> bool {
+        if !abandonment_disposes_per_call(entry.function) {
+            return false;
+        }
+        let neutral = |rv: u64| super::state::return_leaves_no_lifecycle_effect(entry.function, rv);
+        entry.returned_rv.is_none_or(neutral)
+            && self
+                .claims
+                .get(&identity_of_begin(&entry.begin))
+                .is_none_or(|claimants| {
+                    claimants
+                        .values()
+                        .flat_map(|claims| claims.iter())
+                        .all(|claim| neutral(claim.rv))
+                })
     }
 
     /// Whether a birth cut covers all retained staged history for one
@@ -8531,7 +8562,7 @@ impl JournalAdapter {
                 // their late terminals expected-absent (see the
                 // wipe filter); this decide-only pass just skips
                 // them.
-                if !unbounded || abandonment_disposes_per_call(entry.function) {
+                if !unbounded || self.abandonment_disposes_here(entry) {
                     return None;
                 }
                 Some((entry.image, shape_of_entry(entry)))
@@ -9079,7 +9110,7 @@ impl JournalAdapter {
             let abandoned_disposable = entry.abandon.is_some_and(|staged| {
                 abandon_disposition(staged.abandon.reason())
                     == Some(AbandonDisposition::UnboundedInvalidation)
-            }) && abandonment_disposes_per_call(entry.function);
+            }) && self.abandonment_disposes_here(&entry);
             if entry.end.is_none()
                 && !entry.begin.no_end()
                 && entry.corroborated_return.is_none()
@@ -9302,14 +9333,17 @@ impl JournalAdapter {
         // never prune silently. A sibling's abandonment belongs to
         // its own seal; unclaimed shapes barriered before conversion.
         //
-        // Effect-free (neutral S1 or pure-read object)
-        // abandonments dispose per-call instead: they apply no
-        // object effect and carry no interference, so each names
-        // its own loss gap while the key keeps sealing its other
-        // calls. One non-effect-free abandonment still dooms the
-        // whole key (fail closed).
+        // Effect-free abandonments whose observed return evidence is
+        // itself neutral dispose per-call instead
+        // ([`Self::abandonment_disposes_here`]): each names its own loss
+        // gap while the key keeps sealing its other calls. One other
+        // abandonment still dooms the whole key (fail closed). This pass
+        // only classifies: nothing is removed, released or consumed
+        // before invocation-claim validation below, and the disposal
+        // itself runs inside conversion, where the replay builder gives
+        // its effects and its exact call an original terminal step.
         let mut dooming = false;
-        let mut disposable: Vec<JournalNativeKey> = Vec::new();
+        let mut disposable: BTreeSet<JournalNativeKey> = BTreeSet::new();
         for (native, entry) in &self.open {
             if !self.abandons_here(key, &live, entry)
                 || entry.begin_ordinal > frontier
@@ -9321,8 +9355,8 @@ impl JournalAdapter {
             {
                 continue;
             }
-            if abandonment_disposes_per_call(entry.function) {
-                disposable.push(*native);
+            if self.abandonment_disposes_here(entry) {
+                disposable.insert(*native);
             } else {
                 dooming = true;
                 break;
@@ -9330,48 +9364,6 @@ impl JournalAdapter {
         }
         if dooming {
             return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
-        }
-        // Per-call disposal for effect-free abandonments: the
-        // model releases each ticket first (fail closed on
-        // disagreement), then adapter staging drops with expected
-        // absences for late terminals. The key stays live and the
-        // seal continues below; the disposal gaps join the seal's
-        // effects.
-        let mut disposed = ObjectEffects::default();
-        if !disposable.is_empty() {
-            let mut tickets: Vec<(JournalNativeKey, Option<CallToken>)> = Vec::new();
-            for native in &disposable {
-                tickets.push((
-                    *native,
-                    self.open
-                        .get(native)
-                        .expect("partitioned abandonment")
-                        .converted_ticket,
-                ));
-            }
-            let mut agreed = true;
-            for (_, ticket) in &tickets {
-                match model.dispose_abandoned_per_call(*ticket, &mut self.ledger) {
-                    Some(effects) => disposed.effects.extend(effects.effects),
-                    None => {
-                        agreed = false;
-                        break;
-                    }
-                }
-            }
-            if !agreed {
-                return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
-            }
-            for (native, _) in &tickets {
-                let entry = *self.open.get(native).expect("disposed abandonment");
-                self.note_derived_absence(entry.image, *native, entry.function);
-                if entry.converted_ticket.is_none() {
-                    let identity = identity_of_begin(&entry.begin);
-                    let _ = self.consume_claim(&identity, key);
-                }
-            }
-            let dropped: BTreeSet<JournalNativeKey> = disposable.into_iter().collect();
-            self.remove_open_where(|native, _| dropped.contains(native));
         }
         // This key's bounded abandonments need their corroborating
         // returns within the frontier; otherwise the bound is not ready
@@ -9387,9 +9379,7 @@ impl JournalAdapter {
                 })
         });
         if unready {
-            let mut failure = self.wait(SealWait::AbandonReturnPending);
-            failure.effects.effects.extend(disposed.effects);
-            return Err(failure);
+            return Err(self.wait(SealWait::AbandonReturnPending));
         }
         // Every refused begin of this key at or below the frontier needs
         // its bound within the frontier; otherwise the seal waits.
@@ -9399,24 +9389,18 @@ impl JournalAdapter {
                 && refused.corroborated_return.is_none_or(|at| at > frontier)
         });
         if refused_unready {
-            let mut failure = self.wait(SealWait::RefusedReturnPending);
-            failure.effects.effects.extend(disposed.effects);
-            return Err(failure);
+            return Err(self.wait(SealWait::RefusedReturnPending));
         }
-        if let Err(mut failure) = self.validate_invocation_claims(key, &live, frontier, audit) {
-            failure.effects.effects.extend(disposed.effects);
-            return Err(failure);
-        }
-        match self.convert_and_settle(model, key, bootstrap, frontier, model_fence, replay) {
-            Ok(mut success) => {
-                success.effects.effects.extend(disposed.effects);
-                Ok(success)
-            }
-            Err(mut failure) => {
-                failure.effects.effects.extend(disposed.effects);
-                Err(failure)
-            }
-        }
+        self.validate_invocation_claims(key, &live, frontier, audit)?;
+        self.convert_and_settle(
+            model,
+            key,
+            bootstrap,
+            frontier,
+            model_fence,
+            replay,
+            &disposable,
+        )
     }
 
     fn validate_invocation_claims(
@@ -9519,6 +9503,7 @@ impl JournalAdapter {
         frontier: u64,
         model_fence: Option<u64>,
         mut replay: Option<ReplayPreparation>,
+        disposable: &BTreeSet<JournalNativeKey>,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
@@ -9692,9 +9677,24 @@ impl JournalAdapter {
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     self.retained_member_dec(identity, RetainedMember::Open(native));
                     let entry = self.open.get_mut(&native).expect("staged begin");
+                    // The claim leaves the store here: its return value
+                    // stays with the original as disposal evidence. A
+                    // non-neutral value already observed is never
+                    // overwritten by a neutral one.
+                    if entry.returned_rv.is_none_or(|rv| {
+                        super::state::return_leaves_no_lifecycle_effect(function, rv)
+                    }) {
+                        entry.returned_rv = Some(claim.rv);
+                    }
                     entry.converted_ticket = Some(token);
                     entry.converted_for = Some(key);
                     entry.call_key = Some(call_key);
+                    // A per-call disposal settles nothing in the legacy
+                    // delta; the frozen replay table still carries it
+                    // (retained originals below) for its terminal step.
+                    if disposable.contains(&native) {
+                        continue;
+                    }
                     settled.push(SealedCall {
                         ticket: token,
                         key: call_key,
@@ -9731,14 +9731,19 @@ impl JournalAdapter {
         // already begin-ordered; search only that unchanged prefix, then append
         // older fresh terminals once. This avoids a scan per terminal.
         let converted_begins = settled.len();
-        for entry in self
+        for (native, entry) in self
             .open
-            .values()
-            .filter(|entry| entry.converted_for == Some(key))
+            .iter()
+            .filter(|(_, entry)| entry.converted_for == Some(key))
         {
             let end = entry
                 .end
                 .filter(|staged| staged.ordinal <= frontier && !entry.end_converted);
+            // A per-call disposal settles nothing in the legacy delta;
+            // the frozen replay table below still carries its original.
+            if disposable.contains(native) {
+                continue;
+            }
             let abandoned = entry.abandon.is_some_and(|staged| {
                 staged.ordinal <= frontier
                     && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
@@ -9879,6 +9884,43 @@ impl JournalAdapter {
                 let retained = self.keys.get_mut(&key).expect("sealed key");
                 retained.bounded_upper =
                     Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
+            }
+            // An effect-free unbounded abandonment the partition cleared
+            // disposes here, per call: the model releases its ticket with
+            // a named loss gap, and the replay builder records that span
+            // as the call's own terminal step, so the exact staged head
+            // reaches a disposition and no effect lies outside a step.
+            // The prune below drops the original; its late terminal stays
+            // expected-absent.
+            if let Some(staged) = entry.abandon
+                && staged.ordinal <= frontier
+                && disposable.contains(&native)
+            {
+                let start = effects.effects.len();
+                let Some(lost) = model.dispose_abandoned_per_call(Some(token), &mut self.ledger)
+                else {
+                    let lived = self.key_is_live(key);
+                    self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                    self.claims_prune_dirty |= lived;
+                    return Err(SealFailure {
+                        take_failed: None,
+                        gap: JournalGap::ModelRefused,
+                        effects,
+                        h3_voided: None,
+                        fence: None,
+                        scope: SealFailureScope::Unqualified,
+                    });
+                };
+                effects.effects.extend(lost.effects);
+                if let Some(replay) = &mut replay {
+                    replay.call_loss(
+                        entry.call_key.expect("converted loss subject"),
+                        token,
+                        staged.ordinal,
+                        start..effects.effects.len(),
+                    );
+                }
+                self.note_derived_absence(entry.image, native, entry.function);
             }
         }
         // Settle the covered history under this bootstrap. The open
@@ -24574,6 +24616,61 @@ pub(crate) mod tests {
                 .refused,
             "the rebirth keeps the key live"
         );
+    }
+
+    /// The void preservation twins of the per-call evidence rule: a staged
+    /// effect-free abandonment whose corroborating ordinary return already
+    /// proved a lifecycle negative is not neutral, so the void keeps the
+    /// key's doom; the clean-return twin keeps the key live.
+    #[test]
+    fn void_with_corroborated_negative_read_abandonment_dooms_key() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        use pkcs11_types::CkRv;
+        for (rv, doomed) in [
+            (CkRv::OK.0, false),
+            (CkRv::SESSION_HANDLE_INVALID.0, true),
+            (CkRv::OBJECT_HANDLE_INVALID.0, true),
+            (CkRv::CRYPTOKI_NOT_INITIALIZED.0, true),
+        ] {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest_function("C_GetAttributeValue");
+            let getattr = function_id("C_GetAttributeValue");
+            let outer = begin_bytes(1, 1, getattr, 0);
+            scene.ingest(&outer);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&outer, rv)),
+                JournalDisposition::ReturnObserved
+            );
+            let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+            let bootstrap = scene.bootstrap(proof, 0);
+            let frontier = scene.adapter.consumed_frontier();
+            let faulted = JournalAuditReceipt::scripted(
+                7,
+                8,
+                None,
+                0,
+                H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+                scene.closure_generation(),
+            );
+            let failure = scene
+                .seal_explicit(
+                    &faulted,
+                    &bootstrap,
+                    frontier,
+                    SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                )
+                .expect_err("fault audit voids");
+            assert_eq!(failure.gap, JournalGap::FaultChanged);
+            let refused = scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("voided key")
+                .refused
+                || scene.adapter.image_refused((COOKIE, EXEC));
+            assert_eq!(refused, doomed, "rv={rv:#x}");
+        }
     }
 
     #[test]

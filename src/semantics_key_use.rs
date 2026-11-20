@@ -3432,6 +3432,7 @@ impl KeyUseReducer {
     /// path, `None` when the effect already resolved. The mint
     /// always targets the fallback ledger (disposal mints
     /// fallback-only, like the synchronous disposal path).
+    #[allow(clippy::too_many_arguments)] // Exact Started identity: instance/id/category/mechanism/receipt/time plus the mint ledger.
     fn drain_started_pre(
         &mut self,
         instance: RegistryInstanceId,
@@ -4385,10 +4386,9 @@ fn classify_head_charged(
         x if x == p11scope_ebpf_common::lifecycle::LOGIN
             || x == p11scope_ebpf_common::lifecycle::LOGOUT
     ) && crate::semantics_edge::EdgeSemantics::auth_retires_slot(facts)
+        && !gate.try_charge()
     {
-        if !gate.try_charge() {
-            return None;
-        }
+        return None;
     }
     Some(throwaway.would_retire_scope(facts))
 }

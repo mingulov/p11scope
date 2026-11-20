@@ -2808,10 +2808,10 @@ impl EdgeSemantics {
                         None => {
                             // Slot decisions read the open map
                             // (charged); all others are pure.
-                            if matches!(cursor.scope, EdgeRetireScope::Slot { .. }) {
-                                if !budget.try_charge() {
-                                    return false;
-                                }
+                            if matches!(cursor.scope, EdgeRetireScope::Slot { .. })
+                                && !budget.try_charge()
+                            {
+                                return false;
                             }
                             let (session, bit) = next;
                             let decision = self.retire_active_decision(cursor, session, bit);

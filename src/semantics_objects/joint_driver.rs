@@ -374,10 +374,11 @@ impl JointCaptureOwner {
     /// rows, and later seals re-prove above the recorded fence;
     /// receipts cut below it never resume. The next collect then
     /// re-syncs above the fence,
-    /// like any unlocalized loss. A watchdog scoped break takes the
-    /// same path narrowed to its stuck session (fence, wipe and
-    /// failure scope only; no invalidation, no re-sync, no global
-    /// cut), sliced through the budget with resumable cursors, and a
+    /// like any unlocalized loss. Both branches slice through the
+    /// budget with resumable cursors and resume next tick when it
+    /// exhausts. A watchdog scoped break takes the same path
+    /// narrowed to its stuck session (fence, wipe and failure scope
+    /// only; no invalidation, no re-sync, no global cut), and a
     /// stream break subsumes any pending scoped one. The void's
     /// storage is prepaid from the ledger's reserver as in
     /// `dispose_without_ingest`; a refusal keeps the fail-closed
@@ -396,37 +397,41 @@ impl JointCaptureOwner {
         {
             return Ok(RecoveryProgress::Done(false));
         }
-        // A stream break aborts any scoped recovery in progress (its
+        // A fresh stream break aborts any recovery in progress (its
         // lease refunds on drop; the stream void below subsumes the
         // partial fence/wipe/preserve work) and, after the same
-        // preflight, subsumes any pending scoped break.
+        // preflight, subsumes any pending scoped break. An
+        // in-progress stream recovery resumes instead: its break
+        // flag stays set until the re-sync clears it (as before),
+        // so resumption keys off the standing recovery, and the
+        // invalidated short-circuit above plus the re-sync keep a
+        // completed void from restarting.
         if self.adapter.stream_broken {
-            self.adapter.scoped_recovery = None;
-            let bytes =
-                super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
-                    .ok_or(RawQuantumRefusal::Capacity)?;
-            let lease = self
-                .adapter
-                .ledger
-                .resource_reserver()
-                .ok_or(RawQuantumRefusal::ForeignLedger)?
-                .reserve(bytes)
-                .map_err(RawQuantumRefusal::Resource)?;
-            self.adapter.drop_scoped_break();
-            let failure = self
-                .adapter
-                .void_ingest_break_inner(&mut self.model, INGEST_BREAK_VOID_GAP);
-            // The stream watermark breaks absence/attach chains
-            // stream-wide; scoped voids must not set it (see below).
-            self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
-            self.last_void_scope = Some(JointVoidScope::Stream);
-            self.carry_pending_void(failure, bytes, lease);
-            return Ok(RecoveryProgress::Done(true));
+            let resuming =
+                matches!(self.adapter.scoped_recovery, Some(ref recovery) if recovery.stream);
+            if !resuming {
+                self.adapter.scoped_recovery = None;
+                let bytes =
+                    super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+                        .ok_or(RawQuantumRefusal::Capacity)?;
+                let lease = self
+                    .adapter
+                    .ledger
+                    .resource_reserver()
+                    .ok_or(RawQuantumRefusal::ForeignLedger)?
+                    .reserve(bytes)
+                    .map_err(RawQuantumRefusal::Resource)?;
+                self.adapter.drop_scoped_break();
+                let upper = self.adapter.consumed_through;
+                let recovery = self.adapter.begin_stream_recovery(upper, bytes, lease);
+                self.adapter.scoped_recovery = Some(recovery);
+            }
         }
-        // Resume a scoped recovery in progress, or start one from the
-        // pending break. Observe the pending break while prepaying: a
-        // refused preflight keeps the scope for retry instead of
-        // dropping it, and neither break runs twice.
+        // Resume a recovery in progress (scoped or stream), or start
+        // one from the pending break. Observe the pending break
+        // while prepaying: a refused preflight keeps the scope for
+        // retry instead of dropping it, and neither break runs
+        // twice.
         let mut recovery = match self.adapter.scoped_recovery.take() {
             Some(recovery) => recovery,
             None => {
@@ -471,7 +476,8 @@ impl JointCaptureOwner {
         // replays nothing (verifying empty against empty) and closes
         // the feeds for reseed. Healthy domains are outside the
         // failure's scope and seal through it; no watermark, no
-        // invalidation, no global cut.
+        // invalidation, no global cut. A stream recovery fails every
+        // domain its fence-all phase visited instead.
         loop {
             if *budget == 0 {
                 self.adapter.scoped_recovery = Some(recovery);
@@ -481,6 +487,24 @@ impl JointCaptureOwner {
             if adapter.recover_scoped_slice(model, &mut recovery, budget) {
                 break;
             }
+        }
+        if recovery.stream {
+            // The fence-all phase accumulated every domain in key
+            // order; the failure scopes them without re-sorting.
+            let failure = SealFailure {
+                take_failed: None,
+                scope: super::SealFailureScope::AffectedDomains(recovery.stream_scope),
+                gap: INGEST_BREAK_VOID_GAP,
+                effects: recovery.effects,
+                h3_voided: None,
+                fence: Some(recovery.upper),
+            };
+            // The stream watermark breaks absence/attach chains
+            // stream-wide; scoped voids must not set it.
+            self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+            self.last_void_scope = Some(JointVoidScope::Stream);
+            self.carry_pending_void(failure, recovery.bytes, recovery.lease);
+            return Ok(RecoveryProgress::Done(true));
         }
         let mut domains: Vec<crate::semantics_objects::ObjectDomain> = recovery
             .scope

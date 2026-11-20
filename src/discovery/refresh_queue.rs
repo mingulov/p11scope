@@ -39,7 +39,7 @@ pub enum RetirementProof {
 /// the original is gone); a live-same generation retires only by
 /// management decision; an unreadable generation yields nothing —
 /// fail closed (keep pins + named gap at the call site).
-pub fn classify_retirement(
+pub(crate) fn classify_retirement(
     tracked: bool,
     state: Result<crate::process::OriginalGenerationState, String>,
 ) -> Option<RetirementProof> {

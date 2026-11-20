@@ -24211,6 +24211,62 @@ fn joint_failed_take_retries_with_staging_intact() {
     );
 }
 
+/// A take that failed on a definitively stale retained witness is a
+/// real ending, not an unknown: its delivery falls back promptly
+/// (replaying the staged head through the fallback) instead of
+/// retrying through the watchdog delay.
+#[test]
+fn joint_failed_take_falls_back_stale_witness() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) = guarded.admit_shape(&ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(guarded.registry.feed_staged_len_for_test(joint_id), Some(1));
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.take_failed = Some(crate::attach::BirthObservationRefusal::RetainedWitnessMismatch);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert_eq!(
+        outcome,
+        FailureApplyOutcome::FellBack { replayed: 1 },
+        "a stale witness falls back promptly"
+    );
+    assert_ne!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "the fallback leaves Joint"
+    );
+    assert_eq!(
+        guarded.registry.feed_staged_len_for_test(joint_id),
+        Some(0),
+        "the fallback replays the staged head"
+    );
+}
+
 /// An exiting process's Joint rows fold with the rows kept: the
 /// departed fold carries the shared key-use rows and the retained
 /// projection into the observations instead of dropping them with

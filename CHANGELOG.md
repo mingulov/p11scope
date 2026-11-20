@@ -302,6 +302,15 @@ versioned separately and are opaque, exact dispatch keys.
   unprovable overlap keeps the conservative shape.
 - Release qualification never accepts the folded mid-flight row as
   proof of an exit; mixed shapes stay refused.
+- Inventory newcomer counts exclude the uncounted setup seed exactly
+  where it is proven: an on-time row whose first recorded entry
+  passed through a plan-proven function-table-hook endpoint, whose
+  caller spawned after the initial attach with the endpoint already
+  live, bases past exactly that one call. Every other first-entry
+  shape keeps base 0 (conservative toward retaining observed
+  counts), and each rebased seed discloses its window through one
+  `demoted count placed` gap recording a count of placements on its
+  module.
 
 ### Known limitations
 

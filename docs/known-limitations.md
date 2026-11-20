@@ -110,6 +110,18 @@ no gap: those hooks detect provider publication, they count no calls.
 `--pid` captures arm before the `capturing:` line and have no such
 window.
 
+Since v0.7.2 an on-time newcomer's first recorded entry through a
+plan-proven function-table-hook endpoint — with the caller spawned
+after the initial attach and the endpoint already live then — bases
+past exactly that setup seed call, which real clients always make
+first and which is never counted. Any weaker evidence (ordinary
+endpoints; unknown, unauthorized, empty or aliased slot names;
+same-tick births; unknown start times; a missing attach cutover;
+endpoints attached after the spawn; delayed attach receipts) keeps
+base 0, preserving the observed count. Each rebased seed discloses
+its window through exactly one `demoted count placed` gap recording
+a count of placements on its module.
+
 ### A leader exit retires sessions even while other threads live
 
 The observer learns of an exit from the leader thread, so a process

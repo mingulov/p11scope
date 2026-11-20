@@ -93,6 +93,27 @@ key operations: not available - per-key tracking never started, so no key can be
 LINKED_JOINT_TEXT = LINKED_TEXT + """gap [Joint key operations unavailable; retained S1] joint_seal_batch_history_loss
 """
 
+#: The linked run under --key-sizes with the RSA-signing workload:
+#: key rows render, the -v per-row detail names the classified RSA
+#: size, and no END record decoded as malformed.
+LINKED_KEY_SIZES_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded)
+p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
+key operations: 2 keys on 1 provider; rev 12 populated; 1 session
+  key row 1 object 9 sign key (rsa_2048): probably RSA (from mechanism); RSA 2048 (from signature length)
+p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0
+"""
+
+#: The --key-sizes shape with rendered rows but no classified size
+#: (only unmapped lengths joined): the size check must fail it.
+LINKED_KEY_SIZES_NO_RSA_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
+p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded)
+p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
+key operations: 1 key on 1 provider; rev 12 populated; 1 session
+  key row 1 object 9 sign key (unknown): probably secret-key (from mechanism); size unknown (no length map for this mechanism)
+p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0
+"""
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -193,6 +214,9 @@ class JournalGateTests(unittest.TestCase):
         (self.work / "rows.json").write_text(json.dumps({
             "linked": rows,
             "linked-key-sizes": key_sizes_rows(),
+            "linked-key-sizes-norows": key_sizes_rows(),
+            "linked-key-sizes-norsa": key_sizes_rows(),
+            "linked-key-sizes-malformed": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -216,7 +240,13 @@ class JournalGateTests(unittest.TestCase):
         }))
         (self.work / "texts.json").write_text(json.dumps({
             "linked": {"rc": 0, "text": LINKED_TEXT},
-            "linked-key-sizes": {"rc": 0, "text": LINKED_TEXT},
+            "linked-key-sizes": {"rc": 0, "text": LINKED_KEY_SIZES_TEXT},
+            "linked-key-sizes-norows": {"rc": 0, "text": LINKED_TEXT},
+            "linked-key-sizes-norsa": {"rc": 0, "text": LINKED_KEY_SIZES_NO_RSA_TEXT},
+            "linked-key-sizes-malformed": {
+                "rc": 0,
+                "text": LINKED_KEY_SIZES_TEXT.replace(
+                    "audit_malformed=0 ", "audit_malformed=3 ")},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -360,7 +390,7 @@ class JournalGateTests(unittest.TestCase):
         args = workloads[0]
         self.assertEqual(args[0], "mech")
         for flag in ("--cell", "--module", "--iters", "--sleep-us",
-                     "--hold"):
+                     "--rsa-sign", "--hold"):
             self.assertIn(flag, args)
 
     def write_budgets(self, programs):
@@ -612,6 +642,51 @@ class JournalGateTests(unittest.TestCase):
                      "journal-gate1/p11_return_journal_length"):
             self.assertIn(f"{root} - - - ", result.stdout)
         self.assertIn("missing from probe rows", result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_without_rendered_rows_fails(self):
+        # Non-vacuity: a --key-sizes leg whose observer never
+        # rendered key rows fails, even with the length pair loaded.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-norows",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("key rows never rendered under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_without_classified_size_fails(self):
+        # Non-vacuity: rendered rows without a classified RSA size
+        # fail the --key-sizes leg (the joined-size proof is missing).
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-norsa",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no classified RSA-2048 size under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_malformed_records_fails(self):
+        # Non-vacuity: malformed END decodes fail the --key-sizes leg
+        # even when a classified size rendered.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-malformed",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("malformed journal records under --key-sizes",
+                      result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")

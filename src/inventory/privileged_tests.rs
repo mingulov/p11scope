@@ -4990,6 +4990,18 @@ fn start_joint_lane_with_journal(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     manifests: Vec<PathBuf>,
 ) -> Result<crate::inventory_semantics::AttestedSemanticLane> {
+    start_joint_lane_with_journal_sizes(coordinator, manifests, false)
+}
+
+/// Sizes-parameterized journal lane start: `key_sizes` rides the
+/// journal request, so on a FULL build the length pair loads and the
+/// lane seals with sizes; on a P0 build the sizes request refuses
+/// loudly at load.
+fn start_joint_lane_with_journal_sizes(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    manifests: Vec<PathBuf>,
+    key_sizes: bool,
+) -> Result<crate::inventory_semantics::AttestedSemanticLane> {
     use anyhow::Context as _;
     ensure!(
         env!("P11SCOPE_JOURNAL_ENABLED") == "1",
@@ -5005,7 +5017,7 @@ fn start_joint_lane_with_journal(
         .subset
         .context("the conversion subset prepares")?;
     let scope = Scope::System;
-    let spec = crate::attach::journal::JournalSpec { key_sizes: false };
+    let spec = crate::attach::journal::JournalSpec { key_sizes };
     let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
         attach_subset,
         convert_subset,
@@ -5772,6 +5784,75 @@ fn privileged_key_operations_seal_generation_gated_by_flag() -> Result<()> {
         generation.unwrap_or(0)
     );
     Ok(())
+}
+
+/// Sizes lane under privilege: on a FULL journal build the lane
+/// seals with `key_sizes: true` (the length pair loads on this
+/// kernel and the seal publishes); on a build without the length
+/// programs the sizes request refuses loudly, explained by the
+/// embedded object. Either arm pins the sizes-request shape live —
+/// the one privileged cell that loads the length pair.
+#[test]
+#[ignore = "privileged: live journal lane seals with key sizes on FULL, refuses without the length pair"]
+fn privileged_key_sizes_journal_seals_with_length_pair() -> Result<()> {
+    if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
+        eprintln!("KEY_SIZES_JOURNAL journal=inapplicable");
+        return Ok(());
+    }
+    let workload = JointWorkload::build()?;
+    let mut coordinator =
+        system_joint_coordinator(&[workload.soft_copy.clone(), workload.held.clone()])?;
+    let manifest_soft = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.soft_copy,
+        JOINT_SOFT_FUNCTIONS,
+        "keyops-sizes-soft.dr37.json",
+    )?;
+    let manifest_held = provider_joint_manifest(
+        workload.workload.dir.path(),
+        &workload.held,
+        &["C_SignInit", "C_Sign"],
+        "keyops-sizes-held.dr37.json",
+    )?;
+    match start_joint_lane_with_journal_sizes(
+        &mut coordinator,
+        vec![manifest_soft, manifest_held],
+        true,
+    ) {
+        Ok(lane) => {
+            let generation = lane.live_seal_generation_for_test();
+            assert!(
+                generation.is_some_and(|generation| generation >= 1),
+                "a sizes live seal publishes its generation: {generation:?}"
+            );
+            eprintln!(
+                "KEY_SIZES_JOURNAL sealed generation={}",
+                generation.unwrap_or(0)
+            );
+            Ok(())
+        }
+        Err(error) => {
+            // A sizes refusal is finite only when the embedded
+            // object omits the length pair (P0); on FULL a refusal
+            // is a broken load and fails the cell.
+            let parsed = aya_obj::Object::parse(crate::EBPF_JOURNAL_OBJECT)
+                .map_err(|parse| anyhow::anyhow!("the journal object parses: {parse}"))?;
+            let missing: Vec<&str> = crate::attach::journal::LENGTH_PROGRAMS
+                .iter()
+                .copied()
+                .filter(|name| !parsed.programs.contains_key(*name))
+                .collect();
+            ensure!(
+                !missing.is_empty(),
+                "FULL carries the length pair, so a sizes refusal is a broken load: {error:#}"
+            );
+            eprintln!(
+                "KEY_SIZES_JOURNAL refused, length pair omitted: {}",
+                missing.join(",")
+            );
+            Ok(())
+        }
+    }
 }
 
 /// One JOINT_R16 drive-state line: the lane gates plus the machine's

@@ -24,6 +24,9 @@ struct World {
     /// What a cookie query through a pin answers, per domain.
     answers: HashMap<(Pin, NativeDomainId), CookieQuery>,
     queries: usize,
+    /// Live-caller lookups served (read-time and re-sight): the
+    /// visit charge of each pass. Resettable between batches.
+    lookups: std::cell::Cell<usize>,
 }
 
 impl World {
@@ -231,7 +234,12 @@ impl Run {
         self.read_domain(domain, rows, Some(ring_loss));
     }
 
-    fn read_domain(&mut self, domain: NativeDomainId, rows: Vec<WitnessRow>, loss: Option<u64>) {
+    fn read_domain(
+        &mut self,
+        domain: NativeDomainId,
+        rows: Vec<WitnessRow>,
+        loss: Option<u64>,
+    ) -> ResightOutcome {
         let at = self.tick();
         let batch = read_at(domain, rows, at, loss);
         let World {
@@ -239,10 +247,11 @@ impl Run {
             retained,
             answers,
             queries,
+            lookups,
         } = &mut self.world;
-        let lookup = Lookup(live, retained);
+        let lookup = Lookup(live, retained, lookups);
         let mut identity = AnswerTable { answers, queries };
-        self.binder.absorb_witnesses(&batch, &lookup, &mut identity);
+        self.binder.absorb_witnesses(&batch, &lookup, &mut identity)
     }
 
     fn drain(&mut self, execs: &[(u32, u64)]) {
@@ -270,10 +279,12 @@ impl Run {
 struct Lookup<'a>(
     &'a HashMap<u32, (CallerId, u64, Pin)>,
     &'a HashMap<u32, Vec<RetainedCaller>>,
+    &'a std::cell::Cell<usize>,
 );
 
 impl CallerLookup<Pin> for Lookup<'_> {
     fn live_caller(&self, pid: u32) -> Option<LiveCaller<'_, Pin>> {
+        self.2.set(self.2.get() + 1);
         self.0.get(&pid).map(|(id, first_seen_ns, pin)| LiveCaller {
             id: *id,
             first_seen_ns: *first_seen_ns,
@@ -667,7 +678,7 @@ fn metadata_binding_refuses_unreadable_health_and_ignores_older_healthy_read() {
     let older = read_at(domain, Vec::new(), run.clock - 1, Some(0));
     run.binder.absorb_witnesses(
         &older,
-        &Lookup(&run.world.live, &run.world.retained),
+        &Lookup(&run.world.live, &run.world.retained, &run.world.lookups),
         &mut AnswerTable {
             answers: &run.world.answers,
             queries: &mut run.world.queries,
@@ -910,10 +921,9 @@ fn different_binary_exec_binds_each_image_to_its_own_incarnation() {
         row_on(d, 7, 2, T, 2_500, 2), // after
     ]);
     run.settle();
-    assert_eq!(
-        run.verdicts(),
-        vec![unbound(UnboundReason::BeforeAdmission), bound(successor)]
-    );
+    // The pre-admission row's window is clean (the only exec sits at
+    // 2_000, before the row), so it late-binds its own incarnation too.
+    assert_eq!(run.verdicts(), vec![bound(successor), bound(successor)]);
     assert!(
         run.binder.take_transitions().is_empty(),
         "the scan lane already split; the binder proves nothing new"
@@ -1852,12 +1862,18 @@ fn equal_cookie_values_from_two_domains_never_join() {
 }
 
 #[test]
-fn a_row_recorded_before_the_admission_never_binds() {
+fn a_row_recorded_before_the_admission_with_loss_in_its_window_never_binds() {
+    // Fail-closed twin of the clean-window late bind: lifecycle evidence
+    // lost strictly between the row (t0 1_015) and the admission (2_000)
+    // voids the late window (an exec may hide in the loss), so the row
+    // keeps BeforeAdmission. The second read's health (taken at 1_020)
+    // dates the loss inside the window.
     let mut run = Run::new();
     let d = run.domain;
     run.world.admit(T, 1, 0, 2_000);
     run.world.answer(T, 1, d, cookie(d, 7));
-    run.read(vec![row(d, 7, 1, T, 1_999)]);
+    run.read(vec![row(d, 7, 1, T, 1_015)]);
+    run.read_with_loss(Vec::new(), 3);
     run.settle();
     assert_eq!(
         run.verdicts(),
@@ -2005,10 +2021,11 @@ fn the_census_counts_every_row_once() {
         retained,
         answers,
         queries,
+        lookups,
     } = &mut run.world;
     run.binder.absorb_witnesses(
         &batch,
-        &Lookup(live, retained),
+        &Lookup(live, retained, lookups),
         &mut AnswerTable { answers, queries },
     );
     assert_eq!(run.binder.census().pending, 2);
@@ -2232,10 +2249,11 @@ fn horizons_follow_the_facade_stamps_and_domain_tags() {
         retained,
         answers,
         queries,
+        lookups,
     } = &mut run.world;
     run.binder.absorb_witnesses(
         &stale,
-        &Lookup(live, retained),
+        &Lookup(live, retained, lookups),
         &mut AnswerTable { answers, queries },
     );
     assert!(
@@ -2283,8 +2301,9 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
         retained,
         answers,
         queries,
+        lookups,
     } = &mut run.world;
-    let lookup = Lookup(live, retained);
+    let lookup = Lookup(live, retained, lookups);
     let mut identity = AnswerTable { answers, queries };
     let sighting = run
         .binder
@@ -2310,10 +2329,11 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
         retained,
         answers,
         queries,
+        lookups,
     } = &mut run.world;
     run.binder.absorb_witnesses(
         &read_at(run.domain, Vec::new(), 2_002, Some(0)),
-        &Lookup(live, retained),
+        &Lookup(live, retained, lookups),
         &mut AnswerTable { answers, queries },
     );
     assert!(matches!(
@@ -2335,12 +2355,13 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
         retained,
         answers,
         queries,
+        lookups,
     } = &mut run.world;
     assert!(
         run.binder
             .sight_current_binding_at(
                 request,
-                &Lookup(live, retained),
+                &Lookup(live, retained, lookups),
                 &mut AnswerTable { answers, queries },
                 || Some(3_000)
             )
@@ -2351,6 +2372,7 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
         retained,
         answers,
         queries,
+        lookups,
     } = &mut run.world;
     run.binder.absorb_witnesses(
         &read_at(
@@ -2359,7 +2381,7 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
             3_001,
             Some(0),
         ),
-        &Lookup(live, retained),
+        &Lookup(live, retained, lookups),
         &mut AnswerTable { answers, queries },
     );
     assert_eq!(
@@ -2403,10 +2425,11 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
             retained,
             answers,
             queries,
+            lookups,
         } = &mut run.world;
         let result = run.binder.sight_current_binding_at(
             request,
-            &Lookup(live, retained),
+            &Lookup(live, retained, lookups),
             &mut AnswerTable { answers, queries },
             || if control == 4 { None } else { Some(2_000) },
         );
@@ -2427,6 +2450,7 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
                 retained,
                 answers,
                 queries,
+                lookups,
             } = &mut run.world;
             run.binder.absorb_witnesses(
                 &read_at(
@@ -2435,7 +2459,7 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
                     2_002,
                     Some(if control == 6 { 1 } else { 0 }),
                 ),
-                &Lookup(live, retained),
+                &Lookup(live, retained, lookups),
                 &mut AnswerTable { answers, queries },
             );
             assert!(
@@ -2475,6 +2499,87 @@ fn bound_image_equality_keeps_domain_and_full_exec() {
 }
 
 #[test]
+fn a_row_recorded_before_admission_with_a_clean_window_binds_late() {
+    // The inventory soak shape: a newcomer's first use beats the scan
+    // (row t0 1_500, admission 2_000), absorbed after admission. Exec
+    // coverage is active from 0 and no exec or loss is recorded, so no
+    // exec hides between the row and the admission: the live cookie
+    // match proves the row is this incarnation's image.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+#[test]
+fn a_row_absorbed_before_admission_binds_once_the_caller_is_admitted() {
+    // The row is absorbed while no live incarnation holds the tgid
+    // (sightingless wait); the scan admits the caller before the
+    // horizons arrive. The next witness batch re-sights the live
+    // incarnation and the clean window binds late.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    let x = run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+#[test]
+fn a_late_row_with_an_exec_between_row_and_admission_stays_unbound() {
+    // Guard: an exec recorded between the row and the admission voids
+    // the late window (the row may be the pre-exec image's).
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.drain(&[(T, 1_800)]);
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::BeforeAdmission)]
+    );
+}
+
+#[test]
+fn a_late_row_with_lifecycle_loss_between_row_and_admission_stays_unbound() {
+    // Guard: lifecycle evidence lost between the row and the admission
+    // voids the late window (an exec may hide in the loss).
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 1_020)]);
+    run.read_with_loss(Vec::new(), 3);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::BeforeAdmission)]
+    );
+}
+
+#[test]
+fn a_late_row_predating_exec_coverage_stays_unbound() {
+    // Guard: the row predates exec coverage, so execs between the row
+    // and the coverage start are unknowable: no late window opens.
+    let mut run = Run::covered_from(1_600);
+    let d = run.domain;
+    run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::BeforeAdmission)]
+    );
+}
+
+#[test]
 fn bound_image_debug_redacts_private_numbers() {
     use super::super::caller_registry::ImageAuthority;
     let domain = NativeDomainId::mint();
@@ -2488,4 +2593,255 @@ fn bound_image_debug_redacts_private_numbers() {
     assert!(rendered.contains("NativeExact"));
     assert!(rendered.contains("<expected>"));
     assert!(!rendered.contains("41"));
+}
+
+/// The re-sight query below completes at clock 1_035: after the row
+/// read (1_011), the first complete drain (1_020) and the next health
+/// read (1_030), but before the post-query drain (1_040). Ticks start
+/// at 1_000 and advance 10 per read/drain; the first read stamps its
+/// rows at tick + 1.
+fn resight_completed_at_1035() -> Option<u64> {
+    Some(1_035)
+}
+
+/// The re-sight completion clock is unavailable: every pass runs its
+/// queries but stamps none of them.
+fn resight_clock_fails() -> Option<u64> {
+    None
+}
+
+/// The re-sight query below completes at clock 1_055: after the third
+/// read (1_040) but before the post-query drain (1_060). Used by the
+/// missing-clock leg after two unstamped attempts.
+fn resight_completed_at_1055() -> Option<u64> {
+    Some(1_055)
+}
+
+#[test]
+fn a_resight_waits_for_post_query_horizons_before_an_intervening_exec_refuses() {
+    // The row (event 10) is read while no live caller holds the tgid;
+    // a complete drain and the next health read both cover the row
+    // read but predate the re-sight query, so the row waits. The exec
+    // at event 40 arrives with the post-query drain and voids the
+    // late window: the pre-exec row never binds the post-exec image
+    // even though the task cookie never changed across the exec.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 10)]);
+    run.drain(&[]);
+    run.world.admit(T, 1, 0, 50);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.binder.set_resight_clock(resight_completed_at_1035);
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        Vec::new(),
+        "old horizons cover the row read but predate the re-sight query"
+    );
+    run.drain(&[(T, 40)]);
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::BeforeAdmission)]
+    );
+}
+
+#[test]
+fn a_resight_with_an_unavailable_clock_never_binds_against_pre_query_horizons() {
+    // Same scene as the intervening-exec twin, but the re-sight query's
+    // completion clock is unavailable: the unstamped late answer carries
+    // no authority, so the row must not bind (or cache a binding)
+    // against the pre-query horizons even though they cover the old
+    // read. The attempt stays owed and retries within the pass
+    // allowance; once the clock recovers and the post-query drain
+    // delivers the exec, the pre-exec row refuses the successor.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 10)]);
+    run.drain(&[]);
+    run.world.admit(T, 1, 0, 50);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.binder.set_resight_clock(resight_clock_fails);
+    let first = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(
+        first,
+        ResightOutcome::Incomplete,
+        "the unstamped attempt stays owed for a retry"
+    );
+    assert_eq!(
+        run.world.queries, 1,
+        "the query ran; only its stamp is missing"
+    );
+    assert_eq!(
+        run.verdicts(),
+        Vec::new(),
+        "no bind against pre-query horizons without a completion stamp"
+    );
+    let second = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(
+        second,
+        ResightOutcome::Incomplete,
+        "the retry is still unstamped while the clock stays down"
+    );
+    assert_eq!(run.world.queries, 2);
+    assert_eq!(run.verdicts(), Vec::new());
+    // The clock recovers: the late sighting stamps at 1_055, still
+    // uncovered (the last drain started at 1_020), so the row waits.
+    run.binder.set_resight_clock(resight_completed_at_1055);
+    let third = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(third, ResightOutcome::Complete);
+    assert_eq!(run.world.queries, 3);
+    assert_eq!(run.verdicts(), Vec::new());
+    // The post-query drain delivers the intervening exec; the next
+    // health read completes the post-query horizons and the pre-exec
+    // row refuses the post-exec image it never bound.
+    run.drain(&[(T, 40)]);
+    assert_eq!(run.verdicts(), Vec::new());
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::BeforeAdmission)]
+    );
+}
+
+#[test]
+fn a_resight_with_no_intervening_exec_binds_once_post_query_horizons_arrive() {
+    // Identical scene, no intervening exec: the re-sighted row still
+    // waits for post-query horizons, then binds its clean window.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 10)]);
+    run.drain(&[]);
+    let x = run.world.admit(T, 1, 0, 50);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.binder.set_resight_clock(resight_completed_at_1035);
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        Vec::new(),
+        "old horizons cover the row read but predate the re-sight query"
+    );
+    run.drain(&[]);
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+#[test]
+fn a_resight_backlog_beyond_the_pass_allowance_resumes_exactly_once() {
+    // 65 unsighted rows, 64 attempts per pass. The first pass reports
+    // incomplete after 64 queries; the row it never reached holds its
+    // decision (a complete drain cannot decide a row still owed its
+    // attempt); the next pass sights it and reports complete — exactly
+    // one resume — and it binds with the rest.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read((0..65).map(|i| row(d, 7, 1, T, 1_500 + i)).collect());
+    let x = run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    let first = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(first, ResightOutcome::Incomplete);
+    assert_eq!(run.world.queries, 64);
+    run.drain(&[]);
+    assert_eq!(run.verdicts(), vec![bound(x); 64]);
+    assert_eq!(run.binder.census().pending, 1);
+    let second = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(second, ResightOutcome::Complete);
+    assert_eq!(run.world.queries, 65);
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+    assert_eq!(run.binder.census().pending, 0);
+}
+
+#[test]
+fn a_row_arriving_during_an_incomplete_pass_is_sighted_before_it_decides() {
+    // 64 live-hit rows plus one overflow row fill the pass query
+    // allowance; a row for another tgid arrives in the same batch
+    // with a read-time miss. The continuation pass looks the old
+    // overflow row up (absent by then: it misses), but the new row
+    // must still get its promised attempt before deciding: its
+    // caller was admitted after the arrival, so the attempt hits and
+    // the row binds instead of deciding sightingless against the
+    // covered horizons.
+    const A: u32 = 100;
+    const B: u32 = 200;
+    const C: u32 = 300;
+    let mut run = Run::new();
+    let d = run.domain;
+    let mut rows: Vec<WitnessRow> = (0..64).map(|i| row(d, 7, 1, A, 1_500 + i)).collect();
+    rows.push(row(d, 9, 1, B, 1_600));
+    run.read(rows);
+    let x = run.world.admit(A, 1, 0, 2_000);
+    run.world.answer(A, 1, d, cookie(d, 7));
+    run.world.admit(B, 1, 1, 2_000);
+    // Batch B: the pass sights the 64 A rows and leaves the B row
+    // owed past the query allowance; the C row arrives with a
+    // read-time miss in the same batch.
+    let batch_b = run.read_domain(d, vec![row(d, 8, 1, C, 1_610)], Some(0));
+    assert_eq!(batch_b, ResightOutcome::Incomplete);
+    assert_eq!(run.world.queries, 64);
+    assert_eq!(run.verdicts(), Vec::new());
+    // The B caller departs before the continuation; the C caller is
+    // admitted after its row's read-time miss.
+    run.world.retire(B);
+    let z = run.world.admit(C, 1, 2, 2_010);
+    run.world.answer(C, 1, d, cookie(d, 8));
+    run.drain(&[]);
+    assert_eq!(run.verdicts(), vec![bound(x); 64]);
+    // Batch C: fresh horizons cover both waiting rows; the B row
+    // misses its lookup and refuses, while the C row is attempted
+    // first and binds its live caller.
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::NoLiveCaller), bound(z)]
+    );
+    assert_eq!(run.world.queries, 65);
+    assert_eq!(run.binder.census().pending, 0);
+}
+
+#[test]
+fn a_resight_visit_backlog_beyond_the_pass_allowance_resumes_to_complete() {
+    // 1_100 unsighted rows for never-live tgids, past the per-pass
+    // visit allowance: the first pass reports incomplete after
+    // visiting exactly its allowance (all misses, no queries spent);
+    // the next pass visits the remainder and reports complete. Every
+    // row is attempted before it decides.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(
+        (0..1_100)
+            .map(|i| row(d, 7 + i, 1, 10_000 + (i % 8) as u32, 1_500 + i))
+            .collect(),
+    );
+    run.world.lookups.set(0);
+    let first = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(first, ResightOutcome::Incomplete);
+    assert_eq!(run.world.lookups.get(), RESIGHT_VISITS_PER_PASS);
+    assert_eq!(run.world.queries, 0);
+    run.world.lookups.set(0);
+    let second = run.read_domain(d, Vec::new(), Some(0));
+    assert_eq!(second, ResightOutcome::Complete);
+    assert_eq!(run.world.lookups.get(), 1_100 - RESIGHT_VISITS_PER_PASS);
+    assert_eq!(run.world.queries, 0);
+    // The covering drain holds the front row instead of deciding on
+    // its earlier miss and re-queues the stale rows in bulk; the
+    // next witness batches attempt them fresh and every row refuses
+    // on its own miss.
+    run.drain(&[]);
+    assert_eq!(run.verdicts(), Vec::new());
+    let mut verdicts = Vec::new();
+    for _ in 0..8 {
+        if run.binder.census().pending == 0 {
+            break;
+        }
+        run.read(Vec::new());
+        verdicts.extend(run.verdicts());
+    }
+    assert_eq!(run.binder.census().pending, 0);
+    assert_eq!(verdicts.len(), 1_100);
+    assert!(
+        verdicts
+            .iter()
+            .all(|verdict| *verdict == unbound(UnboundReason::NoLiveCaller)),
+        "every row misses its attempt before it refuses"
+    );
 }

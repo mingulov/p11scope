@@ -3272,6 +3272,45 @@ fn a_terminal_refresh_that_never_completes_is_reported() {
     );
 }
 
+/// The terminal exact refresh waits for owed re-sight work: an exact
+/// post-stop sweep that stages a row the scene never admitted leaves a
+/// re-sight attempt owed, so the stop reads on within its budget
+/// instead of finishing at once — the finish files only work the
+/// continuations actually attempted.
+#[test]
+fn a_stop_with_owed_resight_work_reads_past_the_first_exact_refresh() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // Read 1 is the pass's; read 2 is the pre-stop terminal sweep;
+    // read 3 (after begin_stop) is exact and stages a row for a tgid
+    // the scene never admitted, so its re-sight attempt is still
+    // owed when the exact sweep lands.
+    lane.reads.extend([
+        vec![],
+        vec![],
+        vec![RowSpec {
+            endpoint: 0,
+            tgid: 4242,
+            ticket: TICKET,
+        }],
+    ]);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert_eq!(stopped.capture.read_stamps.len(), 4);
+    let log = entries(&log);
+    let stopped_at = log.iter().position(|entry| entry == "begin_stop").unwrap();
+    let after: Vec<&str> = log[stopped_at..]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry == "read" || *entry == "stage:witness")
+        .collect();
+    assert_eq!(
+        after,
+        ["read", "stage:witness", "read", "stage:witness"],
+        "the exact read stages the row and the continuation attempts it"
+    );
+}
+
 /// The terminal sweep is bounded: a sweep that never completes stops
 /// reading at the budget and the stop goes on (its reads are not clean).
 #[test]

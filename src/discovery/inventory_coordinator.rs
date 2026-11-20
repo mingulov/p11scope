@@ -7945,6 +7945,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             NativeBatch::Finish { domain } => Some((*domain, true, 0, true)),
             _ => None,
         };
+        // The domain this batch stages (semantic batches stage none):
+        // the receipt reports its owed re-sight work below.
+        let resight_domain = match &batch {
+            NativeBatch::Witness(batch) => Some(batch.domain),
+            NativeBatch::Lifecycle(batch) => Some(batch.domain),
+            NativeBatch::Finish { domain } => Some(*domain),
+            NativeBatch::Semantic(_) => None,
+        };
         let mut hook_events = Vec::new();
         match batch {
             NativeBatch::Witness(batch) => {
@@ -7957,7 +7965,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     adapter: &self.adapter,
                     allowed: self.retained_fallback_allowed(&batch),
                 };
-                self.binder.absorb_witnesses(&batch, &gate, &mut *identity);
+                // An incomplete re-sight pass resumes on the next
+                // witness batch (the owed attempts persist in the
+                // binder); the receipt below reports whether any
+                // remain, so the stop machine can read on for them.
+                let _resight = self.binder.absorb_witnesses(&batch, &gate, &mut *identity);
                 self.note_witness_batch(&batch);
                 self.record_witness_integrity(&batch);
                 // Counts merge before the binder's decisions stage, so a
@@ -8008,6 +8020,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut receipt = self.stage_binder_output(identity, now_ns);
         receipt.events.extend(hook_events);
+        if let Some(domain) = resight_domain {
+            receipt.resight_owed = self.binder.resight_owed(domain);
+        }
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         if let Some((domain, finished, began_ns, gap_free)) = tombstone_cleanup {
             self.expire_exec_tombstones(domain, began_ns, gap_free);
@@ -8420,7 +8435,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.apply_reconcile_events(&events, now_ns);
         self.registry
             .note_witness_census(self.binder.census().clone());
-        NativeReceipt { events, decided }
+        NativeReceipt {
+            events,
+            decided,
+            resight_owed: false,
+        }
     }
 
     /// One witness read's integrity rows: never bound, never dropped
@@ -12589,6 +12608,10 @@ pub(crate) struct NativeReceipt {
     pub events: Vec<CallerEvent>,
     /// Rows decided by this call.
     pub decided: usize,
+    /// The staged domain still owes re-sight attempts: the stop machine
+    /// reads on while this holds instead of finishing at the first
+    /// exact refresh. Always false for semantic batches.
+    pub resight_owed: bool,
 }
 
 /// One CALLER_USE pair (C7 C4): the image that owns the row plus the
@@ -33461,9 +33484,17 @@ int main(void) {
     }
 
     #[test]
-    fn a_row_from_before_admission_downgrades_the_watch_for_good() {
-        // Read after the admission: the row predates it (t0 40 < 50).
+    fn a_row_from_before_admission_with_an_exec_in_its_window_downgrades_the_watch_for_good() {
+        // Read after the admission: the row predates it (t0 40 < 50) and
+        // an exec at 45 sits strictly inside the late window, so the row
+        // keeps BeforeAdmission. The hook predates the admission, so the
+        // scan lane mints no successor for it.
         let (mut native, caller) = watched_native();
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, 45);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 40, 0);
         native.witness(vec![row]);
@@ -35741,6 +35772,15 @@ int main(void) {
             .map(|ticket| native.row(1000 + ticket, 1, 9, 210, 0))
             .collect();
         native.witness(rows);
+        // Bounded re-sight visits drain over continuations: read on
+        // until every row was attempted and decided.
+        for _ in 0..8 {
+            if native.scene.coordinator.binder.census().pending == 0 {
+                break;
+            }
+            native.witness(Vec::new());
+        }
+        assert_eq!(native.scene.coordinator.binder.census().pending, 0);
         let (text, document) = slice_one_views(&native);
         assert_eq!(document["modules"][0]["unbound_use"]["images"], 4096);
         assert_eq!(
@@ -35779,6 +35819,15 @@ int main(void) {
             .map(|ticket| native.row(1000 + ticket, 1, 9, 210, 0))
             .collect();
         native.witness(rows);
+        // Bounded re-sight visits drain over continuations: read on
+        // until every row was attempted and decided.
+        for _ in 0..24 {
+            if native.scene.coordinator.binder.census().pending == 0 {
+                break;
+            }
+            native.witness(Vec::new());
+        }
+        assert_eq!(native.scene.coordinator.binder.census().pending, 0);
         let (text, document) = slice_one_views(&native);
         assert_eq!(
             document["observation"]["native_witnesses"]["unbound_images"],
@@ -36290,8 +36339,16 @@ int main(void) {
     }
 
     #[test]
-    fn a_row_decided_after_stop_still_downgrades_a_frozen_watch() {
+    fn a_row_decided_after_stop_with_an_exec_in_its_window_still_downgrades_a_frozen_watch() {
         let (mut native, caller) = watched_native();
+        // An exec at 45 sits strictly inside the row's late window (t0 40,
+        // admission 50), so the post-stop decision keeps BeforeAdmission.
+        // The hook predates the admission, so no successor is minted.
+        native.scene.coordinator.exit_clocks_comparable = true;
+        let at = native.stamps.tick();
+        let drain = exec_hook_drain(native.domain, at, 45);
+        let receipt = native.stage(NativeBatch::Lifecycle(drain));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
         // A clean read at 1_010, then the stop freezes the watch there.
         native.read(Vec::new());
         native.scene.coordinator.end_capture_coverage(1_100);

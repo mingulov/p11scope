@@ -1584,15 +1584,19 @@ impl<L> NativeLane<L> {
         let exact = loop {
             let terminal = self.read();
             let exact = terminal.refresh_sweep_completed && !terminal.refresh_sweep_gaps;
-            events.extend(
-                host.stage_native(
-                    NativeBatch::Witness(Box::new(terminal)),
-                    &mut self.capture,
-                    now_ns(),
-                )
-                .events,
+            let receipt = host.stage_native(
+                NativeBatch::Witness(Box::new(terminal)),
+                &mut self.capture,
+                now_ns(),
             );
-            if exact || Instant::now() >= refresh_deadline {
+            events.extend(receipt.events);
+            // Owed re-sight work keeps the terminal refresh reading
+            // within its deadline even once a sweep lands exact: the
+            // finish files only work the continuations actually
+            // attempted. Past the deadline an exact sweep still
+            // finishes (never a refresh-loss misreport); the
+            // remaining rows file incomplete, as accounted.
+            if (exact && !receipt.resight_owed) || Instant::now() >= refresh_deadline {
                 break exact;
             }
         };
@@ -1719,6 +1723,9 @@ pub(crate) struct NativeStop<L> {
     poll_error: Option<String>,
     retirement_budget: Duration,
     retirement: Option<Retirement>,
+    /// The last staged batch left re-sight attempts owed: the terminal
+    /// refresh reads on for them instead of finishing at once.
+    staged_resight_owed: bool,
 }
 
 // Both variants move the same native owner; returning Pending must remain
@@ -1753,6 +1760,7 @@ impl<L> NativeStop<L> {
             poll_error: None,
             retirement_budget: Duration::ZERO,
             retirement: None,
+            staged_resight_owed: false,
         }
     }
 
@@ -1828,10 +1836,9 @@ impl<L> NativeStop<L> {
                     .pending
                     .take()
                     .expect("one original read awaits staging");
-                self.events.extend(
-                    host.stage_native(batch, &mut self.lane.capture, now_ns())
-                        .events,
-                );
+                let receipt = host.stage_native(batch, &mut self.lane.capture, now_ns());
+                self.staged_resight_owed = receipt.resight_owed;
+                self.events.extend(receipt.events);
                 // The next phase's original window starts after this
                 // staging action, exactly once, even if it used the slice.
                 let now = clock.now();
@@ -1870,10 +1877,23 @@ impl<L> NativeStop<L> {
                         }
                     }
                     NativeAfterStage::PostWitness { exact } => {
-                        self.phase = if exact {
+                        // Owed re-sight work keeps the terminal refresh
+                        // reading within its deadline even once a sweep
+                        // lands exact: the finish files only work the
+                        // continuations actually attempted. Past the
+                        // deadline an exact sweep still finishes (its
+                        // refresh was exact — never a refresh-loss
+                        // misreport); the remaining rows file
+                        // incomplete, as accounted.
+                        let owed = self.staged_resight_owed;
+                        self.phase = if exact && !owed {
                             NativeStopPhase::Finish
                         } else if now >= self.refresh_deadline.unwrap() {
-                            NativeStopPhase::RefreshLoss
+                            if exact {
+                                NativeStopPhase::Finish
+                            } else {
+                                NativeStopPhase::RefreshLoss
+                            }
                         } else {
                             NativeStopPhase::PostWitness
                         };

@@ -17,7 +17,14 @@
 //!    tickets of one leader task inside one loaded object, never reused
 //!    there; [`DomainCookie`] equality includes the domain, so equal ticket
 //!    values from two domains never compare equal.
-//! 3. `X.first_seen_ns <= t0`.
+//! 3. `X.first_seen_ns <= t0`, or the row predates the admission inside
+//!    a provably clean window (late binding): exec coverage was already
+//!    active at `t0`, and no exec of `T` or lost lifecycle evidence is
+//!    recorded at or after `t0`. The live cookie match (rules 1+2) plus
+//!    the post-admission horizons (rule 4) then prove the row is this
+//!    incarnation's image: the same task held the same image from the
+//!    row to the sighting, so no pre-admission exec could have swapped
+//!    it. Anything unprovable stays [`UnboundReason::BeforeAdmission`].
 //! 4. No exec record for `T` was seen at or after `X`'s admission, and no
 //!    lifecycle evidence was lost at or after it. The decision waits until
 //!    both a complete lifecycle drain and a readable health read started
@@ -28,6 +35,10 @@
 //!    `WitnessBatch::health_read_ns`), strictly, never on call order: a
 //!    batch staged late or out of order covers only reads it followed. A
 //!    drain that ended at a busy ring head (`head_pending`) covers nothing.
+//!    A row sighted late (after its read, by a re-sight pass) waits for
+//!    horizons past its query's completion instead: only a drain that
+//!    started after the query could have delivered an exec the query's
+//!    answer already reflects.
 //!
 //!    Exec records exist only from the domain's exec coverage start
 //!    ([`ExecCoverage`], stamped after its roots attached). An incarnation
@@ -547,6 +558,31 @@ impl Default for BinderLimits {
     }
 }
 
+/// Whether one witness batch's re-sight pass attempted every row still
+/// owed an attempt: `Complete` when no owed row remains, `Incomplete`
+/// when the pass allowance ran out first (the next batch resumes with
+/// the rows this pass never reached).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResightOutcome {
+    Complete,
+    Incomplete,
+}
+
+/// Cookie queries charged to one witness batch's re-sight pass: one
+/// query (pidfd liveness checks and a BPF map syscall) is one slow
+/// unit under the INV-2 step contract. Rows whose query the allowance
+/// never reached keep their owed attempt for the next batch.
+pub(crate) const RESIGHT_QUERIES_PER_PASS: usize = 64;
+
+/// Live-lookup visits charged to one witness batch's re-sight pass:
+/// each owed row the pass pops costs one visit (an in-memory live
+/// lookup, plus a query on a hit while the query allowance lasts),
+/// so a pass never walks the whole pending queue even against the
+/// full 65,536-row bound — 64 passes drain it worst case. Rows the
+/// visit allowance never reached keep their owed attempt for the
+/// next batch, in queue order.
+pub(crate) const RESIGHT_VISITS_PER_PASS: usize = 1_024;
+
 /// What the cookie query said when the row was read, through the live
 /// incarnation's pin.
 #[derive(Debug, Clone)]
@@ -554,6 +590,24 @@ struct Sighting {
     caller: CallerId,
     first_seen_ns: u64,
     query: CookieQuery,
+    /// Whether a re-sight pass installed this sighting after the row's
+    /// read (`false`: taken at read time, decided against the read). A
+    /// late sighting is a separate representation from a read-time one:
+    /// it may only be accepted once both horizons started strictly
+    /// after the query completed, since old horizons covering the row
+    /// read cannot prove that no exec slipped between the read and the
+    /// query. A late answer whose completion stamp is unavailable
+    /// carries no authority and is never installed (the attempt stays
+    /// owed for a retry); only tests that leave the completion clock
+    /// unmodeled install an unstamped late sighting, decided against
+    /// the row's read like a read-time one.
+    late: bool,
+    /// When a re-sight pass's queries completed (`None`: a read-time
+    /// sighting, or — tests only — a pass whose completion clock is
+    /// unmodeled). Production always models the clock, so a `None`
+    /// there means the clock read failed and the late answer is
+    /// discarded for a retry instead of being installed unstamped.
+    sighted_ns: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -570,6 +624,20 @@ struct Pending {
     /// coverage and competing-image checks still run at decision time,
     /// once both horizons cover the read.
     retained: Option<RetainedCaller>,
+    /// A re-sight attempt is still owed before this row may be decided
+    /// without a sighting: exactly when the row sits in the domain's
+    /// owed queue. A fresh row without a read-time sighting or a
+    /// retained fallback arrives owed, so it never decides
+    /// sightingless before its promised attempt; an attempt clears
+    /// it (a hit past an allowance re-queues instead). A row that
+    /// reaches the front still unsighted but attempted in an earlier
+    /// batch re-queues there, so a caller admitted later is still
+    /// sighted without ever scanning the queue.
+    resight_due: bool,
+    /// The domain batch that last attempted this row (`None`: never).
+    /// A row decides sightingless only on a miss from its own batch;
+    /// an earlier miss is stale once later evidence may have arrived.
+    last_attempt: Option<u64>,
 }
 
 /// Whether `candidate` may carry the row at `event_ns`: proven
@@ -620,6 +688,23 @@ struct DomainState {
     /// Latest exec record instant per tgid.
     exec_ns: HashMap<u32, u64>,
     pending: VecDeque<Pending>,
+    /// Re-sight attempts still owed, as absolute row positions (see
+    /// `popped`/`next_pos`): the pass cursor. Each pass pops from the
+    /// front within its visit and query allowances and pushes
+    /// unattempted work back, so a backlog past the allowances is
+    /// attempted in queue order without ever scanning the pending
+    /// rows. A row sits here exactly when its `resight_due` holds.
+    owed: VecDeque<u64>,
+    /// Absolute positions consumed from the front by decisions: row
+    /// `pending[i]` sits at `popped + i`. Front-only pops keep every
+    /// queued position stable without re-indexing.
+    popped: u64,
+    /// The absolute position the next pushed row takes.
+    next_pos: u64,
+    /// Batches absorbed for this domain (witness and lifecycle
+    /// alike): attempts stamp it, and a row attempted in an earlier
+    /// batch is stale once it reaches the front.
+    batch_seq: u64,
     /// Exec sequences seen per ticket.
     cookies: HashMap<DomainCookie, BTreeMap<u64, ExecSeen>>,
     /// The image each incarnation is bound to in this domain.
@@ -654,6 +739,10 @@ impl DomainState {
             loss_ns: None,
             exec_ns: HashMap::new(),
             pending: VecDeque::new(),
+            owed: VecDeque::new(),
+            popped: 0,
+            next_pos: 0,
+            batch_seq: 0,
             cookies: HashMap::new(),
             callers: HashMap::new(),
             ended: HashSet::new(),
@@ -664,11 +753,26 @@ impl DomainState {
         self.loss_ns = Some(self.loss_ns.map_or(at_ns, |was| was.max(at_ns)));
     }
 
-    /// Both horizons started strictly after the row's read finished.
+    /// Both horizons started strictly after the row's read finished —
+    /// and, for a re-sighted row, strictly after its query completed.
+    /// The read-time threshold cannot prove that no exec slipped
+    /// between the read and a later query, so the late sighting waits
+    /// for its own horizons. An unstamped late sighting (tests only,
+    /// unmodeled clock — a modeled clock failure retries instead of
+    /// installing) falls back to the row's read.
     fn horizons_cover(&self, pending: &Pending) -> bool {
         pending.read_ns.is_some_and(|read_ns| {
-            self.lifecycle_ns.is_some_and(|ns| ns > read_ns)
-                && self.health_ns.is_some_and(|ns| ns > read_ns)
+            // Only a late sighting carries its own completion
+            // threshold; a read-time sighting is decided against
+            // the row's read.
+            let threshold = match pending.sighting.as_ref() {
+                Some(sighting) if sighting.late => sighting
+                    .sighted_ns
+                    .map_or(read_ns, |sighted_ns| sighted_ns.max(read_ns)),
+                _ => read_ns,
+            };
+            self.lifecycle_ns.is_some_and(|ns| ns > threshold)
+                && self.health_ns.is_some_and(|ns| ns > threshold)
         })
     }
 
@@ -676,6 +780,22 @@ impl DomainState {
     /// through a revalidation (unknown coverage: never).
     fn predates_coverage(&self, first_seen_ns: u64) -> bool {
         self.coverage_ns.is_none_or(|start| first_seen_ns < start)
+    }
+
+    /// Whether a row recorded before its incarnation's admission may
+    /// still bind (late binding): exec coverage already covered the
+    /// row's instant, and no exec of the tgid or lost lifecycle
+    /// evidence is recorded at or after it, so no exec hides between
+    /// the row and the admission. Unknown coverage fails closed.
+    fn late_window_clean(&self, row: &WitnessRow) -> bool {
+        !self.predates_coverage(row.recorded_at_ns)
+            && !self
+                .exec_ns
+                .get(&row.host_tgid)
+                .is_some_and(|&exec_ns| exec_ns >= row.recorded_at_ns)
+            && !self
+                .loss_ns
+                .is_some_and(|loss_ns| loss_ns >= row.recorded_at_ns)
     }
 
     /// The row waits for the revalidation pass: its incarnation predates a
@@ -717,6 +837,10 @@ pub(crate) struct NativeBinder {
     metadata_clock_qualified: bool,
     #[cfg(test)]
     current_binding_clock: Option<fn() -> Option<u64>>,
+    /// Scripted re-sight completion stamps (tests only): production
+    /// stamps the pass with the monotonic clock after its queries.
+    #[cfg(test)]
+    resight_clock: Option<fn() -> Option<u64>>,
 }
 
 impl NativeBinder {
@@ -734,6 +858,8 @@ impl NativeBinder {
             metadata_clock_qualified: false,
             #[cfg(test)]
             current_binding_clock: None,
+            #[cfg(test)]
+            resight_clock: None,
         }
     }
 
@@ -1087,20 +1213,32 @@ impl NativeBinder {
         {
             state.lifecycle_ns = Some(state.lifecycle_ns.map_or(started, |was| was.max(started)));
         }
+        state.batch_seq += 1;
         self.decide_ready(index);
     }
 
     /// One witness read: its health (read before its rows) covers earlier
     /// reads; each row is decided at once from a cached exact image, or
     /// sighted (live incarnation plus cookie query, now) and decided once
-    /// both horizons cover its read.
+    /// both horizons cover its read. Rows absorbed while no live
+    /// incarnation held their tgid join the owed queue and are
+    /// re-sighted by later witness batches until they decide, so a
+    /// caller admitted before the horizons arrive still binds (late
+    /// binding); rows with a retained fallback keep their read-time
+    /// verdict path. Each batch visits at most
+    /// [`RESIGHT_VISITS_PER_PASS`] owed rows and queries at most
+    /// [`RESIGHT_QUERIES_PER_PASS`] of them, and reports
+    /// [`ResightOutcome::Incomplete`] when owed rows remain; the next
+    /// batch resumes with them. A re-sighted row decides only once both
+    /// horizons started strictly after its query completed.
     pub(crate) fn absorb_witnesses<Pin>(
         &mut self,
         batch: &WitnessBatch,
         lookup: &dyn CallerLookup<Pin>,
         identity: &mut dyn NativeIdentity<Pin>,
-    ) {
+    ) -> ResightOutcome {
         let index = self.domain_index(batch.domain);
+        self.domains[index].batch_seq += 1;
         let limits = self.limits;
         let state = &mut self.domains[index];
         let metadata_health = batch.phase == crate::attach::capture::CapturePhase::Active
@@ -1136,6 +1274,10 @@ impl NativeBinder {
                 state.health_ns = Some(state.health_ns.map_or(read, |was| was.max(read)));
             }
         }
+        // The re-sight pass runs before the read loop: rows this batch
+        // newly reads were just attempted by the read-time lookup, so
+        // the pass only owes rows carried from earlier batches.
+        let outcome = self.resight_pass(index, lookup, identity);
         let read_ns = stamp(batch.rows_read_ns);
         self.census.integrity += batch.integrity.len() as u64;
         for row in &batch.rows {
@@ -1169,6 +1311,11 @@ impl NativeBinder {
                 caller: caller.id,
                 first_seen_ns: caller.first_seen_ns,
                 query: identity.query_cookie(row.domain, caller.pin),
+                // A read-time sighting is decided against the row's
+                // read; only a late sighting carries its own query
+                // completion threshold.
+                late: false,
+                sighted_ns: None,
             });
             // A row with no live answer may still bind through the one
             // unambiguous retained incarnation; anything else keeps its
@@ -1184,20 +1331,187 @@ impl NativeBinder {
                     };
                     retained_candidate(only, row.recorded_at_ns).then_some(*only)
                 });
+            // A row without a read-time sighting or a retained
+            // fallback joins the owed queue: the read-time lookup was
+            // only good at read time, and the row must not decide
+            // sightingless before a pass attempts it. (The pass above
+            // already ran, so the attempt lands on a later batch.)
+            let due = sighting.is_none() && retained.is_none();
+            if due {
+                state.owed.push_back(state.next_pos);
+            }
             state.pending.push_back(Pending {
                 row: row.clone(),
                 read_ns,
                 sighting,
                 retained,
+                resight_due: due,
+                last_attempt: None,
             });
+            state.next_pos += 1;
             self.census.pending += 1;
         }
         self.decide_ready(index);
+        outcome
+    }
+
+    /// One bounded re-sight pass over the domain's owed queue, in
+    /// queue order: at most [`RESIGHT_VISITS_PER_PASS`] popped rows
+    /// get their live lookup, and at most
+    /// [`RESIGHT_QUERIES_PER_PASS`] live hits are queried, then the
+    /// pass completion stamp for every row this pass sighted. A miss
+    /// stamps its attempt; a hit past an allowance goes back to the
+    /// queue. The pass reports [`ResightOutcome::Incomplete`] while
+    /// owed rows remain and the next batch resumes with them; it
+    /// never scans the pending rows.
+    fn resight_pass<Pin>(
+        &mut self,
+        index: usize,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+    ) -> ResightOutcome {
+        let current = self.domains[index].batch_seq;
+        let mut visits = 0usize;
+        let mut queries = 0usize;
+        let mut sighted: Vec<u64> = Vec::new();
+        while visits < RESIGHT_VISITS_PER_PASS {
+            let Some(pos) = self.domains[index].owed.pop_front() else {
+                break;
+            };
+            visits += 1;
+            let rel = pos.saturating_sub(self.domains[index].popped) as usize;
+            let Some(row_tgid) = self.domains[index]
+                .pending
+                .get(rel)
+                .filter(|pending| {
+                    pending.resight_due && pending.sighting.is_none() && pending.retained.is_none()
+                })
+                .map(|pending| pending.row.host_tgid)
+            else {
+                // Stale or no longer owed (defensive: pops only take
+                // unowed rows and `finish` clears the queue).
+                if let Some(pending) = self.domains[index].pending.get_mut(rel) {
+                    pending.resight_due = false;
+                }
+                continue;
+            };
+            let hit = lookup.live_caller(row_tgid);
+            if hit.is_some() && queries >= RESIGHT_QUERIES_PER_PASS {
+                // A hit past the query allowance stays owed for the
+                // next pass while later rows are still visited.
+                self.domains[index].owed.push_back(pos);
+                continue;
+            }
+            let state = &mut self.domains[index];
+            let Some(pending) = state.pending.get_mut(rel) else {
+                continue;
+            };
+            if !pending.resight_due {
+                continue;
+            }
+            match hit {
+                None => {
+                    pending.resight_due = false;
+                    pending.last_attempt = Some(current);
+                }
+                Some(caller) => {
+                    queries += 1;
+                    pending.resight_due = false;
+                    pending.last_attempt = Some(current);
+                    pending.sighting = Some(Sighting {
+                        caller: caller.id,
+                        first_seen_ns: caller.first_seen_ns,
+                        query: identity.query_cookie(pending.row.domain, caller.pin),
+                        late: true,
+                        sighted_ns: None,
+                    });
+                    sighted.push(pos);
+                }
+            }
+        }
+        // Pass completion, read after every query: it covers each
+        // query's completion, so horizons past it are past them.
+        let completed = if sighted.is_empty() {
+            None
+        } else {
+            self.resight_stamp()
+        };
+        // A modeled clock that answers nothing: the queries ran but
+        // their completion is unstamped, so the late answers carry no
+        // authority and must not decide against the pre-query
+        // horizons. The spent queries are kept spent and every
+        // sighted row goes back to the owed queue: the next pass
+        // retries them within the same bounded allowances. (An
+        // unmodeled test clock keeps the legacy read-threshold
+        // fallback below.)
+        if completed.is_none() && !sighted.is_empty() && self.resight_clock_modeled() {
+            let state = &mut self.domains[index];
+            for pos in &sighted {
+                let rel = pos.saturating_sub(state.popped) as usize;
+                if let Some(pending) = state.pending.get_mut(rel) {
+                    pending.sighting = None;
+                    pending.last_attempt = None;
+                    pending.resight_due = true;
+                }
+            }
+            let state = &mut self.domains[index];
+            for pos in sighted {
+                state.owed.push_back(pos);
+            }
+            return ResightOutcome::Incomplete;
+        }
+        let state = &mut self.domains[index];
+        for pos in sighted {
+            let rel = pos.saturating_sub(state.popped) as usize;
+            if let Some(pending) = state.pending.get_mut(rel)
+                && let Some(sighting) = pending.sighting.as_mut()
+            {
+                sighting.sighted_ns = completed;
+            }
+        }
+        if state.owed.is_empty() {
+            ResightOutcome::Complete
+        } else {
+            ResightOutcome::Incomplete
+        }
+    }
+
+    /// Whether the re-sight completion clock is modeled: production
+    /// always reads the monotonic clock, while tests model it only
+    /// once the seam is set. A modeled clock that answers nothing is
+    /// a clock failure (the late answer retries); an unmodeled one is
+    /// a scene that does not time its queries (the legacy
+    /// read-threshold fallback).
+    fn resight_clock_modeled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.resight_clock.is_some()
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// When this re-sight pass's queries completed: the monotonic
+    /// clock read after the last query (`None` when the clock read
+    /// failed — or the test seam is unset).
+    fn resight_stamp(&self) -> Option<u64> {
+        #[cfg(test)]
+        let completed = self.resight_clock.and_then(|clock| clock());
+        #[cfg(not(test))]
+        let completed = crate::attach::monotonic_ns().and_then(stamp);
+        completed
     }
 
     #[cfg(test)]
     pub(crate) fn set_current_binding_clock(&mut self, clock: fn() -> Option<u64>) {
         self.current_binding_clock = Some(clock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resight_clock(&mut self, clock: fn() -> Option<u64>) {
+        self.resight_clock = Some(clock);
     }
 
     pub(crate) fn domain_active(&self, domain: NativeDomainId) -> bool {
@@ -1382,10 +1696,22 @@ impl NativeBinder {
     /// No later evidence will arrive for `domain` (its capture retired):
     /// every row of that domain still waiting is unbound. Other domains
     /// are untouched.
+    /// Whether `domain` still owes re-sight attempts: rows sit in its
+    /// owed queue that no pass attempted yet. The stop machine reads
+    /// on while this holds instead of finishing at the first exact
+    /// refresh.
+    pub(crate) fn resight_owed(&self, domain: NativeDomainId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| !self.domains[*index].owed.is_empty())
+    }
+
     pub(crate) fn finish(&mut self, domain: NativeDomainId) {
         let index = self.domain_index(domain);
         self.domains[index].finished = true;
+        self.domains[index].owed.clear();
         while let Some(pending) = self.domains[index].pending.pop_front() {
+            self.domains[index].popped += 1;
             self.census.pending -= 1;
             let reason = if self.domains[index].awaits_revalidation(&pending) {
                 UnboundReason::ExecCoverageGap
@@ -1406,13 +1732,69 @@ impl NativeBinder {
 
     fn decide_ready(&mut self, index: usize) {
         loop {
-            let state = &mut self.domains[index];
-            if state.pending.front().is_none_or(|pending| {
-                !state.horizons_cover(pending) || state.awaits_revalidation(pending)
-            }) {
+            // The front row's gate: uncovered or revalidation-waiting
+            // rows hold; an unsighted row without a retained fallback
+            // holds while owed; only a miss from the row's own batch
+            // decides sightingless.
+            let current = self.domains[index].batch_seq;
+            let gate = {
+                let state = &self.domains[index];
+                let Some(pending) = state.pending.front() else {
+                    return;
+                };
+                if !state.horizons_cover(pending) || state.awaits_revalidation(pending) {
+                    false
+                } else if pending.sighting.is_some() || pending.retained.is_some() {
+                    true
+                } else {
+                    !pending.resight_due && pending.last_attempt == Some(current)
+                }
+            };
+            if !gate {
+                // Covered, unowed, but stale: the front row's miss (if
+                // any) predates later evidence, so instead of deciding
+                // on it this batch re-queues the stale rows for a
+                // fresh attempt — a bounded forward walk from the
+                // front, never a whole-queue scan. Uncovered and owed
+                // rows simply hold.
+                let state = &mut self.domains[index];
+                let stale_front = state.pending.front().is_some_and(|pending| {
+                    state.horizons_cover(pending)
+                        && !state.awaits_revalidation(pending)
+                        && pending.sighting.is_none()
+                        && pending.retained.is_none()
+                        && !pending.resight_due
+                        && pending.last_attempt != Some(current)
+                });
+                if stale_front {
+                    let mut steps = 0usize;
+                    let mut at = 0usize;
+                    while steps < RESIGHT_VISITS_PER_PASS {
+                        let Some(pending) = state.pending.get(at) else {
+                            break;
+                        };
+                        steps += 1;
+                        if pending.sighting.is_none()
+                            && pending.retained.is_none()
+                            && !pending.resight_due
+                            && pending.last_attempt != Some(current)
+                            && state.horizons_cover(pending)
+                            && !state.awaits_revalidation(pending)
+                        {
+                            let pos = state.popped + at as u64;
+                            state.owed.push_back(pos);
+                            if let Some(row) = state.pending.get_mut(at) {
+                                row.resight_due = true;
+                            }
+                        }
+                        at += 1;
+                    }
+                }
                 return;
             }
+            let state = &mut self.domains[index];
             let pending = state.pending.pop_front().expect("checked front");
+            state.popped += 1;
             self.census.pending -= 1;
             let binding = decide(
                 state,
@@ -1509,8 +1891,9 @@ fn decide(
             UnboundReason::ExecAmbiguous
         });
     }
-    // Rule 3: never a row recorded before the admission.
-    if row.recorded_at_ns < sighting.first_seen_ns {
+    // Rule 3: never a row recorded before the admission, unless its
+    // pre-admission window is provably clean (late binding).
+    if row.recorded_at_ns < sighting.first_seen_ns && !state.late_window_clean(row) {
         return Binding::Unbound(UnboundReason::BeforeAdmission);
     }
     // Rule 4, coverage: an incarnation admitted before exec coverage began

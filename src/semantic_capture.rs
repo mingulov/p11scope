@@ -1916,30 +1916,6 @@ impl SemanticCapture {
         self.take_drift_tolerated.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Whether a retained take accepts live epochs ahead of the
-    /// effective ones: the same words at local, fault, sticky and
-    /// record flags with a strictly advanced global, while the
-    /// router's newest observation for the key already carries
-    /// disclosed global churn (and no miss-era uncertainty).
-    /// Mirrors the router's own taint inheritance: later global
-    /// advances reuse the first one's reload-not-excluded
-    /// disclosure instead of re-queueing. Untainted, miss-tainted,
-    /// non-global or backward moves refuse.
-    fn accept_live_ahead(
-        live: CompleteEpochs,
-        effective: CompleteEpochs,
-        back_global_tainted: bool,
-        back_miss_tainted: bool,
-    ) -> bool {
-        live.local == effective.local
-            && live.fault == effective.fault
-            && live.sticky == effective.sticky
-            && live.record_flags == effective.record_flags
-            && live.global > effective.global
-            && back_global_tainted
-            && !back_miss_tainted
-    }
-
     /// Request a partition refresh for a key whose take raced live
     /// truth: the next tick re-observes it through the normal
     /// joined sweep, so the router follows current truth and the
@@ -2488,20 +2464,12 @@ impl SemanticCapture {
             return Err(Refusal::WitnessStale);
         }
         if state.epochs != effective {
-            // Live truth ahead of a tainted scan still validates:
-            // the same local words with an advanced global past
-            // disclosed churn. Anything else races for the refresh
-            // scan to prove.
-            let (global_tainted, miss_tainted) = self
-                .router
-                .partition_back_taint(receipt.domain, receipt.image, receipt.endpoint.file_slot)
-                .unwrap_or((false, false));
-            if !retained
-                || !Self::accept_live_ahead(state.epochs, effective, global_tainted, miss_tainted)
-            {
-                return Err(Refusal::EpochDrift);
-            }
-            tolerated = true;
+            // Live ahead of the newest accepted observation races
+            // for the refresh scan to prove: the take carries no
+            // ranges and sees no recorded absence or storage break,
+            // so only a re-observation that re-proves the same
+            // instance can validate.
+            return Err(Refusal::EpochDrift);
         }
         if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
             || !Arc::ptr_eq(

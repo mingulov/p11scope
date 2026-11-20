@@ -1379,8 +1379,9 @@ impl InstanceRouter {
     }
 
     /// Global/miss taint of the newest observation for one key,
-    /// for take-side live-ahead decisions. `None` without an
+    /// for take-twin setup assertions. `None` without an
     /// observation or for a foreign domain.
+    #[cfg(test)]
     pub(crate) fn partition_back_taint(
         &self,
         domain: NativeDomainId,

@@ -28760,6 +28760,37 @@ fn keymeta_flag_off_drops_lengths() {
     assert_eq!(inferred.size.completions, 0);
 }
 
+/// Sizes-unavailable mode (the sizes-off journal retry): a
+/// completed call without lengths reads `key_sizes_unavailable`,
+/// never the needs-flag reason, while families join unchanged.
+#[test]
+fn keymeta_sizes_unavailable_names_its_own_reason() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    ctx.keyuse.set_key_sizes_unavailable();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        None,
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.size.reason,
+        Some(crate::keymeta::REASON_KEY_SIZES_UNAVAILABLE)
+    );
+    assert_eq!(inferred.size.completions, 0);
+}
+
 /// Off-mode drops unwrap parks (§9 stale/replayed rule): a valued
 /// trailer with the flag off parks nothing, so the fresh view's
 /// first row carries no forward-filled size.
@@ -30300,6 +30331,7 @@ fn key_operation_schema_v7_pins_inferred_keys() {
             "rsa",
             "rsa_nonstandard",
             "ec",
+            "ec_class",
             "eddsa",
             "dsa_class",
             "pqc_set",
@@ -32057,10 +32089,13 @@ fn keymeta_legacy_combined_label_conflicts_family_and_size() {
         InferredStatus::Conflicting,
         "ECDSA on a Montgomery-labeled key conflicts"
     );
+    // The conflicting size stays the length-only class: no curve
+    // is inferred from the 64-octet shape, and the Montgomery label
+    // never fills one.
     assert_eq!(
         inferred.size.detail.as_ref().map(|(detail, _)| detail),
         Some(&SizeDetail::Ec {
-            curve: "p256",
+            curve: None,
             octets: 64,
         })
     );
@@ -32069,6 +32104,72 @@ fn keymeta_legacy_combined_label_conflicts_family_and_size() {
         InferredStatus::Conflicting,
         "the size gate agrees with the family gate"
     );
+}
+
+/// An ECDSA completion on a Secp256r1-labeled key publishes the
+/// established curve beside the standing label; the same length on
+/// an unlabeled key publishes the size class only.
+#[test]
+fn keymeta_ecdsa_fill_needs_its_established_curve() {
+    const ECDSA: u64 = 0x1041;
+    // Labeled: the 64-octet class fills p256 from the label.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_SignInit",
+        0,
+        KeyRole::OperationKey,
+        Some(KeyLabel::Ec {
+            curve: SafeCurve::Secp256r1,
+        }),
+    );
+    ctx.start("C_SignInit", 7, Some(ECDSA), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "ec_p256")
+        .expect("the sign row infers");
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Ec {
+            curve: Some("p256"),
+            octets: 64,
+        })
+    );
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
+    // Unlabeled: the same length publishes the class only.
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(ECDSA), &[receipt], 100);
+    ctx.end(
+        "C_Sign",
+        7,
+        CkRv::OK.0,
+        op_capture(),
+        200,
+        Some(LengthOutcome::Value(64)),
+        None,
+    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(
+        inferred.size.detail.as_ref().map(|(detail, _)| detail),
+        Some(&SizeDetail::Ec {
+            curve: None,
+            octets: 64,
+        })
+    );
+    assert_eq!(inferred.size.status, InferredStatus::Inferred);
 }
 
 /// The shared size-detail specimens run through both actual schema

@@ -13,6 +13,11 @@
       "octets": 32,
       "evidence": "wrap_output",
       "about": "wrapped"
+    },
+    "ec_class": {
+      "kind": "ec_class",
+      "octets": 64,
+      "evidence": "sign_output"
     }
   },
   "refused": {

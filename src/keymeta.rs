@@ -289,6 +289,7 @@ pub(crate) fn family_display(family: KeyFamily) -> &'static str {
 pub(crate) const REASON_UNLISTED_MECHANISM: &str = "unlisted_mechanism";
 pub(crate) const REASON_OPERATION_KEY_ONLY: &str = "operation_key_only";
 pub(crate) const REASON_SIZE_INFERENCE_OFF: &str = "size_inference_off";
+pub(crate) const REASON_KEY_SIZES_UNAVAILABLE: &str = "key_sizes_unavailable";
 pub(crate) const REASON_NO_LENGTH_EVIDENCE: &str = "no_length_evidence";
 pub(crate) const REASON_LENGTH_UNAVAILABLE: &str = "length_unavailable";
 pub(crate) const REASON_HYBRID_WRAP_FORMAT: &str = "hybrid_wrap_format";
@@ -307,6 +308,7 @@ pub(crate) fn reason_display(reason: &str) -> &'static str {
         REASON_UNLISTED_MECHANISM => "unlisted mechanism",
         REASON_OPERATION_KEY_ONLY => "mechanism types the operation key",
         REASON_SIZE_INFERENCE_OFF => "needs --key-sizes",
+        REASON_KEY_SIZES_UNAVAILABLE => "key sizes unavailable",
         REASON_NO_LENGTH_EVIDENCE => "no length evidence",
         REASON_LENGTH_UNAVAILABLE => "length unavailable",
         REASON_HYBRID_WRAP_FORMAT => "hybrid wrap format",
@@ -639,7 +641,11 @@ pub(crate) enum SizeDetail {
         modulus_bytes: u64,
     },
     Ec {
-        curve: &'static str,
+        /// The established curve name (`p256`/`p384`/`p521`), filled
+        /// beside the standing label only — never from the length
+        /// alone (P-256, secp256k1 and brainpoolP256r1 share 64
+        /// octets). `None` publishes the size class.
+        curve: Option<&'static str>,
         octets: u64,
     },
     Eddsa {
@@ -793,8 +799,12 @@ fn classify_rsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
     })
 }
 
-/// ECDSA raw r||s lengths name curves; anything else is DER or another
-/// curve (N6: the PKCS#11 result representation is what was measured).
+/// ECDSA raw r||s lengths name size classes, never curves: 64
+/// octets are P-256, secp256k1 or brainpoolP256r1 (96 likewise
+/// P-384/brainpoolP384r1), so the length alone publishes the class
+/// and the curve fills only beside an established curve. Anything
+/// else is DER or another curve (N6: the PKCS#11 result
+/// representation is what was measured).
 fn classify_ecdsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
     match tag {
         EvidenceTag::SignOutput | EvidenceTag::VerifyInput => {}
@@ -804,20 +814,15 @@ fn classify_ecdsa(tag: EvidenceTag, length: u64) -> SizeOutcome {
             };
         }
     }
-    let curve = match length {
-        64 => "p256",
-        96 => "p384",
-        132 => "p521",
-        _ => {
-            return SizeOutcome::Unknown {
-                reason: REASON_VARIABLE_LENGTH_ENCODING,
-            };
-        }
-    };
-    SizeOutcome::Inferred(SizeDetail::Ec {
-        curve,
-        octets: length,
-    })
+    match length {
+        64 | 96 | 132 => SizeOutcome::Inferred(SizeDetail::Ec {
+            curve: None,
+            octets: length,
+        }),
+        _ => SizeOutcome::Unknown {
+            reason: REASON_VARIABLE_LENGTH_ENCODING,
+        },
+    }
 }
 
 /// EdDSA fixed lengths determine the curve (RFC 8032: the mechanism
@@ -1003,8 +1008,9 @@ pub(crate) fn size_family(detail: &SizeDetail) -> Option<KeyFamily> {
 }
 
 /// The concise parenthetical label for one size detail
-/// ("RSA 2048", "EC P-256", "RSA (non-standard length)", ...):
-/// family-implied standalone form.
+/// ("RSA 2048", "EC P-256" established, "EC 256-bit class"
+/// length-only, "RSA (non-standard length)", ...): family-implied
+/// standalone form.
 pub(crate) fn size_concise(detail: &SizeDetail) -> String {
     match detail {
         SizeDetail::Rsa {
@@ -1012,7 +1018,14 @@ pub(crate) fn size_concise(detail: &SizeDetail) -> String {
             ..
         } => format!("RSA {class}"),
         SizeDetail::Rsa { .. } => "RSA (non-standard length)".to_string(),
-        SizeDetail::Ec { curve, .. } => format!("EC {}", ec_curve_display(curve)),
+        SizeDetail::Ec {
+            curve: Some(curve),
+            ..
+        } => format!("EC {}", ec_curve_display(curve)),
+        SizeDetail::Ec {
+            curve: None,
+            octets,
+        } => format!("EC {}", ec_size_class(*octets)),
         SizeDetail::Eddsa { curve, .. } => eddsa_curve_display(curve).to_string(),
         SizeDetail::DsaClass { label, .. } => {
             format!("DSA {}", dsa_class_display(label))
@@ -1039,8 +1052,17 @@ pub(crate) fn size_verbose(detail: &SizeDetail, tag: EvidenceTag) -> String {
             "RSA, {}-bit class (from {noun} length)",
             masked_rsa_class(*modulus_bytes)
         ),
-        SizeDetail::Ec { curve, .. } => {
+        SizeDetail::Ec {
+            curve: Some(curve),
+            ..
+        } => {
             format!("EC {} (from {noun} length)", ec_curve_display(curve))
+        }
+        SizeDetail::Ec {
+            curve: None,
+            octets,
+        } => {
+            format!("EC {} (from {noun} length)", ec_size_class(*octets))
         }
         SizeDetail::Eddsa { curve, .. } => {
             format!("{} (from {noun} length)", eddsa_curve_display(curve))
@@ -1082,6 +1104,66 @@ fn ec_curve_display(curve: &str) -> &str {
         "p384" => "P-384",
         "p521" => "P-521",
         curve => curve,
+    }
+}
+
+/// EC size-class display for a length-only inference ("256-bit
+/// class"): the 64/96/132-octet raw shapes each cover several
+/// curves, so only the class publishes. The 132-octet class reads
+/// 521-bit (the nominal curve size, not 528).
+fn ec_size_class(octets: u64) -> String {
+    match octets {
+        64 => "256-bit class".to_string(),
+        96 => "384-bit class".to_string(),
+        132 => "521-bit class".to_string(),
+        octets => format!("{octets}-octet class"),
+    }
+}
+
+/// The §10.2 curve spelling for one established NIST curve, to fill
+/// a length-only EC class beside its standing label. `None` for
+/// curves no ECDSA length implies (only P-256/P-384/P-521 fill, and
+/// only through establishment).
+pub(crate) fn established_ec_curve_name(curve: SafeCurve) -> Option<&'static str> {
+    match curve {
+        SafeCurve::Secp256r1 => Some("p256"),
+        SafeCurve::Secp384r1 => Some("p384"),
+        SafeCurve::Secp521r1 => Some("p521"),
+        _ => None,
+    }
+}
+
+/// Fill a length-only EC class with its established curve name when
+/// the combined label establishes a NIST curve the length agrees
+/// with: the published curve is established, never inferred from
+/// the length alone. Every other detail returns unchanged.
+pub(crate) fn with_established_curve(
+    detail: SizeDetail,
+    established: Option<EstablishedKind>,
+    mechanism: Option<u64>,
+) -> SizeDetail {
+    let SizeDetail::Ec { curve: None, octets } = detail else {
+        return detail;
+    };
+    let (Some(EstablishedKind::Ec { curve }), Some(mechanism)) = (established, mechanism) else {
+        return SizeDetail::Ec {
+            curve: None,
+            octets,
+        };
+    };
+    let probe = SizeDetail::Ec {
+        curve: None,
+        octets,
+    };
+    if !size_compatible(&probe, mechanism, EstablishedKind::Ec { curve }) {
+        return probe;
+    }
+    let Some(name) = established_ec_curve_name(curve) else {
+        return probe;
+    };
+    SizeDetail::Ec {
+        curve: Some(name),
+        octets,
     }
 }
 
@@ -1149,17 +1231,25 @@ fn grouped_thousands(value: u64) -> String {
 /// Whether two size details are the same size (§10.2): same detail
 /// kind plus size params. The evidence tag never enters (it is not a
 /// parameter), so same-size evidence keeps the first tag by
-/// construction.
+/// construction. The EC curve fill is established metadata, never a
+/// measured param, so classes compare by octets (a class pinned
+/// before its label arrived still matches the filled repeat).
 pub(crate) fn same_size(a: &SizeDetail, b: &SizeDetail) -> bool {
     // Tags never enter: same kind plus same size params only.
-    a == b
+    match (a, b) {
+        (
+            SizeDetail::Ec { octets: x, .. },
+            SizeDetail::Ec { octets: y, .. },
+        ) => x == y,
+        _ => a == b,
+    }
 }
 
 /// The concise combined label for one valued family plus one valued
-/// size ("RSA 2048", "EC P-256", "Ed25519", "DSA 1024-bit class",
-/// "ML-KEM-768", "AES wrapped material 24 bytes"). Self-sufficient
-/// size displays (EdDSA curves, PQC sets) stand alone; every other
-/// kind names the family.
+/// size ("RSA 2048", "EC P-256" established, "EC 256-bit class"
+/// length-only, "Ed25519", "DSA 1024-bit class", "ML-KEM-768", "AES
+/// wrapped material 24 bytes"). Self-sufficient size displays (EdDSA
+/// curves, PQC sets) stand alone; every other kind names the family.
 pub(crate) fn concise_label(family: KeyFamily, detail: &SizeDetail) -> String {
     let fam = family_display(family);
     match detail {
@@ -1168,7 +1258,14 @@ pub(crate) fn concise_label(family: KeyFamily, detail: &SizeDetail) -> String {
             ..
         } => format!("{fam} {class}"),
         SizeDetail::Rsa { .. } => format!("{fam} (non-standard length)"),
-        SizeDetail::Ec { curve, .. } => format!("{fam} {}", ec_curve_display(curve)),
+        SizeDetail::Ec {
+            curve: Some(curve),
+            ..
+        } => format!("{fam} {}", ec_curve_display(curve)),
+        SizeDetail::Ec {
+            curve: None,
+            octets,
+        } => format!("{fam} {}", ec_size_class(*octets)),
         SizeDetail::Eddsa { curve, .. } => eddsa_curve_display(curve).to_string(),
         SizeDetail::DsaClass { label, .. } => {
             format!("{fam} {}", dsa_class_display(label))
@@ -2437,26 +2534,28 @@ mod tests {
         assert!(!size_compatible(&rsa_2048, 0x0001, E::Rsa { bits: 1024 }));
         assert!(size_compatible(&rsa_2048, 0x0001, E::Rsa { bits: 2041 }));
         assert!(!size_compatible(&rsa_2048, 0x0001, E::Aes { bytes: 16 }));
-        // EC field octets against established curves.
-        let p256 = SizeDetail::Ec {
-            curve: "p256",
+        // EC field octets against established curves (the
+        // production class shape; compatibility reads octets only,
+        // never the fill).
+        let ec_64 = SizeDetail::Ec {
+            curve: None,
             octets: 64,
         };
         assert!(size_compatible(
-            &p256,
+            &ec_64,
             0x1044,
             E::Ec {
                 curve: SafeCurve::Secp256r1
             }
         ));
         assert!(!size_compatible(
-            &p256,
+            &ec_64,
             0x1044,
             E::Ec {
                 curve: SafeCurve::Secp384r1
             }
         ));
-        assert!(!size_compatible(&p256, 0x1044, E::Montgomery));
+        assert!(!size_compatible(&ec_64, 0x1044, E::Montgomery));
         // Edwards curves.
         let ed25519 = SizeDetail::Eddsa {
             curve: "ed25519",
@@ -2592,11 +2691,15 @@ mod tests {
                 reason: REASON_HYBRID_WRAP_FORMAT
             }
         );
-        // ECDSA raw lengths name curves; anything else is DER/other.
-        for (octets, curve) in [(64, "p256"), (96, "p384"), (132, "p521")] {
+        // ECDSA raw lengths name size classes, never curves;
+        // anything else is DER/other.
+        for octets in [64, 96, 132] {
             assert_eq!(
                 classify_size(Some(ECDSA), SignOutput, octets),
-                SizeOutcome::Inferred(SizeDetail::Ec { curve, octets }),
+                SizeOutcome::Inferred(SizeDetail::Ec {
+                    curve: None,
+                    octets
+                }),
                 "{octets} octets"
             );
         }
@@ -2860,10 +2963,15 @@ mod tests {
         };
         assert_eq!(size_concise(&masked), "RSA (non-standard length)");
         let ec = SizeDetail::Ec {
-            curve: "p256",
+            curve: Some("p256"),
             octets: 64,
         };
         assert_eq!(size_concise(&ec), "EC P-256");
+        let ec_class = SizeDetail::Ec {
+            curve: None,
+            octets: 64,
+        };
+        assert_eq!(size_concise(&ec_class), "EC 256-bit class");
         let pqc = SizeDetail::PqcSet {
             parameter_set: "ml_kem_768",
             octets: 1088,
@@ -2888,6 +2996,10 @@ mod tests {
             "EC P-256 (from signature length)"
         );
         assert_eq!(
+            size_verbose(&ec_class, SignOutput),
+            "EC 256-bit class (from signature length)"
+        );
+        assert_eq!(
             size_verbose(&pqc, EncapsulateOutput),
             "ML-KEM-768 (from ciphertext length)"
         );
@@ -2898,6 +3010,7 @@ mod tests {
         // Size-implied families (wrapped material types nothing).
         assert_eq!(size_family(&rsa), Some(KeyFamily::Rsa));
         assert_eq!(size_family(&ec), Some(KeyFamily::Ec));
+        assert_eq!(size_family(&ec_class), Some(KeyFamily::Ec));
         assert_eq!(size_family(&pqc), Some(KeyFamily::MlKem));
         assert_eq!(size_family(&wrapped), None);
     }
@@ -2928,21 +3041,33 @@ mod tests {
         ));
         assert!(same_size(
             &SizeDetail::Ec {
-                curve: "p256",
+                curve: None,
                 octets: 64,
             },
             &SizeDetail::Ec {
-                curve: "p256",
+                curve: None,
+                octets: 64,
+            }
+        ));
+        // The established fill never splits a size: a class pinned
+        // before its label arrived still matches the filled repeat.
+        assert!(same_size(
+            &SizeDetail::Ec {
+                curve: None,
+                octets: 64,
+            },
+            &SizeDetail::Ec {
+                curve: Some("p256"),
                 octets: 64,
             }
         ));
         assert!(!same_size(
             &SizeDetail::Ec {
-                curve: "p256",
+                curve: None,
                 octets: 64,
             },
             &SizeDetail::Ec {
-                curve: "p384",
+                curve: None,
                 octets: 96,
             }
         ));
@@ -2972,10 +3097,18 @@ mod tests {
             "RSA (non-standard length)"
         );
         let ec = SizeDetail::Ec {
-            curve: "p256",
+            curve: Some("p256"),
             octets: 64,
         };
         assert_eq!(concise_label(KeyFamily::Ec, &ec), "EC P-256");
+        let ec_class = SizeDetail::Ec {
+            curve: None,
+            octets: 64,
+        };
+        assert_eq!(
+            concise_label(KeyFamily::Ec, &ec_class),
+            "EC 256-bit class"
+        );
         let eddsa = SizeDetail::Eddsa {
             curve: "ed25519",
             octets: 64,
@@ -3069,6 +3202,7 @@ mod tests {
                 "mechanism types the operation key",
             ),
             (REASON_SIZE_INFERENCE_OFF, "needs --key-sizes"),
+            (REASON_KEY_SIZES_UNAVAILABLE, "key sizes unavailable"),
             (REASON_NO_LENGTH_EVIDENCE, "no length evidence"),
             (REASON_LENGTH_UNAVAILABLE, "length unavailable"),
             (REASON_HYBRID_WRAP_FORMAT, "hybrid wrap format"),
@@ -3108,5 +3242,76 @@ mod tests {
                 "{octets} octets"
             );
         }
+    }
+
+    /// The established-curve fill: a class fills only beside a
+    /// combined label that establishes a NIST curve the length
+    /// agrees with. A mismatching label, a non-NIST curve, a missing
+    /// label or mechanism, and every non-EC detail keep the class.
+    #[test]
+    fn established_curve_fills_only_on_agreement() {
+        use EstablishedKind as E;
+        const ECDSA: u64 = 0x1041;
+        let class = || SizeDetail::Ec {
+            curve: None,
+            octets: 64,
+        };
+        assert_eq!(
+            with_established_curve(
+                class(),
+                Some(E::Ec {
+                    curve: SafeCurve::Secp256r1
+                }),
+                Some(ECDSA)
+            ),
+            SizeDetail::Ec {
+                curve: Some("p256"),
+                octets: 64,
+            }
+        );
+        // A mismatching label never fills (the conflict arm, not the
+        // fill, owns the disagreement).
+        assert_eq!(
+            with_established_curve(
+                class(),
+                Some(E::Ec {
+                    curve: SafeCurve::Secp384r1
+                }),
+                Some(ECDSA)
+            ),
+            class()
+        );
+        // A non-NIST established curve never fills.
+        assert_eq!(
+            with_established_curve(class(), Some(E::Montgomery), Some(ECDSA)),
+            class()
+        );
+        // No label or no mechanism never fills.
+        assert_eq!(with_established_curve(class(), None, Some(ECDSA)), class());
+        assert_eq!(
+            with_established_curve(
+                class(),
+                Some(E::Ec {
+                    curve: SafeCurve::Secp256r1
+                }),
+                None
+            ),
+            class()
+        );
+        // Non-EC details pass through untouched.
+        let rsa = SizeDetail::Rsa {
+            size_class: Some(2048),
+            modulus_bytes: 256,
+        };
+        assert_eq!(
+            with_established_curve(
+                rsa.clone(),
+                Some(E::Ec {
+                    curve: SafeCurve::Secp256r1
+                }),
+                Some(ECDSA)
+            ),
+            rsa
+        );
     }
 }

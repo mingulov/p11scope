@@ -2404,11 +2404,14 @@ pub(crate) struct SizeState {
 }
 
 /// One completion's size input after flag/trailer resolution: the
-/// flag is off, the completion carried no trailer, the trailer was
-/// BPF-unavailable, or a length value arrived.
+/// flag is off, the flag was on but the sizes lane failed to start
+/// (key rows continue without lengths), the completion carried no
+/// trailer, the trailer was BPF-unavailable, or a length value
+/// arrived.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SizeInput {
     Off,
+    SizesUnavailable,
     NoEvidence,
     Unavailable,
     Value(u64),
@@ -2558,20 +2561,28 @@ impl SizeState {
         input: SizeInput,
     ) {
         use crate::keymeta::{
-            REASON_LENGTH_UNAVAILABLE, REASON_NO_LENGTH_EVIDENCE, REASON_SIZE_INFERENCE_OFF,
-            SizeOutcome, classify_size,
+            REASON_KEY_SIZES_UNAVAILABLE, REASON_LENGTH_UNAVAILABLE, REASON_NO_LENGTH_EVIDENCE,
+            REASON_SIZE_INFERENCE_OFF, SizeOutcome, classify_size,
         };
         // The weakest unknowns (no reason yet, or a mode/absence
         // reason) lose to everything; only they accept a new reason.
         let weakest = self.status == InferredStatus::Unknown
             && matches!(
                 self.reason,
-                None | Some(REASON_SIZE_INFERENCE_OFF) | Some(REASON_NO_LENGTH_EVIDENCE)
+                None
+                    | Some(REASON_SIZE_INFERENCE_OFF)
+                    | Some(REASON_KEY_SIZES_UNAVAILABLE)
+                    | Some(REASON_NO_LENGTH_EVIDENCE)
             );
         match input {
             SizeInput::Off => {
                 if weakest {
                     self.reason = Some(REASON_SIZE_INFERENCE_OFF);
+                }
+            }
+            SizeInput::SizesUnavailable => {
+                if weakest {
+                    self.reason = Some(REASON_KEY_SIZES_UNAVAILABLE);
                 }
             }
             SizeInput::NoEvidence => {
@@ -2639,6 +2650,12 @@ impl SizeState {
         use crate::keymeta::{families_compatible, same_size, size_compatible, size_family};
         match self.detail.as_ref() {
             None => {
+                // A length-only EC class publishes its established
+                // curve beside the standing label when the length
+                // agrees with it; the curve is established, never
+                // inferred from the length alone.
+                let detail =
+                    crate::keymeta::with_established_curve(detail, established, mechanism);
                 self.detail = Some((detail.clone(), tag));
                 self.status = InferredStatus::Inferred;
                 self.reason = None;
@@ -2828,6 +2845,12 @@ pub(crate) struct KeyUseReducer {
     /// trailers at all (the length programs never load), so the
     /// gate is vacuous there and admitting is the safe default.
     key_sizes: bool,
+    /// Whether the flag was on but the sizes lane failed to start
+    /// (the journal retry seated without length programs): lengths
+    /// drop unclassified with `key_sizes_unavailable`, never the
+    /// needs-flag reason. Latched once at lane start; harnesses
+    /// leave it false.
+    key_sizes_unavailable: bool,
     /// Shared tickets closed while the shared ledger was absent
     /// (N1c): flushed at the next shared contact, C4-style. Bounded
     /// by the shared census — each pend holds a live shared ticket.
@@ -2865,6 +2888,7 @@ impl KeyUseReducer {
             inferred: BTreeMap::new(),
             parked: BTreeMap::new(),
             key_sizes: true,
+            key_sizes_unavailable: false,
         }
     }
 
@@ -2877,10 +2901,35 @@ impl KeyUseReducer {
         self.key_sizes = key_sizes;
     }
 
+    /// Latch the sizes-unavailable mode: the flag was on but the
+    /// sizes lane failed to start, so lengths drop unclassified
+    /// with `key_sizes_unavailable`, never the needs-flag reason.
+    /// Stops admission like off-mode (no trailers can arrive).
+    pub(crate) fn set_key_sizes_unavailable(&mut self) {
+        self.key_sizes = false;
+        self.key_sizes_unavailable = true;
+    }
+
     /// Whether this reducer admits length evidence (wiring pin only).
     #[cfg(test)]
     pub(crate) fn key_sizes_enabled(&self) -> bool {
         self.key_sizes
+    }
+
+    /// Whether the sizes lane failed to start (wiring pin only).
+    #[cfg(test)]
+    pub(crate) fn key_sizes_unavailable(&self) -> bool {
+        self.key_sizes_unavailable
+    }
+
+    /// The dropped-length size input: the unavailable reason when
+    /// the sizes lane failed to start, else the needs-flag reason.
+    fn off_input(&self) -> SizeInput {
+        if self.key_sizes_unavailable {
+            SizeInput::SizesUnavailable
+        } else {
+            SizeInput::Off
+        }
     }
 
     /// Retained per-bucket inferred keys, for the projection.
@@ -3300,7 +3349,7 @@ impl KeyUseReducer {
         }
         let tag = evidence_tag_for_category(open.category);
         let input = match (self.key_sizes, length) {
-            (false, _) => SizeInput::Off,
+            (false, _) => self.off_input(),
             (true, None) => SizeInput::NoEvidence,
             (true, Some(LengthOutcome::Unavailable)) => SizeInput::Unavailable,
             (true, Some(LengthOutcome::Value(value))) => SizeInput::Value(value),
@@ -3426,7 +3475,7 @@ impl KeyUseReducer {
                     let input = if about_this_key {
                         self.size_input_for(length)
                     } else if !self.key_sizes {
-                        SizeInput::Off
+                        self.off_input()
                     } else {
                         SizeInput::NoEvidence
                     };
@@ -3484,7 +3533,7 @@ impl KeyUseReducer {
     fn size_input_for(&self, length: Option<crate::keymeta::LengthOutcome>) -> SizeInput {
         use crate::keymeta::LengthOutcome;
         match (self.key_sizes, length) {
-            (false, _) => SizeInput::Off,
+            (false, _) => self.off_input(),
             (true, None) => SizeInput::NoEvidence,
             (true, Some(LengthOutcome::Unavailable)) => SizeInput::Unavailable,
             (true, Some(LengthOutcome::Value(value))) => SizeInput::Value(value),

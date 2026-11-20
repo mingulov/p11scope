@@ -1164,8 +1164,8 @@
       "additionalProperties": false,
       "properties": {
         "kind": {
-          "enum": ["rsa", "rsa_nonstandard", "ec", "eddsa", "dsa_class", "pqc_set", "wrapped_material"],
-          "description": "Size kind. rsa carries size_class plus modulus_bytes; rsa_nonstandard carries modulus_bytes only (masked class in text, never a range); ec/eddsa carry curve plus octets; dsa_class carries the pinned legacy label; pqc_set carries the parameter set; wrapped_material sizes the wrapped key, never the wrapping key."
+          "enum": ["rsa", "rsa_nonstandard", "ec", "ec_class", "eddsa", "dsa_class", "pqc_set", "wrapped_material"],
+          "description": "Size kind. rsa carries size_class plus modulus_bytes; rsa_nonstandard carries modulus_bytes only (masked class in text, never a range); ec carries the established curve plus octets; ec_class carries octets only (a length alone never names a curve); eddsa carries curve plus octets; dsa_class carries the pinned legacy label; pqc_set carries the parameter set; wrapped_material sizes the wrapped key, never the wrapping key."
         },
         "evidence": {
           "enum": ["sign_output", "verify_input", "encrypt_output", "decrypt_input", "wrap_output", "unwrap_input", "encapsulate_output", "decapsulate_input"],
@@ -1246,6 +1246,16 @@
               "properties": {
                 "kind": {"const": "ec"},
                 "curve": {"enum": ["p256", "p384", "p521"]},
+                "octets": {"enum": [64, 96, 132]},
+                "evidence": {"enum": ["sign_output", "verify_input"]}
+              }
+            },
+            {
+              "type": "object",
+              "required": ["kind", "octets", "evidence"],
+              "additionalProperties": false,
+              "properties": {
+                "kind": {"const": "ec_class"},
                 "octets": {"enum": [64, 96, 132]},
                 "evidence": {"enum": ["sign_output", "verify_input"]}
               }

@@ -1201,9 +1201,20 @@ fn size_detail_json(
                 })
             }
         }
-        SizeDetail::Ec { curve, octets } => serde_json::json!({
+        SizeDetail::Ec {
+            curve: Some(curve),
+            octets,
+        } => serde_json::json!({
             "kind": "ec",
             "curve": curve,
+            "octets": octets,
+            "evidence": evidence,
+        }),
+        SizeDetail::Ec {
+            curve: None,
+            octets,
+        } => serde_json::json!({
+            "kind": "ec_class",
             "octets": octets,
             "evidence": evidence,
         }),

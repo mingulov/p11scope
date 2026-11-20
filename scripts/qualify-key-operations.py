@@ -211,8 +211,8 @@ INFERRED_FAMILIES = ("rsa", "ec", "eddsa", "xeddsa", "secret", "dsa", "dh", "aes
                      "poly1305", "des", "des3", "camellia", "aria", "seed", "gost")
 INFERRED_EVIDENCE = ("sign_output", "verify_input", "encrypt_output", "decrypt_input",
                      "wrap_output", "unwrap_input", "encapsulate_output", "decapsulate_input")
-SIZE_DETAIL_KINDS = ("rsa", "rsa_nonstandard", "ec", "eddsa", "dsa_class", "pqc_set",
-                     "wrapped_material")
+SIZE_DETAIL_KINDS = ("rsa", "rsa_nonstandard", "ec", "ec_class", "eddsa", "dsa_class",
+                     "pqc_set", "wrapped_material")
 # Closed per-kind vocabularies (§10.2): evidence, curves, labels and
 # parameter sets, each enforced in its own variant only.
 RSA_EVIDENCE = ("sign_output", "verify_input", "encrypt_output", "decrypt_input",
@@ -639,6 +639,10 @@ def _check_size_detail(detail):
     elif kind == "ec":
         _keys(detail, {"kind", "curve", "octets", "evidence"})
         _label(detail["curve"], EC_CURVES, "size detail curve")
+        _require(detail["octets"] in (64, 96, 132), "invalid curve detail")
+        _label(detail["evidence"], SIGN_EVIDENCE, "size detail evidence")
+    elif kind == "ec_class":
+        _keys(detail, {"kind", "octets", "evidence"})
         _require(detail["octets"] in (64, 96, 132), "invalid curve detail")
         _label(detail["evidence"], SIGN_EVIDENCE, "size detail evidence")
     elif kind == "eddsa":

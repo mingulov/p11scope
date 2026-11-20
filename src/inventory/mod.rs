@@ -6123,7 +6123,58 @@ fn start_semantic_lane(
                 if stopped() {
                     return None;
                 }
-                let reason = key_operations_refusal_reason(&journal_refusal);
+                // A sizes-on refusal retries the journal once with
+                // sizes off, so a length-program load failure (a
+                // verifier budget on an untested kernel) costs only
+                // sizes, never the key rows. The retry re-mints: the
+                // refused start consumed its subsets.
+                let mut refusal = journal_refusal;
+                if spec.key_sizes {
+                    let sizes_reason = key_operations_refusal_reason(&refusal);
+                    match retry_journal_without_sizes(
+                        coordinator,
+                        scope,
+                        backend,
+                        scan_subset,
+                        run_control,
+                    ) {
+                        RetryWithoutSizes::Sealed(lane) => {
+                            coordinator.note_scope_gap(
+                                "key sizes unavailable".into(),
+                                format!(
+                                    "{sizes_reason}; key operations continue without \
+                                     operation-length sizes"
+                                ),
+                            );
+                            inventory_diagnostic(&format!(
+                                "p11scope: key sizes unavailable: {sizes_reason}; key operations \
+                                 continue without operation-length sizes"
+                            ));
+                            coordinator.note_key_sizes_unavailable();
+                            note_semantic_lane_sealed(true, key_operations);
+                            coordinator.note_semantic_sealed();
+                            return Some(lane);
+                        }
+                        RetryWithoutSizes::Refused(retry_refusal) => {
+                            // The sizes failure keeps its own named
+                            // gap beside the key-operations gap below.
+                            coordinator.note_scope_gap(
+                                "key sizes unavailable".into(),
+                                format!(
+                                    "{sizes_reason}; key operations continue without \
+                                     operation-length sizes"
+                                ),
+                            );
+                            inventory_diagnostic(&format!(
+                                "p11scope: key sizes unavailable: {sizes_reason}; key operations \
+                                 continue without operation-length sizes"
+                            ));
+                            refusal = retry_refusal;
+                        }
+                        RetryWithoutSizes::Stopped => return None,
+                    }
+                }
+                let reason = key_operations_refusal_reason(&refusal);
                 coordinator.note_scope_gap(
                     "key operations unavailable".into(),
                     format!(
@@ -6175,6 +6226,57 @@ fn start_semantic_lane(
             );
             fallback_shell(coordinator, scope, backend, scan_subset)
         }
+    }
+}
+
+/// Outcome of the sizes-off journal retry: a seated lane, a second
+/// refusal (the ordinary retry still follows), or a latched stop.
+enum RetryWithoutSizes {
+    Sealed(crate::inventory_semantics::AttestedSemanticLane),
+    Refused(crate::inventory_semantics::SemanticRefusal),
+    Stopped,
+}
+
+/// Retry one refused sizes-on journal start without sizes: re-mint
+/// (the refused start consumed its subsets) and seal the journal
+/// with `key_sizes: false`. A refused re-mint refuses with its first
+/// code (the mint already disclosed its subset gaps), so the
+/// ordinary retry still follows; a latched stop ends the startup
+/// with no new work.
+fn retry_journal_without_sizes(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scope: &Scope,
+    backend: crate::attach::BackendSelection,
+    scan_subset: bool,
+    run_control: Option<&crate::scope::inventory_cgroup::CollectionControl>,
+) -> RetryWithoutSizes {
+    let stopped = || run_control.is_some_and(|control| control.check().is_err());
+    if stopped() {
+        return RetryWithoutSizes::Stopped;
+    }
+    let (attach_subset, convert_subset) =
+        match seal_mint_start_subsets(coordinator, scan_subset) {
+            Ok(pair) => pair,
+            Err(refusals) => {
+                return RetryWithoutSizes::Refused(refusals.into_iter().next().unwrap_or(
+                    crate::inventory_semantics::SemanticRefusal::Unavailable,
+                ));
+            }
+        };
+    if stopped() {
+        return RetryWithoutSizes::Stopped;
+    }
+    let spec = crate::attach::journal::JournalSpec { key_sizes: false };
+    match seal_start_live(
+        attach_subset,
+        convert_subset,
+        scope,
+        backend,
+        Some(&spec),
+        run_control,
+    ) {
+        Ok(lane) => RetryWithoutSizes::Sealed(lane),
+        Err(refusal) => RetryWithoutSizes::Refused(refusal),
     }
 }
 
@@ -6384,6 +6486,7 @@ fn seal_start_live(
     #[cfg(test)]
     if let Some(verdict) = seal_startup_test::take_start_verdict() {
         seal_startup_test::record_start_scope(scope);
+        seal_startup_test::record_start_journal(journal.map(|spec| spec.key_sizes));
         return verdict;
     }
     crate::inventory_semantics::AttestedSemanticLane::start_live(
@@ -6420,6 +6523,12 @@ mod seal_startup_test {
             const { std::cell::RefCell::new(VecDeque::new()) };
         static START_SCOPES: std::cell::RefCell<Vec<Scope>> =
             const { std::cell::RefCell::new(Vec::new()) };
+        // The journal request per scripted start (`None` ordinary,
+        // `Some(key_sizes)` journal), in order: the sizes-off retry
+        // twin proves the second start re-seals the journal without
+        // sizes instead of falling through to ordinary.
+        static START_JOURNALS: std::cell::RefCell<Vec<Option<bool>>> =
+            const { std::cell::RefCell::new(Vec::new()) };
         // Late-stop probes (F1): one hook per consumed scripted
         // boundary event, in order. A peek hook latches the run
         // control while `take_peek` returns; a start hook latches
@@ -6451,6 +6560,14 @@ mod seal_startup_test {
     pub(super) fn take_start_scopes() -> Vec<Scope> {
         START_SCOPES.with(|recorded| recorded.take())
     }
+    /// Record one scripted start's journal request, in order.
+    pub(super) fn record_start_journal(journal: Option<bool>) {
+        START_JOURNALS.with(|recorded| recorded.borrow_mut().push(journal));
+    }
+    /// Drain the recorded journal requests, in order.
+    pub(super) fn take_start_journals() -> Vec<Option<bool>> {
+        START_JOURNALS.with(|recorded| recorded.take())
+    }
     pub(super) fn with<R>(
         prepares: Vec<Preparation>,
         start: Option<StartVerdict>,
@@ -6472,6 +6589,7 @@ mod seal_startup_test {
                 PREPARE.with(|queued| queued.borrow_mut().clear());
                 START.with(|queued| queued.borrow_mut().clear());
                 START_SCOPES.with(|recorded| recorded.borrow_mut().clear());
+                START_JOURNALS.with(|recorded| recorded.borrow_mut().clear());
                 START_HOOKS.with(|queued| queued.borrow_mut().clear());
             }
         }
@@ -31473,7 +31591,7 @@ mod seal_readiness_tests {
         let mut coordinator = coordinator();
         coordinator.set_key_sizes_requested(true);
         let scope = Scope::Pid(std::process::id());
-        let lane = seal_startup_test::with_start_queue(
+        let (lane, journals) = seal_startup_test::with_start_queue(
             vec![
                 some_preparation(),
                 some_preparation(),
@@ -31485,17 +31603,23 @@ mod seal_readiness_tests {
                 Ok(wind_down_lane(WindDownIo::completing())),
             ],
             || {
-                start_semantic_lane(
+                let lane = start_semantic_lane(
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
                     false,
                     None,
-                )
+                );
+                (lane, seal_startup_test::take_start_journals())
             },
         );
         assert!(lane.is_some(), "the sizes-off journal retry seats a lane");
+        assert_eq!(
+            journals,
+            vec![Some(true), Some(false)],
+            "the retry re-seals the journal without sizes, never ordinary"
+        );
         assert_eq!(
             gaps_for_subject(&mut coordinator, "key sizes unavailable").len(),
             1,
@@ -31504,6 +31628,85 @@ mod seal_readiness_tests {
         assert!(
             gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
             "key rows survive a sizes-only failure"
+        );
+        assert!(
+            coordinator
+                .registry()
+                .keyuse_for_test()
+                .key_sizes_unavailable(),
+            "the retry latches sizes-unavailable on the reducer"
+        );
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS.to_string()],
+            "the retried journal records key operations"
+        );
+    }
+
+    /// Both journal starts refuse with `--key-sizes`: the sizes
+    /// failure keeps its own named gap beside the key-operations gap,
+    /// and the ordinary lane still seats behind them.
+    #[test]
+    fn key_sizes_double_refusal_keeps_both_gaps_behind_ordinary() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        let scope = Scope::Pid(std::process::id());
+        let (lane, journals) = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+                Ok(wind_down_lane(WindDownIo::completing())),
+            ],
+            || {
+                let lane = start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                );
+                (lane, seal_startup_test::take_start_journals())
+            },
+        );
+        assert!(lane.is_some(), "the ordinary retry seats a lane");
+        assert_eq!(
+            journals,
+            vec![Some(true), Some(false), None],
+            "sizes, then sizes-off, then ordinary"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "key sizes unavailable").len(),
+            1,
+            "the sizes failure keeps its own named gap"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").len(),
+            1,
+            "the journal failures void key operations exactly once"
+        );
+        assert!(
+            !coordinator
+                .registry()
+                .keyuse_for_test()
+                .key_sizes_unavailable(),
+            "no journal seated, so nothing latches unavailable"
+        );
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE_KEY_OPERATIONS_REFUSED.to_string()],
+            "the refused request says unavailable, not flag-missing"
         );
     }
 

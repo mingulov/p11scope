@@ -23175,9 +23175,10 @@ fn key_operation_fenced_void_ending_feed_queues_reseed_once() {
     );
 }
 
-/// A failed fresh-evidence take is unknown, not negative: its
-/// delivery retries with staging and Joint mode intact (the next
-/// tick takes again) instead of falling the whole session back.
+/// A transiently failed fresh-evidence take is unknown, not
+/// negative: its delivery retries with staging and Joint mode intact
+/// (the next tick takes again) instead of falling the whole session
+/// back.
 #[test]
 fn joint_failed_take_retries_with_staging_intact() {
     let mut guarded = GuardedScene::new();
@@ -23204,7 +23205,7 @@ fn joint_failed_take_retries_with_staging_intact() {
         &bootstrap,
         crate::semantics_objects::ObjectEffects::default(),
     );
-    failure.take_failed = true;
+    failure.take_failed = Some(crate::attach::BirthObservationRefusal::CurrentPartition);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
         joint_id,

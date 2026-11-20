@@ -3361,7 +3361,7 @@ impl JournalAdapter {
             }
         }
         SealFailure {
-            take_failed: false,
+            take_failed: None,
             scope,
             gap,
             effects,
@@ -3395,7 +3395,7 @@ impl JournalAdapter {
         // not exist at the void, without waiting for the re-sync.
         self.voided_through = self.voided_through.max(upper);
         SealFailure {
-            take_failed: false,
+            take_failed: None,
             scope: self.affected_failure_scope(),
             gap,
             effects,
@@ -3666,7 +3666,7 @@ impl JournalAdapter {
             }
         }
         Some(SealFailure {
-            take_failed: false,
+            take_failed: None,
             scope: SealFailureScope::AffectedDomains(domains),
             gap: if image_fallback {
                 JournalGap::ImageTainted
@@ -5551,10 +5551,10 @@ pub(crate) struct SealFailure {
     /// every non-void refusal.
     pub(crate) fence: Option<u64>,
     /// The seal never observed fresh birth evidence: its evidence
-    /// take failed, so this refusal is unknown, not negative. Only
-    /// the take-failure arm sets this; every other constructor leaves
-    /// it false.
-    pub(crate) take_failed: bool,
+    /// take failed with this refusal. `None` when the take
+    /// succeeded or never ran. Only the take-failure arm sets this;
+    /// every other constructor leaves it `None`.
+    pub(crate) take_failed: Option<crate::attach::BirthObservationRefusal>,
 }
 
 /// Identity of an existing adapter refusal, never positive authority.
@@ -5580,17 +5580,24 @@ impl SealFailure {
         }
     }
 
-    /// Delivery disposition for one seal failure: a failed
-    /// fresh-evidence take is unknown, not negative, so it retries
-    /// with staging intact (the next tick takes again) instead of
-    /// ending the session; every other failure keeps its gap's
-    /// disposition. Failure selection, the audited disposition and
+    /// Delivery disposition for one seal failure: a take failed
+    /// on partition contention or deadline is unknown, not
+    /// negative, so it retries with staging intact (the next tick
+    /// takes again) instead of ending the session; every other
+    /// failure keeps its gap's disposition. Only the contention
+    /// refusal retries: every other take refusal names a permanent
+    /// fact (an unreadable row the recheck will never see again, a
+    /// poisoned or wrong marker, lost custody, a mismatched binding,
+    /// a rejected witness), so it keeps the prompt fallback. A take
+    /// that stays failed degrades via the watchdog park, like any
+    /// stuck retry. Failure selection, the audited disposition and
     /// the feed paths share this mapping.
     pub(crate) fn delivery_disposition(&self) -> crate::semantics_key_use::SealFailureDisposition {
-        if self.take_failed {
-            crate::semantics_key_use::SealFailureDisposition::Retry
-        } else {
-            crate::semantics_key_use::disposition_of(self.gap)
+        use crate::attach::BirthObservationRefusal as Refusal;
+        use crate::semantics_key_use::SealFailureDisposition as Disposition;
+        match self.take_failed {
+            Some(Refusal::CurrentPartition) => Disposition::Retry,
+            _ => crate::semantics_key_use::disposition_of(self.gap),
         }
     }
 
@@ -7060,7 +7067,7 @@ impl JournalAdapter {
             _ => {}
         }
         SealFailure {
-            take_failed: false,
+            take_failed: None,
             gap,
             effects,
             h3_voided,
@@ -7210,7 +7217,16 @@ impl JournalAdapter {
                 // Diagnostic-only (bootstrap arms): count which refusal
                 // failed the take. The refusal below is unchanged.
                 self.note_bootstrap_arm(SealBootstrapArm::Take(refusal));
-                return Err(self.failure(JournalGap::BootstrapMismatch));
+                // A failed take reports its refusal: delivery
+                // retries transient takes with staging intact (the
+                // next tick takes again) instead of ending the
+                // session, while permanent take facts keep the
+                // prompt fallback. The gap stays bootstrap
+                // mismatch; takes that stay failed degrade via the
+                // watchdog park, like any stuck retry.
+                let mut failure = self.failure(JournalGap::BootstrapMismatch);
+                failure.take_failed = Some(refusal);
+                return Err(failure);
             }
         };
         // Re-verify the birth with fresh Session evidence against
@@ -8501,7 +8517,7 @@ impl JournalAdapter {
 
     fn failure(&self, gap: JournalGap) -> SealFailure {
         SealFailure {
-            take_failed: false,
+            take_failed: None,
             gap,
             effects: ObjectEffects::default(),
             h3_voided: None,
@@ -8572,7 +8588,7 @@ impl JournalAdapter {
                 self.retained_refused_dec(refused);
             }
             return Err(SealFailure {
-                take_failed: false,
+                take_failed: None,
                 gap: JournalGap::DomainTainted,
                 effects,
                 h3_voided: None,
@@ -8720,7 +8736,7 @@ impl JournalAdapter {
             self.keys.get_mut(&key).expect("sealed key").tainted = true;
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
-                take_failed: false,
+                take_failed: None,
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
@@ -8793,7 +8809,7 @@ impl JournalAdapter {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
                     self.claims_prune_dirty |= lived;
                     return Err(SealFailure {
-                        take_failed: false,
+                        take_failed: None,
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
@@ -8844,7 +8860,7 @@ impl JournalAdapter {
                 self.keys.get_mut(&key).expect("sealed key").tainted = true;
                 self.claims_prune_dirty |= lived;
                 return Err(SealFailure {
-                    take_failed: false,
+                    take_failed: None,
                     gap: JournalGap::ModelRefused,
                     effects,
                     h3_voided: None,
@@ -8861,7 +8877,7 @@ impl JournalAdapter {
             // operation. Keep the OpenEntry's charge until actual removal.
             let Some(resource) = self.ledger.h8_reservation(entry.begin_ordinal) else {
                 return Err(SealFailure {
-                    take_failed: false,
+                    take_failed: None,
                     gap: JournalGap::ResourceUnavailable,
                     effects,
                     h3_voided: None,
@@ -8907,7 +8923,7 @@ impl JournalAdapter {
                     // The unconverted OpenEntry still owns its original
                     // role/charge; refusal never erased or recreated it.
                     return Err(SealFailure {
-                        take_failed: false,
+                        take_failed: None,
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
@@ -9045,7 +9061,7 @@ impl JournalAdapter {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
                     self.claims_prune_dirty |= lived;
                     return Err(SealFailure {
-                        take_failed: false,
+                        take_failed: None,
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
@@ -9144,7 +9160,7 @@ impl JournalAdapter {
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
-                take_failed: false,
+                take_failed: None,
                 gap: JournalGap::DomainEnded,
                 effects,
                 h3_voided: None,
@@ -9154,7 +9170,7 @@ impl JournalAdapter {
         }
         if rejected {
             return Err(SealFailure {
-                take_failed: false,
+                take_failed: None,
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
@@ -25598,59 +25614,72 @@ pub(crate) mod tests {
         assert_eq!(counts.pin_failed, 0);
     }
 
-    /// A failed fresh-evidence take marks its seal failure as
-    /// unknown, not negative: the gap stays bootstrap mismatch (the
-    /// pinned contract), while the take flag routes delivery to a
-    /// retry with staging intact instead of ending the session.
+    /// A failed fresh-evidence take reports its refusal on the
+    /// seal failure: the gap stays bootstrap mismatch (the pinned
+    /// contract), while the refusal routes delivery (transient takes
+    /// retry with staging intact, permanent take facts keep the
+    /// prompt fallback).
     #[test]
-    fn seal_failed_take_marks_its_failure_retryable() {
+    fn seal_failed_take_reports_its_refusal() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
-        struct FailingBirthSource;
+        struct FailingBirthSource(crate::attach::BirthObservationRefusal);
 
         impl BirthEvidenceSource for FailingBirthSource {
             fn take_birth_evidence(
                 &mut self,
             ) -> Result<SessionBirthEvidence, crate::attach::BirthObservationRefusal> {
-                Err(crate::attach::BirthObservationRefusal::CurrentPartition)
+                Err(self.0)
             }
         }
 
-        let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
-        let create = function_id("C_CreateObject");
-        let begin = begin_bytes(1, 1, create, 0);
-        scene.ingest(&begin);
-        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let bootstrap = scene.bootstrap(proof, 0);
-        let frontier = scene.adapter.consumed_frontier();
-        let audit = scene.audit();
-        let cell = ScriptedFaultCell::steady(audit.fault_after);
-        let mut failing = FailingBirthSource;
-        let failure = scene
-            .adapter
-            .seal(
-                &mut scene.model,
-                &audit,
-                &bootstrap,
-                frontier,
-                &mut failing,
-                &cell,
-            )
-            .expect_err("failed take refuses");
-        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
-        assert!(
-            failure.take_failed,
-            "a failed take marks unknown, not negative"
-        );
+        for refusal in [
+            crate::attach::BirthObservationRefusal::CurrentPartition,
+            crate::attach::BirthObservationRefusal::MarkerNotReady,
+        ] {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            let bootstrap = scene.bootstrap(proof, 0);
+            let frontier = scene.adapter.consumed_frontier();
+            let audit = scene.audit();
+            let cell = ScriptedFaultCell::steady(audit.fault_after);
+            let mut failing = FailingBirthSource(refusal);
+            let failure = scene
+                .adapter
+                .seal(
+                    &mut scene.model,
+                    &audit,
+                    &bootstrap,
+                    frontier,
+                    &mut failing,
+                    &cell,
+                )
+                .expect_err("failed take refuses");
+            assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+            assert_eq!(
+                failure.take_failed,
+                Some(refusal),
+                "a failed take reports its refusal"
+            );
+        }
     }
 
-    /// Delivery disposition routes unknown takes to retry and keeps
-    /// every other failure on its gap's disposition.
+    /// Delivery disposition retries a contention-failed take and
+    /// keeps every other failure on its gap's disposition: a
+    /// permanent take fact (an unreadable row, a poisoned marker,
+    /// lost custody) keeps the prompt fallback.
     #[test]
-    fn seal_failure_delivery_disposition_retries_unknown_takes() {
+    fn seal_failure_delivery_disposition_retries_partition_take() {
+        use crate::attach::BirthObservationRefusal as Refusal;
         use crate::semantics_key_use::SealFailureDisposition;
-        fn failure(gap: JournalGap, take_failed: bool) -> SealFailure {
+        fn failure(
+            gap: JournalGap,
+            take_failed: Option<crate::attach::BirthObservationRefusal>,
+        ) -> SealFailure {
             SealFailure {
                 scope: SealFailureScope::Unqualified,
                 gap,
@@ -25661,15 +25690,30 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(
-            failure(JournalGap::BootstrapMismatch, true).delivery_disposition(),
+            failure(
+                JournalGap::BootstrapMismatch,
+                Some(Refusal::CurrentPartition)
+            )
+            .delivery_disposition(),
             SealFailureDisposition::Retry,
         );
+        for refusal in [
+            Refusal::RowUnreadable,
+            Refusal::MarkerNotReady,
+            Refusal::CustodyLost,
+        ] {
+            assert_eq!(
+                failure(JournalGap::BootstrapMismatch, Some(refusal)).delivery_disposition(),
+                SealFailureDisposition::Fallback,
+                "{refusal:?} keeps the prompt fallback"
+            );
+        }
         assert_eq!(
-            failure(JournalGap::BootstrapMismatch, false).delivery_disposition(),
+            failure(JournalGap::BootstrapMismatch, None).delivery_disposition(),
             SealFailureDisposition::Fallback,
         );
         assert_eq!(
-            failure(JournalGap::H3Loss, false).delivery_disposition(),
+            failure(JournalGap::H3Loss, None).delivery_disposition(),
             SealFailureDisposition::HistoryLoss,
         );
     }

@@ -1522,7 +1522,9 @@ impl JointStaging {
         if self.mode != FeedMode::Joint {
             return (FailureApplyOutcome::Ignored, 0);
         }
-        match disposition_of(failure.gap) {
+        // Contention-failed takes retry with staging intact, like
+        // the production batch path through the audited disposition.
+        match failure.delivery_disposition() {
             SealFailureDisposition::Retry => {
                 // Transient waits keep staging, but never swallow
                 // the refusal's own invalidations (N3).

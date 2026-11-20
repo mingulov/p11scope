@@ -191,6 +191,45 @@ impl ReleaseRoleCursor {
     }
 }
 
+/// Resumable cursor for one budgeted membership release: the
+/// stranded-staged disposal walks a held head's chain without
+/// exceeding its credit. Lookup visits and link reads each cost
+/// one leaf unit; the table stays lookup-consistent across yields
+/// (a removed membership reads absent) and the caller must not
+/// insert, merge or transfer until the release completes.
+pub(super) struct SingleReleaseCursor<C> {
+    role: Role,
+    key: RoleKey,
+    state: SingleReleaseState<C>,
+}
+
+enum SingleReleaseState<C> {
+    Finding {
+        bucket: usize,
+        current: u16,
+        prev: u16,
+        first: bool,
+    },
+    FindingLinear {
+        next_slot: usize,
+    },
+    UnlinkingKey {
+        slot: usize,
+        prev: u16,
+        bucket: usize,
+        node: u16,
+        result: Option<(usize, C)>,
+    },
+    UnlinkingAliases {
+        slot: usize,
+        aliases: [Option<ReservationId>; ROLES],
+        lane: usize,
+        pending: Option<PendingUnlink>,
+        result: Option<(usize, C)>,
+    },
+    Done,
+}
+
 pub(super) struct ReservationTable<C> {
     slots: Vec<TableSlot<C>>,
     next: u64,
@@ -448,6 +487,40 @@ impl<C> ReservationTable<C> {
     #[cfg(test)]
     pub(super) fn reset_test_sweep_visits_for_test(&self) {
         self.test_sweep_visits.set(0);
+    }
+
+    /// Test-only bucket for a model key: lets a high-occupancy twin
+    /// brute-force survivors colliding with a staged head's bucket.
+    #[cfg(test)]
+    pub(crate) fn model_bucket_for_test(value: u64) -> usize {
+        Self::key_bucket(
+            Role::Model,
+            RoleKey {
+                namespace: 0,
+                value,
+            },
+        )
+    }
+
+    /// Test-only bucket for a staged key: the held head's own bucket,
+    /// so colliding survivors can be posed around it.
+    #[cfg(test)]
+    pub(crate) fn staged_bucket_for_test(namespace: u64, value: u64) -> usize {
+        Self::key_bucket(Role::H9Staged, RoleKey { namespace, value })
+    }
+
+    /// Test-only list of retained staged keys: the machine twin finds
+    /// the held head's key among them.
+    #[cfg(test)]
+    pub(super) fn staged_keys_for_test(&self) -> Vec<RoleKey> {
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                slot.operation.as_ref()?.roles[Role::H9Staged.index()]
+                    .as_ref()
+                    .map(|member| member.key)
+            })
+            .collect()
     }
 
     pub(super) fn reservation(&self, role: Role, key: RoleKey) -> Option<ReservationId> {
@@ -931,6 +1004,267 @@ impl<C> ReservationTable<C> {
             }
         }
         Some((member.bytes, member.charge))
+    }
+
+    /// Initial cursor for one budgeted membership release.
+    pub(super) fn single_release_cursor(&self, role: Role, key: RoleKey) -> SingleReleaseCursor<C> {
+        if self.indexed() {
+            SingleReleaseCursor {
+                role,
+                key,
+                state: SingleReleaseState::Finding {
+                    bucket: Self::key_bucket(role, key),
+                    current: INDEX_NONE,
+                    prev: INDEX_NONE,
+                    first: true,
+                },
+            }
+        } else {
+            SingleReleaseCursor {
+                role,
+                key,
+                state: SingleReleaseState::FindingLinear { next_slot: 0 },
+            }
+        }
+    }
+
+    /// One budgeted step of a single membership release: at most
+    /// `budget` leaf units (lookup visits plus chain-link reads).
+    /// Returns whether the release completed, the units spent and
+    /// the independently counted units (both never above `budget`),
+    /// plus the removed bytes and charge when a membership was
+    /// found and the unlink finished. A missing key completes with
+    /// `None` after its bounded lookup. The caller holds `cursor`
+    /// across steps and must not insert, merge or transfer until
+    /// completion.
+    pub(super) fn release_single_step(
+        &mut self,
+        cursor: &mut SingleReleaseCursor<C>,
+        budget: usize,
+    ) -> (bool, usize, usize, Option<(usize, C)>) {
+        if budget == 0 {
+            if matches!(cursor.state, SingleReleaseState::Done) {
+                return (true, 0, 0, None);
+            }
+            return (false, 0, 0, None);
+        }
+        let mut spent = 0usize;
+        let mut actual = 0usize;
+        loop {
+            if spent >= budget {
+                debug_assert!(spent <= budget);
+                return (false, spent, actual, None);
+            }
+            let state = std::mem::replace(&mut cursor.state, SingleReleaseState::Done);
+            match state {
+                SingleReleaseState::Done => {
+                    cursor.state = SingleReleaseState::Done;
+                    debug_assert!(spent <= budget);
+                    return (true, spent, actual, None);
+                }
+                SingleReleaseState::Finding {
+                    bucket,
+                    mut current,
+                    mut prev,
+                    first,
+                } => {
+                    if first {
+                        prev = INDEX_NONE;
+                        current = self.key_heads[bucket];
+                        if current == INDEX_NONE {
+                            cursor.state = SingleReleaseState::Done;
+                            debug_assert!(spent <= budget);
+                            return (true, spent, actual, None);
+                        }
+                    }
+                    if current == INDEX_NONE {
+                        cursor.state = SingleReleaseState::Done;
+                        debug_assert!(spent <= budget);
+                        return (true, spent, actual, None);
+                    }
+                    spent += 1;
+                    actual += 1;
+                    #[cfg(test)]
+                    self.test_slot_visits
+                        .set(self.test_slot_visits.get() + 1);
+                    let slot = node_slot(current);
+                    let lane = node_lane(current);
+                    let role_index = cursor.role.index();
+                    let target = cursor.key;
+                    let found = lane == role_index
+                        && self.slots[slot].operation.as_ref().is_some_and(|op| {
+                            op.roles[lane].as_ref().is_some_and(|m| m.key == target)
+                        });
+                    if found {
+                        let member = self.slots[slot]
+                            .operation
+                            .as_mut()
+                            .and_then(|op| op.roles[role_index].take())
+                            .expect("swept membership retained");
+                        self.populations[role_index] -= 1;
+                        self.bytes -= member.bytes;
+                        let result = (member.bytes, member.charge);
+                        let node = node_code(slot, lane);
+                        cursor.state = SingleReleaseState::UnlinkingKey {
+                            slot,
+                            prev,
+                            bucket,
+                            node,
+                            result: Some(result),
+                        };
+                        continue;
+                    }
+                    let next = self.slots[slot].next[KEY_LINKS][lane];
+                    if next == INDEX_NONE {
+                        cursor.state = SingleReleaseState::Done;
+                        debug_assert!(spent <= budget);
+                        return (true, spent, actual, None);
+                    }
+                    cursor.state = SingleReleaseState::Finding {
+                        bucket,
+                        current: next,
+                        prev: current,
+                        first: false,
+                    };
+                    continue;
+                }
+                SingleReleaseState::FindingLinear { next_slot } => {
+                    if next_slot >= self.slots.len() {
+                        cursor.state = SingleReleaseState::Done;
+                        debug_assert!(spent <= budget);
+                        return (true, spent, actual, None);
+                    }
+                    let at = next_slot;
+                    spent += 1;
+                    actual += 1;
+                    #[cfg(test)]
+                    self.test_slot_visits
+                        .set(self.test_slot_visits.get() + 1);
+                    let role_index = cursor.role.index();
+                    let target = cursor.key;
+                    let found = self.slots[at].operation.as_ref().is_some_and(|op| {
+                        op.roles[role_index]
+                            .as_ref()
+                            .is_some_and(|m| m.key == target)
+                    });
+                    if found {
+                        let member = self.slots[at]
+                            .operation
+                            .as_mut()
+                            .and_then(|op| op.roles[role_index].take())
+                            .expect("swept membership retained");
+                        self.populations[role_index] -= 1;
+                        self.bytes -= member.bytes;
+                        let result = (member.bytes, member.charge);
+                        if self.slot_is_vacant(at) {
+                            self.slots[at].operation = None;
+                            self.live -= 1;
+                        }
+                        cursor.state = SingleReleaseState::Done;
+                        debug_assert!(spent <= budget);
+                        return (true, spent, actual, Some(result));
+                    }
+                    cursor.state = SingleReleaseState::FindingLinear {
+                        next_slot: at + 1,
+                    };
+                    continue;
+                }
+                SingleReleaseState::UnlinkingKey {
+                    slot,
+                    prev: prev_code,
+                    bucket,
+                    node,
+                    mut result,
+                } => {
+                    spent += 1;
+                    actual += 1;
+                    #[cfg(test)]
+                    self.test_sweep_visits
+                        .set(self.test_sweep_visits.get() + 1);
+                    let successor =
+                        self.slots[node_slot(node)].next[KEY_LINKS][node_lane(node)];
+                    if prev_code == INDEX_NONE {
+                        self.key_heads[bucket] = successor;
+                    } else {
+                        self.slots[node_slot(prev_code)].next[KEY_LINKS][node_lane(prev_code)] =
+                            successor;
+                    }
+                    let taken = result.take().expect("pending release keeps its charge");
+                    if self.slot_is_vacant(slot) {
+                        let aliases =
+                            self.slots[slot].operation.as_ref().unwrap().aliases;
+                        self.slots[slot].operation = None;
+                        self.live -= 1;
+                        cursor.state = SingleReleaseState::UnlinkingAliases {
+                            slot,
+                            aliases,
+                            lane: 0,
+                            pending: None,
+                            result: Some(taken),
+                        };
+                        continue;
+                    }
+                    cursor.state = SingleReleaseState::Done;
+                    debug_assert!(spent <= budget);
+                    return (true, spent, actual, Some(taken));
+                }
+                SingleReleaseState::UnlinkingAliases {
+                    slot,
+                    aliases,
+                    mut lane,
+                    mut pending,
+                    mut result,
+                } => {
+                    while lane < ROLES {
+                        let id = aliases[lane];
+                        if id.is_none() {
+                            lane += 1;
+                            continue;
+                        }
+                        let id = id.unwrap();
+                        if pending.is_none() {
+                            pending = Some(PendingUnlink {
+                                plane: ID_LINKS,
+                                bucket: Self::id_bucket(id),
+                                node: node_code(slot, lane),
+                                prev: INDEX_NONE,
+                                splice_ready: false,
+                            });
+                        }
+                        let mut unlink = pending.take().unwrap();
+                        let (done, used, counted) = Self::chain_unlink_resumable(
+                            &mut self.id_heads,
+                            &mut self.slots,
+                            &mut unlink,
+                            budget - spent,
+                        );
+                        spent += used;
+                        actual += counted;
+                        #[cfg(test)]
+                        self.test_sweep_visits
+                            .set(self.test_sweep_visits.get() + counted);
+                        if !done {
+                            cursor.state = SingleReleaseState::UnlinkingAliases {
+                                slot,
+                                aliases,
+                                lane,
+                                pending: Some(unlink),
+                                result,
+                            };
+                            debug_assert!(spent <= budget);
+                            return (false, spent, actual, None);
+                        }
+                        lane += 1;
+                        continue;
+                    }
+                    Self::free_push(&mut self.free_head, &mut self.slots, slot);
+                    let taken = result.take().expect("pending release keeps its charge");
+                    cursor.state = SingleReleaseState::Done;
+                    debug_assert!(spent <= budget);
+                    return (true, spent, actual, Some(taken));
+                }
+            }
+        }
     }
 
     /// Resource bookkeeping only. The enclosing journal must already own

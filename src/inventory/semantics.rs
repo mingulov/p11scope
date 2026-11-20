@@ -1909,13 +1909,15 @@ pub(crate) fn joint_voids_line(
 }
 
 /// One stderr line for the diagnostic seal-bootstrap summary:
-/// which bootstrap check refused a seal, by arm. Counts only; no
-/// identities, paths or payloads. Diagnostic-only: printed beside
-/// the Joint-void summary only when verbose text is requested, never
-/// a contract. Variant detail lists nonzero slots only (`-` when the
-/// bucket is empty).
+/// which bootstrap check refused a seal, by arm, plus retained
+/// takes that succeeded across same-instance drift. Counts only;
+/// no identities, paths or payloads. Diagnostic-only: printed
+/// beside the Joint-void summary only when verbose text is
+/// requested, never a contract. Variant detail lists nonzero slots
+/// only (`-` when the bucket is empty).
 pub(crate) fn joint_bootstraps_line(
     counts: &crate::semantics_objects::journal::SealBootstrapCounts,
+    take_drift_tolerated: u64,
 ) -> String {
     use crate::semantics_objects::journal::SealBootstrapCounts;
     fn detail(slots: &[u64], name: fn(usize) -> Option<&'static str>) -> String {
@@ -1937,9 +1939,10 @@ pub(crate) fn joint_bootstraps_line(
     }
     format!(
         "p11scope: joint seal bootstraps: take_failed={} \
-         reverify_failed={} covers_failed={} pin_failed={} other_failed={} \
-         take_detail={} reverify_detail={}",
+         take_drift_tolerated={} reverify_failed={} covers_failed={} pin_failed={} \
+         other_failed={} take_detail={} reverify_detail={}",
         counts.take_failed_total(),
+        take_drift_tolerated,
         counts.reverify_failed_total(),
         counts.covers_failed,
         counts.pin_failed,
@@ -2381,6 +2384,14 @@ impl AttestedSemanticLane {
         self.live.as_ref().map_or((0, 0, 0, 0), |live| {
             live.capture.admitted_mark_funnel_counts()
         })
+    }
+
+    /// Retained takes that succeeded across same-instance drift
+    /// (diagnostic only; zero without a live lane).
+    pub(crate) fn take_drift_tolerated(&self) -> u64 {
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.capture.take_drift_tolerated())
     }
 
     /// Lane-stash pending floor for the finalizer's disposition: the
@@ -6803,6 +6814,28 @@ mod joint_terminal_tests {
                 Err(SemanticRefusal::Unavailable)
             ),
             "the retained lane refuses the take"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bootstraps_line_tests {
+    use super::*;
+
+    /// The seal-bootstrap line reports retained takes that
+    /// succeeded across drift beside the failure arms.
+    #[test]
+    fn joint_bootstraps_line_reports_take_drift_tolerated() {
+        let counts = crate::semantics_objects::journal::SealBootstrapCounts::default();
+        let line = joint_bootstraps_line(&counts, 7);
+        assert!(
+            line.contains("take_drift_tolerated=7"),
+            "tolerated takes ride the bootstrap line: {line}"
+        );
+        let idle = joint_bootstraps_line(&counts, 0);
+        assert!(
+            idle.contains("take_drift_tolerated=0"),
+            "zero stays explicit: {idle}"
         );
     }
 }

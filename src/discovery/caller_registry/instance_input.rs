@@ -2570,6 +2570,48 @@ impl CallerRegistry {
         self.joint_reseed_queue.push(image);
     }
 
+    /// Queue one take-failure reseed for an image whose Joint feed a
+    /// take failure just ended without a fence: the birth is dead
+    /// (`BootstrapMismatch` never resumes), so only a fresh birth
+    /// can attribute again. The feed must still be reseed-eligible
+    /// and the image must hold unspent budget; a queued reseed
+    /// spends one. Fenced endings use the void arm instead (each
+    /// void already required Joint progress). Returns whether an
+    /// entry was queued.
+    pub(crate) fn maybe_queue_take_reseed(
+        &mut self,
+        key: &InstanceKey,
+        image: ImageIdentity,
+        take_failed: Option<crate::attach::BirthObservationRefusal>,
+        fenced: bool,
+    ) -> bool {
+        /// Take-failure reseeds per image before the fallback stays
+        /// terminal. Small: one recovers (a fresh birth at current
+        /// truth), and two more absorb races where churn overlaps
+        /// the fresh birth's own take.
+        const MAX_TAKE_RESEEDS_PER_IMAGE: u8 = 3;
+        if take_failed.is_none() || fenced || !self.joint_reseed_eligible(key) {
+            return false;
+        }
+        let spent_key = (image.task_cookie, image.exec_id);
+        let spent = self
+            .joint_take_reseed_spent
+            .get(&spent_key)
+            .copied()
+            .unwrap_or(0);
+        if spent >= MAX_TAKE_RESEEDS_PER_IMAGE
+            || (spent == 0 && self.joint_take_reseed_spent.len() >= self.instance_state.limit)
+        {
+            return false;
+        }
+        if self.joint_reseed_queue.len() >= crate::discovery::instances::MAX_PENDING {
+            return false;
+        }
+        self.joint_take_reseed_spent.insert(spent_key, spent + 1);
+        self.joint_reseed_queue.push(image);
+        true
+    }
+
     /// Latch the lane's journal linkage from its drain producers. The
     /// Joint birth path calls this every quantum; tests latch the world
     /// they model. Only a linked lane installs Joint feeds.
@@ -2930,6 +2972,7 @@ impl CallerRegistry {
         let was_joint = record.feed.mode() == FeedMode::Joint;
         let caller = record.caller;
         let gap = batch.audited().failure().gap;
+        let take_failed = batch.audited().failure().take_failed;
         let Some(reducer) = record.semantics.as_mut() else {
             return FailureBatchProgress::Held;
         };
@@ -2971,12 +3014,18 @@ impl CallerRegistry {
                 // `proof_refused_fallback` never stands without one.
                 self.record_gap(joint_ended_gap(caller, joint_seal_reason(gap, class)));
                 // A fenced void ending this feed queues one reseed birth
-                // for its image; unfenced endings resume without one.
+                // for its image; an unfenced take-failure ending queues
+                // one bounded take reseed instead (its birth is dead,
+                // so no clean-point resume can recover it); other
+                // unfenced endings resume without one.
                 if batch.audited().fence().is_some() {
                     let image = self.instance_state.records[&id].key.image;
                     if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
                         self.joint_reseed_queue.push(image);
                     }
+                } else {
+                    let key = self.instance_state.records[&id].key.clone();
+                    self.maybe_queue_take_reseed(&key, key.image, take_failed, false);
                 }
             }
             if !was_joint && matches!(&outcome, FailureBatchProgress::NegativeDelivered(_)) {
@@ -3027,18 +3076,24 @@ impl CallerRegistry {
             self.instance_state.semantic_refused.saturating_add(refused);
         self.after_joint_delivery(id, was_joint, model);
         // Test-only mirror of the production reseed queue: a fenced
-        // void ending this feed queues one reseed birth for its image.
+        // void ending this feed queues one reseed birth for its
+        // image, and an unfenced take-failure ending queues one
+        // bounded take reseed.
         if was_joint
             && matches!(
                 outcome,
                 crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
                     | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
             )
-            && failure.fence.is_some()
         {
-            let image = self.instance_state.records[&id].key.image;
-            if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
-                self.joint_reseed_queue.push(image);
+            if failure.fence.is_some() {
+                let image = self.instance_state.records[&id].key.image;
+                if self.joint_reseed_queue.len() < crate::discovery::instances::MAX_PENDING {
+                    self.joint_reseed_queue.push(image);
+                }
+            } else {
+                let key = self.instance_state.records[&id].key.clone();
+                self.maybe_queue_take_reseed(&key, key.image, failure.take_failed, false);
             }
         }
         outcome

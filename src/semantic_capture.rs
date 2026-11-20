@@ -1431,15 +1431,20 @@ enum RefreshStage {
     Sides { walk: SidesWalk, session: u64 },
     /// Pidfd custody check.
     Custody { session: u64 },
+    /// The bracket's first storage_null sample, before the scan.
+    Bracket { session: u64 },
     /// One scan window, clamped to the service deadline.
-    Scan { session: u64 },
+    Scan {
+        session: u64,
+        storage_before: Option<u64>,
+    },
     /// Stepped post-scan health read over the obtained result.
     PostAudit {
         scanned: Box<ScannedRefresh>,
         walk: HealthWalk,
     },
-    /// The Q1(b) storage_null sample, taken after the scan that
-    /// supplied the epochs (never carried from an earlier pass).
+    /// The Q1(b) bracket's second storage_null sample, after the scan
+    /// that supplied the epochs: it must equal the first.
     Storage(Box<ScannedRefresh>),
     /// Retained target and its file-identity check.
     Target(Box<ScannedRefresh>),
@@ -1454,7 +1459,8 @@ struct ScannedRefresh {
     fence: u64,
     result: Result<ImageScanProof, ImageQueryRefusal>,
     watched: Option<RetainedInventoryTarget>,
-    /// The storage_null sample taken after this scan.
+    /// The scan's storage_null counter: the pre-scan sample until the
+    /// post-scan sample confirms it (the bracket).
     storage: Option<u64>,
     session: u64,
     router: u64,
@@ -2374,9 +2380,9 @@ impl SemanticCapture {
     /// each DESCRIPTORS readback stride (no lookup starts after the
     /// window closes, even mid-stride) and static-side walk stride of
     /// at most [`REFRESH_STRIDE`] entries, the custody check, the
-    /// scan, each read of the post-scan audit, the storage_null
-    /// sample tied to that scan, and the retained target's identity
-    /// check. The router observation pays its join's whole bounded
+    /// storage_null samples bracketing the scan (a move inside the
+    /// bracket withholds the proof), the scan, each read of the
+    /// post-scan audit, and the retained target's identity check. The router observation pays its join's whole bounded
     /// work up front; a join costing more than
     /// [`REFRESH_ACCEPT_CREDITS`] is left to the tick. A spent credit
     /// or a closed window yields with the held interest and its stage
@@ -2603,6 +2609,9 @@ impl SemanticCapture {
         | RefreshStage::Custody {
             session: proven, ..
         }
+        | RefreshStage::Bracket {
+            session: proven, ..
+        }
         | RefreshStage::Scan {
             session: proven, ..
         } = &held.stage
@@ -2687,9 +2696,19 @@ impl SemanticCapture {
                         self.take_refresh_counts.dropped.saturating_add(1);
                     return RefreshFlow::Done;
                 }
-                held.stage = RefreshStage::Scan { session };
+                held.stage = RefreshStage::Bracket { session };
             }
-            RefreshStage::Scan { session } => {
+            RefreshStage::Bracket { session } => {
+                *budget -= 1;
+                held.stage = RefreshStage::Scan {
+                    session,
+                    storage_before: io.storage_null(),
+                };
+            }
+            RefreshStage::Scan {
+                session,
+                storage_before,
+            } => {
                 if !self.refresh_binding_holds(io, held) {
                     self.take_refresh_counts.dropped =
                         self.take_refresh_counts.dropped.saturating_add(1);
@@ -2739,7 +2758,7 @@ impl SemanticCapture {
                         fence,
                         result,
                         watched: None,
-                        storage: None,
+                        storage: storage_before,
                         session,
                         router: Revised::revision(&self.router),
                     }),
@@ -2778,10 +2797,23 @@ impl SemanticCapture {
                     return RefreshFlow::Done;
                 }
                 *budget -= 1;
-                // Q1(b): sampled after the scan, so a storage_null move
-                // the scan's epochs could reflect is always seen (the
-                // native miss arm counts before it globalizes).
-                scanned.storage = io.storage_null();
+                // Q1(b): the scan is bracketed by two samples. Equal
+                // samples prove no storage_null move during the scan,
+                // so the counter is the one its epochs belong to. A
+                // move inside the bracket cannot be placed before or
+                // after the sealed epochs: withhold the proof (counted)
+                // and keep the router's reference; the re-scan proves
+                // post-move truth. An unreadable sample keeps the
+                // legacy rule.
+                let before = scanned.storage;
+                let after = io.storage_null();
+                if before.is_some() && after.is_some() && before != after {
+                    self.take_refresh_counts.restarts =
+                        self.take_refresh_counts.restarts.saturating_add(1);
+                    self.release_refresh(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
+                scanned.storage = after.and(before);
                 held.stage = if held.attached {
                     RefreshStage::Target(scanned)
                 } else {
@@ -5413,24 +5445,33 @@ impl SemanticCapture {
         }
         // Take-requested partition refreshes join this same sweep,
         // so the router follows the current truth a raced take saw
-        // even with no new calls. Resolved fresh; stale interests
-        // drop silently and re-request as needed. A call-driven
+        // even with no new calls. Resolved fresh; a stale interest is
+        // consumed as a counted drop, and one the sweep does not reach
+        // is requeued for a later tick. A call-driven
         // interest for the same key wins (its scan re-observes
         // anyway). Refresh scans carry no birth cut: they re-prove
         // the partition without offering, and births keep flowing
         // through re-arm accounting.
         let mut refresh_keys = BTreeSet::new();
+        // Drained refreshes this tick may not reach (its scan quota or
+        // a capture failure ends the sweep first) are requeued below.
+        let mut drained = BTreeMap::new();
         for ((cookie, exec, file), interest) in self.take_refresh_interests() {
             let key = (cookie, exec, file);
             if joined_interests.contains_key(&key) {
+                drained.insert(key, interest);
                 continue;
             }
-            let Some(endpoint) = io.endpoint(interest.attachment_slot) else {
+            let Some(endpoint) = io
+                .endpoint(interest.attachment_slot)
+                .filter(|endpoint| endpoint.file_slot == file)
+            else {
+                // A stale interest is consumed (counted).
+                self.take_refresh_counts.dropped =
+                    self.take_refresh_counts.dropped.saturating_add(1);
                 continue;
             };
-            if endpoint.file_slot != file {
-                continue;
-            }
+            drained.insert(key, interest);
             joined_interests.insert(
                 key,
                 (
@@ -5462,6 +5503,8 @@ impl SemanticCapture {
             {
                 break;
             }
+            // Reached: the scan (or its refusal) disposes of the key.
+            drained.remove(&key);
             // One per-key scan (the cadence stages its own); the
             // cursor advances per scanned key, as before (its move
             // from before the scan to after is unobservable: the
@@ -5477,6 +5520,18 @@ impl SemanticCapture {
                 }
                 JoinedScanOutcome::Skipped => {}
                 JoinedScanOutcome::Break => break,
+            }
+        }
+        // Unreached refreshes wait for a later tick (a scanned pending
+        // job of the same key already re-observed it); a full or
+        // contended queue makes the loss a counted gap.
+        for (key, interest) in drained {
+            if attempted_keys.contains(&key) || self.stopped {
+                continue;
+            }
+            if !self.requeue_refresh_interest(key, interest) {
+                self.take_refresh_counts.dropped =
+                    self.take_refresh_counts.dropped.saturating_add(1);
             }
         }
         // Retained images that never bind get a bounded horizon: past it

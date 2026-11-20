@@ -67,7 +67,11 @@ name: privileged-tests
 #   manifest assertion (kryoptic's multi-table row is
 #   kryoptic-multi-table) and an inventory --pid workload; a provider
 #   that is not observed on the manifest leg or the inventory leg fails
-#   its cell.
+#   its cell. pqc-keys runs the PQC workload (ML-DSA-44/65/87 plus
+#   ML-KEM-512/768/1024, each generated and used once) against the same
+#   pinned kryoptic under inventory --pid --key-operations, with and
+#   without --key-sizes; every key row must show family + parameter set
+#   in text and --json, with exact known counts (no skip passes).
 # Weekly lib campaign: workflow_dispatch input campaign selects default,
 # long (--include-long) or all (long plus the fixture-skip groups once
 # WP-2 adds them). GitHub schedules run only on the default branch, so the
@@ -2306,3 +2310,53 @@ jobs:
           path: ${{ github.workspace }}/pkcs11-check-providers-full-${{ matrix.provider }}-out/
           if-no-files-found: warn
           retention-days: 30
+  # Post-quantum key visibility on the pinned kryoptic: ML-DSA-44/65/87
+  # plus ML-KEM-512/768/1024 keygen and single use with known counts,
+  # observed with and without --key-sizes. Every required row must
+  # pass; a missing row, count or spotlight line fails the job.
+  pqc-keys:
+    needs: release-build
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc opensc python3 rpm
+      - name: Fetch the pinned kryoptic
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/ci/fetch-provider.sh kryoptic "$RUNNER_TEMP/prov"
+          test -f "$RUNNER_TEMP/prov/kryoptic-rpm/usr/lib64/pkcs11/libkryoptic_pkcs11.so"
+      - name: Download the release observer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-inputs
+          path: ${{ runner.temp }}/release-inputs
+      - name: Run the PQC cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          chmod +x "$in/p11scope" "$in/p11scope-discover"
+          out="$GITHUB_WORKSPACE/pqc-keys-out"
+          # Throwaway token PINs (same values as qualify-public-cli.sh).
+          sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11TEST_PIN=1234 P11TEST_SO_PIN=5678 \
+            TASK_DIR="$RUNNER_TEMP/prov" \
+            scripts/ci/run-cell-script.sh pqc-cell "$in/p11scope" "$out/cells" \
+            --require pqc-workload-truth \
+            --require pqc-sizes-rows \
+            --require pqc-nosizes-rows
+          sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+      - name: Upload the PQC results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pqc-keys
+          path: ${{ github.workspace }}/pqc-keys-out/
+          if-no-files-found: warn
+          retention-days: 7

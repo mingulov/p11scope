@@ -6,6 +6,8 @@
  *
  *   pqc-workload --module P --ready F --go G [--pin P] [--slot N]
  *                  [--post-sleep S] [--pace S] [--settle S]
+ * The user PIN comes from --pin, else $P11TEST_PIN, else the default
+ * throwaway 1234.
  *
  * Sequence: write READY (the process exists so the observer can attach
  * and prearm the provider file), wait for the GO file, then dlopen the
@@ -166,7 +168,7 @@ static const char* rv_name(CK_RV rv){
   }
 }
 int main(int argc, char**argv){
-  const char* module=NULL; const char* ready=NULL; const char* go=NULL; const char* pin="1234";
+  const char* module=NULL; const char* ready=NULL; const char* go=NULL; const char* pin=NULL;
   long slot_arg=-1; int post_sleep=5; int pace=1; int settle=0;
   for(int i=1;i<argc;i++){
     if(!strcmp(argv[i],"--module")&&i+1<argc) module=argv[++i];
@@ -180,6 +182,8 @@ int main(int argc, char**argv){
     else {fprintf(stderr,"usage: %s --module P --ready F --go G [--pin P] [--slot N] [--post-sleep S] [--pace S] [--settle S]\n",argv[0]); return 2;}
   }
   if(!module||!ready||!go){fprintf(stderr,"need --module, --ready and --go\n"); return 2;}
+  if(!pin) pin=getenv("P11TEST_PIN");
+  if(!pin||!*pin) pin="1234";
   if(pace<0) pace=0;
   if(post_sleep<0) post_sleep=0;
   if(settle<0) settle=0;

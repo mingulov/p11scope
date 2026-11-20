@@ -114,7 +114,7 @@ run_leg() {
   READY=$OUT/$leg.ready
   GO=$OUT/$leg.go
   rm -f "$READY" "$GO"
-  WL_ARGV=("$OUT/pqc-workload" --module "$PKCS11_MODULE" --ready "$READY" --go "$GO" --pin "$P11TEST_PIN" --pace 1 --settle 10 --post-sleep 5)
+  WL_ARGV=("$OUT/pqc-workload" --module "$PKCS11_MODULE" --ready "$READY" --go "$GO" --pace 1 --settle 10 --post-sleep 5)
   set +e
   if [ "$ROOTMODE" = yes ]; then
     setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups \

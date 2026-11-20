@@ -2446,6 +2446,18 @@ pub(crate) struct ParkedSize {
 }
 
 impl FamilyState {
+    /// Accumulate one mechanism-less completion: no family evidence,
+    /// so the row names its unknown with `no_mechanism` and counts
+    /// no family completion (mirroring the size side's
+    /// absent-evidence reasons). First unknown reason wins, like the
+    /// unlisted arm; later valued evidence still pins and clears.
+    pub(crate) fn accumulate_no_mechanism(&mut self) {
+        use crate::keymeta::REASON_NO_MECHANISM;
+        if self.status == InferredStatus::Unknown && self.reason.is_none() {
+            self.reason = Some(REASON_NO_MECHANISM);
+        }
+    }
+
     /// Accumulate one mechanism-present completion (§4.4): first
     /// value pins with support, a second distinct specific family
     /// rides the conflict pair, further distinct values count once
@@ -3323,6 +3335,12 @@ impl KeyUseReducer {
                     .or_default()
                     .family
                     .accumulate_family(assoc.established_type, mechanism);
+            } else {
+                self.inferred
+                    .entry(bucket)
+                    .or_default()
+                    .family
+                    .accumulate_no_mechanism();
             }
             self.inferred
                 .entry(bucket)
@@ -3395,6 +3413,12 @@ impl KeyUseReducer {
                                 {
                                     state.reason = Some(REASON_OPERATION_KEY_ONLY);
                                 }
+                            } else {
+                                self.inferred
+                                    .entry(bucket)
+                                    .or_default()
+                                    .family
+                                    .accumulate_no_mechanism();
                             }
                         }
                         KeyRole::WrappingKey
@@ -3408,6 +3432,12 @@ impl KeyUseReducer {
                                     .or_default()
                                     .family
                                     .accumulate_family(established_type, mechanism);
+                            } else {
+                                self.inferred
+                                    .entry(bucket)
+                                    .or_default()
+                                    .family
+                                    .accumulate_no_mechanism();
                             }
                         }
                         KeyRole::OperationKey | KeyRole::Other => {}

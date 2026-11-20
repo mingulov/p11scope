@@ -598,13 +598,19 @@ class BrowserCells(unittest.TestCase):
             for gap in report.get("gaps") or []
             if isinstance(gap, dict)
             and gap.get("subject") == "Joint birth unavailable; retained S1")
-        # Folded browsers (exited before Joint birth) report bootstrap with
-        # S1 rows; bootstrap with no rows still means never covered.
+        # Ruled contract: folded browsers (exited before Joint birth,
+        # or folded after sealing rows) report partial with the named
+        # live_joint_feed_absent reason beside retained rows; a
+        # no-live-feed reason with no rows (or beside live instances
+        # that never got a live feed) still means never covered. The
+        # bootstrap literal stays inline for the observer-first wiring
+        # twin below.
         rows = observations.get("key_operations") or []
-        if (observations.get("reason") == "bootstrap_unavailable"
+        if (observations.get("reason") in ("bootstrap_unavailable",
+                                           "live_joint_feed_absent")
                 and _bootstrap_cover_missing(rows, browser_instances)):
             self.fail(
-                "late browser never covered (per-key tracking never started); "
+                "late browser never covered (no live per-key tracking); "
                 f"birth refusals={birth_refusals}; "
                 f"observation gaps={observations.get('gaps')}")
         self.assertGreater(len(rows), 0, "no key-operation rows at all")
@@ -2156,14 +2162,15 @@ def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
 
 
 def _bootstrap_cover_missing(rows, browser_instances):
-    """True when a bootstrap refusal must fail the FF-FIRST-BG cell.
+    """True when a no-live-feed reason must fail the FF-FIRST-BG cell.
 
-    The caller has already established
-    ``reason == "bootstrap_unavailable"`` (kept inline so the
-    observer-first wiring twin still sees the literal). Bootstrap
-    with rows is tolerated only on the folded leg: live browser
-    instances mean per-key tracking never started for retained
-    callers, and bootstrap with no rows still means never covered.
+    The caller has already established a no-live-feed reason
+    (``bootstrap_unavailable`` or the ruled ``live_joint_feed_absent``;
+    the bootstrap literal stays inline at the call site so the
+    observer-first wiring twin still sees it). Rows are tolerated
+    only on the folded leg: live browser instances mean no live
+    per-key tracking for retained callers, and no rows still means
+    never covered.
     """
     return not rows or bool(browser_instances)
 

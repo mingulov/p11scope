@@ -1292,8 +1292,9 @@ line names the rerun or check remedy; when the journal start itself is
 refused, it names the request and the cause (`requested, but per-key
 tracking did not start (<cause>)`). A linked capture whose tracking
 never starts reads `not available — per-key tracking never started, so
-no key can be named yet`. Mechanisms and API results are reported as
-before. An ordinary native-retirement refusal during a `--manifest`
+no key can be named yet`; retained folded rows instead read partial
+with the rows beside a coverage note. Mechanisms and API results are
+reported as before. An ordinary native-retirement refusal during a `--manifest`
 capture ends the first stop with an incomplete report and a nonzero
 exit. Uncertain native ownership stays retained and replacement
 admission stays blocked; the refusal is not proof of clean detach.

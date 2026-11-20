@@ -78,7 +78,8 @@ GAPS_CAPACITY = 256
 # and docs/schema/inventory-v1-object-observations.schema.json). A schema
 # revision edits these tables, not the logic below.
 STATUSES = ("populated", "partial", "stale", "unavailable")
-REASONS = ("none", "bootstrap_unavailable", "journal_unavailable", "proof_refused_fallback",
+REASONS = ("none", "bootstrap_unavailable", "journal_unavailable", "live_joint_feed_absent",
+           "proof_refused_fallback",
            "authority_lost", "row_budget_exhausted", "publication_budget_exhausted",
            "serialization_refused", "sink_failed")
 SESSION_ORIGINS = ("opened", "first_observed")

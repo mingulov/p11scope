@@ -3538,6 +3538,7 @@ fn key_operations_refusal_cause(presentation: &Presentation) -> Option<String> {
 fn key_observation_plain_reason(reason: &str) -> &str {
     match reason {
         "bootstrap_unavailable" => "per-key tracking never started, so no key can be named yet",
+        "live_joint_feed_absent" => "live per-key tracking unavailable; retained rows continue",
         "proof_refused_fallback" => "key proof refused; plain counts only",
         "authority_lost" => "per-key tracking stopped; plain counts are unaffected",
         "row_budget_exhausted" => "per-key rows hit their budget; plain counts are unaffected",
@@ -4761,6 +4762,10 @@ fn render_snapshot_inner(
                     || !observations.unknown_key_operations.is_empty();
                 let plain = if observations.reason == "authority_lost" && rows_continue {
                     "per-key tracking lost some calls; exact rows continue"
+                } else if observations.reason == "live_joint_feed_absent" && !rows_continue {
+                    // Retained counts without key rows: no rows to
+                    // continue, so the note names plain counts.
+                    "live per-key tracking unavailable; plain counts only"
                 } else {
                     key_observation_plain_reason(observations.reason)
                 };

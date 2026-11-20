@@ -287,6 +287,11 @@ pub(crate) fn family_display(family: KeyFamily) -> &'static str {
 /// named counted reason). JSON carries statuses; `-v` text carries
 /// these reasons via [`reason_display`].
 pub(crate) const REASON_UNLISTED_MECHANISM: &str = "unlisted_mechanism";
+/// A proved completion that carried no mechanism at all: the row's
+/// family stays unknown with this named reason (a zero-completion
+/// reason, like the size side's absent-evidence reasons), never a
+/// bare none.
+pub(crate) const REASON_NO_MECHANISM: &str = "no_mechanism";
 pub(crate) const REASON_OPERATION_KEY_ONLY: &str = "operation_key_only";
 pub(crate) const REASON_SIZE_INFERENCE_OFF: &str = "size_inference_off";
 pub(crate) const REASON_NO_LENGTH_EVIDENCE: &str = "no_length_evidence";
@@ -305,6 +310,7 @@ pub(crate) const REASON_OUTSIDE_ADMISSION_BOUND: &str = "outside_admission_bound
 pub(crate) fn reason_display(reason: &str) -> &'static str {
     match reason {
         REASON_UNLISTED_MECHANISM => "unlisted mechanism",
+        REASON_NO_MECHANISM => "no mechanism",
         REASON_OPERATION_KEY_ONLY => "mechanism types the operation key",
         REASON_SIZE_INFERENCE_OFF => "needs --key-sizes",
         REASON_NO_LENGTH_EVIDENCE => "no length evidence",
@@ -3065,9 +3071,8 @@ mod tests {
         for (reason, display) in [
             (REASON_UNLISTED_MECHANISM, "unlisted mechanism"),
             // Ruled contract: a mechanism-less completion names its
-            // family unknown with no_mechanism (literal: the const
-            // lands with the implementation).
-            ("no_mechanism", "no mechanism"),
+            // family unknown with no_mechanism.
+            (REASON_NO_MECHANISM, "no mechanism"),
             (
                 REASON_OPERATION_KEY_ONLY,
                 "mechanism types the operation key",

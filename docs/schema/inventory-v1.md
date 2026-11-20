@@ -1065,6 +1065,10 @@ and never proves an app identity. See the app identity rows of
   mechanisms and API results are unaffected), and the lane records
   one `joint_journal_unavailable` gap. `bootstrap_unavailable` keeps
   its 0.6.0 meaning (journal linked, no birth yet).
+  `live_joint_feed_absent` names retained folded-Joint evidence
+  (rows, objects, sessions or counts) with no live Joint feed: the
+  section is `partial`, never `unavailable`, and text renders the
+  retained rows beside a one-line coverage note, like JSON.
 - `excluded_modules`, `unmatched_excludes` (additive within v1):
   present only when `--exclude-module` is passed. `excluded_modules`
   lists one row per distinct excluded file (`path`, `dev`, `ino`,
@@ -1296,7 +1300,9 @@ never imply S1 loss.
   carry the seven-key metadata blocks. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
-  (`{reason, count}`, finite reasons, frozen order); the section is
+  (`{reason, count}`, finite reasons, frozen order); retained
+  folded-Joint evidence with no live Joint feed publishes as
+  `partial` with `live_joint_feed_absent`; the section is
   `unavailable` only when no Joint evidence exists at all. `revision` is the
   publication revision. `status` is
   `populated`, `partial`, `stale` or `unavailable`; `reason` is `none`
@@ -1421,7 +1427,9 @@ never imply S1 loss.
   never this closed shape. Families infer in both capture
   modes; sizes infer only with `--key-sizes` (without the flag every
   `inferred_size` reads `unknown` with reason `size_inference_off`
-  and no length word is acquired on any path). `metadata_at_use` is
+  and no length word is acquired on any path). A proved completion
+  that carried no mechanism at all names its family `unknown` with
+  reason `no_mechanism` and counts no family completion. `metadata_at_use` is
   untouched: inference never rewrites it (a 2041-bit RSA key whose
   256-byte signature classifies never reads `rsa_2048` there while
   `inferred_size` carries `size_class` 2048 plus the byte count;

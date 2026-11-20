@@ -28707,7 +28707,10 @@ fn keymeta_unlisted_and_missing_mechanism() {
         .expect("the mechanism-less row names its unknown");
     assert_eq!(inferred.family.status, InferredStatus::Unknown);
     assert_eq!(inferred.family.value, None);
-    assert_eq!(inferred.family.reason, Some("no_mechanism"));
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_NO_MECHANISM)
+    );
     assert_eq!(inferred.family.completions, 0);
 }
 
@@ -28733,7 +28736,11 @@ fn keymeta_direct_without_mechanism_names_no_mechanism() {
             .unwrap_or_else(|| panic!("the mechanism-less {role} row names its unknown"));
         assert_eq!(inferred.family.status, InferredStatus::Unknown, "{role}");
         assert_eq!(inferred.family.value, None, "{role}");
-        assert_eq!(inferred.family.reason, Some("no_mechanism"), "{role}");
+        assert_eq!(
+            inferred.family.reason,
+            Some(crate::keymeta::REASON_NO_MECHANISM),
+            "{role}"
+        );
         assert_eq!(inferred.family.completions, 0, "{role}");
     }
 }

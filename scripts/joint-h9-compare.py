@@ -135,7 +135,8 @@ UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
 STATUSES = {"populated", "partial", "stale", "unavailable"}
-STATUS_REASONS = {"none", "bootstrap_unavailable", "proof_refused_fallback",
+STATUS_REASONS = {"none", "bootstrap_unavailable", "live_joint_feed_absent",
+                  "proof_refused_fallback",
                   "authority_lost", "row_budget_exhausted",
                   "publication_budget_exhausted", "serialization_refused",
                   "sink_failed"}

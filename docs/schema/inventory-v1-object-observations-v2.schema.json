@@ -42,6 +42,7 @@
         "none",
         "bootstrap_unavailable",
         "journal_unavailable",
+        "live_joint_feed_absent",
         "proof_refused_fallback",
         "authority_lost",
         "row_budget_exhausted",
@@ -49,7 +50,7 @@
         "serialization_refused",
         "sink_failed"
       ],
-      "description": "Finite machine reason. none only when status is populated. journal_unavailable names the v0.5.0 world (no journal producer linked, so no key-operation feed exists); bootstrap_unavailable keeps its 0.6.0 meaning (journal linked, no birth yet). serialization_refused is reserved: the JSON encoder is infallible, so current producers never emit it."
+      "description": "Finite machine reason. none only when status is populated. journal_unavailable names the v0.5.0 world (no journal producer linked, so no key-operation feed exists); bootstrap_unavailable keeps its 0.6.0 meaning (journal linked, no birth yet); live_joint_feed_absent names retained folded-Joint evidence with no live Joint feed (partial, never unavailable). serialization_refused is reserved: the JSON encoder is infallible, so current producers never emit it."
     },
     "sessions": {
       "type": "array",

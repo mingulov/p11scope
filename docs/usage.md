@@ -1808,6 +1808,10 @@ Limits that matter in pods:
   `key operations: not available — per-key tracking never started, so no
   key can be named yet` (with `-v`, the machine reason follows in
   parentheses; `--json` keeps it as `object_observations.reason`).
+  When per-key rows were retained but no live feed remains (a folded
+  short-lived caller, for example), the section is partial instead:
+  the text shows the retained rows beside a one-line coverage note
+  naming why live tracking is unavailable, like the JSON section.
   Without the opt-in, or on a build without the journal object, the line
   reads `key operations: not reported (per-key tracking is off)`. With the
   opt-in but a refused semantic subset (unverifiable scan tables, see

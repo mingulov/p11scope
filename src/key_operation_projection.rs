@@ -112,11 +112,13 @@ pub(crate) const UNATTRIBUTED_REASONS: [&str; 7] = [
 /// `journal_unavailable` (OD33/R-50) names the v0.5.0 world: no journal
 /// producer is linked, so no key-operation feed exists;
 /// `bootstrap_unavailable` keeps its 0.6.0 meaning (linked, no birth
-/// yet).
-pub(crate) const REASON_LABELS: [&str; 9] = [
+/// yet); `live_joint_feed_absent` names retained folded-Joint
+/// evidence with no live Joint feed (partial, never unavailable).
+pub(crate) const REASON_LABELS: [&str; 10] = [
     "none",
     "bootstrap_unavailable",
     "journal_unavailable",
+    "live_joint_feed_absent",
     "proof_refused_fallback",
     "authority_lost",
     "row_budget_exhausted",
@@ -1646,11 +1648,17 @@ pub(crate) mod producer {
     /// unknown-key S1 facts, never a refusal); with no Joint feed
     /// the reason names the loss. Rows aggregate per-operation
     /// reducer state into frozen aggregate rows; budgets measure.
-    /// With no Joint feed and no linked producer the reason is
-    /// `journal_unavailable` (OD33/R-50). Folded departed feeds lend
-    /// their final authority and counters beside the live census, so
-    /// a retirement never hides proved rows or erases named loss;
-    /// only the live `joint` census drops the folded feed.
+    /// With no Joint feed, no loss, no fallback and no retained
+    /// evidence the reason is `journal_unavailable` without a linked
+    /// producer (OD33/R-50) and `bootstrap_unavailable` with one.
+    /// Folded departed feeds lend their final authority and counters
+    /// beside the live census, so a retirement never hides proved rows
+    /// or erases named loss; only the live `joint` census drops the
+    /// folded feed. A clean folded history with retained evidence
+    /// stands as history under `populated`; retained evidence with
+    /// no live Joint feed and no folded history is partial with
+    /// `live_joint_feed_absent`, never unavailable. Every other
+    /// census maps exactly as before.
     pub(crate) fn commit_with_journal_linked(
         revision: u64,
         stagings: &[&JointStaging],
@@ -1739,6 +1747,13 @@ pub(crate) mod producer {
             // under `populated`, never as a bootstrap that never
             // started.
             (ObsStatus::Populated, "none")
+        } else if has_evidence {
+            // Retained folded-Joint rows, objects, sessions or
+            // counts with no live Joint feed and no folded
+            // history: partial with the named reason, never
+            // unavailable (only a census with no evidence at all
+            // stays unavailable).
+            (ObsStatus::Partial, "live_joint_feed_absent")
         } else if journal_linked {
             (ObsStatus::Unavailable, "bootstrap_unavailable")
         } else {

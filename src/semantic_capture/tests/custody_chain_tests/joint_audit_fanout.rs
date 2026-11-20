@@ -29261,6 +29261,69 @@ fn joint_pending_h3_continuation_cannot_forgive_native_fault() {
 }
 
 #[test]
+fn joint_reread_plus_h3_pending_keeps_pending_and_absorbs_nothing() {
+    // Mixed reread + H3 pending at the frame boundary: a seal-time
+    // native move must not absorb across undisposed H3 history. The
+    // frame refuses with H3Pending (not FaultChanged, never Ok),
+    // retains its original custody (pending floor 4, staged max 3),
+    // counts no absorb, and cannot convert until H3 disposes.
+    struct ChangedFault;
+    impl crate::semantics_objects::journal::FaultEpoch for ChangedFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(1)
+        }
+    }
+    let PendingH3Scene {
+        mut fixture,
+        frame: mut q1,
+        ..
+    } = pending_h3_from_stash(false, &ChangedFault);
+    let failure = q1
+        .failure_for_test()
+        .expect("mixed reread+H3 must refuse, never absorb");
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::H3Pending
+    );
+    assert!(matches!(
+        q1.audit_for_test().h3_for_test(),
+        H3DispositionEvidence::Clean {
+            staged_max: 3,
+            pending_floor: Some(4),
+        }
+    ));
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 0, "pending voids nothing");
+    assert_eq!(
+        diagnosis.audit_fault_absorbed_chain, 0,
+        "no absorb across pending H3"
+    );
+    assert_eq!(diagnosis.audit_fault_absorbed_reread, 0);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::LocalPending),
+            "the pending frame defers, it never converts"
+        );
+    }
+}
+
+#[test]
 fn joint_first_pending_h3_pins_native_baseline_before_next_fault() {
     // This owner has never acquired a healthy audit or sealed a model call.
     // A's genuine New still registers one Joint consumer before its first

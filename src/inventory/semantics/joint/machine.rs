@@ -772,6 +772,13 @@ enum Phase {
     /// wait unpublished until the sweep completes (at most 64 leaf
     /// units per credit, INV-2).
     Voiding,
+    /// A completed sweep whose stranded staged disposal still owns
+    /// work. Holds the machine here, retaining the published fenced
+    /// failure and exact per-feed reduction state while deferring
+    /// collection and gap disclosure until disposal completes (at most
+    /// 64 leaf units per credit: one per feed visit, one per staged
+    /// head plus each link walk on its release, INV-2).
+    VoidingStaged,
     Collecting(Collected),
     Binding(Collected),
     AwaitH0(Collected),
@@ -2880,6 +2887,7 @@ impl LiveJointMachine {
         Some(match self.phase.as_ref()? {
             Phase::Idle => "Idle",
             Phase::Voiding => "Voiding",
+            Phase::VoidingStaged => "VoidingStaged",
             Phase::Collecting(_) => "Collecting",
             Phase::Binding(_) => "Binding",
             Phase::AwaitH0(_) => "AwaitH0",
@@ -2910,6 +2918,7 @@ impl LiveJointMachine {
             None => ("NoPhase", None),
             Some(Phase::Idle) => ("Idle", None),
             Some(Phase::Voiding) => ("Voiding", None),
+            Some(Phase::VoidingStaged) => ("VoidingStaged", None),
             Some(Phase::Collecting(value)) => ("Collecting", Some(value)),
             Some(Phase::Binding(value)) => ("Binding", Some(value)),
             Some(Phase::AwaitH0(value)) => ("AwaitH0", Some(value)),
@@ -3382,21 +3391,17 @@ impl LiveJointMachine {
                         // The void wipes their H8 and claims, and the
                         // next frame's fallback verification would
                         // trip over them, so dispose them as counted
-                        // history here, preserving their observed
-                        // completions. A no-op unless calls were
-                        // staged. Pinned by the held-call twin. (A
-                        // stashed pre-void outcome is instead retained
-                        // as plain S1 with a counted gap and the lane
-                        // continues; see the N1 twin.)
-                        coordinator.drop_abandoned_joint_staged();
-                        coordinator.note_scope_gap(
-                            crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
-                            format!(
-                                "joint_void_{}_history_loss",
-                                crate::semantics_objects::journal::joint_driver::INGEST_BREAK_VOID_GAP
-                                    .label()
-                            ),
-                        );
+                        // history, preserving their observed
+                        // completions, in the resumable staged phase
+                        // below (at most 64 leaf units per credit).
+                        // A no-op unless calls were staged. Pinned by
+                        // the held-call twin and the long-bucket twin.
+                        // (A stashed pre-void outcome is instead
+                        // retained as plain S1 with a counted gap and
+                        // the lane continues; see the N1 twin.)
+                        coordinator.start_staged_disposal();
+                        budget.spend(1);
+                        return (Phase::VoidingStaged, Ok(Step::Continue));
                     }
                 }
                 let collected = match q {
@@ -3464,10 +3469,31 @@ impl LiveJointMachine {
                     return (Phase::Voiding, Ok(Step::Continue));
                 }
                 // Sweep complete: the owner published the fenced void.
-                // Same post-void disposal and disclosure as Idle's
-                // immediate path, then back to Idle to collect above
-                // the fence.
-                coordinator.drop_abandoned_joint_staged();
+                // Start the resumable staged disposal below, retaining
+                // the failure and exact per-feed reduction state while
+                // deferring gap disclosure and collection until disposal
+                // completes, then back to Idle to collect above the
+                // fence. Pinned by the held-call twin and the
+                // long-bucket twin.
+                coordinator.start_staged_disposal();
+                (Phase::VoidingStaged, Ok(Step::Continue))
+            }
+            Phase::VoidingStaged => {
+                // One resumable disposal credit: at most 64 leaf units
+                // of feed visits, staged heads and link walks, debiting
+                // one action. The published fenced failure and per-feed
+                // reduction state stay retained; collection and gap
+                // disclosure wait until disposal completes. Shared by
+                // running and Finish (both arrive here from Voiding or
+                // Idle's immediate path).
+                if !budget.available() {
+                    return (Phase::VoidingStaged, Ok(Step::Yield));
+                }
+                let (done, _spent) = coordinator.poll_staged_disposal(64);
+                budget.spend(1);
+                if !done {
+                    return (Phase::VoidingStaged, Ok(Step::Continue));
+                }
                 coordinator.note_scope_gap(
                     crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
                     format!(

@@ -16,7 +16,7 @@ use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
     image_query_refusal_label, joint_audit_refusal_line, joint_audit_subjects_line,
-    joint_births_line, joint_seals_line, joint_taints_line, joint_voids_line,
+    joint_births_line, joint_decoder_line, joint_seals_line, joint_taints_line, joint_voids_line,
     scan_refusals_gap_reason, semantic_stop_line,
 };
 
@@ -377,6 +377,29 @@ fn joint_voids_line_format_is_exact() {
          audit_fault_changed_reread=23 audit_h3_loss=29 audit_discarded=31 \
          audit_malformed=37 audit_counter_unprovable=41 audit_fault_unreadable=43 \
          audit_resource_unavailable=47 skip_eras=53 voids_ended_joint_feed=59"
+    );
+}
+
+#[test]
+fn joint_decoder_line_format_is_exact() {
+    assert_eq!(
+        joint_decoder_line(Some(0)),
+        "p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0"
+    );
+    assert_eq!(
+        joint_decoder_line(Some(3)),
+        "p11scope: joint decoder: raw_malformed=3 raw_malformed_unprovable=0"
+    );
+    assert_eq!(
+        joint_decoder_line(None),
+        "p11scope: joint decoder: raw_malformed=unknown raw_malformed_unprovable=1"
+    );
+    assert_eq!(
+        joint_decoder_line(Some(u64::MAX)),
+        format!(
+            "p11scope: joint decoder: raw_malformed={} raw_malformed_unprovable=1",
+            u64::MAX
+        )
     );
 }
 

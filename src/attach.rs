@@ -11640,6 +11640,16 @@ impl Session {
         }
     }
 
+    /// The retained EVENTS decoder's terminal malformed-record total:
+    /// what the single retained drain counted undecodable. `None`
+    /// without a drain (never drained in this session): unknown,
+    /// never zero. Read-only: like [`Self::ring_consumed`] this never
+    /// creates a reader. A saturated total (`u64::MAX`) is unprovable:
+    /// the true count is at least that large.
+    pub(crate) fn events_decoder_malformed(&self) -> Option<u64> {
+        self.events_consumer.as_ref().map(|drain| drain.malformed())
+    }
+
     /// The idle-wait descriptors against the shared discovery allowance:
     /// EVENTS always, and DISCOVERY while the staged FIFO plus what the
     /// Engine still holds leaves room. Stopping the poll while the Engine

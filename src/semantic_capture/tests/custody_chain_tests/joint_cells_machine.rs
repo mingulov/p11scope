@@ -4725,3 +4725,246 @@ fn joint_audited_retry_sweeps_queued_take_refresh() {
     }
     assert_eq!(phase_of(&scene), "Audited");
 }
+
+/// Machine cadence spends before it scans: a wedged Audited poll
+/// with one credit spends it and preserves its scannable queued
+/// key with zero new I/O, while the next credited step scans it.
+#[test]
+fn joint_audited_retry_preserves_refresh_on_exhausted_credit() {
+    let mut scene = primed_scene(1);
+    scene
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 100);
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Auditing", "Negative", "Audited"]);
+    for _ in 0..8 {
+        if phase_of(&scene) == "Audited" {
+            break;
+        }
+        scene
+            .service(1)
+            .expect("setup service must succeed before the event");
+    }
+    assert_eq!(
+        phase_of(&scene),
+        "Audited",
+        "precondition: the seal stalls in Audited"
+    );
+    scene.machine.pose_no_progress_poll_for_test(true);
+    let (image, file, slot, pid) = {
+        let held = scene.scene.real.h0.0.borrow();
+        let slot = held
+            .io
+            .endpoints
+            .iter()
+            .find(|(_, _, endpoint)| endpoint.file_slot == 0)
+            .map(|(slot, _, _)| *slot)
+            .expect("a real attachment slot for file 0");
+        (
+            ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            },
+            0,
+            slot,
+            std::process::id(),
+        )
+    };
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        held.capture
+            .request_partition_refresh(image, file, slot, pid);
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            1,
+            "precondition: the raced take queued its key"
+        );
+    }
+    let scans_before = scene
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .capture
+        .take_refresh_scans();
+    let io_before = scene.scene.real.h0.0.borrow().io.scan_results.len();
+    for _ in 0..2 {
+        let outcome = scene
+            .service(1)
+            .expect("a wedged Audited poll yields Pending");
+        assert!(
+            matches!(
+                outcome,
+                crate::inventory_semantics::JointServiceProgress::Pending
+            ),
+            "the hook keeps the Pending yield"
+        );
+    }
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            1,
+            "exhausted credit preserves the scannable interest"
+        );
+        assert_eq!(
+            held.capture.take_refresh_scans(),
+            scans_before,
+            "exhausted credit scans nothing"
+        );
+        assert_eq!(
+            held.io.scan_results.len(),
+            io_before,
+            "exhausted credit does zero new I/O"
+        );
+    }
+    assert_eq!(phase_of(&scene), "Audited");
+    let outcome = scene
+        .service(10)
+        .expect("the next credited step runs");
+    assert!(
+        matches!(
+            outcome,
+            crate::inventory_semantics::JointServiceProgress::Pending
+        ),
+        "the credited retry still yields Pending"
+    );
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            0,
+            "the credited step drains the interest"
+        );
+        assert!(
+            held.capture.take_refresh_scans() > scans_before,
+            "the credited step scans the key"
+        );
+        assert!(
+            held.io.scan_results.len() > io_before,
+            "the credited step does I/O"
+        );
+    }
+}
+
+/// Machine cadence respects its service deadline: a past-deadline
+/// Audited poll preserves its scannable queued key with zero new
+/// I/O, while the next live-deadline step scans it.
+#[test]
+fn joint_audited_retry_preserves_refresh_on_past_deadline() {
+    let mut scene = primed_scene(1);
+    scene
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 100);
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Auditing", "Negative", "Audited"]);
+    for _ in 0..8 {
+        if phase_of(&scene) == "Audited" {
+            break;
+        }
+        scene
+            .service(1)
+            .expect("setup service must succeed before the event");
+    }
+    assert_eq!(
+        phase_of(&scene),
+        "Audited",
+        "precondition: the seal stalls in Audited"
+    );
+    scene.machine.pose_no_progress_poll_for_test(true);
+    let (image, file, slot, pid) = {
+        let held = scene.scene.real.h0.0.borrow();
+        let slot = held
+            .io
+            .endpoints
+            .iter()
+            .find(|(_, _, endpoint)| endpoint.file_slot == 0)
+            .map(|(slot, _, _)| *slot)
+            .expect("a real attachment slot for file 0");
+        (
+            ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            },
+            0,
+            slot,
+            std::process::id(),
+        )
+    };
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        held.capture
+            .request_partition_refresh(image, file, slot, pid);
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            1,
+            "precondition: the raced take queued its key"
+        );
+    }
+    let scans_before = scene
+        .scene
+        .real
+        .h0
+        .0
+        .borrow()
+        .capture
+        .take_refresh_scans();
+    let io_before = scene.scene.real.h0.0.borrow().io.scan_results.len();
+    let past = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .expect("a past service deadline");
+    for _ in 0..2 {
+        let outcome = scene
+            .service_until(10, past)
+            .expect("a past-deadline Audited poll yields Pending");
+        assert!(
+            matches!(
+                outcome,
+                crate::inventory_semantics::JointServiceProgress::Pending
+            ),
+            "the hook keeps the Pending yield"
+        );
+    }
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            1,
+            "a past deadline preserves the scannable interest"
+        );
+        assert_eq!(
+            held.capture.take_refresh_scans(),
+            scans_before,
+            "a past deadline scans nothing"
+        );
+        assert_eq!(
+            held.io.scan_results.len(),
+            io_before,
+            "a past deadline does zero new I/O"
+        );
+    }
+    assert_eq!(phase_of(&scene), "Audited");
+    let outcome = scene
+        .service(10)
+        .expect("the next live-deadline step runs");
+    assert!(
+        matches!(
+            outcome,
+            crate::inventory_semantics::JointServiceProgress::Pending
+        ),
+        "the live-deadline retry still yields Pending"
+    );
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            0,
+            "the live-deadline step drains the interest"
+        );
+        assert!(
+            held.capture.take_refresh_scans() > scans_before,
+            "the live-deadline step scans the key"
+        );
+    }
+}

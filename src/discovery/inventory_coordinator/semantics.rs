@@ -8042,6 +8042,8 @@ mod promotion_lifecycle_tests {
             audit_counter_unprovable: 37,
             audit_fault_unreadable: 41,
             audit_resource_unavailable: 43,
+            audit_fault_absorbed_chain: 53,
+            audit_fault_absorbed_reread: 59,
             voids_ended_joint_feed: 47,
         };
         coordinator
@@ -8073,9 +8075,11 @@ mod promotion_lifecycle_tests {
                 after.audit_counter_unprovable,
                 after.audit_fault_unreadable,
                 after.audit_resource_unavailable,
+                after.audit_fault_absorbed_chain,
+                after.audit_fault_absorbed_reread,
                 after.voids_ended_joint_feed,
             ),
-            (17, 19, 23, 29, 31, 37, 41, 43, 47),
+            (17, 19, 23, 29, 31, 37, 41, 43, 53, 59, 47),
             "retirement carries the scope-round void counters to the new owner"
         );
     }
@@ -8103,6 +8107,8 @@ mod promotion_lifecycle_tests {
             audit_counter_unprovable: 13,
             audit_fault_unreadable: 17,
             audit_resource_unavailable: 19,
+            audit_fault_absorbed_chain: 0,
+            audit_fault_absorbed_reread: 0,
             voids_ended_joint_feed: 0,
         };
         coordinator

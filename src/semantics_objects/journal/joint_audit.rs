@@ -76,6 +76,26 @@ pub(crate) struct IngestedJointQuantum {
     _storage: ResourceLease,
     // The carried ingest-break void's own prepaid lease (its raw failure).
     _void_storage: Option<ResourceLease>,
+    // Deferred adapter rejections this frame's originals wait on: the
+    // audit failure's and the carried raw refusal's per-row work (their
+    // O(1) refusals already published). The frame drives them through
+    // its service budget and fills each into its failure before any
+    // seal or delivery reads it.
+    audit_fill: Option<u64>,
+    raw_fill: Option<u64>,
+    // A seal outcome whose failure waits on its own deferred rejection
+    // (a seal-time audit void or key doom), with its prepaid storage.
+    parked: Option<ParkedSeal>,
+}
+
+/// One selected seal's outcome held until its deferred rejection fills.
+struct ParkedSeal {
+    consumer: usize,
+    /// The rejection still filling, or `None` once filled.
+    ticket: Option<u64>,
+    outcome: Result<SealSuccess, SealFailure>,
+    storage: ResourceLease,
+    bytes: usize,
 }
 
 pub(crate) type AuditAcquisition = Result<IngestedJointQuantum, (IngestedRaw, RawQuantumRefusal)>;
@@ -905,8 +925,15 @@ impl IngestedJointQuantum {
         let (provenance, frontier) = ingested.into_provenance();
         let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
         let (adapter, model) = owner.parts();
+        // Finished rejections from a frame that no longer exists have no
+        // holder: they drop here, before this frame issues its own.
+        adapter.drop_unclaimed_rejections(None);
         let raw_failure = adapter.refuse_s1only_subjects(model);
+        let mark = adapter.rejection_mark();
         let failure = adapter.audit_collected(model, &audit, fault).err();
+        let audit_fill = failure
+            .as_ref()
+            .and_then(|_| adapter.rejection_issued_since(mark));
         // An ingest-break void's abandonment rides the next frame in its
         // own slot, so every pre-break consumer receives it.
         let (void_failure, void_storage, void_bytes) = take_void(owner);
@@ -931,6 +958,9 @@ impl IngestedJointQuantum {
             targets_storage: None,
             _storage: storage,
             _void_storage: void_storage,
+            audit_fill,
+            raw_fill: None,
+            parked: None,
         };
         assert!(
             frame.retained_storage_bytes().is_some_and(|owned| bytes
@@ -968,10 +998,14 @@ impl IngestedJointQuantum {
             if attachment.generation() < owner.adapter().closure_generation {
                 return Err(RawQuantumRefusal::ClosureStale);
             }
-            let raw_bytes = disposed
-                .failure()
-                .map_or(Some(0), failure_storage)
-                .ok_or(RawQuantumRefusal::Capacity)?;
+            // A raw refusal whose per-row work is still deferred fills
+            // later: charge it at its full one-failure bound now.
+            let raw_bytes = if owner.adapter().raw_rejection.is_some() {
+                one_failure_bound(owner.adapter(), owner.model())
+            } else {
+                disposed.failure().map_or(Some(0), failure_storage)
+            }
+            .ok_or(RawQuantumRefusal::Capacity)?;
             let bytes = size_of::<Self>()
                 .checked_add(raw_bytes)
                 .and_then(|bytes| {
@@ -1016,7 +1050,15 @@ impl IngestedJointQuantum {
         };
         let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
         let (adapter, model) = owner.parts();
+        let raw_fill = raw_failure
+            .as_ref()
+            .and_then(|_| adapter.take_raw_rejection());
+        adapter.drop_unclaimed_rejections(raw_fill);
+        let mark = adapter.rejection_mark();
         let failure = adapter.audit_collected(model, &audit, fault).err();
+        let audit_fill = failure
+            .as_ref()
+            .and_then(|_| adapter.rejection_issued_since(mark));
         let (void_failure, void_storage, void_bytes) = take_void(owner);
         let frame = Self {
             provenance,
@@ -1039,6 +1081,9 @@ impl IngestedJointQuantum {
             targets_storage: None,
             _storage: storage,
             _void_storage: void_storage,
+            audit_fill,
+            raw_fill,
+            parked: None,
         };
         assert!(
             frame.retained_storage_bytes().is_some_and(|actual| bytes
@@ -1083,7 +1128,88 @@ impl IngestedJointQuantum {
             )?)?
             .checked_add(self.active.as_ref().map_or(Some(0), |active| {
                 outcome_storage(&active.outcome)?.checked_add(lookup_storage(&active.outcome)?)
+            })?)?
+            .checked_add(self.parked.as_ref().map_or(Some(0), |parked| {
+                outcome_storage(&parked.outcome)?.checked_add(lookup_storage(&parked.outcome)?)
             })?)
+    }
+
+    /// Whether an original this frame holds still waits on its deferred
+    /// rejection's per-row work.
+    fn awaits_rejection(&self) -> bool {
+        self.audit_fill.is_some() || self.raw_fill.is_some() || self.parked.is_some()
+    }
+
+    /// Drive this frame's deferred rejections through the shared service
+    /// budget (one leaf unit per row, debited before the read) and fill
+    /// each finished one into its original, raw before audit before the
+    /// parked seal (their decision order). Returns true when nothing this
+    /// frame holds still waits.
+    fn complete_rejections(
+        &mut self,
+        adapter: &mut super::JournalAdapter,
+        model: &mut ObjectSemantics,
+        remaining: &mut usize,
+    ) -> bool {
+        loop {
+            let ticket = self
+                .raw_fill
+                .or(self.audit_fill)
+                .or(self.parked.as_ref().and_then(|parked| parked.ticket));
+            let Some(ticket) = ticket else {
+                return true;
+            };
+            if let Some(done) = adapter.take_rejection(ticket) {
+                if self.raw_fill == Some(ticket) {
+                    self.raw_fill = None;
+                    if let Some(raw) = self.raw_failure.as_mut() {
+                        raw.fill_rejection(done);
+                    }
+                } else if self.audit_fill == Some(ticket) {
+                    self.audit_fill = None;
+                    if let Some(failure) = self.failure.as_mut() {
+                        failure.fill_rejection(done);
+                    }
+                } else if let Some(parked) = self.parked.as_mut() {
+                    parked.ticket = None;
+                    if let Err(failure) = parked.outcome.as_mut() {
+                        failure.fill_rejection(done);
+                    }
+                }
+                continue;
+            }
+            if *remaining == 0 {
+                return false;
+            }
+            adapter.drive_rejections(model, remaining);
+        }
+    }
+
+    /// Whether one target's domain lies in an original failure's scope,
+    /// including an all-key scope a deferred audit or raw rejection is
+    /// still accumulating: those cover every adapter key at its current
+    /// era (the scope the cursor will fill, since nothing rebinds a key
+    /// while the frame holds it).
+    fn failure_affects(&self, adapter: &super::JournalAdapter, target: &JointFeedTarget) -> bool {
+        let domain = target.bootstrap().domain();
+        if self
+            .original_failures()
+            .any(|failure| failure.affects_domain(domain))
+        {
+            return true;
+        }
+        if self.audit_fill.is_none() && self.raw_fill.is_none() {
+            return false;
+        }
+        let proof = target.bootstrap().proof();
+        adapter.keys.get(&proof.key).is_some_and(|state| {
+            super::JournalDomainProof {
+                key: proof.key,
+                era: state.era,
+            }
+            .domain()
+                == domain
+        })
     }
 
     #[cfg(test)]
@@ -1193,6 +1319,10 @@ impl IngestedJointQuantum {
                     ConsumerState::Pending | ConsumerState::Future
                 ) && (consumer.stuck_streak > 0
                     || consumer.parked
+                    // An all-key original still filling covers every
+                    // consumer it will name (fail closed).
+                    || self.audit_fill.is_some()
+                    || self.raw_fill.is_some()
                     || self
                         .failure_for(consumer.target.bootstrap().domain())
                         .is_some())
@@ -1665,7 +1795,7 @@ impl IngestedJointQuantum {
         if !self.bound || self.active.is_some() {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
-        if !self.pending_h3_is_owned(ports, view) {
+        if self.awaits_rejection() || !self.pending_h3_is_owned(ports, view) {
             return Ok(QuantumSealProgress::LocalPending);
         }
         // H3 remains pending. Preserve only the already-checked native fault
@@ -1699,9 +1829,7 @@ impl IngestedJointQuantum {
             // ended. Only a fresh positive seal needs the current binding.
             if matches!(self.ingress, FrameIngress::Disposed(_))
                 || mode == FeedMode::S1Only
-                || self
-                    .original_failures()
-                    .any(|failure| failure.affects_domain(target.bootstrap().domain()))
+                || self.failure_affects(owner.adapter(), &target)
             {
                 continue;
             }
@@ -1735,9 +1863,7 @@ impl IngestedJointQuantum {
             return Err(RawQuantumRefusal::Capacity);
         }
         consumers.extend(registry.joint_history_targets().map(|(target, mode)| {
-            let affects = self
-                .original_failures()
-                .any(|failure| failure.affects_domain(target.bootstrap().domain()));
+            let affects = self.failure_affects(owner.adapter(), &target);
             FrameConsumer {
                 target,
                 state: if mode == FeedMode::Joint || affects {
@@ -1902,6 +2028,25 @@ impl IngestedJointQuantum {
         if *remaining == 0 {
             return Ok(self.progress());
         }
+        // Deferred rejection work first: no original is read, sealed past
+        // or delivered until its per-row work has filled it.
+        if self.awaits_rejection() {
+            let (_, owner, _, _, _) = ports.split();
+            let (adapter, model) = owner.parts();
+            if !self.complete_rejections(adapter, model, remaining) {
+                return Ok(QuantumSealProgress::DeliveryReady);
+            }
+            if let Some(parked) = self.parked.take() {
+                return Ok(self.settle_outcome(
+                    ports,
+                    parked.consumer,
+                    parked.outcome,
+                    parked.storage,
+                    parked.bytes,
+                    remaining,
+                ));
+            }
+        }
         if self.active.is_some() {
             return Ok(QuantumSealProgress::DeliveryReady);
         }
@@ -1966,7 +2111,13 @@ impl IngestedJointQuantum {
             target: &target,
             binding,
         };
+        let mark = adapter.rejection_mark();
+        // A refusal decided by this seal runs its inline rejection work
+        // from this same service budget, never past it.
+        adapter.bound_inline_credit(*remaining);
         let outcome = adapter.seal_in_audit(model, input, &mut selected, fault, replay);
+        let spent = adapter.take_inline_spent();
+        *remaining = remaining.saturating_sub(spent);
         assert!(
             outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
             "retained seal result exceeds its checked preflight bound"
@@ -1975,6 +2126,56 @@ impl IngestedJointQuantum {
             lookup_storage(&outcome).is_some_and(|actual| actual <= temporary),
             "retained original lookup exceeds its original preflight lease"
         );
+        if outcome.is_err()
+            && let Some(ticket) = adapter.rejection_issued_since(mark)
+        {
+            // The refusal published; its per-row work (an audit void's
+            // preserve/fence/wipe, a doomed key's model rows) runs under
+            // this shared budget, resuming next service when it
+            // exhausts. The outcome settles only once filled.
+            self.parked = Some(ParkedSeal {
+                consumer: index,
+                ticket: Some(ticket),
+                outcome,
+                storage,
+                bytes,
+            });
+            if !self.complete_rejections(adapter, model, remaining) {
+                return Ok(QuantumSealProgress::DeliveryReady);
+            }
+            let parked = self.parked.take().expect("filled parked seal");
+            return Ok(self.settle_outcome(
+                ports,
+                parked.consumer,
+                parked.outcome,
+                parked.storage,
+                parked.bytes,
+                remaining,
+            ));
+        }
+        Ok(self.settle_outcome(ports, index, outcome, storage, bytes, remaining))
+    }
+
+    /// Settle one selected seal outcome (filled): a broad failure
+    /// requeues every consumer it affects; a fresh birth with no history
+    /// of its own waits as future input; anything else becomes the
+    /// active delivery.
+    fn settle_outcome(
+        &mut self,
+        ports: &mut JointPublicationPorts<'_>,
+        index: usize,
+        outcome: Result<SealSuccess, SealFailure>,
+        storage: ResourceLease,
+        bytes: usize,
+        remaining: &mut usize,
+    ) -> QuantumSealProgress {
+        assert!(
+            outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
+            "retained seal result exceeds its checked preflight bound"
+        );
+        let target = self.consumers[index].target;
+        let (_, owner, _, _, _) = ports.split();
+        let adapter = owner.adapter();
         if let Err(failure) = &outcome {
             if matches!(failure.scope, SealFailureScope::AffectedDomains(_)) {
                 let failure = outcome.expect_err("checked original broad failure");
@@ -1996,7 +2197,7 @@ impl IngestedJointQuantum {
                 self.failure = Some(failure);
                 self.failure_storage = Some(storage);
                 self.reset_park();
-                return Ok(QuantumSealProgress::DeliveryReady);
+                return QuantumSealProgress::DeliveryReady;
             }
             // A fresh birth with no staged call of its own inside this
             // frontier (late attach, an idle caller) can only be grounded
@@ -2013,7 +2214,7 @@ impl IngestedJointQuantum {
                 // no-progress guard observe the actual committed work.
                 *remaining -= 1;
                 self.advance_consumer(ConsumerState::Future);
-                return Ok(QuantumSealProgress::AwaitFutureInput);
+                return QuantumSealProgress::AwaitFutureInput;
             }
         }
         self.active = Some(ActiveSeal {
@@ -2022,7 +2223,7 @@ impl IngestedJointQuantum {
             replay: SealReplayCursor::default(),
             _storage: storage,
         });
-        Ok(QuantumSealProgress::DeliveryReady)
+        QuantumSealProgress::DeliveryReady
     }
 
     #[cfg(test)]
@@ -2048,6 +2249,27 @@ impl IngestedJointQuantum {
         self.preflight(ports)?;
         if !self.bound {
             return Err(RawQuantumRefusal::DispositionMismatch);
+        }
+        if self.awaits_rejection() {
+            // An original still filling is never delivered partially:
+            // its deferred work runs first, from this same budget.
+            let (_, owner, _, _, _) = ports.split();
+            let (adapter, model) = owner.parts();
+            if !self.complete_rejections(adapter, model, remaining) {
+                diagnosis.note_other();
+                return Ok(QuantumSealProgress::DeliveryReady);
+            }
+            if let Some(parked) = self.parked.take() {
+                diagnosis.note_other();
+                return Ok(self.settle_outcome(
+                    ports,
+                    parked.consumer,
+                    parked.outcome,
+                    parked.storage,
+                    parked.bytes,
+                    remaining,
+                ));
+            }
         }
         if self.pending == 0 {
             diagnosis.note_other();
@@ -2388,6 +2610,11 @@ impl IngestedJointQuantum {
         {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
+        if self.awaits_rejection() {
+            // An unfilled original keeps the frame: its per-row work and
+            // its delivery are still owed.
+            return Err((self, RawQuantumRefusal::DispositionMismatch));
+        }
         self.finish_frame_inner(ports)
     }
 
@@ -2426,7 +2653,7 @@ impl IngestedJointQuantum {
         if !self.pending_h3_is_owned(ports, view) {
             return Err((self, RawQuantumRefusal::H3Undisposed));
         }
-        if !self.bound || self.active.is_some() || self.pending != 0 {
+        if !self.bound || self.active.is_some() || self.pending != 0 || self.awaits_rejection() {
             return Err((self, RawQuantumRefusal::DispositionMismatch));
         }
         // The exact continuation above qualified all negative consumers and

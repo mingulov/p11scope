@@ -3266,6 +3266,62 @@ impl KeyUseReducer {
         }
     }
 
+    /// Observe one `Ended` effect during budgeted disposal, queuing
+    /// its fallback association release for the shared leaf budget
+    /// instead of walking the reservation index synchronously. Only
+    /// fallback tickets occur here (disposal mints with `shared`
+    /// `None`, so `ticket_shared` is always false); a shared ticket
+    /// would pend for a shared contact the disposal never provides,
+    /// failing the preserved-absorb empty assertion and catching the
+    /// misuse. Preserves terminal reasons, effect order (caller
+    /// drains the queue FIFO) and close semantics exactly like
+    /// [`Self::observe_effect_from_stage`]'s `Ended` arm.
+    fn observe_ended_queued_for_disposal(
+        &mut self,
+        instance: RegistryInstanceId,
+        id: &OperationId,
+        outcome: &OperationOutcome,
+        length: &Option<crate::keymeta::LengthOutcome>,
+        corroboration: &Option<u64>,
+        assoc_queue: &mut VecDeque<u64>,
+    ) {
+        let key = (instance, *id);
+        if let Some(open) = self.open.remove(&key) {
+            let (ticket, ticket_shared) = (open.ticket, open.ticket_shared);
+            if *outcome == OperationOutcome::Completed {
+                self.attribute_completion(&open, *length, *corroboration);
+            } else {
+                for assoc in &open.associations {
+                    if let AssocBucket::Proved(bucket) = assoc.bucket
+                        && self.inferred.get(&bucket) == Some(&RowInference::default())
+                    {
+                        self.inferred.remove(&bucket);
+                    }
+                }
+            }
+            self.close_open(open, *outcome);
+            if ticket_shared {
+                debug_assert!(
+                    false,
+                    "disposal mints fallback-only; a shared ticket cannot queue"
+                );
+                self.pending_shared_releases.push(ticket);
+            } else {
+                assoc_queue.push_back(ticket);
+            }
+            return;
+        }
+        if let Some(refused) = self.refused.remove(&key) {
+            let slot = unknown_index(refused.category, unbound_reason_for(refused.category));
+            self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
+            self.unknown_add(slot, *outcome);
+            self.evidence.refused_terminals = self.evidence.refused_terminals.saturating_add(1);
+            return;
+        }
+        self.evidence.orphan_ends = self.evidence.orphan_ends.saturating_add(1);
+        self.unknown_add(unknown_index("unknown", "unbound"), *outcome);
+    }
+
     /// Attribute one successful Init-based completion (§4.3/§9):
     /// the terminal length evidence (when admitted) and the
     /// Init-bound mechanism join the open's proved associations; a
@@ -3988,12 +4044,95 @@ impl<S: OperationSink> OperationSink for KeyUseTee<'_, S> {
     }
 }
 
+/// Budgeted-disposal tee: `Ended` terminals feed the preserved
+/// reducer with their fallback association releases queued for the
+/// shared leaf budget (never a synchronous index walk). Other
+/// effects (which the budgeted invalidation never emits, but a
+/// future retire scope might) fall back to immediate disposal-mint
+/// handling with the fallback ledger. Preserves terminal reasons
+/// and effect order (the caller drains the queue FIFO before
+/// absorbing).
+pub(crate) struct DisposalTee<'a> {
+    keyuse: &'a mut KeyUseReducer,
+    instance: RegistryInstanceId,
+    fallback_for_mint: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
+    assoc_queue: &'a mut VecDeque<u64>,
+}
+
+impl<'a> DisposalTee<'a> {
+    pub(crate) fn new(
+        keyuse: &'a mut KeyUseReducer,
+        instance: RegistryInstanceId,
+        fallback_for_mint: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
+        assoc_queue: &'a mut VecDeque<u64>,
+    ) -> Self {
+        Self {
+            keyuse,
+            instance,
+            fallback_for_mint,
+            assoc_queue,
+        }
+    }
+}
+
+impl OperationSink for DisposalTee<'_> {
+    const WANTS_EFFECTS: bool = true;
+
+    fn emit(&mut self, effect: OperationEffect) {
+        match &effect {
+            OperationEffect::Ended {
+                id,
+                outcome,
+                length,
+                corroboration,
+                ..
+            } => {
+                self.keyuse.observe_ended_queued_for_disposal(
+                    self.instance,
+                    id,
+                    outcome,
+                    length,
+                    corroboration,
+                    self.assoc_queue,
+                );
+            }
+            _ => {
+                self.keyuse.observe_effect_from_stage(
+                    self.instance,
+                    &effect,
+                    None,
+                    self.fallback_for_mint.as_deref_mut(),
+                    None,
+                );
+            }
+        }
+    }
+}
+
 /// Resumable cursor for one feed's stranded staged disposal: holds
-/// the preservation reducers across credits so a long chain unlink
-/// never exceeds its credit. The feed's staged queue, frontier and
-/// counts stay untouched until each head's release completes, then
-/// the head pops, reduces (Joint) and counts atomically. Finalize
-/// (invalidate plus absorb) runs once after the last head.
+/// the preservation reducers across credits so no credit exceeds its
+/// leaf budget. Each head's H9 chain unlink drains first (one leaf
+/// per head/next/inspect read); its removed pool charge is RETAINED
+/// until the payload drops (drop-then-refund, never an early refund
+/// while the payload lives). The head then pops, reduces (Joint)
+/// and counts. Finalization drains the throwaway via a resumable
+/// budgeted invalidation (one leaf per machine pop + terminal,
+/// pending/detached drop, or open unbind) with fallback association
+/// releases queued FIFO and drained through the same gate (one leaf
+/// per chain read), preserving terminal reasons and effect order
+/// until the per-feed results merge once. At most one leaf per unit.
+/// Worst-case leaves for one non-retiring staged head's atomic
+/// reduction (pop + edge + key-use + fallback mint walks): 1 pop, 2
+/// machines × 2 (visit + terminal), 2 mints × 25 (single-preflight
+/// miss walk for the measured max chain 12: 1 head + 12 inspects + 12
+/// nexts). Totals 55, rounded to 56. The caller reserve-checks
+/// (`try_charge_n`) before starting a head and yields without
+/// starting when fewer remain (retry with a fresh credit); the
+/// property test pins the max chain and per-head reads so the bound
+/// never silently goes stale. Retiring heads use resumable cursors
+/// (exact per-leaf, no bound).
+const HEAD_WORST: usize = 56;
+
 pub(crate) struct FeedDisposalCursor {
     instance: RegistryInstanceId,
     is_joint: bool,
@@ -4001,6 +4140,31 @@ pub(crate) struct FeedDisposalCursor {
     preserved: Option<KeyUseReducer>,
     pending_release: Option<crate::semantics_objects::journal::LedgerReleaseCursor>,
     pending_position: Option<u64>,
+    /// Retained H9 charge from a completed unlink whose payload has
+    /// not yet dropped: held across yields (including the pop-credit
+    /// boundary) and refunded once after the drop. `None` when no
+    /// unlink has completed ahead of its drop. On terminal
+    /// cancellation the cursor drops with the lease, refunding once.
+    pending_lease: Option<(
+        usize,
+        Option<crate::semantics_edge::resources::ResourceLease>,
+    )>,
+    invalidate: Option<crate::semantics_edge::EdgeInvalidationCursor>,
+    /// All-scope retire cursor for one staged head (C_Finalize OK,
+    /// CRYPTOKI_NOT_INITIALIZED, Cancelled terminals): held across
+    /// credits until the head's retire drains, then the head pops
+    /// WITHOUT a second observe (the cursor already applied the
+    /// retire; a second observe would double-retire).
+    head_retire_all: Option<crate::semantics_edge::EdgeInvalidationCursor>,
+    /// Subset-scope retire cursor for one staged head (Session /
+    /// SessionMachines / Slot / Selected): same hold-and-pop discipline.
+    head_retire: Option<crate::semantics_edge::EdgeRetireCursor>,
+    /// Set once the head's retire cursor completes (All or subset):
+    /// the pending head pops without observe on re-entry.
+    head_retired: bool,
+    assoc_queue: VecDeque<u64>,
+    assoc_release: Option<crate::semantics_objects::journal::LedgerReleaseCursor>,
+    finalize_started: bool,
     finalized: bool,
 }
 
@@ -4013,69 +4177,241 @@ impl FeedDisposalCursor {
             preserved: is_joint.then(KeyUseReducer::new),
             pending_release: None,
             pending_position: None,
+            pending_lease: None,
+            invalidate: None,
+            head_retire_all: None,
+            head_retire: None,
+            head_retired: false,
+            assoc_queue: VecDeque::with_capacity(crate::semantics_edge::MAX_EDGE_ACTIVE_OPS),
+            assoc_release: None,
+            finalize_started: false,
             finalized: !is_joint,
         }
     }
 
-    /// Drive one feed's disposal for at most `budget` leaf units (one
-    /// per staged head plus each link walk on its release). Returns
-    /// whether the feed completed and the units spent (never above
-    /// `budget`). `fallback` carries the association ledger for Joint
-    /// preservation (`None` for pure feeds, unused); `keyuse` absorbs
-    /// the preserved summaries once at the end. The caller counts the
-    /// feed visit itself before the first poll.
+    /// Test-only retained-lease bytes: `Some` while an unlinked head's
+    /// charge is held ahead of its payload drop.
+    #[cfg(test)]
+    pub(crate) fn pending_lease_bytes_for_test(&self) -> Option<usize> {
+        self.pending_lease.as_ref().map(|(bytes, _)| *bytes)
+    }
+
+    /// Drive one feed's disposal through the shared pre-debit
+    /// `gate`. Returns whether the feed completed. `fallback`
+    /// carries the association ledger for Joint preservation (`None`
+    /// for pure feeds, unused); `keyuse` absorbs the preserved
+    /// summaries once at the end. The caller counts the feed visit
+    /// itself before the first poll.
     pub(crate) fn poll(
         &mut self,
         feed: &mut JointStaging,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
         mut fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
         keyuse: &mut KeyUseReducer,
-        budget: usize,
-    ) -> (bool, usize) {
-        if budget == 0 {
-            let done = feed.staged.is_empty()
-                && self.pending_release.is_none()
-                && self.pending_position.is_none()
-                && self.finalized;
-            return (done, 0);
-        }
-        let mut spent = 0usize;
+        gate: &mut crate::semantics_objects::journal::LeafBudget,
+    ) -> bool {
         loop {
-            if spent >= budget {
-                debug_assert!(spent <= budget);
-                return (false, spent);
+            if gate.remaining() == 0 {
+                return false;
+            }
+            if let Some(release) = self.assoc_release.as_mut() {
+                let Some(fallback_ledger) = fallback.as_deref_mut() else {
+                    debug_assert!(false, "queued assoc release needs its ledger");
+                    return false;
+                };
+                let remaining = gate.remaining();
+                let (done, used, result) = fallback_ledger.release_step(release, remaining);
+                for _ in 0..used {
+                    let charged = gate.try_charge();
+                    debug_assert!(charged);
+                }
+                if !done {
+                    return false;
+                }
+                self.assoc_release = None;
+                drop(result);
+                continue;
+            }
+            if let Some(ticket) = self.assoc_queue.pop_front() {
+                let Some(fallback_ledger) = fallback.as_deref_mut() else {
+                    debug_assert!(false, "queued assoc release needs its ledger");
+                    self.assoc_queue.push_front(ticket);
+                    return false;
+                };
+                let cursor = fallback_ledger.release_assoc_cursor(ticket);
+                self.assoc_release = Some(cursor);
+                continue;
             }
             if let Some(release) = self.pending_release.as_mut() {
-                let (done, used) = ledger.release_step(release, budget - spent);
-                spent += used;
+                let remaining = gate.remaining();
+                let (done, used, result) = ledger.release_step(release, remaining);
+                for _ in 0..used {
+                    let charged = gate.try_charge();
+                    debug_assert!(charged);
+                }
                 if !done {
-                    debug_assert!(spent <= budget);
-                    return (false, spent);
+                    return false;
                 }
                 self.pending_release = None;
+                if let Some(lease) = result {
+                    debug_assert!(self.pending_lease.is_none());
+                    self.pending_lease = Some(lease);
+                }
+                continue;
+            }
+            if self.invalidate.is_some() {
+                if !self.is_joint {
+                    self.invalidate = None;
+                    continue;
+                }
+                let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
+                let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                let invalidate = self.invalidate.as_mut().expect("invalidation retained");
+                let mut tee = DisposalTee::new(
+                    preserved,
+                    self.instance,
+                    fallback.as_deref_mut(),
+                    &mut self.assoc_queue,
+                );
+                let done = throwaway.poll_invalidation_step(invalidate, &mut tee, gate);
+                if !done {
+                    return false;
+                }
+                self.invalidate = None;
+                continue;
+            }
+            if self.head_retire_all.is_some() {
+                if !self.is_joint {
+                    self.head_retire_all = None;
+                    continue;
+                }
+                let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
+                let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                let retire = self.head_retire_all.as_mut().expect("head retire retained");
+                let mut tee = DisposalTee::new(
+                    preserved,
+                    self.instance,
+                    fallback.as_deref_mut(),
+                    &mut self.assoc_queue,
+                );
+                let done = throwaway.poll_invalidation_step(retire, &mut tee, gate);
+                if !done {
+                    return false;
+                }
+                self.head_retire_all = None;
+                self.head_retired = true;
+                continue;
+            }
+            if self.head_retire.is_some() {
+                if !self.is_joint {
+                    self.head_retire = None;
+                    continue;
+                }
+                let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
+                let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                let retire = self.head_retire.as_mut().expect("head retire retained");
+                let mut tee = DisposalTee::new(
+                    preserved,
+                    self.instance,
+                    fallback.as_deref_mut(),
+                    &mut self.assoc_queue,
+                );
+                let done = throwaway.poll_retire_step(retire, &mut tee, gate);
+                if !done {
+                    return false;
+                }
+                self.head_retire = None;
+                self.head_retired = true;
                 continue;
             }
             if let Some(expected) = self.pending_position {
-                if spent >= budget {
-                    debug_assert!(spent <= budget);
-                    return (false, spent);
+                if self.head_retired {
+                    if !gate.try_charge() {
+                        return false;
+                    }
+                    let head = feed.staged.pop_front().expect("pending head retained");
+                    assert_eq!(
+                        head.position, expected,
+                        "the disposal holds its head across credits"
+                    );
+                    let (position, _native) = (head.position, head.resource_native);
+                    drop(head);
+                    feed.frontier = feed.frontier.max(position);
+                    feed.history_disposed = feed.history_disposed.saturating_add(1);
+                    self.pending_position = None;
+                    self.head_retired = false;
+                    drop(self.pending_lease.take());
+                    continue;
                 }
-                spent += 1;
+                if !self.is_joint {
+                    if !gate.try_charge() {
+                        return false;
+                    }
+                    let head = feed.staged.pop_front().expect("pending head retained");
+                    assert_eq!(
+                        head.position, expected,
+                        "the disposal holds its head across credits"
+                    );
+                    let (position, _native) = (head.position, head.resource_native);
+                    drop(head);
+                    feed.frontier = feed.frontier.max(position);
+                    feed.history_disposed = feed.history_disposed.saturating_add(1);
+                    self.pending_position = None;
+                    drop(self.pending_lease.take());
+                    continue;
+                }
+                let front = feed.staged.front().expect("pending head retained");
+                assert_eq!(
+                    front.position, expected,
+                    "the disposal holds its head across credits"
+                );
+                let peek = {
+                    let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                    throwaway.would_retire_scope(&front.facts)
+                };
+                match peek {
+                    crate::semantics_edge::RetirePeek::All {
+                        count_reconciliations,
+                    } => {
+                        let origin = front.origin.clone();
+                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                        self.head_retire_all = Some(throwaway.start_budgeted_invalidation(
+                            false,
+                            Some(&origin),
+                            count_reconciliations,
+                        ));
+                        continue;
+                    }
+                    crate::semantics_edge::RetirePeek::Subset(scope) => {
+                        let origin = front.origin.clone();
+                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                        self.head_retire = Some(throwaway.start_budgeted_retire(scope, &origin));
+                        continue;
+                    }
+                    crate::semantics_edge::RetirePeek::NoOp => {
+                        if !gate.try_charge() {
+                            return false;
+                        }
+                    }
+                    crate::semantics_edge::RetirePeek::Bounded => {
+                        if !gate.try_charge_n(HEAD_WORST) {
+                            return false;
+                        }
+                    }
+                }
                 let head = feed.staged.pop_front().expect("pending head retained");
                 assert_eq!(
                     head.position, expected,
                     "the disposal holds its head across credits"
                 );
-                if self.is_joint {
+                {
                     let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
                     let preserved = self.preserved.as_mut().expect("joint keeps reducers");
-                    let mut outer = NoSink;
-                    let mut tee = KeyUseTee::new(
-                        &mut outer,
+                    let mut tee = DisposalTee::new(
                         preserved,
                         self.instance,
-                        None,
                         fallback.as_deref_mut(),
+                        &mut self.assoc_queue,
                     );
                     throwaway.observe_with_effects(&head.facts, &head.origin, &mut tee);
                 }
@@ -4084,36 +4420,41 @@ impl FeedDisposalCursor {
                 feed.frontier = feed.frontier.max(position);
                 feed.history_disposed = feed.history_disposed.saturating_add(1);
                 self.pending_position = None;
+                drop(self.pending_lease.take());
                 continue;
             }
             let Some(front) = feed.staged.front() else {
                 if self.finalized {
-                    debug_assert!(spent <= budget);
-                    return (true, spent);
+                    return true;
                 }
-                if spent >= budget {
-                    debug_assert!(spent <= budget);
-                    return (false, spent);
+                if !self.is_joint {
+                    self.finalized = true;
+                    return true;
                 }
-                spent += 1;
-                let mut throwaway = self.throwaway.take().expect("joint finalizes once");
-                let mut preserved = self.preserved.take().expect("joint finalizes once");
-                {
-                    let mut outer = NoSink;
-                    let mut tee = KeyUseTee::new(
-                        &mut outer,
-                        &mut preserved,
-                        self.instance,
-                        None,
-                        fallback.as_deref_mut(),
-                    );
-                    throwaway.invalidate_with_effects(&mut tee);
+                if !self.finalize_started {
+                    if self.throwaway.is_none() || self.preserved.is_none() {
+                        debug_assert!(false, "joint finalizes once with live reducers");
+                        return false;
+                    }
+                    let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                    self.invalidate =
+                        Some(throwaway.start_budgeted_invalidation(true, None, false));
+                    self.finalize_started = true;
+                    continue;
                 }
+                debug_assert!(self.invalidate.is_none());
+                debug_assert!(self.assoc_queue.is_empty());
+                debug_assert!(self.assoc_release.is_none());
+                let preserved = self.preserved.take().expect("joint finalizes once");
+                let _throwaway = self.throwaway.take().expect("joint finalizes once");
                 keyuse.absorb_preserved(preserved);
                 self.finalized = true;
-                debug_assert!(spent <= budget);
-                return (true, spent);
+                return true;
             };
+            if self.pending_lease.is_some() {
+                debug_assert!(false, "a retained lease always pairs with its head");
+                return false;
+            }
             let (position, native) = (front.position, front.resource_native);
             let cursor = match native {
                 Some(native) => ledger.release_cursor_collected(native, position),
@@ -4122,6 +4463,389 @@ impl FeedDisposalCursor {
             self.pending_position = Some(position);
             self.pending_release = Some(cursor);
             continue;
+        }
+    }
+}
+
+#[cfg(test)]
+mod disposal_tests {
+    use super::*;
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::{LeafBudget, StagingLedger};
+
+    fn call(function: &str, session: u64, rv: u64, ts_ns: u64) -> SemanticCall {
+        SemanticCall {
+            function: function.into(),
+            rv,
+            session,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    fn init_call(function: &str, session: u64, mechanism: u64, ts_ns: u64) -> SemanticCall {
+        SemanticCall {
+            function: function.into(),
+            session,
+            mechanism,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    fn origin(function: &str, session: u64, ts_ns: u64) -> EffectOrigin {
+        EffectOrigin {
+            function: function.into(),
+            session,
+            ts_ns,
+        }
+    }
+
+    fn joint_feed() -> JointStaging {
+        let mut feed = JointStaging::select_s1_only();
+        feed.mode = FeedMode::Joint;
+        feed
+    }
+
+    fn unknown_sums(keyuse: &KeyUseReducer) -> [u64; 4] {
+        let mut sums = [0u64; 4];
+        for row in keyuse.unknown_counters().iter() {
+            sums[0] += row.completed;
+            sums[1] += row.failed;
+            sums[2] += row.cancelled;
+            sums[3] += row.unknown;
+        }
+        sums
+    }
+
+    #[test]
+    fn feed_disposal_finalize_with_65_truncated_opens_is_resumable() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(7);
+        for position in 1..=65u64 {
+            let session = 1000 + position;
+            feed.stage(
+                init_call("C_SignInit", session, 0x000d, 100 + position),
+                origin("C_SignInit", session, 100 + position),
+                position,
+                &mut ledger,
+            )
+            .unwrap();
+        }
+        assert_eq!(feed.staged_len(), 65);
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let mut polls = 0;
+        let mut max_spent = 0;
+        let mut sum_spent = 0;
+        let mut sum_reads = 0;
+        loop {
+            ledger.reset_test_leaf_reads_for_test();
+            ledger.reset_test_slot_visits_for_test();
+            fallback.reset_test_leaf_reads_for_test();
+            fallback.reset_test_slot_visits_for_test();
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            let spent = gate.spent();
+            let reads = ledger.test_leaf_reads_for_test()
+                + ledger.test_slot_visits_for_test()
+                + fallback.test_leaf_reads_for_test()
+                + fallback.test_slot_visits_for_test();
+            assert!(spent <= 64, "poll {polls} spent {spent} above 64");
+            assert!(
+                reads <= spent,
+                "poll {polls} reads {reads} above debited {spent}"
+            );
+            max_spent = max_spent.max(spent);
+            sum_spent += spent;
+            sum_reads += reads;
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 512, "the 65-open disposal must complete");
+        }
+        assert!(polls > 2, "65 opens need several credits, got {polls}");
+        assert_eq!(max_spent, 64, "at least one full credit is exercised");
+        assert!(sum_reads <= sum_spent);
+        assert_eq!(feed.staged_len(), 0);
+        assert_eq!(feed.history_disposed(), 65);
+        assert_eq!(unknown_sums(&keyuse)[3], 65, "65 truncated Unknown rows");
+        assert_eq!(unknown_sums(&keyuse)[2], 0, "no Cancelled rows here");
+        assert_eq!(ledger.staged(), 0, "every H9 released");
+        assert_eq!(
+            fallback.census(),
+            0,
+            "every fallback association released exactly once"
+        );
+    }
+
+    #[test]
+    fn feed_disposal_c_finalize_head_with_65_machines_retires_resumably() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(9);
+        for position in 1..=65u64 {
+            let session = 2000 + position;
+            feed.stage(
+                init_call("C_SignInit", session, 0x000d, 100 + position),
+                origin("C_SignInit", session, 100 + position),
+                position,
+                &mut ledger,
+            )
+            .unwrap();
+        }
+        feed.stage(
+            call("C_Finalize", p11scope_ebpf_common::SESSION_NONE, 0, 1000),
+            origin("C_Finalize", p11scope_ebpf_common::SESSION_NONE, 1000),
+            66,
+            &mut ledger,
+        )
+        .unwrap();
+        assert_eq!(feed.staged_len(), 66);
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let mut polls = 0;
+        let mut max_spent = 0;
+        let mut sum_spent = 0;
+        let mut sum_reads = 0;
+        loop {
+            ledger.reset_test_leaf_reads_for_test();
+            ledger.reset_test_slot_visits_for_test();
+            fallback.reset_test_leaf_reads_for_test();
+            fallback.reset_test_slot_visits_for_test();
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            let spent = gate.spent();
+            let reads = ledger.test_leaf_reads_for_test()
+                + ledger.test_slot_visits_for_test()
+                + fallback.test_leaf_reads_for_test()
+                + fallback.test_slot_visits_for_test();
+            assert!(spent <= 64, "poll {polls} spent {spent} above 64");
+            assert!(
+                reads <= spent,
+                "poll {polls} reads {reads} above debited {spent}"
+            );
+            max_spent = max_spent.max(spent);
+            sum_spent += spent;
+            sum_reads += reads;
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 1024, "the finalize retire must complete");
+        }
+        assert!(polls > 2, "65 retires need several credits, got {polls}");
+        assert_eq!(max_spent, 64, "at least one full credit is exercised");
+        assert!(sum_reads <= sum_spent);
+        assert_eq!(feed.staged_len(), 0);
+        assert_eq!(feed.history_disposed(), 66);
+        assert_eq!(
+            unknown_sums(&keyuse)[2],
+            65,
+            "the 65 retired opens close Cancelled (not Unknown)"
+        );
+        assert_eq!(ledger.staged(), 0, "every H9 released");
+        assert_eq!(
+            fallback.census(),
+            0,
+            "every fallback association released exactly once"
+        );
+    }
+
+    #[test]
+    fn feed_disposal_last_unit_unlink_retains_lease_until_pop() {
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(11);
+        feed.stage(
+            init_call("C_SignInit", 3001, 0x000d, 100),
+            origin("C_SignInit", 3001, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let pool_before = pool.snapshot().charged_bytes;
+        let mut unlink_polls = 0;
+        loop {
+            let mut gate = LeafBudget::new(1);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            assert!(!done, "one-unit credits cannot finish a head plus finalize");
+            unlink_polls += 1;
+            assert!(unlink_polls < 64, "the unlink must complete");
+            if cursor.pending_lease_bytes_for_test().is_some() {
+                break;
+            }
+        }
+        assert_eq!(feed.staged_len(), 1, "the head stays staged");
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            pool_before,
+            "no pool refund while the payload lives"
+        );
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        assert!(
+            fallback.mint_keyassoc(16).is_err(),
+            "exact-fit: no room while the H9 lease is retained"
+        );
+        let mut gate = LeafBudget::new(64);
+        let done = cursor.poll(
+            &mut feed,
+            &mut ledger,
+            Some(&mut fallback),
+            &mut keyuse,
+            &mut gate,
+        );
+        let _ = done;
+        assert_eq!(feed.staged_len(), 0, "the pop drops the payload");
+        assert_eq!(
+            cursor.pending_lease_bytes_for_test(),
+            None,
+            "the drop refunds the retained lease"
+        );
+        assert!(
+            pool.snapshot().charged_bytes < pool_before,
+            "the pop refunds the pool charge"
+        );
+        pool.reference_set_limit(usize::MAX);
+        assert!(
+            fallback.mint_keyassoc(16).is_ok(),
+            "room returns once the payload drops"
+        );
+    }
+
+    /// Queued disposal `Ended` handling matches the synchronous arm
+    /// exactly (same closes, unknown summaries, evidence, refusals;
+    /// ledger releases deferred FIFO without loss): random opens then
+    /// random terminals, sync vs queued + budgeted drain, over 50
+    /// seeds. Guards the duplicated `Ended` arm against drift.
+    #[test]
+    fn queued_ended_matches_synchronous_observe() {
+        use crate::semantics_edge::OperationId;
+        for seed in 0..50u64 {
+            let mut snapshots = Vec::new();
+            for path in 0..2 {
+                let mut state = seed.wrapping_add(0xabcd_ef01_2345_6789);
+                let mut next = || {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    state = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+                    state
+                };
+                let pool = SemanticResourcePool::default();
+                let mut fallback = StagingLedger::with_resources(pool.reserver());
+                fallback.prepare_capacity().unwrap();
+                let instance =
+                    crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(
+                        (100 + seed) as u32,
+                    );
+                let mut keyuse = KeyUseReducer::new();
+                let opens = 1 + (next() % 20);
+                let mut ids = Vec::new();
+                for ordinal in 0..opens {
+                    let id = OperationId::from_ordinal_for_test(1 + ordinal);
+                    ids.push(id);
+                    let effect = OperationEffect::Started {
+                        id,
+                        category: "sign",
+                        mechanism: Some(0x000d),
+                        key_receipt: None,
+                        origin: origin("C_SignInit", 1, 100 + ordinal),
+                    };
+                    keyuse.observe_effect(instance, &effect, None, Some(&mut fallback));
+                }
+                let mut queue = VecDeque::new();
+                for id in &ids {
+                    if next().is_multiple_of(4) {
+                        continue;
+                    }
+                    let outcome = match next() % 4 {
+                        0 => OperationOutcome::Completed,
+                        1 => OperationOutcome::Failed,
+                        2 => OperationOutcome::Cancelled,
+                        _ => OperationOutcome::Unknown,
+                    };
+                    if path == 0 {
+                        let effect = OperationEffect::Ended {
+                            id: *id,
+                            category: "sign",
+                            outcome,
+                            origin: origin("C_Sign", 1, 500),
+                            length: None,
+                            corroboration: None,
+                        };
+                        keyuse.observe_effect(instance, &effect, None, Some(&mut fallback));
+                    } else {
+                        keyuse.observe_ended_queued_for_disposal(
+                            instance, id, &outcome, &None, &None, &mut queue,
+                        );
+                    }
+                }
+                if path == 1 {
+                    while let Some(ticket) = queue.pop_front() {
+                        let mut cursor = fallback.release_assoc_cursor(ticket);
+                        loop {
+                            let (done, _, result) = fallback.release_step(&mut cursor, 64);
+                            if done {
+                                drop(result);
+                                break;
+                            }
+                        }
+                    }
+                }
+                snapshots.push((
+                    unknown_sums(&keyuse),
+                    fallback.census(),
+                    fallback.charged_bytes(),
+                    keyuse.evidence(),
+                    keyuse.open().len(),
+                    keyuse.refused_opens().len(),
+                    pool.snapshot().charged_bytes,
+                ));
+            }
+            assert_eq!(
+                snapshots[1], snapshots[0],
+                "seed {seed}: queued + drain matches sync"
+            );
         }
     }
 }

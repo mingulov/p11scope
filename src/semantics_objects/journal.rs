@@ -28,6 +28,7 @@ pub(crate) mod joint_driver;
 #[cfg(test)]
 mod native_producer_tests;
 mod reservations;
+pub(crate) use reservations::LeafBudget;
 #[cfg(all(test, p11scope_journal_roots))]
 mod root_proof_tests;
 mod seal_replay;

@@ -45,6 +45,7 @@
 
 use crate::keymeta::{CompletionEvidence, LengthOutcome};
 use crate::semantics::{cancel_operation_mask, direct_cancel_flag};
+use crate::semantics_objects::journal::LeafBudget;
 use p11scope_ebpf_common::{
     FUNCTION_NONE, SESSION_NONE, SlotSemantics, USER_TYPE_NONE, capture, direct, lifecycle,
     semantic_flags, transition,
@@ -212,6 +213,11 @@ impl OperationId {
     #[cfg(test)]
     pub(crate) fn ordinal_for_test(self) -> u64 {
         self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_ordinal_for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -1065,6 +1071,157 @@ impl EndState {
             Self::Unknown => OperationOutcome::Unknown,
         }
     }
+}
+
+/// Resumable budgeted invalidation cursor: drains active machines
+/// one per leaf, then pending/detached payloads and open bindings.
+/// Held by the disposal across credits; the edge maps themselves
+/// retain the remaining entries (pop reduces, no snapshot).
+pub(crate) struct EdgeInvalidationCursor {
+    phase: EdgeInvalidationPhase,
+    origin: EffectOrigin,
+    end: EndState,
+    count_reconciliations: bool,
+    changed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeInvalidationPhase {
+    Active,
+    Pending,
+    Detached,
+    Open,
+    Done,
+}
+
+/// Budgeted retire scope for one staged lifecycle call during
+/// disposal (All retires use [`EdgeInvalidationCursor`] with
+/// `end_unknown=false`; these cover the subset scopes). Mirrors the
+/// synchronous `retire_session` / `end_session_machines` /
+/// `clear_selected` / CLOSE_ALL / LOGIN conditions; the peek
+/// [`EdgeSemantics::would_retire_scope`] shares the pure condition
+/// helpers so the two cannot drift.
+/// Post-retire action for one session scope (mirrors the
+/// synchronous arms' evidence counts and open inserts; counts are
+/// O(1) integer increments, free; the OPEN insert charges 1 leaf).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SessionPost {
+    /// CLOSE_SESSION OK: count unmatched_closes when no open existed.
+    Close,
+    /// SESSION_CLOSED/HANDLE_INVALID reconcile: count
+    /// state_reconciliations when anything retired.
+    Reconcile,
+    /// OPEN_SESSION OK reuse: insert the new open (session→slot) with
+    /// headroom counting (dropped when full).
+    Open { slot: u64 },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EdgeRetireScope {
+    /// One session: forget its open, end its machines as `end_unknown`
+    /// (false=Cancelled), drop its pendings, float its async ids,
+    /// then apply `post`. Covers CLOSE_SESSION OK (`Close`),
+    /// SESSION_CLOSED/HANDLE_INVALID (`Reconcile`), OPEN_SESSION
+    /// handle reuse (`Open`, Unknown).
+    Session {
+        session: u64,
+        end_unknown: bool,
+        post: SessionPost,
+    },
+    /// One session's machines only (no open/pending/async): covers
+    /// SET_OPERATION_STATE OK (counts operation_state_imports after).
+    SessionMachines { session: u64, end_unknown: bool },
+    /// Sessions on one slot: end owned machines as Cancelled, drop
+    /// owned pendings, float owned async, forget owned opens. When
+    /// `close_all` also ends unproven sessions (active/pending with
+    /// no open) as Unknown (CLOSE_ALL_SESSIONS OK); otherwise owned
+    /// only (LOGIN/LOGOUT OK/PIN_LOCKED).
+    Slot { slot: u64, close_all: bool },
+    /// Selected machines/pendings/async on one session by cancel
+    /// flags (SESSION_CANCEL OK / OPERATION_CANCEL_FAILED ambiguity
+    /// when `ambiguous`).
+    Selected {
+        session: u64,
+        flags: u64,
+        ambiguous: bool,
+    },
+}
+
+/// Resumable budgeted retire cursor for one staged head's subset
+/// scope: scans active/pending/detached/open incrementally with
+/// `done_upto` positions (no snapshot allocation), one leaf per
+/// visited entry (plus one per emitted terminal for matching
+/// machines, via `try_charge_n(2)` atomically so visit+terminal never
+/// split across credits). Association releases for emitted terminals
+/// queue in the caller's assoc queue (same shared budget). Preserves
+/// terminal reasons (Cancelled for owned/selected, Unknown for
+/// unproven) and effect order (map order per phase).
+pub(crate) struct EdgeRetireCursor {
+    scope: EdgeRetireScope,
+    origin: EffectOrigin,
+    phase: EdgeRetirePhase,
+    active_done_upto: Option<(u64, u16)>,
+    pending_done_upto: Option<(u64, u32)>,
+    detached_done_upto: Option<(u64, u32, crate::semantics_objects::AsyncValue)>,
+    open_done_upto: Option<u64>,
+    /// Slot CLOSE_ALL second Active pass (unproven Unknown after owned
+    /// Cancelled, matching synchronous grouped order): false during
+    /// the owned pass, true during the unproven pass.
+    slot_unproven_pass: bool,
+    /// Whether any state retired (open/machine/pending/async): drives
+    /// reconcile/auth post counts. Set as phases drain.
+    changed: bool,
+    /// Whether the session's open existed before the forget (Session
+    /// Close/Reconcile posts): set during the Open forget.
+    session_had_open: Option<bool>,
+    /// Pending OPEN insert (session, slot) after the forget (Session
+    /// Open post): set after forget completes, cleared after insert.
+    open_insert_pending: Option<(u64, u64)>,
+    /// Whether Selected unknown-flags counting ran (first poll).
+    selected_counted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeRetirePhase {
+    Active,
+    Pending,
+    Detached,
+    Open,
+    Done,
+}
+
+/// Pure peek result for one staged head (see
+/// [`EdgeSemantics::would_retire_scope`]).
+#[derive(Debug, Clone)]
+pub(crate) enum RetirePeek {
+    /// Zero-leaf observe (gate failure, unsealed/COUNT_ONLY, PENDING
+    /// queue, lifecycle guard miss): caller pops for 1 unit and runs
+    /// observe synchronously with no pre-charge (0 reads).
+    NoOp,
+    /// Bounded observe (Init/Update/Direct/Async, 2-machine
+    /// OPERATION_NOT_INITIALIZED): caller reserve-checks HEAD_WORST
+    /// and runs atomically.
+    Bounded,
+    /// Whole-scope retire (caller uses budgeted invalidation):
+    /// `count_reconciliations` mirrors sync (true for
+    /// CRYPTOKI_NOT_INITIALIZED reconcile, false for FINALIZE and
+    /// loss finalization).
+    All { count_reconciliations: bool },
+    /// Subset retire (caller uses budgeted retire cursor).
+    Subset(EdgeRetireScope),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireActiveDecision {
+    Skip,
+    End(EndState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireDetachedAction {
+    Keep,
+    Float,
+    Drop,
 }
 
 impl EdgeSemantics {
@@ -2089,6 +2246,799 @@ impl EdgeSemantics {
         let open_charge = self.open.len() * resources::OPEN_BINDING_CHARGE;
         self.open.clear();
         self.release_resource_charge(open_charge);
+    }
+
+    /// Start a resumable budgeted invalidation (disposal finalization
+    /// and staged All-scope retiring calls): drains active machines
+    /// two leaves per machine (visit + terminal), then
+    /// pending/detached drops and open unbinds, with the same terminal
+    /// reasons, effect order (active-map order), counters and resource
+    /// releases as the synchronous arms. `end_unknown` names the
+    /// terminal (true=Unknown for loss/invalidate, false=Cancelled for
+    /// finalize/retire); `origin` names the terminals (`None` for the
+    /// loss origin of finalization, `Some` for a retiring head's call
+    /// origin like sync `retire_all`); `count_reconciliations` mirrors
+    /// sync (true only for CRYPTOKI_NOT_INITIALIZED reconcile). The
+    /// caller drives [`Self::poll_invalidation_step`] with the shared
+    /// [`LeafBudget`] until it completes.
+    pub(crate) fn start_budgeted_invalidation(
+        &self,
+        end_unknown: bool,
+        origin: Option<&EffectOrigin>,
+        count_reconciliations: bool,
+    ) -> EdgeInvalidationCursor {
+        let end = if end_unknown {
+            EndState::Unknown
+        } else {
+            EndState::Cancelled
+        };
+        EdgeInvalidationCursor {
+            phase: EdgeInvalidationPhase::Active,
+            origin: match origin {
+                Some(origin) => origin.clone(),
+                None => EffectOrigin {
+                    function: "loss".into(),
+                    session: SESSION_NONE,
+                    ts_ns: self.last_seen_ns,
+                },
+            },
+            end,
+            count_reconciliations,
+            changed: false,
+        }
+    }
+
+    /// Drive one budgeted invalidation step through the shared
+    /// pre-debit gate: two leaves per active machine (visit +
+    /// terminal, atomically via `try_charge_n(2)` so the pair never
+    /// splits), one per pending/detached drop or open unbind. Returns
+    /// whether the invalidation completed. On exhaustion yields
+    /// WITHOUT popping (no read past the credit). Emitted terminals
+    /// feed `sink` (the disposal tees them into its preserved
+    /// key-use, queuing association releases for the same budget).
+    /// Preserves terminal reasons and effect order.
+    pub(crate) fn poll_invalidation_step<S: OperationSink>(
+        &mut self,
+        cursor: &mut EdgeInvalidationCursor,
+        sink: &mut S,
+        budget: &mut LeafBudget,
+    ) -> bool {
+        loop {
+            match cursor.phase {
+                EdgeInvalidationPhase::Active => {
+                    if self.active.is_empty() {
+                        cursor.phase = EdgeInvalidationPhase::Pending;
+                        continue;
+                    }
+                    if !budget.try_charge_n(2) {
+                        return false;
+                    }
+                    let Some(((_, bit), machine)) = self.active.pop_first() else {
+                        cursor.phase = EdgeInvalidationPhase::Pending;
+                        continue;
+                    };
+                    cursor.changed = true;
+                    self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
+                    match cursor.end {
+                        EndState::Completed => {
+                            self.completed = self.completed.saturating_add(1);
+                        }
+                        EndState::Cancelled => {
+                            self.cancelled = self.cancelled.saturating_add(1);
+                        }
+                        EndState::Failed => self.failed = self.failed.saturating_add(1),
+                        EndState::Unknown => {
+                            self.unknown = self.unknown.saturating_add(1);
+                        }
+                    }
+                    if S::WANTS_EFFECTS {
+                        sink.emit(OperationEffect::Ended {
+                            id: OperationId(machine.generation),
+                            category: Self::category_name(bit),
+                            outcome: cursor.end.outcome(),
+                            origin: cursor.origin.clone(),
+                            length: None,
+                            corroboration: None,
+                        });
+                    }
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                EdgeInvalidationPhase::Pending => {
+                    if self.pending.is_empty() {
+                        cursor.phase = EdgeInvalidationPhase::Detached;
+                        continue;
+                    }
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    let _ = self.pending.pop_first();
+                    cursor.changed = true;
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                EdgeInvalidationPhase::Detached => {
+                    if self.detached.is_empty() {
+                        cursor.phase = EdgeInvalidationPhase::Open;
+                        continue;
+                    }
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    let _ = self.detached.pop_first();
+                    cursor.changed = true;
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                EdgeInvalidationPhase::Open => {
+                    if self.open.is_empty() {
+                        if cursor.count_reconciliations && cursor.changed {
+                            self.evidence.state_reconciliations =
+                                self.evidence.state_reconciliations.saturating_add(1);
+                        }
+                        cursor.phase = EdgeInvalidationPhase::Done;
+                        continue;
+                    }
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    let _ = self.open.pop_first();
+                    cursor.changed = true;
+                    self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                EdgeInvalidationPhase::Done => {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Pure retire-scope peek for one staged head during disposal:
+    /// returns how the head would retire WITHOUT mutating (no counter
+    /// increments, no map changes). `NoOp` means zero-leaf observe
+    /// (caller pops for 1, no pre-charge); `Bounded` means bounded
+    /// observe (caller reserve-checks HEAD_WORST and runs atomically);
+    /// `All` means whole-scope retire (caller uses
+    /// [`Self::start_budgeted_invalidation`] with Cancelled);
+    /// `Subset(scope)` means subset retire (caller uses
+    /// [`Self::start_budgeted_retire`]). Shares the pure
+    /// gate/descriptor/lifecycle condition helpers with
+    /// [`Self::observe_inner`] so the two cannot drift (only the
+    /// downgrade-cause counting differs, which the peek correctly
+    /// omits). LOGIN/LOGOUT resolve their slot from the live open map
+    /// (like sync); without an open for the session they no-op.
+    pub(crate) fn would_retire_scope(&self, call: &SemanticCall) -> RetirePeek {
+        if !call.attributable || !call.authorized || !call.unambiguous || call.count_only {
+            return RetirePeek::NoOp;
+        }
+        let descriptor =
+            crate::kinds::descriptor(&call.function).unwrap_or(SlotSemantics::COUNT_ONLY);
+        if descriptor == SlotSemantics::COUNT_ONLY {
+            return RetirePeek::NoOp;
+        }
+        if call.rv == CkRv::OPERATION_NOT_INITIALIZED.0 {
+            return RetirePeek::Bounded;
+        }
+        if call.rv == CkRv::SESSION_CLOSED.0 || call.rv == CkRv::SESSION_HANDLE_INVALID.0 {
+            return RetirePeek::Subset(EdgeRetireScope::Session {
+                session: call.session,
+                end_unknown: false,
+                post: SessionPost::Reconcile,
+            });
+        }
+        if call.rv == CkRv::CRYPTOKI_NOT_INITIALIZED.0 {
+            return RetirePeek::All {
+                count_reconciliations: true,
+            };
+        }
+        if call.rv == CkRv::PENDING.0 {
+            return RetirePeek::NoOp;
+        }
+        if matches!(
+            descriptor.lifecycle,
+            x if x == lifecycle::ASYNC_COMPLETE
+                || x == lifecycle::ASYNC_GET_ID
+                || x == lifecycle::ASYNC_JOIN
+        ) {
+            return RetirePeek::Bounded;
+        }
+        match descriptor.lifecycle {
+            x if x == lifecycle::OPEN_SESSION => {
+                if call.rv == CkRv::OK.0 && call.session != SESSION_NONE {
+                    RetirePeek::Subset(EdgeRetireScope::Session {
+                        session: call.session,
+                        end_unknown: true,
+                        post: SessionPost::Open { slot: call.slot_id },
+                    })
+                } else {
+                    RetirePeek::NoOp
+                }
+            }
+            x if x == lifecycle::CLOSE_SESSION => {
+                if call.rv == CkRv::OK.0 {
+                    RetirePeek::Subset(EdgeRetireScope::Session {
+                        session: call.session,
+                        end_unknown: false,
+                        post: SessionPost::Close,
+                    })
+                } else {
+                    RetirePeek::NoOp
+                }
+            }
+            x if x == lifecycle::CLOSE_ALL_SESSIONS => {
+                if call.rv == CkRv::OK.0 {
+                    RetirePeek::Subset(EdgeRetireScope::Slot {
+                        slot: call.slot_id,
+                        close_all: true,
+                    })
+                } else {
+                    RetirePeek::NoOp
+                }
+            }
+            x if x == lifecycle::FINALIZE => {
+                if call.rv == CkRv::OK.0 {
+                    RetirePeek::All {
+                        count_reconciliations: false,
+                    }
+                } else {
+                    RetirePeek::NoOp
+                }
+            }
+            x if x == lifecycle::LOGIN || x == lifecycle::LOGOUT => {
+                if call.rv != CkRv::OK.0 && call.rv != CkRv::PIN_LOCKED.0 {
+                    return RetirePeek::NoOp;
+                }
+                match self.open.get(&call.session).copied() {
+                    Some(slot) => RetirePeek::Subset(EdgeRetireScope::Slot {
+                        slot,
+                        close_all: false,
+                    }),
+                    None => RetirePeek::NoOp,
+                }
+            }
+            x if x == lifecycle::SESSION_CANCEL => {
+                let selected = (call.flags & crate::semantics::KNOWN_CANCEL_FLAGS).count_ones();
+                if call.rv == CkRv::OK.0
+                    || (call.rv == CkRv::OPERATION_CANCEL_FAILED.0 && selected > 1)
+                {
+                    RetirePeek::Subset(EdgeRetireScope::Selected {
+                        session: call.session,
+                        flags: call.flags,
+                        ambiguous: call.rv == CkRv::OPERATION_CANCEL_FAILED.0 && selected > 1,
+                    })
+                } else {
+                    RetirePeek::NoOp
+                }
+            }
+            x if x == lifecycle::SET_OPERATION_STATE => {
+                if call.rv == CkRv::OK.0 {
+                    RetirePeek::Subset(EdgeRetireScope::SessionMachines {
+                        session: call.session,
+                        end_unknown: false,
+                    })
+                } else {
+                    RetirePeek::NoOp
+                }
+            }
+            _ => RetirePeek::Bounded,
+        }
+    }
+
+    /// Start a resumable budgeted subset retire for one staged head's
+    /// scope (see [`Self::would_retire_scope`]). The caller drives
+    /// [`Self::poll_retire_step`] with the shared [`LeafBudget`]
+    /// until it completes, then finishes the head (pop/count, no
+    /// second retire: the synchronous observe's retire arms must NOT
+    /// run for this head since the cursor already applied them; the
+    /// caller skips observe for retiring heads and only preserves via
+    /// the cursor's emitted terminals).
+    pub(crate) fn start_budgeted_retire(
+        &self,
+        scope: EdgeRetireScope,
+        origin: &EffectOrigin,
+    ) -> EdgeRetireCursor {
+        let _ = self.last_seen_ns;
+        EdgeRetireCursor {
+            scope,
+            origin: origin.clone(),
+            phase: EdgeRetirePhase::Active,
+            active_done_upto: None,
+            pending_done_upto: None,
+            detached_done_upto: None,
+            open_done_upto: None,
+            slot_unproven_pass: false,
+            changed: false,
+            session_had_open: None,
+            open_insert_pending: None,
+            selected_counted: false,
+        }
+    }
+
+    /// Drive one budgeted subset-retire step through the shared
+    /// pre-debit gate. Returns whether the retire completed. On
+    /// exhaustion yields WITHOUT advancing past the refused leaf (no
+    /// read past the credit). Matching machines emit `Ended` through
+    /// `sink` (the disposal tees them into its preserved key-use,
+    /// queuing association releases for the same budget). Preserves
+    /// terminal reasons and effect order (map order per phase).
+    pub(crate) fn poll_retire_step<S: OperationSink>(
+        &mut self,
+        cursor: &mut EdgeRetireCursor,
+        sink: &mut S,
+        budget: &mut LeafBudget,
+    ) -> bool {
+        if let EdgeRetireScope::Selected { flags, .. } = &cursor.scope
+            && !cursor.selected_counted
+        {
+            cursor.selected_counted = true;
+            if flags & !crate::semantics::KNOWN_CANCEL_FLAGS != 0 {
+                self.evidence.session_cancel_unknown_flags =
+                    self.evidence.session_cancel_unknown_flags.saturating_add(1);
+            }
+        }
+        loop {
+            match cursor.phase {
+                EdgeRetirePhase::Active => {
+                    let Some(next) = self.retire_next_active(cursor) else {
+                        if matches!(cursor.scope, EdgeRetireScope::SessionMachines { .. }) {
+                            self.evidence.operation_state_imports =
+                                self.evidence.operation_state_imports.saturating_add(1);
+                            cursor.phase = EdgeRetirePhase::Done;
+                            continue;
+                        }
+                        if matches!(
+                            cursor.scope,
+                            EdgeRetireScope::Slot {
+                                close_all: true,
+                                ..
+                            }
+                        ) && !cursor.slot_unproven_pass
+                        {
+                            cursor.slot_unproven_pass = true;
+                            cursor.active_done_upto = None;
+                            continue;
+                        }
+                        cursor.phase = EdgeRetirePhase::Pending;
+                        continue;
+                    };
+                    let (session, bit) = next;
+                    let decision = self.retire_active_decision(cursor, session, bit);
+                    match decision {
+                        RetireActiveDecision::Skip => {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            cursor.active_done_upto = Some(next);
+                            if budget.remaining() == 0 {
+                                return false;
+                            }
+                        }
+                        RetireActiveDecision::End(end) => {
+                            if !budget.try_charge_n(2) {
+                                return false;
+                            }
+                            cursor.active_done_upto = Some(next);
+                            cursor.changed = true;
+                            let machine = self
+                                .active
+                                .remove(&next)
+                                .expect("retire scan retained its machine");
+                            self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
+                            match end {
+                                EndState::Completed => {
+                                    self.completed = self.completed.saturating_add(1);
+                                }
+                                EndState::Cancelled => {
+                                    self.cancelled = self.cancelled.saturating_add(1);
+                                }
+                                EndState::Failed => {
+                                    self.failed = self.failed.saturating_add(1);
+                                }
+                                EndState::Unknown => {
+                                    self.unknown = self.unknown.saturating_add(1);
+                                }
+                            }
+                            if S::WANTS_EFFECTS {
+                                sink.emit(OperationEffect::Ended {
+                                    id: OperationId(machine.generation),
+                                    category: Self::category_name(bit),
+                                    outcome: end.outcome(),
+                                    origin: cursor.origin.clone(),
+                                    length: None,
+                                    corroboration: None,
+                                });
+                            }
+                            let _ = session;
+                            if budget.remaining() == 0 {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                EdgeRetirePhase::Pending => {
+                    let Some(next) = self.retire_next_pending(cursor) else {
+                        cursor.phase = EdgeRetirePhase::Detached;
+                        continue;
+                    };
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    cursor.pending_done_upto = Some(next);
+                    if self.retire_pending_doomed(cursor, &next) {
+                        self.pending.remove(&next);
+                        cursor.changed = true;
+                    }
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                EdgeRetirePhase::Detached => {
+                    if self.detached.is_empty() {
+                        if matches!(
+                            cursor.scope,
+                            EdgeRetireScope::Slot {
+                                close_all: false,
+                                ..
+                            }
+                        ) {
+                            if cursor.changed {
+                                self.evidence.auth_state_ambiguities =
+                                    self.evidence.auth_state_ambiguities.saturating_add(1);
+                            }
+                            cursor.phase = EdgeRetirePhase::Done;
+                        } else {
+                            cursor.phase = EdgeRetirePhase::Open;
+                        }
+                        continue;
+                    }
+                    let Some(next) = self.retire_next_detached(cursor) else {
+                        if matches!(
+                            cursor.scope,
+                            EdgeRetireScope::Slot {
+                                close_all: false,
+                                ..
+                            }
+                        ) {
+                            if cursor.changed {
+                                self.evidence.auth_state_ambiguities =
+                                    self.evidence.auth_state_ambiguities.saturating_add(1);
+                            }
+                            cursor.phase = EdgeRetirePhase::Done;
+                        } else {
+                            cursor.phase = EdgeRetirePhase::Open;
+                        }
+                        continue;
+                    };
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    cursor.detached_done_upto = Some(next);
+                    match self.retire_detached_action(cursor, &next) {
+                        RetireDetachedAction::Float => {
+                            if let Some(id) = self.detached.get_mut(&next) {
+                                id.owner = None;
+                                cursor.changed = true;
+                            }
+                        }
+                        RetireDetachedAction::Drop => {
+                            self.detached.remove(&next);
+                            cursor.changed = true;
+                        }
+                        RetireDetachedAction::Keep => {}
+                    }
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                EdgeRetirePhase::Open => match cursor.scope.clone() {
+                    EdgeRetireScope::Session { session, post, .. } => {
+                        if cursor.open_insert_pending.is_none() && cursor.session_had_open.is_none()
+                        {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            let had = self.open.remove(&session).is_some();
+                            if had {
+                                self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
+                                cursor.changed = true;
+                            }
+                            cursor.session_had_open = Some(had);
+                            if let SessionPost::Open { slot } = post {
+                                cursor.open_insert_pending = Some((session, slot));
+                            }
+                        }
+                        if let Some((ins_session, ins_slot)) = cursor.open_insert_pending {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            if !self.open.contains_key(&ins_session)
+                                && self.open.len() >= MAX_EDGE_SESSIONS
+                            {
+                                self.dropped = self.dropped.saturating_add(1);
+                            } else {
+                                self.retain_resource_charge(resources::OPEN_BINDING_CHARGE);
+                                self.open.insert(ins_session, ins_slot);
+                            }
+                            cursor.open_insert_pending = None;
+                        }
+                        match post {
+                            SessionPost::Close => {
+                                if cursor.session_had_open == Some(false) {
+                                    self.evidence.unmatched_closes =
+                                        self.evidence.unmatched_closes.saturating_add(1);
+                                }
+                            }
+                            SessionPost::Reconcile => {
+                                if cursor.changed {
+                                    self.evidence.state_reconciliations =
+                                        self.evidence.state_reconciliations.saturating_add(1);
+                                }
+                            }
+                            SessionPost::Open { .. } => {
+                                if cursor.changed {
+                                    self.evidence.state_reconciliations =
+                                        self.evidence.state_reconciliations.saturating_add(1);
+                                }
+                            }
+                        }
+                        cursor.phase = EdgeRetirePhase::Done;
+                    }
+                    EdgeRetireScope::SessionMachines { .. } => {
+                        cursor.phase = EdgeRetirePhase::Done;
+                    }
+                    EdgeRetireScope::Selected { ambiguous, .. } => {
+                        if ambiguous {
+                            self.evidence.session_cancel_ambiguities =
+                                self.evidence.session_cancel_ambiguities.saturating_add(1);
+                        }
+                        cursor.phase = EdgeRetirePhase::Done;
+                    }
+                    EdgeRetireScope::Slot { slot, close_all } => {
+                        if !close_all {
+                            cursor.phase = EdgeRetirePhase::Done;
+                            continue;
+                        }
+                        let Some(next) = self.retire_next_open(cursor) else {
+                            cursor.phase = EdgeRetirePhase::Done;
+                            continue;
+                        };
+                        if !budget.try_charge() {
+                            return false;
+                        }
+                        cursor.open_done_upto = Some(next);
+                        if self.open.get(&next) == Some(&slot) {
+                            self.open.remove(&next);
+                            self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
+                            cursor.changed = true;
+                        }
+                        if budget.remaining() == 0 {
+                            return false;
+                        }
+                    }
+                },
+                EdgeRetirePhase::Done => {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Next active key for the retire scan: session ranges seek
+    /// directly (only the session's keys are visited); slot scopes
+    /// scan all with a per-session predicate.
+    fn retire_next_active(&self, cursor: &EdgeRetireCursor) -> Option<(u64, u16)> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        match &cursor.scope {
+            EdgeRetireScope::Session { session, .. }
+            | EdgeRetireScope::SessionMachines { session, .. } => match cursor.active_done_upto {
+                None => self
+                    .active
+                    .range((*session, 0)..=(*session, u16::MAX))
+                    .next()
+                    .map(|(key, _)| *key),
+                Some(done) => self
+                    .active
+                    .range((Excluded(done), Included((*session, u16::MAX))))
+                    .next()
+                    .map(|(key, _)| *key),
+            },
+            EdgeRetireScope::Selected { session, .. } => match cursor.active_done_upto {
+                None => self
+                    .active
+                    .range((*session, 0)..=(*session, u16::MAX))
+                    .next()
+                    .map(|(key, _)| *key),
+                Some(done) => self
+                    .active
+                    .range((Excluded(done), Included((*session, u16::MAX))))
+                    .next()
+                    .map(|(key, _)| *key),
+            },
+            EdgeRetireScope::Slot { .. } => match cursor.active_done_upto {
+                None => self.active.keys().next().copied(),
+                Some(done) => self
+                    .active
+                    .range((Excluded(done), Unbounded))
+                    .next()
+                    .map(|(key, _)| *key),
+            },
+        }
+    }
+
+    /// Whether the scanned active machine ends (and how) or is
+    /// skipped (still visited, 1 leaf).
+    fn retire_active_decision(
+        &self,
+        cursor: &EdgeRetireCursor,
+        session: u64,
+        bit: u16,
+    ) -> RetireActiveDecision {
+        match &cursor.scope {
+            EdgeRetireScope::Session { end_unknown, .. }
+            | EdgeRetireScope::SessionMachines { end_unknown, .. } => {
+                RetireActiveDecision::End(if *end_unknown {
+                    EndState::Unknown
+                } else {
+                    EndState::Cancelled
+                })
+            }
+            EdgeRetireScope::Slot { slot, close_all } => {
+                if *close_all && cursor.slot_unproven_pass {
+                    match self.open.get(&session) {
+                        None => RetireActiveDecision::End(EndState::Unknown),
+                        Some(_) => RetireActiveDecision::Skip,
+                    }
+                } else {
+                    match self.open.get(&session) {
+                        Some(owner) if owner == slot => {
+                            RetireActiveDecision::End(EndState::Cancelled)
+                        }
+                        _ => RetireActiveDecision::Skip,
+                    }
+                }
+            }
+            EdgeRetireScope::Selected { flags, .. } => {
+                let mask = cancel_operation_mask(*flags);
+                if mask & bit != 0 {
+                    RetireActiveDecision::End(EndState::Cancelled)
+                } else {
+                    RetireActiveDecision::Skip
+                }
+            }
+        }
+    }
+
+    /// Next pending key for the retire scan.
+    fn retire_next_pending(&self, cursor: &EdgeRetireCursor) -> Option<(u64, u32)> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        match &cursor.scope {
+            EdgeRetireScope::Session { session, .. }
+            | EdgeRetireScope::Selected { session, .. } => match cursor.pending_done_upto {
+                None => self
+                    .pending
+                    .range((*session, 0)..=(*session, u32::MAX))
+                    .next()
+                    .map(|(key, _)| *key),
+                Some(done) => self
+                    .pending
+                    .range((Excluded(done), Included((*session, u32::MAX))))
+                    .next()
+                    .map(|(key, _)| *key),
+            },
+            EdgeRetireScope::SessionMachines { .. } => None,
+            EdgeRetireScope::Slot { .. } => match cursor.pending_done_upto {
+                None => self.pending.keys().next().copied(),
+                Some(done) => self
+                    .pending
+                    .range((Excluded(done), Unbounded))
+                    .next()
+                    .map(|(key, _)| *key),
+            },
+        }
+    }
+
+    /// Whether the scanned pending call drops.
+    fn retire_pending_doomed(&self, cursor: &EdgeRetireCursor, next: &(u64, u32)) -> bool {
+        match &cursor.scope {
+            EdgeRetireScope::Session { .. } => true,
+            EdgeRetireScope::SessionMachines { .. } => false,
+            EdgeRetireScope::Slot { slot, close_all } => match self.open.get(&next.0) {
+                Some(owner) => owner == slot,
+                None => *close_all,
+            },
+            EdgeRetireScope::Selected {
+                session: _, flags, ..
+            } => {
+                let pending = self.pending.get(next).expect("retire scan retained");
+                let descriptor = crate::kinds::descriptor(&pending.call.function)
+                    .unwrap_or(SlotSemantics::COUNT_ONLY);
+                let mask = cancel_operation_mask(*flags);
+                !(descriptor.operations & mask == 0
+                    && direct_cancel_flag(descriptor.direct) & flags == 0)
+            }
+        }
+    }
+
+    /// Next detached key for the retire scan (detached keys are not
+    /// owner-ordered, so session scopes scan all).
+    fn retire_next_detached(
+        &self,
+        cursor: &EdgeRetireCursor,
+    ) -> Option<(u64, u32, crate::semantics_objects::AsyncValue)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match &cursor.scope {
+            EdgeRetireScope::SessionMachines { .. } => None,
+            _ => match &cursor.detached_done_upto {
+                None => self.detached.keys().next().copied(),
+                Some(done) => self
+                    .detached
+                    .range((Excluded(*done), Unbounded))
+                    .next()
+                    .map(|(key, _)| *key),
+            },
+        }
+    }
+
+    /// Float, drop, or keep the scanned detached id.
+    fn retire_detached_action(
+        &self,
+        cursor: &EdgeRetireCursor,
+        next: &(u64, u32, crate::semantics_objects::AsyncValue),
+    ) -> RetireDetachedAction {
+        let id = self.detached.get(next).expect("retire scan retained");
+        match &cursor.scope {
+            EdgeRetireScope::Session { session, .. } => {
+                if id.owner == Some(*session) {
+                    RetireDetachedAction::Float
+                } else {
+                    RetireDetachedAction::Keep
+                }
+            }
+            EdgeRetireScope::SessionMachines { .. } => RetireDetachedAction::Keep,
+            EdgeRetireScope::Slot { slot, close_all } => match id.owner {
+                Some(owner) => match self.open.get(&owner) {
+                    Some(candidate) if candidate == slot => RetireDetachedAction::Float,
+                    Some(_) => RetireDetachedAction::Keep,
+                    None if *close_all => RetireDetachedAction::Float,
+                    None => RetireDetachedAction::Keep,
+                },
+                None => RetireDetachedAction::Keep,
+            },
+            EdgeRetireScope::Selected { session, flags, .. } => {
+                if id.owner != Some(*session) {
+                    return RetireDetachedAction::Keep;
+                }
+                let descriptor = crate::kinds::descriptor(&id.call.function)
+                    .unwrap_or(SlotSemantics::COUNT_ONLY);
+                let mask = cancel_operation_mask(*flags);
+                if descriptor.operations & mask == 0
+                    && direct_cancel_flag(descriptor.direct) & flags == 0
+                {
+                    RetireDetachedAction::Keep
+                } else {
+                    RetireDetachedAction::Drop
+                }
+            }
+        }
+    }
+
+    /// Next open key for slot-scope scans.
+    fn retire_next_open(&self, cursor: &EdgeRetireCursor) -> Option<u64> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match cursor.open_done_upto {
+            None => self.open.keys().next().copied(),
+            Some(done) => self
+                .open
+                .range((Excluded(done), Unbounded))
+                .next()
+                .map(|(key, _)| *key),
+        }
     }
 
     /// Same-file double-load detection (F7b/F7c): live operations end
@@ -3328,5 +4278,175 @@ mod tests {
             Some("CKR_BUFFER_TOO_SMALL".to_string())
         );
         assert_eq!(rv_name(0xdead_beef), None);
+    }
+
+    fn seed_edge(edge: &mut EdgeSemantics, seed: u64) {
+        let mut state = seed.wrapping_add(0x1234_5678_9abc_def1);
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+            state
+        };
+        for index in 0..(20 + (next() % 40)) {
+            let session = 1 + (next() % 8);
+            let function = match next() % 6 {
+                0 => "C_OpenSession",
+                1 => "C_SignInit",
+                2 => "C_EncryptInit",
+                3 => "C_Sign",
+                4 => "C_CloseSession",
+                _ => "C_Login",
+            };
+            let ts = 100 + index * 10;
+            if function.ends_with("Init") {
+                edge.observe(&init(function, session, RSA_PSS, ts));
+            } else {
+                edge.observe(&call(function, session, CkRv::OK.0, ts));
+            }
+        }
+    }
+
+    fn retiring_calls() -> Vec<SemanticCall> {
+        vec![
+            call("C_Finalize", SESSION_NONE, CkRv::OK.0, 10_000),
+            call("C_Sign", 3, CkRv::CRYPTOKI_NOT_INITIALIZED.0, 10_010),
+            call("C_CloseSession", 2, CkRv::OK.0, 10_020),
+            call("C_CloseAllSessions", 1, CkRv::OK.0, 10_030),
+            call("C_Login", 4, CkRv::OK.0, 10_040),
+            call("C_Logout", 4, CkRv::OK.0, 10_050),
+            SemanticCall {
+                flags: crate::semantics::KNOWN_CANCEL_FLAGS & 0x3,
+                ..call("C_SessionCancel", 2, CkRv::OK.0, 10_060)
+            },
+            call("C_SetOperationState", 5, CkRv::OK.0, 10_070),
+            call("C_Sign", 6, CkRv::SESSION_CLOSED.0, 10_080),
+            call("C_OpenSession", 7, CkRv::OK.0, 10_090),
+        ]
+    }
+
+    /// Budgeted retire cursors match synchronous observe exactly:
+    /// same end maps, counters, evidence and effect order, one leaf
+    /// per visit/terminal/drop/unbind, over random seeds and every
+    /// retiring call shape (All, Session, Slot, Selected).
+    #[test]
+    fn budgeted_retire_matches_synchronous_observe() {
+        use crate::semantics_objects::journal::LeafBudget;
+        for seed in 0..30u64 {
+            for retiring in retiring_calls() {
+                let origin = EffectOrigin {
+                    function: retiring.function.clone(),
+                    session: retiring.session,
+                    ts_ns: retiring.ts_ns,
+                };
+                let mut sync_edge = EdgeSemantics::default();
+                seed_edge(&mut sync_edge, seed);
+                let mut sync_effects = Vec::new();
+                sync_edge.observe_with_effects(&retiring, &origin, &mut sync_effects);
+                let mut budgeted_edge = EdgeSemantics::default();
+                seed_edge(&mut budgeted_edge, seed);
+                let mut budgeted_effects = Vec::new();
+                match budgeted_edge.would_retire_scope(&retiring) {
+                    RetirePeek::NoOp | RetirePeek::Bounded => {
+                        budgeted_edge.observe_with_effects(
+                            &retiring,
+                            &origin,
+                            &mut budgeted_effects,
+                        );
+                    }
+                    RetirePeek::All {
+                        count_reconciliations,
+                    } => {
+                        let mut cursor = budgeted_edge.start_budgeted_invalidation(
+                            false,
+                            Some(&origin),
+                            count_reconciliations,
+                        );
+                        let mut polls = 0;
+                        loop {
+                            let mut gate = LeafBudget::new(2);
+                            if budgeted_edge.poll_invalidation_step(
+                                &mut cursor,
+                                &mut budgeted_effects,
+                                &mut gate,
+                            ) {
+                                break;
+                            }
+                            assert!(
+                                gate.spent() <= 2,
+                                "seed {seed}: poll spent {} above 2",
+                                gate.spent()
+                            );
+                            polls += 1;
+                            assert!(polls < 100_000, "seed {seed}: retire must complete");
+                        }
+                    }
+                    RetirePeek::Subset(scope) => {
+                        let mut cursor = budgeted_edge.start_budgeted_retire(scope, &origin);
+                        let mut polls = 0;
+                        loop {
+                            let mut gate = LeafBudget::new(7);
+                            if budgeted_edge.poll_retire_step(
+                                &mut cursor,
+                                &mut budgeted_effects,
+                                &mut gate,
+                            ) {
+                                break;
+                            }
+                            assert!(
+                                gate.spent() <= 7,
+                                "seed {seed}: poll spent {} above 7",
+                                gate.spent()
+                            );
+                            polls += 1;
+                            assert!(polls < 100_000, "seed {seed}: retire must complete");
+                        }
+                    }
+                }
+                assert_eq!(
+                    budgeted_effects, sync_effects,
+                    "seed {seed} {}: effects match",
+                    retiring.function
+                );
+                assert_eq!(
+                    (
+                        budgeted_edge.active.len(),
+                        budgeted_edge.pending.len(),
+                        budgeted_edge.detached.len(),
+                        budgeted_edge.open.len()
+                    ),
+                    (
+                        sync_edge.active.len(),
+                        sync_edge.pending.len(),
+                        sync_edge.detached.len(),
+                        sync_edge.open.len()
+                    ),
+                    "seed {seed} {}: end maps match",
+                    retiring.function
+                );
+                assert_eq!(
+                    (
+                        budgeted_edge.completed,
+                        budgeted_edge.cancelled,
+                        budgeted_edge.failed,
+                        budgeted_edge.unknown
+                    ),
+                    (
+                        sync_edge.completed,
+                        sync_edge.cancelled,
+                        sync_edge.failed,
+                        sync_edge.unknown
+                    ),
+                    "seed {seed} {}: counters match",
+                    retiring.function
+                );
+                assert_eq!(
+                    budgeted_edge.evidence, sync_edge.evidence,
+                    "seed {seed} {}: evidence matches",
+                    retiring.function
+                );
+            }
+        }
     }
 }

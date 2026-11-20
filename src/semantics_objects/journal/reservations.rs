@@ -191,12 +191,73 @@ impl ReleaseRoleCursor {
     }
 }
 
+/// Pre-debit leaf budget: every budgeted leaf charges BEFORE its
+/// read through [`LeafBudget::try_charge`]. When exhausted, the read
+/// MUST NOT execute (the caller yields without loading). Shared
+/// across reservation head/next/inspect reads, sweep slot visits,
+/// staged-disposal feed visits/heads, edge invalidation pops and
+/// association ledger chain reads, so no path can underdebit by
+/// post-counting. At most one leaf per unit.
+#[derive(Debug)]
+pub(crate) struct LeafBudget {
+    remaining: usize,
+    spent: usize,
+}
+
+impl LeafBudget {
+    pub(crate) fn new(budget: usize) -> Self {
+        Self {
+            remaining: budget,
+            spent: 0,
+        }
+    }
+
+    /// Charge one leaf before its read. Returns false WITHOUT
+    /// charging when exhausted: the caller must yield without
+    /// performing the read.
+    pub(crate) fn try_charge(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        self.spent += 1;
+        true
+    }
+
+    /// Charge `n` leaves at once before a bounded atomic region
+    /// (e.g., a non-retiring head's edge + key-use + mint walks, whose
+    /// worst case is proven below the credit). Returns false WITHOUT
+    /// charging anything when fewer than `n` remain: the caller must
+    /// yield without starting the region (retry with a fresh credit).
+    /// Overcharges when the region uses fewer than `n` reads
+    /// (`reads <= spent` still holds); the property test pins the
+    /// worst case so the bound never silently goes stale.
+    pub(crate) fn try_charge_n(&mut self, n: usize) -> bool {
+        if self.remaining < n {
+            return false;
+        }
+        self.remaining -= n;
+        self.spent += n;
+        true
+    }
+
+    pub(crate) fn spent(&self) -> usize {
+        self.spent
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.remaining
+    }
+}
+
 /// Resumable cursor for one budgeted membership release: the
 /// stranded-staged disposal walks a held head's chain without
-/// exceeding its credit. Lookup visits and link reads each cost
-/// one leaf unit; the table stays lookup-consistent across yields
-/// (a removed membership reads absent) and the caller must not
-/// insert, merge or transfer until the release completes.
+/// exceeding its credit. Each chain-dependent read (bucket-head
+/// load, candidate inspection, next-link/successor load) costs one
+/// leaf unit via the shared pre-debit gate; the table stays
+/// lookup-consistent across yields (a removed membership reads
+/// absent) and the caller must not insert, merge or transfer until
+/// the release completes.
 pub(super) struct SingleReleaseCursor<C> {
     role: Role,
     key: RoleKey,
@@ -204,11 +265,18 @@ pub(super) struct SingleReleaseCursor<C> {
 }
 
 enum SingleReleaseState<C> {
-    Finding {
+    FindingHead {
+        bucket: usize,
+    },
+    FindingInspect {
         bucket: usize,
         current: u16,
         prev: u16,
-        first: bool,
+    },
+    FindingNext {
+        bucket: usize,
+        current: u16,
+        prev: u16,
     },
     FindingLinear {
         next_slot: usize,
@@ -252,12 +320,15 @@ pub(super) struct ReservationTable<C> {
     /// `key_slot`, `id_slot` and free-slot searches.
     #[cfg(test)]
     test_slot_visits: std::cell::Cell<usize>,
-    /// Test-only sweep cost counter: independently counted slot
-    /// visits plus chain-link reads (head, predecessor and
-    /// target-successor loads) across `release_role_step`. The
-    /// reported `spent` must match this count on every step.
+    /// Test-only unified leaf counter: every budgeted leaf read
+    /// (head, inspect, next/successor, sweep/scan slot visit) across
+    /// `release_single_step` and `release_role_step`. Incremented
+    /// inside the single pre-debit gate alongside the debit, so the
+    /// reported `spent` must equal this count on every step and no
+    /// budgeted read can bypass it without bypassing the gate (which
+    /// the accessor-only test forbids).
     #[cfg(test)]
-    test_sweep_visits: std::cell::Cell<usize>,
+    test_leaf_reads: std::cell::Cell<usize>,
 }
 
 impl<C> ReservationTable<C> {
@@ -292,7 +363,7 @@ impl<C> ReservationTable<C> {
             #[cfg(test)]
             test_slot_visits: std::cell::Cell::new(0),
             #[cfg(test)]
-            test_sweep_visits: std::cell::Cell::new(0),
+            test_leaf_reads: std::cell::Cell::new(0),
         })
     }
 
@@ -307,6 +378,91 @@ impl<C> ReservationTable<C> {
 
     fn id_bucket(id: ReservationId) -> usize {
         index_hash(&[id.0]) as usize % INDEX_BUCKETS
+    }
+
+    /// The single budgeted-read gate for reservation leaves: charge
+    /// first via `budget`, then load. Returns `None` WITHOUT loading
+    /// when the credit is exhausted. Every budgeted head, inspect,
+    /// next/successor and slot-visit read goes through these three
+    /// methods (one gate, shared across key/ID planes and lookup /
+    /// unlink / sweep paths); direct indexing in budgeted paths is
+    /// forbidden (see the accessor-only test). Writes (splices,
+    /// takes, free-list links) cost nothing: they perform no
+    /// chain-dependent read.
+    fn budgeted_head(&self, plane: usize, bucket: usize, budget: &mut LeafBudget) -> Option<u16> {
+        if !budget.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        let heads = if plane == KEY_LINKS {
+            &self.key_heads
+        } else {
+            &self.id_heads
+        };
+        Some(heads[bucket])
+    }
+
+    /// Budgeted next-link / successor load through the single gate.
+    fn budgeted_next(
+        &self,
+        slot: usize,
+        plane: usize,
+        lane: usize,
+        budget: &mut LeafBudget,
+    ) -> Option<u16> {
+        if !budget.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        Some(self.slots[slot].next[plane][lane])
+    }
+
+    /// Budgeted candidate inspection through the single gate: whether
+    /// the node at (`slot`, `lane`) owns `role`/`key`.
+    fn budgeted_match(
+        &self,
+        slot: usize,
+        lane: usize,
+        role: Role,
+        key: RoleKey,
+        budget: &mut LeafBudget,
+    ) -> Option<bool> {
+        if !budget.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        Some(
+            lane == role.index()
+                && self.slots[slot]
+                    .operation
+                    .as_ref()
+                    .is_some_and(|op| op.roles[lane].as_ref().is_some_and(|m| m.key == key)),
+        )
+    }
+
+    /// Budgeted sweep/scan slot visit through the single gate: the
+    /// retained key for `role` at `at`, if any.
+    fn budgeted_slot_key(
+        &self,
+        at: usize,
+        role: Role,
+        budget: &mut LeafBudget,
+    ) -> Option<Option<RoleKey>> {
+        if !budget.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        Some(
+            self.slots[at]
+                .operation
+                .as_ref()
+                .and_then(|op| op.roles[role.index()].as_ref())
+                .map(|member| member.key),
+        )
     }
 
     /// Push a node onto its bucket chain. State is taken explicitly
@@ -348,81 +504,92 @@ impl<C> ReservationTable<C> {
         }
     }
 
-    /// Resumable chain unlink for the budgeted void sweep: at most
-    /// `budget` link reads this call (`INDEX_NONE` in `prev` starts at
-    /// the head, `splice_ready` completes a retained splice). Returns
-    /// whether the splice completed, the units spent and the
-    /// independently counted link reads performed (both count the
-    /// head read, predecessor reads and the target-successor load,
-    /// never above `budget`). When the budget ends at the discovered
-    /// splice position, the unlink yields with `splice_ready` set and
-    /// the chain unchanged, so the next step's successor load is
-    /// exact.
-    fn chain_unlink_resumable(
-        heads: &mut [u16; INDEX_BUCKETS],
-        slots: &mut [TableSlot<C>],
-        pending: &mut PendingUnlink,
-        budget: usize,
-    ) -> (bool, usize, usize) {
-        if budget == 0 {
-            return (false, 0, 0);
-        }
-        let mut spent = 0;
-        let mut actual = 0;
+    /// Resumable chain unlink through the single pre-debit gate
+    /// (`INDEX_NONE` in `prev` starts at the head, `splice_ready`
+    /// completes a retained splice). Drives at most the remaining
+    /// `budget` leaves this call (head, predecessor and
+    /// target-successor loads, one unit each, never beyond
+    /// exhaustion: a refused charge yields WITHOUT loading). Returns
+    /// whether the splice completed. When the budget ends at the
+    /// discovered splice position, the unlink yields with
+    /// `splice_ready` set and the chain unchanged, so the next
+    /// step's successor load is exact.
+    fn chain_unlink_step(&mut self, pending: &mut PendingUnlink, budget: &mut LeafBudget) -> bool {
         if pending.splice_ready {
-            spent += 1;
-            actual += 1;
-            let successor =
-                slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
+            let target_slot = node_slot(pending.node);
+            let target_lane = node_lane(pending.node);
+            let plane = pending.plane;
+            let Some(successor) = self.budgeted_next(target_slot, plane, target_lane, budget)
+            else {
+                return false;
+            };
             if pending.prev == INDEX_NONE {
+                let heads = if plane == KEY_LINKS {
+                    &mut self.key_heads
+                } else {
+                    &mut self.id_heads
+                };
                 heads[pending.bucket] = successor;
             } else {
-                slots[node_slot(pending.prev)].next[pending.plane][node_lane(pending.prev)] =
-                    successor;
+                let prev_slot = node_slot(pending.prev);
+                let prev_lane = node_lane(pending.prev);
+                self.slots[prev_slot].next[plane][prev_lane] = successor;
             }
             pending.splice_ready = false;
-            return (true, spent, actual);
+            return true;
         }
         if pending.prev == INDEX_NONE {
-            spent += 1;
-            actual += 1;
-            let head = heads[pending.bucket];
+            let plane = pending.plane;
+            let bucket = pending.bucket;
+            let Some(head) = self.budgeted_head(plane, bucket, budget) else {
+                return false;
+            };
             if head == pending.node {
-                if spent >= budget {
+                let target_slot = node_slot(pending.node);
+                let target_lane = node_lane(pending.node);
+                let Some(successor) = self.budgeted_next(target_slot, plane, target_lane, budget)
+                else {
                     pending.splice_ready = true;
-                    return (false, spent, actual);
-                }
-                spent += 1;
-                actual += 1;
-                heads[pending.bucket] =
-                    slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
-                return (true, spent, actual);
+                    return false;
+                };
+                let heads = if plane == KEY_LINKS {
+                    &mut self.key_heads
+                } else {
+                    &mut self.id_heads
+                };
+                heads[bucket] = successor;
+                return true;
             }
             pending.prev = head;
             assert_ne!(pending.prev, INDEX_NONE, "indexed node linked");
-            if spent >= budget {
-                return (false, spent, actual);
+            if budget.remaining() == 0 {
+                return false;
             }
         }
-        while spent < budget {
-            spent += 1;
-            actual += 1;
-            let next = slots[node_slot(pending.prev)].next[pending.plane][node_lane(pending.prev)];
+        loop {
+            let prev_slot = node_slot(pending.prev);
+            let prev_lane = node_lane(pending.prev);
+            let plane = pending.plane;
+            let Some(next) = self.budgeted_next(prev_slot, plane, prev_lane, budget) else {
+                return false;
+            };
             if next == pending.node {
-                if spent >= budget {
+                let node_slot = node_slot(pending.node);
+                let node_lane = node_lane(pending.node);
+                let Some(successor) = self.budgeted_next(node_slot, plane, node_lane, budget)
+                else {
                     pending.splice_ready = true;
-                    return (false, spent, actual);
-                }
-                spent += 1;
-                actual += 1;
-                slots[node_slot(pending.prev)].next[pending.plane][node_lane(pending.prev)] =
-                    slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
-                return (true, spent, actual);
+                    return false;
+                };
+                self.slots[prev_slot].next[plane][prev_lane] = successor;
+                return true;
             }
             pending.prev = next;
             assert_ne!(pending.prev, INDEX_NONE, "indexed node linked");
+            if budget.remaining() == 0 {
+                return false;
+            }
         }
-        (false, spent, actual)
     }
 
     /// Pop the first vacant slot from the intrusive free list.
@@ -477,16 +644,16 @@ impl<C> ReservationTable<C> {
         self.test_slot_visits.set(0);
     }
 
-    /// Test-only read of the sweep cost counter.
+    /// Test-only read of the unified budgeted-leaf counter.
     #[cfg(test)]
-    pub(super) fn test_sweep_visits_for_test(&self) -> usize {
-        self.test_sweep_visits.get()
+    pub(super) fn test_leaf_reads_for_test(&self) -> usize {
+        self.test_leaf_reads.get()
     }
 
-    /// Test-only reset of the sweep cost counter.
+    /// Test-only reset of the unified budgeted-leaf counter.
     #[cfg(test)]
-    pub(super) fn reset_test_sweep_visits_for_test(&self) {
-        self.test_sweep_visits.set(0);
+    pub(super) fn reset_test_leaf_reads_for_test(&self) {
+        self.test_leaf_reads.set(0);
     }
 
     /// Test-only bucket for a model key: lets a high-occupancy twin
@@ -586,45 +753,36 @@ impl<C> ReservationTable<C> {
         // Synchronous callers drain the same budgeted sweep without
         // yielding: each internal step still honors the leaf budget.
         let mut cursor = ReleaseRoleCursor::new();
-        while !self.release_role_step(role, &mut cursor, 64).0 {}
+        loop {
+            let mut gate = LeafBudget::new(64);
+            if self.release_role_step(role, &mut cursor, &mut gate) {
+                break;
+            }
+        }
     }
 
-    /// One budgeted sweep step over `role`: at most `budget` leaf units
-    /// (slot visits plus chain-link reads: bucket-head, predecessor
-    /// and target-successor loads). Returns whether the sweep
-    /// completed and the units spent (never above `budget`). The caller
-    /// holds `cursor` across steps and must not insert, merge or
-    /// transfer until completion.
+    /// One budgeted sweep step over `role` through the shared
+    /// pre-debit `gate` (slot visits plus chain-link reads:
+    /// bucket-head, predecessor and target-successor loads, one unit
+    /// each, never beyond exhaustion). Returns whether the sweep
+    /// completed. The caller holds `cursor` across steps and must not
+    /// insert, merge or transfer until completion.
     pub(super) fn release_role_step(
         &mut self,
         role: Role,
         cursor: &mut ReleaseRoleCursor,
-        budget: usize,
-    ) -> (bool, usize) {
-        let mut spent = 0;
+        gate: &mut LeafBudget,
+    ) -> bool {
         let indexed = self.indexed();
         loop {
-            if spent >= budget {
-                debug_assert!(spent <= budget);
-                return (false, spent);
+            if gate.remaining() == 0 {
+                return false;
             }
             if let Some(mut pending) = cursor.pending_alias_unlink.take() {
-                let (done, used, actual) = Self::chain_unlink_resumable(
-                    &mut self.id_heads,
-                    &mut self.slots,
-                    &mut pending,
-                    budget - spent,
-                );
-                spent += used;
-                #[cfg(test)]
-                self.test_sweep_visits
-                    .set(self.test_sweep_visits.get() + actual);
-                #[cfg(not(test))]
-                let _ = actual;
+                let done = self.chain_unlink_step(&mut pending, gate);
                 if !done {
                     cursor.pending_alias_unlink = Some(pending);
-                    debug_assert!(spent <= budget);
-                    return (false, spent);
+                    return false;
                 }
                 cursor.pending_alias_lane += 1;
                 continue;
@@ -660,22 +818,10 @@ impl<C> ReservationTable<C> {
                 continue;
             }
             if let Some(mut pending) = cursor.pending_key.take() {
-                let (done, used, actual) = Self::chain_unlink_resumable(
-                    &mut self.key_heads,
-                    &mut self.slots,
-                    &mut pending,
-                    budget - spent,
-                );
-                spent += used;
-                #[cfg(test)]
-                self.test_sweep_visits
-                    .set(self.test_sweep_visits.get() + actual);
-                #[cfg(not(test))]
-                let _ = actual;
+                let done = self.chain_unlink_step(&mut pending, gate);
                 if !done {
                     cursor.pending_key = Some(pending);
-                    debug_assert!(spent <= budget);
-                    return (false, spent);
+                    return false;
                 }
                 let at = cursor.next_slot;
                 if self.slot_is_vacant(at) {
@@ -686,18 +832,12 @@ impl<C> ReservationTable<C> {
                 continue;
             }
             if cursor.next_slot >= self.slots.len() {
-                debug_assert!(spent <= budget);
-                return (true, spent);
+                return true;
             }
             let at = cursor.next_slot;
-            spent += 1;
-            #[cfg(test)]
-            self.test_sweep_visits.set(self.test_sweep_visits.get() + 1);
-            let key = self.slots[at]
-                .operation
-                .as_ref()
-                .and_then(|operation| operation.roles[role.index()].as_ref())
-                .map(|member| member.key);
+            let Some(key) = self.budgeted_slot_key(at, role, gate) else {
+                return false;
+            };
             if let Some(key) = key {
                 let member = self.slots[at]
                     .operation
@@ -915,6 +1055,24 @@ impl<C> ReservationTable<C> {
         charge: C,
     ) -> Result<ReservationId, Refusal> {
         self.preflight(role, key, existing, bytes)?;
+        self.insert_prechecked(role, key, existing, bytes, charge)
+    }
+
+    /// Insert after a successful [`Self::preflight`] with no yield or
+    /// table mutation between (the synchronous charge path): skips
+    /// the second preflight's duplicate chain walks (one key walk, or
+    /// one key plus one id walk when joining), halving mint reads.
+    /// Callers that yield between preflight and insert must use
+    /// [`Self::insert`] (which re-checks). The `existing` operation
+    /// lookup for `at` still walks once (its index is needed).
+    pub(super) fn insert_prechecked(
+        &mut self,
+        role: Role,
+        key: RoleKey,
+        existing: Option<ReservationId>,
+        bytes: usize,
+        charge: C,
+    ) -> Result<ReservationId, Refusal> {
         let at = match existing {
             Some(id) => self.id_slot(id).expect("preflight retained the operation"),
             None => {
@@ -1012,11 +1170,8 @@ impl<C> ReservationTable<C> {
             SingleReleaseCursor {
                 role,
                 key,
-                state: SingleReleaseState::Finding {
+                state: SingleReleaseState::FindingHead {
                     bucket: Self::key_bucket(role, key),
-                    current: INDEX_NONE,
-                    prev: INDEX_NONE,
-                    first: true,
                 },
             }
         } else {
@@ -1029,72 +1184,118 @@ impl<C> ReservationTable<C> {
     }
 
     /// One budgeted step of a single membership release: at most
-    /// `budget` leaf units (lookup visits plus chain-link reads).
-    /// Returns whether the release completed, the units spent and
-    /// the independently counted units (both never above `budget`),
-    /// plus the removed bytes and charge when a membership was
-    /// found and the unlink finished. A missing key completes with
-    /// `None` after its bounded lookup. The caller holds `cursor`
-    /// across steps and must not insert, merge or transfer until
-    /// completion.
+    /// `budget` leaf units, each pre-debited through the single gate
+    /// (bucket-head load, candidate inspection, next-link/successor
+    /// load, linear slot visit — one unit each, never beyond
+    /// exhaustion). Returns whether the release completed, the units
+    /// spent and the independently counted leaf reads (both never
+    /// above `budget`), plus the removed bytes and charge when a
+    /// membership was found and the unlink finished. A missing key
+    /// completes with `None` after its bounded lookup. An empty
+    /// bucket costs its head load. The caller holds `cursor` across
+    /// steps and must not insert, merge or transfer until completion.
     pub(super) fn release_single_step(
         &mut self,
         cursor: &mut SingleReleaseCursor<C>,
         budget: usize,
     ) -> (bool, usize, usize, Option<(usize, C)>) {
+        #[cfg(test)]
+        let observed_before = self.test_leaf_reads.get();
         if budget == 0 {
             if matches!(cursor.state, SingleReleaseState::Done) {
                 return (true, 0, 0, None);
             }
             return (false, 0, 0, None);
         }
-        let mut spent = 0usize;
-        let mut actual = 0usize;
+        let mut gate = LeafBudget::new(budget);
         loop {
-            if spent >= budget {
+            if gate.remaining() == 0 {
+                let spent = gate.spent();
+                #[cfg(test)]
+                let actual = self.test_leaf_reads.get() - observed_before;
+                #[cfg(not(test))]
+                let actual = spent;
                 debug_assert!(spent <= budget);
+                debug_assert_eq!(spent, actual);
                 return (false, spent, actual, None);
             }
             let state = std::mem::replace(&mut cursor.state, SingleReleaseState::Done);
             match state {
                 SingleReleaseState::Done => {
                     cursor.state = SingleReleaseState::Done;
+                    let spent = gate.spent();
+                    #[cfg(test)]
+                    let actual = self.test_leaf_reads.get() - observed_before;
+                    #[cfg(not(test))]
+                    let actual = spent;
                     debug_assert!(spent <= budget);
+                    debug_assert_eq!(spent, actual);
                     return (true, spent, actual, None);
                 }
-                SingleReleaseState::Finding {
-                    bucket,
-                    mut current,
-                    mut prev,
-                    first,
-                } => {
-                    if first {
-                        prev = INDEX_NONE;
-                        current = self.key_heads[bucket];
-                        if current == INDEX_NONE {
-                            cursor.state = SingleReleaseState::Done;
-                            debug_assert!(spent <= budget);
-                            return (true, spent, actual, None);
-                        }
-                    }
+                SingleReleaseState::FindingHead { bucket } => {
+                    let Some(current) = self.budgeted_head(KEY_LINKS, bucket, &mut gate) else {
+                        cursor.state = SingleReleaseState::FindingHead { bucket };
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
+                        debug_assert!(spent <= budget);
+                        return (false, spent, actual, None);
+                    };
                     if current == INDEX_NONE {
                         cursor.state = SingleReleaseState::Done;
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
                         debug_assert!(spent <= budget);
                         return (true, spent, actual, None);
                     }
-                    spent += 1;
-                    actual += 1;
-                    #[cfg(test)]
-                    self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+                    cursor.state = SingleReleaseState::FindingInspect {
+                        bucket,
+                        current,
+                        prev: INDEX_NONE,
+                    };
+                    continue;
+                }
+                SingleReleaseState::FindingInspect {
+                    bucket,
+                    current,
+                    prev,
+                } => {
+                    if current == INDEX_NONE {
+                        cursor.state = SingleReleaseState::Done;
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
+                        debug_assert!(spent <= budget);
+                        return (true, spent, actual, None);
+                    }
                     let slot = node_slot(current);
                     let lane = node_lane(current);
-                    let role_index = cursor.role.index();
+                    let role = cursor.role;
                     let target = cursor.key;
-                    let found = lane == role_index
-                        && self.slots[slot].operation.as_ref().is_some_and(|op| {
-                            op.roles[lane].as_ref().is_some_and(|m| m.key == target)
-                        });
+                    let Some(found) = self.budgeted_match(slot, lane, role, target, &mut gate)
+                    else {
+                        cursor.state = SingleReleaseState::FindingInspect {
+                            bucket,
+                            current,
+                            prev,
+                        };
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
+                        debug_assert!(spent <= budget);
+                        return (false, spent, actual, None);
+                    };
                     if found {
+                        let role_index = role.index();
                         let member = self.slots[slot]
                             .operation
                             .as_mut()
@@ -1113,39 +1314,77 @@ impl<C> ReservationTable<C> {
                         };
                         continue;
                     }
-                    let next = self.slots[slot].next[KEY_LINKS][lane];
+                    cursor.state = SingleReleaseState::FindingNext {
+                        bucket,
+                        current,
+                        prev,
+                    };
+                    continue;
+                }
+                SingleReleaseState::FindingNext {
+                    bucket,
+                    current,
+                    prev,
+                } => {
+                    let slot = node_slot(current);
+                    let lane = node_lane(current);
+                    let Some(next) = self.budgeted_next(slot, KEY_LINKS, lane, &mut gate) else {
+                        cursor.state = SingleReleaseState::FindingNext {
+                            bucket,
+                            current,
+                            prev,
+                        };
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
+                        debug_assert!(spent <= budget);
+                        return (false, spent, actual, None);
+                    };
                     if next == INDEX_NONE {
                         cursor.state = SingleReleaseState::Done;
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
                         debug_assert!(spent <= budget);
                         return (true, spent, actual, None);
                     }
-                    cursor.state = SingleReleaseState::Finding {
+                    cursor.state = SingleReleaseState::FindingInspect {
                         bucket,
                         current: next,
                         prev: current,
-                        first: false,
                     };
                     continue;
                 }
                 SingleReleaseState::FindingLinear { next_slot } => {
                     if next_slot >= self.slots.len() {
                         cursor.state = SingleReleaseState::Done;
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
                         debug_assert!(spent <= budget);
                         return (true, spent, actual, None);
                     }
                     let at = next_slot;
-                    spent += 1;
-                    actual += 1;
-                    #[cfg(test)]
-                    self.test_slot_visits.set(self.test_slot_visits.get() + 1);
-                    let role_index = cursor.role.index();
+                    let role = cursor.role;
+                    let Some(key) = self.budgeted_slot_key(at, role, &mut gate) else {
+                        cursor.state = SingleReleaseState::FindingLinear { next_slot };
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
+                        debug_assert!(spent <= budget);
+                        return (false, spent, actual, None);
+                    };
                     let target = cursor.key;
-                    let found = self.slots[at].operation.as_ref().is_some_and(|op| {
-                        op.roles[role_index]
-                            .as_ref()
-                            .is_some_and(|m| m.key == target)
-                    });
-                    if found {
+                    if key == Some(target) {
+                        let role_index = role.index();
                         let member = self.slots[at]
                             .operation
                             .as_mut()
@@ -1159,6 +1398,11 @@ impl<C> ReservationTable<C> {
                             self.live -= 1;
                         }
                         cursor.state = SingleReleaseState::Done;
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
                         debug_assert!(spent <= budget);
                         return (true, spent, actual, Some(result));
                     }
@@ -1172,11 +1416,26 @@ impl<C> ReservationTable<C> {
                     node,
                     mut result,
                 } => {
-                    spent += 1;
-                    actual += 1;
-                    #[cfg(test)]
-                    self.test_sweep_visits.set(self.test_sweep_visits.get() + 1);
-                    let successor = self.slots[node_slot(node)].next[KEY_LINKS][node_lane(node)];
+                    let target_slot = node_slot(node);
+                    let target_lane = node_lane(node);
+                    let Some(successor) =
+                        self.budgeted_next(target_slot, KEY_LINKS, target_lane, &mut gate)
+                    else {
+                        cursor.state = SingleReleaseState::UnlinkingKey {
+                            slot,
+                            prev: prev_code,
+                            bucket,
+                            node,
+                            result,
+                        };
+                        let spent = gate.spent();
+                        #[cfg(test)]
+                        let actual = self.test_leaf_reads.get() - observed_before;
+                        #[cfg(not(test))]
+                        let actual = spent;
+                        debug_assert!(spent <= budget);
+                        return (false, spent, actual, None);
+                    };
                     if prev_code == INDEX_NONE {
                         self.key_heads[bucket] = successor;
                     } else {
@@ -1198,6 +1457,11 @@ impl<C> ReservationTable<C> {
                         continue;
                     }
                     cursor.state = SingleReleaseState::Done;
+                    let spent = gate.spent();
+                    #[cfg(test)]
+                    let actual = self.test_leaf_reads.get() - observed_before;
+                    #[cfg(not(test))]
+                    let actual = spent;
                     debug_assert!(spent <= budget);
                     return (true, spent, actual, Some(taken));
                 }
@@ -1225,17 +1489,7 @@ impl<C> ReservationTable<C> {
                             });
                         }
                         let mut unlink = pending.take().unwrap();
-                        let (done, used, counted) = Self::chain_unlink_resumable(
-                            &mut self.id_heads,
-                            &mut self.slots,
-                            &mut unlink,
-                            budget - spent,
-                        );
-                        spent += used;
-                        actual += counted;
-                        #[cfg(test)]
-                        self.test_sweep_visits
-                            .set(self.test_sweep_visits.get() + counted);
+                        let done = self.chain_unlink_step(&mut unlink, &mut gate);
                         if !done {
                             cursor.state = SingleReleaseState::UnlinkingAliases {
                                 slot,
@@ -1244,15 +1498,41 @@ impl<C> ReservationTable<C> {
                                 pending: Some(unlink),
                                 result,
                             };
+                            let spent = gate.spent();
+                            #[cfg(test)]
+                            let actual = self.test_leaf_reads.get() - observed_before;
+                            #[cfg(not(test))]
+                            let actual = spent;
                             debug_assert!(spent <= budget);
                             return (false, spent, actual, None);
                         }
                         lane += 1;
+                        if gate.remaining() == 0 {
+                            cursor.state = SingleReleaseState::UnlinkingAliases {
+                                slot,
+                                aliases,
+                                lane,
+                                pending: None,
+                                result,
+                            };
+                            let spent = gate.spent();
+                            #[cfg(test)]
+                            let actual = self.test_leaf_reads.get() - observed_before;
+                            #[cfg(not(test))]
+                            let actual = spent;
+                            debug_assert!(spent <= budget);
+                            return (false, spent, actual, None);
+                        }
                         continue;
                     }
                     Self::free_push(&mut self.free_head, &mut self.slots, slot);
                     let taken = result.take().expect("pending release keeps its charge");
                     cursor.state = SingleReleaseState::Done;
+                    let spent = gate.spent();
+                    #[cfg(test)]
+                    let actual = self.test_leaf_reads.get() - observed_before;
+                    #[cfg(not(test))]
+                    let actual = spent;
                     debug_assert!(spent <= budget);
                     return (true, spent, actual, Some(taken));
                 }
@@ -2192,9 +2472,11 @@ mod tests {
             let mut steps = 0;
             let mut saw_partial = false;
             loop {
-                table.reset_test_sweep_visits_for_test();
-                let (done, spent) = table.release_role_step(Role::H8Open, &mut cursor, budget);
-                let actual = table.test_sweep_visits_for_test();
+                table.reset_test_leaf_reads_for_test();
+                let mut gate = LeafBudget::new(budget);
+                let done = table.release_role_step(Role::H8Open, &mut cursor, &mut gate);
+                let spent = gate.spent();
+                let actual = table.test_leaf_reads_for_test();
                 assert!(
                     spent <= budget,
                     "credit {budget} reported {spent} above its budget"
@@ -2277,12 +2559,11 @@ mod tests {
             prev: INDEX_NONE,
             splice_ready: false,
         };
-        let (done, spent, actual) = ReservationTable::<()>::chain_unlink_resumable(
-            &mut table.key_heads,
-            &mut table.slots,
-            &mut pending,
-            1,
-        );
+        table.reset_test_leaf_reads_for_test();
+        let mut gate = LeafBudget::new(1);
+        let done = table.chain_unlink_step(&mut pending, &mut gate);
+        let spent = gate.spent();
+        let actual = table.test_leaf_reads_for_test();
         assert!(!done, "budget 1 cannot finish a non-head splice");
         assert_eq!(spent, 1, "one debit for the head load");
         assert_eq!(actual, 1, "exactly one head load occurs");
@@ -2325,14 +2606,216 @@ mod tests {
             prev: INDEX_NONE,
             splice_ready: false,
         };
-        let (done, spent, actual) = ReservationTable::<()>::chain_unlink_resumable(
-            &mut table.id_heads,
-            &mut table.slots,
-            &mut pending,
-            1,
-        );
+        table.reset_test_leaf_reads_for_test();
+        let mut gate = LeafBudget::new(1);
+        let done = table.chain_unlink_step(&mut pending, &mut gate);
+        let spent = gate.spent();
+        let actual = table.test_leaf_reads_for_test();
         assert!(!done, "budget 1 cannot finish a non-head splice");
         assert_eq!(spent, 1, "one debit for the head load");
         assert_eq!(actual, 1, "exactly one head load occurs");
+    }
+
+    /// Deterministic xorshift64* (no dependency): the property test's
+    /// fuzz PRNG over mixed-lane fixtures.
+    fn xorshift_next(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        *state = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    #[test]
+    fn resource_reservations_property_mixed_lane_reads_never_exceed_debited() {
+        let roles = [
+            Role::Raw,
+            Role::H8Open,
+            Role::Model,
+            Role::H9Staged,
+            Role::Association,
+        ];
+        for seed in 0..100u64 {
+            let mut rng = seed
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .wrapping_add(0x1234_5678_9abc_def1);
+            let capacity = [16usize, 256, 4_096][(xorshift_next(&mut rng) % 3) as usize];
+            let fills = (xorshift_next(&mut rng) % (capacity.min(256) as u64)) as usize + 1;
+            let mut table = ReservationTable::try_new(capacity).unwrap();
+            let mut present: Vec<(Role, RoleKey)> = Vec::new();
+            for _ in 0..fills {
+                let role = roles[(xorshift_next(&mut rng) % 5) as usize];
+                let key = RoleKey {
+                    namespace: xorshift_next(&mut rng) % 4,
+                    value: (xorshift_next(&mut rng) % 50_000) + 1,
+                };
+                if table.insert(role, key, None, 1, ()).is_ok() {
+                    present.push((role, key));
+                }
+            }
+            let budget = [0usize, 1, 2, 63, 64, 65, 128][(xorshift_next(&mut rng) % 7) as usize];
+            let target = if !present.is_empty()
+                && xorshift_next(&mut rng).is_multiple_of(2)
+            {
+                let pick = (xorshift_next(&mut rng) % present.len() as u64) as usize;
+                present[pick]
+            } else {
+                (
+                    roles[(xorshift_next(&mut rng) % 5) as usize],
+                    RoleKey {
+                        namespace: xorshift_next(&mut rng) % 4,
+                        value: 900_000 + (xorshift_next(&mut rng) % 50_000),
+                    },
+                )
+            };
+            let mut cursor = table.single_release_cursor(target.0, target.1);
+            let mut steps = 0;
+            let mut sum_spent = 0usize;
+            let mut sum_reads = 0usize;
+            loop {
+                table.reset_test_leaf_reads_for_test();
+                let (done, spent, actual, _) = table.release_single_step(&mut cursor, budget);
+                let reads = table.test_leaf_reads_for_test();
+                assert_eq!(
+                    spent, actual,
+                    "seed {seed}: reported {spent} must equal observed {actual}"
+                );
+                assert_eq!(
+                    reads, actual,
+                    "seed {seed}: unified counter {reads} must equal step reads {actual}"
+                );
+                assert!(
+                    spent <= budget,
+                    "seed {seed}: spent {spent} above credit {budget}"
+                );
+                assert!(
+                    reads <= spent,
+                    "seed {seed}: reads {reads} above debited {spent}"
+                );
+                sum_spent += spent;
+                sum_reads += reads;
+                steps += 1;
+                if done {
+                    break;
+                }
+                assert!(
+                    steps < 20_000,
+                    "seed {seed}: the budgeted release must complete"
+                );
+                if budget == 0 {
+                    break;
+                }
+            }
+            assert_eq!(
+                sum_reads, sum_spent,
+                "seed {seed}: total reads must equal total debited"
+            );
+            let sweep_role = roles[(xorshift_next(&mut rng) % 5) as usize];
+            let mut sweep = ReleaseRoleCursor::new();
+            let mut sweep_steps = 0;
+            loop {
+                table.reset_test_leaf_reads_for_test();
+                let mut gate = LeafBudget::new(budget);
+                let done = table.release_role_step(sweep_role, &mut sweep, &mut gate);
+                let spent = gate.spent();
+                let reads = table.test_leaf_reads_for_test();
+                assert_eq!(
+                    spent, reads,
+                    "seed {seed}: sweep spent {spent} must equal reads {reads}"
+                );
+                assert!(
+                    spent <= budget,
+                    "seed {seed}: sweep spent {spent} above credit {budget}"
+                );
+                sweep_steps += 1;
+                if done {
+                    break;
+                }
+                assert!(
+                    sweep_steps < 40_000,
+                    "seed {seed}: the budgeted sweep must complete"
+                );
+                if budget == 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// The budgeted paths must read heads/links only through the
+    /// single pre-debit gate (`budgeted_head` / `budgeted_next` /
+    /// `budgeted_match` / `budgeted_slot_key`): direct `key_heads[` /
+    /// `id_heads[` / `.next[` READS in `release_single_step`,
+    /// `release_role_step` or `chain_unlink_step` fail this test
+    /// (writes, `] =`, are allowed: splices perform no read). This
+    /// catches the review's repeat-read mutation
+    /// (`black_box(heads[bucket])` with debits unchanged): the extra
+    /// load appears as a direct read and fails the scan.
+    #[test]
+    fn budgeted_paths_use_only_the_debiting_accessor() {
+        let source = include_str!("reservations.rs");
+        for name in [
+            "fn release_single_step",
+            "fn release_role_step",
+            "fn chain_unlink_step",
+        ] {
+            let start = source.find(name).expect("budgeted fn present");
+            let rest = &source[start..];
+            let end = rest
+                .find("\n    fn ")
+                .map(|offset| start + offset)
+                .unwrap_or(source.len());
+            let body = &source[start..end];
+            assert!(
+                body.contains("budgeted_head")
+                    || body.contains("budgeted_next")
+                    || body.contains("budgeted_match")
+                    || body.contains("budgeted_slot_key")
+                    || body.contains("chain_unlink_step"),
+                "{name} must go through the debiting gate"
+            );
+            for (number, line) in body.lines().enumerate() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("///") || trimmed.starts_with("//") {
+                    continue;
+                }
+                for marker in ["key_heads[", "id_heads[", ".next["] {
+                    if let Some(at) = line.find(marker) {
+                        let after = &line[at + marker.len()..];
+                        let is_write = after.find("] =").is_some();
+                        assert!(
+                            is_write,
+                            "{name} line {} has a direct {marker} read \
+                             (bypass the gate): {line}",
+                            number + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The scanner above must catch a forced extra head load: a fake
+    /// budgeted body with `black_box(heads[bucket])` and unchanged
+    /// debits fails the same rule.
+    #[test]
+    fn budgeted_accessor_scan_catches_a_repeated_head_read() {
+        let fake = r#"
+    fn release_single_step(&mut self) {
+        let head = heads[bucket];
+        pending.prev = std::hint::black_box(heads[pending.bucket]);
+        spent += 1;
+    }
+"#;
+        let mut direct_reads = 0;
+        for line in fake.lines() {
+            for marker in ["key_heads[", "id_heads[", "heads["] {
+                if line.contains(marker) && !line.contains("] =") {
+                    direct_reads += 1;
+                }
+            }
+        }
+        assert_eq!(direct_reads, 2, "the fake body has two direct reads");
     }
 }

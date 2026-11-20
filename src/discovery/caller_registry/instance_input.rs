@@ -3103,16 +3103,18 @@ impl CallerRegistry {
         });
     }
 
-    /// Drive stranded staged disposal for at most `budget` leaf units
-    /// (one per feed visit, one per staged head plus each link walk on
-    /// its release). Returns whether disposal completed and the units
-    /// spent (never above `budget`). Completion clears the cursor;
-    /// without a started disposal it completes at once with no work.
+    /// Drive stranded staged disposal through the shared pre-debit
+    /// gate (one leaf per feed visit, staged head, chain read,
+    /// machine pop + terminal, payload drop, or open unbind).
+    /// Returns whether disposal completed and the units spent (never
+    /// above `budget`). Completion clears the cursor; without a
+    /// started disposal it completes at once with no work.
     pub(crate) fn poll_staged_disposal(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
         budget: usize,
     ) -> (bool, usize) {
+        use crate::semantics_objects::journal::LeafBudget;
         if budget == 0 {
             if self.staged_disposal.is_none() {
                 return (true, 0);
@@ -3122,10 +3124,11 @@ impl CallerRegistry {
         let Some(mut cursor) = self.staged_disposal.take() else {
             return (true, 0);
         };
-        let mut spent = 0usize;
+        let mut gate = LeafBudget::new(budget);
         loop {
-            if spent >= budget {
+            if gate.remaining() == 0 {
                 self.staged_disposal = Some(cursor);
+                let spent = gate.spent();
                 debug_assert!(spent <= budget);
                 return (false, spent);
             }
@@ -3138,14 +3141,13 @@ impl CallerRegistry {
                 };
                 let is_joint = record.feed.mode() == FeedMode::Joint;
                 let feed = &mut record.feed;
-                let remaining = budget - spent;
-                let (feed_done, used) = if is_joint {
+                let feed_done = if is_joint {
                     current.poll(
                         feed,
                         ledger,
                         Some(&mut self.assoc_fallback),
                         &mut self.joint_keyuse,
-                        remaining,
+                        &mut gate,
                     )
                 } else {
                     // Pure feeds keep no preservation reducers; the
@@ -3153,11 +3155,11 @@ impl CallerRegistry {
                     // reducer sees no preserved summaries. Pass the live
                     // key-use handle through (unused on this path) to
                     // keep one poll shape.
-                    current.poll(feed, ledger, None, &mut self.joint_keyuse, remaining)
+                    current.poll(feed, ledger, None, &mut self.joint_keyuse, &mut gate)
                 };
-                spent += used;
                 if !feed_done {
                     self.staged_disposal = Some(cursor);
+                    let spent = gate.spent();
                     debug_assert!(spent <= budget);
                     return (false, spent);
                 }
@@ -3177,10 +3179,16 @@ impl CallerRegistry {
                 }
             };
             let Some(next_id) = next_id else {
+                let spent = gate.spent();
                 debug_assert!(spent <= budget);
                 return (true, spent);
             };
-            spent += 1;
+            if !gate.try_charge() {
+                self.staged_disposal = Some(cursor);
+                let spent = gate.spent();
+                debug_assert!(spent <= budget);
+                return (false, spent);
+            }
             let Some(record) = self.instance_state.semantics.get_mut(&next_id) else {
                 cursor.done_upto = Some(next_id);
                 continue;

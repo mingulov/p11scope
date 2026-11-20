@@ -2919,4 +2919,45 @@ pub(crate) mod tests {
             "a transient take still ranks below the stale-witness ending"
         );
     }
+
+    /// Failure selection ranks the take sub-causes with their
+    /// dispositions: races retry below real endings, while a
+    /// witness whose truth broke ranks with the fallback it keeps.
+    #[test]
+    fn failure_rank_orders_take_subcauses_with_dispositions() {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        fn failure(
+            gap: JournalGap,
+            take_failed: Option<crate::attach::BirthObservationRefusal>,
+        ) -> SealFailure {
+            SealFailure {
+                scope: SealFailureScope::Unqualified,
+                gap,
+                effects: ObjectEffects::default(),
+                h3_voided: None,
+                fence: None,
+                take_failed,
+            }
+        }
+        let retry = failure_rank(&failure(JournalGap::H3Pending, None));
+        let fallback = failure_rank(&failure(JournalGap::BootstrapMismatch, None));
+        for refusal in [
+            Refusal::EpochDrift,
+            Refusal::TakeDeadline,
+            Refusal::SessionBorrowed,
+        ] {
+            assert_eq!(
+                failure_rank(&failure(JournalGap::BootstrapMismatch, Some(refusal))),
+                retry,
+                "{refusal:?} ranks as retry"
+            );
+        }
+        for refusal in [Refusal::CaptureDrift, Refusal::WitnessStale] {
+            assert_eq!(
+                failure_rank(&failure(JournalGap::BootstrapMismatch, Some(refusal))),
+                fallback,
+                "{refusal:?} ranks with fallback"
+            );
+        }
+    }
 }

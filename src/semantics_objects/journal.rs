@@ -16338,6 +16338,174 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn post_absorb_absence_birth_refuses_until_void() {
+        // Absorb/rebirth interplay pin (fail-closed): an absorb trips the
+        // absence chain without fencing, so an AbsenceAppearance birth for
+        // a pre-absorb sighting refuses AbsenceUnproven until a later void
+        // fences above the trip. The control birth below proves the same
+        // rebirth works before the absorb; the absorb seal itself refuses
+        // (its own trip vetoes its reconversion re-verify) and the later
+        // birth refuses too. Whether the veto is the intended contract
+        // awaits an owner ruling; this twin fixes the current refusal.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        // H3-loss void: fences every key without invalidating the stream.
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        let fence = scene.adapter.consumed_through;
+        // Control: the post-void rebirth births above the fence while no
+        // absorb tripped past it.
+        let mut other = AttestationFixture::new(image_default());
+        let rebirth = scene
+            .adapter
+            .attest_key(&other.admit())
+            .expect("fenced sibling rebirths");
+        let control = SessionBirthGrant::scripted(
+            rebirth,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        BootstrapReceipt::attest(&scene.adapter, &control).expect("rebirth births pre-absorb");
+        // Post-void history, then a between-collection fault in the same
+        // seal: the audit absorbs (tripping past the fence) and the seal's
+        // own reconversion re-verify refuses the tripped chain.
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let tripped_through = scene.adapter.consumed_through;
+        assert!(
+            tripped_through > fence,
+            "the absorb trips past the void fence"
+        );
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let failure = scene
+            .seal_at(&resume, 8)
+            .expect_err("the absorb vetoes its own reconversion");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        assert_eq!(scene.adapter.last_fault, Some(8));
+        assert_eq!(
+            scene.adapter.last_audit_failure,
+            Some(tripped_through),
+            "the absorb trips the chain past the fence"
+        );
+        assert_eq!(
+            scene.adapter.joint_void_diagnosis().void_audit,
+            1,
+            "the absorb voids nothing itself"
+        );
+        assert_eq!(
+            scene.adapter.voided_through_for_test(),
+            fence,
+            "the absorb fences nothing"
+        );
+        // The veto persists for later births until a void fences above it.
+        let vetoed = SessionBirthGrant::scripted(
+            rebirth,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &vetoed),
+            Err(BirthRefusal::AbsenceUnproven),
+            "post-absorb rebirth refuses until the next void"
+        );
+    }
+
+    #[test]
+    fn seal_huge_fault_cell_saturates_without_absorb() {
+        // Saturation-guard symmetry: a seal-time cell reading above the u32
+        // domain is a broken reader (production maps it to Saturated), so
+        // the collection audit refuses FaultSaturated instead of letting
+        // the absorb mistake the huge epoch for a post-collection move.
+        // Mirrors the seal_in_audit guard on the domain leg.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        struct RawHugeCell(u64);
+        impl FaultEpoch for RawHugeCell {
+            fn fault_epoch(&self) -> Result<u64, FaultReadError> {
+                Ok(self.0)
+            }
+        }
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let reaudit = scene.audit();
+        let huge = RawHugeCell(u64::from(u32::MAX) + 1);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &huge,
+            )
+            .expect_err("a saturated cell voids");
+        assert_eq!(failure.gap, JournalGap::FaultSaturated);
+        assert!(
+            scene.adapter.stopped,
+            "saturation stops the adapter like the domain leg"
+        );
+    }
+
+    #[test]
     fn seal_regressed_fault_cell_still_voids() {
         // Fail-closed twin of the absorbs above: a seal-time cell
         // reading below the pinned baseline is a broken reader (the
@@ -17992,6 +18160,180 @@ pub(crate) mod tests {
             !harness.owner.adapter().image_refused((COOKIE, EXEC)),
             "a scoped-wiped destroy terminal must not taint"
         );
+    }
+
+    #[test]
+    fn void_wiped_bad_return_end_disposes_without_taint() {
+        // Return-axis twin of the void-wipe destroy disposal: a void-wiped
+        // neutral call whose END reports a handle/session failure is the
+        // same expected fallout (the void's fence and named gap already
+        // disclose the loss), so it disposes with telemetry instead of
+        // tainting. Mirrors the old bad-return pin's rig (C_SignInit +
+        // OBJECT_HANDLE_INVALID) with the disposal contract.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let mut scene = Scene::new(image_default());
+        let sign_init = function_id("C_SignInit");
+        let mut begin = begin_bytes(1, 1, sign_init, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let rv = pkcs11_types::CkRv::OBJECT_HANDLE_INVALID.0;
+        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, rv, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped bad-return terminal must not taint"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .contradiction_diagnosis()
+                .terminal_before_begin,
+            1,
+            "the disposal still counts telemetry"
+        );
+    }
+
+    #[test]
+    fn void_wiped_destroy_end_then_handle_reuse_rebinds_new_object() {
+        // Post-disposal binding proof: a successful destroy straddling a
+        // fenced void disposes (never proves), and a later create reusing
+        // the same session+handle rebinds a NEW object instead of naming
+        // the destroyed key. The safety is model-side, not claim-side:
+        // the void retires the domain's live views, clears its bindings
+        // and bumps its generation (fence_void -> outcome_lost(Voided) ->
+        // void_bootstrap), so the reconversion above the fence mints
+        // fresh. Same-key reconversion is the strongest case (shared
+        // namespace); rebirth adds key separation on top.
+        use crate::semantics_objects::{Lifetime, ObjectGap};
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY};
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let destroy = function_id("C_DestroyObject");
+        // Live object O1 minted on the CREATE result handle.
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let first = scene.seal(&bootstrap).expect("sole key seals");
+        let destroyed = first
+            .effects
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ObjectEffect::Created { object, .. } => Some(*object),
+                _ => None,
+            })
+            .expect("the create effect names O1");
+        {
+            let before = scene.model.project();
+            assert_eq!(
+                before.object(destroyed).expect("O1 projects").lifetime,
+                Lifetime::Live
+            );
+        }
+        // A successful destroy straddles an H3-loss void: its BEGIN is
+        // wiped and its END disposes without tainting. The kill names the
+        // CREATE result handle the default END mints.
+        let mut kill = begin_bytes(1, 2, destroy, 0);
+        put_u64(&mut kill, 88, 0x9090_9090_9090_9090);
+        kill[126] = 1;
+        assert_eq!(scene.ingest(&kill), JournalDisposition::BeginAdmitted);
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        let fence = scene.adapter.consumed_through;
+        let end = end_bytes(&kill, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 60);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped destroy terminal must not taint"
+        );
+        // The void retired O1 as lost; the disposed destroy proved
+        // nothing, so O1 is never destroyed.
+        {
+            let lost = scene.model.project();
+            assert_eq!(
+                lost.object(destroyed)
+                    .expect("O1 survives the void")
+                    .lifetime,
+                Lifetime::Retired(ObjectGap::OutcomeLost),
+                "the void retires O1 as lost, never destroyed"
+            );
+        }
+        // Reconversion reusing the same handle binds a new live object.
+        scene.attest();
+        let next = begin_bytes(1, 3, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let reconverted = scene.seal_at(&resume, 7).expect("post-void history seals");
+        assert!(
+            !reconverted
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::Destroyed { .. })),
+            "the disposed destroy proves no destruction"
+        );
+        let rebound = reconverted
+            .effects
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ObjectEffect::Created { object, .. } => Some(*object),
+                _ => None,
+            })
+            .expect("the reconversion creates");
+        assert_ne!(rebound, destroyed, "the reused handle names a new object");
+        {
+            let after = scene.model.project();
+            assert_eq!(
+                after.object(rebound).expect("new view").lifetime,
+                Lifetime::Live
+            );
+            assert_eq!(
+                after.object(destroyed).expect("old view").lifetime,
+                Lifetime::Retired(ObjectGap::OutcomeLost)
+            );
+        }
     }
 
     #[test]
@@ -27692,6 +28034,113 @@ pub(crate) mod tests {
         assert_eq!(
             scene.adapter.attest_key(&other.admit()),
             Err(AttestationRefusal::ImageSealed)
+        );
+    }
+
+    #[test]
+    fn scoped_fenced_sibling_still_blocks_rebirth() {
+        // Scoped fences never exempt rebirth: a watchdog scoped void wipes
+        // only its slice (the global cut stays put), so a converted
+        // sibling fenced by a scoped void still blocks a new key as
+        // ImageSealed. Only a global void (fence plus advanced global
+        // cut) clears the sibling's staged claims. (Global post-void
+        // rebirth stays allowed: fenced_sibling_allows_post_void_rebirth.)
+        use super::joint_driver::JointVoidScope;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let sign = function_id("C_Sign");
+        // Sight the image as pre-existing before the key binds, so the
+        // attach-observed birth below carries pre-cut history.
+        let shape = begin_bytes(1, 1, create, 0);
+        let mut affecting = ordinary_for(&shape, 0);
+        affecting.slot = 99;
+        affecting.target_function = sign;
+        harness.ingest_ordinary(affecting);
+        let proof = harness.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        harness.ingest(&begin);
+        harness.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let birth = BootstrapReceipt::attest(
+            harness.owner.adapter(),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::AttachObserved,
+                1,
+                harness.closure_generation(),
+            ),
+        )
+        .expect("pre-existing image births as attach-observed");
+        harness.seal_empty(&birth).expect("healthy receipt seals");
+        {
+            let state = harness
+                .owner
+                .adapter()
+                .keys
+                .get(&proof.key)
+                .expect("sealed key");
+            assert!(state.model_registered, "the sibling converted");
+            assert!(state.sealed_through > 0, "the sibling sealed");
+            assert_eq!(
+                harness.owner.adapter().voided_through_for_test(),
+                0,
+                "nothing voided before the scoped break"
+            );
+        }
+        // An unbound barrier the scoped void sheds.
+        let barrier_image = (COOKIE + 2, EXEC + 2);
+        let barrier = begin_bytes_image(1, 9, create, 0, barrier_image);
+        harness.ingest(&barrier);
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the unbound BEGIN bars seals before the void"
+        );
+        // Direct fixture ingests mark the stream broken; the watchdog
+        // scenario models a linked lane with its stream position
+        // intact, so clear the flag before the scoped break.
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        {
+            let state = harness
+                .owner
+                .adapter()
+                .keys
+                .get(&proof.key)
+                .expect("fenced key");
+            assert!(state.void_fence > 0, "the scoped void fences the key");
+            assert!(
+                state.sealed_through <= state.void_fence,
+                "the sibling conversion is entirely fenced"
+            );
+            assert!(state.model_registered, "the fence keeps the registration");
+            assert_eq!(
+                harness.owner.adapter().voided_through_for_test(),
+                0,
+                "the global void cut stays put across the scoped void"
+            );
+        }
+        let mut other = AttestationFixture::new(image_default());
+        assert_eq!(
+            harness.owner.adapter_mut().attest_key(&other.admit()),
+            Err(AttestationRefusal::ImageSealed),
+            "a scoped-fenced sibling still blocks rebirth"
         );
     }
 

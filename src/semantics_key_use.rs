@@ -4185,6 +4185,12 @@ pub(crate) struct FeedDisposalCursor {
     /// Subset-scope retire cursor for one staged head (Session /
     /// SessionMachines / Slot / Selected): same hold-and-pop discipline.
     head_retire: Option<crate::semantics_edge::EdgeRetireCursor>,
+    /// Budgeted pending-admission cursor for one staged PENDING head
+    /// (route + origin capture + insert + oldest-first eviction, one
+    /// leaf per visit): held across credits until the admission
+    /// commits, then the head pops WITHOUT a second observe (a second
+    /// observe would double-queue).
+    head_pending: Option<crate::semantics_edge::PendingAdmissionCursor>,
     /// Set once the head's retire cursor completes (All or subset):
     /// the pending head pops without observe on re-entry.
     head_retired: bool,
@@ -4207,6 +4213,7 @@ impl FeedDisposalCursor {
             invalidate: None,
             head_retire_all: None,
             head_retire: None,
+            head_pending: None,
             head_retired: false,
             assoc_queue: VecDeque::with_capacity(crate::semantics_edge::MAX_EDGE_ACTIVE_OPS),
             assoc_release: None,
@@ -4367,6 +4374,28 @@ impl FeedDisposalCursor {
                 self.head_retired = true;
                 continue;
             }
+            if self.head_pending.is_some() {
+                if !self.is_joint {
+                    self.head_pending = None;
+                    continue;
+                }
+                let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
+                let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                let pending = self.head_pending.as_mut().expect("head admission retained");
+                let mut tee = DisposalTee::new(
+                    preserved,
+                    self.instance,
+                    fallback.as_deref_mut(),
+                    &mut self.assoc_queue,
+                );
+                let done = throwaway.poll_pending_admission_step(pending, &mut tee, gate);
+                if !done {
+                    return false;
+                }
+                self.head_pending = None;
+                self.head_retired = true;
+                continue;
+            }
             if let Some(expected) = self.pending_position {
                 if self.head_retired {
                     if !gate.try_charge() {
@@ -4435,6 +4464,12 @@ impl FeedDisposalCursor {
                         let origin = front.origin.clone();
                         let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
                         self.head_retire = Some(throwaway.start_budgeted_retire(scope, &origin));
+                        continue;
+                    }
+                    crate::semantics_edge::RetirePeek::Pending => {
+                        let facts = front.facts.clone();
+                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                        self.head_pending = Some(throwaway.start_pending_admission(facts));
                         continue;
                     }
                     crate::semantics_edge::RetirePeek::NoOp => {

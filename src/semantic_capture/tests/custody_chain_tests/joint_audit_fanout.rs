@@ -31691,6 +31691,179 @@ fn joint_s1only_negative_visits_journal_rows_per_credit_on_frame() {
     );
 }
 
+/// A deferred S1-only negative's exact scope, not its provisional
+/// all-key bound, decides which consumers may seal: a disjoint S1-only
+/// history (a prior Joint feed now S1-only) that the filled failure does
+/// not name stays negative-only once the fill finishes, never entering
+/// the positive seal path.
+#[test]
+fn joint_deferred_s1only_negative_keeps_disjoint_s1only_history_negative_only() {
+    use crate::semantics_key_use::FeedMode;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let disjoint = fixture
+        .feeds()
+        .into_iter()
+        .map(|feed| feed.id)
+        .find(|id| {
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .feed_mode_for_test(*id)
+                == Some(FeedMode::Joint)
+        })
+        .expect("a prior-sealed Joint feed");
+    let child_c = OwnedStoppedChild::new();
+    let caller = fixture.scene.real.bind(
+        child_c.id(),
+        ImageIdentity {
+            task_cookie: 73,
+            exec_id: 0,
+        },
+        0,
+    );
+    for (sequence, name) in ["C_SignInit", "C_SignUpdate", "C_SignFinal"]
+        .into_iter()
+        .enumerate()
+    {
+        fixture
+            .scene
+            .push(child_c.id(), 0, name, sequence as u64 + 1);
+    }
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    fixture.scene.admit_providers(child_c.id(), caller, &[0]);
+    fixture.scene.prepare_batch(batch, 3);
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let mut ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original C raw: {reason:?}"));
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    while coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {}
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    coordinator
+        .registry_mut()
+        .pose_feed_mode_for_test(disjoint, FeedMode::S1Only);
+    // One inline unit: the S1-only negative defers to the frame, as a
+    // large subject set does under the default credit.
+    coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .bound_inline_credit_for_test(1);
+    let mut frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    assert!(
+        frame.awaits_fill_for_test(),
+        "precondition: the S1-only negative is still filling"
+    );
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    assert!(
+        frame
+            .consumer_states_for_test()
+            .iter()
+            .any(|state| state.0 == disjoint),
+        "precondition: the posed S1-only history is a consumer"
+    );
+    let h0 = fixture.scene.real.h0.clone();
+    let mut polls = 0usize;
+    while frame.awaits_fill_for_test() {
+        polls += 1;
+        assert!(polls < 256, "the fill completes");
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        };
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        let mut remaining = 64usize;
+        frame
+            .seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining)
+            .unwrap();
+    }
+    let exact = frame.original_failures_for_test().any(|failure| {
+        failure.affects_domain(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_history_targets()
+                .find(|(target, _)| target.id() == disjoint)
+                .expect("history target")
+                .0
+                .bootstrap()
+                .domain(),
+        )
+    });
+    assert!(
+        !exact,
+        "precondition: the filled negative does not name the disjoint history"
+    );
+    let state = frame
+        .consumer_states_for_test()
+        .into_iter()
+        .find(|state| state.0 == disjoint)
+        .expect("the disjoint consumer")
+        .1;
+    assert_eq!(
+        state, "NegativeOnly",
+        "a disjoint S1-only history never waits on a positive seal"
+    );
+}
+
 #[test]
 fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
     with_genuine_prior_terminal(false, false, |_, _, _, _, _| false);

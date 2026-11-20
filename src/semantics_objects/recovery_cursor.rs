@@ -995,18 +995,16 @@ fn doom_open(
             }
         };
         let native = checked.native.expect("checked open");
-        // An attribution too large to decide drops the row: the key is
-        // refused and its doom names the loss (fail closed).
-        let drop = match journal.claim_probe(
-            &checked.shape,
-            Some(key.image()),
-            &mut recovery.deposit,
-            credit,
-        ) {
+        // The frozen live set is indexed, so only the identity's own
+        // claims price the decision. A row drops only when the paid
+        // attribution proves it the doomed key's; one whose claims are
+        // too many to decide stays staged (a sibling's history is never
+        // dropped on uncertainty; the doom's own scope is unchanged).
+        let drop = match journal.claim_probe(&checked.shape, None, &mut recovery.deposit, credit) {
             ClaimProbe::Fits(paid) => {
                 journal.attributes_to(key, &checked.shape, Some(&recovery.doom_live), paid)
             }
-            ClaimProbe::Never => true,
+            ClaimProbe::Never => false,
             ClaimProbe::Yield => {
                 recovery.check = Some(checked);
                 recovery.phase = ScopedRecoveryPhase::DoomOpen { after };
@@ -1054,11 +1052,12 @@ fn doom_refused(
             }
         };
         recovery.verdict = Some(
-            match journal.claim_probe(&shape, Some(key.image()), &mut recovery.deposit, credit) {
+            match journal.claim_probe(&shape, None, &mut recovery.deposit, credit) {
                 ClaimProbe::Fits(paid) => {
                     journal.attributes_to(key, &shape, Some(&recovery.doom_live), paid)
                 }
-                ClaimProbe::Never => true,
+                // Undecidable: kept, as for the staged originals above.
+                ClaimProbe::Never => false,
                 ClaimProbe::Yield => {
                     recovery.check = Some(CheckedRead::refused_shape(shape));
                     recovery.phase = ScopedRecoveryPhase::DoomRefused { read, write };

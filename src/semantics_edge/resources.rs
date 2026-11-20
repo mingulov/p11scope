@@ -178,6 +178,41 @@ impl SemanticResourceReserver {
     pub(crate) fn covers(&self, lease: &ResourceLease, required_bytes: usize) -> bool {
         Arc::ptr_eq(&self.shared, &lease.shared) && lease.bytes >= required_bytes
     }
+
+    /// Turns a held lease into one of exactly `bytes`, charging only the
+    /// shortfall and refunding any excess. A replacement that fits once
+    /// the held charge is credited therefore never needs both at once.
+    /// A refusal hands the held lease back unchanged; a lease from
+    /// another pool is kept apart and refunds only after success.
+    pub(crate) fn resize(
+        &self,
+        held: Option<ResourceLease>,
+        bytes: usize,
+    ) -> Result<ResourceLease, (Option<ResourceLease>, SemanticResourceRefusal)> {
+        let mut lease = match held {
+            Some(lease) if Arc::ptr_eq(&self.shared, &lease.shared) => lease,
+            // No held charge in this pool (or a foreign one): reserve in
+            // full; a foreign lease drops only once the new one exists.
+            other => {
+                return match self.reserve(bytes) {
+                    Ok(fresh) => Ok(fresh),
+                    Err(refusal) => Err((other, refusal)),
+                };
+            }
+        };
+        if lease.bytes >= bytes {
+            let excess = lease.bytes - bytes;
+            lease.release(excess);
+            return Ok(lease);
+        }
+        match lease.reserve(bytes - lease.bytes) {
+            Ok(extra) => {
+                lease.absorb(extra);
+                Ok(lease)
+            }
+            Err(refusal) => Err((Some(lease), refusal)),
+        }
+    }
 }
 
 impl Default for SemanticResourcePool {
@@ -411,6 +446,38 @@ impl Drop for ScratchLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserver_resize_charges_only_the_shortfall_and_returns_refused_leases() {
+        let pool = SemanticResourcePool::reference_limit(SEMANTIC_TRANSITION_SCRATCH + 4096);
+        let reserver = pool.reserver();
+        let held = reserver.reserve(3000).unwrap();
+        // Growing to 4096 needs only 1096 more: it fits although both
+        // leases together (3000 + 4096) would not.
+        let grown = reserver.resize(Some(held), 4096).expect("shortfall fits");
+        assert!(reserver.covers(&grown, 4096) && !reserver.covers(&grown, 4097));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + 4096
+        );
+        let Err((back, _)) = reserver.resize(Some(grown), 4097) else {
+            panic!("the pool cannot grow past its limit");
+        };
+        let back = back.expect("a refusal hands the held lease back");
+        assert!(reserver.covers(&back, 4096) && !reserver.covers(&back, 4097));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + 4096
+        );
+        let shrunk = reserver.resize(Some(back), 1000).expect("shrinking fits");
+        assert!(reserver.covers(&shrunk, 1000) && !reserver.covers(&shrunk, 1001));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            SEMANTIC_TRANSITION_SCRATCH + 1000
+        );
+        drop(shrunk);
+        assert_eq!(pool.snapshot().charged_bytes, SEMANTIC_TRANSITION_SCRATCH);
+    }
 
     #[test]
     fn reserver_coverage_rejects_foreign_or_insufficient_live_lease() {

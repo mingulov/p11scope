@@ -782,6 +782,13 @@ pub(crate) trait LaneTestIo {
     ) -> Option<CurrentPartitionReceipt> {
         None
     }
+    /// Machine cadence: re-observe take-raced keys while a seal
+    /// retry stalls. Test owners without a substituted H0 stay a
+    /// pure no-op; owners with one run the real sweep through
+    /// their substituted I/O and stash.
+    fn service_take_refresh_sweep(&mut self) -> bool {
+        false
+    }
     fn stash_admission_evidence(
         &mut self,
         _receipts: Vec<CurrentPartitionReceipt>,
@@ -1910,7 +1917,8 @@ pub(crate) fn joint_voids_line(
 
 /// One stderr line for the diagnostic seal-bootstrap summary:
 /// which bootstrap check refused a seal, by arm, plus retained
-/// takes that succeeded across same-instance drift. Counts only;
+/// takes that succeeded across same-instance drift and
+/// take-refresh keys re-scanned by cadence sweeps. Counts only;
 /// no identities, paths or payloads. Diagnostic-only: printed
 /// beside the Joint-void summary only when verbose text is
 /// requested, never a contract. Variant detail lists nonzero slots
@@ -1918,6 +1926,7 @@ pub(crate) fn joint_voids_line(
 pub(crate) fn joint_bootstraps_line(
     counts: &crate::semantics_objects::journal::SealBootstrapCounts,
     take_drift_tolerated: u64,
+    take_refresh_scans: u64,
 ) -> String {
     use crate::semantics_objects::journal::SealBootstrapCounts;
     fn detail(slots: &[u64], name: fn(usize) -> Option<&'static str>) -> String {
@@ -1939,10 +1948,11 @@ pub(crate) fn joint_bootstraps_line(
     }
     format!(
         "p11scope: joint seal bootstraps: take_failed={} \
-         take_drift_tolerated={} reverify_failed={} covers_failed={} pin_failed={} \
+         take_drift_tolerated={} take_refresh_scans={} reverify_failed={} covers_failed={} pin_failed={} \
          other_failed={} take_detail={} reverify_detail={}",
         counts.take_failed_total(),
         take_drift_tolerated,
+        take_refresh_scans,
         counts.reverify_failed_total(),
         counts.covers_failed,
         counts.pin_failed,
@@ -2392,6 +2402,43 @@ impl AttestedSemanticLane {
         self.live
             .as_ref()
             .map_or(0, |live| live.capture.take_drift_tolerated())
+    }
+
+    /// Take-refresh keys re-scanned by cadence sweeps
+    /// (diagnostic only; zero without a live lane).
+    pub(crate) fn take_refresh_scans(&self) -> u64 {
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.capture.take_refresh_scans())
+    }
+
+    /// Machine cadence: re-observe take-raced keys while a seal
+    /// retry stalls, so the next attempt validates against
+    /// current truth. The sweep report stashes for the next tick
+    /// merge (receipts, outcomes and disclosures ride the batch);
+    /// scan refusals count beside the tick's. True when a sweep
+    /// ran. No queued interests means no raced take, and the
+    /// service stays a pure no-op.
+    pub(crate) fn service_take_refresh_sweep(&mut self) -> bool {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            return test.service_take_refresh_sweep();
+        }
+        let Some(live) = self.live.as_deref_mut() else {
+            return false;
+        };
+        if !live.capture.has_queued_take_refresh() {
+            return false;
+        }
+        let pins = live.capture.refresh_target_pins();
+        let mut report = live.capture.sweep_take_refresh(&mut live.session, &pins);
+        live.scan_refusals = live
+            .scan_refusals
+            .saturating_add(report.scan_refusals.len() as u64);
+        count_scan_refusals(&mut live.refusal_counts, &report.scan_refusals);
+        let (_, shed) = stash_refresh_report(&mut live.stashed_refresh, &mut report);
+        live.scan_refusals = live.scan_refusals.saturating_add(shed);
+        true
     }
 
     /// Lane-stash pending floor for the finalizer's disposition: the
@@ -6827,14 +6874,33 @@ mod bootstraps_line_tests {
     #[test]
     fn joint_bootstraps_line_reports_take_drift_tolerated() {
         let counts = crate::semantics_objects::journal::SealBootstrapCounts::default();
-        let line = joint_bootstraps_line(&counts, 7);
+        // Arity follows the additive cadence-sweep field; both
+        // assertions below are untouched.
+        let line = joint_bootstraps_line(&counts, 7, 0);
         assert!(
             line.contains("take_drift_tolerated=7"),
             "tolerated takes ride the bootstrap line: {line}"
         );
-        let idle = joint_bootstraps_line(&counts, 0);
+        let idle = joint_bootstraps_line(&counts, 0, 0);
         assert!(
             idle.contains("take_drift_tolerated=0"),
+            "zero stays explicit: {idle}"
+        );
+    }
+
+    /// The seal-bootstrap line reports take-refresh keys
+    /// re-scanned by cadence sweeps beside the failure arms.
+    #[test]
+    fn joint_bootstraps_line_reports_take_refresh_scans() {
+        let counts = crate::semantics_objects::journal::SealBootstrapCounts::default();
+        let line = joint_bootstraps_line(&counts, 0, 3);
+        assert!(
+            line.contains("take_refresh_scans=3"),
+            "swept keys ride the bootstrap line: {line}"
+        );
+        let idle = joint_bootstraps_line(&counts, 0, 0);
+        assert!(
+            idle.contains("take_refresh_scans=0"),
             "zero stays explicit: {idle}"
         );
     }

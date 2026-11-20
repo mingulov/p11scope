@@ -24246,6 +24246,54 @@ fn key_operation_fenced_void_ending_feed_queues_reseed_once() {
     );
 }
 
+/// An unfenced take-failure fallback queues one bounded reseed for
+/// its image: the birth is dead (`BootstrapMismatch` never
+/// resumes), so only a fresh birth can attribute again.
+#[test]
+fn key_operation_take_failure_fallback_queues_bounded_reseed() {
+    let mut fresh = GuardedScene::new();
+    let bootstrap = fresh.scene.bootstrap();
+    let joint_key = fresh.key(1);
+    assert!(
+        fresh
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = fresh.register(1);
+    let (facts, position) =
+        fresh.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    fresh.observe(&joint_key, position, facts);
+    fresh
+        .registry
+        .publish_with_ledger(fresh.scene.adapter.ledger_mut());
+    let mut failure = fresh.scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    assert!(failure.fence.is_none());
+    failure.take_failed = Some(crate::attach::BirthObservationRefusal::WitnessStale);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = fresh.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &fresh.scene.model,
+        fresh.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        FailureApplyOutcome::FellBack { replayed: 1 }
+    ));
+    let queued = fresh.registry.drain_joint_reseed_queue();
+    assert_eq!(queued.len(), 1, "one take-fallback queues one reseed");
+    assert_eq!(
+        (queued[0].task_cookie, queued[0].exec_id),
+        (101, 1),
+        "the queued image is the fallen-back feed's"
+    );
+}
+
 /// A transiently failed fresh-evidence take is unknown, not
 /// negative: its delivery retries with staging and Joint mode intact
 /// (the next tick takes again) instead of falling the whole session

@@ -1187,7 +1187,7 @@ impl SealBootstrapCounts {
     /// variant. A new variant extends this count, the name table and
     /// the index match together (the index match is exhaustive, so a
     /// new variant fails to compile until it is placed).
-    pub(crate) const TAKE_ARMS: usize = 17;
+    pub(crate) const TAKE_ARMS: usize = 22;
     /// Re-verify-failure slots: one per `BirthRefusal` variant,
     /// with the same extend-together rule.
     pub(crate) const REVERIFY_ARMS: usize = 8;
@@ -1210,6 +1210,11 @@ impl SealBootstrapCounts {
         "AppearanceRejected",
         "NegativeFenceMismatch",
         "RetainedWitnessMismatch",
+        "EpochDrift",
+        "CaptureDrift",
+        "WitnessStale",
+        "TakeDeadline",
+        "SessionBorrowed",
     ];
     /// Re-verify-failure slot names in index order.
     const REVERIFY_ARM_NAMES: [&'static str; Self::REVERIFY_ARMS] = [
@@ -1245,6 +1250,11 @@ impl SealBootstrapCounts {
             AppearanceRejected => 14,
             NegativeFenceMismatch => 15,
             RetainedWitnessMismatch => 16,
+            EpochDrift => 17,
+            CaptureDrift => 18,
+            WitnessStale => 19,
+            TakeDeadline => 20,
+            SessionBorrowed => 21,
         }
     }
 
@@ -6161,22 +6171,28 @@ impl SealFailure {
     }
 
     /// Delivery disposition for one seal failure: a take failed
-    /// on partition contention or deadline is unknown, not
+    /// on contention, deadline or a live race is unknown, not
     /// negative, so it retries with staging intact (the next tick
     /// takes again) instead of ending the session; every other
-    /// failure keeps its gap's disposition. Only the contention
-    /// refusal retries: every other take refusal names a permanent
+    /// failure keeps its gap's disposition. Only the transient
+    /// refusals retry: every other take refusal names a permanent
     /// fact (an unreadable row the recheck will never see again, a
     /// poisoned or wrong marker, lost custody, a mismatched binding,
-    /// a rejected witness), so it keeps the prompt fallback. A take
-    /// that stays failed degrades via the watchdog park, like any
-    /// stuck retry. Failure selection, the audited disposition and
-    /// the feed paths share this mapping.
+    /// a rejected witness, a witness whose truth broke), so it
+    /// keeps the prompt fallback. A take that stays failed degrades
+    /// via the watchdog park, like any stuck retry. Failure
+    /// selection, the audited disposition and the feed paths share
+    /// this mapping.
     pub(crate) fn delivery_disposition(&self) -> crate::semantics_key_use::SealFailureDisposition {
         use crate::attach::BirthObservationRefusal as Refusal;
         use crate::semantics_key_use::SealFailureDisposition as Disposition;
         match self.take_failed {
-            Some(Refusal::CurrentPartition) => Disposition::Retry,
+            Some(
+                Refusal::CurrentPartition
+                | Refusal::EpochDrift
+                | Refusal::TakeDeadline
+                | Refusal::SessionBorrowed,
+            ) => Disposition::Retry,
             _ => crate::semantics_key_use::disposition_of(self.gap),
         }
     }
@@ -30732,6 +30748,11 @@ pub(crate) mod tests {
             Take::AppearanceRejected,
             Take::NegativeFenceMismatch,
             Take::RetainedWitnessMismatch,
+            Take::EpochDrift,
+            Take::CaptureDrift,
+            Take::WitnessStale,
+            Take::TakeDeadline,
+            Take::SessionBorrowed,
         ];
         assert_eq!(takes.len(), SealBootstrapCounts::TAKE_ARMS);
         let mut seen = [false; SealBootstrapCounts::TAKE_ARMS];
@@ -30775,6 +30796,13 @@ pub(crate) mod tests {
                 }
                 Take::RetainedWitnessMismatch => {
                     assert_eq!((index, name), (16, Some("RetainedWitnessMismatch")))
+                }
+                Take::EpochDrift => assert_eq!((index, name), (17, Some("EpochDrift"))),
+                Take::CaptureDrift => assert_eq!((index, name), (18, Some("CaptureDrift"))),
+                Take::WitnessStale => assert_eq!((index, name), (19, Some("WitnessStale"))),
+                Take::TakeDeadline => assert_eq!((index, name), (20, Some("TakeDeadline"))),
+                Take::SessionBorrowed => {
+                    assert_eq!((index, name), (21, Some("SessionBorrowed")))
                 }
             }
         }
@@ -31215,6 +31243,47 @@ pub(crate) mod tests {
             SealFailureDisposition::Retry,
             "a contended take still retries"
         );
+    }
+
+    /// Delivery disposition routes the take sub-causes: contention,
+    /// deadline and live races retry with staging intact, while a
+    /// witness whose truth broke keeps the prompt fallback (only a
+    /// fresh birth can attribute again).
+    #[test]
+    fn seal_failure_delivery_disposition_routes_take_subcauses() {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        use crate::semantics_key_use::SealFailureDisposition;
+        fn failure(
+            gap: JournalGap,
+            take_failed: Option<crate::attach::BirthObservationRefusal>,
+        ) -> SealFailure {
+            SealFailure {
+                scope: SealFailureScope::Unqualified,
+                gap,
+                effects: ObjectEffects::default(),
+                h3_voided: None,
+                fence: None,
+                take_failed,
+            }
+        }
+        for refusal in [
+            Refusal::EpochDrift,
+            Refusal::TakeDeadline,
+            Refusal::SessionBorrowed,
+        ] {
+            assert_eq!(
+                failure(JournalGap::BootstrapMismatch, Some(refusal)).delivery_disposition(),
+                SealFailureDisposition::Retry,
+                "{refusal:?} retries with staging intact"
+            );
+        }
+        for refusal in [Refusal::CaptureDrift, Refusal::WitnessStale] {
+            assert_eq!(
+                failure(JournalGap::BootstrapMismatch, Some(refusal)).delivery_disposition(),
+                SealFailureDisposition::Fallback,
+                "{refusal:?} keeps the prompt fallback"
+            );
+        }
     }
 
     #[test]

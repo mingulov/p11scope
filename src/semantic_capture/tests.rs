@@ -1203,6 +1203,10 @@ struct ScriptIo {
     raises: usize,
     raise_fails: bool,
     local: u32,
+    /// Scripted global epoch for call stamps, scans and receipt
+    /// re-reads: bumping this past a birth simulates the
+    /// unattributable global churn live takes must tolerate.
+    global: u32,
     output_image: Option<ImageIdentity>,
     output_file: Option<u32>,
     scan_advance: Duration,
@@ -1277,6 +1281,7 @@ impl ScriptIo {
             raises: 0,
             raise_fails: false,
             local: 0,
+            global: 0,
             output_image: None,
             output_file: None,
             scan_advance: Duration::ZERO,
@@ -1307,7 +1312,7 @@ impl ScriptIo {
             file_slot_plus1: 1,
             fault,
             epoch: self.local,
-            global: 0,
+            global: self.global,
         };
         self.records.push_back(DecodedEventRecord {
             joint_resource: None,
@@ -1430,7 +1435,7 @@ impl CaptureIo for ScriptIo {
             image: self.current_image,
             epochs: self.receipt_epochs.unwrap_or(CompleteEpochs {
                 local: u64::from(self.local),
-                global: 0,
+                global: u64::from(self.global),
                 fault: self.last_health.fault,
                 sticky: self.last_health.sticky,
                 record_flags: 0,
@@ -1488,7 +1493,7 @@ impl CaptureIo for ScriptIo {
             self.output_file.unwrap_or(job.endpoint.file_slot),
             CompleteEpochs {
                 local: u64::from(self.local),
-                global: 0,
+                global: u64::from(self.global),
                 fault: self.last_health.fault,
                 sticky: 0,
                 record_flags: 0,
@@ -1655,7 +1660,8 @@ impl JointBirthHarness {
         begin[40..48].copy_from_slice(&self.io.current_image.exec_id.to_le_bytes());
         begin[56..64].copy_from_slice(&(0x7000_0000 + endpoint.offset).to_le_bytes());
         begin[64..68].copy_from_slice(&self.io.local.to_le_bytes());
-        begin[68..76].fill(0);
+        begin[68..72].copy_from_slice(&self.io.global.to_le_bytes());
+        begin[72..76].fill(0);
         begin[76..78].copy_from_slice(&1u16.to_le_bytes());
         begin[104..108].copy_from_slice(&slot.to_le_bytes());
         let end = end_bytes(
@@ -2276,6 +2282,208 @@ fn joint_birth_witness_uses_actual_new_once() {
             )
             .is_err()
     );
+}
+
+/// A birth sealed once (positive control), ready for take twins to
+/// drift, race or break its witness.
+fn birth_sealed_witness() -> (
+    JointBirthHarness,
+    RetainedBirthWitness,
+    crate::semantics_objects::journal::tests::NativeBirthRows,
+) {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (collection, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let (row, control, _) =
+        publisher.publish_stamped(&["0", "0"], harness.fixture.attachment().generation());
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    let mut model = crate::semantics_objects::ObjectSemantics::new();
+    assert_eq!(harness.seal(collection, &witness, &mut rows, &mut model), 1);
+    (harness, witness, rows)
+}
+
+/// A retained take survives unattributable global churn: the scan
+/// appends a same-partition continuation past the birth, and the
+/// take validates against current truth instead of failing the
+/// stale receipt forever. The tolerance is counted.
+#[test]
+fn joint_retained_take_tolerates_same_instance_global_drift() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    assert_eq!(harness.capture.take_drift_tolerated(), 0);
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("same-instance drift tolerates");
+    assert_eq!(harness.capture.take_drift_tolerated(), 1);
+}
+
+/// A retained take refuses a genuine remap: the local move mints
+/// new partitions, so the birth is dead (`WitnessStale`) and only
+/// a fresh birth can attribute again. Nothing is tolerated.
+#[test]
+fn joint_retained_take_refuses_remapped_partitions_as_stale() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.local = 2;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::New]);
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("a remap breaks the birth");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::WitnessStale
+    );
+    assert_eq!(harness.capture.take_drift_tolerated(), 0);
+}
+
+/// A retained take refuses a changed live image as stale: the
+/// process under the pin is no longer the birth's image, which
+/// never heals, so the birth is dead (`WitnessStale`).
+#[test]
+fn joint_retained_take_refuses_changed_live_image_as_stale() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.current_image = ImageIdentity {
+        task_cookie: 72,
+        exec_id: 0,
+    };
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("a changed image breaks the birth");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::WitnessStale
+    );
+    assert_eq!(harness.capture.take_drift_tolerated(), 0);
+}
+
+/// A retained take refused under another capture names the drift:
+/// the witness outlived its capture (`CaptureDrift`), so no take
+/// under this capture can validate it.
+#[test]
+fn joint_retained_take_names_foreign_capture_drift() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let foreign = capture(&harness.io);
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &foreign,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("a foreign capture refuses the take");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::CaptureDrift
+    );
+}
+
+/// A retained take that outruns its scan slice names the deadline
+/// (`TakeDeadline`): unknown, not negative.
+#[test]
+fn joint_retained_take_names_scan_slice_deadline() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.receipt_advance = Duration::from_millis(51);
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("an overrun take refuses");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::TakeDeadline
+    );
+}
+
+/// A retained take whose live epochs raced past the receipt names
+/// the race (`EpochDrift`): the next tick re-takes against current
+/// truth.
+#[test]
+fn joint_retained_take_names_live_epoch_race() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.receipt_epochs = Some(CompleteEpochs {
+        local: 1,
+        global: 5,
+        fault: 0,
+        sticky: 0,
+        record_flags: 0,
+    });
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("a raced take refuses");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+}
+
+/// Every native receipt-state refusal maps through the take to its
+/// own sub-cause: custody and attachment keep their owners, epoch
+/// and deadline name the take condition, and a failed read stays
+/// unclassified (`CurrentPartition`).
+#[test]
+fn joint_retained_take_maps_receipt_state_refusals() {
+    use crate::attach::BirthObservationRefusal as TakeRefusal;
+    let cases = [
+        (CurrentReceiptRefusal::Custody, TakeRefusal::CustodyLost),
+        (
+            CurrentReceiptRefusal::Attachment,
+            TakeRefusal::AttachmentMismatch,
+        ),
+        (CurrentReceiptRefusal::Epoch, TakeRefusal::EpochDrift),
+        (CurrentReceiptRefusal::Deadline, TakeRefusal::TakeDeadline),
+        (CurrentReceiptRefusal::Audit, TakeRefusal::CurrentPartition),
+    ];
+    for (posed, expected) in cases {
+        let (mut harness, witness, mut rows) = birth_sealed_witness();
+        harness.io.receipt_refusal = Some(posed);
+        let refusal = witness
+            .fresh_evidence_with(
+                &mut harness.io,
+                &mut rows,
+                &harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding(),
+            )
+            .expect_err("a refused read refuses the take");
+        assert_eq!(refusal, expected, "receipt {posed:?} maps through the take");
+    }
 }
 
 #[test]

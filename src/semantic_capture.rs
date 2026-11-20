@@ -2267,9 +2267,34 @@ impl SemanticCapture {
                 .router
                 .partition_back_taint(receipt.domain, receipt.image, receipt.endpoint.file_slot)
                 .unwrap_or((false, false));
-            if !retained
-                || !Self::accept_live_ahead(state.epochs, effective, global_tainted, miss_tainted)
-            {
+            // TEMPORARY gate trace (debug commit, reverted).
+            static TAKE_DEBUG_SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = TAKE_DEBUG_SEQ.fetch_add(1, Ordering::Relaxed);
+            let wall = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let decision = retained
+                && Self::accept_live_ahead(
+                    state.epochs,
+                    effective,
+                    global_tainted,
+                    miss_tainted,
+                );
+            eprintln!(
+                "GATEDBG seq={seq} t={wall:.3} retained={retained} live=({},{},{},{},{}) eff=({},{},{},{},{}) taint=({global_tainted},{miss_tainted}) decision={decision}",
+                state.epochs.local,
+                state.epochs.global,
+                state.epochs.fault,
+                state.epochs.sticky,
+                state.epochs.record_flags,
+                effective.local,
+                effective.global,
+                effective.fault,
+                effective.sticky,
+                effective.record_flags,
+            );
+            if !decision {
                 return Err(Refusal::EpochDrift);
             }
             tolerated = true;
@@ -4121,6 +4146,15 @@ impl SemanticCapture {
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        // TEMPORARY tick trace (debug commit, reverted).
+        eprintln!(
+            "TICKDBG t={:.3} collected={}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+            collected.is_some()
+        );
         // One storage_null snapshot per scan pass for the Q1(b) gate.
         self.router.note_storage_null(io.storage_null());
         let mut report = TickReport::default();

@@ -4406,19 +4406,22 @@ impl ModelState {
         effects
     }
 
-    /// Per-call disposal for one abandoned neutral (effect-free S1)
-    /// call: its outcome is recorded lost under the named gap and its
-    /// pending ticket released, without voiding its domain's bootstrap
-    /// or retiring any other view. Neutral calls apply no object
-    /// effect and carry no interference, so their abandonment ends at
-    /// the call while the incarnation keeps sealing. Only the
-    /// journal's per-call disposal path calls this, with a converted
-    /// ticket (`Some`) or `None` when the abandoned call never
-    /// converted (a bare loss gap, no ticket to release). A missing
-    /// ticket counts stale and disposes; a non-neutral ticket is
-    /// refused (`None`, fail closed) so the caller keeps whole-key
-    /// refusal for it.
-    pub(super) fn dispose_abandoned_neutral(
+    /// Per-call disposal for one abandoned effect-free call
+    /// (neutral S1 or pure-read object): its outcome is recorded
+    /// lost under the named gap and its pending ticket released,
+    /// without voiding its domain's bootstrap or retiring any other
+    /// view. Effect-free calls apply no object effect and carry no
+    /// interference, so their abandonment ends at the call while
+    /// the incarnation keeps sealing. Only the journal's per-call
+    /// disposal path calls this, with a converted ticket (`Some`)
+    /// or `None` when the abandoned call never converted (a bare
+    /// loss gap, no ticket to release). A missing ticket counts
+    /// stale and disposes; a non-effect-free ticket is refused
+    /// (`None`, fail closed) so the caller keeps whole-key refusal
+    /// for it. The gate reads the journal's single disposal
+    /// predicate over the same function ordinal the journal
+    /// partitioned on, so disagreement stays unreachable.
+    pub(super) fn dispose_abandoned_per_call(
         &mut self,
         token: Option<CallToken>,
         ledger: &mut super::journal::StagingLedger,
@@ -4432,7 +4435,7 @@ impl ModelState {
             self.gap_effect(&mut effects, ObjectGap::StaleToken);
             return Some(effects);
         };
-        if call.kind != CallKind::Neutral {
+        if !super::journal::abandonment_disposes_per_call(call.function) {
             return None;
         }
         self.gap_effect(&mut effects, ObjectGap::OutcomeLost);

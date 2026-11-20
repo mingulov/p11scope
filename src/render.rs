@@ -1578,6 +1578,24 @@ pub struct Evidence {
     pub object_capture: ObjectCaptureEvidence,
     #[serde(skip)]
     pub pid_descendant_gaps: u64,
+    /// Fresh mid-run admissions inside `pid_descendant_gaps`: members the
+    /// capture admitted (and scanned) whose pre-admission life is still
+    /// unobserved. Never above `pid_descendant_gaps`; the remainder
+    /// (exits, prune and finish sweeps, sentinels) was never observed.
+    /// Manually serialized beside the gap counts; never part of shares
+    /// or verdicts.
+    #[serde(skip)]
+    pub pid_descendant_gaps_admitted: u64,
+    /// Run-tree provider mappers the member-stop backstop held until
+    /// their probes attached. Manually serialized beside the gap
+    /// counts; never part of shares or verdicts.
+    #[serde(skip)]
+    pub member_stop_attached: u64,
+    /// Run-tree provider mappers resumed before their probes attached.
+    /// Every one filed a first-use row; manually serialized beside the
+    /// gap counts; never part of shares or verdicts.
+    #[serde(skip)]
+    pub member_stop_unattached: u64,
     #[serde(skip)]
     pub multi_rebuild_gaps: u64,
     /// Provider files the fanotify drain staged (informational: the
@@ -7281,6 +7299,9 @@ pub(crate) mod tests {
             attach_backend: Default::default(),
             object_capture: ObjectCaptureEvidence::for_build(false),
             pid_descendant_gaps: 0,
+            pid_descendant_gaps_admitted: 0,
+            member_stop_attached: 0,
+            member_stop_unattached: 0,
             multi_rebuild_gaps: 0,
             learned_staged_files: 0,
             learned_event_loss: 0,
@@ -10976,6 +10997,70 @@ pub(crate) mod tests {
         );
     }
 
+    /// CLI text: folded discovery rows leave the generic bucket and
+    /// render as named histogram lines with their counts. Named
+    /// product-limit rows keep today's shape (counted in the bucket
+    /// beside their histogram line).
+    #[test]
+    fn folded_rows_leave_the_generic_bucket_with_named_lines() {
+        let mut ev = evidence();
+        ev.skipped = vec![
+            // Two truly generic rows stay in the bucket.
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            },
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "discovery unavailable".into(),
+            },
+            // One named product-limit row: still bucket-counted (kept).
+            SkippedOut {
+                name: "discovery subject".into(),
+                reason: "loader context capacity 256 is exhausted".into(),
+            },
+        ];
+        for reason in [
+            "process exited mid-flight",
+            "process exited mid-flight",
+            "process exited mid-flight",
+            "process exited mid-flight",
+            "process exited mid-flight",
+            "scan budget exhausted",
+            "scan budget exhausted",
+            "no unique attached loader context",
+        ] {
+            ev.skipped.push(SkippedOut {
+                name: "discovery subject".into(),
+                reason: reason.into(),
+            });
+        }
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                verbosity,
+            );
+            assert!(
+                out.contains("3 discovery steps unavailable"),
+                "{verbosity:?}: {out}"
+            );
+            for fragment in [
+                "loader context capacity 256 is exhausted: 1",
+                "process exited mid-flight: 5",
+                "scan budget exhausted: 2",
+                "no unique attached loader context: 1",
+            ] {
+                assert!(out.contains(fragment), "{verbosity:?}: {out}");
+            }
+        }
+    }
+
     /// CLI text: loader and live-window gaps read as plain words,
     /// never as internal mechanism names.
     #[test]
@@ -11021,6 +11106,358 @@ pub(crate) mod tests {
             "{out}"
         );
         assert!(!out.contains("delivery failure suspected"), "{out}");
+    }
+
+    /// CLI text: one unconfirmed stop renders two rows (the partly
+    /// paused load and the unconfirmed loader tracking); when the
+    /// member-stop backstop covered the same load they fold into one
+    /// row. Every other shape keeps both rows.
+    #[test]
+    fn pause_loader_backstop_fold_renders_one_row() {
+        fn backstopped(ev: &mut Evidence) {
+            ev.pause = "partial";
+            ev.pause_attempts = 4;
+            ev.pause_confirmed = 3;
+            ev.pause_partial = 1;
+            ev.loader_discovery.initial_set_capture.none = 1;
+            ev.loader_discovery.initial_set_timing.unproven = 1;
+            ev.loader_discovery.strategies.debug_state_every_hit = 2;
+            ev.loader_discovery.hits = 4;
+            ev.loader_discovery.benign_hits = 4;
+            ev.member_stop_attached = 1;
+            ev.member_stop_unattached = 0;
+        }
+        fn concise(ev: &Evidence) -> String {
+            scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                ev,
+                crate::cli::TextVerbosity::Concise,
+            )
+        }
+        // The fold: one row, in concise and verbose text alike; the
+        // verdict stays PARTIAL and JSON keeps both causes.
+        let mut ev = evidence();
+        backstopped(&mut ev);
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert!(
+            ev.gap_classes.observation.causes.contains(&"pause_partial"),
+            "JSON keeps the pause cause: {:?}",
+            ev.gap_classes.observation.causes
+        );
+        assert!(
+            ev.gap_classes
+                .observation
+                .causes
+                .contains(&"loader_discovery"),
+            "JSON keeps the loader cause: {:?}",
+            ev.gap_classes.observation.causes
+        );
+        let out = concise(&ev);
+        assert!(
+            out.contains("1 load held only by the member-stop backstop"),
+            "{out}"
+        );
+        assert!(!out.contains("only partly paused"), "{out}");
+        assert!(!out.contains("library-load tracking"), "{out}");
+        let verbose = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose.contains(
+                "1 load held only by the member-stop backstop (pause_partial, loader_discovery)"
+            ),
+            "{verbose}"
+        );
+        // Plural: the count rides the folded row.
+        let mut ev = evidence();
+        backstopped(&mut ev);
+        ev.pause_partial = 2;
+        ev.pause_attempts = 5;
+        ev.verdict();
+        let out = concise(&ev);
+        assert!(
+            out.contains("2 loads held only by the member-stop backstop"),
+            "{out}"
+        );
+        // Each violated condition unfolds back to the two rows.
+        let unfold: Vec<(&str, fn(&mut Evidence))> = vec![
+            (
+                "unbound loader context",
+                (|ev: &mut Evidence| {
+                    ev.loader_discovery.strategies.unavailable = 1;
+                    ev.loader_discovery.dlopen_timing.none = 1;
+                }) as fn(&mut Evidence),
+            ),
+            (
+                "loader timing never bound",
+                (|ev: &mut Evidence| {
+                    ev.loader_discovery.initial_set_timing.none = 1;
+                    ev.loader_discovery.initial_set_timing.unproven = 0;
+                }) as fn(&mut Evidence),
+            ),
+            (
+                "unaccounted loader hit",
+                (|ev: &mut Evidence| {
+                    ev.loader_discovery.benign_hits = 3;
+                }) as fn(&mut Evidence),
+            ),
+            (
+                "no backstop hold",
+                (|ev: &mut Evidence| {
+                    ev.member_stop_attached = 0;
+                }) as fn(&mut Evidence),
+            ),
+            (
+                "backstop resumed unattached",
+                (|ev: &mut Evidence| {
+                    ev.member_stop_unattached = 1;
+                }) as fn(&mut Evidence),
+            ),
+            (
+                "learned-file row present",
+                (|ev: &mut Evidence| {
+                    ev.skipped = vec![SkippedOut {
+                        name: "learned provider file".into(),
+                        reason: LEARNED_FIRST_RUN_REASON.into(),
+                    }];
+                }) as fn(&mut Evidence),
+            ),
+        ];
+        for (label, break_it) in unfold {
+            let mut ev = evidence();
+            backstopped(&mut ev);
+            break_it(&mut ev);
+            ev.verdict();
+            let out = concise(&ev);
+            assert!(out.contains("only partly paused"), "{label}: {out}");
+            assert!(
+                out.contains("library-load tracking could not be confirmed"),
+                "{label}: {out}"
+            );
+            assert!(!out.contains("member-stop backstop"), "{label}: {out}");
+        }
+        // A single row needs no fold: pause-only and loader-only
+        // shapes keep their one row.
+        let mut ev = evidence();
+        backstopped(&mut ev);
+        ev.loader_discovery.initial_set_capture.none = 0;
+        ev.loader_discovery.initial_set_timing.unproven = 0;
+        ev.verdict();
+        let out = concise(&ev);
+        assert!(out.contains("1 load only partly paused"), "{out}");
+        assert!(!out.contains("library-load tracking"), "{out}");
+        assert!(!out.contains("member-stop backstop"), "{out}");
+        let mut ev = evidence();
+        backstopped(&mut ev);
+        ev.pause = "sigstop";
+        ev.pause_attempts = 4;
+        ev.pause_confirmed = 4;
+        ev.pause_partial = 0;
+        ev.verdict();
+        let out = concise(&ev);
+        assert!(!out.contains("only partly paused"), "{out}");
+        assert!(
+            out.contains("library-load tracking could not be confirmed"),
+            "{out}"
+        );
+        assert!(!out.contains("member-stop backstop"), "{out}");
+    }
+
+    /// CLI text: the discovery retry breakdown renders its per-class
+    /// event counts in the default text, so a folded row count no
+    /// longer hides its multiplicity. Empty maps render nothing, and
+    /// retries without a skipped row stay quiet.
+    #[test]
+    fn retry_breakdown_renders_per_class_counts_in_default_text() {
+        let mut ev = evidence();
+        ev.skipped = vec![SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        }];
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("process-view".to_string(), 72),
+            ("other".to_string(), 15),
+            ("maps-snapshot".to_string(), 0),
+        ]);
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                verbosity,
+            );
+            assert!(
+                out.contains("discovery retries: other x15, process view x72"),
+                "{verbosity:?}: {out}"
+            );
+            assert!(!out.contains("maps-snapshot"), "{verbosity:?}: {out}");
+        }
+        // Empty maps render no fragment.
+        let mut ev = evidence();
+        ev.skipped = vec![SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        }];
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains("discovery retries"), "{out}");
+        // Retries without a skipped row stay quiet: the fragment
+        // belongs to the skipped cause.
+        let mut ev = evidence();
+        ev.pause = "partial";
+        ev.pause_attempts = 1;
+        ev.pause_partial = 1;
+        ev.discovery_retry_classes =
+            BTreeMap::from([("other".to_string(), 9)]);
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("1 load only partly paused"), "{out}");
+        assert!(!out.contains("discovery retries"), "{out}");
+    }
+
+    /// CLI text: the verbose dominant-class fragment is gone,
+    /// subsumed by the full breakdown now in the default text.
+    #[test]
+    fn verbose_drops_the_dominant_class_fragment() {
+        let mut ev = evidence();
+        ev.skipped = vec![SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        }];
+        ev.discovery_retry_classes = BTreeMap::from([
+            ("process-view".to_string(), 19861),
+            ("process-ended".to_string(), 341),
+            ("other".to_string(), 300),
+        ]);
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                verbosity,
+            );
+            assert!(!out.contains("dominant retry class"), "{verbosity:?}: {out}");
+            assert!(
+                out.contains(
+                    "discovery retries: other x300, process-ended x341, process view x19861"
+                ),
+                "{verbosity:?}: {out}"
+            );
+        }
+    }
+
+    /// CLI text: the descendant-gap row splits into admitted/scanned
+    /// versus never observed. The total still gates the verdict, and
+    /// a corrupt split (admitted above the total) clamps instead of
+    /// rendering a negative remainder.
+    #[test]
+    fn descendant_gap_split_names_admitted_and_never_observed() {
+        let mut ev = evidence();
+        ev.pid_descendant_gaps = 32;
+        ev.pid_descendant_gaps_admitted = 5;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                verbosity,
+            );
+            assert!(
+                out.contains(
+                    "32 short-lived process gaps (5 admitted/scanned, 27 never observed)"
+                ),
+                "{verbosity:?}: {out}"
+            );
+        }
+        // Nothing admitted: the whole count was never observed.
+        let mut ev = evidence();
+        ev.pid_descendant_gaps = 19;
+        ev.pid_descendant_gaps_admitted = 0;
+        ev.verdict();
+        let out = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            out.contains(
+                "19 short-lived process gaps (0 admitted/scanned, 19 never observed)"
+            ),
+            "{out}"
+        );
+        // Singular stays singular.
+        let mut ev = evidence();
+        ev.pid_descendant_gaps = 1;
+        ev.pid_descendant_gaps_admitted = 1;
+        ev.verdict();
+        let out = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            out.contains(
+                "1 short-lived process gap (1 admitted/scanned, 0 never observed)"
+            ),
+            "{out}"
+        );
+        // A corrupt split clamps: admitted never renders above total.
+        let mut ev = evidence();
+        ev.pid_descendant_gaps = 2;
+        ev.pid_descendant_gaps_admitted = 9;
+        ev.verdict();
+        let out = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            out.contains(
+                "2 short-lived process gaps (2 admitted/scanned, 0 never observed)"
+            ),
+            "{out}"
+        );
+    }
+
+    /// The versioned evidence publishes the new gap keys as u64
+    /// counts beside the existing gap counts.
+    #[test]
+    fn versioned_evidence_publishes_the_new_gap_keys() {
+        let mut ev = evidence();
+        ev.pid_descendant_gaps = 32;
+        ev.pid_descendant_gaps_admitted = 5;
+        ev.member_stop_attached = 1;
+        ev.member_stop_unattached = 0;
+        ev.verdict();
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let evidence = &document["evidence"];
+        assert_eq!(evidence["pid_descendant_gaps_admitted"], 5);
+        assert!(evidence["pid_descendant_gaps_admitted"].is_u64());
+        assert_eq!(evidence["member_stop_attached"], 1);
+        assert!(evidence["member_stop_attached"].is_u64());
+        assert_eq!(evidence["member_stop_unattached"], 0);
+        assert!(evidence["member_stop_unattached"].is_u64());
     }
 
     /// CLI text: when names are the only gap, counts are complete and
@@ -19444,6 +19881,280 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!text.contains("PRIVATE_"), "{text}");
         assert!(text.contains("10 discovery steps unavailable"), "{text}");
+    }
+
+    /// Gap-noise fold: the six mid-flight generation pairs project to
+    /// one public reason. Folding renames, never drops: JSON keeps one
+    /// row per underlying record, and the text names the folded row
+    /// with its count instead of the generic bucket.
+    #[test]
+    fn mid_flight_generation_pairs_project_to_one_public_reason() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "live discovery generation",
+                "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation changed during inventory preflight",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation changed during post-retirement preflight",
+            ),
+            (
+                "live discovery generation",
+                "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+            ),
+            (
+                "live discovery record",
+                "a structurally valid private terminal record failed exact live resolution",
+            ),
+            (
+                "process view",
+                "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "process exited mid-flight",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        // One JSON row per underlying record: folding renames, never drops.
+        assert_eq!(ev.skipped.len(), 6);
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 6);
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains("process exited mid-flight: 6"),
+            "{text}"
+        );
+        assert!(!text.contains("discovery steps unavailable"), "{text}");
+        assert!(!text.contains("discovery step unavailable"), "{text}");
+    }
+
+    /// Gap-noise fold: every work-ceiling wording projects to one
+    /// public reason, whatever subject filed it — except a function
+    /// subject, which keeps its entry row (the fold must never redact
+    /// a function name).
+    #[test]
+    fn work_ceiling_wordings_project_to_scan_budget() {
+        use crate::discovery::scan::Skipped;
+        const CEILING: &str = "capture discovery work ceiling reached; remaining provider bytes were not scanned";
+        let wrapped = [
+            format!("memory scan refused: initial mapping validation unavailable: {CEILING}"),
+            format!("memory scan refused: final mapping validation unavailable: {CEILING}"),
+            format!(
+                "memory scan refused: process generation changed during acquisition: {CEILING}"
+            ),
+        ];
+        let mut internals: Vec<(String, String)> = Vec::new();
+        for subject in [
+            "capture discovery",
+            "live loader arming",
+            "/private/PATH_OBJECT.so",
+        ] {
+            internals.push((subject.into(), CEILING.into()));
+            for reason in &wrapped {
+                internals.push((subject.into(), reason.clone()));
+            }
+        }
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: subject.clone(),
+                reason: reason.clone(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "scan budget exhausted",
+                "{subject} {reason}"
+            );
+        }
+        // A function subject keeps its entry row even with a ceiling reason.
+        let kept = capture_skipped_out(&Skipped {
+            subject: "C_Sign".into(),
+            reason: CEILING.into(),
+        });
+        assert_eq!(kept.name, "C_Sign");
+        assert_eq!(kept.reason, "function entry unavailable");
+        // No path subject survives the fold, in JSON or in text.
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: subject.clone(),
+                    reason: reason.clone(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.skipped.len(), 12);
+        let document = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let rendered = document.to_string();
+        assert!(!rendered.contains("PRIVATE_"), "{rendered}");
+        assert!(!rendered.contains("/private/"), "{rendered}");
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!text.contains("PRIVATE_"), "{text}");
+        assert!(text.contains("scan budget exhausted: 12"), "{text}");
+    }
+
+    /// Gap-noise fold: the two no-unique-loader-context pairs project
+    /// to their own public reason, distinct from the ceiling row (a
+    /// different operator action).
+    #[test]
+    fn loader_context_pairs_project_to_their_own_reason() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "live export hook",
+                "a refreshed provider had no unique attached loader context",
+            ),
+            (
+                "live manifest getter hook",
+                "a manifest getter's process had no unique attached loader context",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "no unique attached loader context",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.skipped.len(), 2);
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains("no unique attached loader context: 2"),
+            "{text}"
+        );
+        assert!(!text.contains("discovery steps unavailable"), "{text}");
+    }
+
+    /// Gap-noise fold: near misses stay generic. Truncated, reworded,
+    /// re-cased, padded or suffixed variants of a folded pair, other
+    /// reasons under the same subjects, and the neighboring budget
+    /// reasons (deadline, clock) never fold.
+    #[test]
+    fn fold_near_misses_stay_generic() {
+        use crate::discovery::scan::Skipped;
+        let internals = [
+            (
+                "live discovery generation",
+                "candidate generation changed before mutation",
+            ),
+            (
+                "live discovery generation",
+                "Candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live discovery generation",
+                " candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live discovery generation",
+                "candidate generation changed before mutation; canonical identity, plan, and links were unchanged; pid 42",
+            ),
+            (
+                "process view",
+                "a process in scope could not be retained or scanned before it changed",
+            ),
+            (
+                "live export hook",
+                "a refreshed provider had no unique attached loader context!",
+            ),
+            (
+                "live export hook",
+                "the process generation changed around a dynamic export attachment",
+            ),
+            (
+                "live discovery generation",
+                "a process generation changed after link mutation; its targets were retired before context cleanup",
+            ),
+            (
+                "live discovery generation",
+                "a retained process generation changed and was scheduled for conservative cleanup",
+            ),
+            (
+                "capture discovery",
+                "capture discovery deadline reached; remaining provider bytes were not scanned",
+            ),
+            (
+                "capture discovery",
+                "monotonic clock read failed; remaining provider bytes were not scanned",
+            ),
+            (
+                "capture discovery",
+                "capture attempted-I/O ceiling reached; remaining provider bytes were not read",
+            ),
+        ];
+        for (subject, reason) in &internals {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = internals
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(text.contains("12 discovery steps unavailable"), "{text}");
     }
 
     /// View-collapse fix1 (RED): the deep-scan selection cap projects to

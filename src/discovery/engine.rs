@@ -1030,6 +1030,11 @@ pub struct Engine {
     /// churn or a completed rearm clears it, and view removal prunes it.
     exec_rearm_views: BTreeMap<ProcessViewId, Option<u64>>,
     pid_descendant_gaps: u64,
+    /// Fresh mid-run admissions inside `pid_descendant_gaps`: the gap
+    /// sites for exits, prune and finish sweeps, sentinels and the
+    /// lifecycle floor never bump this. Read alongside the total; the
+    /// remainder was never observed.
+    pid_descendant_gaps_admitted: u64,
     /// Handed-back run-tree survivors measured at run end. Run-lane only;
     /// annotation beside the paired `run process tree` skip, which carries
     /// the verdict.
@@ -14311,6 +14316,7 @@ impl Engine {
             static_probes_process_wide: None,
             exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
+            pid_descendant_gaps_admitted: 0,
             run_tree_handed_back: 0,
             multi_rebuild_gaps: 0,
             coverage_retire_windows: Vec::new(),
@@ -15643,6 +15649,27 @@ impl Engine {
         } else {
             0
         }
+    }
+
+    /// Fresh mid-run admissions inside [`Self::pid_descendant_gaps`]:
+    /// members the capture admitted (and scanned) whose pre-admission
+    /// life is still unobserved. Zero where generations never admit.
+    /// The caller renders the remainder (never observed) as the total
+    /// minus this, saturating.
+    pub(crate) fn pid_descendant_gaps_admitted(&self) -> u64 {
+        if self.admits_generations() {
+            self.pid_descendant_gaps_admitted
+        } else {
+            0
+        }
+    }
+
+    /// Member-stop backstop coverage: provider mappers held until
+    /// their probes attached, and provider mappers resumed before
+    /// attach (each of which filed a first-use row). `(0, 0)` where
+    /// the hook never ran. See [`member_stop::member_stop_coverage`].
+    pub(crate) fn member_stop_coverage(&self) -> (u64, u64) {
+        member_stop::member_stop_coverage(&self.member_stops.stats)
     }
 
     /// Extensive-mode static-hint split, present only when armed. Like

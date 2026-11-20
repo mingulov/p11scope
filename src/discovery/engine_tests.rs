@@ -6970,6 +6970,175 @@ fn cgroup_finish_sweep_counts_a_never_admitted_never_exited_newcomer() {
     );
 }
 
+/// Gap-noise split: only fresh mid-run admissions count admitted.
+/// Exits, prune and finish sweeps bump the total alone, so the
+/// remainder (total minus admitted) is the never-observed count and
+/// the total never drops a gap.
+#[test]
+fn descendant_gap_admissions_split_from_never_observed() {
+    let first = ProcessView::open(ProcessViewId(31), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    assert_eq!(engine.pid_descendant_gaps_admitted(), 0);
+
+    // A fresh mid-run admission gaps admitted.
+    let second = ProcessView::open(ProcessViewId(32), pid).unwrap();
+    engine.views.push(second);
+    engine.record_cgroup_view_admissions([ProcessViewId(32)]);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(engine.pid_descendant_gaps_admitted(), 1);
+
+    // Re-recording the same admission never double-counts either side.
+    engine.record_cgroup_view_admissions([ProcessViewId(32)]);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(engine.pid_descendant_gaps_admitted(), 1);
+
+    // An unmatched exit gaps the total alone: never observed.
+    let mut short_lived: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    short_lived.kind = DISCOVERY_KIND_LEADER_EXIT;
+    short_lived.pid_tgid = u64::from(pid.saturating_add(1)) << 32;
+    short_lived.hook_ts_ns = admitted;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(
+        &mut ScriptedSession::default(),
+        &short_lived,
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+    assert_eq!(engine.pid_descendant_gaps_admitted(), 1);
+
+    // A pruned newcomer gaps the total alone: never observed.
+    engine.mark_newcomer_arrival(4242, Some(100));
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(engine.pid_descendant_gaps(), 3);
+    assert_eq!(engine.pid_descendant_gaps_admitted(), 1);
+
+    // PID scope admits nothing: both sides read zero.
+    engine.scope = Scope::Pid(pid);
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    assert_eq!(engine.pid_descendant_gaps_admitted(), 0);
+}
+
+/// Gap-noise fold pipeline: folded pairs filed through the engine
+/// publish and project to their folded reasons with every record
+/// kept — one JSON row per underlying internal pair.
+#[test]
+fn folded_pairs_publish_and_project_with_every_record_kept() {
+    use crate::render::capture_skipped_out;
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let internals = [
+        (
+            "live discovery generation",
+            "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during inventory preflight",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+        ),
+        (
+            "live discovery generation",
+            "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+        ),
+        (
+            "live discovery record",
+            "a structurally valid private terminal record failed exact live resolution",
+        ),
+        (
+            "process view",
+            "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
+        ),
+        (
+            "capture discovery",
+            "capture discovery work ceiling reached; remaining provider bytes were not scanned",
+        ),
+        (
+            "capture discovery",
+            "memory scan refused: initial mapping validation unavailable: capture discovery work ceiling reached; remaining provider bytes were not scanned",
+        ),
+        (
+            "live loader arming",
+            "capture discovery work ceiling reached; remaining provider bytes were not scanned",
+        ),
+        (
+            "live export hook",
+            "a refreshed provider had no unique attached loader context",
+        ),
+        (
+            "live manifest getter hook",
+            "a manifest getter's process had no unique attached loader context",
+        ),
+    ];
+    for (subject, reason) in &internals {
+        engine.note_object_skips(vec![Skipped {
+            subject: (*subject).into(),
+            reason: (*reason).into(),
+        }]);
+    }
+    engine.record_publication_skips();
+    assert_eq!(engine.plan.skipped.len(), internals.len());
+    let projected: Vec<_> = engine.plan.skipped.iter().map(capture_skipped_out).collect();
+    // One JSON row per underlying record: folding renames, never drops.
+    assert_eq!(projected.len(), internals.len());
+    let reasons: Vec<&str> = projected.iter().map(|skip| skip.reason.as_str()).collect();
+    assert_eq!(
+        reasons.iter().filter(|reason| **reason == "process exited mid-flight").count(),
+        6,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons.iter().filter(|reason| **reason == "scan budget exhausted").count(),
+        3,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|reason| **reason == "no unique attached loader context")
+            .count(),
+        2,
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.iter().all(|reason| *reason != "discovery unavailable"),
+        "no folded pair stays generic: {reasons:?}"
+    );
+}
+
+/// Drift guard for the folded terminal-record pair: it has no cheap
+/// live seam, so the test pins its filing site's exact strings in
+/// source. A reword must update the projection allowlist in the same
+/// patch instead of silently unfolding back to generic.
+#[test]
+fn folded_terminal_record_pair_matches_its_filing_site() {
+    let source = include_str!("engine.rs");
+    assert!(
+        source.contains("\"live discovery record\"")
+            && source.contains(
+                "\"a structurally valid private terminal record failed exact live resolution\""
+            ),
+        "the folded terminal-record pair must keep its filing site"
+    );
+    let projected = crate::render::capture_skipped_out(&Skipped {
+        subject: "live discovery record".into(),
+        reason: "a structurally valid private terminal record failed exact live resolution".into(),
+    });
+    assert_eq!(projected.reason, "process exited mid-flight");
+}
+
 /// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
 /// the bound. The child must already be killed (else this proves nothing).
 fn wait_until_zombie(pid: u32) {
@@ -20665,6 +20834,9 @@ fn evidence_verdict(
         attach_backend: Default::default(),
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
+        pid_descendant_gaps_admitted: 0,
+        member_stop_attached: 0,
+        member_stop_unattached: 0,
         multi_rebuild_gaps: 0,
         learned_staged_files: 0,
         learned_event_loss: 0,
@@ -46666,6 +46838,9 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         attach_backend: Default::default(),
         object_capture: render::ObjectCaptureEvidence::for_build(false),
         pid_descendant_gaps: 0,
+        pid_descendant_gaps_admitted: 0,
+        member_stop_attached: 0,
+        member_stop_unattached: 0,
         multi_rebuild_gaps: 0,
         learned_staged_files: 0,
         learned_event_loss: 0,

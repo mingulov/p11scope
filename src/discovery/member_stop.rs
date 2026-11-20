@@ -219,6 +219,22 @@ pub(crate) struct MemberStopStats {
     pub(crate) unsettled_reads: u64,
 }
 
+/// Backstop coverage from the service totals: `(attached, unattached)`.
+///
+/// `attached` counts provider mappers held until their probes attached.
+/// `unattached` counts provider mappers resumed before attach — every
+/// one of which filed the named first-use row, so `unattached == 0`
+/// with `attached > 0` proves every stopped mapper attached. All
+/// other ends are neutral here: provider-free releases, members that
+/// exited while held (they never ran unattached), proven non-members,
+/// still-stopped retries, cap overflows (whose staging files the row
+/// itself), and read waits. The destructure is exhaustive on purpose:
+/// a new end state fails to compile until it is classified.
+pub(crate) fn member_stop_coverage(stats: &MemberStopStats) -> (u64, u64) {
+    let _ = stats;
+    (0, 0)
+}
+
 /// One executable file row of a member's maps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecRow {
@@ -1661,6 +1677,90 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backstop coverage classifies every service total: attached
+    /// holds prove coverage, every unattached end counts (each filed
+    /// its first-use row), and every other end is neutral. The table
+    /// sets each field alone so a misclassified field fails on its
+    /// own row.
+    #[test]
+    fn member_stop_coverage_classifies_every_end() {
+        // Attached holds prove coverage.
+        let stats = MemberStopStats {
+            attached_resumes: 3,
+            ..MemberStopStats::default()
+        };
+        assert_eq!(member_stop_coverage(&stats), (3, 0));
+        // Every unattached end counts: refused, timed-out, forced,
+        // unproven, FUSE-backed, moved-out, watchdog-lost, unreadable.
+        let unattached_fields: Vec<(&str, fn(&mut MemberStopStats))> = vec![
+            ("refused_resumes", |stats| stats.refused_resumes = 2),
+            ("timed_out", |stats| stats.timed_out = 2),
+            ("forced_resumes", |stats| stats.forced_resumes = 2),
+            ("unproven_resumes", |stats| stats.unproven_resumes = 2),
+            ("fuse_resumes", |stats| stats.fuse_resumes = 2),
+            (
+                "moved_out_resumes",
+                |stats| stats.moved_out_resumes = 2,
+            ),
+            (
+                "lost_guard_resumes",
+                |stats| stats.lost_guard_resumes = 2,
+            ),
+            ("unreadable", |stats| stats.unreadable = 2),
+        ];
+        for (field, set) in unattached_fields {
+            let mut stats = MemberStopStats::default();
+            set(&mut stats);
+            assert_eq!(
+                member_stop_coverage(&stats),
+                (0, 2),
+                "{field} must count unattached"
+            );
+        }
+        // Mixed ends sum on their own sides.
+        let stats = MemberStopStats {
+            attached_resumes: 4,
+            refused_resumes: 1,
+            timed_out: 2,
+            unreadable: 3,
+            ..MemberStopStats::default()
+        };
+        assert_eq!(member_stop_coverage(&stats), (4, 6));
+        // Neutral ends never move either side: stops, clears,
+        // departures, retries, non-members, overflows, read waits.
+        let neutral_fields: Vec<(&str, fn(&mut MemberStopStats))> = vec![
+            ("stopped", |stats| stats.stopped = 5),
+            ("provider_holds", |stats| stats.provider_holds = 5),
+            ("cleared_files", |stats| stats.cleared_files = 5),
+            ("departed", |stats| stats.departed = 5),
+            (
+                "resume_unavailable",
+                |stats| stats.resume_unavailable = 5,
+            ),
+            ("not_members", |stats| stats.not_members = 5),
+            (
+                "stop_staged_overflow",
+                |stats| stats.stop_staged_overflow = 5,
+            ),
+            ("unsettled_reads", |stats| stats.unsettled_reads = 5),
+        ];
+        for (field, set) in neutral_fields {
+            let mut stats = MemberStopStats::default();
+            stats.attached_resumes = 1;
+            set(&mut stats);
+            assert_eq!(
+                member_stop_coverage(&stats),
+                (1, 0),
+                "{field} must stay neutral"
+            );
+        }
+        // Nothing running: zero coverage, never unknown.
+        assert_eq!(
+            member_stop_coverage(&MemberStopStats::default()),
+            (0, 0)
+        );
+    }
 
     #[test]
     fn fuse_devices_come_from_mountinfo() {

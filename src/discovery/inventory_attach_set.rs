@@ -222,6 +222,14 @@ pub(crate) struct AbsorbOutcome {
     pub verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
     pub gaps: Vec<AttachGap>,
     pub decisions: DecisionLog,
+    /// Every endpoint this plan's active slots matched — freshly
+    /// minted or reused — with the positions of its matching slots in
+    /// `plan.slots`, in endpoint order. Matching reuses this absorb's
+    /// own identity resolution (live reads on the ordinary path,
+    /// already-prepared facts on the cgroup path), so setup
+    /// classification over it never performs provider reads at
+    /// commit, on any publication route.
+    pub slot_matches: Vec<(EndpointId, Vec<usize>)>,
 }
 
 /// Which side of a copy-up pair proof carried the witness-proven
@@ -1116,7 +1124,36 @@ impl InventoryAttachSet {
             );
             Self::insert_verdict(&mut outcome.verdicts, key, verdict);
         }
+        outcome.slot_matches = self.slot_matches_for_outcome(plan, &resolved);
         outcome
+    }
+
+    /// Matches this absorb's endpoints against its plan's active
+    /// slots: slot `S` matches endpoint `(R, O)` when `S` is active,
+    /// names offset `O`, resolved to retained object `R`, and `R`
+    /// carries an endpoint at `O` (freshly minted or reused from an
+    /// earlier pass). Resolution to `Known` already proved the
+    /// same-object identity (by raw key or by content, through live
+    /// reads or already-prepared facts), so this performs no reads
+    /// of its own on either path.
+    fn slot_matches_for_outcome(
+        &self,
+        plan: &AttachPlan,
+        resolved: &BTreeMap<PinnedObjectId, Resolution>,
+    ) -> Vec<(EndpointId, Vec<usize>)> {
+        let mut by_endpoint: BTreeMap<EndpointId, Vec<usize>> = BTreeMap::new();
+        for (position, slot) in plan.slots.iter().enumerate() {
+            if !plan.is_active(slot.index) {
+                continue;
+            }
+            let Some(Resolution::Known(retained)) = resolved.get(&slot.object) else {
+                continue;
+            };
+            if let Some(endpoint) = self.by_endpoint.get(&(*retained, slot.file_offset)) {
+                by_endpoint.entry(*endpoint).or_default().push(position);
+            }
+        }
+        by_endpoint.into_iter().collect()
     }
 
     /// Maps one plan object onto the retained objects: by raw maps key
@@ -2132,6 +2169,38 @@ pub(crate) mod tests {
                 interfaces: vec![],
             },
         }
+    }
+
+    /// A scanned module like [`module_with_targets`], but each entry
+    /// carries its own name and the module exports each own-object
+    /// name exactly at its entry's offset, so export agreement
+    /// authorizes the names (the production shape for setup hooks and
+    /// their ordinary neighbors). Names must be distinct per object,
+    /// as a real `.dynsym` is.
+    pub(crate) fn module_with_named_targets(
+        pins: &PinnedObjects,
+        path: &Path,
+        targets: &[(&Path, u64, &'static str)],
+    ) -> ReconciledModule {
+        let plain: Vec<(&Path, u64)> = targets
+            .iter()
+            .map(|(target, file_offset, _)| (*target, *file_offset))
+            .collect();
+        let mut module = module_with_targets(pins, path, &plain);
+        for (entry, (_, _, name)) in module.scanned.tables[0]
+            .entries
+            .iter_mut()
+            .zip(targets.iter())
+        {
+            entry.name = name;
+        }
+        module.exports = targets
+            .iter()
+            .filter(|(target, _, _)| *target == path)
+            .map(|(_, file_offset, name)| (name.to_string(), *file_offset))
+            .collect::<Vec<_>>()
+            .into();
+        module
     }
 
     pub(crate) fn offsets(count: u64) -> Vec<u64> {

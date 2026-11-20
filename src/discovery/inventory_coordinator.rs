@@ -542,6 +542,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// endpoint ids their absorb minted: how receipt stamps address
     /// watches. Populated by [`Self::absorb_prearm_plan`].
     prearm_endpoints: BTreeMap<crate::plan::AttachKey, EndpointId>,
+    /// Endpoints whose plan slot names are all function-table hooks
+    /// (the run's [`HookRegistry`]): a pair's first recorded entry
+    /// through one of these is provably a setup call, never a counted
+    /// call. Populated by [`Self::note_setup_endpoints`] at every plan
+    /// absorb; a matched endpoint's membership follows its latest
+    /// evidence, so a later ordinary alias removes a stale mark.
+    /// Absent (unknown, unauthorized, or aliased names) means no
+    /// setup evidence: counted entries are preserved.
+    setup_endpoints: BTreeSet<EndpointId>,
     /// Frozen pre-arm stop boundary: set once, first wins, by
     /// `end_capture_coverage` (native lane) or `freeze_prearm_stop`
     /// (scan/no-lane path). `None` means not yet frozen (the terminal
@@ -1293,6 +1302,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             prearm_state: crate::prearm_module::PrearmState::empty(),
             prearm_scope_start_ns: None,
             prearm_endpoints: BTreeMap::new(),
+            setup_endpoints: BTreeSet::new(),
             prearm_stop: None,
             adapter,
             registry,
@@ -1535,6 +1545,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             crate::plan::AdmissionScope::Shared,
         );
         let absorbed = self.attach_set.absorb(&plan, &pins);
+        self.note_setup_endpoints(&plan, &absorbed);
         // Declared-key → endpoint-id map, before the delta joins the pending
         // targets: match the fresh endpoints by (retained identity, offset),
         // indexed by offset so the per-endpoint scan stays small.
@@ -7465,6 +7476,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return BTreeMap::new();
         };
         let absorbed = self.attach_set.absorb(&lowering.plan, &lowering.pins);
+        self.note_setup_endpoints(&lowering.plan, &absorbed);
         // DEMO-4: retain this pass's reconciled scan modules and
         // their aggregate pins for one no-manifest scan-seal
         // attempt after the pass (consumed there; never more than
@@ -9158,6 +9170,55 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// only a genuine advance past what is staged stages — and demoted
     /// past what the base holds (round 4, rebind). The publication's
     /// decisions finalize the target as `Bound` or `Dropped`.
+    /// Records the setup-class endpoints one absorbed plan matched: an
+    /// endpoint whose every matching active plan slot name is a
+    /// function-table hook of the run's [`HookRegistry`]. Every plan
+    /// absorb (pre-arm, live lowerings and prepared cgroup commits
+    /// alike) calls this with its plan and outcome before the plan
+    /// drops. Matching reuses the absorb's own identity resolution
+    /// (freshly minted or reused endpoints alike), never fresh
+    /// provider reads — including on the no-read cgroup commit. A
+    /// matched endpoint's membership follows its latest evidence: a
+    /// later ordinary alias removes a stale setup mark, preserving
+    /// counted entries; unmatched endpoints keep theirs.
+    pub(crate) fn note_setup_endpoints(
+        &mut self,
+        plan: &crate::plan::AttachPlan,
+        absorbed: &AbsorbOutcome,
+    ) {
+        use std::collections::HashSet;
+        let hooks: HashSet<String> = self
+            .engine
+            .hooks
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for (endpoint, positions) in &absorbed.slot_matches {
+            // Setup-class only when every name on every matching slot
+            // is a function-table hook: unknown, unauthorized, empty
+            // and hook-plus-ordinary aliased slots carry no setup
+            // evidence, and counted entries are preserved. Only active
+            // slots speak (the attach set matched those); a retired
+            // slot's names are stale evidence about its key.
+            let mut setup = !positions.is_empty();
+            for position in positions {
+                let setup_pure = plan.slots.get(*position).is_some_and(|slot| {
+                    !slot.names.is_empty() && slot.names.iter().all(|name| hooks.contains(name))
+                });
+                if !setup_pure {
+                    setup = false;
+                    break;
+                }
+            }
+            if setup {
+                self.setup_endpoints.insert(*endpoint);
+            } else {
+                self.setup_endpoints.remove(endpoint);
+            }
+        }
+    }
+
     fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
         let key = PairKey::of(row);
         let held_first = self
@@ -12256,7 +12317,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let absorbed = match provider
                         .absorb(&lowering.plan, &lowering.pins, |units| work.charge(units))
                     {
-                        Ok(absorbed) => Some(absorbed),
+                        // Setup classification for the prepared path,
+                        // like every other publication route: the
+                        // matches reuse the absorb's already-prepared
+                        // object identity, so the commit performs no
+                        // provider reads for them.
+                        Ok(absorbed) => {
+                            self.note_setup_endpoints(&lowering.plan, &absorbed);
+                            Some(absorbed)
+                        }
                         Err(reason) => {
                             collection.preparation_incomplete();
                             self.registry.record_gap(RegistryGap {
@@ -25641,6 +25710,105 @@ exit 0
         );
     }
 
+    /// The prepared cgroup commit preserves counts for unnamed slots:
+    /// one real cgroup pass over the provider fixture absorbs
+    /// endpoints through the no-read commit, and its plan slots all
+    /// carry the `unknown` name (no export agreement in this scene),
+    /// so no setup evidence is recorded. Named-slot setup/ordinary
+    /// classification through the prepared absorb is pinned by the
+    /// mechanism twins below.
+    #[test]
+    fn cgroup_prepared_absorb_preserves_counts_for_unnamed_slots() {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let _completion = coordinator.take_cgroup_completion().unwrap();
+        assert!(
+            coordinator.attach_set.len() > 0,
+            "the cgroup pass absorbed endpoints"
+        );
+        assert!(
+            coordinator.setup_endpoints.is_empty(),
+            "unknown slot names carry no setup evidence"
+        );
+    }
+
+    /// Named-slot classification through the prepared absorb: the
+    /// hooks-only endpoint lands in the setup evidence with no
+    /// provider read at consumption, while the ordinary endpoint
+    /// stays out.
+    #[test]
+    fn prepared_absorb_classifies_named_setup_endpoints() {
+        let (native, _caller, setup, ordinary) = watched_native_with_setup_prepared();
+        let setup_id = native.scene.delta.endpoints[setup].id;
+        let ordinary_id = native.scene.delta.endpoints[ordinary].id;
+        assert!(
+            native.scene.coordinator.setup_endpoints.contains(&setup_id),
+            "the prepared commit classifies its setup endpoint"
+        );
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .setup_endpoints
+                .contains(&ordinary_id),
+            "the ordinary endpoint carries no setup evidence"
+        );
+    }
+
+    /// A reused endpoint that later gains an ordinary alias loses its
+    /// setup classification: counted entries are preserved over stale
+    /// setup evidence.
+    #[test]
+    fn a_reused_endpoint_loses_setup_when_an_ordinary_alias_arrives() {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _caller) = watched_native();
+        let (setup, _ordinary) = extend_with_setup(&mut native);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        assert!(
+            native.scene.coordinator.setup_endpoints.contains(&endpoint),
+            "plan 1 records the hooks-only endpoint as setup"
+        );
+        // Plan 2 reuses the same endpoint under an ordinary alias: the
+        // endpoint is retained (no delta), but its slots no longer
+        // prove setup-only use.
+        let path = native.scene.path.clone();
+        let module = fx::module_with_named_targets(
+            &native.scene.pins,
+            &path,
+            &[
+                (&path, 0x2000, "C_GetFunctionList"),
+                (&path, 0x2000, "C_Initialize"),
+            ],
+        );
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let plan = fx::lower_named(std::slice::from_ref(&module), &native.scene.pins, policy);
+        let absorbed = native
+            .scene
+            .coordinator
+            .attach_set
+            .absorb(&plan, &native.scene.pins);
+        native
+            .scene
+            .coordinator
+            .note_setup_endpoints(&plan, &absorbed);
+        assert!(
+            !native.scene.coordinator.setup_endpoints.contains(&endpoint),
+            "the ordinary alias retires the stale setup evidence"
+        );
+    }
+
     #[test]
     fn counts_for_an_unbound_row_never_publish() {
         // R-C51-1 and DR-C51-PREADMIT: the row never binds, so its
@@ -33524,6 +33692,137 @@ int main(void) {
         native.scene.coordinator.commit_batch(false).unwrap();
         assert!(watched(&native.scene.coverage(caller)));
         (native, caller)
+    }
+
+    /// Absorbs an export-agreement-named module into the scene beside
+    /// its current endpoints: a `C_GetFunctionList` setup endpoint and
+    /// an ordinary `C_Initialize` endpoint. Returns the scene delta
+    /// member indexes of the setup and ordinary endpoints for row
+    /// building.
+    fn extend_with_setup(native: &mut NativeScene) -> (usize, usize) {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let path = native.scene.path.clone();
+        let module = fx::module_with_named_targets(
+            &native.scene.pins,
+            &path,
+            &[
+                (&path, 0x2000, "C_GetFunctionList"),
+                (&path, 0x2010, "C_Initialize"),
+            ],
+        );
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let plan = fx::lower_named(std::slice::from_ref(&module), &native.scene.pins, policy);
+        let absorbed = native
+            .scene
+            .coordinator
+            .attach_set
+            .absorb(&plan, &native.scene.pins);
+        native
+            .scene
+            .coordinator
+            .note_setup_endpoints(&plan, &absorbed);
+        native
+            .scene
+            .delta
+            .endpoints
+            .extend(absorbed.delta.endpoints);
+        native.scene.delta.objects.extend(absorbed.delta.objects);
+        let setup = native
+            .scene
+            .delta
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.file_offset == 0x2000)
+            .expect("the setup endpoint joined the delta");
+        let ordinary = native
+            .scene
+            .delta
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.file_offset == 0x2010)
+            .expect("the ordinary endpoint joined the delta");
+        (setup, ordinary)
+    }
+
+    /// A watched native scene extended with an export-agreement-named
+    /// module beside the scene's two unnamed endpoints: a
+    /// `C_GetFunctionList` setup endpoint and an ordinary
+    /// `C_Initialize` endpoint. Returns the scene delta member indexes
+    /// of the setup and ordinary endpoints for row building.
+    fn watched_native_with_setup() -> (NativeScene, CallerId, usize, usize) {
+        let (mut native, caller) = watched_native();
+        let (setup, ordinary) = extend_with_setup(&mut native);
+        (native, caller, setup, ordinary)
+    }
+
+    /// [`extend_with_setup`] through the prepared absorb: the same
+    /// named module, but preparation retains every provider read and
+    /// the commit consumes the plan under the no-read invariant (any
+    /// retention or identity read at consumption fails the test),
+    /// then classifies from the absorb's own matches — the cgroup
+    /// commit shape.
+    fn extend_with_setup_prepared(native: &mut NativeScene) -> (usize, usize) {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let path = native.scene.path.clone();
+        let module = fx::module_with_named_targets(
+            &native.scene.pins,
+            &path,
+            &[
+                (&path, 0x2000, "C_GetFunctionList"),
+                (&path, 0x2010, "C_Initialize"),
+            ],
+        );
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let plan = fx::lower_named(std::slice::from_ref(&module), &native.scene.pins, policy);
+        let prepared = native
+            .scene
+            .coordinator
+            .attach_set
+            .prepare_absorption(&native.scene.pins, |_| true)
+            .unwrap();
+        let absorbed = crate::discovery::inventory_attach_set::provider_read_test::observe_all(
+            || panic!("prepared consumption must not retain or stat again"),
+            || {
+                prepared
+                    .absorb(&plan, &native.scene.pins, |_| true)
+                    .unwrap()
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .note_setup_endpoints(&plan, &absorbed);
+        native
+            .scene
+            .delta
+            .endpoints
+            .extend(absorbed.delta.endpoints);
+        native.scene.delta.objects.extend(absorbed.delta.objects);
+        let setup = native
+            .scene
+            .delta
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.file_offset == 0x2000)
+            .expect("the setup endpoint joined the delta");
+        let ordinary = native
+            .scene
+            .delta
+            .endpoints
+            .iter()
+            .position(|endpoint| endpoint.file_offset == 0x2010)
+            .expect("the ordinary endpoint joined the delta");
+        (setup, ordinary)
+    }
+
+    /// [`watched_native_with_setup`] through the prepared absorb (see
+    /// [`extend_with_setup_prepared`]).
+    fn watched_native_with_setup_prepared() -> (NativeScene, CallerId, usize, usize) {
+        let (mut native, caller) = watched_native();
+        let (setup, ordinary) = extend_with_setup_prepared(&mut native);
+        (native, caller, setup, ordinary)
     }
 
     fn use_before_admission(coverage: &UseCoverage) -> bool {

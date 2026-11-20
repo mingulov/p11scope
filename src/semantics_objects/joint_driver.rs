@@ -244,6 +244,11 @@ pub(crate) struct JointCaptureOwner {
     // it holds no ledger charge, only a pool lease and the failure's
     // own buffers.
     pending_void: Option<PendingVoid>,
+    // A started but not yet published void: the fenced failure and its
+    // prepaid lease wait here while the machine drives the reservation
+    // sweep one credit at a time. Publication into `pending_void`
+    // waits for sweep completion, as does collection.
+    void_cleanup: Option<PendingVoid>,
 }
 
 /// A void's original failure and the lease that paid for it.
@@ -265,6 +270,7 @@ impl JointCaptureOwner {
             model,
             adapter,
             pending_void: None,
+            void_cleanup: None,
         }
     }
 
@@ -278,6 +284,7 @@ impl JointCaptureOwner {
             model: ObjectSemantics::new(),
             adapter: JournalAdapter::with_ledger(limits, StagingLedger::with_resources(reserver)),
             pending_void: None,
+            void_cleanup: None,
         }
     }
 
@@ -346,6 +353,19 @@ impl JointCaptureOwner {
     /// voided; the caller then records the void's own gap
     /// ([`INGEST_BREAK_VOID_GAP`]).
     pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
+        let started = self.start_void_ingest_break()?;
+        if started {
+            while !self.poll_void_cleanup(64).0 {}
+        }
+        Ok(started)
+    }
+
+    /// Start the ingest-break void: fence and invalidate at once, hold
+    /// the fenced failure and its prepaid lease in `void_cleanup`, and
+    /// start the reservation sweep resumably. Returns whether the lane
+    /// was voided. Publication into `pending_void` waits for
+    /// `poll_void_cleanup` to complete, as does collection.
+    pub(crate) fn start_void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
         let adapter = &self.adapter;
         if !adapter.stream_broken
             || adapter.invalidated
@@ -365,8 +385,44 @@ impl JointCaptureOwner {
             .map_err(RawQuantumRefusal::Resource)?;
         let failure = self
             .adapter
-            .void_ingest_break_inner(&mut self.model, INGEST_BREAK_VOID_GAP);
+            .void_ingest_break_start(&mut self.model, INGEST_BREAK_VOID_GAP);
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+        self.void_cleanup = Some(PendingVoid {
+            failure,
+            bytes,
+            lease,
+        });
+        if !self.adapter.ledger.h8_void_pending() {
+            self.publish_void_cleanup();
+        }
+        Ok(true)
+    }
+
+    /// Drive the started void's reservation sweep for at most `units`
+    /// leaf units. Returns whether the sweep completed (and the void
+    /// published) and the units spent.
+    pub(crate) fn poll_void_cleanup(&mut self, units: usize) -> (bool, usize) {
+        if self.void_cleanup.is_none() {
+            return (true, 0);
+        }
+        let (done, spent) = self.adapter.void_ingest_break_poll(units);
+        if done {
+            self.publish_void_cleanup();
+        }
+        (done, spent)
+    }
+
+    /// Whether a started void still owns sweep work.
+    pub(crate) fn void_cleanup_pending(&self) -> bool {
+        self.void_cleanup.is_some()
+    }
+
+    /// Publish a completed void cleanup into `pending_void`, merging
+    /// fences exactly as the synchronous void did.
+    fn publish_void_cleanup(&mut self) {
+        let Some(cleanup) = self.void_cleanup.take() else {
+            return;
+        };
         // Keep the abandonment (sessions Uncertain(OutcomeLost), views
         // and objects retired, bootstrap voided) for the next audit
         // frame's consumers. The next audit frame (ingested or
@@ -378,17 +434,15 @@ impl JointCaptureOwner {
         // delivered void covers both breaks.
         match self.pending_void.as_mut() {
             Some(pending) => {
-                pending.failure.fence = pending.failure.fence.max(failure.fence);
+                pending.failure.fence = pending
+                    .failure
+                    .fence
+                    .max(cleanup.failure.fence);
             }
             None => {
-                self.pending_void = Some(PendingVoid {
-                    failure,
-                    bytes,
-                    lease,
-                });
+                self.pending_void = Some(cleanup);
             }
         }
-        Ok(true)
     }
 
     /// Break the linked stream after a running quantum was abandoned

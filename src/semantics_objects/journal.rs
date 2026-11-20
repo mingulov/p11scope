@@ -3013,13 +3013,27 @@ impl JournalAdapter {
         model: &mut ObjectSemantics,
         gap: JournalGap,
     ) -> SealFailure {
+        let failure = self.void_ingest_break_start(model, gap);
+        while !self.void_ingest_break_poll(64).0 {}
+        failure
+    }
+
+    /// Start the ingest-break void: fence and invalidate at once, start
+    /// the staged sweep resumably. The caller drives
+    /// `void_ingest_break_poll` until it completes before collecting.
+    /// The returned failure is fenced but not yet published.
+    pub(crate) fn void_ingest_break_start(
+        &mut self,
+        model: &mut ObjectSemantics,
+        gap: JournalGap,
+    ) -> SealFailure {
         let upper = self.consumed_through;
         let mut effects = self.preserve_abandonment_refusals(model);
         effects
             .effects
             .extend(self.fence_void(model, upper).effects);
         self.invalidated = true;
-        self.void_staged();
+        self.void_staged_start();
         // Bind future births at void time, like reject_audit: births
         // naming a cut below the void refuse even when their key did
         // not exist at the void, without waiting for the re-sync.
@@ -3031,6 +3045,13 @@ impl JournalAdapter {
             h3_voided: None,
             fence: Some(upper),
         }
+    }
+
+    /// Drive the ingest-break void's reservation sweep for at most
+    /// `units` leaf units. Returns whether the sweep completed and the
+    /// units spent.
+    pub(crate) fn void_ingest_break_poll(&mut self, units: usize) -> (bool, usize) {
+        self.void_staged_poll(units)
     }
 
     fn has_s1only_subjects(&self) -> bool {
@@ -7332,6 +7353,15 @@ impl JournalAdapter {
     /// explicitly lost, so later proof resumes at or above the fence
     /// instead of silently skipping it.
     fn void_staged(&mut self) {
+        self.void_staged_start();
+        while !self.void_staged_poll(64).0 {}
+    }
+
+    /// Start the staged void: the memory-only map clears run at once
+    /// (plain drops, one step under the owner amendment) and the H8
+    /// reservation sweep starts resumably. The caller drives
+    /// `void_staged_poll` until it completes before collecting.
+    fn void_staged_start(&mut self) {
         // Record every invocation this void is about to wipe, before the
         // table clears. The set is replaced, not accumulated: it stays
         // bounded by the open-table limit, and an admission older than
@@ -7366,7 +7396,7 @@ impl JournalAdapter {
             self.note_derived_absence(image, key, function);
         }
         self.open.clear();
-        self.ledger.release_all_h8open();
+        self.ledger.start_h8_void();
         self.refused.clear();
         self.retained_counts.clear();
         self.retained_census_drift = false;
@@ -7375,6 +7405,13 @@ impl JournalAdapter {
         for state in self.keys.values_mut() {
             state.bootstraps.clear();
         }
+    }
+
+    /// Drive the staged void's reservation sweep for at most `units`
+    /// leaf units. Returns whether the sweep completed and the units
+    /// spent.
+    fn void_staged_poll(&mut self, units: usize) -> (bool, usize) {
+        self.ledger.poll_h8_void(units)
     }
 
     fn retained_failure_domain(&self, bootstrap: &BootstrapReceipt) -> Option<ObjectDomain> {

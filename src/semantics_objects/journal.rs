@@ -17361,6 +17361,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn seal_chain_plus_h3_pending_carries_native_baseline() {
+        // Mixed chain + H3 pending: a between-collection fault move
+        // must not strand the frame on a stale pin. The seal refuses
+        // with H3Pending (no void, no fence, no absorbs) but carries
+        // the audited close into the pin, so the exact continuation
+        // can qualify once the live H0 producer owns its floor.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        assert_eq!(scene.adapter.last_fault, Some(7));
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        reaudit.h0_below = 8;
+        reaudit.h3 = H3DispositionEvidence::scripted_clean_pending(3, Some(4));
+        let failure = scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("chain plus H3 pending must not absorb");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        assert_eq!(failure.fence, None, "pending fences nothing");
+        assert_eq!(
+            scene.adapter.last_fault,
+            Some(8),
+            "the verified chain close rides the pending refusal"
+        );
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "pending voids nothing");
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
+        // Custody retained: the same frontier seals at the carried
+        // epoch once H3 disposes.
+        let mut clean = scene.audit();
+        clean.fault_before = 8;
+        clean.fault_after = 8;
+        scene
+            .seal_explicit(
+                &clean,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect("kept inputs seal at the carried epoch");
+    }
+
+    #[test]
     fn void_wiped_wrong_descriptor_end_taints() {
         // Mismatched late END after a global void wipe: the release
         // excuses the missing BEGIN (loss of model continuity), never a

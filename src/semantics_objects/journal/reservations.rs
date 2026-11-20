@@ -545,6 +545,8 @@ impl<C> ReservationTable<C> {
                 #[cfg(test)]
                 self.test_sweep_visits
                     .set(self.test_sweep_visits.get() + actual);
+                #[cfg(not(test))]
+                let _ = actual;
                 if !done {
                     cursor.pending_alias_unlink = Some(pending);
                     debug_assert!(spent <= budget);
@@ -594,6 +596,8 @@ impl<C> ReservationTable<C> {
                 #[cfg(test)]
                 self.test_sweep_visits
                     .set(self.test_sweep_visits.get() + actual);
+                #[cfg(not(test))]
+                let _ = actual;
                 if !done {
                     cursor.pending_key = Some(pending);
                     debug_assert!(spent <= budget);

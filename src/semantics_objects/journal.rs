@@ -353,7 +353,9 @@ pub(crate) const MAX_UNSETTLED_STAGED: usize = 4_096;
 #[path = "journal/ledger.rs"]
 mod ledger;
 pub(in crate::semantics_objects) use ledger::ExistingReservation;
-pub(crate) use ledger::{LedgerRefusal, StagedResourceOrigin, StagingLedger};
+pub(crate) use ledger::{
+    LedgerRefusal, LedgerReleaseCursor, StagedResourceOrigin, StagingLedger,
+};
 
 // ---------------------------------------------------------------------------
 // Sealed primitives: only the adapter mints these

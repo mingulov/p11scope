@@ -11761,6 +11761,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.drop_abandoned_joint_staged(ledger);
     }
 
+    /// Start the resumable stranded staged disposal after a void sweep:
+    /// snapshot retained feeds; the machine drives
+    /// `poll_staged_disposal` until it completes before collecting.
+    pub(crate) fn start_staged_disposal(&mut self) {
+        self.registry.start_staged_disposal();
+    }
+
+    /// Drive stranded staged disposal for at most `budget` leaf units.
+    /// Returns whether disposal completed and the units spent (never
+    /// above `budget`).
+    pub(crate) fn poll_staged_disposal(&mut self, budget: usize) -> (bool, usize) {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.poll_staged_disposal(ledger, budget)
+    }
+
     /// Pose a coordinator-half pending Joint publication (no registry
     /// phase): the hold twin's wedge stand-in. Real registry-pending
     /// shapes are driven by the joint fixtures instead.

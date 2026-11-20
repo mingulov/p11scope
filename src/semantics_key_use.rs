@@ -3987,3 +3987,143 @@ impl<S: OperationSink> OperationSink for KeyUseTee<'_, S> {
         self.outer.emit(effect);
     }
 }
+
+/// Resumable cursor for one feed's stranded staged disposal: holds
+/// the preservation reducers across credits so a long chain unlink
+/// never exceeds its credit. The feed's staged queue, frontier and
+/// counts stay untouched until each head's release completes, then
+/// the head pops, reduces (Joint) and counts atomically. Finalize
+/// (invalidate plus absorb) runs once after the last head.
+pub(crate) struct FeedDisposalCursor {
+    instance: RegistryInstanceId,
+    is_joint: bool,
+    throwaway: Option<EdgeSemantics>,
+    preserved: Option<KeyUseReducer>,
+    pending_release: Option<crate::semantics_objects::journal::LedgerReleaseCursor>,
+    pending_position: Option<u64>,
+    finalized: bool,
+}
+
+impl FeedDisposalCursor {
+    pub(crate) fn new(instance: RegistryInstanceId, is_joint: bool) -> Self {
+        Self {
+            instance,
+            is_joint,
+            throwaway: is_joint.then(EdgeSemantics::default),
+            preserved: is_joint.then(KeyUseReducer::new),
+            pending_release: None,
+            pending_position: None,
+            finalized: !is_joint,
+        }
+    }
+
+    /// Drive one feed's disposal for at most `budget` leaf units (one
+    /// per staged head plus each link walk on its release). Returns
+    /// whether the feed completed and the units spent (never above
+    /// `budget`). `fallback` carries the association ledger for Joint
+    /// preservation (`None` for pure feeds, unused); `keyuse` absorbs
+    /// the preserved summaries once at the end. The caller counts the
+    /// feed visit itself before the first poll.
+    pub(crate) fn poll(
+        &mut self,
+        feed: &mut JointStaging,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        mut fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        keyuse: &mut KeyUseReducer,
+        budget: usize,
+    ) -> (bool, usize) {
+        if budget == 0 {
+            let done = feed.staged.is_empty()
+                && self.pending_release.is_none()
+                && self.pending_position.is_none()
+                && self.finalized;
+            return (done, 0);
+        }
+        let mut spent = 0usize;
+        loop {
+            if spent >= budget {
+                debug_assert!(spent <= budget);
+                return (false, spent);
+            }
+            if let Some(release) = self.pending_release.as_mut() {
+                let (done, used) = ledger.release_step(release, budget - spent);
+                spent += used;
+                if !done {
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
+                }
+                self.pending_release = None;
+                continue;
+            }
+            if let Some(expected) = self.pending_position {
+                if spent >= budget {
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
+                }
+                spent += 1;
+                let head = feed.staged.pop_front().expect("pending head retained");
+                assert_eq!(
+                    head.position, expected,
+                    "the disposal holds its head across credits"
+                );
+                if self.is_joint {
+                    let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
+                    let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                    let mut outer = NoSink;
+                    let mut tee = KeyUseTee::new(
+                        &mut outer,
+                        preserved,
+                        self.instance,
+                        None,
+                        fallback.as_deref_mut(),
+                    );
+                    throwaway.observe_with_effects(&head.facts, &head.origin, &mut tee);
+                }
+                let (position, _native) = (head.position, head.resource_native);
+                drop(head);
+                feed.frontier = feed.frontier.max(position);
+                feed.history_disposed = feed.history_disposed.saturating_add(1);
+                self.pending_position = None;
+                continue;
+            }
+            let Some(front) = feed.staged.front() else {
+                if self.finalized {
+                    debug_assert!(spent <= budget);
+                    return (true, spent);
+                }
+                if spent >= budget {
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
+                }
+                spent += 1;
+                let mut throwaway =
+                    self.throwaway.take().expect("joint finalizes once");
+                let mut preserved =
+                    self.preserved.take().expect("joint finalizes once");
+                {
+                    let mut outer = NoSink;
+                    let mut tee = KeyUseTee::new(
+                        &mut outer,
+                        &mut preserved,
+                        self.instance,
+                        None,
+                        fallback.as_deref_mut(),
+                    );
+                    throwaway.invalidate_with_effects(&mut tee);
+                }
+                keyuse.absorb_preserved(preserved);
+                self.finalized = true;
+                debug_assert!(spent <= budget);
+                return (true, spent);
+            };
+            let (position, native) = (front.position, front.resource_native);
+            let cursor = match native {
+                Some(native) => ledger.release_cursor_collected(native, position),
+                None => ledger.release_cursor(position),
+            };
+            self.pending_position = Some(position);
+            self.pending_release = Some(cursor);
+            continue;
+        }
+    }
+}

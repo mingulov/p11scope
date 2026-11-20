@@ -1717,6 +1717,20 @@ impl Default for InstanceState {
     }
 }
 
+/// Resumable cursor for stranded staged disposal across retained
+/// feeds: visits each feed once plus each staged head and link walk
+/// within a shared leaf budget. The registry holds it while the
+/// machine defers collection and gap disclosure until disposal
+/// completes. Feeds are walked live by identity order (no snapshot
+/// scan); `done_upto` bounds the next visit exclusively.
+pub(super) struct StagedDisposalCursor {
+    done_upto: Option<RegistryInstanceId>,
+    current: Option<(
+        RegistryInstanceId,
+        crate::semantics_key_use::FeedDisposalCursor,
+    )>,
+}
+
 impl CallerRegistry {
     /// Census at immutable publication, never on the semantic ingress path.
     /// The byte pool and these counts cover both legacy and instance reducers.
@@ -3067,6 +3081,120 @@ impl CallerRegistry {
             } else {
                 record.feed.drop_abandoned_staged(ledger);
             }
+        }
+    }
+
+    /// Start the resumable stranded staged disposal: walk retained
+    /// feeds live by identity order; the machine drives
+    /// `poll_staged_disposal` until it completes before collecting
+    /// above the fence. A started disposal keeps its exact per-feed
+    /// reduction state until it finishes; feeds added later wait for
+    /// the next void. Empty registries hold no disposal.
+    pub(crate) fn start_staged_disposal(&mut self) {
+        if self.staged_disposal.is_some() {
+            return;
+        }
+        if self.instance_state.semantics.is_empty() {
+            return;
+        }
+        self.staged_disposal = Some(StagedDisposalCursor {
+            done_upto: None,
+            current: None,
+        });
+    }
+
+    /// Drive stranded staged disposal for at most `budget` leaf units
+    /// (one per feed visit, one per staged head plus each link walk on
+    /// its release). Returns whether disposal completed and the units
+    /// spent (never above `budget`). Completion clears the cursor;
+    /// without a started disposal it completes at once with no work.
+    pub(crate) fn poll_staged_disposal(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        budget: usize,
+    ) -> (bool, usize) {
+        if budget == 0 {
+            if self.staged_disposal.is_none() {
+                return (true, 0);
+            }
+            return (false, 0);
+        }
+        let Some(mut cursor) = self.staged_disposal.take() else {
+            return (true, 0);
+        };
+        let mut spent = 0usize;
+        loop {
+            if spent >= budget {
+                self.staged_disposal = Some(cursor);
+                debug_assert!(spent <= budget);
+                return (false, spent);
+            }
+            if let Some((id, current)) = cursor.current.as_mut() {
+                let id = *id;
+                let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+                    cursor.current = None;
+                    cursor.done_upto = Some(id);
+                    continue;
+                };
+                let is_joint = record.feed.mode() == FeedMode::Joint;
+                let feed = &mut record.feed;
+                let remaining = budget - spent;
+                let (feed_done, used) = if is_joint {
+                    current.poll(
+                        feed,
+                        ledger,
+                        Some(&mut self.assoc_fallback),
+                        &mut self.joint_keyuse,
+                        remaining,
+                    )
+                } else {
+                    // Pure feeds keep no preservation reducers; the
+                    // fallback stays untouched and the shared key-use
+                    // reducer sees no preserved summaries. Pass the live
+                    // key-use handle through (unused on this path) to
+                    // keep one poll shape.
+                    current.poll(feed, ledger, None, &mut self.joint_keyuse, remaining)
+                };
+                spent += used;
+                if !feed_done {
+                    self.staged_disposal = Some(cursor);
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
+                }
+                cursor.current = None;
+                cursor.done_upto = Some(id);
+                continue;
+            }
+            let next_id = {
+                use std::ops::Bound::{Excluded, Unbounded};
+                let map = &self.instance_state.semantics;
+                match cursor.done_upto {
+                    None => map.keys().next().copied(),
+                    Some(done) => map
+                        .range((Excluded(done), Unbounded))
+                        .next()
+                        .map(|(id, _)| *id),
+                }
+            };
+            let Some(next_id) = next_id else {
+                debug_assert!(spent <= budget);
+                return (true, spent);
+            };
+            spent += 1;
+            let Some(record) = self.instance_state.semantics.get_mut(&next_id) else {
+                cursor.done_upto = Some(next_id);
+                continue;
+            };
+            if record.feed.staged_len() == 0 {
+                cursor.done_upto = Some(next_id);
+                continue;
+            }
+            let is_joint = record.feed.mode() == FeedMode::Joint;
+            cursor.current = Some((
+                next_id,
+                crate::semantics_key_use::FeedDisposalCursor::new(next_id, is_joint),
+            ));
+            continue;
         }
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {

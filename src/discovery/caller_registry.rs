@@ -4177,6 +4177,9 @@ pub(crate) struct CallerRegistry {
     /// publications use the supplied shared owner. Each association
     /// returns its ticket to the owner which minted it.
     assoc_fallback: crate::semantics_objects::journal::StagingLedger,
+    /// Resumable stranded staged disposal across retained feeds, held
+    /// while the void machine defers collection and gap disclosure.
+    staged_disposal: Option<instance_input::StagedDisposalCursor>,
     /// Current Joint-mode feeds; feeds may permanently fall back.
     joint_feeds: usize,
     /// Capture-lifetime accounting latch, set by a true Joint
@@ -4425,6 +4428,7 @@ impl CallerRegistry {
             joint_grant_storage: None,
             joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
             assoc_fallback,
+            staged_disposal: None,
             joint_feeds: 0,
             joint_accounting: false,
             key_projection: None,

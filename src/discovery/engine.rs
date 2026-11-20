@@ -16109,6 +16109,8 @@ impl Engine {
             let pid = view_data.pid;
             if self.insert_cgroup_admission(view, view_data).is_none() {
                 self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
+                self.pid_descendant_gaps_admitted =
+                    self.pid_descendant_gaps_admitted.saturating_add(1);
             }
             // 6.14 Option B: an admitted PID's exits match its
             // admission, never a gap, so its stash entry is dead.

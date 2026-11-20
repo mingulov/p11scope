@@ -231,8 +231,34 @@ pub(crate) struct MemberStopStats {
 /// itself), and read waits. The destructure is exhaustive on purpose:
 /// a new end state fails to compile until it is classified.
 pub(crate) fn member_stop_coverage(stats: &MemberStopStats) -> (u64, u64) {
-    let _ = stats;
-    (0, 0)
+    let MemberStopStats {
+        stopped: _,
+        cleared_files: _,
+        provider_holds: _,
+        attached_resumes,
+        timed_out,
+        refused_resumes,
+        unreadable,
+        departed: _,
+        resume_unavailable: _,
+        not_members: _,
+        forced_resumes,
+        moved_out_resumes,
+        unproven_resumes,
+        lost_guard_resumes,
+        stop_staged_overflow: _,
+        fuse_resumes,
+        unsettled_reads: _,
+    } = *stats;
+    let unattached = refused_resumes
+        .saturating_add(timed_out)
+        .saturating_add(forced_resumes)
+        .saturating_add(unproven_resumes)
+        .saturating_add(fuse_resumes)
+        .saturating_add(moved_out_resumes)
+        .saturating_add(lost_guard_resumes)
+        .saturating_add(unreadable);
+    (attached_resumes, unattached)
 }
 
 /// One executable file row of a member's maps.
@@ -1693,25 +1719,28 @@ mod tests {
         assert_eq!(member_stop_coverage(&stats), (3, 0));
         // Every unattached end counts: refused, timed-out, forced,
         // unproven, FUSE-backed, moved-out, watchdog-lost, unreadable.
-        let unattached_fields: Vec<(&str, fn(&mut MemberStopStats))> = vec![
-            ("refused_resumes", |stats| stats.refused_resumes = 2),
-            ("timed_out", |stats| stats.timed_out = 2),
-            ("forced_resumes", |stats| stats.forced_resumes = 2),
-            ("unproven_resumes", |stats| stats.unproven_resumes = 2),
-            ("fuse_resumes", |stats| stats.fuse_resumes = 2),
-            (
-                "moved_out_resumes",
-                |stats| stats.moved_out_resumes = 2,
-            ),
-            (
-                "lost_guard_resumes",
-                |stats| stats.lost_guard_resumes = 2,
-            ),
-            ("unreadable", |stats| stats.unreadable = 2),
-        ];
-        for (field, set) in unattached_fields {
+        for field in [
+            "refused_resumes",
+            "timed_out",
+            "forced_resumes",
+            "unproven_resumes",
+            "fuse_resumes",
+            "moved_out_resumes",
+            "lost_guard_resumes",
+            "unreadable",
+        ] {
             let mut stats = MemberStopStats::default();
-            set(&mut stats);
+            match field {
+                "refused_resumes" => stats.refused_resumes = 2,
+                "timed_out" => stats.timed_out = 2,
+                "forced_resumes" => stats.forced_resumes = 2,
+                "unproven_resumes" => stats.unproven_resumes = 2,
+                "fuse_resumes" => stats.fuse_resumes = 2,
+                "moved_out_resumes" => stats.moved_out_resumes = 2,
+                "lost_guard_resumes" => stats.lost_guard_resumes = 2,
+                "unreadable" => stats.unreadable = 2,
+                _ => unreachable!("table field {field}"),
+            }
             assert_eq!(
                 member_stop_coverage(&stats),
                 (0, 2),
@@ -1729,26 +1758,31 @@ mod tests {
         assert_eq!(member_stop_coverage(&stats), (4, 6));
         // Neutral ends never move either side: stops, clears,
         // departures, retries, non-members, overflows, read waits.
-        let neutral_fields: Vec<(&str, fn(&mut MemberStopStats))> = vec![
-            ("stopped", |stats| stats.stopped = 5),
-            ("provider_holds", |stats| stats.provider_holds = 5),
-            ("cleared_files", |stats| stats.cleared_files = 5),
-            ("departed", |stats| stats.departed = 5),
-            (
-                "resume_unavailable",
-                |stats| stats.resume_unavailable = 5,
-            ),
-            ("not_members", |stats| stats.not_members = 5),
-            (
-                "stop_staged_overflow",
-                |stats| stats.stop_staged_overflow = 5,
-            ),
-            ("unsettled_reads", |stats| stats.unsettled_reads = 5),
-        ];
-        for (field, set) in neutral_fields {
-            let mut stats = MemberStopStats::default();
-            stats.attached_resumes = 1;
-            set(&mut stats);
+        for field in [
+            "stopped",
+            "provider_holds",
+            "cleared_files",
+            "departed",
+            "resume_unavailable",
+            "not_members",
+            "stop_staged_overflow",
+            "unsettled_reads",
+        ] {
+            let mut stats = MemberStopStats {
+                attached_resumes: 1,
+                ..MemberStopStats::default()
+            };
+            match field {
+                "stopped" => stats.stopped = 5,
+                "provider_holds" => stats.provider_holds = 5,
+                "cleared_files" => stats.cleared_files = 5,
+                "departed" => stats.departed = 5,
+                "resume_unavailable" => stats.resume_unavailable = 5,
+                "not_members" => stats.not_members = 5,
+                "stop_staged_overflow" => stats.stop_staged_overflow = 5,
+                "unsettled_reads" => stats.unsettled_reads = 5,
+                _ => unreachable!("table field {field}"),
+            }
             assert_eq!(
                 member_stop_coverage(&stats),
                 (1, 0),
@@ -1756,10 +1790,7 @@ mod tests {
             );
         }
         // Nothing running: zero coverage, never unknown.
-        assert_eq!(
-            member_stop_coverage(&MemberStopStats::default()),
-            (0, 0)
-        );
+        assert_eq!(member_stop_coverage(&MemberStopStats::default()), (0, 0));
     }
 
     #[test]

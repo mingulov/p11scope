@@ -294,12 +294,14 @@ capture, and a consumer must dispatch on the top-level `lane` field
   `verdict_with_selection(true)`) embeds `versioned_evidence`: the full base
   set plus the profile-only fields `interface_selection`,
   `attach_mechanisms`, `pid_descendant_gaps`, `multi_rebuild_gaps`,
-  and the learned-file counts `learned_staged_files`,
-  `learned_event_loss`, and `learned_cap_skipped`. Its
+  `pid_descendant_gaps_admitted`, `member_stop_attached`,
+  `member_stop_unattached`, and the learned-file counts
+  `learned_staged_files`, `learned_event_loss`, and
+  `learned_cap_skipped`. Its
   verdict is selection-aware: a descendant gap, a rebuild gap, or any
   selection loss forces `PARTIAL`.
 - The **metrics** lane (`render::json`, verdict
-  `verdict_with_selection(false)`) embeds `Evidence` directly, so the four
+  `verdict_with_selection(false)`) embeds `Evidence` directly, so the
   `#[serde(skip)]` profile-only fields above are absent. Its verdict is
   selection-blind by construction: the same capture that reads `PARTIAL` as
   profile over a descendant gap reads `COMPLETE`-eligible as metrics, with no
@@ -311,7 +313,7 @@ add selection verdict authority to metrics. Historical v2-metrics documents
 retain their old shape without `attach_backend`.
 
 The terminal trace `EVIDENCE` object follows the profile lane: it carries the
-four versioned-only fields and no `lane` key (it is an evidence object, not a
+versioned-only fields and no `lane` key (it is an evidence object, not a
 document). The release oracle enforces the split (`exact_evidence_keys` with
 `profile=True/False`), the per-lane verdict scope, and the `lane`
 discriminator value.
@@ -493,11 +495,12 @@ note, including object-level skips and transient watch-scan races that
 file no `skipped` row, so they do not reconcile one-to-one with
 `skipped` rows. Labels and counts are finite — the stderr first samples
 that may name target paths never reach this key. The object never feeds
-verdicts by itself. Verbose text names the dominant class as its own
-coverage fragment (`dominant retry class: <words> x<count>`, with user
-words for the `process-view` label); the concise coverage line stays one
-line without it. This is a v3-additive disclosure that introduces no new
-schema revision.
+verdicts by itself. Both texts name every nonzero class with its count
+as one coverage fragment (`discovery retries: <words> x<count>, ...`,
+alphabetical by label, with user words for the `process-view` label),
+so a folded row count no longer hides its multiplicity; the concise
+coverage line stays one line with it. This is a v3-additive disclosure
+that introduces no new schema revision.
 
 `pid_descendant_gaps` and `multi_rebuild_gaps` are saturating u64 counts.
 `pid_descendant_gaps` is zero for exact PID scope because process-creation
@@ -517,6 +520,28 @@ outside W3's completeness claim. A novel unmatched exit latches one lower-bound
 overflow increment when the bounded ledger is full. If admission already
 counted the gap, coalescing overflow marks `PARTIAL` without another increment.
 Replays and further unremembered keys do not increment again.
+
+`pid_descendant_gaps_admitted` is the fresh mid-run admissions inside
+`pid_descendant_gaps`: members the capture admitted (and scanned) whose
+pre-admission life is still unobserved. Never above the total; the
+remainder (exits, prune and finish sweeps, sentinels) was never
+observed — members sighted in a walk but never scanned land in the
+remainder too. The text row splits the count (`<total> short-lived
+process gaps (<admitted> admitted/scanned, <rest> never observed)`);
+the total still gates the verdict, and the split never feeds shares,
+verdicts, or completeness.
+
+`member_stop_attached` counts run-tree provider mappers the member-stop
+backstop held until their probes attached; `member_stop_unattached`
+counts run-tree provider mappers resumed before attach, each of which
+filed a first-use row. Both are zero where the hook never ran. When at
+least one mapper attached with none unattached, every recorded load
+resolved benignly, the loader aggregate's only roots are the
+unconfirmed hold's unproven timing, and no learned-file row exists,
+the text folds the partly-paused-load row and the unconfirmed
+loader-tracking row into one (`<n> load(s) held only by the member-stop
+backstop`); the verdict stays `PARTIAL` and JSON keeps both causes.
+The counts never feed shares, verdicts, or completeness.
 
 `gap_exe_hints` is present if and only if the capture armed extensive
 mode (`--track-short-lived`) over a `--cgroup`/`--system` scope;
@@ -1164,6 +1189,28 @@ exactly:
   reconciliation passes file the same row when they hit the cap.
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
+
+Gap-noise folds file under the discovery subject with three finite
+reasons (in addition to the v2 list and the reasons above). Each
+record is `{name: "discovery subject", reason}` with `reason` exactly
+one of:
+
+- `process exited mid-flight`: one of six mid-flight generation
+  pairs — a short-lived process exited or changed while discovery
+  was mid-read (candidate, inventory preflight, stale report,
+  terminal record, or an unreadable member). Exact internal pairs
+  only; near misses stay generic.
+- `scan budget exhausted`: a work-ceiling stop, bare or wrapped in
+  a scan refusal, whatever subject filed it. Function subjects keep
+  their entry row instead — the fold never redacts a function name.
+- `no unique attached loader context`: a provider whose loader
+  context could not be uniquely attached. Distinct from the ceiling
+  row: a different operator action.
+
+Folding renames rows, never drops them: JSON keeps one row per
+underlying internal record. The text names each folded row with its
+count and leaves folded rows out of the generic `discovery steps
+unavailable` bucket.
 
 Run-tree scope gaps file under their own subject. Each record is
 `{name: "run process tree", reason}` with `reason` exactly one of:

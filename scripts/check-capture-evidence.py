@@ -282,6 +282,8 @@ ATTACH_MECHANISMS = {"per-offset", "uprobe-multi"}
 PROFILE_V3_FIELDS = {
     "interface_selection", "attach_mechanisms",
     "pid_descendant_gaps", "multi_rebuild_gaps",
+    "pid_descendant_gaps_admitted",
+    "member_stop_attached", "member_stop_unattached",
     "learned_staged_files", "learned_event_loss", "learned_cap_skipped",
 }
 ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
@@ -659,6 +661,14 @@ DEEP_SCAN_SELECTION_CAPPED = (
 MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
 PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
 DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
+# Gap-noise folds: mid-flight exits, scan-budget stops and
+# loader-context misses project to these finite reasons instead of
+# the generic redaction (render.rs `capture_skipped_out` fold arms).
+# Each folds exact internal pairs only; folding renames rows, never
+# drops them. The validator must accept what the producer emits.
+MID_FLIGHT_REASON = "process exited mid-flight"
+SCAN_BUDGET_REASON = "scan budget exhausted"
+LOADER_CONTEXT_REASON = "no unique attached loader context"
 # Run-tree (v0.7.0): a run that follows the command's child processes
 # files its scope gaps under its own subject with finite reasons
 # (render.rs `capture_skipped_out` run-tree arm). The survivor count
@@ -844,6 +854,9 @@ DISCOVERY_REASONS = {
     MANIFEST_OBJECT_UNAVAILABLE,
     PREARM_OBJECT_UNAVAILABLE,
     DISCOVERY_TRANSPORT_UNAVAILABLE,
+    MID_FLIGHT_REASON,
+    SCAN_BUDGET_REASON,
+    LOADER_CONTEXT_REASON,
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a
@@ -1271,6 +1284,16 @@ def exact_profile_v3_selection(document, *, terminal=False, run=False):
     exact_object_capture(evidence["object_capture"])
     for field in ("pid_descendant_gaps", "multi_rebuild_gaps"):
         uint(evidence[field], U64_MAX, field)
+    for field in (
+        "pid_descendant_gaps_admitted",
+        "member_stop_attached", "member_stop_unattached",
+    ):
+        uint(evidence[field], U64_MAX, field)
+    require(
+        evidence["pid_descendant_gaps_admitted"] <= evidence["pid_descendant_gaps"],
+        f"admitted gaps above the gap total: {evidence['pid_descendant_gaps_admitted']} "
+        f"> {evidence['pid_descendant_gaps']}",
+    )
     loss = (
         selection["selection_truncated"]
         or any(item["coverage"] not in {"observed", "absent_covered"} for item in providers)
@@ -5064,6 +5087,9 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
         evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
         evidence.setdefault("pid_descendant_gaps", 0)
         evidence.setdefault("multi_rebuild_gaps", 0)
+        evidence.setdefault("pid_descendant_gaps_admitted", 0)
+        evidence.setdefault("member_stop_attached", 0)
+        evidence.setdefault("member_stop_unattached", 0)
         evidence.setdefault("learned_staged_files", 0)
         evidence.setdefault("learned_event_loss", 0)
         evidence.setdefault("learned_cap_skipped", 0)
@@ -6865,6 +6891,12 @@ def self_test():
         lambda d: d["evidence"]["interface_selection"]["tuples"][0]["inventory_matches"][0].update(name_agrees=True),
         lambda d: d["evidence"].update(pid_descendant_gaps=-1),
         lambda d: d["evidence"].update(multi_rebuild_gaps=U64_MAX + 1),
+        lambda d: d["evidence"].update(pid_descendant_gaps_admitted=-1),
+        lambda d: d["evidence"].update(member_stop_attached=-1),
+        lambda d: d["evidence"].update(member_stop_unattached=U64_MAX + 1),
+        lambda d: d["evidence"].update(
+            pid_descendant_gaps=2, pid_descendant_gaps_admitted=3
+        ),
     ):
         bad = copy.deepcopy(selection_doc)
         mutate(bad)

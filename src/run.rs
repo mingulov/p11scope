@@ -14397,6 +14397,8 @@ pub(crate) fn evidence_for(
     ] = facts.discovery_losses();
     let pause_status = pause.status();
     let pid_descendant_gaps = engine.pid_descendant_gaps();
+    let pid_descendant_gaps_admitted = engine.pid_descendant_gaps_admitted();
+    let (member_stop_attached, member_stop_unattached) = engine.member_stop_coverage();
     let mut interface_selection = if include_selection {
         engine.interface_selection()
     } else {
@@ -14516,9 +14518,9 @@ pub(crate) fn evidence_for(
         attach_backend,
         object_capture,
         pid_descendant_gaps,
-        pid_descendant_gaps_admitted: 0,
-        member_stop_attached: 0,
-        member_stop_unattached: 0,
+        pid_descendant_gaps_admitted,
+        member_stop_attached,
+        member_stop_unattached,
         multi_rebuild_gaps: engine.multi_rebuild_gaps(),
         learned_staged_files: engine.learned_staged_files(),
         learned_event_loss: engine.learned_event_loss(),

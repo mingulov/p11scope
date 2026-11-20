@@ -2036,6 +2036,15 @@ pub(crate) const LEARNED_DISABLED_REASON: &str = "file learning was disabled by 
 pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned";
 pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
+/// Gap-noise folds: mid-flight exits, scan-budget stops and
+/// loader-context misses project to these finite public reasons
+/// instead of the generic redaction. Each folds exact internal pairs
+/// only (the ceiling by its fixed reason sentence, whatever subject
+/// filed it); function subjects always keep their entry row, and
+/// folding renames rows, never drops them.
+const MID_FLIGHT_REASON: &str = "process exited mid-flight";
+const SCAN_BUDGET_REASON: &str = "scan budget exhausted";
+const LOADER_CONTEXT_REASON: &str = "no unique attached loader context";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
 const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";
 const SHARED_OVERLAY_UNCERTAINTY: &str = "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved";
@@ -2190,6 +2199,52 @@ fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether an internal skip is one of the six mid-flight generation
+/// pairs: a short-lived process exited or changed while discovery was
+/// mid-read (candidate, preflight, stale report, terminal record, or
+/// an unreadable member). Exact subject and reason, never prefix or
+/// substring: near misses stay generic.
+fn is_mid_flight_pair(subject: &str, reason: &str) -> bool {
+    matches!(
+        (subject, reason),
+        (
+            "live discovery generation",
+            "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during inventory preflight",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+        ) | (
+            "live discovery generation",
+            "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+        ) | (
+            "live discovery record",
+            "a structurally valid private terminal record failed exact live resolution",
+        ) | (
+            "process view",
+            "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
+        )
+    )
+}
+
+/// Whether an internal skip is one of the two no-unique-loader-context
+/// pairs (exact): kept distinct from the ceiling row, a different
+/// operator action.
+fn is_loader_context_pair(subject: &str, reason: &str) -> bool {
+    matches!(
+        (subject, reason),
+        (
+            "live export hook",
+            "a refreshed provider had no unique attached loader context",
+        ) | (
+            "live manifest getter hook",
+            "a manifest getter's process had no unique attached loader context",
+        )
+    )
+}
+
 /// Convert an untyped internal discovery loss into the finite public capture
 /// record. Detailed paths, process identities, and error chains remain in
 /// diagnostics; capture output keeps only the categorical loss needed to make
@@ -2274,6 +2329,20 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         }
     } else if gated_null {
         "null pointer"
+    // Gap-noise folds, after the function arms so a function subject
+    // always keeps its entry row. The ceiling matches by its fixed
+    // reason sentence, bare or wrapped in a scan refusal, whatever
+    // subject filed it; the public reason is fixed, so no subject
+    // text can leak through the fold.
+    } else if is_mid_flight_pair(&s.subject, &s.reason) {
+        MID_FLIGHT_REASON
+    } else if s
+        .reason
+        .contains(crate::discovery::scan::WORK_CEILING_REASON)
+    {
+        SCAN_BUDGET_REASON
+    } else if is_loader_context_pair(&s.subject, &s.reason) {
+        LOADER_CONTEXT_REASON
     } else if s.subject == "physical static probe gap"
         && s.reason
             == "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete"
@@ -4612,6 +4681,50 @@ fn ring_unexplained(account: &Option<RingAccountEvidence>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether the pause-partial and loader-discovery rows fold into one:
+/// every loader root is the unconfirmed hold's unproven timing (no
+/// arming, strategy or state root), every recorded load resolved
+/// benignly (covering the pause-exempt owned child), and the
+/// member-stop backstop held at least one provider mapper until
+/// attach with none resumed unattached and no learned-file row
+/// anywhere. The verdict and the JSON causes never fold, only the
+/// text rows.
+fn pause_loader_backstop_fold(ev: &Evidence) -> bool {
+    if ev.pause_partial == 0 || ev.loader_discovery.complete() {
+        return false;
+    }
+    let loader = &ev.loader_discovery;
+    if loader.strategies.dlopen_return > 0 || loader.strategies.unavailable > 0 {
+        return false;
+    }
+    if loader.state_read_failures > 0 {
+        return false;
+    }
+    if loader.dlopen_timing.none > 0 || loader.dlopen_timing.known_pre_relocation > 0 {
+        return false;
+    }
+    if loader.initial_set_timing.none > 0 || loader.initial_set_timing.known_pre_relocation > 0 {
+        return false;
+    }
+    if loader.initial_set_capture.none == 0 && loader.initial_set_timing.unproven == 0 {
+        return false;
+    }
+    if loader.benign_hits != loader.hits {
+        return false;
+    }
+    if ev.member_stop_attached == 0 || ev.member_stop_unattached > 0 {
+        return false;
+    }
+    if ev
+        .skipped
+        .iter()
+        .any(|skip| skip.name == LEARNED_SKIP_SUBJECT)
+    {
+        return false;
+    }
+    true
+}
+
 /// One human fragment per verdict cause, stating the count behind it.
 /// Concise text is plain words only; verbose pairs the machine cause
 /// name beside each plain fragment. A cause without a phrase folds
@@ -4619,6 +4732,22 @@ fn ring_unexplained(account: &Option<RingAccountEvidence>) -> u64 {
 /// in verbose, so a new gate always surfaces.
 fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec<String> {
     let count = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    // The backstop-folded row, taken by whichever of its two causes
+    // renders first; the other then skips. `None` unless the fold
+    // holds, so single rows never touch it.
+    let backstop_fold = pause_loader_backstop_fold(ev);
+    let mut backstop_fold_fragment: Option<String> = backstop_fold.then(|| {
+        let plain = count(
+            ev.pause_partial,
+            "load held only by the member-stop backstop",
+            "loads held only by the member-stop backstop",
+        );
+        if verbose {
+            format!("{plain} (pause_partial, loader_discovery)")
+        } else {
+            plain
+        }
+    });
     let mut fragments = Vec::new();
     let mut state_gaps = 0u64;
     let mut state_causes: Vec<&str> = Vec::new();
@@ -4709,7 +4838,9 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
             "skipped" => {
                 // Discovery-subject entries are unavailable discovery
                 // steps, not skipped functions; only named function
-                // entries keep the "skipped" wording.
+                // entries keep the "skipped" wording. Folded rows
+                // render as their own named histogram lines below,
+                // never in the generic bucket.
                 let mut subjects = 0u64;
                 let mut functions = 0u64;
                 for skip in ev
@@ -4718,7 +4849,12 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     .filter(|skip| skip.reason != NULL_POINTER_REASON)
                 {
                     if skip.name == DISCOVERY_SUBJECT {
-                        subjects += 1;
+                        if skip.reason != MID_FLIGHT_REASON
+                            && skip.reason != SCAN_BUDGET_REASON
+                            && skip.reason != LOADER_CONTEXT_REASON
+                        {
+                            subjects += 1;
+                        }
                     } else if skip.name == LEARNED_SKIP_SUBJECT
                         || skip.name == COVERAGE_RETIRED_SUBJECT
                     {
@@ -4752,6 +4888,9 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LOADER_CONTEXT_CHILD_RESERVE,
                     LOADER_SCAN_LEDGER_EXCEEDED,
                     LOADER_ARM_LEDGER_FULL,
+                    MID_FLIGHT_REASON,
+                    SCAN_BUDGET_REASON,
+                    LOADER_CONTEXT_REASON,
                     LEARNED_FIRST_RUN_REASON,
                     LEARNED_OVERFLOW_REASON,
                     LEARNED_CAP_REASON,
@@ -4773,6 +4912,11 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         fragments.push(tag(format!("{reason}: {hits}")));
                     }
                 }
+                // Per-class retry event counts, in the default text too:
+                // a folded row count no longer hides its multiplicity.
+                if let Some(retries) = retry_breakdown_fragment(ev) {
+                    fragments.push(tag(retries));
+                }
                 // Deep-scan selection over the cap: the counted gap. User
                 // processes only (kernel threads excluded); the same
                 // counts ride in `evidence.deep_scan_selection`.
@@ -4791,9 +4935,6 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     let items = skipped_item_list(ev);
                     if !items.is_empty() {
                         fragments.push(format!("skipped: {}", items.join(", ")));
-                    }
-                    if let Some(dominant) = dominant_retry_class(ev) {
-                        fragments.push(dominant);
                     }
                 }
                 continue;
@@ -4918,17 +5059,31 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "probe link lost",
                 "probe links lost",
             ),
-            "pause_partial" => count(
-                ev.pause_partial,
-                "load only partly paused",
-                "loads only partly paused",
-            ),
+            "pause_partial" => {
+                if let Some(folded) = backstop_fold_fragment.take() {
+                    fragments.push(folded);
+                    continue;
+                } else if backstop_fold {
+                    continue;
+                }
+                count(
+                    ev.pause_partial,
+                    "load only partly paused",
+                    "loads only partly paused",
+                )
+            }
             "pause_unavailable" => count(
                 ev.pause_unavailable,
                 "load could not be paused (collected unpaused)",
                 "loads could not be paused (collected unpaused)",
             ),
             "loader_discovery" => {
+                if let Some(folded) = backstop_fold_fragment.take() {
+                    fragments.push(folded);
+                    continue;
+                } else if backstop_fold {
+                    continue;
+                }
                 let loader = &ev.loader_discovery;
                 if loader.hits == 0 && loader.strategies.debug_state_every_hit == 1 {
                     "library-load tracking received nothing from the kernel \
@@ -4949,11 +5104,21 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 "output bytes dropped",
             ),
             "interface_selection" => "function list not fully identified".to_string(),
-            "pid_descendant_gaps" => count(
-                ev.pid_descendant_gaps,
-                "short-lived process gap",
-                "short-lived process gaps",
-            ),
+            "pid_descendant_gaps" => {
+                // Interim split: admitted (scanned, pre-admission life
+                // unobserved) versus never observed. The total still
+                // gates the verdict; a corrupt split clamps instead of
+                // rendering a negative remainder.
+                let total = ev.pid_descendant_gaps;
+                let admitted = ev.pid_descendant_gaps_admitted.min(total);
+                let never = total.saturating_sub(admitted);
+                format!(
+                    "{} ({} admitted/scanned, {} never observed)",
+                    count(total, "short-lived process gap", "short-lived process gaps"),
+                    admitted,
+                    never
+                )
+            }
             "multi_rebuild_gaps" => count(
                 ev.multi_rebuild_gaps,
                 "probe re-attach gap",
@@ -5160,7 +5325,7 @@ fn skipped_item_list(ev: &Evidence) -> Vec<String> {
     items
 }
 
-/// User words for a discovery retry label in the verbose coverage
+/// User words for a discovery retry label in the coverage
 /// fragment. The `process-view` accumulator label is internal jargon
 /// for a scope member the capture could not retain or scan, so it
 /// renders with the same words the `skipped` rows use. Every other
@@ -5174,29 +5339,24 @@ fn retry_class_user_words(label: &str) -> &str {
     }
 }
 
-/// The largest discovery retry class, for the verbose coverage line
-/// only: the concise line hides thousands of retried views, so `-v`
-/// names the dominant class with its count as its own fragment. Ties
-/// break toward the alphabetically first label; empty when discovery
-/// never retried. Labels render in user words (see
-/// `retry_class_user_words`). Concise output never calls this and stays
-/// one line.
-fn dominant_retry_class(ev: &Evidence) -> Option<String> {
-    let mut best: Option<(&String, u64)> = None;
+/// The discovery retry breakdown for the coverage line, default
+/// text included: every nonzero noise class with its event count, so
+/// a folded row count no longer hides its multiplicity. Labels
+/// render in user words (see `retry_class_user_words`); the JSON
+/// breakdown keeps the stable labels untouched. Empty when discovery
+/// never retried.
+fn retry_breakdown_fragment(ev: &Evidence) -> Option<String> {
+    let mut parts = Vec::new();
     for (label, count) in &ev.discovery_retry_classes {
         if *count == 0 {
             continue;
         }
-        if best.is_none_or(|(_, kept)| *count > kept) {
-            best = Some((label, *count));
-        }
+        parts.push(format!("{} x{count}", retry_class_user_words(label)));
     }
-    best.map(|(label, count)| {
-        format!(
-            "dominant retry class: {} x{count}",
-            retry_class_user_words(label)
-        )
-    })
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("discovery retries: {}", parts.join(", ")))
 }
 
 /// True for an owned run that never paused while its command ran
@@ -5689,6 +5849,18 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
         serde_json::to_value(&ev.attach_backend).expect("attach backend evidence serializes"),
     );
     object.insert("pid_descendant_gaps".into(), ev.pid_descendant_gaps.into());
+    object.insert(
+        "pid_descendant_gaps_admitted".into(),
+        ev.pid_descendant_gaps_admitted.into(),
+    );
+    object.insert(
+        "member_stop_attached".into(),
+        ev.member_stop_attached.into(),
+    );
+    object.insert(
+        "member_stop_unattached".into(),
+        ev.member_stop_unattached.into(),
+    );
     object.insert("multi_rebuild_gaps".into(), ev.multi_rebuild_gaps.into());
     object.insert(
         "learned_staged_files".into(),
@@ -9775,14 +9947,22 @@ pub(crate) mod tests {
     fn bounded_decode_omissions_render_finite_partial_evidence() {
         use crate::discovery::scan::{Skipped, WORK_CEILING_REASON};
 
-        let mut reasons = vec![
-            "capture table decode ceiling reached (512 candidates, 53248 entries); remaining \
-             table data was not decoded",
-            "capture interface decode ceiling reached (512 records); remaining interface data \
-             was not decoded",
+        let reasons = [
+            (
+                "capture table decode ceiling reached (512 candidates, 53248 entries); remaining \
+                 table data was not decoded",
+                "discovery unavailable",
+            ),
+            (
+                "capture interface decode ceiling reached (512 records); remaining interface data \
+                 was not decoded",
+                "discovery unavailable",
+            ),
+            // The work ceiling folds to its own finite reason; the
+            // decode ceilings stay generic.
+            (WORK_CEILING_REASON, "scan budget exhausted"),
         ];
-        reasons.push(WORK_CEILING_REASON);
-        for reason in reasons {
+        for (reason, public) in reasons {
             let mut ev = evidence();
             ev.skipped = vec![capture_skipped_out(&Skipped {
                 subject: "/private/provider.so".into(),
@@ -9801,7 +9981,7 @@ pub(crate) mod tests {
                 profile["evidence"]["skipped"][0],
                 serde_json::json!({
                     "name": "discovery subject",
-                    "reason": "discovery unavailable",
+                    "reason": public,
                 })
             );
             assert!(!profile.to_string().contains("/private/provider.so"));
@@ -11040,12 +11220,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
         ] {
-            let out = scope_summary_with_verbosity(
-                "pid",
-                &reports_fixture(),
-                &ev,
-                verbosity,
-            );
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
             assert!(
                 out.contains("3 discovery steps unavailable"),
                 "{verbosity:?}: {out}"
@@ -11185,53 +11360,42 @@ pub(crate) mod tests {
             "{out}"
         );
         // Each violated condition unfolds back to the two rows.
-        let unfold: Vec<(&str, fn(&mut Evidence))> = vec![
-            (
-                "unbound loader context",
-                (|ev: &mut Evidence| {
+        for label in [
+            "unbound loader context",
+            "loader timing never bound",
+            "unaccounted loader hit",
+            "no backstop hold",
+            "backstop resumed unattached",
+            "learned-file row present",
+        ] {
+            let mut ev = evidence();
+            backstopped(&mut ev);
+            match label {
+                "unbound loader context" => {
                     ev.loader_discovery.strategies.unavailable = 1;
                     ev.loader_discovery.dlopen_timing.none = 1;
-                }) as fn(&mut Evidence),
-            ),
-            (
-                "loader timing never bound",
-                (|ev: &mut Evidence| {
+                }
+                "loader timing never bound" => {
                     ev.loader_discovery.initial_set_timing.none = 1;
                     ev.loader_discovery.initial_set_timing.unproven = 0;
-                }) as fn(&mut Evidence),
-            ),
-            (
-                "unaccounted loader hit",
-                (|ev: &mut Evidence| {
+                }
+                "unaccounted loader hit" => {
                     ev.loader_discovery.benign_hits = 3;
-                }) as fn(&mut Evidence),
-            ),
-            (
-                "no backstop hold",
-                (|ev: &mut Evidence| {
+                }
+                "no backstop hold" => {
                     ev.member_stop_attached = 0;
-                }) as fn(&mut Evidence),
-            ),
-            (
-                "backstop resumed unattached",
-                (|ev: &mut Evidence| {
+                }
+                "backstop resumed unattached" => {
                     ev.member_stop_unattached = 1;
-                }) as fn(&mut Evidence),
-            ),
-            (
-                "learned-file row present",
-                (|ev: &mut Evidence| {
+                }
+                "learned-file row present" => {
                     ev.skipped = vec![SkippedOut {
                         name: "learned provider file".into(),
                         reason: LEARNED_FIRST_RUN_REASON.into(),
                     }];
-                }) as fn(&mut Evidence),
-            ),
-        ];
-        for (label, break_it) in unfold {
-            let mut ev = evidence();
-            backstopped(&mut ev);
-            break_it(&mut ev);
+                }
+                _ => unreachable!("table label {label}"),
+            }
             ev.verdict();
             let out = concise(&ev);
             assert!(out.contains("only partly paused"), "{label}: {out}");
@@ -11289,12 +11453,7 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
         ] {
-            let out = scope_summary_with_verbosity(
-                "pid",
-                &reports_fixture(),
-                &ev,
-                verbosity,
-            );
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
             assert!(
                 out.contains("discovery retries: other x15, process view x72"),
                 "{verbosity:?}: {out}"
@@ -11321,8 +11480,7 @@ pub(crate) mod tests {
         ev.pause = "partial";
         ev.pause_attempts = 1;
         ev.pause_partial = 1;
-        ev.discovery_retry_classes =
-            BTreeMap::from([("other".to_string(), 9)]);
+        ev.discovery_retry_classes = BTreeMap::from([("other".to_string(), 9)]);
         ev.verdict();
         let out = scope_summary_with_verbosity(
             "pid",
@@ -11353,13 +11511,11 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
         ] {
-            let out = scope_summary_with_verbosity(
-                "pid",
-                &reports_fixture(),
-                &ev,
-                verbosity,
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
+            assert!(
+                !out.contains("dominant retry class"),
+                "{verbosity:?}: {out}"
             );
-            assert!(!out.contains("dominant retry class"), "{verbosity:?}: {out}");
             assert!(
                 out.contains(
                     "discovery retries: other x300, process-ended x341, process view x19861"
@@ -11384,16 +11540,9 @@ pub(crate) mod tests {
             crate::cli::TextVerbosity::Concise,
             crate::cli::TextVerbosity::Verbose,
         ] {
-            let out = scope_summary_with_verbosity(
-                "pid",
-                &reports_fixture(),
-                &ev,
-                verbosity,
-            );
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
             assert!(
-                out.contains(
-                    "32 short-lived process gaps (5 admitted/scanned, 27 never observed)"
-                ),
+                out.contains("32 short-lived process gaps (5 admitted/scanned, 27 never observed)"),
                 "{verbosity:?}: {out}"
             );
         }
@@ -11404,9 +11553,7 @@ pub(crate) mod tests {
         ev.verdict();
         let out = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            out.contains(
-                "19 short-lived process gaps (0 admitted/scanned, 19 never observed)"
-            ),
+            out.contains("19 short-lived process gaps (0 admitted/scanned, 19 never observed)"),
             "{out}"
         );
         // Singular stays singular.
@@ -11416,9 +11563,7 @@ pub(crate) mod tests {
         ev.verdict();
         let out = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            out.contains(
-                "1 short-lived process gap (1 admitted/scanned, 0 never observed)"
-            ),
+            out.contains("1 short-lived process gap (1 admitted/scanned, 0 never observed)"),
             "{out}"
         );
         // A corrupt split clamps: admitted never renders above total.
@@ -11428,9 +11573,7 @@ pub(crate) mod tests {
         ev.verdict();
         let out = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            out.contains(
-                "2 short-lived process gaps (2 admitted/scanned, 0 never observed)"
-            ),
+            out.contains("2 short-lived process gaps (2 admitted/scanned, 0 never observed)"),
             "{out}"
         );
     }
@@ -19344,10 +19487,11 @@ pub(crate) mod tests {
     }
 
     // Dominant retry class: verbose names the largest discovery retry
-    // class behind the generic skipped rows; the concise default stays
-    // one line without it.
+    // class behind the generic skipped rows; both texts name every
+    // nonzero class with its count, and the concise default stays one
+    // line with it.
     #[test]
-    fn coverage_line_verbose_names_the_dominant_retry_class() {
+    fn coverage_line_names_the_retry_breakdown_in_both_texts() {
         let mut ev = evidence();
         ev.skipped = vec![
             SkippedOut {
@@ -19371,45 +19515,49 @@ pub(crate) mod tests {
             verbose.contains("discovery subject (discovery unavailable) x2"),
             "{verbose}"
         );
-        // Tier-3 review M2: the dominant class is its own fragment, and
-        // the user-facing fragment says "process view", not the
-        // internal accumulator label "process-view".
+        // Tier-3 review M2: the breakdown is its own fragment, and the
+        // user-facing fragment says "process view", not the internal
+        // accumulator label "process-view".
         assert!(
-            verbose.contains("dominant retry class: process view x19861"),
+            verbose
+                .contains("discovery retries: other x300, process-ended x341, process view x19861"),
             "{verbose}"
         );
         assert!(
             !verbose.contains("process-view"),
-            "the verbose fragment uses user words, not the accumulator label: {verbose}"
+            "the breakdown uses user words, not the accumulator label: {verbose}"
         );
-        // Structural: the dominant class is its own fragment element,
-        // not an item inside the "skipped: ..." list element (fragments
+        // Structural: the breakdown is its own fragment element, not
+        // an item inside the "skipped: ..." list element (fragments
         // within a group join with ", ", so the joined line alone cannot
         // tell the two apart).
         let fragments = cause_fragments(&ev, &["skipped"], true);
         assert!(
             fragments
                 .iter()
-                .any(|fragment| fragment.starts_with("dominant retry class: ")),
-            "the dominant class is its own fragment: {fragments:?}"
+                .any(|fragment| fragment.starts_with("discovery retries: ")),
+            "the breakdown is its own fragment: {fragments:?}"
         );
         assert!(
             fragments
                 .iter()
                 .filter(|fragment| fragment.starts_with("skipped: "))
-                .all(|fragment| !fragment.contains("dominant retry class")),
-            "the skipped list carries no dominant item: {fragments:?}"
+                .all(|fragment| !fragment.contains("discovery retries")),
+            "the skipped list carries no breakdown item: {fragments:?}"
         );
         let line = coverage_line(&ev, false);
-        assert!(!line.contains("dominant retry class"), "{line}");
+        assert!(
+            line.contains("discovery retries: other x300, process-ended x341, process view x19861"),
+            "{line}"
+        );
         assert!(!line.contains('\n'), "{line}");
     }
 
-    // Dominant retry class, ties: equal counts break toward the
-    // alphabetically first label, and zero counts never win — an
-    // all-zero map names no dominant class at all.
+    // Retry breakdown: classes list alphabetically by label, zero
+    // counts never render, and an all-zero map renders no fragment
+    // in either text.
     #[test]
-    fn coverage_line_verbose_breaks_retry_class_ties_alphabetically() {
+    fn retry_breakdown_lists_classes_alphabetically_and_skips_zeros() {
         let mut ev = evidence();
         ev.skipped = vec![
             SkippedOut {
@@ -19428,12 +19576,15 @@ pub(crate) mod tests {
         ]);
         ev.verdict();
         assert_eq!(ev.completeness, "PARTIAL");
-        let verbose = coverage_line(&ev, true);
-        assert!(
-            verbose.contains("dominant retry class: other x5"),
-            "{verbose}"
-        );
-        // A six-way tie names the alphabetically first of all six labels.
+        for verbosity in [false, true] {
+            let line = coverage_line(&ev, verbosity);
+            assert!(
+                line.contains("discovery retries: other x5, process-ended x5"),
+                "{verbosity}: {line}"
+            );
+            assert!(!line.contains("maps-snapshot"), "{verbosity}: {line}");
+        }
+        // All six labels list alphabetically with user words.
         ev.discovery_retry_classes = BTreeMap::from([
             ("maps-snapshot".to_string(), 7),
             ("object-missing".to_string(), 7),
@@ -19444,14 +19595,19 @@ pub(crate) mod tests {
         ]);
         let verbose = coverage_line(&ev, true);
         assert!(
-            verbose.contains("dominant retry class: maps-snapshot x7"),
+            verbose.contains(
+                "discovery retries: maps-snapshot x7, object-missing x7, other x7, \
+                 process-ended x7, process view x7, stale-view x7"
+            ),
             "{verbose}"
         );
-        // An all-zero map names no dominant class at all.
+        // An all-zero map renders no breakdown at all.
         ev.discovery_retry_classes =
             BTreeMap::from([("maps-snapshot".to_string(), 0), ("other".to_string(), 0)]);
-        let verbose = coverage_line(&ev, true);
-        assert!(!verbose.contains("dominant retry class"), "{verbose}");
+        for verbosity in [false, true] {
+            let line = coverage_line(&ev, verbosity);
+            assert!(!line.contains("discovery retries"), "{verbosity}: {line}");
+        }
     }
 
     // The JSON evidence carries the complete per-class retry breakdown,
@@ -19948,10 +20104,7 @@ pub(crate) mod tests {
         );
         assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 6);
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(
-            text.contains("process exited mid-flight: 6"),
-            "{text}"
-        );
+        assert!(text.contains("process exited mid-flight: 6"), "{text}");
         assert!(!text.contains("discovery steps unavailable"), "{text}");
         assert!(!text.contains("discovery step unavailable"), "{text}");
     }
@@ -19963,7 +20116,8 @@ pub(crate) mod tests {
     #[test]
     fn work_ceiling_wordings_project_to_scan_budget() {
         use crate::discovery::scan::Skipped;
-        const CEILING: &str = "capture discovery work ceiling reached; remaining provider bytes were not scanned";
+        const CEILING: &str =
+            "capture discovery work ceiling reached; remaining provider bytes were not scanned";
         let wrapped = [
             format!("memory scan refused: initial mapping validation unavailable: {CEILING}"),
             format!("memory scan refused: final mapping validation unavailable: {CEILING}"),

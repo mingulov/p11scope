@@ -7008,11 +7008,7 @@ fn descendant_gap_admissions_split_from_never_observed() {
     short_lived.pid_tgid = u64::from(pid.saturating_add(1)) << 32;
     short_lived.hook_ts_ns = admitted;
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(
-        &mut ScriptedSession::default(),
-        &short_lived,
-        &mut pending,
-    );
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &short_lived, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 2);
     assert_eq!(engine.pid_descendant_gaps_admitted(), 1);
 
@@ -7090,17 +7086,28 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     }
     engine.record_publication_skips();
     assert_eq!(engine.plan.skipped.len(), internals.len());
-    let projected: Vec<_> = engine.plan.skipped.iter().map(capture_skipped_out).collect();
+    let projected: Vec<_> = engine
+        .plan
+        .skipped
+        .iter()
+        .map(capture_skipped_out)
+        .collect();
     // One JSON row per underlying record: folding renames, never drops.
     assert_eq!(projected.len(), internals.len());
     let reasons: Vec<&str> = projected.iter().map(|skip| skip.reason.as_str()).collect();
     assert_eq!(
-        reasons.iter().filter(|reason| **reason == "process exited mid-flight").count(),
+        reasons
+            .iter()
+            .filter(|reason| **reason == "process exited mid-flight")
+            .count(),
         6,
         "{reasons:?}"
     );
     assert_eq!(
-        reasons.iter().filter(|reason| **reason == "scan budget exhausted").count(),
+        reasons
+            .iter()
+            .filter(|reason| **reason == "scan budget exhausted")
+            .count(),
         3,
         "{reasons:?}"
     );
@@ -7113,7 +7120,9 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
         "{reasons:?}"
     );
     assert!(
-        reasons.iter().all(|reason| *reason != "discovery unavailable"),
+        reasons
+            .iter()
+            .all(|reason| *reason != "discovery unavailable"),
         "no folded pair stays generic: {reasons:?}"
     );
 }
@@ -14547,7 +14556,7 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
     );
     assert_eq!(
         render::capture_skipped_out(&engine.counters.object_skips[0]).reason,
-        "discovery unavailable"
+        "process exited mid-flight"
     );
     assert!(
         unreadable_member_skip(11, true, "scripted, proven gone", &mut noise).is_none(),

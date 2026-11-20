@@ -623,10 +623,17 @@ fn cell_tight_recurring_budget() -> CellResult {
             advanced = true;
         }
         last_tables_word = cursor.tables.word;
-        if only_module(&outcome, &format!("pass {pass}"))?.tables.len() == 1
-            && cursor.complete
-            && cursor.validated
-        {
+        // Convergence is the cursor's: work-starved passes clear their
+        // publication (flood contract) but stage frontiers, so modules
+        // appear only once a pass completes. A complete validated
+        // cursor always rides a published module (the bracket passed).
+        if cursor.complete && cursor.validated {
+            if only_module(&outcome, &format!("pass {pass}"))?.tables.len() != 1 {
+                return Err(format!(
+                    "a complete validated cursor rides one decoded table: {}",
+                    summarize(&outcome)
+                ));
+            }
             let mut roomy_fixture =
                 LateTableFixture::with_layout(300 << 10, (300 << 10) - 2048, false);
             let (roomy, _) = roomy_fixture.pass(ROOMY_LIMITS, RetainedFileFacts::default());

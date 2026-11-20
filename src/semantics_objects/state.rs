@@ -33,6 +33,12 @@ use pkcs11_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
 
+mod leaves;
+pub(in crate::semantics_objects) use leaves::{DetachedAfter, ModelLeaves, PendingAfter};
+
+/// A detached deferred origin's table key.
+type DetachedKey = (ObjectDomain, KnownScope, u32, AsyncValue);
+
 type InstanceKey = (u64, u64, u64, u64);
 
 /// Test observations of the real settlement loop, never replay authority.
@@ -260,15 +266,21 @@ fn call_kind(function: u32) -> Option<CallKind> {
 /// One resumable retirement of a held domain: the per-row cursor behind
 /// both the atomic abandonment/void disposals and the sliced recovery
 /// passes that charge one leaf unit per row ([`ModelState::retire_domain_step`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct DomainRetirement {
-    domain: ObjectDomain,
-    kind: RetireKind,
-    stage: RetireStage,
+    pub(in crate::semantics_objects) domain: ObjectDomain,
+    pub(in crate::semantics_objects) kind: RetireKind,
+    pub(in crate::semantics_objects) stage: RetireStage,
+    /// Views this retirement ended and sessions it ended: their deferred
+    /// origins (input losses, session disposals) are applied in one
+    /// bounded pass, one origin per unit, instead of a whole-table scan
+    /// under each view's or session's unit.
+    pub(in crate::semantics_objects) retired: BTreeSet<ObjectId>,
+    pub(in crate::semantics_objects) ended: BTreeSet<SessionIncarnation>,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RetireKind {
+pub(in crate::semantics_objects) enum RetireKind {
     /// Unbounded-abandonment disposal (`abandon_domain`): retire, fence
     /// and release every call, void proof under `Loss`.
     Abandon,
@@ -278,13 +290,23 @@ enum RetireKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetireStage {
+pub(in crate::semantics_objects) enum RetireStage {
     Start,
     Views(Option<(SessionIncarnation, ObjectHandle)>),
-    Sessions(Option<SessionHandle>),
+    /// Live sessions past `after`; `clearing` is the session whose
+    /// remaining bindings clear one per unit before it ends.
+    Sessions {
+        after: Option<SessionHandle>,
+        clearing: Option<(SessionHandle, SessionIncarnation)>,
+    },
+    /// The retired views' and ended sessions' deferred origins.
+    DeferredPending(PendingAfter),
+    DeferredDetached(DetachedAfter),
     Bindings,
     FenceCalls(Option<CallKey>),
     RemoveCalls(Option<CallKey>),
+    /// Queued deferred charge releases, one per unit.
+    Releases,
     Finish,
     Done,
 }
@@ -295,6 +317,8 @@ impl DomainRetirement {
             domain,
             kind: RetireKind::Abandon,
             stage: RetireStage::Start,
+            retired: BTreeSet::new(),
+            ended: BTreeSet::new(),
         }
     }
 
@@ -303,10 +327,12 @@ impl DomainRetirement {
             domain,
             kind: RetireKind::Void(upper),
             stage: RetireStage::Start,
+            retired: BTreeSet::new(),
+            ended: BTreeSet::new(),
         }
     }
 
-    fn reason(&self) -> ObjectGap {
+    pub(in crate::semantics_objects) fn reason(&self) -> ObjectGap {
         match self.kind {
             RetireKind::Abandon => ObjectGap::Loss,
             RetireKind::Void(_) => ObjectGap::OutcomeLost,
@@ -1024,32 +1050,6 @@ impl ModelState {
     /// live sessions, each with one live view, plus `rows` pending call
     /// tickets, so a retirement has many model rows under one domain.
     #[cfg(test)]
-    pub(super) fn populate_domain_rows_for_test(&mut self, domain: ObjectDomain, rows: usize) {
-        if !self.domains.contains_key(&domain) {
-            self.register_domain(domain).expect("domain registers");
-        }
-        self.domains.get_mut(&domain).expect("domain").bootstrap = Some(0);
-        let base = self.next_token + 1_000;
-        for index in 0..rows as u64 {
-            let session = self
-                .alloc_session(
-                    domain,
-                    SessionHandle::new(10_000 + index).expect("session handle"),
-                    SessionOrigin::Opened,
-                    SlotScope::reference_known(0, 0),
-                )
-                .expect("session opens");
-            self.alloc_view(
-                domain,
-                session,
-                ObjectHandle::new(20_000 + index).expect("object handle"),
-                ViewOrigin::FirstObserved,
-                Birth::Unknown,
-                [FieldState::Unknown; METADATA_FIELDS],
-                Lifetime::Live,
-            )
-            .expect("view binds");
-    #[cfg(test)]
     /// Test-only: one live session in `domain` holding `tombstones`
     /// tombstoned bindings and `deferred` pending deferred origins, so a
     /// retirement has many rows under a single session.
@@ -1093,6 +1093,32 @@ impl ModelState {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn populate_domain_rows_for_test(&mut self, domain: ObjectDomain, rows: usize) {
+        if !self.domains.contains_key(&domain) {
+            self.register_domain(domain).expect("domain registers");
+        }
+        self.domains.get_mut(&domain).expect("domain").bootstrap = Some(0);
+        let base = self.next_token + 1_000;
+        for index in 0..rows as u64 {
+            let session = self
+                .alloc_session(
+                    domain,
+                    SessionHandle::new(10_000 + index).expect("session handle"),
+                    SessionOrigin::Opened,
+                    SlotScope::reference_known(0, 0),
+                )
+                .expect("session opens");
+            self.alloc_view(
+                domain,
+                session,
+                ObjectHandle::new(20_000 + index).expect("object handle"),
+                ViewOrigin::FirstObserved,
+                Birth::Unknown,
+                [FieldState::Unknown; METADATA_FIELDS],
+                Lifetime::Live,
+            )
+            .expect("view binds");
             let token = CallToken(base + index);
             let key = CallKey::reference(base + index);
             let begin = 30_000 + index;
@@ -2755,18 +2781,33 @@ impl ModelState {
 
     /// End one live view's binding with a finite lifetime state.
     fn end_view(&mut self, id: ObjectId, lifetime: Lifetime, effects: &mut ObjectEffects) {
+        self.end_view_with(id, lifetime, effects, true);
+    }
+
+    /// End one live view; `mark_lost` scans the deferred tables for its
+    /// frozen inputs at once (a bounded retirement instead applies the
+    /// loss in its own per-origin pass). Returns whether the view ended.
+    fn end_view_with(
+        &mut self,
+        id: ObjectId,
+        lifetime: Lifetime,
+        effects: &mut ObjectEffects,
+        mark_lost: bool,
+    ) -> bool {
         let Some(view) = self.objects.get_mut(&id) else {
-            return;
+            return false;
         };
         // Seal bound (journal `SealEffectBound`): only a `Live` view ends,
         // and nothing makes a view `Live` again, so each view ends once.
         if view.lifetime != Lifetime::Live {
-            return;
+            return false;
         }
         view.lifetime = lifetime;
         let (domain, session, handle) = (view.domain, view.session, view.handle);
         self.mark_retired(id, domain);
-        self.mark_deferred_lost(id);
+        if mark_lost {
+            self.mark_deferred_lost(id);
+        }
         effects.push(match lifetime {
             Lifetime::Retired(reason) => ObjectEffect::Retired { object: id, reason },
             Lifetime::AccessEnded(reason) => ObjectEffect::AccessEnded { object: id, reason },
@@ -2778,6 +2819,7 @@ impl ModelState {
         if self.domains[&domain].bindings.get(&(session, handle)) == Some(&Binding::View(id)) {
             self.set_binding(domain, session, handle, None);
         }
+        true
     }
 
     fn destroy_view(&mut self, call: CallToken, id: ObjectId, effects: &mut ObjectEffects) {
@@ -2824,20 +2866,36 @@ impl ModelState {
     }
 
     fn end_session(&mut self, s: SessionIncarnation, end: SessionEnd, effects: &mut ObjectEffects) {
+        self.end_session_with(s, end, effects, true);
+    }
+
+    /// End one live session; `dispose_deferred` scans the deferred tables
+    /// for its origins at once (a bounded retirement clears its bindings
+    /// first and disposes its origins in its own per-origin pass, so the
+    /// loop below finds nothing). Returns whether the session ended.
+    fn end_session_with(
+        &mut self,
+        s: SessionIncarnation,
+        end: SessionEnd,
+        effects: &mut ObjectEffects,
+        dispose_deferred: bool,
+    ) -> bool {
         let Some(record) = self.sessions.get_mut(&s) else {
-            return;
+            return false;
         };
         // Seal bound (journal `SealEffectBound`): only a `Live` session
         // ends, and only allocation makes a session `Live`.
         if record.state != SessionState::Live {
-            return;
+            return false;
         }
         record.state = match end {
             SessionEnd::Closed => SessionState::Closed,
             SessionEnd::Uncertain(reason) => SessionState::Ended(reason),
         };
         let (domain, handle) = (record.domain, record.handle);
-        self.dispose_session_deferred(s);
+        if dispose_deferred {
+            self.dispose_session_deferred(s);
+        }
         let at = self.position(domain);
         self.domains
             .get_mut(&domain)
@@ -2859,6 +2917,7 @@ impl ModelState {
         if let Some(usage) = self.instances.get_mut(&domain.instance_key()) {
             usage.live_sessions -= 1;
         }
+        true
     }
 
     /// Mint one deferred origin at a PENDING object END (6.07b
@@ -4612,154 +4671,20 @@ impl ModelState {
         effects: &mut ObjectEffects,
         units: &mut usize,
     ) -> bool {
-        let domain = retirement.domain;
-        let reason = retirement.reason();
-        loop {
-            if retirement.stage == RetireStage::Done {
-                return true;
-            }
-            if *units == 0 {
-                return false;
-            }
-            *units -= 1;
-            #[cfg(test)]
-            {
-                self.test_retire_units += 1;
-            }
-            match retirement.stage {
-                RetireStage::Start => {
-                    if matches!(retirement.kind, RetireKind::Abandon) {
-                        self.gap(ObjectGap::Loss);
-                    }
-                    if let Err(unheld) = self.held(domain) {
-                        self.gap_effect(effects, unheld);
-                        retirement.stage = RetireStage::Done;
-                        continue;
-                    }
-                    let state = self.domains.get_mut(&domain).expect("held domain");
-                    state.bootstrap = None;
-                    state.initialized = false;
-                    retirement.stage = RetireStage::Views(None);
-                }
-                RetireStage::Views(after) => {
-                    let next = {
-                        let bindings = &self.domains[&domain].bindings;
-                        match after {
-                            None => bindings.iter().next(),
-                            Some(last) => bindings
-                                .range((
-                                    std::ops::Bound::Excluded(last),
-                                    std::ops::Bound::Unbounded,
-                                ))
-                                .next(),
-                        }
-                        .map(|(key, binding)| (*key, *binding))
-                    };
-                    match next {
-                        None => retirement.stage = RetireStage::Sessions(None),
-                        Some((key, binding)) => {
-                            retirement.stage = RetireStage::Views(Some(key));
-                            if let Binding::View(id) = binding {
-                                self.end_view(id, Lifetime::Retired(reason), effects);
-                            }
-                        }
-                    }
-                }
-                RetireStage::Sessions(after) => {
-                    let next = {
-                        let live = &self.domains[&domain].live_sessions;
-                        match after {
-                            None => live.iter().next(),
-                            Some(last) => live
-                                .range((
-                                    std::ops::Bound::Excluded(last),
-                                    std::ops::Bound::Unbounded,
-                                ))
-                                .next(),
-                        }
-                        .map(|(handle, s)| (*handle, *s))
-                    };
-                    match next {
-                        None => retirement.stage = RetireStage::Bindings,
-                        Some((handle, s)) => {
-                            retirement.stage = RetireStage::Sessions(Some(handle));
-                            self.end_session(s, SessionEnd::Uncertain(reason), effects);
-                        }
-                    }
-                }
-                RetireStage::Bindings => {
-                    let next = self.domains[&domain].bindings.keys().next().copied();
-                    match next {
-                        // Removal always succeeds, so the first key is
-                        // always a fresh row.
-                        Some((s, h)) => self.set_binding(domain, s, h, None),
-                        None => {
-                            retirement.stage = match retirement.kind {
-                                RetireKind::Abandon => RetireStage::FenceCalls(None),
-                                RetireKind::Void(_) => RetireStage::Finish,
-                            };
-                        }
-                    }
-                }
-                RetireStage::FenceCalls(after) => {
-                    let next = {
-                        let keys = &self.domains[&domain].keys;
-                        match after {
-                            None => keys.iter().next(),
-                            Some(last) => keys
-                                .range((
-                                    std::ops::Bound::Excluded(last),
-                                    std::ops::Bound::Unbounded,
-                                ))
-                                .next(),
-                        }
-                        .map(|(key, token)| (*key, *token))
-                    };
-                    match next {
-                        None => retirement.stage = RetireStage::RemoveCalls(None),
-                        Some((key, token)) => {
-                            retirement.stage = RetireStage::FenceCalls(Some(key));
-                            self.fence(token);
-                        }
-                    }
-                }
-                RetireStage::RemoveCalls(after) => {
-                    let next = {
-                        let keys = &self.domains[&domain].keys;
-                        match after {
-                            None => keys.iter().next(),
-                            Some(last) => keys
-                                .range((
-                                    std::ops::Bound::Excluded(last),
-                                    std::ops::Bound::Unbounded,
-                                ))
-                                .next(),
-                        }
-                        .map(|(key, token)| (*key, *token))
-                    };
-                    match next {
-                        None => retirement.stage = RetireStage::Finish,
-                        Some((key, token)) => {
-                            retirement.stage = RetireStage::RemoveCalls(Some(key));
-                            self.remove_call(token, ledger);
-                        }
-                    }
-                }
-                RetireStage::Finish => {
-                    // Every view, session and binding already retired
-                    // above, so this is the closing bookkeeping only.
-                    self.void_bootstrap(domain, reason, effects, ledger);
-                    if let RetireKind::Void(upper) = retirement.kind {
-                        self.gap(ObjectGap::OutcomeLost);
-                        if let Some(state) = self.domains.get_mut(&domain) {
-                            state.fence_floor = max_opt(state.fence_floor, Some(upper.0));
-                        }
-                    }
-                    retirement.stage = RetireStage::Done;
-                }
-                RetireStage::Done => unreachable!("checked above"),
-            }
-        }
+        let cap = *units;
+        let mut credit = super::credit::Credit::slice(cap, units);
+        super::recovery_cursor::retire_step(
+            &mut ModelLeaves::new(self),
+            ledger,
+            retirement,
+            effects,
+            &mut credit,
+        )
+    }
+
+    /// The paid model-row surface for the recovery cursor.
+    pub(super) fn leaves(&mut self) -> ModelLeaves<'_> {
+        ModelLeaves::new(self)
     }
 
     /// Per-call disposal for one abandoned effect-free call
@@ -6950,68 +6875,6 @@ mod tests {
         assert_eq!(fx.state.usage().deferred_origins, 1);
         assert_eq!(ledger.charged_bytes(), one);
     }
-    /// I3 on model rows nested under one session: every tombstone the
-    /// session holds and every deferred origin it owns is its own leaf,
-    /// so no poll clears or disposes more rows than the units it debited
-    /// (one-unit and full-credit polls, abandon and void).
-    #[test]
-    fn domain_retirement_charges_each_session_tombstone_and_deferred_record() {
-        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
-        for per_poll in [1usize, 64] {
-            for abandon in [true, false] {
-                let mut state = ModelState::new(ObjectLimits::policy());
-                state.populate_session_tombstones_for_test(domain, 97, 97);
-                assert_eq!(state.tombstones, 97);
-                let mut ledger = super::super::journal::StagingLedger::new();
-                let mut retirement = if abandon {
-                    DomainRetirement::abandon(domain)
-                } else {
-                    DomainRetirement::void(domain, RefCut::reference(40_000))
-                };
-                let mut effects = ObjectEffects::default();
-                let mut polls = 0usize;
-                loop {
-                    let (tombs, deferred) = (state.tombstones, state.deferred_pending.len());
-                    let mut units = per_poll;
-                    let done = state.retire_domain_step(
-                        &mut retirement,
-                        &mut ledger,
-                        &mut effects,
-                        &mut units,
-                    );
-                    let debited = per_poll - units;
-                    let cleared = tombs - state.tombstones;
-                    let disposed = deferred - state.deferred_pending.len();
-                    assert!(
-                        cleared + disposed <= debited,
-                        "per_poll={per_poll} abandon={abandon} poll {polls}: \
-                         {cleared} tombstones and {disposed} deferred records \
-                         under {debited} units"
-                    );
-                    polls += 1;
-                    assert!(polls < 100_000, "the retirement terminates");
-                    if done {
-                        break;
-                    }
-                }
-                assert_eq!(state.tombstones, 0, "every tombstone clears");
-                assert!(
-                    state.deferred_pending.is_empty(),
-                    "the dead session's deferred origins dispose"
-                );
-                assert_eq!(
-                    effects
-                        .effects
-                        .iter()
-                        .filter(|effect| matches!(effect, ObjectEffect::SessionEnded { .. }))
-                        .count(),
-                    1,
-                    "the one session ends once"
-                );
-            }
-        }
-    }
-
 
     // Pool-backed disposal twin driver (607b-F3 round 2): mint one
     // deferred origin against the shared pool, pin the pool at its
@@ -7091,6 +6954,68 @@ mod tests {
     /// holds more rows than one credit, and produces exactly the atomic
     /// disposal's effects, gaps and residual usage (both kinds, several
     /// row counts and per-poll budgets).
+    /// I3 on model rows nested under one session: every tombstone the
+    /// session holds and every deferred origin it owns is its own leaf,
+    /// so no poll clears or disposes more rows than the units it debited
+    /// (one-unit and full-credit polls, abandon and void).
+    #[test]
+    fn domain_retirement_charges_each_session_tombstone_and_deferred_record() {
+        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+        for per_poll in [1usize, 64] {
+            for abandon in [true, false] {
+                let mut state = ModelState::new(ObjectLimits::policy());
+                state.populate_session_tombstones_for_test(domain, 97, 97);
+                assert_eq!(state.tombstones, 97);
+                let mut ledger = super::super::journal::StagingLedger::new();
+                let mut retirement = if abandon {
+                    DomainRetirement::abandon(domain)
+                } else {
+                    DomainRetirement::void(domain, RefCut::reference(40_000))
+                };
+                let mut effects = ObjectEffects::default();
+                let mut polls = 0usize;
+                loop {
+                    let (tombs, deferred) = (state.tombstones, state.deferred_pending.len());
+                    let mut units = per_poll;
+                    let done = state.retire_domain_step(
+                        &mut retirement,
+                        &mut ledger,
+                        &mut effects,
+                        &mut units,
+                    );
+                    let debited = per_poll - units;
+                    let cleared = tombs - state.tombstones;
+                    let disposed = deferred - state.deferred_pending.len();
+                    assert!(
+                        cleared + disposed <= debited,
+                        "per_poll={per_poll} abandon={abandon} poll {polls}: \
+                         {cleared} tombstones and {disposed} deferred records \
+                         under {debited} units"
+                    );
+                    polls += 1;
+                    assert!(polls < 100_000, "the retirement terminates");
+                    if done {
+                        break;
+                    }
+                }
+                assert_eq!(state.tombstones, 0, "every tombstone clears");
+                assert!(
+                    state.deferred_pending.is_empty(),
+                    "the dead session's deferred origins dispose"
+                );
+                assert_eq!(
+                    effects
+                        .effects
+                        .iter()
+                        .filter(|effect| matches!(effect, ObjectEffect::SessionEnded { .. }))
+                        .count(),
+                    1,
+                    "the one session ends once"
+                );
+            }
+        }
+    }
+
     #[test]
     fn domain_retirement_cursor_matches_atomic_and_bounds_each_poll() {
         let domain = ObjectDomain::reference(1, 1, 1, 1, 1);

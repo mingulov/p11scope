@@ -882,13 +882,23 @@ fn length_identity_refusal_abandons_the_stash_on_both_halves() {
         modeled_contract(MAIN),
         "object_return must abandon the stash in its identity-refusal arm"
     );
+    // Non-vacuity: removing the identity-arm abandon breaks the
+    // contract. The removal targets the identity arm specifically
+    // (the aggregate gate above it abandons too, so a first-match
+    // removal would prove nothing).
     let start = ROOTS
         .find("    pub(crate) fn ordinary_return<Record: ReturnPayload>(")
         .unwrap();
     let marker = "length_return_abandon(&key)";
-    let tail = ROOTS[start..].replacen(marker, "REMOVED", 1);
+    let identity = ROOTS[start..].find("!image_pair_matches").unwrap() + start;
+    let abandon = ROOTS[identity..].find(marker).unwrap() + identity;
+    let mutated = format!(
+        "{}REMOVED{}",
+        &ROOTS[..abandon],
+        &ROOTS[abandon + marker.len()..]
+    );
     assert!(
-        !ordinary_contract(&format!("{}{}", &ROOTS[..start], tail)),
+        !ordinary_contract(&mutated),
         "removed ordinary identity abandon"
     );
 }

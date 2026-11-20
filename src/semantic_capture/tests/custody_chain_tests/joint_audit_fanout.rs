@@ -31304,6 +31304,229 @@ fn joint_abandoned_read_with_corroborated_negative_keeps_key_refusal() {
     }
 }
 
+/// Model rows retired so far (test-only counter on the canonical model).
+fn retired_rows(fixture: &CanonicalFanoutScene) -> usize {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .test_retire_units()
+}
+
+/// Serve one frame as the coordinator does (each poll one credit shared
+/// by seal and delivery) until it completes, asserting no poll retires
+/// more model rows than its credit. Returns the poll count.
+fn drive_frame_counting_rows(
+    fixture: &mut CanonicalFanoutScene,
+    frame: &mut IngestedJointQuantum,
+    fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    credit: usize,
+) -> usize {
+    let h0 = fixture.scene.real.h0.clone();
+    let mut polls = 0usize;
+    while polls < 4_096 {
+        polls += 1;
+        let before = retired_rows(fixture);
+        let progress = {
+            let mut births = NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            };
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            let mut remaining = credit;
+            frame
+                .seal_next_bounded(&mut ports, &mut births, fault, &mut remaining)
+                .unwrap();
+            let mut diagnosis =
+                crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
+            frame
+                .deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis)
+                .unwrap()
+        };
+        let rows = retired_rows(fixture) - before;
+        assert!(rows <= credit, "poll {polls} retired {rows} model rows");
+        if matches!(
+            progress,
+            QuantumSealProgress::Complete | QuantumSealProgress::AwaitFutureInput
+        ) {
+            return polls;
+        }
+    }
+    panic!("the bounded rejection always completes");
+}
+
+/// A collection audit void over a key holding 97 model rows (sessions,
+/// views, call tickets), on the production frame: the audit decision
+/// retires no more than one credit, every frame service poll (one
+/// 64-unit credit shared by seal and delivery, as the coordinator runs it)
+/// retires at most its credit, more than one poll is needed, and the
+/// delivered failure still carries every row's retirement.
+#[test]
+fn joint_audit_void_rejection_never_exceeds_one_credit_per_poll() {
+    const ROWS: usize = 97;
+    const CREDIT: usize = 64;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let proof = target.bootstrap().proof();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .model_mut()
+        .populate_domain_rows_for_test(target.bootstrap().domain(), ROWS);
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    let fault = FrameFault::clean();
+    fault.epoch.set(1);
+    let before = retired_rows(&fixture);
+    let mut frame = fixture.audited(1, 1, &fault);
+    let at_audit = retired_rows(&fixture) - before;
+    assert!(
+        at_audit <= CREDIT,
+        "the audit decision retired {at_audit} model rows in one call"
+    );
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    let polls = drive_frame_counting_rows(&mut fixture, &mut frame, &fault, CREDIT);
+    assert!(polls > 1, "{ROWS} model rows never retire under one credit");
+    let failure = frame
+        .failure_for_test()
+        .expect("the frame carries the audit void");
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::FaultChanged
+    );
+    assert!(
+        failure.affects_proof_for_test(&proof),
+        "the all-key scope covers the key"
+    );
+    let ended = failure
+        .effects
+        .effects
+        .iter()
+        .filter(|effect| matches!(effect, ObjectEffect::SessionEnded { .. }))
+        .count();
+    let retired = failure
+        .effects
+        .effects
+        .iter()
+        .filter(|effect| matches!(effect, ObjectEffect::Retired { .. }))
+        .count();
+    assert!(
+        ended >= ROWS && retired >= ROWS,
+        "every row's retirement rides the failure: ended={ended} retired={retired}"
+    );
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame
+        .finish_frame(&mut ports)
+        .unwrap_or_else(|(_, reason)| panic!("the voided frame finishes: {reason:?}"));
+}
+
+/// A seal-time key doom (a read abandonment whose return proved a
+/// lifecycle negative) over a key holding 97 model rows, on the
+/// production frame: the refusal publishes at the seal, the key's model
+/// rows retire through the frame's service credit, at most one credit
+/// per poll, across more than one poll, and the key stays refused.
+#[test]
+fn joint_seal_time_doom_retires_rows_per_credit_on_frame() {
+    use pkcs11_types::CkRv;
+    const ROWS: usize = 97;
+    const CREDIT: usize = 64;
+    let (mut fixture, mut frame, proof) =
+        stage_neutral_abandonment(false, CkRv::SESSION_HANDLE_INVALID.0);
+    let domain = fixture.replay_target().0.bootstrap().domain();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .model_mut()
+        .populate_domain_rows_for_test(domain, ROWS);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    // Seal service only: the synthetic rows are model-side, so this twin
+    // stops once the doom's rows have retired (delivery would verify the
+    // feed's own history, which the synthetic rows are not part of).
+    let start = retired_rows(&fixture);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut polls = 0usize;
+    while retired_rows(&fixture) - start < ROWS {
+        polls += 1;
+        assert!(polls < 4_096, "the bounded doom always completes");
+        let before = retired_rows(&fixture);
+        {
+            let mut births = NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            };
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            let mut remaining = CREDIT;
+            frame
+                .seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining)
+                .unwrap();
+        }
+        let rows = retired_rows(&fixture) - before;
+        assert!(rows <= CREDIT, "poll {polls} retired {rows} model rows");
+    }
+    assert!(polls > 1, "{ROWS} model rows never retire under one credit");
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .proof_refused_for_test(proof),
+        "the doomed key stays refused"
+    );
+}
+
 #[test]
 fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
     with_genuine_prior_terminal(false, false, |_, _, _, _, _| false);

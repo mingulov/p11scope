@@ -636,24 +636,30 @@ PY
     # iteration, so key rows must render and one -v per-key sign row
     # must carry the exact classified-size fragment (proving lengths
     # joined through the 648-byte decode into key rows; a bare token
-    # elsewhere, such as a provider tally, proves nothing), and the
-    # terminal retained-decoder count must read zero malformed
-    # records (a decode regression would strand every sized call
-    # there). The audit-void split stays for explaining the selected
-    # cause; only the raw decoder total proves the invariant, and an
-    # absent or unprovable count refuses.
+    # elsewhere, such as a provider tally, proves nothing), and one
+    # exact terminal retained-decoder record must read zero
+    # malformed records (a decode regression would strand every
+    # sized call there). Both decoder fields are evaluated on that
+    # single record only: a zero, flag or `unknown` on any other
+    # line proves nothing. The audit-void split stays for
+    # explaining the selected cause; only the raw decoder total
+    # proves the invariant, and an absent, duplicate, malformed or
+    # unprovable count refuses.
     if [ "$KEY_SIZES" = 1 ] && [ -f "$J_TXT" ]; then
         if ! grep -Eq 'key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+' "$J_TXT"; then
             add_reason "key rows never rendered under --key-sizes"
         elif ! grep -Eq '^  key row [^ ]+ object [^ ]+ sign key .*RSA 2048 \(from signature length\)' "$J_TXT"; then
             add_reason "no classified RSA-2048 size under --key-sizes"
         fi
-        if ! grep -q 'raw_malformed=' "$J_TXT"; then
+        DECODER_LINES=$(grep -c '^p11scope: joint decoder: ' "$J_TXT" || true)
+        if [ "$DECODER_LINES" != 1 ]; then
             add_reason "raw malformed count absent or unprovable under --key-sizes"
-        elif grep -q 'raw_malformed=unknown' "$J_TXT" || ! grep -q 'raw_malformed_unprovable=0' "$J_TXT"; then
-            add_reason "raw malformed count absent or unprovable under --key-sizes"
-        elif ! grep -Eq 'raw_malformed=0( |$)' "$J_TXT"; then
+        elif grep -Eq '^p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0$' "$J_TXT"; then
+            : # the single provable terminal zero
+        elif grep -Eq '^p11scope: joint decoder: raw_malformed=[1-9][0-9]* raw_malformed_unprovable=0$' "$J_TXT"; then
             add_reason "malformed journal records under --key-sizes"
+        else
+            add_reason "raw malformed count absent or unprovable under --key-sizes"
         fi
     fi
     OBSERVED="unknown"

@@ -7127,23 +7127,92 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for the folded terminal-record pair: it has no cheap
-/// live seam, so the test pins its filing site's exact strings in
-/// source. A reword must update the projection allowlist in the same
-/// patch instead of silently unfolding back to generic.
+/// Drift guard for all eight folded gap-noise pairs (six mid-flight,
+/// two loader-context): filing sites without a cheap live seam pin
+/// their exact strings in source, so a reword must update the
+/// projection allowlist in the same patch instead of silently
+/// unfolding back to generic. Each pair also asserts its
+/// `capture_skipped_out` projection.
 #[test]
-fn folded_terminal_record_pair_matches_its_filing_site() {
+fn folded_gap_noise_pairs_match_their_filing_sites() {
     let source = include_str!("engine.rs");
-    assert!(
-        source.contains("\"live discovery record\"")
-            && source.contains(
-                "\"a structurally valid private terminal record failed exact live resolution\""
-            ),
-        "the folded terminal-record pair must keep its filing site"
-    );
+    // (subject, reason, public reason): the seven pairs filed as
+    // quoted literals in `engine.rs` source.
+    let pairs: &[(&str, &str, &str)] = &[
+        (
+            "live discovery generation",
+            "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+            "process exited mid-flight",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during inventory preflight",
+            "process exited mid-flight",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+            "process exited mid-flight",
+        ),
+        (
+            "live discovery generation",
+            "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+            "process exited mid-flight",
+        ),
+        (
+            "live discovery record",
+            "a structurally valid private terminal record failed exact live resolution",
+            "process exited mid-flight",
+        ),
+        (
+            "live export hook",
+            "a refreshed provider had no unique attached loader context",
+            "no unique attached loader context",
+        ),
+        (
+            "live manifest getter hook",
+            "a manifest getter's process had no unique attached loader context",
+            "no unique attached loader context",
+        ),
+    ];
+    for &(subject, reason, public) in pairs {
+        let quoted_subject = format!("\"{subject}\"");
+        let quoted_reason = format!("\"{reason}\"");
+        assert!(
+            source.contains(quoted_subject.as_str()),
+            "folded pair ({subject}, {reason}) must keep its subject at its filing site"
+        );
+        assert!(
+            source.contains(quoted_reason.as_str()),
+            "folded pair ({subject}, {reason}) must keep its reason at its filing site"
+        );
+        let projected = crate::render::capture_skipped_out(&Skipped {
+            subject: subject.into(),
+            reason: reason.into(),
+        });
+        assert_eq!(
+            projected.reason, public,
+            "folded pair ({subject}, {reason})"
+        );
+    }
+    // The eighth pair lives in split `UNREADABLE_MEMBER_*` constants,
+    // so its filing site pins the constant definitions instead of one
+    // quoted literal (the joined reason still asserts its projection).
+    for marker in [
+        "UNREADABLE_MEMBER_SUBJECT",
+        "UNREADABLE_MEMBER_REASON",
+        "\"process view\"",
+        "\"a process in scope could not be retained or scanned before it changed; a provider",
+        "only that generation mapped was never discovered",
+    ] {
+        assert!(
+            source.contains(marker),
+            "the unreadable-member filing site must keep {marker}"
+        );
+    }
     let projected = crate::render::capture_skipped_out(&Skipped {
-        subject: "live discovery record".into(),
-        reason: "a structurally valid private terminal record failed exact live resolution".into(),
+        subject: "process view".into(),
+        reason: "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered".into(),
     });
     assert_eq!(projected.reason, "process exited mid-flight");
 }

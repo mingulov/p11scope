@@ -202,6 +202,35 @@ LINKED_KEY_SIZES_TRAILING_DECODER_TEXT = LINKED_KEY_SIZES_TEXT.replace(
     "p11scope: joint decoder: raw_malformed=0 "
     "raw_malformed_unprovable=0 trailing-bytes\n")
 
+#: The healthy --key-sizes transcript whose seal line carries NUL
+#: immediately after the lane-ready marker: the fragment check
+#: still matches, but the complete proof must refuse.
+LINKED_KEY_SIZES_SEAL_NUL_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "p11scope: semantic lane ready;",
+    "p11scope: semantic lane ready\x00;", 1)
+
+#: The healthy --key-sizes transcript whose activity line replaces
+#: the fields after `bindings 1` with arbitrary text: the prefix
+#: check still matches, but the complete proof must refuse.
+LINKED_KEY_SIZES_ACTIVITY_MANGLED_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "bindings 1, refused 0, hook misses 0, eras 0, instances 1",
+    "bindings 1 ARBITRARY", 1)
+
+#: The healthy --key-sizes transcript whose key summary carries a
+#: trailing control byte: the fragment check still matches, but the
+#: complete proof must refuse.
+LINKED_KEY_SIZES_SUMMARY_BEL_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "key operations: 2 keys on 1 provider; rev 12 populated; 1 session\n",
+    "key operations: 2 keys on 1 provider; rev 12 populated; 1 session\x07\n",
+    1)
+
+#: The healthy --key-sizes transcript whose classified RSA per-key
+#: row carries a trailing BEL: the fragment check still matches,
+#: but the complete proof must refuse.
+LINKED_KEY_SIZES_RSA_BEL_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "RSA 2048 (from signature length)\n",
+    "RSA 2048 (from signature length)\x07\n", 1)
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -233,6 +262,22 @@ if name=='vng':
     if os.environ.get('FAKE_BAD_HELPER')=='bad': (out/'guest-env.sh').write_text('return 0\n')
     release=os.environ.get('FAKE_RELEASE_PIN') or (kernel[1:]+'-test' if kernel.startswith('v') else kernel+'-test')
     env={**os.environ,'FAKE_RELEASE':release}
+    mangle=os.environ.get('FAKE_VNG_MANGLE')
+    if mangle:
+        done=subprocess.run(['/bin/sh','-c',command],env=env,capture_output=True)
+        lines=done.stdout.split(b'\n')
+        fixed=[]
+        for line in lines:
+            if mangle=='work-ready-bare' and line.startswith(b'guest-work-ready='): line=b'guest-work-ready='
+            elif mangle=='token-ok-suffix' and line==b'guest-stage=token-ok': line=b'guest-stage=token-okEXTRA'
+            elif mangle=='workload-ready-bel' and line==b'guest-stage=workload-ready': line=b'guest-stage=workload-ready\x07'
+            elif mangle=='release-suffix' and line.startswith(b'guest-release='): line=line+b'=unexpected'
+            elif mangle=='journal-rc-suffix' and line.startswith(b'journal-rc='): line=line+b'=unexpected'
+            fixed.append(line)
+        sys.stdout.buffer.write(b'\n'.join(fixed))
+        sys.stdout.buffer.flush()
+        sys.stderr.buffer.write(done.stderr)
+        sys.exit(done.returncode)
     if os.environ.get('FAKE_STRIP_STAGED'):
         done=subprocess.run(['/bin/sh','-c',command],env=env,capture_output=True,text=True)
         for line in done.stdout.splitlines():
@@ -321,6 +366,10 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-nul-decoder": key_sizes_rows(),
             "linked-key-sizes-control-decoder": key_sizes_rows(),
             "linked-key-sizes-trailing-decoder": key_sizes_rows(),
+            "linked-key-sizes-seal-nul": key_sizes_rows(),
+            "linked-key-sizes-activity-mangled": key_sizes_rows(),
+            "linked-key-sizes-summary-bel": key_sizes_rows(),
+            "linked-key-sizes-rsa-bel": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -391,6 +440,14 @@ class JournalGateTests(unittest.TestCase):
                 "rc": 0, "text": LINKED_KEY_SIZES_CONTROL_DECODER_TEXT},
             "linked-key-sizes-trailing-decoder": {
                 "rc": 0, "text": LINKED_KEY_SIZES_TRAILING_DECODER_TEXT},
+            "linked-key-sizes-seal-nul": {
+                "rc": 0, "text": LINKED_KEY_SIZES_SEAL_NUL_TEXT},
+            "linked-key-sizes-activity-mangled": {
+                "rc": 0, "text": LINKED_KEY_SIZES_ACTIVITY_MANGLED_TEXT},
+            "linked-key-sizes-summary-bel": {
+                "rc": 0, "text": LINKED_KEY_SIZES_SUMMARY_BEL_TEXT},
+            "linked-key-sizes-rsa-bel": {
+                "rc": 0, "text": LINKED_KEY_SIZES_RSA_BEL_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -1062,6 +1119,135 @@ class JournalGateTests(unittest.TestCase):
                                     key_sizes="1")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_bare_work_ready_fails(self):
+        # A bare guest-work-ready marker proves no staged work area:
+        # the complete proof refuses as infrastructure.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "work-ready-bare"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest work area never readied", row["detail"])
+
+    def test_key_sizes_run_with_token_ok_suffix_fails(self):
+        # A token-ok stage with trailing bytes is not the exact
+        # marker: the complete proof refuses as infrastructure.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "token-ok-suffix"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest stages never ran", row["detail"])
+
+    def test_key_sizes_run_with_workload_ready_bel_fails(self):
+        # A workload-ready stage with a trailing BEL is not the exact
+        # marker: the complete proof refuses as infrastructure.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "workload-ready-bel"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest stages never ran", row["detail"])
+
+    def test_key_sizes_run_with_release_suffix_fails(self):
+        # A guest release with a second equals section is not the
+        # exact record: the extractor must not discard it.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "release-suffix"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("expected", row["detail"])
+
+    def test_key_sizes_run_with_journal_rc_suffix_fails(self):
+        # A guest exit record with a second equals section is not the
+        # exact record: the extractor must not discard it.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "journal-rc-suffix"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertNotEqual(row["qualification"], "qualified")
+
+    def test_key_sizes_run_with_seal_nul_fails(self):
+        # A seal line with NUL after the marker still contains the
+        # fragment, but the complete proof must refuse.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-seal-nul",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("semantic lane never sealed", result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_mangled_activity_fails(self):
+        # An activity line with arbitrary text after the bindings
+        # count still contains the prefix, but the complete proof
+        # must refuse as idle.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-activity-mangled",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("linked lane idle", result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_summary_bel_fails(self):
+        # A key summary with a trailing BEL still contains the
+        # fragment, but the complete proof must refuse as never
+        # rendered.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-summary-bel",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("key rows never rendered under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_rsa_bel_fails(self):
+        # A classified RSA per-key row with a trailing BEL still
+        # contains the fragment, but the complete proof must refuse.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-rsa-bel",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no classified RSA-2048 size under --key-sizes",
                       result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])

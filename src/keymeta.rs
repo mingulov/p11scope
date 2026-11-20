@@ -89,6 +89,16 @@ const GENERIC_SECRET_IDS: &[u64] = &[
 ];
 const HKDF_IDS: &[u64] = &[0x0000402a, 0x0000402b];
 const ML_KEM_IDS: &[u64] = &[0x00000017];
+/// The one attested vendor exception to the §4.2 vendor rule:
+/// `CKM_NSS_ML_KEM` (`0xCE53_4381`, NSS `lib/util/pkcs11n.h`
+/// `CKM_NSS + 49`), exposed by softokn beside standard `CKM_ML_KEM`
+/// and used for TLS KEM operations (`lib/ssl/tls13con.c`). Same
+/// family and length map as the standard id; the vendor keygen id
+/// (`0xCE53_4380`) stays silent under the creation rule, and legacy
+/// Kyber (`0xCE53_437D/0xCE53_437E`) stays silent (Kyber is not
+/// ML-KEM). De-facto NSS block ownership is the same reliance the
+/// display-only vendor table already takes.
+const NSS_ML_KEM_IDS: &[u64] = &[0xCE53_4381];
 const ML_DSA_IDS: &[u64] = &[
     0x0000001d, 0x0000001f, 0x00000023, 0x00000024, 0x00000025, 0x00000026, 0x00000027, 0x00000028,
     0x00000029, 0x0000002a, 0x0000002b, 0x0000002c,
@@ -160,7 +170,9 @@ const AES_KW_PKCS7_ID: u64 = 0x0000210c;
 /// Infer the §4.2 family for one mechanism id, or `None` when the id
 /// infers nothing (unlisted, vendor, keygen/parameter-gen, CMS_SIG,
 /// PBKD2, PBA, or an unobserved legacy id). Full-width equality:
-/// hostile-width aliases never match.
+/// hostile-width aliases never match. The one exception is the
+/// attested NSS ML-KEM operation id ([`NSS_ML_KEM_IDS`]), which
+/// infers exactly like standard `CKM_ML_KEM`.
 pub(crate) fn infer_family(mechanism: u64) -> Option<KeyFamily> {
     // Spec order; each table is sorted for binary search.
     if RSA_IDS.binary_search(&mechanism).is_ok() {
@@ -194,6 +206,9 @@ pub(crate) fn infer_family(mechanism: u64) -> Option<KeyFamily> {
         return Some(KeyFamily::Hkdf);
     }
     if ML_KEM_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::MlKem);
+    }
+    if NSS_ML_KEM_IDS.binary_search(&mechanism).is_ok() {
         return Some(KeyFamily::MlKem);
     }
     if ML_DSA_IDS.binary_search(&mechanism).is_ok() {
@@ -709,6 +724,9 @@ pub(crate) fn classify_size(mechanism: Option<u64>, tag: EvidenceTag, length: u6
         };
     }
     if ML_KEM_IDS.binary_search(&mechanism).is_ok() {
+        return classify_ml_kem(tag, length);
+    }
+    if NSS_ML_KEM_IDS.binary_search(&mechanism).is_ok() {
         return classify_ml_kem(tag, length);
     }
     if ML_DSA_IDS.binary_search(&mechanism).is_ok() {

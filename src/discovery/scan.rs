@@ -9652,14 +9652,13 @@ mod tests {
                 .map_or(measured.work_units_count(), |b| b.1)
                 + 1,
         );
-        // Data-always: a work-starved bracket over a live view keeps the
-        // decoded module with the failure named, never an empty view.
+        // A work-starved bracket over a live view drops the decoded
+        // module with the failure named: its pins cannot succeed, so the
+        // bracket clears instead of publishing.
         let outcome = f.run(&mut budget).unwrap();
-        assert_eq!(outcome.modules().len(), 1);
-        assert_eq!(outcome.modules()[0].tables.len(), 1);
         assert!(
-            !outcome.modules()[0].tables_scan_finished,
-            "a kept module never claims a finished tables scan: {outcome:?}"
+            outcome.modules().is_empty(),
+            "a work-starved bracket publishes nothing: {outcome:?}"
         );
         assert!(
             outcome
@@ -9736,14 +9735,16 @@ mod tests {
         );
     }
 
-    /// The table-decode ceiling names its remainder and keeps what it
-    /// decoded: one provider fills the 512th candidate slot, the other
-    /// two are refused, the work budget starves the final bracket, and
-    /// the live view still pins the process. The decoded module must
-    /// be published with the bracket failure named — never an empty
-    /// view — plus one counted gap for the two undecoded files.
+    /// The table-decode ceiling names its remainder while a work-starved
+    /// bracket drops what it decoded: one provider fills the 512th
+    /// candidate slot, the other two are refused, the work budget
+    /// starves the final bracket, and the live view still pins the
+    /// process. The decoded module must be dropped with the bracket
+    /// failure named — a work-starved bracket never publishes, since
+    /// its pins cannot succeed — plus one counted gap for the two
+    /// undecoded files.
     #[test]
-    fn work_starved_bracket_keeps_decoded_tables_with_counted_undecoded_gap() {
+    fn work_starved_bracket_drops_decoded_tables_with_counted_undecoded_gap() {
         // Control: the same saturated ceiling with a healthy work budget.
         // One provider fills the 512th candidate slot, two are refused
         // per-file, and the bracket passes. Its scan-only work figure
@@ -9788,10 +9789,13 @@ mod tests {
             .iter()
             .filter(|module| !module.tables.is_empty())
             .collect();
-        assert_eq!(
-            decoded.len(),
-            1,
-            "the 512th candidate survives its starved bracket: {outcome:?}"
+        assert!(
+            outcome.modules().is_empty(),
+            "a work-starved bracket drops its decoded modules: {outcome:?}"
+        );
+        assert!(
+            decoded.is_empty(),
+            "no decoded table survives a work-starved bracket: {outcome:?}"
         );
         assert!(
             outcome
@@ -10108,13 +10112,15 @@ mod tests {
         }
     }
 
-    /// The stop-break site carries the same plain row: with the table
-    /// ceiling fully saturated and the work budget sized to stop inside
-    /// the first provider's tables scan, the refused module breaks the
-    /// loop with its plain ceiling row (never the no-table remedy), the
-    /// second provider is never visited, and the counted gap says one.
-    /// Ceilings are probed, not computed: work accounting is
-    /// deterministic, and the first ceiling with the break shape wins.
+    /// The stop-break site carries the same plain row while the
+    /// work-starved bracket drops the module: with the table ceiling
+    /// fully saturated and the work budget sized to stop inside the
+    /// first provider's tables scan, the refused module breaks the
+    /// loop with its plain ceiling row (never the no-table remedy),
+    /// the second provider is never visited, the counted gap says one,
+    /// and the starved bracket publishes nothing. Ceilings are probed,
+    /// not computed: work accounting is deterministic, and the first
+    /// ceiling with the break shape wins.
     #[test]
     fn refused_file_stopped_mid_scan_keeps_its_plain_ceiling_row() {
         fn break_shape(delta: u64) -> Option<ScanOutcome> {
@@ -10124,11 +10130,17 @@ mod tests {
             budget.set_work_ceiling_for_test(budget.work_units_count() + delta);
             let hints = probe.provider_paths();
             let outcome = probe.run_with_hints(&hints, &mut budget).unwrap();
-            (outcome.modules().len() == 1
+            let refused = hints[0].display().to_string();
+            (outcome.modules().is_empty()
                 && outcome.skipped().iter().any(|skip| {
                     skip.subject == "table decode"
                         && skip.reason
                             == "1 provider file was not decoded: table decode ceiling reached"
+                })
+                && outcome.skipped().iter().any(|skip| {
+                    skip.subject == refused
+                        && skip.reason
+                            == "provider file was not decoded: table decode ceiling reached"
                 }))
             .then_some(outcome)
         }
@@ -10144,13 +10156,10 @@ mod tests {
         let hints = f.provider_paths();
         let outcome = f.run_with_hints(&hints, &mut budget).unwrap();
         assert_eq!(budget.stopped_reason(), Some(WORK_CEILING_REASON));
-        assert_eq!(
-            outcome.modules().len(),
-            1,
-            "the stop breaks the loop before the second provider: {outcome:?}"
+        assert!(
+            outcome.modules().is_empty(),
+            "the work-starved bracket publishes nothing: {outcome:?}"
         );
-        assert_eq!(outcome.modules()[0].path, hints[0].display().to_string());
-        assert!(outcome.modules()[0].tables.is_empty());
         assert!(
             outcome
                 .skipped()
@@ -10298,10 +10307,11 @@ mod tests {
     /// C1 twin (two providers): the check proves the first provider's
     /// mapping changed (`Ok(false)`), then the second provider's
     /// validation spend starves the work ceiling. The proven-changed
-    /// module must be dropped with its mapping-changed row; the later,
-    /// never-validated module keeps with an unfinished scan.
+    /// module must be dropped with its mapping-changed row, and the
+    /// work-starved bracket drops the later, never-validated module
+    /// too — a work-starved bracket never publishes.
     #[test]
-    fn starved_bracket_drops_a_proven_changed_module_and_keeps_the_later_unproven_one() {
+    fn work_starved_bracket_drops_both_modules_with_named_rows() {
         fn changed_first() -> BracketFixture {
             let mut fixture = BracketFixture::with_providers(8, true, &["provider2.so"]);
             fixture.maps_b = fixture
@@ -10345,22 +10355,19 @@ mod tests {
             "a proven-changed module is dropped, never published: {outcome:?}"
         );
         assert!(
-            outcome
+            !outcome
                 .skipped()
                 .iter()
                 .any(|s| s.subject == changed_path && s.reason == MAPPING_CHANGED_REASON),
-            "the proven change stays named: {outcome:?}"
+            "a work-starved clear files no per-module row; the bracket failure names the occurrence: {outcome:?}"
         );
-        let kept: Vec<_> = outcome
-            .modules()
-            .iter()
-            .filter(|m| m.path == kept_path)
-            .collect();
-        assert_eq!(kept.len(), 1, "the unproven module keeps: {outcome:?}");
-        assert_eq!(kept[0].tables.len(), 1);
         assert!(
-            !kept[0].tables_scan_finished,
-            "a kept module never claims a finished tables scan: {outcome:?}"
+            outcome.modules().iter().all(|m| m.path != kept_path),
+            "the work-starved bracket drops the later unproven module too: {outcome:?}"
+        );
+        assert!(
+            outcome.modules().is_empty(),
+            "a work-starved bracket publishes nothing: {outcome:?}"
         );
         assert!(
             outcome
@@ -10376,8 +10383,8 @@ mod tests {
     /// C1 twin (generation stop): the check passes — one validation proves
     /// a mapping change — then `final_generation` spends the last work
     /// unit (production proves the filesystem there). The `(Ok, Err)` arm
-    /// must still drop the proven-changed module with its row, and keep
-    /// an unproven module unfinished.
+    /// must still drop the proven-changed module with its row, and the
+    /// work-starved generation proof drops the unproven module too.
     #[test]
     fn generation_stop_after_a_passed_check_still_drops_a_proven_changed_module() {
         for changed in [false, true] {
@@ -10423,18 +10430,16 @@ mod tests {
                     "a proven-changed module is dropped, never published: {outcome:?}"
                 );
                 assert!(
-                    outcome
+                    !outcome
                         .skipped()
                         .iter()
                         .any(|s| s.subject == path && s.reason == MAPPING_CHANGED_REASON),
-                    "the proven change stays named: {outcome:?}"
+                    "a work-starved clear files no per-module row; the generation proof names the occurrence: {outcome:?}"
                 );
             } else {
-                assert_eq!(outcome.modules().len(), 1);
-                assert_eq!(outcome.modules()[0].tables.len(), 1);
                 assert!(
-                    !outcome.modules()[0].tables_scan_finished,
-                    "a kept module never claims a finished tables scan: {outcome:?}"
+                    outcome.modules().is_empty(),
+                    "a work-starved generation proof publishes nothing: {outcome:?}"
                 );
             }
             assert!(!outcome.mapping_scan_completed());

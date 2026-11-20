@@ -36,17 +36,21 @@
 //!   nonempty late-provider rescan with physical publication and loader
 //!   rearm (ticket 256), original-head admission, zero unexplained loss.
 //! - `pressure_live256_all_blocked_twin_refuses_once` (privileged): the
-//!   separately declared all-blocked/N+1 twin: exactly one head refusal,
-//!   sticky loss, FIFO progress, and a batch no strict lossless verdict
-//!   can pass. No capacity reset.
+//!   separately declared all-blocked/N+1 twin: exactly one head deferral
+//!   (no truncation, no dropped age, one unfinished row), FIFO progress,
+//!   and eventual head admission through later service ticks. No capacity
+//!   reset. (Keeps its historical name; the refusal body was re-cut to
+//!   defer-not-drop per the r5 controller ruling on r3 PARTIAL 62dd42525,
+//!   which accepts approved design section 5.2 over the superseded
+//!   refuse-on-full pins.)
 //! - `pressure_live256_unparked_head_control_admits` (privileged): the
 //!   twin's fullness control. The identical arming with an empty request
-//!   map admits the same head with zero loss, proving the refusal pins
+//!   map admits the same head with zero loss, proving the deferral pins
 //!   the full blocked map rather than the head.
 //! - `pressure_all_blocked_fail_control_selects_eligible` (unprivileged,
 //!   deterministic): the twin's blockedness fail-control. The twin's exact
 //!   map shape minus the live contexts selects an eligible entry instead
-//!   of refusing, proving the refusal pins per-entry blockedness: break
+//!   of deferring, proving the deferral pins per-entry blockedness: break
 //!   the all-blocked precondition and the verdict flips.
 //!
 //! FIFO/ages/serials preservation *across service opportunities* stays
@@ -3803,10 +3807,10 @@ fn cgroup_scope_probe_flags_in_scope_ambient_only() {
 /// blocking broken (no view holds a loader context anywhere), the held
 /// head's episode must SELECT an eligible entry instead of ruling the
 /// snapshot out: the lowest-pid entry is selected, nothing is ruled out
-/// without an attempt, and no refusal is recorded. This proves the
-/// twin's refusal pins per-entry blockedness: make every entry eligible
-/// and the verdict flips from refuse-once to select. The mirror half
-/// (all entries ineligible, no selection, refused once) stays pinned by
+/// without an attempt, and no deferral is recorded. This proves the
+/// twin's deferral pins per-entry blockedness: make every entry eligible
+/// and the verdict flips from defer-once to select. The mirror half
+/// (all entries ineligible, no selection, deferred once) stays pinned by
 /// the deterministic unit twin and the live twin on genuine records.
 /// No capture runs here: selection reads only the request map, the view
 /// list and the loader registry, so an empty engine plus the seam-fed
@@ -3906,7 +3910,7 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
     );
     assert_eq!(
         engine.discovery_truncated, 0,
-        "{WHAT}: no refusal without all-blocked"
+        "{WHAT}: no deferral without all-blocked"
     );
     assert_eq!(
         engine.newcomer_ages.dropped_unknown, 0,
@@ -3925,21 +3929,23 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
 /// views, real loader contexts from a real settled capture) — then parks
 /// a genuine fresh-EXEC head against the full blocked map. Every queued
 /// request is ineligible (its owner holds a live loader context), so the
-/// head is refused exactly once with sticky explicit loss, zero safe
-/// scans and zero selection attempts. No capacity reset at the refusal:
-/// all 256 contexts survive identical, views stay live, no retirements
-/// queued. The suffix then advances through ordinary service (FIFO
-/// progress): a bounded run of forced full ticks retires the serviced
-/// prefix, so minted contexts drain monotonically and scan work grows.
-/// Neither map convergence nor rearm is pinned there: at live-256 the
-/// post-retirement rescan systematically defers behind the tick quantum
-/// (the initial scan phase consumes it scan-until-expiry over the 256
-/// refreshed views, and retirement detaches add wall-time, so every
-/// refilled request is retained while its contexts retire), and rearm is
-/// additionally impossible because phase 1 spent the 256
-/// capture-lifetime loader IDs. Only progress and the sticky loss are
-/// pinned, so any strict lossless verdict over this batch must fail.
-/// Own episode, own capture, fresh ticket budget.
+/// head is deferred exactly once with no loss (zero truncation, zero
+/// dropped age, one unfinished row), zero safe scans and zero selection
+/// attempts. No capacity reset at the deferral: all 256 contexts survive
+/// identical, views stay live, no retirements queued. The suffix then
+/// advances through ordinary service (FIFO progress): a bounded run of
+/// forced full ticks retires the serviced prefix, so minted contexts
+/// drain monotonically and scan work grows. Neither map convergence nor
+/// rearm is pinned there: at live-256 the post-retirement rescan
+/// systematically defers behind the tick quantum (the initial scan phase
+/// consumes it scan-until-expiry over the 256 refreshed views, and
+/// retirement detaches add wall-time, so every refilled request is
+/// retained while its contexts retire), and rearm is additionally
+/// impossible because phase 1 spent the 256 capture-lifetime loader IDs.
+/// Only progress, the sticky unfinished row and the head's eventual
+/// admission are pinned: the deferral leaves PARTIAL evidence, never
+/// loss, and later ticks admit the deferred head. Own episode, own
+/// capture, fresh ticket budget.
 ///
 /// Cgroup-scoped by determinism, not by product need (the 257 cell's
 /// pattern): under System scope ambient EXECs share the burst batches,
@@ -3952,7 +3958,7 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
 /// all-blocked: it converges to admitted-head under any working fix, so
 /// its refusal asserts encoded the lane-A stall. That shape is preserved
 /// as the `pressure_live256_unparked_head_control_admits` control, which
-/// proves the refusal pins the all-blocked precondition: without the full
+/// proves the deferral pins the all-blocked precondition: without the full
 /// blocked map the same head is admitted with zero loss.
 #[test]
 #[ignore = "privileged: live BPF all-blocked negative twin; run as root with --ignored --test-threads=1 under the privileged lane"]
@@ -4056,7 +4062,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     // The armed checkpoint: 256 live obligations, exactly 256 arms, zero
     // loss. Passes and attempts are observations only here: the cgroup
     // scope admits no ambient EXEC to park, so they reflect owned-only
-    // service (the positive tolerates the same); only the refusal's own
+    // service (the positive tolerates the same); only the deferral's own
     // deltas pin zero transactions/attempts.
     assert_eq!(engine.loader_arms, 256, "{WHAT}: exactly 256 arm attempts");
     assert_eq!(
@@ -4075,7 +4081,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     );
     assert!(
         engine.exec_rearm_views.is_empty(),
-        "{WHAT}: no rearm markers before the refusal"
+        "{WHAT}: no rearm markers before the deferral"
     );
     assert!(
         engine.retirement_intents.is_empty(),
@@ -4162,7 +4168,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
 
     // The fresh head parks against the full blocked map. Its batch must
     // hold no other request-creating arrival: at a full blocked map any
-    // unknown-pid consumed record would corrupt the exactly-once refusal.
+    // unknown-pid consumed record would corrupt the exactly-once deferral.
     // Born inside the scope, like the wave: move in, spawn, move out.
     cgroup.move_in(this, WHAT);
     let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
@@ -4213,7 +4219,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     // Dispatch the head batch DIRECTLY through the production dispatch,
     // exactly as the unit twin does: the apply wrapper's trailing
     // inventory tick would begin FIFO service (retire churn) before the
-    // refusal is observed. No nested ring pull can run here: with
+    // deferral is observed. No nested ring pull can run here: with
     // every candidate blocked, no service pass runs to invoke the
     // collector, so the batch in hand is the whole input.
     let passes_before_dispatch = engine.pressure_service_passes;
@@ -4242,17 +4248,37 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     twin_census(&engine, &owned2, "dispatched", WHAT);
 
     // The twin predicates, mirroring the unit twin on genuine records.
+    //
+    // Controller ruling (r5, on r3 PARTIAL 62dd42525): the superseded
+    // refuse-on-full pins (truncated 1, dropped 1, explicit loss) are
+    // re-cut to the approved design section 5.2 defer-not-drop contract
+    // (owner 3a2): the all-blocked head defers — no truncation, no
+    // dropped age, one unfinished row — and later service ticks admit
+    // it. The negative control below pins that the deferral is neither
+    // silent admission nor silent loss.
     assert_eq!(
-        engine.discovery_truncated, 1,
-        "{WHAT}: the all-blocked head is refused exactly once"
+        engine.discovery_truncated, 0,
+        "{WHAT}: the all-blocked head defers without truncation"
+    );
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished")
+            .count(),
+        1,
+        "{WHAT}: the all-blocked head defers into one unfinished row"
     );
     assert!(
         !engine.refresh_queue.contains_key(&head_pid),
-        "{WHAT}: a refused head leaves no request behind"
+        "{WHAT}: a deferred head leaves no request behind"
     );
     assert_eq!(
-        engine.newcomer_ages.dropped_unknown, 1,
-        "{WHAT}: the refused head keeps explicit dropped-age evidence"
+        engine.newcomer_ages.dropped_unknown, 0,
+        "{WHAT}: a deferred head drops no age; it samples at admission"
     );
     assert!(
         engine
@@ -4261,12 +4287,23 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             .iter()
             .any(|skip| skip.subject == "live discovery refresh"
                 && skip.reason.contains("exceeded the bounded pending queue")),
-        "{WHAT}: the refusal publishes explicit loss: {:?}",
+        "{WHAT}: the deferral publishes one unfinished row: {:?}",
         engine.counters.object_skips
+    );
+    // Negative control: deferral is neither silent admission nor silent
+    // loss. The head holds no view and no loader ticket changed hands —
+    // the work is pending, visible only in the one unfinished row above.
+    assert!(
+        engine.views.iter().all(|view| view.pid() != head_pid),
+        "{WHAT}: the deferred head holds no view before service"
+    );
+    assert_eq!(
+        engine.loader_arms, 256,
+        "{WHAT}: the deferred head arms nothing before service"
     );
     assert_eq!(
         engine.deep_scans, scans_before_dispatch,
-        "{WHAT}: the all-blocked refusal runs zero safe scans"
+        "{WHAT}: the all-blocked deferral runs zero safe scans"
     );
     assert_eq!(
         engine.pressure_attempts, attempts_before_dispatch,
@@ -4274,7 +4311,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     );
     assert_eq!(
         engine.pressure_service_passes, passes_before_dispatch,
-        "{WHAT}: the refusal runs no service transaction"
+        "{WHAT}: the deferral runs no service transaction"
     );
     // No capacity reset: every obligation survives identical.
     assert_eq!(
@@ -4300,7 +4337,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         .collect();
     assert_eq!(
         contexts_after, contexts_before,
-        "{WHAT}: all 256 live contexts survive the refusal identical"
+        "{WHAT}: all 256 live contexts survive the deferral identical"
     );
     assert_no_ambient_arms(&engine, &owned2, WHAT);
     for view in &engine.views {
@@ -4323,8 +4360,9 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     // ordinary service (enumerate, scan, retire, rescan, rearm), the same
     // tick ambient bursts would trigger, minus storm-timing flakiness.
     //
-    // Only progress and sticky loss are pinned here. The map is
-    // deliberately NOT pinned empty: at live-256 the post-retirement
+    // Only progress, the sticky unfinished row and the head's eventual
+    // admission are pinned here. The map is deliberately NOT pinned
+    // empty: at live-256 the post-retirement
     // rescan systematically defers (the initial scan phase consumes the
     // tick quantum scan-until-expiry over the 256 refreshed views, and
     // retirement detaches add wall-time, so refilled requests are
@@ -4342,6 +4380,11 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         minted_before_suffix, 256,
         "{WHAT}: the suffix starts with all 256 obligations live"
     );
+    assert_eq!(
+        engine.loader_arms, 256,
+        "{WHAT}: the suffix starts with no arming past the checkpoint"
+    );
+    let probation_before_suffix = engine.probationary_completions;
     let scans_before_suffix = engine.deep_scans;
     let mut minted_floor = minted_before_suffix;
     for tick in 0..8u32 {
@@ -4373,30 +4416,58 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         engine.deep_scans > scans_before_suffix,
         "{WHAT}: the suffix performed scan work"
     );
-    // The loss is sticky: later service never erases it, so any strict
-    // lossless verdict over this batch must fail. The counts stay lower
-    // bounds, not exact, though the cgroup scope admits no ambient
-    // newcomers to refuse past the head's one: the bounds are retained so
-    // the twin keeps pinning at least the head's refusal. The exact-once
-    // pin stands above, taken before the suffix ran.
-    assert!(
-        engine.discovery_truncated >= 1,
-        "{WHAT}: the historical loss survives service"
+    // The deferral is sticky: later service never erases the unfinished
+    // row, and no loss count ever appears — the cgroup scope admits no
+    // ambient newcomer to defer past the head's one, so the exact pins
+    // stand: truncated and dropped stay 0 while the one unfinished row
+    // persists. The exact-once pin stands above, taken before the suffix
+    // ran.
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "{WHAT}: later service files no truncation"
     );
-    assert!(
-        engine.newcomer_ages.dropped_unknown >= 1,
-        "{WHAT}: the refused head keeps explicit dropped-age evidence"
+    assert_eq!(
+        engine.newcomer_ages.dropped_unknown, 0,
+        "{WHAT}: later service drops no age"
     );
-    assert!(
+    assert_eq!(
         engine
             .counters
             .object_skips
             .iter()
-            .any(|skip| skip.subject == "live discovery refresh"
-                && skip.reason.contains("exceeded the bounded pending queue")),
-        "{WHAT}: the refusal's explicit loss entry persists: {:?}",
-        engine.counters.object_skips
+            .filter(|skip| skip.subject == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished")
+            .count(),
+        1,
+        "{WHAT}: the one unfinished row persists across service"
     );
+    // Eventual admission (the defer-not-drop liveness half): later
+    // service ticks enumerate the deferred head as a newcomer and admit
+    // it with no loader ticket (provider-free), proving the deferral was
+    // not a drop. Either a live ticketless view, or a P3 probationary
+    // completion (no view at capacity) — the head is the only newcomer
+    // in the scope during the suffix, so any probationary delta is its
+    // completion.
+    assert_eq!(
+        engine.loader_arms, 256,
+        "{WHAT}: the suffix arms nothing new"
+    );
+    match engine
+        .views
+        .iter()
+        .find(|view| view.pid() == head_pid && view.still_the_same())
+    {
+        Some(view) => assert!(
+            engine.loader_registry.ids_for_view(view.id()).is_empty(),
+            "{WHAT}: the admitted head holds no loader context"
+        ),
+        None => assert!(
+            engine.probationary_completions > probation_before_suffix,
+            "{WHAT}: the viewless head completed through the probationary probe (head queued: {})",
+            engine.refresh_queue.contains_key(&head_pid),
+        ),
+    }
     assert_no_ambient_arms(&engine, &owned2, WHAT);
     for view in &engine.views {
         if owned2.contains(&view.pid()) {
@@ -4446,7 +4517,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
     cgroup.remove(WHAT);
     let fds_end = fd_count();
     println!(
-        "t8: twin: PASS: 1 refusal, sticky loss, FIFO progress (minted 256->{minted_floor}), 256 contexts survive refusal; serial_delta={serial_delta} arm_ticks={} suffix_ticks=8 passes={passes_end} attempts={attempts_end} arms={arms_end} inter_drain_max={:?} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",
+        "t8: twin: PASS: 1 deferral, sticky unfinished row, FIFO progress (minted 256->{minted_floor}), 256 contexts survive deferral, head admitted; serial_delta={serial_delta} arm_ticks={} suffix_ticks=8 passes={passes_end} attempts={attempts_end} arms={arms_end} inter_drain_max={:?} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",
         settle1.ticks,
         settle1.inter_drain_max,
         wall_start.elapsed(),
@@ -4460,7 +4531,7 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
 /// but the fresh head arrives against an EMPTY map (no refilled
 /// requests), so it never parks, is never refused, and is admitted with
 /// zero loss while consuming no loader ticket (provider-free views stay
-/// unarmed). This control proves the twin's refusal pins the all-blocked
+/// unarmed). This control proves the twin's deferral pins the all-blocked
 /// precondition: break the full blocked map and the same head is
 /// admitted, not refused. Release 2, the post drain and the LEDGER checks
 /// match the twin (the control's small map additionally settles, which

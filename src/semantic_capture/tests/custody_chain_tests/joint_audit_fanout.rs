@@ -13597,7 +13597,9 @@ fn joint_machine_idle_void_with_colliding_h8_is_resumable_one_credit_at_a_time()
             ledger.charge_h8open(H8_BASE + ordinal, H8_BYTES).unwrap();
         }
         for token in 0..BULK {
-            ledger.charge_model(MODEL_BASE + token, MODEL_BYTES).unwrap();
+            ledger
+                .charge_model(MODEL_BASE + token, MODEL_BYTES)
+                .unwrap();
         }
     }
     let bulk_roles = fixture

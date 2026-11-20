@@ -113,6 +113,11 @@ pub const fn valid_safe_attribute_length(
 /// size); ModulusBits accepts `256..=16384` (512/1536 measured live on
 /// all RSA providers). Non-listed sizes label through the existing
 /// `*_other` arms; unlisted values still refuse with the named reason.
+/// Always inlined: an outlined copy returns its Option by hidden
+/// out-pointer, which both breaks the five-register ABI pin and pushes
+/// the length-program call chain past the 512-byte frame bound (v6.6
+/// refuses the misaligned callers outright).
+#[inline(always)]
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
         // The attested vendor spelling normalizes to its standard

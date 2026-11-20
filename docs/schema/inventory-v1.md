@@ -1255,16 +1255,23 @@ contracts are
 [inventory-v1-object-observations-v5.schema.json](inventory-v1-object-observations-v5.schema.json)
 (section version 5) and
 [inventory-v1-object-observations-v6.schema.json](inventory-v1-object-observations-v6.schema.json)
-(section version 6) and
+(section version 6),
 [inventory-v1-object-observations-v7.schema.json](inventory-v1-object-observations-v7.schema.json)
-(section version 7); consumers must reject unknown section versions,
+(section version 7) and
+[inventory-v1-object-observations-v9.schema.json](inventory-v1-object-observations-v9.schema.json)
+(section version 9; version 8 is the Task 7 provider section under
+the shared allocator); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 7 iff inferred key content is
+- `version` follows the content: 9 iff relaxed-dialect content is
+  present — a relaxed label or curve name, class 5..=11, a key
+  type outside the v7 thirteen, a value length outside
+  12/16/24/32/48, or modulus bits outside the five listed sizes
+  (requested or established) — else 7 iff inferred key content is
   present — any key row whose `inferred_family` or `inferred_size`
   status is not `unknown`, or with any inference completions — else
   6 iff new-site content is present —
@@ -1289,11 +1296,12 @@ never imply S1 loss.
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
-  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5 and 6 are
+  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5, 6 and 7 are
   frozen; version 1 never carries KEM labels and neither 1 nor 2
-  carries `unattributed`; versions 4, 5, 6 and 7 always carry
-  `unattributed` (possibly empty), and versions 5, 6 and 7 always
-  carry the seven-key metadata blocks. A feed that fell back or lost
+  carries `unattributed`; versions 4, 5, 6, 7 and 9 always carry
+  `unattributed` (possibly empty), and versions 5, 6, 7 and 9 always
+  carry the seven-key metadata blocks. Like version 7, version 9
+  carries the inferred keys on every proved row. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
   (`{reason, count}`, finite reasons, frozen order); the section is
@@ -1317,15 +1325,15 @@ never imply S1 loss.
   token inventory.
 - `requested`/`established` each hold the fixed metadata slots —
   six at section versions 1–4 (`class`, `key_type`, `token`,
-  `value_len`, `modulus_bits`, `ec_params`), seven at versions 5–6
+  `value_len`, `modulus_bits`, `ec_params`), seven at versions 5–9
   (plus `parameter_set`) — every slot `{status, value}` with
   `status` one of `unknown`, `value`, `conflict` or `invalidated`,
-  plus `source` at version 6 (`query`, `creation_success` or null:
+  plus `source` at versions 6–9 (`query`, `creation_success` or null:
   how the field was established — a provider attribute-result read
   or a successful creation return promoting its own finite
   template; an established `value` always carries `query` or
   `creation_success`, while requested blocks and every non-`value`
-  status carry null), plus `reason` at version 6 (one of four
+  status carry null), plus `reason` at versions 6–9 (one of four
   closed reasons or null: `template truncated (first 8 attributes
   captured)` on unknown fields never seen on a truncated template,
   `template value outside approved finite set` on kinds seen with an
@@ -1337,15 +1345,19 @@ never imply S1 loss.
   one — and `template partly read` on unknown fields never seen
   on a partly-read template; null for every other field, and null
   on every field of a query-only view).
-  A `value` carries the accepted numeric code or null: class 0-4,
-  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at version 6;
-  73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–6; OASIS
-  numbers), token 0 or 1, value length 12, 16, 24, 32 or 48 bytes
-  (16/24/32 at versions 1–5), modulus bits 1024, 2048, 3072,
-  4096 or 8192, the curve name (`secp256r1`, `secp384r1`,
+  A `value` carries the accepted numeric code or null: class 0-4
+  (0–11 at version 9),
+  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at versions 6–9;
+  73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–9; every
+  assigned standard `CKK_*` at version 9, with the attested
+  `CKK_NSS_ML_KEM` vendor spelling normalizing to 73 at capture;
+  OASIS numbers), token 0 or 1, value length 12, 16, 24, 32 or 48 bytes
+  (16/24/32 at versions 1–5; 1..=4096 at version 9), modulus bits 1024, 2048, 3072,
+  4096 or 8192 (256..=16384 at version 9), the curve name (`secp256r1`, `secp384r1`,
   `secp521r1`, plus `x25519`, `x448`, `ed25519`, `ed448` at
-  version 6) or null, and the parameter-set code 1..=12 at
-  versions 5–6. Labels are presentation names; JSON carries numeric
+  versions 6–9, plus `secp256k1`, `brainpoolp256r1`,
+  `brainpoolp384r1` at version 9) or null, and the parameter-set code 1..=12 at
+  versions 5–9. Labels are presentation names; JSON carries numeric
   codes. Since version 6, a successful creation return promotes its
   own observed finite template cells to established (requested
   `CKA_TOKEN` still never establishes; unknown/conflict shapes still
@@ -1361,20 +1373,22 @@ never imply S1 loss.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
   `malformed`, `excluded`), distinct from current validity, over
-  the six metadata fields (seven at section versions 5–6).
+  the six metadata fields (seven at section versions 5–9).
 - `label` is the combined key label from established facts of the same
   view only (`rsa_1024`, `rsa_2048`, `rsa_3072`, `rsa_4096`,
   `rsa_other`, `aes_128`, `aes_192`, `aes_256`, `aes_other`,
   `ec_p256`, `ec_p384`, `ec_p521`, at section version 5 the
   eighteen PQC labels `ml_dsa_44`, `ml_dsa_65`, `ml_dsa_87`,
   `ml_kem_512`, `ml_kem_768`, `ml_kem_1024` and the twelve
-  `slh_dsa_*` sets, and at section version 6 the sixteen new-site
+  `slh_dsa_*` sets, at section version 6 the sixteen new-site
   labels `x25519`, `x448`, `ed25519`, `ed448`, `hkdf_96`,
   `hkdf_128`, `hkdf_192`, `hkdf_256`, `hkdf_384`, `hkdf_other`,
   `generic_96`, `generic_128`, `generic_192`, `generic_256`,
-  `generic_384`, `generic_other`) or null. It is withheld when class
+  `generic_384`, `generic_other`, and at section version 9 the
+  three relaxed labels `ec_secp256k1`, `ec_brainpoolp256r1`,
+  `ec_brainpoolp384r1`) or null. It is withheld when class
   conflicts or an established class is incompatible with the key type
-  (AES, generic-secret and HKDF need `secret_key`; RSA, EC, PQC,
+  (AES, generic-secret, HMAC and HKDF need `secret_key`; RSA, EC, PQC,
   Edwards and Montgomery need `public_key`/`private_key`). An
   Edwards label joins an established ed25519/ed448 curve with the
   `ec_edwards` key type, a Montgomery label an established
@@ -1383,18 +1397,26 @@ never imply S1 loss.
   mismatched curve — or, on a complete `C_CreateObject` or
   public-half `C_GenerateKeyPair` template, an unestablished
   curve — stays unlabeled with the curve reason on the curve field
-  in JSON and its count in verbose text. A PQC label joins an
+  in JSON and its count in verbose text. An HMAC label joins an
+  established byte size with the established HMAC key type exactly
+  like a generic-secret label (the `key_type` field keeps the exact
+  HMAC numeric beside it). A PQC label joins an
   established
   parameter-set code with the established key type from the same
   view; a code alone, a type alone, or a recognized mechanism never
   labels. `unknown` is a key-row label only, never a view label.
-  One provenance exception: an RSA private key created by
+  Pair-mate provenance exceptions: an RSA private key created by
   `C_GenerateKeyPair` carries its pair-mate public key's established
   size when both handles came from the same successful return
   (CKA_MODULUS_BITS is defined on RSA public keys only, so the
-  private size is never read directly). Such a label is recognizable:
-  the view's own `established.modulus_bits` stays `unknown` while the
-  label names the inherited size. Unpaired keys and failed generations
+  private size is never read directly), and an EC-family private
+  key likewise carries the mate's established curve
+  (CKA_EC_PARAMS lives in the public template; Edwards/Montgomery
+  mismatch rules still apply to the inherited curve). Such a label
+  is recognizable:
+  the view's own `established.modulus_bits` (or `established.ec_params`)
+  stays `unknown` while the
+  label names the inherited size (or curve). Unpaired keys and failed generations
   stay unlabeled: a valid, unconflicted use rows under `unknown`;
   invalid attribution counts `metadata_unknown` and a conflict
   `metadata_conflicting` in `unknown_key_operations[]`.

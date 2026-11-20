@@ -741,6 +741,25 @@ work if it persists, not to keymeta. Task 1 acceptance is the
 RED→GREEN twins plus the R2 finite-set twins on the v0.8.0 base,
 not browser yield (yield is Task 5, after keyrows Task 3).
 
+Amendment (relaxed-dialect fix1, 2026-11-20, owner rule): the
+"Generic unlisted-type creation row" premise above is superseded.
+The KeyType set is no longer R2's thirteen ids: every assigned
+standard `CKK_*` (`0x00..=0x05 | 0x10..=0x4b` per OASIS PKCS #11
+3.2, including `0x33`/`0x34`) plus the one attested vendor
+spelling (`CKK_NSS_ML_KEM`, normalizing to `0x49`) now
+establishes; `CKO_*` 0..=11, `CKA_VALUE_LEN` 1..=4096,
+`CKA_MODULUS_BITS` 256..=16384, secp256k1/brainpool curves, the
+two SoftHSM PrintableString Edwards spellings, 4-byte `CK_ULONG`
+scalars and the 0x362/0x363 concat derives join likewise. A
+`0x33`/`0x34` creation now promotes the key-type fact beside the
+size (still no label — establishment only); HMAC types join
+their size into generic-secret labels; EC-family private halves
+inherit the mate's curve like RSA sizes. Values outside the new
+closed sets still refuse per-field with the named reason, and
+one refusal still degrades only its object. Section version 9
+carries the widened vocabulary (§10.1; v8 is the Task 7 provider
+section under the shared allocator).
+
 Creation-template facts stay ON by default (owner 08:50, §15 K7):
 creation calls are cold (not hot per-call paths), the R2 reads
 ride the existing creation adapters, and no `--key-sizes` is

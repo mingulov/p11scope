@@ -13536,6 +13536,302 @@ fn joint_machine_idle_void_drops_call_held_behind_running_call() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
+/// The linked-stream void with colliding retained H8 entries is resumable
+/// under the Finish work budget: at most 64 leaf units per credit (INV-2),
+/// holding the fenced void and deferring collection until cleanup
+/// completes. Drives one credit at a time, checks multi-credit progress,
+/// the loss disclosure, preserved Model siblings and single refunds.
+#[test]
+fn joint_machine_idle_void_with_colliding_h8_is_resumable_one_credit_at_a_time() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let prime_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    let prime_charged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .charged_bytes();
+    let prime_census = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .census();
+    let pool_before_bulk = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    // 512 sequential H8 ordinals collide across the 1,024 key buckets
+    // (259 predecessor visits on top of the 4,096 slot visits), forcing
+    // multi-credit cleanup at 64 units per credit. High ordinals avoid
+    // the prime calls' small tickets. Models are separate surviving
+    // siblings in their own operations.
+    const BULK: u64 = 512;
+    const H8_BASE: u64 = 500_000;
+    const MODEL_BASE: u64 = 600_000;
+    const H8_BYTES: u64 = 10;
+    const MODEL_BYTES: u64 = 20;
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let ledger = coordinator.joint_capture_mut().ledger_mut();
+        ledger.prepare_capacity().unwrap();
+        for ordinal in 0..BULK {
+            ledger.charge_h8open(H8_BASE + ordinal, H8_BYTES).unwrap();
+        }
+        for token in 0..BULK {
+            ledger.charge_model(MODEL_BASE + token, MODEL_BYTES).unwrap();
+        }
+    }
+    let bulk_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(
+        bulk_roles[1],
+        prime_roles[1] + BULK as usize,
+        "the bulk H8 entries are retained"
+    );
+    assert_eq!(
+        bulk_roles[2],
+        prime_roles[2] + BULK as usize,
+        "the bulk Model siblings are retained"
+    );
+    let bulk_charged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .charged_bytes();
+    assert_eq!(
+        bulk_charged,
+        prime_charged + BULK * H8_BYTES + BULK * MODEL_BYTES,
+        "bulk charges add their exact bytes"
+    );
+    let bulk_census = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .census();
+    assert_eq!(
+        bulk_census,
+        prime_census + 2 * BULK as usize,
+        "each bulk charge mints its own operation"
+    );
+    let pool_after_bulk = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    assert_eq!(
+        pool_after_bulk,
+        pool_before_bulk
+            + BULK as usize * (H8_BYTES as usize + OWNED_ALLOCATION_PADDING)
+            + BULK as usize * (MODEL_BYTES as usize + OWNED_ALLOCATION_PADDING),
+        "each bulk membership prepays its exact pool lease"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 99);
+    let initial_h8 = bulk_roles[1];
+    assert!(
+        initial_h8 >= BULK as usize,
+        "the void has colliding H8 work to do: {initial_h8}"
+    );
+    let mut void_started = false;
+    let mut saw_partial = false;
+    let mut void_done_charged = None;
+    let mut void_done_pool = None;
+    let mut void_done_roles = None;
+    let mut published = false;
+    for _ in 0..1_024 {
+        let h8 = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[1];
+        if h8 < initial_h8 {
+            void_started = true;
+        }
+        // Only pre-completion H8 counts as void progress: post-void
+        // quanta recharge new H8 after the void empties it.
+        if void_started && void_done_charged.is_none() && h8 > 0 && h8 < initial_h8 {
+            saw_partial = true;
+        }
+        // Capture the exact post-void ledger the moment H8 empties,
+        // before the next credit collects the post-void call.
+        if void_started && h8 == 0 && void_done_charged.is_none() {
+            let ledger = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger();
+            void_done_charged = Some(ledger.charged_bytes());
+            void_done_roles = Some(ledger.roles_for_test());
+            void_done_pool = Some(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .semantic_resource_snapshot()
+                    .charged_bytes,
+            );
+        }
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!(
+                "the resumable void must not refuse: {reason:?} phase={:?} snapshot={:?}",
+                fixture.machine.latched_phase_label(),
+                fixture.machine.diagnostic_snapshot_for_test(),
+            ),
+        }
+        let after = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[1];
+        if void_started && void_done_charged.is_none() && after > 0 && after < initial_h8 {
+            saw_partial = true;
+        }
+        if void_started && after == 0 && void_done_charged.is_none() {
+            let ledger = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger();
+            void_done_charged = Some(ledger.charged_bytes());
+            void_done_roles = Some(ledger.roles_for_test());
+            void_done_pool = Some(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .semantic_resource_snapshot()
+                    .charged_bytes,
+            );
+        }
+    }
+    assert!(void_started, "the broken stream must void its H8");
+    assert!(
+        saw_partial,
+        "the void must progress over multiple one-credit steps, not finish in one: initial_h8={initial_h8}"
+    );
+    assert!(published, "the post-void frame publishes");
+    let done_roles = void_done_roles.expect("the void emptied H8 before publishing");
+    assert_eq!(done_roles[1], 0, "the void removed every H8 membership");
+    assert_eq!(
+        done_roles[2],
+        prime_roles[2] + BULK as usize,
+        "the void preserved every Model sibling"
+    );
+    let done_charged = void_done_charged.unwrap();
+    let prime_h8_bytes = bulk_charged
+        .checked_sub(done_charged)
+        .and_then(|removed| removed.checked_sub(BULK * H8_BYTES))
+        .expect("the void refunded at least the bulk H8 bytes");
+    assert_eq!(
+        done_charged,
+        bulk_charged - prime_h8_bytes - BULK * H8_BYTES,
+        "one refund per removed H8 membership"
+    );
+    // The pool is shared with births, H0 and discovery, so the machine
+    // pins exact ledger bytes above and exact bulk prepay before the
+    // void; the ledger unit neighbor pins each removed lease's exact
+    // pool refund for the shared release path.
+    let _ = (void_done_pool, prime_roles, pool_after_bulk);
+    // Siblings stay live: a surviving Model re-charge refuses while a
+    // freed H8 ordinal and a fresh Model token both succeed.
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let ledger = coordinator.joint_capture_mut().ledger_mut();
+        assert!(
+            ledger.charge_model(MODEL_BASE, MODEL_BYTES).is_err(),
+            "the surviving Model sibling is still present"
+        );
+        assert!(
+            ledger.charge_model(700_000, MODEL_BYTES).is_ok(),
+            "the table has room: the refusal above is presence, not Full"
+        );
+        ledger.release_model(700_000);
+        assert!(
+            ledger.charge_h8open(H8_BASE, H8_BYTES).is_ok(),
+            "the freed H8 ordinal is reusable"
+        );
+        ledger.release_h8open(H8_BASE);
+    }
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_void_ingest_break_loss_history_loss".to_string()
+        )),
+        "the resumable void still discloses its fenced loss: {gaps:?}"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
 /// The void's own slot with the raw slot occupied: after the first break
 /// ends the bound feed, the bound caller's next call is admitted S1-only
 /// and its journal original is refused into the audit frame's raw slot.

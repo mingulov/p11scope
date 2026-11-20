@@ -1417,9 +1417,35 @@ pub(crate) trait BirthRowReader {
 
 /// Finite birth-observation refusal: which genuine Session producer
 /// failed. Observation refuses; nothing is minted.
+///
+/// The take sub-causes split drift from contention: `EpochDrift`,
+/// `CaptureDrift` and `WitnessStale` name a witness that no longer
+/// matches live truth, while `TakeDeadline` and `SessionBorrowed`
+/// name a take that may succeed on retry. `CurrentPartition` keeps
+/// only the unclassified residue (capture-health and native-read
+/// failures); it still retries like any unknown take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthObservationRefusal {
     CurrentPartition,
+    /// The live re-read epochs moved past the retained receipt
+    /// mid-take: truth raced the take, so the next tick re-takes
+    /// against current truth. A changed live image is permanent,
+    /// not a race, so it refuses as `WitnessStale` instead.
+    EpochDrift,
+    /// The witness names another capture identity: it outlived its
+    /// capture, so no take under this capture can ever validate it.
+    CaptureDrift,
+    /// The retained receipt is stale and current truth broke with
+    /// it (remapped partitions, retired image, moved fence or
+    /// changed live image): the birth is dead and only a fresh
+    /// birth can attribute again.
+    WitnessStale,
+    /// The take exceeded its scan slice or the receipt deadline:
+    /// unknown, not negative, so the next tick takes again.
+    TakeDeadline,
+    /// The Session was already borrowed: contention, so the next
+    /// tick takes again.
+    SessionBorrowed,
     StreamCut,
     AbsenceHistory,
     /// The PROC_EPOCH marker readback is not READY naming the admitted

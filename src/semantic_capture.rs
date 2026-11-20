@@ -1588,6 +1588,10 @@ pub(crate) struct SemanticCapture {
     /// as a hook-miss era for the router's instance carry.
     hook_misses: u64,
     miss_raises: u64,
+    /// Retained takes that succeeded across same-instance drift (the
+    /// receipt was stale but current truth still names its
+    /// instance): diagnostic only, counted under shared borrows.
+    take_drift_tolerated: AtomicU64,
     /// Last tick's scan count and refusals, for the stuck-transaction
     /// diagnostic only. Test-visible; production behavior never reads it.
     #[cfg(test)]
@@ -1698,6 +1702,7 @@ impl SemanticCapture {
             continuity_cuts: 0,
             hook_misses: 0,
             miss_raises: 0,
+            take_drift_tolerated: AtomicU64::new(0),
             #[cfg(test)]
             last_tick_scans_for_test: 0,
             #[cfg(test)]
@@ -1821,6 +1826,14 @@ impl SemanticCapture {
     /// only): attempts, duplicate refusals, cap refusals, misses.
     pub(crate) fn admitted_mark_funnel_counts(&self) -> (u64, u64, u64, u64) {
         self.router.admitted_mark_funnel_counts()
+    }
+
+    /// Retained takes that succeeded across same-instance drift
+    /// (diagnostic only): the stop disclosure reads this beside
+    /// the seal-bootstrap arms.
+    #[cfg_attr(not(test), allow(dead_code))] // Wired to the stop disclosure with the bump.
+    pub(crate) fn take_drift_tolerated(&self) -> u64 {
+        self.take_drift_tolerated.load(Ordering::Relaxed)
     }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins

@@ -2786,6 +2786,55 @@ impl AttestedSemanticLane {
         }
     }
 
+    /// Poll one length-stash kernel counter; `Some(delta)` on a rise.
+    /// Same cumulative-counter contract as
+    /// [`Self::poll_length_stash_loss`], one native lookup: a failed
+    /// read latches the shared unknown-loss flag and delays that
+    /// counter's disclosure to its next good read. The machine polls
+    /// insert and mismatch separately, one budgeted action each.
+    pub(crate) fn poll_length_stash_insert_loss(&mut self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if test.length_stash_insert_loss_fails() {
+                self.length_loss_unknown = true;
+                return None;
+            }
+            let insert = test.length_stash_insert_loss()?;
+            return self.note_length_insert_total(insert);
+        }
+        let live = self.live.as_mut()?;
+        match live.session.length_stash_insert_failures() {
+            Ok(insert) => self.note_length_insert_total(insert),
+            Err(_) => {
+                self.length_loss_unknown = true;
+                None
+            }
+        }
+    }
+
+    /// Poll the stash-mismatch kernel counter; `Some(delta)` on a
+    /// rise. Mirrors [`Self::poll_length_stash_insert_loss`] on the
+    /// mismatch half of the shared baseline and unknown flag.
+    pub(crate) fn poll_length_stash_mismatch_loss(&mut self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if test.length_stash_mismatch_loss_fails() {
+                self.length_loss_unknown = true;
+                return None;
+            }
+            let mismatch = test.length_stash_mismatch_loss()?;
+            return self.note_length_mismatch_total(mismatch);
+        }
+        let live = self.live.as_mut()?;
+        match live.session.length_stash_mismatches() {
+            Ok(mismatch) => self.note_length_mismatch_total(mismatch),
+            Err(_) => {
+                self.length_loss_unknown = true;
+                None
+            }
+        }
+    }
+
     /// Take the unknown-loss disclosure, once per lane (mirrors
     /// [`Self::take_events_loss_unknown`]).
     pub(crate) fn take_length_loss_unknown(&mut self) -> bool {
@@ -2811,6 +2860,24 @@ impl AttestedSemanticLane {
             (insert_delta > 0).then_some(insert_delta),
             (mismatch_delta > 0).then_some(mismatch_delta),
         )
+    }
+
+    /// Fold one insert-counter read into the lane: `Some(delta)` on
+    /// a rise. Updates only the insert half of the shared baseline;
+    /// the kernel counter only grows.
+    fn note_length_insert_total(&mut self, insert: u64) -> Option<u64> {
+        let delta = insert.saturating_sub(self.length_stash_seen.0);
+        self.length_stash_seen.0 = insert;
+        (delta > 0).then_some(delta)
+    }
+
+    /// Fold one mismatch-counter read into the lane: `Some(delta)`
+    /// on a rise. Updates only the mismatch half of the shared
+    /// baseline.
+    fn note_length_mismatch_total(&mut self, mismatch: u64) -> Option<u64> {
+        let delta = mismatch.saturating_sub(self.length_stash_seen.1);
+        self.length_stash_seen.1 = mismatch;
+        (delta > 0).then_some(delta)
     }
 
     /// Cumulative disclosed length-stash losses (insert failures,

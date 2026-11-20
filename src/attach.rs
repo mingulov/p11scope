@@ -8670,6 +8670,32 @@ impl Session {
             .fold(0u64, u64::saturating_add))
     }
 
+    /// One length-stash counter (all CPUs): a single native map
+    /// lookup. The machine charges and deadline-checks each lookup
+    /// separately; the plain path reads both back to back.
+    fn length_stash_counter(&self, index: &u32) -> Result<u64> {
+        let evidence: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+        Ok(evidence
+            .get(index, 0)?
+            .iter()
+            .copied()
+            .fold(0u64, u64::saturating_add))
+    }
+
+    /// Cumulative `EVIDENCE_START` insert failures (all CPUs): the
+    /// stash map was full, so the call runs without retention.
+    pub(crate) fn length_stash_insert_failures(&self) -> Result<u64> {
+        self.length_stash_counter(&EVIDENCE_LENGTH_INSERT_FAILURES)
+    }
+
+    /// Cumulative stash mismatches (all CPUs): the return's START
+    /// stamp disagreed with the retained row; deleted and counted,
+    /// never a guessed length.
+    pub(crate) fn length_stash_mismatches(&self) -> Result<u64> {
+        self.length_stash_counter(&EVIDENCE_LENGTH_STASH_MISMATCHES)
+    }
+
     /// Cumulative length-stash losses (all CPUs): `EVIDENCE_START`
     /// insert failures (the stash map was full, so the call runs
     /// without retention) and stash mismatches (the return's START
@@ -8677,16 +8703,9 @@ impl Session {
     /// never a guessed length). The inventory lane polls these
     /// beside the ring loss; rises are disclosed, never silent.
     pub(crate) fn length_stash_loss(&self) -> Result<(u64, u64)> {
-        let evidence: PerCpuArray<_, u64> =
-            PerCpuArray::try_from(self.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
-        let sum = |index: &u32| {
-            evidence
-                .get(index, 0)
-                .map(|counts| counts.iter().copied().fold(0u64, u64::saturating_add))
-        };
         Ok((
-            sum(&EVIDENCE_LENGTH_INSERT_FAILURES)?,
-            sum(&EVIDENCE_LENGTH_STASH_MISMATCHES)?,
+            self.length_stash_insert_failures()?,
+            self.length_stash_mismatches()?,
         ))
     }
 

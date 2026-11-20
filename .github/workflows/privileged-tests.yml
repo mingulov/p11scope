@@ -70,8 +70,9 @@ name: privileged-tests
 #   its cell. pqc-keys runs the PQC workload (ML-DSA-44/65/87 plus
 #   ML-KEM-512/768/1024, each generated and used once) against the same
 #   pinned kryoptic under inventory --pid --key-operations, with and
-#   without --key-sizes; every key row must show family + parameter set
-#   in text and --json, with exact known counts (no skip passes).
+#   without --key-sizes (scripts/ci/pqc-cell.sh); every key row must show
+#   family + parameter set in text and --json, with exact known counts
+#   (no skip passes).
 # Weekly lib campaign: workflow_dispatch input campaign selects default,
 # long (--include-long) or all (long plus the fixture-skip groups once
 # WP-2 adds them). GitHub schedules run only on the default branch, so the

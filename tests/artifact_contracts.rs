@@ -11552,6 +11552,9 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
         // them as root through scripts/ci/run-cell-script.sh's name
         // dispatch, so the lane body is hosted there, not UNRUN.
         "scripts/ci/provider-matrix-cell.sh",
+        // The privileged PQC key-visibility cell: same name dispatch
+        // (`run-cell-script.sh pqc-cell`), hosted in the pqc-keys job.
+        "scripts/ci/pqc-cell.sh",
     ];
     let priv_yml = read(".github/workflows/privileged-tests.yml");
     for lane in &hosted_elsewhere {

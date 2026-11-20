@@ -2199,6 +2199,82 @@ mod tests {
         }
     }
 
+    /// The attested NSS ML-KEM operation mechanism infers its
+    /// family: `CKM_NSS_ML_KEM` (`0xCE53_4381`, NSS
+    /// `lib/util/pkcs11n.h` `CKM_NSS + 49`, exposed by softokn and
+    /// used beside standard `CKM_ML_KEM` for TLS KEM operations)
+    /// names ML-KEM exactly like the standard id. The vendor keygen
+    /// id stays silent under the creation rule, like every
+    /// `_KEY_PAIR_GEN` id.
+    #[test]
+    fn nss_ml_kem_vendor_mechanism_infers_family() {
+        const NSS_ML_KEM: u64 = 0xCE53_4381;
+        const NSS_ML_KEM_KEY_PAIR_GEN: u64 = 0xCE53_4380;
+        assert_eq!(infer_family(NSS_ML_KEM), Some(KeyFamily::MlKem));
+        assert_eq!(infer_family(NSS_ML_KEM_KEY_PAIR_GEN), None);
+    }
+
+    /// NSS legacy Kyber vendor mechanisms infer nothing: Kyber is
+    /// not ML-KEM (no `kyber` family exists in the §4.2 vocabulary),
+    /// so the operation id stays silent even though its ML-KEM
+    /// successor maps.
+    #[test]
+    fn nss_kyber_vendor_mechanisms_infer_nothing() {
+        for id in [0xCE53_437Du64, 0xCE53_437E] {
+            assert_eq!(infer_family(id), None, "id 0x{id:x} infers nothing");
+        }
+    }
+
+    /// NSS ML-KEM length triples classify exactly like the standard
+    /// ML-KEM id (FIPS 203 Table 2 ciphertext lengths): softokn
+    /// offers 768/1024 only, but a length names its set under any
+    /// ML-KEM mechanism. Wrong evidence kinds, unmapped lengths and
+    /// the keygen id never neighbor-map.
+    #[test]
+    fn nss_ml_kem_vendor_length_triples() {
+        use EvidenceTag::*;
+        const NSS_ML_KEM: u64 = 0xCE53_4381;
+        const NSS_ML_KEM_KEY_PAIR_GEN: u64 = 0xCE53_4380;
+        for (tag, octets, set) in [
+            (EncapsulateOutput, 768, "ml_kem_512"),
+            (EncapsulateOutput, 1088, "ml_kem_768"),
+            (DecapsulateInput, 1568, "ml_kem_1024"),
+        ] {
+            assert_eq!(
+                classify_size(Some(NSS_ML_KEM), tag, octets),
+                SizeOutcome::Inferred(SizeDetail::PqcSet {
+                    parameter_set: set,
+                    octets,
+                }),
+                "{octets} octets"
+            );
+        }
+        assert_eq!(
+            classify_size(Some(NSS_ML_KEM), DecapsulateInput, 769),
+            SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH
+            }
+        );
+        assert_eq!(
+            classify_size(Some(NSS_ML_KEM), SignOutput, 1088),
+            SizeOutcome::Unknown {
+                reason: REASON_NO_LENGTH_MAP
+            }
+        );
+        assert_eq!(
+            classify_size(Some(NSS_ML_KEM_KEY_PAIR_GEN), EncapsulateOutput, 1088),
+            SizeOutcome::Unknown {
+                reason: REASON_UNLISTED_MECHANISM
+            }
+        );
+        assert_eq!(
+            classify_size(Some(0xCE53_437E), EncapsulateOutput, 1088),
+            SizeOutcome::Unknown {
+                reason: REASON_UNLISTED_MECHANISM
+            }
+        );
+    }
+
     /// Family value/display spellings (§10.2 enum + §10.3 fragments).
     #[test]
     fn family_spellings() {

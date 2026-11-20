@@ -1049,6 +1049,50 @@ impl ModelState {
                 Lifetime::Live,
             )
             .expect("view binds");
+    #[cfg(test)]
+    /// Test-only: one live session in `domain` holding `tombstones`
+    /// tombstoned bindings and `deferred` pending deferred origins, so a
+    /// retirement has many rows under a single session.
+    #[cfg(test)]
+    pub(super) fn populate_session_tombstones_for_test(
+        &mut self,
+        domain: ObjectDomain,
+        tombstones: usize,
+        deferred: usize,
+    ) {
+        if !self.domains.contains_key(&domain) {
+            self.register_domain(domain).expect("domain registers");
+        }
+        self.domains.get_mut(&domain).expect("domain").bootstrap = Some(0);
+        let session = self
+            .alloc_session(
+                domain,
+                SessionHandle::new(9_999).expect("session handle"),
+                SessionOrigin::Opened,
+                SlotScope::reference_known(0, 0),
+            )
+            .expect("session opens");
+        for index in 0..tombstones as u64 {
+            let handle = ObjectHandle::new(50_000 + index).expect("object handle");
+            self.set_binding(domain, session, handle, Some(Binding::Tombstone));
+        }
+        for index in 0..deferred as u32 {
+            self.deferred_pending.insert(
+                (session, index),
+                DeferredOrigin {
+                    ticket: CallToken(60_000 + u64::from(index)),
+                    position: 0,
+                    function: 0,
+                    domain,
+                    generation: 0,
+                    session: Some(session),
+                    inputs: [DeferredInput::Absent, DeferredInput::Absent],
+                    sequence: u64::from(index),
+                },
+            );
+        }
+    }
+
             let token = CallToken(base + index);
             let key = CallKey::reference(base + index);
             let begin = 30_000 + index;
@@ -6906,6 +6950,68 @@ mod tests {
         assert_eq!(fx.state.usage().deferred_origins, 1);
         assert_eq!(ledger.charged_bytes(), one);
     }
+    /// I3 on model rows nested under one session: every tombstone the
+    /// session holds and every deferred origin it owns is its own leaf,
+    /// so no poll clears or disposes more rows than the units it debited
+    /// (one-unit and full-credit polls, abandon and void).
+    #[test]
+    fn domain_retirement_charges_each_session_tombstone_and_deferred_record() {
+        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+        for per_poll in [1usize, 64] {
+            for abandon in [true, false] {
+                let mut state = ModelState::new(ObjectLimits::policy());
+                state.populate_session_tombstones_for_test(domain, 97, 97);
+                assert_eq!(state.tombstones, 97);
+                let mut ledger = super::super::journal::StagingLedger::new();
+                let mut retirement = if abandon {
+                    DomainRetirement::abandon(domain)
+                } else {
+                    DomainRetirement::void(domain, RefCut::reference(40_000))
+                };
+                let mut effects = ObjectEffects::default();
+                let mut polls = 0usize;
+                loop {
+                    let (tombs, deferred) = (state.tombstones, state.deferred_pending.len());
+                    let mut units = per_poll;
+                    let done = state.retire_domain_step(
+                        &mut retirement,
+                        &mut ledger,
+                        &mut effects,
+                        &mut units,
+                    );
+                    let debited = per_poll - units;
+                    let cleared = tombs - state.tombstones;
+                    let disposed = deferred - state.deferred_pending.len();
+                    assert!(
+                        cleared + disposed <= debited,
+                        "per_poll={per_poll} abandon={abandon} poll {polls}: \
+                         {cleared} tombstones and {disposed} deferred records \
+                         under {debited} units"
+                    );
+                    polls += 1;
+                    assert!(polls < 100_000, "the retirement terminates");
+                    if done {
+                        break;
+                    }
+                }
+                assert_eq!(state.tombstones, 0, "every tombstone clears");
+                assert!(
+                    state.deferred_pending.is_empty(),
+                    "the dead session's deferred origins dispose"
+                );
+                assert_eq!(
+                    effects
+                        .effects
+                        .iter()
+                        .filter(|effect| matches!(effect, ObjectEffect::SessionEnded { .. }))
+                        .count(),
+                    1,
+                    "the one session ends once"
+                );
+            }
+        }
+    }
+
 
     // Pool-backed disposal twin driver (607b-F3 round 2): mint one
     // deferred origin against the shared pool, pin the pool at its

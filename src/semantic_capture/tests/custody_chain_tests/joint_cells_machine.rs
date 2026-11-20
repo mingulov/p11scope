@@ -4649,3 +4649,79 @@ fn joint_machine_first_call_after_unadmitted_sighting_still_births_joint() {
         "refusals={refusals:?}"
     );
 }
+
+/// Machine cadence: a seal stalled in Audited re-observes
+/// take-raced keys before its next attempt. The wedged commit
+/// pends without progress; the hook drains the queued interest
+/// through the take-refresh sweep (a stale slot drops without
+/// scanning) while the service still yields Pending. Scanning
+/// and stash content ride the capture-level sweep twins; this
+/// twin pins the Audited wiring only.
+#[test]
+fn joint_audited_retry_sweeps_queued_take_refresh() {
+    let mut scene = primed_scene(1);
+    scene
+        .scene
+        .push(std::process::id(), 0, "C_CreateObject", 100);
+    scene.machine.begin_commit(true).unwrap();
+    reach_any(&mut scene, &["Auditing", "Negative", "Audited"]);
+    for _ in 0..8 {
+        if phase_of(&scene) == "Audited" {
+            break;
+        }
+        scene
+            .service(1)
+            .expect("setup service must succeed before the event");
+    }
+    assert_eq!(
+        phase_of(&scene),
+        "Audited",
+        "precondition: the seal stalls in Audited"
+    );
+    scene.machine.pose_no_progress_poll_for_test(true);
+    // A stale take-refresh interest: slot 99 resolves nowhere, so
+    // the sweep drains it without scanning.
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        held.capture.request_partition_refresh(
+            ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            },
+            0,
+            99,
+            std::process::id(),
+        );
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            1,
+            "precondition: the raced take queued its key"
+        );
+    }
+    for _ in 0..4 {
+        let outcome = scene
+            .service(1)
+            .expect("a wedged Audited poll yields Pending");
+        assert!(
+            matches!(
+                outcome,
+                crate::inventory_semantics::JointServiceProgress::Pending
+            ),
+            "the hook keeps the Pending yield"
+        );
+    }
+    {
+        let held = scene.scene.real.h0.0.borrow();
+        assert_eq!(
+            held.capture.refresh_interest_count_for_test(),
+            0,
+            "the Audited retry swept the queued interest"
+        );
+        assert_eq!(
+            held.capture.take_refresh_scans(),
+            0,
+            "a stale slot drains without scanning"
+        );
+    }
+    assert_eq!(phase_of(&scene), "Audited");
+}

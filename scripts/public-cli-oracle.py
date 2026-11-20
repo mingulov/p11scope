@@ -818,6 +818,28 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0
         and type(evidence.get("coverage_retired_slots", 0)) is int
         and evidence.get("coverage_retired_slots", 0) == 68)
+    # Relaxed composition (same ruling): the hosted host leg runs
+    # mt-system with the runner-noise flag, and a capture can carry
+    # the fixed R1 disclosure plus an already-ruled ambient
+    # descendant gap (CI-GAP-1). Strict keeps the exact two-cause
+    # pin above; a guest gap-plus-retirement stays a new shape.
+    # Shape mirrors run 44781310336 (lossy [skipped,
+    # coverage_retired_slots, pid_descendant_gaps], 1 R1 skip,
+    # slots=68, gaps=1, exact 64065). Any nonzero gap count
+    # qualifies here, like every other relaxed runner-noise arm;
+    # any further cause, skip or slot count still fails.
+    ok_coverage_retired_noise = (
+        relaxed
+        and cell == "mt-system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes")
+        == ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]
+        and skip_entries == [COVERAGE_RETIRED_SKIP]
+        and evidence.get("modules_skipped") == []
+        and type(evidence.get("pid_descendant_gaps", 0)) is int
+        and evidence.get("pid_descendant_gaps", 0) >= 1
+        and type(evidence.get("coverage_retired_slots", 0)) is int
+        and evidence.get("coverage_retired_slots", 0) == 68)
     # Ambient-burst lane, evidence-only: count cover is not proof, so
     # the census join annotates the failure detail below and never
     # accepts a cell (a real gap-for-gap join needs per-gap identity
@@ -870,7 +892,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
-                or ok_loader_quiet or ok_coverage_retired,
+                or ok_loader_quiet or ok_coverage_retired
+                or ok_coverage_retired_noise,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and

@@ -1208,6 +1208,64 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_coverage_retired_with_runner_gap_passes_when_allowed(self):
+        # Relaxed composition: the fixed R1 disclosure plus one
+        # already-ruled ambient descendant gap qualifies on the
+        # flagged host leg with exact owned counts. Shape mirrors
+        # run 44781310336 (lossy [skipped, coverage_retired_slots,
+        # pid_descendant_gaps], 1 R1 skip, slots=68, gaps=1).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=1", result["detail"])
+
+    def test_coverage_retired_with_two_runner_gaps_passes_when_allowed(self):
+        # Like every other relaxed runner-noise arm, any nonzero gap
+        # count composes with the R1 disclosure on the flagged leg.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"]["pid_descendant_gaps"] = 2
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+
+    def test_coverage_retired_with_runner_gap_fails_in_strict_mode(self):
+        # Strict keeps the exact two-cause pin: a gap-plus-retirement
+        # on an unflagged leg stays a new shape and still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
     def test_loader_quiet_passes_on_system_in_strict_mode(self):
         # The loader-quiet cell disjunct covers system too: the same
         # transient shape (lone named skip, one unavailable, zero

@@ -1769,9 +1769,11 @@ mod tests {
     }
 
     /// Adopted bug-1 budget-only twin, re-cut onto the cursor: only a
-    /// budget stop accrues toward demotion. Other truncations and
-    /// unattempted members keep ordinary fresh retry priority without
-    /// accruing.
+    /// budget stop accrues toward demotion. Other truncations keep
+    /// ordinary fresh retry priority without accruing, while unattempted
+    /// members stay never-attempted (ahead of retried members), so a
+    /// deferred tail retries before a retried prefix and no refused
+    /// prefix can camp at the head.
     #[test]
     fn owner2_cursor_demotion_counts_only_budget_stops() {
         let mut pass = detailed(u64::MAX, u64::MAX);
@@ -1786,8 +1788,8 @@ mod tests {
         assert_eq!(
             pass.cursor()
                 .order_members(&[(21, Some(210)), (22, Some(220)), (23, None)]),
-            vec![23, 21, 22],
-            "unaccrued members keep fresh retry priority"
+            vec![22, 23, 21],
+            "unattempted members stay never-attempted, ahead of retried members"
         );
         // A budget stop does accrue.
         pass.cursor_mut()

@@ -31527,6 +31527,170 @@ fn joint_seal_time_doom_retires_rows_per_credit_on_frame() {
     );
 }
 
+fn leaf_visits(fixture: &CanonicalFanoutScene) -> usize {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .leaf_visits_for_test()
+}
+
+/// I3 on the frame, seal-time doom over many journal rows: the doomed
+/// key's staged-row scan (97 extra retained rows on another image) and
+/// its refused-begin rebuild run under the seal service budget, never
+/// visiting more journal leaves in one poll than that poll's credit.
+#[test]
+fn joint_seal_time_doom_visits_journal_rows_per_credit_on_frame() {
+    use pkcs11_types::CkRv;
+    const CREDIT: usize = 64;
+    let (mut fixture, mut frame, proof) =
+        stage_neutral_abandonment(false, CkRv::SESSION_HANDLE_INVALID.0);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    {
+        let ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+    }
+    let h0 = fixture.scene.real.h0.clone();
+    for poll in 0..16 {
+        let before = leaf_visits(&fixture);
+        let spent = {
+            let mut births = NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            };
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            let mut remaining = CREDIT;
+            frame
+                .seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining)
+                .unwrap();
+            CREDIT - remaining
+        };
+        let visits = leaf_visits(&fixture) - before;
+        assert!(
+            visits <= spent,
+            "poll {poll}: {visits} journal leaves visited under {spent} units"
+        );
+    }
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .proof_refused_for_test(proof),
+        "the doomed key stays refused"
+    );
+}
+
+/// I3 on the frame, S1-only ingest: a genuine S1Only caller's exact
+/// originals refuse through the bulk negative while 97 unrelated
+/// retained rows stand; building the frame visits at most one credit
+/// of journal leaves, and the negative keeps its gap.
+#[test]
+fn joint_s1only_negative_visits_journal_rows_per_credit_on_frame() {
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let child_c = OwnedStoppedChild::new();
+    let caller = fixture.scene.real.bind(
+        child_c.id(),
+        ImageIdentity {
+            task_cookie: 73,
+            exec_id: 0,
+        },
+        0,
+    );
+    for (sequence, name) in ["C_SignInit", "C_SignUpdate", "C_SignFinal"]
+        .into_iter()
+        .enumerate()
+    {
+        fixture
+            .scene
+            .push(child_c.id(), 0, name, sequence as u64 + 1);
+    }
+    let raw = fixture.scene.collect_with_fault(&BirthFault);
+    fixture.scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = fixture.scene.real.tick();
+    fixture.scene.admit_providers(child_c.id(), caller, &[0]);
+    fixture.scene.prepare_batch(batch, 3);
+    let raw = fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .collected
+        .take()
+        .unwrap();
+    let mut ingested = raw
+        .ingest(
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture_mut()
+                .adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("original C raw: {reason:?}"));
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    while coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+        .unwrap()
+        .is_some()
+    {}
+    while coordinator
+        .stage_next_prepared_admission_with_disposition(&fixture.scene.producers, &mut ingested)
+        .unwrap()
+    {}
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    let before = leaf_visits(&fixture);
+    let frame = acquire(&mut fixture.scene, ingested, &fixture.attached, &BirthFault);
+    let visits = leaf_visits(&fixture) - before;
+    assert!(
+        visits <= 64,
+        "building the S1-only negative visited {visits} journal leaves"
+    );
+    assert_eq!(
+        frame.failure_for_test().unwrap().gap,
+        crate::semantics_objects::journal::JournalGap::DomainTainted
+    );
+}
+
 #[test]
 fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
     with_genuine_prior_terminal(false, false, |_, _, _, _, _| false);

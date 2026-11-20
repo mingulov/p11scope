@@ -1847,6 +1847,11 @@ pub(crate) struct JournalAdapter {
     /// The latest unlocalized raw disposal's rejection ticket, taken by
     /// the negative audit frame that carries its failure.
     raw_rejection: Option<u64>,
+    /// Test-only count of journal leaves (entries, refused begins, keys,
+    /// claims) recovery and rejection work visited, independent of the
+    /// credit it debited.
+    #[cfg(test)]
+    test_leaf_visits: std::cell::Cell<usize>,
     /// The inline allowance a deciding call may spend on its own
     /// rejection (at most one credit; a budgeted caller lowers it to
     /// what its service budget has left) and what the last deciding
@@ -2071,6 +2076,8 @@ impl JournalAdapter {
             rejection_done: Vec::new(),
             rejection_seq: 0,
             raw_rejection: None,
+            #[cfg(test)]
+            test_leaf_visits: std::cell::Cell::new(0),
             inline_credit: SCOPED_RECOVERY_SLICE,
             inline_spent: 0,
             barrier_scan: None,
@@ -2306,6 +2313,51 @@ impl JournalAdapter {
             recovery.wiped_open.len(),
             recovery.wiped_refused.len(),
         ))
+    }
+
+    /// Count one visited journal leaf (test builds only).
+    #[inline]
+    fn note_leaf_visit(&self) {
+        #[cfg(test)]
+        self.test_leaf_visits.set(self.test_leaf_visits.get() + 1);
+    }
+
+    /// Test-only count of journal leaves visited by recovery and
+    /// rejection work so far.
+    #[cfg(test)]
+    pub(crate) fn leaf_visits_for_test(&self) -> usize {
+        self.test_leaf_visits.get()
+    }
+
+    /// Test-only: stage `rows` synthetic unconverted open entries cloned
+    /// from a retained one onto an unkeyed foreign image, above every cut
+    /// (so they bar nothing), each with its census membership and custody
+    /// charge, so bounded recovery work has many journal rows to visit.
+    #[cfg(test)]
+    pub(crate) fn populate_foreign_open_rows_for_test(&mut self, rows: usize) {
+        let template = *self.open.values().next().expect("a retained open entry");
+        for index in 0..rows as u64 {
+            let native = (u64::MAX - 1, index);
+            let mut entry = template;
+            entry.image = (template.image.0 ^ 0x5eed_0000, template.image.1);
+            entry.begin_ordinal = u64::MAX / 2 + index;
+            entry.end = None;
+            entry.abandon = None;
+            entry.converted_ticket = None;
+            entry.converted_for = None;
+            entry.end_converted = false;
+            entry.raw_resource = None;
+            entry.collected_origin = None;
+            entry.s1only_subject = None;
+            self.ledger
+                .charge_h8open(entry.begin_ordinal, 1)
+                .expect("synthetic custody charges");
+            self.retained_member_inc(
+                identity_of_begin(&entry.begin),
+                RetainedMember::Open(native),
+            );
+            assert!(self.open.insert(native, entry).is_none());
+        }
     }
 
     /// Test-only read of the adapter invalidation flag; see above.
@@ -3626,7 +3678,10 @@ impl JournalAdapter {
             domains.extend(
                 self.keys
                     .iter()
-                    .filter(|(key, _)| self.is_tainted((key.cookie, key.exec)))
+                    .filter(|(key, _)| {
+                        self.note_leaf_visit();
+                        self.is_tainted((key.cookie, key.exec))
+                    })
                     .map(|(key, state)| {
                         JournalDomainProof {
                             key: *key,
@@ -3642,7 +3697,11 @@ impl JournalAdapter {
         let overflow = self.taint_overflow;
         let sightings = &self.sightings;
         let mut killed = false;
+        #[cfg(test)]
+        let visits = &self.test_leaf_visits;
         for (key, state) in &mut self.keys {
+            #[cfg(test)]
+            visits.set(visits.get() + 1);
             let image = (key.cookie, key.exec);
             let affected = taints.contains(&image) || (overflow && !sightings.contains_key(&image));
             if !affected || state.refused {
@@ -3673,6 +3732,7 @@ impl JournalAdapter {
             let mut doomed = [(0u64, 0u64); MAX_UNSETTLED_STAGED];
             let mut count = 0;
             for (key, entry) in &self.open {
+                self.note_leaf_visit();
                 if self.is_tainted(entry.image) {
                     doomed[count] = *key;
                     count += 1;
@@ -3695,6 +3755,8 @@ impl JournalAdapter {
                 .refused
                 .iter()
                 .filter(|entry| {
+                    #[cfg(test)]
+                    self.test_leaf_visits.set(self.test_leaf_visits.get() + 1);
                     taints.contains(&entry.image)
                         || (overflow && !sightings.contains_key(&entry.image))
                 })
@@ -3708,7 +3770,11 @@ impl JournalAdapter {
             // keys. Their proof claims can no longer convert; H9 still owns
             // its separate original rows/roles until negative fanout delivers.
             let count = &mut self.claim_counts;
+            #[cfg(test)]
+            let visits = &self.test_leaf_visits;
             self.claims.retain(|identity, claimants| {
+                #[cfg(test)]
+                visits.set(visits.get() + 1);
                 let affected = taints.contains(&identity.image)
                     || (overflow && !sightings.contains_key(&identity.image));
                 if affected {
@@ -3922,6 +3988,7 @@ impl JournalAdapter {
             let Some((native, subject)) = next else {
                 break;
             };
+            self.note_leaf_visit();
             after = Some(native);
             if let Some(key) = subject {
                 if let Some(state) = self.keys.get(&key) {
@@ -3942,6 +4009,7 @@ impl JournalAdapter {
         // Independent image/overflow evidence keeps its full existing union,
         // even when every marked subject itself had a retained exact key.
         for (key, state) in &self.keys {
+            self.note_leaf_visit();
             if self.is_tainted((key.cookie, key.exec)) {
                 image_fallback = true;
                 let domain = JournalDomainProof {
@@ -3963,7 +4031,11 @@ impl JournalAdapter {
         let overflow = self.taint_overflow;
         let sightings = &self.sightings;
         let mut killed = false;
+        #[cfg(test)]
+        let visits = &self.test_leaf_visits;
         for (key, state) in &mut self.keys {
+            #[cfg(test)]
+            visits.set(visits.get() + 1);
             let domain = JournalDomainProof {
                 key: *key,
                 era: state.era,
@@ -4004,6 +4076,7 @@ impl JournalAdapter {
             let Some((native, selected)) = next else {
                 break;
             };
+            self.note_leaf_visit();
             after = Some(native);
             if selected {
                 let entry = self
@@ -7217,7 +7290,10 @@ impl JournalAdapter {
         claimants
             .values()
             .flatten()
-            .all(|claim| claim_names_shape(shape, claim))
+            .all(|claim| {
+                self.note_leaf_visit();
+                claim_names_shape(shape, claim)
+            })
             .then_some(claimants)
     }
 
@@ -8296,7 +8372,10 @@ impl JournalAdapter {
                     claimants
                         .values()
                         .flat_map(|claims| claims.iter())
-                        .all(|claim| neutral(claim.rv))
+                        .all(|claim| {
+                            self.note_leaf_visit();
+                            neutral(claim.rv)
+                        })
                 })
     }
 
@@ -8993,6 +9072,7 @@ impl JournalAdapter {
                 return true;
             };
             let shaped = self.open.get(&native).and_then(|entry| {
+                self.note_leaf_visit();
                 let unbounded = entry.abandon.is_some_and(|staged| {
                     abandon_disposition(staged.abandon.reason())
                         == Some(AbandonDisposition::UnboundedInvalidation)
@@ -10051,6 +10131,7 @@ impl JournalAdapter {
             .open
             .iter()
             .filter(|(_, entry)| {
+                self.note_leaf_visit();
                 entry.image == image
                     && (self.converts_here(key, live, entry) || entry.converted_for == Some(key))
             })
@@ -10060,6 +10141,7 @@ impl JournalAdapter {
         let mut kept = Vec::with_capacity(self.refused.len());
         let mut dropped = Vec::new();
         for refused in self.refused.iter() {
+            self.note_leaf_visit();
             if !self.refused_converts_here(key, live, refused) {
                 kept.push(*refused);
             } else {
@@ -24189,6 +24271,278 @@ pub(crate) mod tests {
             "every view retirement, including those the aborted scoped void \
              gathered, reaches the consumers once"
         );
+    }
+
+    #[test]
+    fn stream_break_refused_reservation_keeps_partial_scoped_void_for_retry() {
+        // A stream break that cannot reserve its storage yet must leave
+        // the aborted scoped void (its standing retirement and the
+        // effects it already applied) in place: the retry after the
+        // pool frees publishes every view retirement and session end
+        // exactly once.
+        use super::joint_driver::RecoveryProgress;
+        let mut harness = OwnerHarness::new(image_default());
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let proof = proofs[0];
+        harness
+            .owner
+            .model_mut()
+            .populate_domain_rows_for_test(proof.domain(), 97);
+        harness
+            .owner
+            .adapter_mut()
+            .keys
+            .get_mut(&proof.key)
+            .expect("attested key")
+            .model_registered = true;
+        let key = proof.key;
+        harness.owner.adapter_mut().break_scoped_for_watchdog(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        let before = harness.owner.model().test_retire_units();
+        let mut polls = 0usize;
+        while harness.owner.model().test_retire_units() == before {
+            let mut budget = 8usize;
+            assert_eq!(
+                harness.owner.void_ingest_break_bounded(&mut budget),
+                Ok(RecoveryProgress::Yielded),
+                "97 rows never finish under small credits"
+            );
+            polls += 1;
+            assert!(polls < 1_000);
+        }
+        harness.owner.adapter_mut().break_stream_for_test();
+        let snapshot = harness.pool.snapshot();
+        harness.pool.reference_set_limit(snapshot.charged_bytes);
+        let mut budget = 64usize;
+        assert!(
+            matches!(
+                harness.owner.void_ingest_break_bounded(&mut budget),
+                Err(super::joint_driver::RawQuantumRefusal::Resource(_))
+            ),
+            "the stream takeover refuses while the pool is full"
+        );
+        assert!(
+            harness
+                .owner
+                .adapter()
+                .scoped_recovery_progress_for_test()
+                .is_some(),
+            "a refused takeover keeps the aborted scoped void"
+        );
+        harness.pool.reference_set_limit(snapshot.limit_bytes);
+        let (_, _) = drive_void_counting_model_rows(&mut harness, 64);
+        let failure = harness
+            .owner
+            .pending_void_for_test()
+            .expect("the stream void carries its failure");
+        let count = |want: fn(&ObjectEffect) -> bool| {
+            failure.effects.effects.iter().filter(|e| want(e)).count()
+        };
+        assert_eq!(
+            count(|e| matches!(e, ObjectEffect::Retired { .. })),
+            97,
+            "every view retirement reaches the consumers once after the retry"
+        );
+        assert_eq!(
+            count(|e| matches!(e, ObjectEffect::SessionEnded { .. })),
+            97,
+            "every session end reaches the consumers once after the retry"
+        );
+    }
+
+    /// A preservation basis that completes on the slice's last unit
+    /// leaves nothing for the decision: the slice yields and the doom
+    /// lands on later credit, never debiting below zero. One staged
+    /// mutating abandonment on one registered key, one-unit polls.
+    #[test]
+    fn stream_doom_preserve_yields_when_basis_spends_the_last_unit() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let proof = proofs[0];
+        harness
+            .owner
+            .adapter_mut()
+            .keys
+            .get_mut(&proof.key)
+            .expect("attested key")
+            .model_registered = true;
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(harness.ingest(&abandon), JournalDisposition::AbandonStaged);
+        harness.owner.adapter_mut().break_stream_for_test();
+        let (polls, _) = drive_void_counting_model_rows(&mut harness, 1);
+        assert!(polls > 3, "one-unit polls span the recovery");
+        assert!(
+            harness.owner.adapter().proof_refused_for_test(proof),
+            "the gated doom completes on later credit"
+        );
+    }
+
+    /// Debit before read on a claim-dependent preservation decision: an
+    /// effect-free unbounded abandonment with one neutral queued claim.
+    /// No poll reads more journal leaves (entries, claims) than the units
+    /// it debited; the neutral return still disposes per call.
+    #[test]
+    fn scoped_preserve_never_reads_a_queued_claim_before_paying() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::RecoveryProgress;
+        let mut harness = OwnerHarness::new(image_default());
+        let getattr = function_id("C_GetAttributeValue");
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let key = proofs[0].key;
+        let begin = begin_bytes(1, 1, getattr, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(harness.ingest(&abandon), JournalDisposition::AbandonStaged);
+        {
+            let adapter = harness.owner.adapter_mut();
+            let staged = adapter.open.values().next().expect("one open").begin;
+            let claim = keepup_claim_for_begin(&staged, staged.session_word());
+            adapter
+                .claims
+                .entry(identity_of_begin(&staged))
+                .or_default()
+                .entry(key)
+                .or_default()
+                .push_back(claim);
+            adapter.claim_counts += 1;
+        }
+        harness.owner.adapter_mut().break_scoped_for_watchdog(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        let mut polls = 0usize;
+        loop {
+            // One-unit polls first (a claim decision cannot start inside
+            // them), then full credits to finish.
+            let per_poll = if polls < 64 { 1 } else { SCOPED_RECOVERY_SLICE };
+            let before = harness.owner.adapter().leaf_visits_for_test();
+            let mut budget = per_poll;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded void never refuses its own budget");
+            let visits = harness.owner.adapter().leaf_visits_for_test() - before;
+            assert!(
+                visits <= per_poll - budget,
+                "poll {polls}: {visits} journal leaves read under {} units",
+                per_poll - budget
+            );
+            polls += 1;
+            assert!(polls < 10_000, "the bounded void always terminates");
+            if let RecoveryProgress::Done(_) = progress {
+                break;
+            }
+        }
+        assert!(
+            !harness.owner.adapter().keys[&key].refused,
+            "a neutral queued return disposes the abandoned read per call"
+        );
+    }
+
+    /// I3, localized raw refusal: one tainted image's 98 staged rows and
+    /// one registered key holding 97 model rows. The deciding call visits
+    /// at most one credit of journal rows; the rest of the refusal (keys,
+    /// rows, refused begins, claims, model rows) runs per credit under
+    /// the Idle driver, and the filled failure keeps every effect and the
+    /// exact affected scope.
+    #[test]
+    fn localized_raw_refusal_visits_journal_rows_per_credit() {
+        use super::joint_driver::RecoveryProgress;
+        let mut harness = OwnerHarness::new(image_default());
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let proof = proofs[0];
+        let create = function_id("C_CreateObject");
+        assert_eq!(
+            harness.ingest(&begin_bytes(1, 1, create, 0)),
+            JournalDisposition::BeginAdmitted
+        );
+        harness
+            .owner
+            .adapter_mut()
+            .populate_foreign_open_rows_for_test(97);
+        let foreign = (COOKIE ^ 0x5eed_0000, EXEC);
+        harness
+            .owner
+            .model_mut()
+            .populate_domain_rows_for_test(proof.domain(), 97);
+        harness
+            .owner
+            .adapter_mut()
+            .keys
+            .get_mut(&proof.key)
+            .expect("attested key")
+            .model_registered = true;
+        let before = harness.owner.adapter().leaf_visits_for_test();
+        let mut failure = {
+            let (adapter, model) = harness.owner.parts();
+            adapter.refuse_disposed_raw_deferred(
+                model,
+                [foreign, (COOKIE, EXEC)].into_iter(),
+                false,
+                JournalGap::Malformed,
+            )
+        };
+        let inline = harness.owner.adapter().leaf_visits_for_test() - before;
+        assert!(
+            inline <= SCOPED_RECOVERY_SLICE,
+            "the refusal decision visits at most one credit of journal rows ({inline})"
+        );
+        let mut polls = 0usize;
+        loop {
+            let before = harness.owner.adapter().leaf_visits_for_test();
+            let mut budget = SCOPED_RECOVERY_SLICE;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded driver never refuses its own budget");
+            let visits = harness.owner.adapter().leaf_visits_for_test() - before;
+            assert!(
+                visits <= SCOPED_RECOVERY_SLICE - budget,
+                "poll {polls}: {visits} journal leaves under {} units",
+                SCOPED_RECOVERY_SLICE - budget
+            );
+            polls += 1;
+            assert!(polls < 1_000, "the bounded refusal terminates");
+            if progress != RecoveryProgress::Yielded {
+                break;
+            }
+        }
+        if let Some(ticket) = harness.owner.adapter_mut().take_raw_rejection() {
+            if let Some(done) = harness.owner.adapter_mut().take_rejection(ticket) {
+                failure.fill_rejection(done);
+            }
+        }
+        let adapter = harness.owner.adapter();
+        assert!(adapter.keys[&proof.key].refused, "the tainted key refuses");
+        assert!(
+            adapter
+                .open
+                .values()
+                .all(|entry| !adapter.is_tainted(entry.image)),
+            "every tainted image's staged row drops"
+        );
+        assert!(
+            failure.affects_domain(proof.domain()),
+            "the scope keeps the key"
+        );
+        let ended = failure
+            .effects
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, ObjectEffect::SessionEnded { .. }))
+            .count();
+        assert_eq!(ended, 97, "every model session's end reaches the failure");
     }
 
     #[test]

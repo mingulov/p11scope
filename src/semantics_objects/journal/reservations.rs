@@ -347,7 +347,8 @@ impl<C> ReservationTable<C> {
         if pending.prev == INDEX_NONE {
             spent += 1;
             actual += 1;
-            if heads[pending.bucket] == pending.node {
+            let head = heads[pending.bucket];
+            if head == pending.node {
                 if spent >= budget {
                     pending.splice_ready = true;
                     return (false, spent, actual);
@@ -358,12 +359,7 @@ impl<C> ReservationTable<C> {
                     slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
                 return (true, spent, actual);
             }
-            pending.prev = heads[pending.bucket];
-            // The miss above reads the bucket head a second time:
-            // count each load where it occurs so the independent
-            // count diverges from the single debit until the head
-            // is cached.
-            actual += 1;
+            pending.prev = head;
             assert_ne!(pending.prev, INDEX_NONE, "indexed node linked");
             if spent >= budget {
                 return (false, spent, actual);

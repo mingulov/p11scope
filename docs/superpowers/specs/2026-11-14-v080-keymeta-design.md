@@ -2223,17 +2223,21 @@ reason (policy limits, not secrets). The schema (§17.5) has no
 serial/label/session/memory/clock keys, so that exclusion is
 structural: there is nowhere to publish them even by accident.
 
-### 17.3 Allowlist-v3 amendment block (PROPOSED, written by this design)
+### 17.3 Allowlist-v3 amendment block (APPROVED for opt-in, written by this design)
 
-Status when merged: PROPOSED for owner/Opus privacy review + Codex
-re-review (the Task 0 gate applies to this block too); not active
-until reviewed. Placement: a new `## Provider, token and mechanism
+Merged as PROPOSED for owner/Opus privacy review + Codex
+re-review (the Task 0 gate applied to this block too); approved
+for `--provider-info` opt-in on 2026-11-19 (owner direction via
+the Task 7 fix8 brief: finish the section without privacy
+questions to the owner; owner sign-off at 0.9.x like Task 2).
+Placement: a new `## Provider, token and mechanism
 info (v0.8.0 keymeta Task 7)` section appended after the §11 keymeta
 section, plus the field-inventory edit below (Task 7 Step 0
-serializes after the Task 0 merge, §13 — shared file, one writer
-at a time). Header status line gains the section (PROPOSED). v1/v2
-bytes unchanged. No descriptor-table edit, no authority-condition
-edit: §8.4 covers Task 7 too (fields, not entries).
+serialized after the Task 0 merge, §13 — shared file, one writer
+at a time). The header status line carries the section as APPROVED
+for the opt-in form. v1/v2 bytes unchanged. No descriptor-table
+edit, no authority-condition edit: §8.4 covers Task 7 too (fields,
+not entries).
 
 Edit 1 — field inventory (§Field inventory and retention): append
 rows: `Provider info struct (C_GetInfo)` (the two §17.1 field

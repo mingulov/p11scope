@@ -431,6 +431,16 @@ impl JointCaptureOwner {
             Some(recovery) => recovery,
             None => {
                 if !self.adapter.scoped_break_pending() {
+                    // No void stands: spend the tick's budget on owed
+                    // taint-overflow marks so they always drain, then
+                    // report idle only once nothing is owed.
+                    if self.adapter.has_taint_overflow_pending() {
+                        let mut left = super::SCOPED_RECOVERY_SLICE.min(*budget);
+                        if self.adapter.drain_taint_overflow_slice(&mut left, budget) {
+                            return Ok(RecoveryProgress::Done(false));
+                        }
+                        return Ok(RecoveryProgress::Yielded);
+                    }
                     return Ok(RecoveryProgress::Done(false));
                 }
                 let bytes =

@@ -71,6 +71,9 @@ OBSERVATIONS_VERSION_V4 = 4
 OBSERVATIONS_VERSION_V5 = 5
 OBSERVATIONS_VERSION_V6 = 6
 OBSERVATIONS_VERSION_V7 = 7
+# Version 8 is taken by the separate Task 7 provider section under the
+# shared allocator; object_observations skips from 7 to 9.
+OBSERVATIONS_VERSION_V9 = 9
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -185,9 +188,12 @@ GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction"
                "pending_capacity", "session_capacity", "object_capacity", "instance_capacity",
                "id_exhausted", "device_loss", "unseen_finalize", "inconsistent_mechanism",
                "outcome_lost", "unknown_domain", "domain_pruned", "pruned_object_referenced",
-               "corroboration_mismatch", "wrapped_park_refused")
+               "corroboration_mismatch", "wrapped_park_refused",
+               "unknown_mechanism_rows_refused")
 # v7-only gap reasons: refused below v7, never silently dropped.
 V7_ONLY_GAPS = ("corroboration_mismatch", "wrapped_park_refused")
+# v9-only gap reasons: refused below v9, never silently dropped.
+V9_ONLY_GAPS = ("unknown_mechanism_rows_refused",)
 
 SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects",
                 "key_operations", "unknown_key_operations", "gaps", "budgets"}
@@ -230,6 +236,8 @@ PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44", "ml_dsa_65",
             "slh_dsa_192f", "slh_dsa_256s", "slh_dsa_256f")
 UNKNOWN_ROW_KEYS = {"category", "reason", "unit", "completed", "failed", "cancelled",
                     "unknown", "active"}
+UNKNOWN_ROW_KEYS_V9 = UNKNOWN_ROW_KEYS | {"mechanisms"}
+UNKNOWN_MECH_ROW_KEYS = {"mechanism", "terminals"}
 GAP_ROW_KEYS = {"subject", "reason", "repeats"}
 BUDGET_KEYS = {"key_rows", "object_rows", "unknown_rows", "encoded_bytes",
                "allocation_refused", "refusal_reason"}
@@ -739,14 +747,26 @@ def _check_key_row(row, objects, roles, labels=METADATA_LABELS, version=1):
     return category, counters
 
 
-def _check_unknown_row(row):
-    _keys(row, UNKNOWN_ROW_KEYS)
+def _check_unknown_row(row, version):
+    _keys(row, UNKNOWN_ROW_KEYS_V9 if version >= OBSERVATIONS_VERSION_V9
+          else UNKNOWN_ROW_KEYS)
     category = _label(row["category"], CATEGORIES, "operation category")
     reason = _label(row["reason"], UNKNOWN_REASONS, "unknown-key reason")
     unit = _label(row["unit"], UNITS, "operation unit")
     counters = {name: row[name] for name in
                 ("completed", "failed", "cancelled", "unknown", "active")}
     _require(all(_u64(value) for value in counters.values()), "invalid unknown row counters")
+    if version >= OBSERVATIONS_VERSION_V9:
+        entries = row["mechanisms"]
+        _require(type(entries) is list, "unexpected fields")
+        seen = []
+        for entry in entries:
+            _keys(entry, UNKNOWN_MECH_ROW_KEYS)
+            _require(_u64(entry["mechanism"]) and _u64(entry["terminals"]),
+                     "invalid unknown mechanism entry")
+            seen.append(entry["mechanism"])
+        _require(len(set(seen)) == len(seen), "duplicate unknown mechanism")
+        _require(sorted(seen) == seen, "unknown mechanisms out of order")
     return category, reason, unit, counters
 
 
@@ -761,6 +781,8 @@ def _check_gaps(gaps, version):
         reason = _label(row["reason"], GAP_REASONS, "gap reason")
         if version < OBSERVATIONS_VERSION_V7 and reason in V7_ONLY_GAPS:
             raise OracleRefusal(f"v7-only gap reason in v{version} section")
+        if version < OBSERVATIONS_VERSION_V9 and reason in V9_ONLY_GAPS:
+            raise OracleRefusal(f"v9-only gap reason in v{version} section")
         _require(_u64(row["repeats"]), "invalid gap repeats")
         _require((subject, reason) not in seen, "duplicate gap row")
         seen.add((subject, reason))
@@ -821,13 +843,13 @@ def check_section(section):
     _keys(section, SECTION_KEYS_V3
           if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
                          OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
-                         OBSERVATIONS_VERSION_V7)
+                         OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
                              OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
                              OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
-                             OBSERVATIONS_VERSION_V7),
+                             OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
@@ -886,7 +908,7 @@ def check_section(section):
     unknown = []
     _require(type(section["unknown_key_operations"]) is list, "unexpected fields")
     for row in section["unknown_key_operations"]:
-        unknown.append(_check_unknown_row(row))
+        unknown.append(_check_unknown_row(row, version))
     pairs = [(category, reason) for category, reason, _, _ in unknown]
     _require(len(set(pairs)) == len(pairs), "duplicate unknown row")
     _require(sorted(pairs) == pairs, "unknown rows out of order")
@@ -894,10 +916,26 @@ def check_section(section):
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
     if version == OBSERVATIONS_VERSION_V6:
         _require_v6_content(section, keys)
-    if version >= OBSERVATIONS_VERSION_V7:
+    if version >= OBSERVATIONS_VERSION_V9:
+        _require_v9_content(section)
+    elif version >= OBSERVATIONS_VERSION_V7:
         _require_v7_content(section)
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
             "unknown": unknown, "gaps": gaps, "unattributed": unattributed}
+
+
+def _require_v9_content(section):
+    """A v9 section carries a non-empty mechanisms breakdown on some
+    unknown row, or a valid published v9-only gap (gap-driven v9,
+    rows or rowless). The gaps passed `_check_gaps` before this runs,
+    so a listed v9-only reason is already well-formed."""
+    for row in section["unknown_key_operations"]:
+        if row["mechanisms"]:
+            return
+    for row in section["gaps"]["rows"]:
+        if row["subject"] == "key_operation" and row["reason"] in V9_ONLY_GAPS:
+            return
+    _require(False, "v9 section without unknown mechanism content")
 
 
 def _require_v7_content(section):

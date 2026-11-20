@@ -1362,10 +1362,11 @@
         },
         "mechanisms": {
           "type": "array",
+          "maxItems": 8,
           "items": {
             "$ref": "#/$defs/unknown_mechanism"
           },
-          "description": "By-number terminal counts per observed mechanism id, sorted by id. Mechanism-less terminals (orphan ends, unreadable ids) keep no entry: row counters stay exact while this breakdown covers mechanism-bearing terminals only."
+          "description": "By-number terminal counts per observed mechanism id, sorted by id, at most 8 (further ids refuse into the unknown_mechanism_rows_refused gap). Mechanism-less terminals (orphan ends, unreadable ids) keep no entry: row counters stay exact while this breakdown covers mechanism-bearing terminals only."
         }
       }
     },

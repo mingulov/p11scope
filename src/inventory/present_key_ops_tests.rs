@@ -626,7 +626,7 @@ fn key_ops_verbose_names_unknown_row_mechanisms() {
     let block = key_ops_block(&verbose);
     assert!(
         block.contains(
-            &"  unknown key row generate_key_pair/not_applicable: CKM_NSS_ML_KEM_KEY_PAIR_GEN ×2"
+            &"  unknown key row generate_key_pair/not_applicable: CKM_NSS_ML_KEM_KEY_PAIR_GEN terminals=2"
         ),
         "verbose names the unknown-row mechanism:\n{verbose}"
     );

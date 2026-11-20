@@ -5857,13 +5857,15 @@ fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
         let revision = event["revision"].as_u64().unwrap_or(u64::MAX);
         // Per-event H9 version authority: absent means v1 (pre-6.07c
         // producers emit v1 rows only); unknown versions refuse,
-        // never guessed from labels or the final section. v5-v7 add
-        // no roles or creations, so the v2 tables still validate.
+        // never guessed from labels or the final section. v5-v7/v9
+        // add no roles or creations, so the v2 tables still
+        // validate. (Version 8 is the separate Task 7 provider
+        // section, never a row version here.)
         let version = event
             .get("version")
             .map_or(1, |v| v.as_u64().unwrap_or(u64::MAX));
         assert!(
-            (1..=7).contains(&version),
+            (1..=7).contains(&version) || version == 9,
             "H9 row version {version} refused"
         );
         let (roles, creations): (&[&str], &[&str]) = if version >= 2 {
@@ -6389,8 +6391,10 @@ fn key_operation_one_projection_three_consumers() {
     let delta = emitter.emit(&mut writer, &r2, 2_000).unwrap();
     assert_eq!(delta.deferred, 0);
     assert_eq!(
-        delta.emitted, 3,
-        "only the sign row, the new lost summary and the destroyed object row re-emit"
+        delta.emitted, 6,
+        "the sign row, the new lost summary and the destroyed object row re-emit, \
+         plus the three r1 unknown summaries re-rendered with the v9 key \
+         (their terminals carry no mechanism, so the breakdowns are empty)"
     );
     assert_eq!(
         emitter.tracked(),
@@ -12652,12 +12656,15 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
 /// reconstruction dispatches role/creation vocabularies per event
 /// and refuses unknown versions. Creation-only and role-only KEM
 /// states and rotation all ride real rendering and reconstruction
-/// (v7: every scene trips inference).
+/// (v7: every scene trips inference; the conflicted creation-only
+/// scene also carries unknown-row mechanism detail, hence v9).
 #[test]
 fn key_operation_kem_jsonl_version_dispatch() {
     use crate::discovery::engine::inventory_coordinator::PassReport;
     use crate::inventory_events::{KeyOperationEmitter, pass_payload};
-    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V7, object_observations_json};
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9, object_observations_json,
+    };
     fn row_versions(lines: &[serde_json::Value]) -> Vec<u64> {
         lines
             .iter()
@@ -12833,9 +12840,9 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "creation-only: no KEM role row"
     );
     let section = object_observations_json(&r2);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
-    assert_eq!(marker_version(&r2), 7);
-    let v2path = dir.path().join("v7delta.jsonl");
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V9);
+    assert_eq!(marker_version(&r2), 9);
+    let v2path = dir.path().join("v9delta.jsonl");
     let mut writer = EventWriter::create(&v2path, 1 << 20, 5).unwrap();
     loop {
         let out = emitter.emit(&mut writer, &r2, 2_000).unwrap();
@@ -12844,11 +12851,11 @@ fn key_operation_kem_jsonl_version_dispatch() {
         }
     }
     drop(writer);
-    let r2delta = read_stream(dir.path(), "v7delta.jsonl");
+    let r2delta = read_stream(dir.path(), "v9delta.jsonl");
     assert!(!r2delta.is_empty(), "the transition emits new rows");
     assert!(
-        row_versions(&r2delta).iter().all(|v| *v == 7),
-        "new rows bind v7"
+        row_versions(&r2delta).iter().all(|v| *v == 9),
+        "new rows bind v9"
     );
     assert!(
         row_keys(&v7lines).is_disjoint(&row_keys(&r2delta)),
@@ -12875,7 +12882,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
     );
     let r3 = commit(3, &[&staging], &scene.model.project(), &keyuse);
     let section = object_observations_json(&r3);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V9);
     let v3path = dir.path().join("v3delta.jsonl");
     let mut writer = EventWriter::create(&v3path, 1 << 20, 5).unwrap();
     loop {
@@ -12887,8 +12894,8 @@ fn key_operation_kem_jsonl_version_dispatch() {
     drop(writer);
     let r3delta = read_stream(dir.path(), "v3delta.jsonl");
     assert!(
-        row_versions(&r3delta).iter().all(|v| *v == 7),
-        "later rows bind v7"
+        row_versions(&r3delta).iter().all(|v| *v == 9),
+        "later rows bind v9"
     );
     let before = &row_keys(&v7lines) | &row_keys(&r2delta);
     let r3keys = row_keys(&r3delta);
@@ -12905,10 +12912,10 @@ fn key_operation_kem_jsonl_version_dispatch() {
         if line["kind"] == "object_observed"
             && reemitted.contains(&format!("o:{}", line["event"]["row"]["object"]))
         {
-            assert_eq!(line["event"]["version"], 7, "re-emits bind current v7");
+            assert_eq!(line["event"]["version"], 9, "re-emits bind current v9");
             assert_eq!(
                 line["event"]["row"]["creation"], "create",
-                "creation vocabulary stays valid under v7"
+                "creation vocabulary stays valid under v9"
             );
         }
     }
@@ -13044,7 +13051,10 @@ fn key_operation_kem_jsonl_version_dispatch() {
     for line in &spun {
         if line["kind"] == "object_observed" || line["kind"] == "key_operations_observed" {
             let version = line["event"]["version"].as_u64().unwrap_or(u64::MAX);
-            assert!(version == 7, "known version survives");
+            assert!(
+                version == 7 || version == 9,
+                "known version survives (r1 rows bind v7, r2/r3 rows v9)"
+            );
         }
     }
     assert!(
@@ -22977,7 +22987,9 @@ fn key_operation_partial_publication_counts_unattributed() {
         "the replayed calls count once as not attributed"
     );
     let fell_json = object_observations_json(&fell);
-    assert_eq!(fell_json["version"], 3);
+    // The replayed unknown rows carry their S1 mechanism ids, so the
+    // fallback section rides v9 (unknown detail plus unattributed).
+    assert_eq!(fell_json["version"], 9);
     assert_eq!(
         fell_json["unattributed"],
         serde_json::json!([{"reason": "proof_refused_fallback", "count": 3}])
@@ -27227,15 +27239,16 @@ fn key_operation_newsite_curve_name_triggers_v6_without_label() {
 }
 
 /// Keymeta §6 trigger twin: requested-only new-site content trips
-/// section v6. Duplicating conflicting sizes promote nothing (no
-/// established value, no source anywhere), but the requested 12
-/// still counts as new-site content.
+/// the v6 shapes (seven-key blocks with per-field source/reason).
+/// Duplicating conflicting sizes promote nothing (no established
+/// value, no source anywhere), but the requested 12 still counts as
+/// new-site content. The conflicted sign use also partitions
+/// unknown with its mechanism id, so the section rides v9.
+/// V6 stays frozen: v1–v7 output without unknown detail is byte-stable.
 #[test]
-fn key_operation_newsite_requested_conflict_triggers_v6_without_source() {
+fn key_operation_newsite_requested_conflict_without_source() {
     use crate::key_operation_projection::producer::commit;
-    use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
-    };
+    use crate::key_operation_projection::{object_observations_json, observations_version};
     use crate::semantics_key_use::KeyUseReducer;
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
@@ -27278,9 +27291,12 @@ fn key_operation_newsite_requested_conflict_triggers_v6_without_source() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
+    assert_eq!(
+        observations_version(&committed),
+        crate::key_operation_projection::OBSERVATIONS_VERSION_V9
+    );
     let section = object_observations_json(&committed);
-    assert_eq!(section["version"], 6);
+    assert_eq!(section["version"], 9);
     assert_eq!(
         section["objects"][0]["requested"]["value_len"]["status"], "conflict",
         "the duplicating sizes conflict in the requested block"
@@ -32958,10 +32974,12 @@ fn keymeta_type_only_checks_family() {
 }
 
 /// A rowless park refusal still discloses in a versioned section: with
-/// no proved rows the refusal promotes the section to v7 carrying the
-/// named gap, never a v1 section with a v7-only gap and never PARTIAL.
+/// no proved rows the refusal promotes the section to v9 (the refused
+/// park's unwraps also partition unknown with their mechanism ids)
+/// carrying the named gap, never a v1 section with a newer-only gap
+/// and never PARTIAL.
 #[test]
-fn keymeta_rowless_park_refusal_promotes_to_v7() {
+fn keymeta_rowless_park_refusal_promotes_to_v9() {
     use crate::key_operation_projection::producer::commit;
     let ids = KeymetaCtx::object_ids(3);
     let scene = JointScene::new();
@@ -33023,8 +33041,79 @@ fn keymeta_rowless_park_refusal_promotes_to_v7() {
     assert_eq!(gap.repeats, 1);
     assert_eq!(
         crate::key_operation_projection::observations_version(&committed),
+        9,
+        "a v7-only gap beside unknown detail promotes its section to v9"
+    );
+}
+
+/// A park refusal with proved terminals stays v7: no unknown rows
+/// means no unknown detail, so the v7-only gap alone promotes the
+/// section to v7 — never v1 with a v7-only gap and never PARTIAL.
+#[test]
+fn keymeta_proved_park_refusal_promotes_to_v7() {
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(3);
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    let mut ledger = StagingLedger::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
+        let receipt =
+            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+        let mut c = call("C_UnwrapKey", 7, CkRv::OK.0, 100 + n as u64 * 100);
+        c.mechanism = 0x2109;
+        c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NONE;
+        let origin = EffectOrigin::from(&c);
+        let before = sink.len();
+        edge.observe_joint_with_resources(
+            &c,
+            &origin,
+            &[receipt],
+            &CompletionEvidence {
+                length: Some(LengthOutcome::Value(32)),
+                fresh_view: Some(view.as_u64()),
+            },
+            &mut sink,
+        )
+        .expect("replay");
+        assert_eq!(sink.len(), before + 1, "unwrap {n} emits");
+        let effect = sink.last().cloned().expect("effect");
+        keyuse.observe_effect(instance, &effect, Some(&mut ledger), None);
+    }
+    let evidence = keyuse.key_use_evidence();
+    assert_eq!(evidence.parked_refused, 1);
+    assert!(
+        !evidence.partial,
+        "a refused park is inference-side, never row loss"
+    );
+    assert_eq!(
+        keyuse.aggregates().len(),
+        1,
+        "both unwraps share one proved bucket"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert_eq!(committed.reason, "none");
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "proved terminals partition no unknown rows"
+    );
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "wrapped_park_refused")
+        .expect("the refusal publishes as a named gap");
+    assert_eq!(gap.subject, "key_operation");
+    assert_eq!(gap.repeats, 1);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
         7,
-        "a v7-only gap promotes its section to v7"
+        "a v7-only gap without unknown detail promotes its section to v7"
     );
 }
 
@@ -33110,11 +33199,13 @@ fn key_operation_schema_v7_detail_validates_closed_variants() {
 }
 
 /// A proved row with blank inference beside a v7-only gap: the
-/// section still promotes to v7, and every proved row keeps (and
-/// renders) its blank inferred blocks — the snapshot, the stream
-/// rows and the row envelope share one version decision.
+/// section still promotes (to v9: the refused park's unwraps also
+/// partition unknown with their mechanism ids), and every proved
+/// row keeps (and renders) its blank inferred blocks — the
+/// snapshot, the stream rows and the row envelope share one version
+/// decision.
 #[test]
-fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
+fn keymeta_gap_promotes_blank_row_to_v9_with_shape() {
     use crate::key_operation_projection::contract::KEY_ROW_KEYS_V7;
     use crate::key_operation_projection::producer::commit;
     let ids = KeymetaCtx::object_ids(3);
@@ -33196,11 +33287,11 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
     assert_eq!(gap.repeats, 1);
     assert_eq!(
         crate::key_operation_projection::observations_version(&committed),
-        7,
-        "a v7-only gap promotes its section to v7"
+        9,
+        "a v7-only gap beside unknown detail promotes its section to v9"
     );
     let section = crate::key_operation_projection::object_observations_json(&committed);
-    assert_eq!(section["version"], 7);
+    assert_eq!(section["version"], 9);
     let rendered = &section["key_operations"][0];
     let mut keys: Vec<String> = rendered
         .as_object()
@@ -33211,18 +33302,18 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
     keys.sort();
     let mut want: Vec<String> = KEY_ROW_KEYS_V7.iter().map(|key| key.to_string()).collect();
     want.sort();
-    assert_eq!(keys, want, "gap-driven v7 rows carry all 15 keys");
+    assert_eq!(keys, want, "gap-driven v9 rows carry all 15 keys");
     assert_eq!(rendered["inferred_family"]["status"], "unknown");
     assert_eq!(rendered["inferred_size"]["status"], "unknown");
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schema_file: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
-            root.join("docs/schema/inventory-v1-object-observations-v7.schema.json"),
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
         )
         .unwrap(),
     )
     .unwrap();
-    // The emitted row validates against the selected (v7) schema's
+    // The emitted row validates against the selected (v9) schema's
     // key-row shape through its real references: full-section
     // validation needs the policy budgets limit, which the
     // capacity-1 refusal twin cannot carry, so the checker twins
@@ -33231,10 +33322,10 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
     row_schema["$defs"] = schema_file["$defs"].clone();
     let validator = jsonschema::options()
         .build(&row_schema)
-        .expect("v7 key-row schema builds");
+        .expect("v9 key-row schema builds");
     assert!(
         validator.is_valid(rendered),
-        "the gap-driven v7 row validates against the v7 key-row schema"
+        "the gap-driven v9 row validates against the v9 key-row schema"
     );
 }
 
@@ -33327,10 +33418,14 @@ fn unknown_rows_keep_by_number_mechanism_counts() {
             assert_eq!(entry_keys, want_mech, "mechanism entries carry 2 keys");
         }
     }
-    assert_eq!(
-        section["unknown_key_operations"][0]["mechanisms"][0]["mechanism"],
-        0xCE53_4380u64
-    );
+    let keygen_json = section["unknown_key_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["category"] == "generate_key_pair")
+        .expect("the keygen JSON row");
+    assert_eq!(keygen_json["mechanisms"][0]["mechanism"], 0xCE53_4380u64);
+    assert_eq!(keygen_json["mechanisms"][0]["terminals"], 2);
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schema_file: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
@@ -33350,6 +33445,74 @@ fn unknown_rows_keep_by_number_mechanism_counts() {
             "unknown rows validate against the v9 unknown-row schema"
         );
     }
+}
+
+/// A mechanism-only v9 section keeps blank inferred blocks on
+/// proved rows: v9 is v7 vocabulary plus unknown detail, so proved
+/// rows still render all 15 keys.
+#[test]
+fn mechanism_only_v9_keeps_proved_row_inferred_keys() {
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS_V7;
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    // Proved but blank: a receipt-bound start with no completion, so
+    // no inferred content either way.
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 50);
+    // Unknown detail without any inferred content.
+    assert!(
+        ctx.direct("C_GenerateKeyPair", 7, Some(0xCE53_4380), &[], 100, None, None)
+            .is_some(),
+        "the vendor keygen emits"
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        9,
+        "unknown-row mechanism detail alone promotes to v9"
+    );
+    assert_eq!(committed.key_operations.len(), 1);
+    let row = &committed.key_operations[0];
+    let inferred = row
+        .inferred
+        .as_ref()
+        .expect("mechanism-only v9 keeps blank inferred blocks");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], 9);
+    let rendered = &section["key_operations"][0];
+    let mut keys: Vec<String> = rendered
+        .as_object()
+        .expect("row object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    let mut want: Vec<String> = KEY_ROW_KEYS_V7.iter().map(|key| key.to_string()).collect();
+    want.sort();
+    assert_eq!(keys, want, "mechanism-only v9 rows carry all 15 keys");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut row_schema = serde_json::json!({"$ref": "#/$defs/key_row"});
+    row_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&row_schema)
+        .expect("v9 key-row schema builds");
+    assert!(
+        validator.is_valid(rendered),
+        "the mechanism-only v9 row validates against the v9 key-row schema"
+    );
 }
 
 /// Mechanism-less unknown terminals keep no detail entry and never
@@ -33409,9 +33572,9 @@ fn unknown_rows_without_mechanisms_stay_below_v9() {
 #[test]
 fn unknown_mechanism_overflow_refuses_with_named_gap() {
     use crate::key_operation_projection::producer::commit;
-    use crate::semantics_key_use::MAX_UNKNOWN_MECHANISMS;
+    use crate::semantics_key_use::MAX_UNKNOWN_MECHANISMS_PER_BUCKET;
     let mut ctx = KeymetaCtx::new();
-    let total = MAX_UNKNOWN_MECHANISMS + 6;
+    let total = MAX_UNKNOWN_MECHANISMS_PER_BUCKET + 6;
     for (n, id) in (0x10000u64..).take(total).enumerate() {
         assert!(
             ctx.direct("C_GenerateKeyPair", 7, Some(id), &[], 100 + n as u64, None, None)
@@ -33436,8 +33599,8 @@ fn unknown_mechanism_overflow_refuses_with_named_gap() {
     assert_eq!(keygen.completed, total as u64, "row counters stay exact");
     assert_eq!(
         keygen.mechanisms.len(),
-        MAX_UNKNOWN_MECHANISMS,
-        "detail keeps the first 1024 pairs"
+        MAX_UNKNOWN_MECHANISMS_PER_BUCKET,
+        "detail keeps the first 8 ids"
     );
     let gap = committed
         .gaps
@@ -33550,6 +33713,11 @@ fn key_operation_schema_v9_pins_unknown_mechanism_keys() {
         required(&schema, "/$defs/unknown_mechanism/required"),
         table(&UNKNOWN_MECH_ROW_KEYS),
         "mechanism entries require both keys"
+    );
+    assert_eq!(
+        schema["$defs"]["unknown_row"]["properties"]["mechanisms"]["maxItems"],
+        8,
+        "at most 8 detail entries per unknown row"
     );
     let v9_gaps = names(&schema, "/$defs/gap_reason/enum");
     let v7_gaps = names(&v7, "/$defs/gap_reason/enum");

@@ -2244,6 +2244,33 @@ fn inferred_row_detail(row: &crate::key_operation_projection::KeyAggRow) -> Opti
     ))
 }
 
+/// One `-v` per-row unknown-mechanism line, or nothing for rows
+/// without mechanism detail. Entries render by number with their
+/// display name when the id is a known standard or listed vendor
+/// mechanism, never guessed.
+fn unknown_row_detail(row: &crate::key_operation_projection::UnknownAggRow) -> Option<String> {
+    if row.mechanisms.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = row
+        .mechanisms
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} terminals={}",
+                crate::mechanism_names::mechanism_label(entry.mechanism),
+                entry.terminals
+            )
+        })
+        .collect();
+    Some(format!(
+        "  unknown key row {}/{}: {}",
+        row.category,
+        row.reason,
+        entries.join(", ")
+    ))
+}
+
 /// The `-v` family-conflict fragment: both pinned values with counts
 /// plus further values, or the single inferred value for an
 /// established mismatch (the established label stands on the row).
@@ -4855,6 +4882,27 @@ fn render_snapshot_inner(
                     let _ = writeln!(out, "  and 1 more key row (not shown)");
                 } else if hidden > 1 {
                     let _ = writeln!(out, "  and {hidden} more key rows (not shown)");
+                }
+                // Verbose per-row unknown-mechanism detail (rows
+                // carrying by-number counts), bounded with a counted
+                // overflow line.
+                let mut unknown_shown = 0usize;
+                let mut unknown_hidden = 0usize;
+                for row in &observations.unknown_key_operations {
+                    let Some(line) = unknown_row_detail(row) else {
+                        continue;
+                    };
+                    if unknown_shown < KEY_DETAIL_ROWS_SHOWN {
+                        let _ = writeln!(out, "{line}");
+                        unknown_shown += 1;
+                    } else {
+                        unknown_hidden += 1;
+                    }
+                }
+                if unknown_hidden == 1 {
+                    let _ = writeln!(out, "  and 1 more unknown key row (not shown)");
+                } else if unknown_hidden > 1 {
+                    let _ = writeln!(out, "  and {unknown_hidden} more unknown key rows (not shown)");
                 }
             }
             // F16 (7.05 PQC): the PQC spotlight names proved uses per

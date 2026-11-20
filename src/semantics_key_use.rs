@@ -2184,6 +2184,14 @@ pub(crate) struct UnknownCounters {
     pub cancelled: u64,
     pub unknown: u64,
     pub active: u64,
+    /// By-number mechanism detail (v9): (mechanism id, terminals)
+    /// pairs, the first [`Self::mech_len`] valid, allocation-free
+    /// (terminals never allocate). Past
+    /// [`MAX_UNKNOWN_MECHANISMS_PER_BUCKET`] distinct ids, new ids
+    /// refuse into [`KeyUseEvidence::unknown_mechanism_refused`]
+    /// while the counters above stay exact.
+    pub mechs: [(u64, u64); MAX_UNKNOWN_MECHANISMS_PER_BUCKET],
+    pub mech_len: u8,
 }
 
 impl UnknownCounters {
@@ -2194,6 +2202,30 @@ impl UnknownCounters {
             OperationOutcome::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
             OperationOutcome::Unknown => self.unknown = self.unknown.saturating_add(1),
         }
+    }
+
+    /// Keep one terminal's by-number attribution: bump a retained
+    /// id, fill the next inline slot, or refuse (`false`) past the
+    /// per-bucket cap. Allocation-free.
+    fn keep_mechanism(&mut self, id: u64) -> bool {
+        self.merge_mechanism(id, 1)
+    }
+
+    /// Merge one absorbed (id, terminals) pair: bump a retained id
+    /// by the full count, fill the next inline slot with it, or
+    /// refuse (`false`) past the per-bucket cap. Allocation-free.
+    fn merge_mechanism(&mut self, id: u64, terminals: u64) -> bool {
+        let len = usize::from(self.mech_len);
+        if let Some(pair) = self.mechs[..len].iter_mut().find(|pair| pair.0 == id) {
+            pair.1 = pair.1.saturating_add(terminals);
+            return true;
+        }
+        if len >= MAX_UNKNOWN_MECHANISMS_PER_BUCKET {
+            return false;
+        }
+        self.mechs[len] = (id, terminals);
+        self.mech_len = len as u8 + 1;
+        true
     }
 
     /// Whether any counter is nonzero: only live summaries publish.
@@ -2252,11 +2284,12 @@ pub(crate) const UNKNOWN_REASONS: [&str; 6] = [
 /// terminal increments never allocate. Index `category * 6 + reason`
 /// in the tables above.
 pub(crate) const UNKNOWN_BUCKETS: usize = 23 * 6;
-/// Distinct (unknown bucket, mechanism id) detail pairs the
-/// reducer retains for v9 unknown rows. Past the cap, new pairs
-/// refuse into [`KeyUseEvidence::unknown_mechanism_refused`] while
-/// row counters stay exact.
-pub(crate) const MAX_UNKNOWN_MECHANISMS: usize = 1024;
+/// Distinct mechanism ids one unknown summary retains for v9
+/// detail (inline, allocation-free: terminals never allocate).
+/// Past the per-bucket cap, new ids refuse into
+/// [`KeyUseEvidence::unknown_mechanism_refused`] while row counters
+/// stay exact.
+pub(crate) const MAX_UNKNOWN_MECHANISMS_PER_BUCKET: usize = 8;
 
 /// The fixed-summary index for one (category, reason) pair. Total:
 /// S1 categories and reducer reasons always land in-vocabulary (a
@@ -2329,9 +2362,9 @@ pub(crate) struct KeyUseEvidence {
     /// coverage loss.
     pub parked_refused: u64,
     /// Unknown-summary terminals whose mechanism detail was refused
-    /// past [`MAX_UNKNOWN_MECHANISMS`]: counted as the named
-    /// `unknown_mechanism_rows_refused` gap, never silent, never a
-    /// row, never coverage loss (row counters stay exact).
+    /// past [`MAX_UNKNOWN_MECHANISMS_PER_BUCKET`]: counted as the
+    /// named `unknown_mechanism_rows_refused` gap, never silent,
+    /// never a row, never coverage loss (row counters stay exact).
     pub unknown_mechanism_refused: u64,
 }
 
@@ -2849,17 +2882,16 @@ pub(crate) struct KeyUseReducer {
     open: BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse>,
     refused: BTreeMap<(RegistryInstanceId, OperationId), RefusedOpen>,
     aggregates: BTreeMap<AggKey, AggCounters>,
-    unknown: [UnknownCounters; UNKNOWN_BUCKETS],
+    /// Fixed unknown summaries, boxed: the inline per-bucket detail
+    /// would otherwise bloat every stack frame holding a reducer by
+    /// value. One heap allocation at construction; terminal paths
+    /// still allocate nothing.
+    unknown: Box<[UnknownCounters; UNKNOWN_BUCKETS]>,
     /// Fixed unknown summaries ever live (N9): once a summary row
     /// emits, its zero-active replacement emits forever after, so the
     /// cumulative consumer never keeps stale activity. Fixed 138
     /// flags — within the finite summary bound, never cleared.
     unknown_ever_live: [bool; UNKNOWN_BUCKETS],
-    /// By-number mechanism detail for unknown summaries (v9):
-    /// terminals per (unknown bucket, observed mechanism id).
-    /// Bounded by [`MAX_UNKNOWN_MECHANISMS`]; refused detail counts
-    /// [`KeyUseEvidence::unknown_mechanism_refused`], never rows.
-    unknown_mechanisms: BTreeMap<(usize, u64), u64>,
     capacity: usize,
     evidence: KeyUseEvidence,
     /// Per-bucket inferred keys (keymeta §10.2): family (both modes)
@@ -2906,9 +2938,8 @@ impl KeyUseReducer {
             open: BTreeMap::new(),
             refused: BTreeMap::new(),
             aggregates: BTreeMap::new(),
-            unknown: [UnknownCounters::default(); UNKNOWN_BUCKETS],
+            unknown: Box::new([UnknownCounters::default(); UNKNOWN_BUCKETS]),
             unknown_ever_live: [false; UNKNOWN_BUCKETS],
-            unknown_mechanisms: BTreeMap::new(),
             capacity,
             evidence: KeyUseEvidence::default(),
             pending_shared_releases: Vec::new(),
@@ -2951,12 +2982,6 @@ impl KeyUseReducer {
         &self.unknown
     }
 
-    /// By-number mechanism detail for unknown summaries: terminals
-    /// per (unknown bucket, observed mechanism id).
-    pub(crate) fn unknown_mechanisms(&self) -> &BTreeMap<(usize, u64), u64> {
-        &self.unknown_mechanisms
-    }
-
     /// Fixed unknown summaries ever live, by bucket index (N9): the
     /// projection emits these even at all zeros (zero-active
     /// replacements for rows the cumulative consumer already saw).
@@ -2966,16 +2991,27 @@ impl KeyUseReducer {
 
     /// Mark one fixed unknown summary ever-live and add a terminal
     /// outcome (N9), keeping its by-number mechanism attribution
-    /// (`None` when no usable id was observed).
+    /// (`None` keeps no entry). Detail past
+    /// [`MAX_UNKNOWN_MECHANISMS_PER_BUCKET`] refuses into
+    /// [`KeyUseEvidence::unknown_mechanism_refused`] while the row
+    /// counters stay exact. Allocation-free.
     fn unknown_add(
         &mut self,
         index: usize,
         outcome: OperationOutcome,
         mechanism: Option<u64>,
     ) {
-        let _ = mechanism;
         self.unknown_ever_live[index] = true;
         self.unknown[index].add(outcome);
+        let Some(id) = mechanism else {
+            return;
+        };
+        if !self.unknown[index].keep_mechanism(id) {
+            self.evidence.unknown_mechanism_refused = self
+                .evidence
+                .unknown_mechanism_refused
+                .saturating_add(1);
+        }
     }
 
     /// Mark one fixed unknown summary ever-live and count live
@@ -2988,8 +3024,10 @@ impl KeyUseReducer {
     /// Merge a fully-closed preservation reducer's unknown summaries
     /// and evidence (bulk-disposal preservation): fixed unknown
     /// counters add (never refuse, never re-partition), ever-live
-    /// ORs (N9), evidence counts add. The preserved reducer holds
-    /// no opens, refused opens, proved aggregates (receipt-less by
+    /// ORs (N9), by-number detail pairs add under the same
+    /// per-bucket cap (overflow terminals join the refusal count),
+    /// evidence counts add. The preserved reducer holds no opens,
+    /// refused opens, proved aggregates (receipt-less by
     /// construction) or pended releases — anything left would be a
     /// pairing leak across the loss boundary.
     pub(crate) fn absorb_preserved(&mut self, other: KeyUseReducer) {
@@ -3011,6 +3049,17 @@ impl KeyUseReducer {
         {
             *live |= add;
         }
+        for (slot, add) in self.unknown.iter_mut().zip(other.unknown.iter()) {
+            let len = usize::from(add.mech_len);
+            for (id, terminals) in add.mechs[..len].iter() {
+                if !slot.merge_mechanism(*id, *terminals) {
+                    self.evidence.unknown_mechanism_refused = self
+                        .evidence
+                        .unknown_mechanism_refused
+                        .saturating_add(*terminals);
+                }
+            }
+        }
         let (mine, theirs) = (&mut self.evidence, other.evidence);
         mine.unknown_key_rows = mine
             .unknown_key_rows
@@ -3031,6 +3080,9 @@ impl KeyUseReducer {
         mine.duplicate_starts = mine
             .duplicate_starts
             .saturating_add(theirs.duplicate_starts);
+        mine.unknown_mechanism_refused = mine
+            .unknown_mechanism_refused
+            .saturating_add(theirs.unknown_mechanism_refused);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -3068,7 +3120,8 @@ impl KeyUseReducer {
     /// aggregate buckets on start (refuse at N+1, never evict),
     /// close into the reserved buckets on end, complete atomically
     /// on direct. Terminals move within reserved buckets and fixed
-    /// summaries and allocate nothing.
+    /// summaries and allocate nothing (unknown-mechanism detail is
+    /// inline).
     #[cfg_attr(not(test), allow(dead_code))] // Staged aggregation path: exercised by the key-operation tests; no production feed wires it yet.
     pub(crate) fn observe_effect(
         &mut self,

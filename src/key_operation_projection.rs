@@ -1982,6 +1982,17 @@ pub(crate) mod producer {
             }
             let category = UNKNOWN_CATEGORIES[index / UNKNOWN_REASONS.len()];
             let reason = UNKNOWN_REASONS[index % UNKNOWN_REASONS.len()];
+            // Commit-time only: inline detail arrives in first-seen
+            // order, so the row sorts it by id here.
+            let len = usize::from(counters.mech_len);
+            let mut mechanisms: Vec<UnknownMechCount> = counters.mechs[..len]
+                .iter()
+                .map(|(id, terminals)| UnknownMechCount {
+                    mechanism: *id,
+                    terminals: *terminals,
+                })
+                .collect();
+            mechanisms.sort_by_key(|entry| entry.mechanism);
             unknown_rows.push(UnknownAggRow {
                 category,
                 reason,
@@ -1991,7 +2002,7 @@ pub(crate) mod producer {
                 cancelled: counters.cancelled,
                 unknown: counters.unknown,
                 active: counters.active,
-                mechanisms: Vec::new(),
+                mechanisms,
             });
         }
         unknown_rows.sort_by(|a, b| (a.category, a.reason).cmp(&(b.category, b.reason)));
@@ -2025,21 +2036,34 @@ pub(crate) mod producer {
                 repeats: parks_refused,
             });
         }
+        // Refused unknown-mechanism detail is inference-side, never
+        // row loss (no partial): the count publishes as a named gap.
+        let mech_refused = keyuse.key_use_evidence().unknown_mechanism_refused;
+        if mech_refused > 0 {
+            observations.gaps.push(GapRow {
+                subject: "key_operation",
+                reason: "unknown_mechanism_rows_refused",
+                repeats: mech_refused,
+            });
+        }
         // The row shape follows the same version decision as the
         // snapshot, marker and stream ([`observations_version`]):
         // v7 keeps the inferred keys on every proved row, whether a
         // row carries non-blank content or a v7-only gap does, so a
-        // gap-driven v7 section still renders all 15 keys per row.
-        // Below v7 every row drops its keys (uniform fill above,
-        // frozen 13 below). Model gaps (collected after this) never
-        // trigger v7, and the at-most-three key-side gaps sort
-        // before them under the 256-cap, so this decision equals the
-        // final one.
+        // gap-driven v7 section still renders all 15 keys per row —
+        // and v9 keeps them too (v9 is v7 vocabulary plus unknown
+        // detail, so a mechanism-only v9 section still renders all
+        // 15 keys per proved row). Below v7 every row drops its keys
+        // (uniform fill above, frozen 13 below). Model gaps
+        // (collected after this) never trigger v7 or v9, and the
+        // key-side gaps sort before them under the 256-cap, so this
+        // decision equals the final one.
         let v7 = observations.key_operations.iter().any(|row| {
             row.inferred
                 .as_ref()
                 .is_some_and(|keys| keys.is_v7_content())
-        }) || has_v7_gap_content(observations);
+        }) || has_v7_gap_content(observations)
+            || has_v9_content(observations);
         if !v7 {
             for row in &mut observations.key_operations {
                 row.inferred = None;

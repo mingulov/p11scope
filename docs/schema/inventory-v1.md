@@ -1261,14 +1261,21 @@ contracts are
 [inventory-v1-object-observations-v6.schema.json](inventory-v1-object-observations-v6.schema.json)
 (section version 6) and
 [inventory-v1-object-observations-v7.schema.json](inventory-v1-object-observations-v7.schema.json)
-(section version 7); consumers must reject unknown section versions,
+(section version 7) and
+[inventory-v1-object-observations-v9.schema.json](inventory-v1-object-observations-v9.schema.json)
+(section version 9; version 8 is taken by the separate Task 7
+provider section under the shared allocator); consumers must reject
+unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 7 iff inferred key content is
+- `version` follows the content: 9 iff unknown-row mechanism detail
+  is present — any unknown row with a non-empty `mechanisms`
+  breakdown, or the `unknown_mechanism_rows_refused` gap — else 7
+  iff inferred key content is
   present — any key row whose `inferred_family` or `inferred_size`
   status is not `unknown`, or with any inference completions — else
   6 iff new-site content is present —
@@ -1293,10 +1300,10 @@ never imply S1 loss.
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
-  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5 and 6 are
+  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5, 6 and 7 are
   frozen; version 1 never carries KEM labels and neither 1 nor 2
-  carries `unattributed`; versions 4, 5, 6 and 7 always carry
-  `unattributed` (possibly empty), and versions 5, 6 and 7 always
+  carries `unattributed`; versions 4, 5, 6, 7 and 9 always carry
+  `unattributed` (possibly empty), and versions 5, 6, 7 and 9 always
   carry the seven-key metadata blocks. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
@@ -1461,7 +1468,16 @@ never imply S1 loss.
   subsequent row.
 - `unknown_key_operations[]` (sorted by category and reason) holds
   capture-wide unknown-key summaries without `started` (starts are
-  never fabricated into the unknown bucket).
+  never fabricated into the unknown bucket). At version 9 each row
+  also carries `mechanisms`: by-number terminal counts per observed
+  mechanism id (`{mechanism, terminals}`, sorted by id, no name key
+  — names ride `-v` text only). Mechanism-less terminals (orphan
+  ends, unreadable ids) keep no entry: the row counters stay exact
+  while the breakdown covers mechanism-bearing terminals only.
+  Detail past the 8-ids-per-row budget refuses into the
+  `unknown_mechanism_rows_refused` gap (versions 1–7 never carry
+  it); `-v` names each row's breakdown per row
+  (`unknown key row <category>/<reason>: <name> terminals=<n>`).
 - `gaps` (`{rows[{subject, reason, repeats}], suppressed}`) and
   `budgets` (`key_rows`/`object_rows`/`unknown_rows` occupancy,
   measured `encoded_bytes`, pool `allocation_refused`/`refusal_reason`)

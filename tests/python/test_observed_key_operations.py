@@ -576,15 +576,17 @@ class ObservedRsaTests(unittest.TestCase):
              defs["unknown_reason"]["enum"]),
             ("GAP_SUBJECTS", ORACLE.GAP_SUBJECTS,
              defs["gap_row"]["properties"]["subject"]["enum"]),
-            # The script carries the two new v7-only gap reasons ahead
-            # of the frozen base schema (v1-v6 never emit them: each
-            # implies admitted lengths, hence non-blank rows, hence
-            # v7). The v7 schema file pins both reasons (see the
-            # v7-only test below); the union keeps this v1 pin
-            # correct.
+            # The script carries the new v7-only and v9-only gap
+            # reasons ahead of the frozen base schema (v1-v6 never
+            # emit the v7 pair: each implies admitted lengths, hence
+            # non-blank rows, hence v7; v1-v7 never emit the v9
+            # reason). The v7/v9 schema files pin their reasons (see
+            # the version-only tests below); the union keeps this v1
+            # pin correct.
             ("GAP_REASONS", ORACLE.GAP_REASONS,
              set(defs["gap_reason"]["enum"])
-             | {"corroboration_mismatch", "wrapped_park_refused"}),
+             | {"corroboration_mismatch", "wrapped_park_refused",
+                "unknown_mechanism_rows_refused"}),
             ("CURVE_LABELS", ORACLE.CURVE_LABELS,
              [name for name in
               defs["metadata_field_curve"]["properties"]["value"]["enum"]
@@ -1145,6 +1147,149 @@ class ObservedRsaTests(unittest.TestCase):
                     "suppressed": 0}
                 with self.assertRaises(ORACLE.OracleRefusal):
                     ORACLE.check_section(mutated)
+
+    def test_oracle_v9_tables_match_v9_schema(self):
+        # The v9-only gap reason is pinned in the v9 schema file and
+        # absent from the frozen base file (v1-v7 never carry it);
+        # the unknown-row required keys grow by exactly `mechanisms`,
+        # and the mechanism entry shape is closed at two keys.
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v9.schema.json",
+                  encoding="utf-8") as stream:
+            schema = json.load(stream)
+        defs = schema["$defs"]
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations.schema.json",
+                  encoding="utf-8") as stream:
+            base = json.load(stream)
+        with self.subTest("version const"):
+            self.assertEqual(schema["properties"]["version"]["const"], 9)
+            self.assertEqual(ORACLE.OBSERVATIONS_VERSION_V9, 9)
+        with self.subTest("unknown row keys"):
+            self.assertEqual(set(ORACLE.UNKNOWN_ROW_KEYS_V9),
+                             set(defs["unknown_row"]["required"]))
+            self.assertEqual(set(ORACLE.UNKNOWN_ROW_KEYS_V9),
+                             set(ORACLE.UNKNOWN_ROW_KEYS) | {"mechanisms"})
+        with self.subTest("mechanism entry keys"):
+            self.assertEqual(set(ORACLE.UNKNOWN_MECH_ROW_KEYS),
+                             set(defs["unknown_mechanism"]["required"]))
+        with self.subTest("v9-only gap reason"):
+            self.assertIn("unknown_mechanism_rows_refused",
+                          defs["gap_reason"]["enum"])
+            self.assertNotIn(
+                "unknown_mechanism_rows_refused",
+                base["$defs"]["gap_reason"]["enum"])
+            self.assertIn("unknown_mechanism_rows_refused",
+                          ORACLE.GAP_REASONS)
+
+    def test_h9_v9_section_checks_structurally(self):
+        # v9 shape: v7 key rows plus the mechanisms breakdown on every
+        # unknown row. The breakdown refuses malformed shapes,
+        # duplicates and misordering; a v9 section without unknown
+        # mechanism content is refused; the v9-only gap reason
+        # qualifies beside rows and rowless.
+        section = observed("metadata-conflict.json")
+        assert section["version"] == 1
+        assert len(section["unknown_key_operations"]) == 1
+        section["version"] = 9
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "unknown",
+                                      "value": None, "completions": 0}
+            row["inferred_size"] = {"status": "unknown",
+                                    "detail": None, "completions": 0}
+        for row in section["unknown_key_operations"]:
+            row["mechanisms"] = [{"mechanism": 0x17, "terminals": 1},
+                                 {"mechanism": 0xCE534380,
+                                  "terminals": 2}]
+        with self.subTest("v9 shape checks"):
+            facts = ORACLE.check_section(copy.deepcopy(section))
+            self.assertEqual(len(facts["unknown"]), 1)
+        with self.subTest("missing mechanisms refused"):
+            mutated = copy.deepcopy(section)
+            del mutated["unknown_key_operations"][0]["mechanisms"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("open mechanism entry refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"][0]["name"] = \
+                "CKM_ML_KEM"
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("duplicate mechanism refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"].append(
+                {"mechanism": 0x17, "terminals": 1})
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("misordered mechanisms refused"):
+            mutated = copy.deepcopy(section)
+            entries = mutated["unknown_key_operations"][0]["mechanisms"]
+            entries.reverse()
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v9 without unknown mechanism content refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"] = []
+            with self.assertRaisesRegex(
+                    ORACLE.OracleRefusal,
+                    "v9 section without unknown mechanism content"):
+                ORACLE.check_section(mutated)
+        with self.subTest("v9 gap reason qualifies"):
+            mutated = copy.deepcopy(section)
+            mutated["gaps"] = {
+                "rows": [{"subject": "key_operation",
+                          "reason": "unknown_mechanism_rows_refused",
+                          "repeats": 6}],
+                "suppressed": 0}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["gaps"]["rows"]), 1)
+        with self.subTest("rowless v9 with a refusal gap qualifies"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"] = []
+            mutated["gaps"] = {
+                "rows": [{"subject": "key_operation",
+                          "reason": "unknown_mechanism_rows_refused",
+                          "repeats": 6}],
+                "suppressed": 0}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["unknown"]), 1)
+
+    def test_h9_v1_refuses_v9_detail(self):
+        # Version-aware unknown vocabulary: the mechanisms key and
+        # the v9-only gap reason qualify in v9 (pinned above) and are
+        # refused in v1, never silently dropped.
+        section = observed("metadata-conflict.json")
+        assert section["version"] == 1
+        with self.subTest("mechanisms key refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"] = []
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v9 gap refused"):
+            mutated = copy.deepcopy(section)
+            mutated["gaps"] = {
+                "rows": [{"subject": "key_operation",
+                          "reason": "unknown_mechanism_rows_refused",
+                          "repeats": 1}],
+                "suppressed": 0}
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
 
     def test_h9_v7_gap_content_qualifies_without_inferred_rows(self):
         # Gap-driven v7: a valid published v7-only gap counts as v7

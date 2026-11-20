@@ -20072,6 +20072,40 @@ pub(crate) mod tests {
         gcc(dir, out, &source, &["-shared", "-fPIC"], &[])
     }
 
+    /// Build a shared object with `bytes` of file-backed data ahead of a
+    /// real 68-slot table plus one wide interface: the table sits last,
+    /// so a pass that cannot afford the whole object finds nothing and
+    /// must resume across passes to reach it.
+    fn gcc_table_last_provider(dir: &std::path::Path, out: &str, bytes: usize) -> PathBuf {
+        let mut stubs = String::new();
+        for index in 0..67 {
+            stubs.push_str(&format!("S({index}) "));
+        }
+        let mut slots = String::from("s0, s1, s2, C_GetFunctionList");
+        for index in 3..67 {
+            slots.push_str(&format!(", s{index}"));
+        }
+        let source = dir.join(format!("{out}.c"));
+        std::fs::write(
+            &source,
+            format!(
+                "/* {bytes} bytes of file-backed data ahead of the table. */\n\
+                 typedef unsigned char CK_BYTE;\n\
+                 typedef unsigned long CK_RV;\n\
+                 typedef struct {{ CK_BYTE major; CK_BYTE minor; }} CK_VERSION;\n\
+                 typedef struct {{ CK_VERSION version; void *functions[68]; }} Table;\n\
+                 #define S(n) static CK_RV s##n(void) {{ return 0; }}\n\
+                 {stubs}\n\
+                 CK_RV C_GetFunctionList(void **out);\n\
+                 __attribute__((section(\".provider_scan\"), used)) static unsigned char scan_blob[{bytes}] = {{1}};\n\
+                 __attribute__((section(\".provider_scan\"), used)) static Table provider_table = {{{{2, 40}}, {{{slots}}}}};\n\
+                 CK_RV C_GetFunctionList(void **out) {{ if (out) *out = &provider_table; return 0; }}\n"
+            ),
+        )
+        .unwrap();
+        gcc(dir, out, &source, &["-shared", "-fPIC"], &[])
+    }
+
     /// Spawn one owned large-table driver over `mapped` (and optionally a
     /// real provider), stopped after its readiness handshake.
     fn spawn_table_driver(
@@ -20122,11 +20156,94 @@ pub(crate) mod tests {
         })
     }
 
+    /// Resume a stopped fixture child (it idles in pause() until commanded).
+    fn cont_child(pid: u32) {
+        // SAFETY: pid names the test's own retained child.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+    }
+
+    /// Spawn one owned driver with a reload handshake (autostopped after
+    /// READY1): returns the child plus the reload command and READY2
+    /// paths. The test resumes the child, runs a roomy pass that pins,
+    /// commands a reload (same files, fresh addresses: pins hold while
+    /// decode cursors miss), and stops it again before the small passes.
+    fn spawn_table_driver_reloadable(
+        dir: &std::path::Path,
+        driver: &std::path::Path,
+        ready_name: &str,
+        mapped: &[std::path::PathBuf],
+        providers: &[&std::path::Path],
+        cmd_name: &str,
+        ready2_name: &str,
+    ) -> (
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let ready = dir.join(ready_name);
+        let cmd = dir.join(cmd_name);
+        let ready2 = dir.join(ready2_name);
+        let mut command = std::process::Command::new(driver);
+        command.arg(&ready);
+        for path in mapped {
+            command.arg("--map").arg(path);
+        }
+        for provider in providers {
+            command.arg("--provider").arg(provider);
+        }
+        command
+            .arg("--reload-cmd")
+            .arg(&cmd)
+            .arg("--reload-ready")
+            .arg(&ready2);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = OwnedStoppedChild::spawn_stopped(&mut command, |pid| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned large-table child did not finish startup"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // SAFETY: pid names the child retained by spawn_stopped.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+        });
+        (child, cmd, ready2)
+    }
+
+    /// Command a running driver's provider reload and stop it after
+    /// READY2: same files, fresh addresses, so pins held from an earlier
+    /// pass survive while decode cursors miss and scan fresh.
+    fn reload_and_stop_child(
+        child: &mut crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        cmd: &std::path::Path,
+        ready2: &std::path::Path,
+    ) {
+        std::fs::write(cmd, b"reload\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready2.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned driver did not finish its provider reload"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        child.stop();
+    }
+
     /// One scene pass before the fold: deep-scan gaps, module paths,
-    /// attempted file I/O and shared pass work spent.
+    /// per-module decoded table counts, attempted file I/O and shared
+    /// pass work spent.
+    #[derive(Debug)]
     struct CgroupTablePass {
         gaps: Vec<(u32, String, String)>,
         modules: Vec<String>,
+        tables: Vec<(String, usize)>,
         attempted_io: Option<u64>,
         used_work: usize,
     }
@@ -20212,15 +20329,74 @@ pub(crate) mod tests {
             std::fs::write(self._dir.path().join("cgroup.procs"), members).unwrap();
         }
 
-        /// One full collect/apply/commit transaction; returns the
-        /// collection's deep-scan gaps, module paths and attempted file
-        /// I/O before the fold.
+        /// Variant of [`new_with_providers`](Self::new_with_providers) whose
+        /// child reloads its providers on command (same files, fresh
+        /// addresses): returns the scene plus the reload command and
+        /// READY2 paths. The child stops after READY1; the test resumes
+        /// it, runs a roomy pass that pins, commands the reload, and stops
+        /// it again before the small passes (pins hold, decode restarts).
+        fn new_with_providers_reloadable(
+            dir: tempfile::TempDir,
+            mapped: &[std::path::PathBuf],
+            providers: &[&std::path::Path],
+        ) -> (Self, std::path::PathBuf, std::path::PathBuf) {
+            let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let driver = gcc(
+                dir.path(),
+                "large-table-driver",
+                &manifest.join("tests/fixtures/large-table-driver.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror"],
+                &["-ldl"],
+            );
+            let (child, cmd, ready2) = spawn_table_driver_reloadable(
+                dir.path(),
+                &driver,
+                "large-table-ready",
+                mapped,
+                providers,
+                "large-table-reload-cmd",
+                "large-table-reload-ready",
+            );
+            std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+            let mut coordinator = Box::new(
+                InventoryCoordinator::new(
+                    crate::scope::cgroup(dir.path()).unwrap(),
+                    HookRegistry::builtin(),
+                    vec![],
+                    vec![],
+                    OsProcessSource,
+                    RegistryLimits::default_limits(),
+                )
+                .unwrap(),
+            );
+            coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+            (
+                Self {
+                    _dir: dir,
+                    driver,
+                    children: vec![child],
+                    coordinator,
+                },
+                cmd,
+                ready2,
+            )
+        }
+
+        /// One full collect/apply/commit transaction under the default
+        /// walk limits; returns the collection's deep-scan gaps, module
+        /// paths, decoded table counts and attempted file I/O before
+        /// the fold.
         fn pass(&mut self) -> CgroupTablePass {
+            self.pass_with_limits(CgroupWalkLimits::default())
+        }
+
+        /// One full collect/apply/commit transaction under `limits`.
+        fn pass_with_limits(&mut self, limits: CgroupWalkLimits) -> CgroupTablePass {
             let collection = self
                 .coordinator
                 .cgroup_collector(
                     CgroupWalkState::default(),
-                    CgroupWalkLimits::default(),
+                    limits,
                     CollectionControl::new(None),
                     None,
                 )
@@ -20228,6 +20404,7 @@ pub(crate) mod tests {
             let pass = CgroupTablePass {
                 gaps: collection.member_gaps_for_test(),
                 modules: collection.module_paths_for_test(),
+                tables: collection.module_tables_for_test(),
                 attempted_io: collection.attempted_io_bytes_for_test(),
                 used_work: collection.used_work(),
             };
@@ -20238,6 +20415,96 @@ pub(crate) mod tests {
             let _completion = self.coordinator.take_cgroup_completion().unwrap();
             pass
         }
+
+        /// One full collect/apply/commit transaction whose pass budget
+        /// carries a custom scan-window work ceiling (the production
+        /// path always sizes the shared allowance; tests shrink the
+        /// window to pin the window leg binding first).
+        fn pass_with_window(
+            &mut self,
+            window_work: u64,
+            limits: CgroupWalkLimits,
+        ) -> CgroupTablePass {
+            let collection = collect_with_window(
+                &mut self.coordinator,
+                CgroupWalkState::default(),
+                limits,
+                window_work,
+            );
+            let pass = CgroupTablePass {
+                gaps: collection.member_gaps_for_test(),
+                modules: collection.module_paths_for_test(),
+                tables: collection.module_tables_for_test(),
+                attempted_io: collection.attempted_io_bytes_for_test(),
+                used_work: collection.used_work(),
+            };
+            self.coordinator
+                .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+                .unwrap();
+            self.coordinator.commit_batch(false).unwrap();
+            let _completion = self.coordinator.take_cgroup_completion().unwrap();
+            pass
+        }
+    }
+
+    /// Collect one cgroup pass whose scan budget carries a custom
+    /// scan-window work ceiling, building the request the coordinator's
+    /// collector would with the custom scan budget substituted. The
+    /// caller applies, commits and takes the completion.
+    fn collect_with_window(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        window_work: u64,
+    ) -> crate::inspect_system::inventory_cgroup::CgroupCollection {
+        use crate::discovery::scan::{
+            CaptureWorkBudget, DiscoveryPolicy, InventoryDiscoveryLimits, InventoryWindowLimits,
+        };
+        use crate::inspect_system::inventory_cgroup::CgroupCollectRequest;
+        let Scope::Cgroup { dir, .. } = &coordinator.engine.scope else {
+            panic!("cgroup scene requires a retained cgroup root");
+        };
+        let root = Arc::clone(dir);
+        let DiscoveryPolicy::Inventory(work) = coordinator.engine.budget.policy() else {
+            panic!("cgroup inventory requires the Inventory work policy");
+        };
+        let hints = coordinator.engine.module_hints.clone();
+        let hooks = coordinator.engine.hooks.clone();
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let count_manifests = coordinator.count_manifests.clone();
+        let prearm_prior = coordinator.prearm_prior;
+        let window = InventoryWindowLimits::new(
+            work.window.io_bytes,
+            window_work,
+            work.window.decoded_tables,
+            work.window.decoded_entries,
+            work.window.interfaces,
+        )
+        .expect("the test window keeps the run's non-zero ceilings");
+        let shrunk =
+            InventoryDiscoveryLimits::new(work.per_operation_bytes, window, work.retained())
+                .expect("the test window keeps the run's byte ceiling");
+        let carried = std::mem::take(&mut coordinator.cgroup_file_facts);
+        let fence = coordinator.cgroup_fence.issue();
+        let scan_budget = coordinator.collector_budget(
+            CaptureWorkBudget::for_inventory(shrunk).with_retained_file_facts(carried),
+            false,
+        );
+        let request = CgroupCollectRequest {
+            root,
+            fence,
+            state,
+            limits,
+            control: CollectionControl::new(None),
+            max_scan_pids: None,
+            scan_budget,
+            observer: None,
+            count_manifests,
+            prearm_prior,
+            scripted_member_gaps: Vec::new(),
+            scripted_member_gaps_only: None,
+        };
+        crate::inspect_system::inventory_cgroup::collect(request, &hints, &hooks, policy)
     }
 
     /// Create empty placeholders for the fixture roles, order them by
@@ -20416,6 +20683,629 @@ pub(crate) mod tests {
              not skip the large data: used {} units",
             first.used_work
         );
+    }
+
+    /// The table-last fixture self-check: under a roomy production pass
+    /// the provider's table decodes in one pass. This pins fixture
+    /// validity independently of resume: the resume twins below fail
+    /// because the pass allowance is small, never because the table
+    /// cannot decode.
+    #[test]
+    fn table_last_provider_fixture_decodes_in_a_roomy_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", 1_600_000);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let first = scene.pass();
+        let tables: usize = first
+            .tables
+            .iter()
+            .filter(|(path, _)| path.contains("table-last"))
+            .map(|(_, count)| count)
+            .sum();
+        assert_eq!(
+            tables, 1,
+            "a roomy pass must decode the table-last fixture's one table: {:?} {:?}",
+            first.tables, first.gaps
+        );
+    }
+
+    /// Resume twin, shared-walk leg: one member maps a table-last
+    /// provider whose decode costs ten times the pass walk allowance
+    /// (300K words against 30K units). Pass 0 runs roomy (decoding,
+    /// pinning and counting everything); the child then reloads its
+    /// providers (same files, fresh addresses: pins hold while decode
+    /// cursors miss) and the allowance shrinks. Early small passes
+    /// cannot reach the table; after enough passes the provider is found
+    /// again (its table re-decodes) and stays counted (its 68 endpoints
+    /// hold, pins retained), unfinished passes name their in-progress
+    /// gap, and the converged view shows no work-exhaustion gap. Pinning
+    /// (whole-file hashing against the same shared allowance) is why
+    /// the roomy first pass exists: a 10x file can never hash under a
+    /// 10x-small allowance, but it hashes once roomy and stays pinned.
+    /// The walk allowance binds here (the scan window stays roomy); the
+    /// companion twin binds the window leg.
+    #[test]
+    fn cgroup_passes_resume_a_provider_costing_ten_times_the_walk_allowance() {
+        const ALLOWANCE: usize = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        const MAX_PASSES: usize = 15;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let (mut scene, cmd, ready2) =
+            CgroupTableScene::new_with_providers_reloadable(dir, &[], &[provider.as_path()]);
+        // Pass 0, roomy: the scene works end to end (found + counted).
+        let roomy = scene.pass_with_limits(CgroupWalkLimits::default());
+        assert!(
+            roomy
+                .tables
+                .iter()
+                .filter(|(path, _)| path.contains("table-last"))
+                .map(|(_, count)| count)
+                .sum::<usize>()
+                > 0,
+            "the roomy first pass must decode the provider: {roomy:?}"
+        );
+        assert_eq!(
+            scene.coordinator.attach_set().len(),
+            68,
+            "the roomy first pass must count the provider's 68 slots"
+        );
+        // Reload: same files, fresh addresses. Pins hold; decode restarts.
+        let pid = scene.children[0].id();
+        cont_child(pid);
+        reload_and_stop_child(&mut scene.children[0], &cmd, &ready2);
+        let limits = CgroupWalkLimits {
+            work_units: ALLOWANCE,
+            ..CgroupWalkLimits::default()
+        };
+        let mut found_at = None;
+        let mut saw_in_progress = false;
+        for pass in 0..MAX_PASSES {
+            let report = scene.pass_with_limits(limits.clone());
+            let tables: usize = report
+                .tables
+                .iter()
+                .filter(|(path, _)| path.contains("table-last"))
+                .map(|(_, count)| count)
+                .sum();
+            if pass == 0 {
+                assert_eq!(
+                    tables, 0,
+                    "the first small pass must not reach the table (else the 10x sizing is vacuous)"
+                );
+            }
+            saw_in_progress |= report
+                .gaps
+                .iter()
+                .any(|(_, subject, _)| subject == "scan_in_progress");
+            assert_eq!(
+                scene.coordinator.attach_set().len(),
+                68,
+                "counting holds while decode resumes (pass {pass})"
+            );
+            if tables > 0 {
+                found_at = Some(pass);
+                break;
+            }
+        }
+        let found_at = found_at.expect(
+            "the cgroup provider costing 10x the walk allowance must be found after enough passes",
+        );
+        assert!(
+            found_at > 0,
+            "the provider must be found by resuming across passes, not in the first pass"
+        );
+        assert!(
+            saw_in_progress,
+            "unfinished cgroup passes must name the scan_in_progress gap"
+        );
+        // Finding the table is not convergence (the interface sweep
+        // costs a second full pass over the object, and pinning needs an
+        // unstopped pass): further passes finish them, and only the
+        // converged pass counts the endpoints.
+        let mut converged = None;
+        for _ in 0..12 {
+            let report = scene.pass_with_limits(limits.clone());
+            let busy = report.gaps.iter().any(|(_, subject, reason)| {
+                subject == "scan_in_progress"
+                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+                    || reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+            });
+            if !busy {
+                converged = Some(report);
+                break;
+            }
+        }
+        let converged = converged.expect("resumed passes must converge to a clean view");
+        for (_, subject, reason) in &converged.gaps {
+            assert_ne!(
+                subject, "scan_in_progress",
+                "the converged pass must not still be in progress: {converged:?}"
+            );
+            assert!(
+                !reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+                    && !reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON),
+                "the converged view must show no work-exhaustion gap: {converged:?}"
+            );
+        }
+        assert_eq!(
+            scene.coordinator.attach_set().len(),
+            68,
+            "the found provider's 68 slots must be counted as endpoints"
+        );
+    }
+
+    /// Resume twin, scan-window leg: a table-last provider whose decode
+    /// costs ten times the scan window (300K words against 30K units)
+    /// while the walk allowance stays roomy, so the window work ceiling
+    /// (not the shared walk stop) is the per-pass bound the scan resumes
+    /// across. Pinning (whole-file hashing against the roomy walk
+    /// allowance) fits every pass, so no reload is needed: after enough
+    /// passes the provider is found and counted, unfinished passes name
+    /// their in-progress gap, and the converged view is clean.
+    #[test]
+    fn cgroup_passes_resume_when_the_scan_window_binds_first() {
+        const ALLOWANCE: u64 = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        const MAX_PASSES: usize = 15;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let mut found_at = None;
+        let mut saw_in_progress = false;
+        for pass in 0..MAX_PASSES {
+            let report = scene.pass_with_window(ALLOWANCE, CgroupWalkLimits::default());
+            let tables: usize = report
+                .tables
+                .iter()
+                .filter(|(path, _)| path.contains("table-last"))
+                .map(|(_, count)| count)
+                .sum();
+            if pass == 0 {
+                assert_eq!(
+                    tables, 0,
+                    "the first small pass must not reach the table (else the 10x sizing is vacuous)"
+                );
+            }
+            saw_in_progress |= report
+                .gaps
+                .iter()
+                .any(|(_, subject, _)| subject == "scan_in_progress");
+            if tables > 0 {
+                found_at = Some(pass);
+                break;
+            }
+        }
+        found_at.expect(
+            "the cgroup provider costing 10x the window allowance must be found after enough passes",
+        );
+        assert!(
+            saw_in_progress,
+            "unfinished cgroup passes must name the scan_in_progress gap"
+        );
+        // Finding the table is not convergence (the interface sweep
+        // costs a second full pass over the object, and pinning needs an
+        // unstopped pass): further passes finish them, and only the
+        // converged pass counts the endpoints.
+        let mut converged = false;
+        for _ in 0..12 {
+            let report = scene.pass_with_window(ALLOWANCE, CgroupWalkLimits::default());
+            let busy = report.gaps.iter().any(|(_, subject, reason)| {
+                subject == "scan_in_progress"
+                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+                    || reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+            });
+            if !busy {
+                converged = true;
+                break;
+            }
+        }
+        assert!(converged, "resumed passes must converge to a clean view");
+        assert_eq!(
+            scene.coordinator.attach_set().len(),
+            68,
+            "the found provider's 68 slots must be counted as endpoints"
+        );
+    }
+
+    /// One full collect/apply/commit transaction threading the real walk
+    /// continuation across passes (like the driver threads it), instead
+    /// of restarting every walk from a default state and discarding the
+    /// returned completion. Returns the pass report and the outcome.
+    fn continued_cgroup_pass(
+        scene: &mut CgroupTableScene,
+        state: &mut CgroupWalkState,
+        limits: CgroupWalkLimits,
+    ) -> (CgroupTablePass, ScopedCollectionOutcome) {
+        let taken = std::mem::take(state);
+        let collection = scene
+            .coordinator
+            .cgroup_collector(taken, limits, CollectionControl::new(None), None)
+            .unwrap()();
+        let pass = CgroupTablePass {
+            gaps: collection.member_gaps_for_test(),
+            modules: collection.module_paths_for_test(),
+            tables: collection.module_tables_for_test(),
+            attempted_io: collection.attempted_io_bytes_for_test(),
+            used_work: collection.used_work(),
+        };
+        scene
+            .coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        scene.coordinator.commit_batch(false).unwrap();
+        let completion = scene.coordinator.take_cgroup_completion().unwrap();
+        *state = completion.state;
+        (pass, completion.outcome)
+    }
+
+    /// Whether the coordinator's terminal registry history carries the
+    /// transaction-incomplete verdict with a work-exhaustion reason.
+    fn has_terminal_work_exhaustion(
+        coordinator: &InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+    ) -> bool {
+        coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "cgroup scope transaction incomplete"
+                && gap.reason.contains("shared work allowance exhausted")
+        })
+    }
+
+    /// A work-stopped pass with genuine resumable progress projects
+    /// continuation, not terminal exhaustion: pass one (small decode
+    /// allowance, roomy walk) leaves the provider unfinished; pass two's
+    /// walk allowance is gone, so its transaction stops on shared work
+    /// with the carried progress intact. The commit must record no
+    /// terminal work-exhaustion verdict, and the live terminal gap must
+    /// name the in-progress resume state instead.
+    #[test]
+    fn partial_cgroup_pass_projects_continuation_not_terminal_exhaustion() {
+        const ALLOWANCE: u64 = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let mut state = CgroupWalkState::default();
+        let (first, _) = continued_cgroup_pass_with_window(
+            &mut scene,
+            &mut state,
+            CgroupWalkLimits::default(),
+            ALLOWANCE,
+        );
+        assert!(
+            first
+                .gaps
+                .iter()
+                .any(|(_, subject, _)| subject == "scan_in_progress"),
+            "pass one must leave resumable progress: {first:?}"
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_some(),
+            "the carried progress is live after pass one"
+        );
+        // Pass two: the walk allowance is gone before any member scans.
+        let starved = CgroupWalkLimits {
+            work_units: 0,
+            ..CgroupWalkLimits::default()
+        };
+        let (_, outcome) = continued_cgroup_pass(&mut scene, &mut state, starved);
+        assert_eq!(
+            outcome,
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::Membership(
+                    crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit
+                )
+            ),
+            "pass two must stop on shared work (setup pin)"
+        );
+        assert!(
+            !has_terminal_work_exhaustion(&scene.coordinator),
+            "a work stop with resumable progress records no terminal exhaustion verdict: {:?}",
+            scene.coordinator.registry().gaps()
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_some(),
+            "the live terminal gap still names the in-progress resume state"
+        );
+    }
+
+    /// The converged successor of a work-stopped pass leaves no stale
+    /// exhaustion behind: after the walk allowance returns and the
+    /// resumed passes converge, the terminal history carries no
+    /// work-exhaustion verdict and no live in-progress gap remains.
+    #[test]
+    fn converged_cgroup_pass_leaves_no_stale_exhaustion_gap() {
+        const ALLOWANCE: u64 = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let mut state = CgroupWalkState::default();
+        let _ = continued_cgroup_pass_with_window(
+            &mut scene,
+            &mut state,
+            CgroupWalkLimits::default(),
+            ALLOWANCE,
+        );
+        let starved = CgroupWalkLimits {
+            work_units: 0,
+            ..CgroupWalkLimits::default()
+        };
+        let _ = continued_cgroup_pass(&mut scene, &mut state, starved);
+        let mut converged = false;
+        for _ in 0..27 {
+            let (report, _) = continued_cgroup_pass_with_window(
+                &mut scene,
+                &mut state,
+                CgroupWalkLimits::default(),
+                ALLOWANCE,
+            );
+            let busy = report.gaps.iter().any(|(_, subject, reason)| {
+                subject == "scan_in_progress"
+                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+                    || reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+            });
+            if !busy {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the resumed passes must converge to a clean view"
+        );
+        assert_eq!(
+            scene.coordinator.attach_set().len(),
+            68,
+            "the found provider's 68 slots must be counted as endpoints"
+        );
+        assert!(
+            !has_terminal_work_exhaustion(&scene.coordinator),
+            "no stale exhaustion verdict survives the converged pass: {:?}",
+            scene.coordinator.registry().gaps()
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_none(),
+            "the converged terminal shows no in-progress gap"
+        );
+    }
+
+    /// While a worker owns the carried bundle, the last valid progress
+    /// summary stays live: taking the next job must not empty the
+    /// terminal progress source, so a stop that discards that job still
+    /// reports the previously committed progress.
+    #[test]
+    fn discarded_worker_keeps_the_last_progress_summary() {
+        const ALLOWANCE: u64 = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let mut state = CgroupWalkState::default();
+        let _ = continued_cgroup_pass_with_window(
+            &mut scene,
+            &mut state,
+            CgroupWalkLimits::default(),
+            ALLOWANCE,
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_some(),
+            "pass one must leave live progress (setup pin)"
+        );
+        // The next job takes the bundle into the worker; the stop
+        // discards it before apply, so the coordinator never takes it back.
+        let taken = std::mem::take(&mut state);
+        let _job = scene
+            .coordinator
+            .cgroup_collector(
+                taken,
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap();
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_some(),
+            "the last valid progress summary stays live while the worker owns the bundle"
+        );
+    }
+
+    /// A work stop with no resumable progress keeps its raw refusal: a
+    /// pass that never scanned anything records the terminal
+    /// work-exhaustion verdict verbatim instead of translating it into a
+    /// continuation that names nothing.
+    #[test]
+    fn work_stop_without_progress_keeps_its_raw_refusal() {
+        const BLOB_BYTES: usize = 2_400_000;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let mut state = CgroupWalkState::default();
+        let starved = CgroupWalkLimits {
+            work_units: 0,
+            ..CgroupWalkLimits::default()
+        };
+        let (_, outcome) = continued_cgroup_pass(&mut scene, &mut state, starved);
+        assert_eq!(
+            outcome,
+            ScopedCollectionOutcome::Incomplete(
+                crate::inspect_system::inventory_cgroup::ScopedCollectionGap::Membership(
+                    crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit
+                )
+            ),
+            "the walk must stop on shared work (setup pin)"
+        );
+        assert!(
+            has_terminal_work_exhaustion(&scene.coordinator),
+            "a non-resumable stall keeps its raw work refusal: {:?}",
+            scene.coordinator.registry().gaps()
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_none(),
+            "nothing resumable means no live progress gap"
+        );
+    }
+
+    /// The cold cgroup twin: no roomy pre-pass admits anything first —
+    /// the scan window binds at 10x while the walk (pinning) allowance
+    /// stays roomy, so the large provider first enters after resumption.
+    /// Drives the real walk continuation across passes, asserts the
+    /// provider cursor's advancing offsets and the rendered done/total
+    /// pass by pass, then its identity, admitted slots and endpoint
+    /// count on the converged pass.
+    #[test]
+    fn cold_cgroup_provider_enters_after_resumption_with_offsets_and_counts() {
+        use std::os::unix::fs::MetadataExt as _;
+        const ALLOWANCE: u64 = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        const MAX_PASSES: usize = 15;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let provider_inode = std::fs::metadata(&provider).unwrap().ino();
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        assert_eq!(
+            scene.coordinator.attach_set().len(),
+            0,
+            "cold: nothing is admitted before the first small pass"
+        );
+        let mut state = CgroupWalkState::default();
+        let frontier_of = |scene: &CgroupTableScene| {
+            scene
+                .coordinator
+                .cgroup_file_facts
+                .decode_cursors_for_test()
+                .into_iter()
+                .find(|(key, _)| key.file.inode == provider_inode)
+                .map(|(_, cursor)| {
+                    (
+                        cursor.tables.snapshot,
+                        cursor.tables.word,
+                        cursor.interfaces.snapshot,
+                        cursor.interfaces.word,
+                        cursor.complete,
+                    )
+                })
+        };
+        let mut found_at = None;
+        let mut saw_in_progress = false;
+        let mut advances = 0u32;
+        let mut last: Option<(usize, u64)> = None;
+        for pass in 0..MAX_PASSES {
+            let (report, _) = continued_cgroup_pass_with_window(
+                &mut scene,
+                &mut state,
+                CgroupWalkLimits::default(),
+                ALLOWANCE,
+            );
+            let tables: usize = report
+                .tables
+                .iter()
+                .filter(|(path, _)| path.contains("table-last"))
+                .map(|(_, count)| count)
+                .sum();
+            if pass == 0 {
+                assert_eq!(
+                    tables, 0,
+                    "the first small pass must not reach the table (else the 10x sizing is vacuous)"
+                );
+            }
+            let frontier = frontier_of(&scene).expect("every pass records the provider's cursor");
+            if let Some(previous) = last {
+                assert!(
+                    (frontier.0, frontier.1) >= (previous.0, previous.1),
+                    "the table frontier never moves backward (pass {pass})"
+                );
+                if (frontier.0, frontier.1) > (previous.0, previous.1) {
+                    advances += 1;
+                }
+            }
+            last = Some((frontier.0, frontier.1));
+            saw_in_progress |= report.gaps.iter().any(|(_, subject, reason)| {
+                subject == "scan_in_progress" && reason.contains("objects finished")
+            });
+            if tables > 0 {
+                found_at = Some(pass);
+                break;
+            }
+        }
+        let found_at = found_at.expect(
+            "the cold cgroup provider costing 10x the window allowance must be found after enough passes",
+        );
+        assert!(
+            found_at > 0,
+            "the provider must be found by resuming across passes, not in the first pass"
+        );
+        assert!(
+            advances > 0,
+            "the provider cursor must advance across passes"
+        );
+        assert!(
+            saw_in_progress,
+            "unfinished cgroup passes must name the scan_in_progress gap with done/total"
+        );
+        let mut converged = false;
+        for _ in 0..12 {
+            let (report, _) = continued_cgroup_pass_with_window(
+                &mut scene,
+                &mut state,
+                CgroupWalkLimits::default(),
+                ALLOWANCE,
+            );
+            let busy = report.gaps.iter().any(|(_, subject, reason)| {
+                subject == "scan_in_progress"
+                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+                    || reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+            });
+            if !busy {
+                converged = true;
+                break;
+            }
+        }
+        assert!(converged, "resumed passes must converge to a clean view");
+        assert_eq!(
+            scene.coordinator.attach_set().len(),
+            68,
+            "the found provider's 68 slots must be counted as endpoints"
+        );
+        let mut offsets: Vec<u64> = scene
+            .coordinator
+            .attach_set()
+            .endpoints()
+            .map(|endpoint| endpoint.file_offset)
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(
+            offsets.len(),
+            68,
+            "the 68 admitted slots name distinct file offsets"
+        );
+    }
+
+    /// Continued pass variant whose scan budget carries a custom
+    /// scan-window work ceiling (see `collect_with_window`).
+    fn continued_cgroup_pass_with_window(
+        scene: &mut CgroupTableScene,
+        state: &mut CgroupWalkState,
+        limits: CgroupWalkLimits,
+        window_work: u64,
+    ) -> (CgroupTablePass, ScopedCollectionOutcome) {
+        let taken = std::mem::take(state);
+        let collection = collect_with_window(&mut scene.coordinator, taken, limits, window_work);
+        let pass = CgroupTablePass {
+            gaps: collection.member_gaps_for_test(),
+            modules: collection.module_paths_for_test(),
+            tables: collection.module_tables_for_test(),
+            attempted_io: collection.attempted_io_bytes_for_test(),
+            used_work: collection.used_work(),
+        };
+        scene
+            .coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        scene.coordinator.commit_batch(false).unwrap();
+        let completion = scene.coordinator.take_cgroup_completion().unwrap();
+        *state = completion.state;
+        (pass, completion.outcome)
     }
 
     /// The changed-file twin: pass 1 caches the changed file's facts,

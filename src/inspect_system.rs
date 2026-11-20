@@ -11295,6 +11295,52 @@ pub(crate) mod demotion_retirement_producer_tests {
         pub(crate) fn id(&self) -> u32 {
             self.0.as_ref().expect("retained owned child").id()
         }
+
+        /// Stop a resumed owned child (SIGSTOP + confirmed stop), like
+        /// the tail of [`spawn_stopped`](Self::spawn_stopped): for
+        /// fixtures the test resumes (SIGCONT), drives through a
+        /// handshake, then freezes again before scanning.
+        pub(crate) fn stop(&mut self) {
+            let pid = self.id() as libc::pid_t;
+            // SAFETY: pid names only this retained owned child.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned positive-control child did not stop on request"
+                );
+                let mut status = 0;
+                // SAFETY: pid names only this retained owned child; WNOHANG
+                // prevents a blocking wait and WUNTRACED reports its stop.
+                let waited =
+                    unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED | libc::WNOHANG) };
+                if waited == pid {
+                    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                        // waitpid already reaped it: never kill that pid again.
+                        self.0 = None;
+                    }
+                    assert!(
+                        libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGSTOP,
+                        "owned positive-control child ended before the requested stop: {status}"
+                    );
+                    return;
+                }
+                if waited < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        // Another wait has already consumed this child.
+                        self.0 = None;
+                    }
+                    assert_eq!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted,
+                        "cannot observe owned positive-control child stop: {error}"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     impl Drop for OwnedStoppedChild {

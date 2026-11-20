@@ -13802,65 +13802,107 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
     let disposed_before = fixture.disposed_total();
     let unknown_before = fixture.unknown_terminals();
     let held_reduced_before = feed_state(&fixture, 1).2;
-    fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_capture()
-        .ledger()
-        .reset_test_slot_visits_for_test();
-    fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_capture()
-        .ledger()
-        .reset_test_sweep_visits_for_test();
-    fixture
-        .service(1)
-        .expect("the first disposal credit never refuses");
-    let first_lookups = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_capture()
-        .ledger()
-        .test_slot_visits_for_test();
-    let first_sweep = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_capture()
-        .ledger()
-        .test_sweep_visits_for_test();
+    let mut max_spent = 0usize;
+    let mut max_reads = 0usize;
+    let mut sum_spent = 0usize;
+    let mut sum_reads = 0usize;
+    let mut disposal_polls = 0usize;
+    let mut first_spent = None;
+    let mut first_reads = None;
+    for _ in 0..512 {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .reset_test_leaf_reads_for_test();
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .reset_test_slot_visits_for_test();
+        let (done, spent) = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .poll_staged_disposal(64);
+        let leaf = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .test_leaf_reads_for_test();
+        let slots = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .test_slot_visits_for_test();
+        let reads = leaf + slots;
+        assert!(
+            spent <= 64,
+            "disposal poll {disposal_polls} spent {spent} above its 64 credit"
+        );
+        assert!(
+            reads <= spent,
+            "disposal poll {disposal_polls} performed {reads} chain reads \
+             (leaf {leaf} + slot {slots}) for {spent} debited"
+        );
+        max_spent = max_spent.max(spent);
+        max_reads = max_reads.max(reads);
+        sum_spent += spent;
+        sum_reads += reads;
+        if disposal_polls == 0 {
+            first_spent = Some(spent);
+            first_reads = Some(reads);
+            assert_eq!(
+                feed_state(&fixture, 1).1,
+                1,
+                "a full disposal credit preserves the held head"
+            );
+            let partial_staged = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .ledger()
+                .staged_keys_for_test();
+            assert!(
+                partial_staged.contains(&(held_ns, held_val)),
+                "the held member survives a partial disposal credit"
+            );
+        }
+        disposal_polls += 1;
+        if done {
+            break;
+        }
+    }
     assert_eq!(
-        first_lookups, 62,
-        "two feed visits plus 62 chain visits fill the 64-unit credit"
+        (first_spent, first_reads),
+        (Some(64), Some(62)),
+        "two feed visits plus 62 reservation leaves (1 head + 31 \
+         inspects + 30 nexts) fill the first 64-unit credit"
     );
-    assert_eq!(
-        first_sweep, 0,
-        "no unlink starts before its lookup completes"
-    );
-    assert_eq!(
-        feed_state(&fixture, 1).1,
-        1,
-        "a full disposal credit preserves the held head"
-    );
-    let partial_staged = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .joint_capture()
-        .ledger()
-        .staged_keys_for_test();
     assert!(
-        partial_staged.contains(&(held_ns, held_val)),
-        "the held member survives a partial disposal credit"
+        disposal_polls > 1,
+        "the long-bucket disposal needs several credits"
+    );
+    assert_eq!(max_spent, 64, "at least one full credit is exercised");
+    assert!(max_reads <= 64, "no poll reads past its credit");
+    assert!(
+        sum_reads <= sum_spent,
+        "total reads {sum_reads} never exceed total debited {sum_spent}"
     );
     let mut published = false;
     for _ in 0..512 {

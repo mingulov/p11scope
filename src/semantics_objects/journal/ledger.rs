@@ -204,19 +204,19 @@ impl StagingLedger {
         }
     }
 
-    /// Test-only read of the sweep cost counter.
+    /// Test-only read of the unified budgeted-leaf counter.
     #[cfg(test)]
-    pub(crate) fn test_sweep_visits_for_test(&self) -> usize {
+    pub(crate) fn test_leaf_reads_for_test(&self) -> usize {
         self.table
             .as_ref()
-            .map_or(0, |table| table.test_sweep_visits_for_test())
+            .map_or(0, |table| table.test_leaf_reads_for_test())
     }
 
-    /// Test-only reset of the sweep cost counter.
+    /// Test-only reset of the unified budgeted-leaf counter.
     #[cfg(test)]
-    pub(crate) fn reset_test_sweep_visits_for_test(&self) {
+    pub(crate) fn reset_test_leaf_reads_for_test(&self) {
         if let Some(table) = self.table.as_ref() {
-            table.reset_test_sweep_visits_for_test();
+            table.reset_test_leaf_reads_for_test();
         }
     }
 
@@ -313,8 +313,11 @@ impl StagingLedger {
             ),
             None => None, // Only cfg(test) construction permits an unbound table.
         };
+        // Synchronous charge path: the preflight above passed with
+        // no yield or table mutation between, so the prechecked
+        // insert's expects hold (no second preflight walks).
         table
-            .insert(role, key, existing, bytes, charge)
+            .insert_prechecked(role, key, existing, bytes, charge)
             .map_err(Into::into)
     }
 
@@ -534,21 +537,37 @@ impl StagingLedger {
         LedgerReleaseCursor { inner }
     }
 
-    /// Drive one staged release for at most `budget` leaf units.
-    /// Returns whether the release completed and the units spent
-    /// (never above `budget`). Completion drops the removed charge,
-    /// refunding its pool lease exactly like the synchronous release.
+    /// Initial cursor for one budgeted association release (fallback
+    /// ledger chain reads during disposal invalidation). Empty
+    /// ledgers hold no work and complete at once. Driven by the same
+    /// [`Self::release_step`] gate as staged releases.
+    pub(crate) fn release_assoc_cursor(&self, ticket: u64) -> LedgerReleaseCursor {
+        let inner = self
+            .table
+            .as_ref()
+            .map(|table| table.single_release_cursor(Role::Association, Self::key(ticket)));
+        LedgerReleaseCursor { inner }
+    }
+
+    /// Drive one budgeted release (staged or association) for at most
+    /// `budget` leaf units through the single pre-debit gate. Returns
+    /// whether the release completed, the units spent (never above
+    /// `budget`) and, on completion, the removed bytes and charge when
+    /// a membership was found. The caller RETAINS the returned charge
+    /// until its payload drops (drop-then-refund): dropping it at
+    /// unlink completion would refund the pool while the staged
+    /// payload still lives. A missing key completes with `None`.
     pub(crate) fn release_step(
         &mut self,
         cursor: &mut LedgerReleaseCursor,
         budget: usize,
-    ) -> (bool, usize) {
+    ) -> (bool, usize, Option<(usize, Option<ResourceLease>)>) {
         let Some(inner) = cursor.inner.as_mut() else {
-            return (true, 0);
+            return (true, 0, None);
         };
         let Some(table) = self.table.as_mut() else {
             cursor.inner = None;
-            return (true, 0);
+            return (true, 0, None);
         };
         let (done, spent, actual, result) = table.release_single_step(inner, budget);
         #[cfg(not(test))]
@@ -560,10 +579,14 @@ impl StagingLedger {
         );
         if done {
             cursor.inner = None;
-            drop(result);
         }
         debug_assert!(spent <= budget);
-        (done, spent)
+        if done {
+            (done, spent, result)
+        } else {
+            debug_assert!(result.is_none());
+            (done, spent, None)
+        }
     }
 
     pub(crate) fn charge_h8open(&mut self, ordinal: u64, bytes: u64) -> Result<(), LedgerRefusal> {
@@ -592,10 +615,12 @@ impl StagingLedger {
         self.h8_void = needs.then(ReleaseRoleCursor::new);
     }
 
-    /// Drive the H8 void sweep for at most `units` leaf units (slot
-    /// visits plus chain-link reads). Returns whether the sweep
-    /// completed and the units spent (never above `units`).
+    /// Drive the H8 void sweep through the shared pre-debit gate
+    /// for at most `units` leaf units (slot visits plus chain-link
+    /// reads). Returns whether the sweep completed and the units
+    /// spent (never above `units`).
     pub(crate) fn poll_h8_void(&mut self, units: usize) -> (bool, usize) {
+        use super::reservations::LeafBudget;
         let Some(cursor) = self.h8_void.as_mut() else {
             return (true, 0);
         };
@@ -603,7 +628,10 @@ impl StagingLedger {
             self.h8_void = None;
             return (true, 0);
         };
-        let (done, spent) = table.release_role_step(Role::H8Open, cursor, units);
+        let mut gate = LeafBudget::new(units);
+        let done = table.release_role_step(Role::H8Open, cursor, &mut gate);
+        let spent = gate.spent();
+        debug_assert!(spent <= units);
         if done {
             self.h8_void = None;
         }

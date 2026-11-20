@@ -1875,19 +1875,20 @@ Limits that matter in pods:
   ```
 
   ```text
-  key operations: 100 keys on 1 provider; rev 42 partial; 42 sessions
-    key proof refused; plain counts only (reason: proof_refused_fallback)
-    /usr/lib64/firefox/libsoftokn3.so: decapsulate 1 completed, 0 returned errors, 0 active operations (probably ML-KEM-768: 1) (i0)
-    unknown keys: generate_key_pair 7 completed, 0 returned errors, 0 active operations (not_applicable)
+  key operations: 103 keys on 1 provider; rev 58 partial; 48 sessions
+    per-key tracking lost some calls; exact rows continue (reason: authority_lost)
+    /home/user/p11scope-live/browser/ms-playwright/firefox-1555/firefox/libsoftokn3.so: decapsulate 1 completed, 0 returned errors, 0 active operations (probably ML-KEM-768: 1) (i0)
+    unknown keys: generate_key_pair 22 completed, 0 returned errors, 0 active operations (not_applicable)
     key row i0 object 16 decapsulate decapsulation_key (unknown): probably ML-KEM (from mechanism); ML-KEM-768 (from ciphertext length)
-    unknown key row generate_key_pair/not_applicable: CKM_NSS_ML_KEM_KEY_PAIR_GEN terminals=7
+    unknown key row generate_key_pair/not_applicable: CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN terminals=15, CKM_NSS_ML_KEM_KEY_PAIR_GEN terminals=7
   ```
 
   `--json` carries the same rows: the decapsulate row infers
   `ml_kem`/`ml_kem_768` from the standard mechanism id plus the
-  1088-octet ciphertext, while the unknown keygen row keeps the
-  vendor id by number (`3461563264` = `0xCE534380`,
-  `CKM_NSS_ML_KEM_KEY_PAIR_GEN`):
+  1088-octet ciphertext, while the unknown keygen row keeps both
+  vendor ids by number (`3461563263` = `0xCE53437F`,
+  `CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN`; `3461563264` =
+  `0xCE534380`, `CKM_NSS_ML_KEM_KEY_PAIR_GEN`):
 
   ```json
   {"category": "decapsulate", "completed": 1, "object": 16,
@@ -1899,19 +1900,21 @@ Limits that matter in pods:
                "evidence": "decapsulate_input", "octets": 1088},
     "completions": 1}}
   {"category": "generate_key_pair", "reason": "not_applicable",
-   "completed": 7, "mechanisms": [{"mechanism": 3461563264,
-                                   "terminals": 7}]}
+   "unit": "operations", "completed": 22, "failed": 0,
+   "cancelled": 0, "unknown": 0, "active": 0,
+   "mechanisms": [{"mechanism": 3461563263, "terminals": 15},
+                  {"mechanism": 3461563264, "terminals": 7}]}
   ```
 
   Inferred versus proven: the `probably ML-KEM` family and the
   `ML-KEM-768` parameter set are inferences, labeled as such — the
-  key's type and parameter set were never established (proof
-  refused), so no proven `pqc keys` spotlight names this use. The
-  mechanism ids, names and counts are observed facts. Limits:
-  ML-DSA is absent because Firefox TLS offers no ML-DSA signature
-  schemes today, so a handshake needing one dies during
-  negotiation before any verification can be observed; NSS also
-  exposes no ML-DSA mechanisms to observe.
+  key's type and parameter set were never established, so no proven
+  `pqc keys` spotlight names this use. The mechanism ids, names
+  and counts are observed facts. Limits: ML-DSA is absent because
+  Firefox TLS offers no ML-DSA signature schemes today, so a
+  handshake needing one dies during negotiation before any
+  verification can be observed; NSS also exposes no ML-DSA
+  mechanisms to observe.
 
   The fixture PID and IDs vary by run. Mapping alone does not prove use;
   `At least N entries observed` counts entries, a lower bound, rather than

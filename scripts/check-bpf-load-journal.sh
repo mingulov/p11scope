@@ -475,7 +475,7 @@ for KERNEL in "$@"; do
         infra_fail "vng run failed or timed out"
         continue
     fi
-    if ! grep -q '^journal-rc=' "$VNG_LOG"; then
+    if ! grep -aEq '^journal-rc=[0-9]+$' "$VNG_LOG"; then
         infra_fail "no guest exit line"
         continue
     fi
@@ -486,31 +486,36 @@ for KERNEL in "$@"; do
     # it strictly after successful boot staging, loop mount and tmp
     # checks, and every staging failure returns before it.
     grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
-    if ! grep -q '^guest-work-ready=' "$VNG_LOG"; then
+    if ! grep -aEq '^guest-work-ready=ext4 uid-mode=0:700 TMPDIR=/var/tmp/p11scope-bpf\.[^=[:space:][:cntrl:]]+$' "$VNG_LOG"; then
         infra_fail "guest work area never readied"
         continue
     fi
-    GUEST_RELEASE=$(grep '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2)
+    if ! grep -a '^guest-release=' "$VNG_LOG" | tail -1 | grep -aEq '^guest-release=[^=[:space:][:cntrl:]]+$'; then
+        GUEST_RELEASE=$(grep -a '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2-)
+        infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
+        continue
+    fi
+    GUEST_RELEASE=$(grep -aE '^guest-release=[^=[:space:][:cntrl:]]+$' "$VNG_LOG" | tail -1 | cut -d= -f2)
     if release_ok "$KERNEL" "$GUEST_RELEASE"; then
         echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
     else
         infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
         continue
     fi
-    if grep -q '^guest-stage=token-failed' "$VNG_LOG"; then
+    if grep -aEq '^guest-stage=token-failed$' "$VNG_LOG"; then
         infra_fail "guest SoftHSM token setup failed"
         continue
     fi
-    if grep -q '^guest-stage=workload-not-ready' "$VNG_LOG"; then
+    if grep -aEq '^guest-stage=workload-not-ready$' "$VNG_LOG"; then
         infra_fail "guest workload never readied"
         continue
     fi
-    if ! grep -q '^guest-stage=token-ok' "$VNG_LOG" \
-        || ! grep -q '^guest-stage=workload-ready' "$VNG_LOG"; then
+    if ! grep -aEq '^guest-stage=token-ok$' "$VNG_LOG" \
+        || ! grep -aEq '^guest-stage=workload-ready$' "$VNG_LOG"; then
         infra_fail "guest stages never ran"
         continue
     fi
-    J_RC=$(grep '^journal-rc=' "$VNG_LOG" | tail -1 | cut -d= -f2)
+    J_RC=$(grep -aE '^journal-rc=[0-9]+$' "$VNG_LOG" | tail -1 | cut -d= -f2)
     echo "# journal rc=$J_RC"
     # Both journal roots loaded, from the raw probe rows (the report
     # below gates counts, but only budgets gate presence, so the pair
@@ -639,9 +644,9 @@ PY
     if [ -f "$J_TXT" ] && grep -Eq 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
         REFUSAL=$(grep -E 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
-    elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
+    elif [ ! -f "$J_TXT" ] || ! grep -aEq '^p11scope: semantic lane ready; mechanisms and API results are recorded from now on \(key operations: (recorded only with --key-operations|recorded|unavailable)\)$' "$J_TXT"; then
         add_reason "semantic lane never sealed"
-    elif ! grep -Eq 'semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, lost [0-9]+, bindings [1-9][0-9]*' "$J_TXT"; then
+    elif ! grep -aEq '^p11scope: semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, lost [0-9]+, bindings [1-9][0-9]*, refused [0-9]+, hook misses [0-9]+, eras [0-9]+, instances [0-9]+$' "$J_TXT"; then
         add_reason "linked lane idle (no joined calls)"
     fi
     # Size-path proof under --key-sizes: the workload RSA-signs every
@@ -667,9 +672,9 @@ PY
     # data and any byte outside the exact grammar (NUL, other
     # control bytes, trailing data) refuses as unprovable.
     if [ "$KEY_SIZES" = 1 ] && [ -f "$J_TXT" ]; then
-        if ! grep -Eq 'key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+' "$J_TXT"; then
+        if ! grep -aEq '^key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+ (populated|partial|stale|unavailable); [0-9]+ sessions?$' "$J_TXT"; then
             add_reason "key rows never rendered under --key-sizes"
-        elif ! grep -Eq '^  key row [^ ]+ object [^ ]+ sign key .*RSA 2048 \(from signature length\)' "$J_TXT"; then
+        elif ! grep -aEq '^  key row [^ ]+ object [^ ]+ sign key \([^()]*\): [[:print:]]*RSA 2048 \(from signature length\)[[:print:]]*$' "$J_TXT"; then
             add_reason "no classified RSA-2048 size under --key-sizes"
         fi
         DECODER_LINES=$(grep -ac '^p11scope: joint decoder:' "$J_TXT" || true)

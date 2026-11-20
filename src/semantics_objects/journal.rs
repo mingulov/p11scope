@@ -3361,6 +3361,7 @@ impl JournalAdapter {
             }
         }
         SealFailure {
+            take_failed: false,
             scope,
             gap,
             effects,
@@ -3394,6 +3395,7 @@ impl JournalAdapter {
         // not exist at the void, without waiting for the re-sync.
         self.voided_through = self.voided_through.max(upper);
         SealFailure {
+            take_failed: false,
             scope: self.affected_failure_scope(),
             gap,
             effects,
@@ -3664,6 +3666,7 @@ impl JournalAdapter {
             }
         }
         Some(SealFailure {
+            take_failed: false,
             scope: SealFailureScope::AffectedDomains(domains),
             gap: if image_fallback {
                 JournalGap::ImageTainted
@@ -5547,6 +5550,11 @@ pub(crate) struct SealFailure {
     /// their loss close and refuse below-fence receipts; `None` for
     /// every non-void refusal.
     pub(crate) fence: Option<u64>,
+    /// The seal never observed fresh birth evidence: its evidence
+    /// take failed, so this refusal is unknown, not negative. Only
+    /// the take-failure arm sets this; every other constructor leaves
+    /// it false.
+    pub(crate) take_failed: bool,
 }
 
 /// Identity of an existing adapter refusal, never positive authority.
@@ -5569,6 +5577,20 @@ impl SealFailure {
             SealFailureScope::Unqualified => false,
             SealFailureScope::Domain(owned) => *owned == domain,
             SealFailureScope::AffectedDomains(owned) => owned.contains(&domain),
+        }
+    }
+
+    /// Delivery disposition for one seal failure: a failed
+    /// fresh-evidence take is unknown, not negative, so it retries
+    /// with staging intact (the next tick takes again) instead of
+    /// ending the session; every other failure keeps its gap's
+    /// disposition. Failure selection, the audited disposition and
+    /// the feed paths share this mapping.
+    pub(crate) fn delivery_disposition(&self) -> crate::semantics_key_use::SealFailureDisposition {
+        if self.take_failed {
+            crate::semantics_key_use::SealFailureDisposition::Retry
+        } else {
+            crate::semantics_key_use::disposition_of(self.gap)
         }
     }
 
@@ -7038,6 +7060,7 @@ impl JournalAdapter {
             _ => {}
         }
         SealFailure {
+            take_failed: false,
             gap,
             effects,
             h3_voided,
@@ -8478,6 +8501,7 @@ impl JournalAdapter {
 
     fn failure(&self, gap: JournalGap) -> SealFailure {
         SealFailure {
+            take_failed: false,
             gap,
             effects: ObjectEffects::default(),
             h3_voided: None,
@@ -8548,6 +8572,7 @@ impl JournalAdapter {
                 self.retained_refused_dec(refused);
             }
             return Err(SealFailure {
+                take_failed: false,
                 gap: JournalGap::DomainTainted,
                 effects,
                 h3_voided: None,
@@ -8695,6 +8720,7 @@ impl JournalAdapter {
             self.keys.get_mut(&key).expect("sealed key").tainted = true;
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
+                take_failed: false,
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
@@ -8767,6 +8793,7 @@ impl JournalAdapter {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
                     self.claims_prune_dirty |= lived;
                     return Err(SealFailure {
+                        take_failed: false,
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
@@ -8817,6 +8844,7 @@ impl JournalAdapter {
                 self.keys.get_mut(&key).expect("sealed key").tainted = true;
                 self.claims_prune_dirty |= lived;
                 return Err(SealFailure {
+                    take_failed: false,
                     gap: JournalGap::ModelRefused,
                     effects,
                     h3_voided: None,
@@ -8833,6 +8861,7 @@ impl JournalAdapter {
             // operation. Keep the OpenEntry's charge until actual removal.
             let Some(resource) = self.ledger.h8_reservation(entry.begin_ordinal) else {
                 return Err(SealFailure {
+                    take_failed: false,
                     gap: JournalGap::ResourceUnavailable,
                     effects,
                     h3_voided: None,
@@ -8878,6 +8907,7 @@ impl JournalAdapter {
                     // The unconverted OpenEntry still owns its original
                     // role/charge; refusal never erased or recreated it.
                     return Err(SealFailure {
+                        take_failed: false,
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
@@ -9015,6 +9045,7 @@ impl JournalAdapter {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
                     self.claims_prune_dirty |= lived;
                     return Err(SealFailure {
+                        take_failed: false,
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
@@ -9113,6 +9144,7 @@ impl JournalAdapter {
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
+                take_failed: false,
                 gap: JournalGap::DomainEnded,
                 effects,
                 h3_voided: None,
@@ -9122,6 +9154,7 @@ impl JournalAdapter {
         }
         if rejected {
             return Err(SealFailure {
+                take_failed: false,
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
@@ -25563,6 +25596,82 @@ pub(crate) mod tests {
         assert_eq!(counts.reverify_failed_total(), 0);
         assert_eq!(counts.covers_failed, 0);
         assert_eq!(counts.pin_failed, 0);
+    }
+
+    /// A failed fresh-evidence take marks its seal failure as
+    /// unknown, not negative: the gap stays bootstrap mismatch (the
+    /// pinned contract), while the take flag routes delivery to a
+    /// retry with staging intact instead of ending the session.
+    #[test]
+    fn seal_failed_take_marks_its_failure_retryable() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        struct FailingBirthSource;
+
+        impl BirthEvidenceSource for FailingBirthSource {
+            fn take_birth_evidence(
+                &mut self,
+            ) -> Result<SessionBirthEvidence, crate::attach::BirthObservationRefusal> {
+                Err(crate::attach::BirthObservationRefusal::CurrentPartition)
+            }
+        }
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let cell = ScriptedFaultCell::steady(audit.fault_after);
+        let mut failing = FailingBirthSource;
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &audit,
+                &bootstrap,
+                frontier,
+                &mut failing,
+                &cell,
+            )
+            .expect_err("failed take refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        assert!(
+            failure.take_failed,
+            "a failed take marks unknown, not negative"
+        );
+    }
+
+    /// Delivery disposition routes unknown takes to retry and keeps
+    /// every other failure on its gap's disposition.
+    #[test]
+    fn seal_failure_delivery_disposition_retries_unknown_takes() {
+        use crate::semantics_key_use::SealFailureDisposition;
+        fn failure(gap: JournalGap, take_failed: bool) -> SealFailure {
+            SealFailure {
+                scope: SealFailureScope::Unqualified,
+                gap,
+                effects: ObjectEffects::default(),
+                h3_voided: None,
+                fence: None,
+                take_failed,
+            }
+        }
+        assert_eq!(
+            failure(JournalGap::BootstrapMismatch, true).delivery_disposition(),
+            SealFailureDisposition::Retry,
+        );
+        assert_eq!(
+            failure(JournalGap::BootstrapMismatch, false).delivery_disposition(),
+            SealFailureDisposition::Fallback,
+        );
+        assert_eq!(
+            failure(JournalGap::H3Loss, false).delivery_disposition(),
+            SealFailureDisposition::HistoryLoss,
+        );
     }
 
     #[test]

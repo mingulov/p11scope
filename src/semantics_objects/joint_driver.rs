@@ -480,6 +480,7 @@ impl JointCaptureOwner {
         domains.sort();
         domains.dedup();
         let failure = SealFailure {
+            take_failed: false,
             scope: super::SealFailureScope::AffectedDomains(domains),
             gap: INGEST_BREAK_VOID_GAP,
             effects: recovery.effects,

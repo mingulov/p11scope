@@ -2498,3 +2498,33 @@ impl IngestedJointQuantum {
         disposed
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::super::{JournalGap, ObjectEffects, SealFailure, SealFailureScope};
+    use super::failure_rank;
+
+    /// Failure selection ranks an unknown take below real endings: a
+    /// transient take failure never masks a fallback or loss the
+    /// frame must deliver.
+    #[test]
+    fn failure_rank_orders_unknown_take_below_endings() {
+        fn failure(gap: JournalGap, take_failed: bool) -> SealFailure {
+            SealFailure {
+                scope: SealFailureScope::Unqualified,
+                gap,
+                effects: ObjectEffects::default(),
+                h3_voided: None,
+                fence: None,
+                take_failed,
+            }
+        }
+        let unknown = failure_rank(&failure(JournalGap::BootstrapMismatch, true));
+        let fallback = failure_rank(&failure(JournalGap::BootstrapMismatch, false));
+        let loss = failure_rank(&failure(JournalGap::H3Loss, false));
+        let retry = failure_rank(&failure(JournalGap::H3Pending, false));
+        assert_eq!(unknown, retry, "an unknown take ranks as retry");
+        assert!(unknown < fallback, "an unknown take never masks a fallback");
+        assert!(unknown < loss, "an unknown take never masks loss");
+    }
+}

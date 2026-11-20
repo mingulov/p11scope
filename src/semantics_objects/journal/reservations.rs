@@ -2962,13 +2962,51 @@ mod tests {
         }
     }
 
+    /// Slice one budgeted fn's body out of this file's source: from
+    /// its definition to the next item (any visibility), so the scan
+    /// never bleeds into neighbors.
+    fn budgeted_fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let start = source.find(name).expect("budgeted fn present");
+        let rest = &source[start..];
+        let end = ["\n    fn ", "\n    pub(super) fn ", "\n    pub(crate) fn "]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .map(|offset| start + offset)
+            .unwrap_or(source.len());
+        &source[start..end]
+    }
+
+    /// The one direct-read detector for budgeted bodies and fixtures:
+    /// counts lines with a head/link read outside the gate. `heads[`
+    /// subsumes `key_heads[`/`id_heads[` and also catches a real
+    /// aliased read (`let heads = &self.key_heads; ... heads[b]`);
+    /// writes (`] =`) are allowed (splices perform no read); comment
+    /// lines are skipped.
+    fn count_direct_reads(body: &str) -> usize {
+        let mut direct_reads = 0;
+        for line in body.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("///") || trimmed.starts_with("//") {
+                continue;
+            }
+            for marker in ["heads[", ".next["] {
+                if let Some(at) = line.find(marker) {
+                    let after = &line[at + marker.len()..];
+                    if after.find("] =").is_none() {
+                        direct_reads += 1;
+                    }
+                }
+            }
+        }
+        direct_reads
+    }
+
     /// The budgeted paths must read heads/links only through the
-    /// single pre-debit gate (`budgeted_head` / `budgeted_next` /
-    /// `budgeted_match` / `budgeted_slot_key`): direct `key_heads[` /
-    /// `id_heads[` / `.next[` READS in `release_single_step`,
-    /// `release_role_step` or `chain_unlink_step` fail this test
-    /// (writes, `] =`, are allowed: splices perform no read). This
-    /// catches the review's repeat-read mutation
+    /// single pre-debit gate (the `budgeted_*` vocabulary below):
+    /// direct head/link READS in a budgeted driver fail this test
+    /// (writes are allowed: splices perform no read). This catches
+    /// the review's repeat-read mutation
     /// (`black_box(heads[bucket])` with debits unchanged): the extra
     /// load appears as a direct read and fails the scan.
     #[test]
@@ -2978,46 +3016,30 @@ mod tests {
             "fn release_single_step",
             "fn release_role_step",
             "fn chain_unlink_step",
+            "fn mint_walk_step",
         ] {
-            let start = source.find(name).expect("budgeted fn present");
-            let rest = &source[start..];
-            let end = rest
-                .find("\n    fn ")
-                .map(|offset| start + offset)
-                .unwrap_or(source.len());
-            let body = &source[start..end];
+            let body = budgeted_fn_body(source, name);
             assert!(
                 body.contains("budgeted_head")
                     || body.contains("budgeted_next")
                     || body.contains("budgeted_match")
                     || body.contains("budgeted_slot_key")
+                    || body.contains("budgeted_slot_snapshot")
                     || body.contains("chain_unlink_step"),
                 "{name} must go through the debiting gate"
             );
-            for (number, line) in body.lines().enumerate() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("///") || trimmed.starts_with("//") {
-                    continue;
-                }
-                for marker in ["key_heads[", "id_heads[", ".next["] {
-                    if let Some(at) = line.find(marker) {
-                        let after = &line[at + marker.len()..];
-                        let is_write = after.find("] =").is_some();
-                        assert!(
-                            is_write,
-                            "{name} line {} has a direct {marker} read \
-                             (bypass the gate): {line}",
-                            number + 1,
-                        );
-                    }
-                }
-            }
+            assert_eq!(
+                count_direct_reads(body),
+                0,
+                "{name} must not read heads/links outside the gate"
+            );
         }
     }
 
     /// The scanner above must catch a forced extra head load: a fake
     /// budgeted body with `black_box(heads[bucket])` and unchanged
-    /// debits fails the same rule.
+    /// debits fails the same detector, as does a realistic aliased
+    /// mutation (`let heads = &self.key_heads;` plus the extra load).
     #[test]
     fn budgeted_accessor_scan_catches_a_repeated_head_read() {
         let fake = r#"
@@ -3027,15 +3049,24 @@ mod tests {
         spent += 1;
     }
 "#;
-        let mut direct_reads = 0;
-        for line in fake.lines() {
-            for marker in ["key_heads[", "id_heads[", "heads["] {
-                if line.contains(marker) && !line.contains("] =") {
-                    direct_reads += 1;
-                }
-            }
-        }
-        assert_eq!(direct_reads, 2, "the fake body has two direct reads");
+        assert_eq!(
+            count_direct_reads(fake),
+            2,
+            "the fake body has two direct reads"
+        );
+        let aliased = r#"
+    fn release_role_step(&mut self) {
+        let heads = &self.key_heads;
+        let head = heads[bucket];
+        pending.prev = std::hint::black_box(heads[pending.bucket]);
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(aliased),
+            2,
+            "a real aliased head load is still a direct read"
+        );
     }
 
     /// Budgeted release subcursors share one mutable gate: the single
@@ -3045,15 +3076,7 @@ mod tests {
     #[test]
     fn budgeted_release_paths_share_one_gate() {
         let reservations = include_str!("reservations.rs");
-        let start = reservations
-            .find("fn release_single_step")
-            .expect("budgeted fn present");
-        let rest = &reservations[start..];
-        let end = rest
-            .find("\n    fn ")
-            .map(|offset| start + offset)
-            .unwrap_or(reservations.len());
-        let body = &reservations[start..end];
+        let body = budgeted_fn_body(reservations, "fn release_single_step");
         assert!(
             !body.contains("LeafBudget::new"),
             "release_single_step must share the caller's gate, not mint one"
@@ -3086,15 +3109,7 @@ mod tests {
     fn budgeted_release_paths_fold_slot_rereads_into_charged_visits() {
         let source = include_str!("reservations.rs");
         for name in ["fn release_single_step", "fn release_role_step"] {
-            let start = source.find(name).expect("budgeted fn present");
-            let rest = &source[start..];
-            let end = ["\n    fn ", "\n    pub(super) fn ", "\n    pub(crate) fn "]
-                .iter()
-                .filter_map(|marker| rest.find(marker))
-                .min()
-                .map(|offset| start + offset)
-                .unwrap_or(source.len());
-            let body = &source[start..end];
+            let body = budgeted_fn_body(source, name);
             assert!(
                 !body.contains("slot_is_vacant("),
                 "{name} must not reload vacancy after its charged visit"

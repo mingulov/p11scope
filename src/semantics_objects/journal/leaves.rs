@@ -18,8 +18,7 @@ use super::{
     AbandonDisposition, CallAttribution, CallIdentity, JournalAdapter, JournalDomainKey,
     JournalDomainProof, JournalNativeKey, ProbeDeposit, RecoveryMode, RefCut, RetainedMember,
     ScopedRecovery, StagedShape, StagingLedger, TaintCause, abandon_disposition,
-    abandonment_disposes_per_call, disposes_unclaimable_original, identity_of_begin,
-    shape_of_entry,
+    abandonment_disposes_per_call, identity_of_begin, shape_of_entry,
 };
 use crate::semantics_objects::ObjectDomain;
 use crate::semantics_objects::credit::{Credit, Paid};
@@ -699,9 +698,7 @@ impl<'a> JournalLeaves<'a> {
                 function: entry.function,
             };
         }
-        let excused = unterminated
-            && entry.abandon.is_none()
-            && disposes_unclaimable_original(entry.function);
+        let excused = unterminated && entry.abandon.is_none();
         self.apply_wipe_open(native, excused);
         WipeOpen::Done
     }
@@ -721,9 +718,10 @@ impl<'a> JournalLeaves<'a> {
         let Some(entry) = self.drop_open(native) else {
             return;
         };
-        // Effect-free wiped BEGINs excuse their late terminals at ingest
-        // (their void-wipe evidence routes them to plain S1); anything
-        // else taints fail-closed there.
+        // Wiped BEGINs leave their late terminals expected-absent at
+        // ingest regardless of function (their void-wipe evidence
+        // disposes them without proof); only terminals with no
+        // recorded wipe taint fail-closed there.
         if excused {
             self.adapter
                 .note_derived_absence(entry.image, native, entry.function);

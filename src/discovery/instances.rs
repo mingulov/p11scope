@@ -1381,7 +1381,6 @@ impl InstanceRouter {
     /// Global/miss taint of the newest observation for one key,
     /// for take-side live-ahead decisions. `None` without an
     /// observation or for a foreign domain.
-    #[cfg_attr(not(test), allow(dead_code))] // Consulted by take validation with the gate.
     pub(crate) fn partition_back_taint(
         &self,
         domain: NativeDomainId,

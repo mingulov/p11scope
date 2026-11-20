@@ -1807,4 +1807,60 @@ mod tests {
         assert_eq!(BUDGET_STOP_DEMOTE_AFTER, 3);
         assert!(demotion_gap_subject().contains('3'));
     }
+
+    /// Fair-share ordering: within the retry tier the least-spent member
+    /// scans first, so a low-pid refused prefix that already spent its
+    /// turns cannot camp at the head ahead of a high-pid tail that spent
+    /// little. Never-attempted members still precede all retries.
+    #[test]
+    fn owner2_cursor_orders_retry_tier_by_least_spent_first() {
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        pass.cursor_mut().note_member_outcomes(&[
+            ((10, Some(100)), MemberOutcome::CutShortOther, 5000),
+            ((500, Some(5000)), MemberOutcome::CutShortOther, 100),
+        ]);
+        assert_eq!(
+            pass.cursor().order_members(&[
+                (10, Some(100)),
+                (500, Some(5000)),
+                (501, Some(5010))
+            ]),
+            vec![501, 500, 10],
+            "the least-spent retry scans first, regardless of pid"
+        );
+    }
+
+    /// Own-spend accumulation: per-member spend totals across passes,
+    /// pruned to live pids and cleared on pid reuse, so fair-share
+    /// ordering reflects what each incarnation actually spent.
+    #[test]
+    fn owner2_cursor_accumulates_own_spend_and_clears_on_reuse() {
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        pass.cursor_mut().note_member_outcomes(&[
+            ((10, Some(100)), MemberOutcome::CutShortOther, 5000),
+            ((11, Some(110)), MemberOutcome::CutShortOther, 100),
+        ]);
+        assert_eq!(
+            pass.cursor().own_spend_for_test().get(&(10, Some(100))),
+            Some(&5000)
+        );
+        pass.cursor_mut()
+            .note_member_outcomes(&[((10, Some(100)), MemberOutcome::CutShortOther, 3000)]);
+        assert_eq!(
+            pass.cursor().own_spend_for_test().get(&(10, Some(100))),
+            Some(&8000),
+            "spend accumulates across passes"
+        );
+        pass.cursor_mut()
+            .note_member_outcomes(&[((10, Some(200)), MemberOutcome::CutShortOther, 50)]);
+        assert_eq!(
+            pass.cursor().own_spend_for_test().get(&(10, Some(200))),
+            Some(&50),
+            "a recycled pid starts fresh"
+        );
+        assert!(
+            !pass.cursor().own_spend_for_test().contains_key(&(10, Some(100))),
+            "the old incarnation's spend never transfers"
+        );
+    }
 }

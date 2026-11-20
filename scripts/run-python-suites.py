@@ -193,6 +193,7 @@ RUN = [
     ("test_system_scope_soak.py", []),
     ("test_system_test_manifest.py", []),
     ("test_t7_campaign.py", []),
+    ("test_tls_server_resumption.py", []),
     ("test_uprobe_close_throughput_probe.py", []),
     ("test_vng_boot_watch.py", []),
     ("test_vng_wrapper_exits.py", []),

@@ -3569,7 +3569,11 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
             subject == "native capture events lost" || subject == "key sizes lost some lengths"
         })
         .collect();
-    assert_eq!(staged.len(), 2, "no gap repeats past completion: {staged:?}");
+    assert_eq!(
+        staged.len(),
+        2,
+        "no gap repeats past completion: {staged:?}"
+    );
 }
 
 /// A Finish publication that exhausts its slice defers its loss
@@ -3654,41 +3658,7 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
         stash_polls.get(),
         "every publish polls both counters exactly once"
     );
-    assert!(
-        ring_polls.get() >= 1,
-        "the resume polls the loss counters"
-    );
-    let staged: Vec<_> = scene
-        .scene
-        .real
-        .scene
-        .coordinator
-        .registry()
-        .staged_scope_gaps_for_test()
-        .into_iter()
-        .filter(|(subject, _)| {
-            subject == "native capture events lost" || subject == "key sizes lost some lengths"
-        })
-        .collect();
-    assert_eq!(
-        staged,
-        [
-            (
-                "native capture events lost".to_string(),
-                "the EVENTS ring was full; the kernel refused records \
-                 before the drain could read them \
-                 (kernel reserve failures; exact count in events_lost)"
-                    .to_string(),
-            ),
-            (
-                "key sizes lost some lengths".to_string(),
-                "the length stash dropped retention (a full map or a \
-                 stale row; exact counts in the semantic capture summary)"
-                    .to_string(),
-            ),
-        ],
-        "each rise stages one named gap on the budgeted resume"
-    );
+    assert!(ring_polls.get() >= 1, "the resume polls the loss counters");
     let lane = &scene.scene.real.lane;
     let summary = lane.semantic_summary();
     assert_eq!(
@@ -3710,6 +3680,47 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
         ((3, 1), 3, 1),
         "the disclosed stash delta counts exactly once on the resume"
     );
+    // Each rise stages one named gap on the resume; the finish's own
+    // later publications publish the staged rows, so each surfaces
+    // exactly once, never stuck staged and never doubled.
+    let coordinator = &scene.scene.real.scene.coordinator;
+    for (subject, reason) in [
+        (
+            "native capture events lost",
+            "the EVENTS ring was full; the kernel refused records \
+             before the drain could read them \
+             (kernel reserve failures; exact count in events_lost)",
+        ),
+        (
+            "key sizes lost some lengths",
+            "the length stash dropped retention (a full map or a \
+             stale row; exact counts in the semantic capture summary)",
+        ),
+    ] {
+        let gaps: Vec<_> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .zip(coordinator.registry().gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == subject)
+            .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+            .collect();
+        assert_eq!(gaps.len(), 1, "one {subject} gap surfaces: {gaps:?}");
+        assert_eq!(
+            gaps[0],
+            (reason.to_string(), 1),
+            "a single {subject} rise surfaces once"
+        );
+    }
+    let staged: Vec<_> = coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| {
+            subject == "native capture events lost" || subject == "key sizes lost some lengths"
+        })
+        .collect();
+    assert_eq!(staged.len(), 0, "no loss gap is stuck staged: {staged:?}");
     // A finished lane refuses further polls: no second receipt, no
     // further lookups, no repeated gaps.
     for _ in 0..3 {
@@ -3723,19 +3734,17 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
         stash_polls.get(),
         "no lookup repeats past completion"
     );
-    let staged: Vec<_> = scene
-        .scene
-        .real
-        .scene
-        .coordinator
+    let coordinator = &scene.scene.real.scene.coordinator;
+    let gaps: Vec<_> = coordinator
         .registry()
-        .staged_scope_gaps_for_test()
-        .into_iter()
-        .filter(|(subject, _)| {
-            subject == "native capture events lost" || subject == "key sizes lost some lengths"
+        .gaps()
+        .iter()
+        .filter(|gap| {
+            gap.subject == "native capture events lost"
+                || gap.subject == "key sizes lost some lengths"
         })
         .collect();
-    assert_eq!(staged.len(), 2, "no gap repeats past completion: {staged:?}");
+    assert_eq!(gaps.len(), 2, "no gap repeats past completion: {gaps:?}");
 }
 
 /// Plain and machine polls share one ring-loss baseline on one

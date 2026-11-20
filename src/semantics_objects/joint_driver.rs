@@ -427,9 +427,11 @@ impl JointCaptureOwner {
                 // consumers must see them). The partial fence/wipe work
                 // is subsumed as before. The carried effects are paid
                 // on top of the stream void's own bound.
-                // Reserve before taking: a refused reservation leaves the
-                // aborted recovery (its applied effects and its own lease)
-                // standing for the retry.
+                // Resize the aborted recovery's own lease before taking:
+                // only the shortfall is charged (the replacement never
+                // needs both leases at once), and a refusal hands the
+                // held lease back so the aborted recovery (its applied
+                // effects and its lease) stands for the retry.
                 let carried_len = self
                     .adapter
                     .scoped_recovery
@@ -445,13 +447,26 @@ impl JointCaptureOwner {
                     super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
                         .and_then(|bytes| bytes.checked_add(carried_bytes))
                         .ok_or(RawQuantumRefusal::Capacity)?;
-                let lease = self
+                let held = self
                     .adapter
-                    .ledger
-                    .resource_reserver()
-                    .ok_or(RawQuantumRefusal::ForeignLedger)?
-                    .reserve(bytes)
-                    .map_err(RawQuantumRefusal::Resource)?;
+                    .scoped_recovery
+                    .as_mut()
+                    .and_then(|aborted| aborted.lease.take());
+                let Some(reserver) = self.adapter.ledger.resource_reserver() else {
+                    if let Some(aborted) = self.adapter.scoped_recovery.as_mut() {
+                        aborted.lease = held;
+                    }
+                    return Err(RawQuantumRefusal::ForeignLedger);
+                };
+                let lease = match reserver.resize(held, bytes) {
+                    Ok(lease) => lease,
+                    Err((held, refusal)) => {
+                        if let Some(aborted) = self.adapter.scoped_recovery.as_mut() {
+                            aborted.lease = held;
+                        }
+                        return Err(RawQuantumRefusal::Resource(refusal));
+                    }
+                };
                 let (standing, carried) = match self.adapter.scoped_recovery.take() {
                     Some(aborted) => (aborted.model_retire, aborted.effects),
                     None => (None, super::ObjectEffects::default()),
@@ -667,6 +682,17 @@ impl JointCaptureOwner {
     #[cfg(test)]
     pub(crate) fn pending_void_bytes_for_test(&self) -> Option<usize> {
         self.pending_void.as_ref().map(|pending| pending.bytes)
+    }
+
+    /// Whether the pending void's lease charges exactly `bytes`.
+    #[cfg(test)]
+    pub(crate) fn pending_void_lease_is_exactly_for_test(&self, bytes: usize) -> bool {
+        let Some(reserver) = self.adapter.ledger.resource_reserver() else {
+            return false;
+        };
+        self.pending_void.as_ref().is_some_and(|pending| {
+            reserver.covers(&pending.lease, bytes) && !reserver.covers(&pending.lease, bytes + 1)
+        })
     }
 
     /// The capture's one object model, with its retained history (read

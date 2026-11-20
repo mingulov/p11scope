@@ -2770,6 +2770,22 @@ impl CallerRegistry {
             .map(|record| record.feed.mode())
     }
 
+    /// Tests-only: pose one feed's mode (a disjoint S1-only history
+    /// beside a deferred negative).
+    #[cfg(test)]
+    pub(crate) fn pose_feed_mode_for_test(
+        &mut self,
+        id: RegistryInstanceId,
+        mode: crate::semantics_key_use::FeedMode,
+    ) {
+        self.instance_state
+            .semantics
+            .get_mut(&id)
+            .expect("registered feed")
+            .feed
+            .pose_mode_for_test(mode);
+    }
+
     /// Tests-only replay-frontier read: a late Joint selection must
     /// leave it alone (it counts H0 positions, not journal cuts).
     #[cfg(test)]

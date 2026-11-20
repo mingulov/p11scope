@@ -1706,7 +1706,7 @@ pub(crate) struct ScopedRecovery {
     /// Seal-time doom: the doomed key and the live set frozen at the
     /// decision (its staged rows attribute against it).
     pub(in crate::semantics_objects) doom_key: Option<JournalDomainKey>,
-    pub(in crate::semantics_objects) doom_live: Vec<JournalDomainKey>,
+    pub(in crate::semantics_objects) doom_live: BTreeSet<JournalDomainKey>,
     /// S1-only negative: a subject's key was gone (or independent image
     /// evidence stood), so the failure names the image taint.
     pub(in crate::semantics_objects) image_fallback: bool,
@@ -1845,7 +1845,7 @@ struct RejectionPlan {
     scope: bool,
     retire: Option<super::state::DomainRetirement>,
     /// A seal-time doom's key and frozen live set.
-    doom: Option<(JournalDomainKey, Vec<JournalDomainKey>)>,
+    doom: Option<(JournalDomainKey, BTreeSet<JournalDomainKey>)>,
 }
 
 /// A finished deferred rejection: the effects its cursor applied, for
@@ -7256,6 +7256,17 @@ impl JournalAdapter {
         shape: &StagedShape,
         live: &[JournalDomainKey],
     ) -> CallAttribution {
+        self.attribute_call_by(key, shape, |claimant| live.contains(claimant))
+    }
+
+    /// [`Self::attribute_call`] with the liveness test supplied (an
+    /// indexed lookup in a frozen sorted live set, for the doom cursor).
+    fn attribute_call_by(
+        &self,
+        key: JournalDomainKey,
+        shape: &StagedShape,
+        is_live: impl Fn(&JournalDomainKey) -> bool,
+    ) -> CallAttribution {
         let mut mine = false;
         let mut sibling = false;
         let mut dead = false;
@@ -7266,7 +7277,7 @@ impl JournalAdapter {
                 }
                 if *claimant == key {
                     mine = true;
-                } else if live.contains(claimant) {
+                } else if is_live(claimant) {
                     sibling = true;
                 } else {
                     dead = true;
@@ -8503,7 +8514,7 @@ impl JournalAdapter {
             verdict: None,
             verdict_at: None,
             doom_key: None,
-            doom_live: Vec::new(),
+            doom_live: BTreeSet::new(),
             image_fallback: false,
             deposit: ProbeDeposit::default(),
             phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
@@ -8547,7 +8558,7 @@ impl JournalAdapter {
             verdict: None,
             verdict_at: None,
             doom_key: None,
-            doom_live: Vec::new(),
+            doom_live: BTreeSet::new(),
             image_fallback: false,
             deposit: ProbeDeposit::default(),
             phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
@@ -8586,10 +8597,14 @@ impl JournalAdapter {
         retire: super::state::DomainRetirement,
     ) -> u64 {
         let ticket = self.issue_rejection(RecoveryMode::Doom, false, Some(retire));
+        // Frozen as a set: the cursor's per-claimant liveness test is an
+        // indexed lookup, so the image's key-list width never prices an
+        // attribution out of reach.
+        let live: BTreeSet<JournalDomainKey> = live.iter().copied().collect();
         self.rejection_queue
             .back_mut()
             .expect("issued rejection")
-            .doom = Some((key, live.to_vec()));
+            .doom = Some((key, live));
         ticket
     }
 
@@ -8641,6 +8656,13 @@ impl JournalAdapter {
     pub(super) fn bound_inline_credit(&mut self, remaining: usize) {
         self.inline_credit = remaining.min(SCOPED_RECOVERY_SLICE);
         self.inline_spent = 0;
+    }
+
+    /// Tests-only: bound the next deciding call's inline settlement, so
+    /// a small negative defers to its frame as a large one does.
+    #[cfg(test)]
+    pub(crate) fn bound_inline_credit_for_test(&mut self, remaining: usize) {
+        self.bound_inline_credit(remaining);
     }
 
     /// Restore the default inline allowance and return what the bounded
@@ -8727,7 +8749,7 @@ impl JournalAdapter {
         };
         let (doom_key, doom_live) = match plan.doom {
             Some((key, live)) => (Some(key), live),
-            None => (None, Vec::new()),
+            None => (None, BTreeSet::new()),
         };
         // The scope is prepaid at exactly one domain per key, like the
         // synchronous snapshot: reserve it exactly at activation.
@@ -23232,6 +23254,92 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn stream_takeover_credits_the_aborted_scoped_lease_it_replaces() {
+        // The pool fits the stream void once the aborted scoped void's
+        // own lease is credited, but not both leases at once: the
+        // takeover must progress at this limit (no repeated refusal),
+        // carry every applied effect exactly once and leave the pool
+        // charged with the stream void's lease alone.
+        use super::joint_driver::RecoveryProgress;
+        let mut harness = OwnerHarness::new(image_default());
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let proof = proofs[0];
+        harness
+            .owner
+            .model_mut()
+            .populate_domain_rows_for_test(proof.domain(), 97);
+        harness
+            .owner
+            .adapter_mut()
+            .keys
+            .get_mut(&proof.key)
+            .expect("attested key")
+            .model_registered = true;
+        let key = proof.key;
+        harness.owner.adapter_mut().break_scoped_for_watchdog(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        let before = harness.owner.model().test_retire_units();
+        let mut polls = 0usize;
+        while harness.owner.model().test_retire_units() == before {
+            let mut budget = 8usize;
+            assert_eq!(
+                harness.owner.void_ingest_break_bounded(&mut budget),
+                Ok(RecoveryProgress::Yielded),
+                "97 rows never finish under small credits"
+            );
+            polls += 1;
+            assert!(polls < 1_000);
+        }
+        harness.owner.adapter_mut().break_stream_for_test();
+        let (held, carried) = {
+            let aborted = harness
+                .owner
+                .adapter()
+                .scoped_recovery
+                .as_ref()
+                .expect("the scoped void is mid-rows");
+            assert!(aborted.lease.is_some(), "the scoped void holds its lease");
+            (aborted.bytes, aborted.effects.effects.len())
+        };
+        let needed = super::joint_audit::raw_disposition_storage_bound(
+            harness.owner.adapter(),
+            harness.owner.model(),
+        )
+        .expect("bounded")
+            + carried * 2 * size_of::<ObjectEffect>();
+        let snapshot = harness.pool.snapshot();
+        let others = snapshot.charged_bytes - held;
+        harness.pool.reference_set_limit(others + held.max(needed));
+        let mut budget = 64usize;
+        assert!(
+            harness.owner.void_ingest_break_bounded(&mut budget).is_ok(),
+            "the replacement fits once the held lease is credited"
+        );
+        let (_, _) = drive_void_counting_model_rows(&mut harness, 64);
+        let failure = harness
+            .owner
+            .pending_void_for_test()
+            .expect("the stream void carries its failure");
+        let count = |want: fn(&ObjectEffect) -> bool| {
+            failure.effects.effects.iter().filter(|e| want(e)).count()
+        };
+        assert_eq!(count(|e| matches!(e, ObjectEffect::Retired { .. })), 97);
+        assert_eq!(
+            count(|e| matches!(e, ObjectEffect::SessionEnded { .. })),
+            97
+        );
+        assert_eq!(harness.owner.pending_void_bytes_for_test(), Some(needed));
+        assert!(
+            harness.owner.pending_void_lease_is_exactly_for_test(needed),
+            "the stream void holds exactly its own bound, no leftover of the old lease"
+        );
+    }
+
     /// A preservation basis that completes on the slice's last unit
     /// leaves nothing for the decision: the slice yields and the doom
     /// lands on later credit, never debiting below zero. One staged
@@ -24382,6 +24490,234 @@ pub(crate) mod tests {
                 .refused,
             "the mutating abandonment keeps its permanent refusal"
         );
+    }
+
+    #[test]
+    fn seal_time_doom_keeps_a_sibling_exact_history_on_a_wide_image() {
+        // 33 live keys share one image. The doomed key's mutating
+        // abandonment refuses it; a live sibling's own exact call (a
+        // distinct invocation it alone claims) is the sibling's history:
+        // the doom keeps it staged with its custody, however wide the
+        // image's key list, and refuses only the doomed key.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let mut fixtures = Vec::new();
+        let mut siblings = Vec::new();
+        for _ in 0..32 {
+            let mut fixture = AttestationFixture::new(image_default());
+            let admitted = fixture.admit_session_function(SESSION, "C_CreateObject");
+            siblings.push(scene.adapter.attest_key(&admitted).expect("key attests"));
+            fixtures.push(fixture);
+        }
+        let sibling = siblings[0].key;
+        assert_ne!(sibling, proof.key, "precondition: a distinct sibling key");
+        assert_eq!(
+            scene.adapter.image_keys[&(COOKIE, EXEC)].len(),
+            33,
+            "precondition: one wide image"
+        );
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        assert_eq!(
+            scene.ingest(&begin_bytes(2, 1, create, 0)),
+            JournalDisposition::BeginAdmitted
+        );
+        let sibling_native = {
+            let (native, entry) = scene
+                .adapter
+                .open
+                .iter()
+                .find(|(_, entry)| entry.abandon.is_none())
+                .expect("the sibling's staged call");
+            let staged = entry.begin;
+            let claim = keepup_claim_for_begin(&staged, staged.session_word());
+            let native = *native;
+            scene
+                .adapter
+                .claims
+                .entry(identity_of_begin(&staged))
+                .or_default()
+                .entry(sibling)
+                .or_default()
+                .push_back(claim);
+            scene.adapter.claim_counts += 1;
+            native
+        };
+        let doomed_ordinal = scene
+            .adapter
+            .open
+            .values()
+            .find(|entry| entry.abandon.is_some())
+            .expect("the doomed original")
+            .begin_ordinal;
+        let sibling_ordinal = scene.adapter.open[&sibling_native].begin_ordinal;
+        assert!(
+            scene
+                .adapter
+                .ledger
+                .h8_open_bytes_for_test(sibling_ordinal)
+                .is_some(),
+            "precondition: the sibling's original holds H8 custody"
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the mutating abandonment dooms its key");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        let mut polls = 0usize;
+        loop {
+            let mut budget = SCOPED_RECOVERY_SLICE;
+            if scene
+                .adapter
+                .drive_rejections(&mut scene.model, &mut budget)
+            {
+                break;
+            }
+            polls += 1;
+            assert!(polls < 1_000, "the doom completes");
+        }
+        assert!(
+            scene.adapter.keys[&proof.key].refused,
+            "the doomed key is refused"
+        );
+        assert!(
+            !scene.adapter.keys[&sibling].refused,
+            "the sibling keeps sealing"
+        );
+        assert!(
+            scene.adapter.open.contains_key(&sibling_native),
+            "the sibling's exact original stays staged"
+        );
+        assert_eq!(
+            scene.adapter.open.len(),
+            1,
+            "only the doomed key's own original drops"
+        );
+        assert!(
+            scene
+                .adapter
+                .ledger
+                .h8_open_bytes_for_test(sibling_ordinal)
+                .is_some(),
+            "the sibling keeps its H8 custody"
+        );
+        assert!(
+            scene
+                .adapter
+                .ledger
+                .h8_open_bytes_for_test(doomed_ordinal)
+                .is_none(),
+            "the doomed original refunds its custody"
+        );
+    }
+
+    #[test]
+    fn seal_time_doom_keeps_a_sibling_exact_refused_begin_on_a_wide_image() {
+        // The refused-begin twin: the sibling's exact call was refused for
+        // capacity. The doom keeps it (and its census) and drops only the
+        // doomed key's own history, however wide the image's key list.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 1,
+                ..JournalLimits::policy()
+            },
+        );
+        let proof = scene.attest();
+        let mut fixtures = Vec::new();
+        let mut sibling = None;
+        for _ in 0..32 {
+            let mut fixture = AttestationFixture::new(image_default());
+            let admitted = fixture.admit_session_function(SESSION, "C_CreateObject");
+            let key = scene
+                .adapter
+                .attest_key(&admitted)
+                .expect("key attests")
+                .key;
+            sibling.get_or_insert(key);
+            fixtures.push(fixture);
+        }
+        let sibling = sibling.expect("a sibling key");
+        assert_eq!(scene.adapter.image_keys[&(COOKIE, EXEC)].len(), 33);
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        assert_eq!(
+            scene.ingest(&begin_bytes(2, 1, create, 0)),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        {
+            let refused = *scene
+                .adapter
+                .refused
+                .first()
+                .expect("the sibling's refused call");
+            let claim = AdmittedJournalClaim {
+                admission: 0,
+                return_ns: 0,
+                returned: CallFingerprint {
+                    image: refused.image,
+                    function: refused.function,
+                    pid_tgid: refused.pid_tgid,
+                    entry_ns: refused.entry_ns,
+                    slot: refused.slot,
+                    session: refused.session,
+                    mechanism: refused.mechanism,
+                    capture: refused.capture,
+                    slot_id: refused.slot_id,
+                    flags: refused.flags,
+                    user_type: refused.user_type,
+                },
+                rv: 0,
+            };
+            scene
+                .adapter
+                .claims
+                .entry(refused.identity())
+                .or_default()
+                .entry(sibling)
+                .or_default()
+                .push_back(claim);
+            scene.adapter.claim_counts += 1;
+        }
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the mutating abandonment dooms its key");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        let mut polls = 0usize;
+        loop {
+            let mut budget = SCOPED_RECOVERY_SLICE;
+            if scene
+                .adapter
+                .drive_rejections(&mut scene.model, &mut budget)
+            {
+                break;
+            }
+            polls += 1;
+            assert!(polls < 1_000, "the doom completes");
+        }
+        assert!(
+            scene.adapter.keys[&proof.key].refused,
+            "the doomed key is refused"
+        );
+        assert!(
+            !scene.adapter.keys[&sibling].refused,
+            "the sibling keeps sealing"
+        );
+        assert_eq!(
+            scene.adapter.refused.len(),
+            1,
+            "the sibling's exact refused begin stays staged"
+        );
+        assert!(scene.adapter.open.is_empty(), "the doomed original drops");
     }
 
     #[test]

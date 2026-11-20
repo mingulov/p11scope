@@ -22,6 +22,7 @@ use crate::discovery::overlay_witness::{
     witness_unavailable_refusal,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
+use crate::discovery::scan_pass::{DecodeCursor, DecodeCursorKey};
 use crate::discovery::sweep_attribution::is_caller_range;
 use crate::process::leader_exit::LeaderExitReadBudget;
 use crate::process::{
@@ -1109,6 +1110,12 @@ pub(crate) struct RetainedFileFacts {
     elf_export_facts: BTreeMap<InspectedFileKey, ElfExportFacts>,
     table_cap_refusals: BTreeMap<InspectedFileKey, String>,
     loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
+    /// Resumable per-object decode cursors: unfinished work continues
+    /// next pass from its frontier instead of restarting, and completed
+    /// objects re-emit their cached tables at ~zero work while they
+    /// validate unchanged. Keyed by file identity plus the target
+    /// generation; anything else misses and scans fresh.
+    decode_cursors: BTreeMap<DecodeCursorKey, DecodeCursor>,
     retained_cache_bytes: u64,
     /// Keys the producing pass looked up or inserted. A later pass that
     /// has not reached one of these entries yet must not reclaim it ahead
@@ -1157,6 +1164,45 @@ impl RetainedFileFacts {
             self.retained_cache_bytes,
         )
     }
+
+    /// `(cursors, unfinished cursors)` entry counts.
+    #[cfg(test)]
+    pub(crate) fn cursor_counts(&self) -> (usize, usize) {
+        (
+            self.decode_cursors.len(),
+            self.decode_cursors
+                .values()
+                .filter(|cursor| !cursor.complete)
+                .count(),
+        )
+    }
+}
+
+/// Accounted bytes of the carried decode-cursor map. Kept separate from
+/// [`file_fact_bytes`] so the file-map twins keep their shape.
+fn decode_cursor_bytes_total(cursors: &BTreeMap<DecodeCursorKey, DecodeCursor>) -> u64 {
+    cursors.iter().fold(0u64, |bytes, (key, cursor)| {
+        bytes.saturating_add(super::scan_pass::decode_cursor_bytes(key, cursor))
+    })
+}
+
+/// End-of-view continuation naming: while the view holds unfinished
+/// cursors, drop its raw pass-budget stops (they continue next pass)
+/// and return the in-progress gap to push; without unfinished cursors
+/// every gap stays verbatim (`None`), so a stall keeps its exact raw
+/// wording. Runs after the bracket validation, so compositions name
+/// through the same rule as take sites and spend failures.
+fn continued_view_gap(
+    skipped: &mut Vec<Skipped>,
+    budget: &CaptureWorkBudget,
+    pid: u32,
+    start_time: Option<u64>,
+) -> Option<(String, String)> {
+    let gap = budget.view_in_progress_gap(pid, start_time)?;
+    skipped.retain(|skip| {
+        !(skip.reason.contains(WORK_CEILING_REASON) || skip.reason.contains(COLLECTION_STOP_REASON))
+    });
+    Some(gap)
 }
 
 #[derive(Debug, Clone)]
@@ -2132,6 +2178,7 @@ impl CaptureWorkBudget {
             elf_export_facts: std::mem::take(&mut self.elf_export_facts),
             table_cap_refusals: std::mem::take(&mut self.table_cap_refusals),
             loader_elf_facts: std::mem::take(&mut self.loader_elf_facts),
+            decode_cursors: self.pass.take_decode_cursors(),
             retained_cache_bytes: std::mem::replace(&mut self.retained_cache_bytes, 0),
             touched_inspected_files: std::mem::take(&mut self.touched_inspected_files),
             touched_loader_elf_facts: std::mem::take(&mut self.touched_loader_elf_facts),
@@ -2177,6 +2224,10 @@ impl CaptureWorkBudget {
                 "carried bytes exceed the destination ceiling"
             );
         }
+        debug_assert!(
+            facts.decode_cursors.len() <= super::scan_pass::MAX_DECODE_CURSORS,
+            "carried decode cursors exceed the shared cursor cap"
+        );
         debug_assert_eq!(
             facts.retained_cache_bytes,
             file_fact_bytes(
@@ -2184,7 +2235,8 @@ impl CaptureWorkBudget {
                 &facts.elf_export_facts,
                 &facts.table_cap_refusals,
                 &facts.loader_elf_facts,
-            ),
+            )
+            .saturating_add(decode_cursor_bytes_total(&facts.decode_cursors)),
             "the carried byte counter matches its entries"
         );
         self.touched_inspected_files.clear();
@@ -2200,7 +2252,90 @@ impl CaptureWorkBudget {
         self.table_cap_refusals = facts.table_cap_refusals;
         self.loader_elf_facts = facts.loader_elf_facts;
         self.retained_cache_bytes = facts.retained_cache_bytes;
+        // Installing arms resume even for an empty bundle: the collector
+        // that installs is a multi-pass inventory pass, so progress it
+        // makes this pass must carry a cursor for the next one.
+        // Single-shot captures and engine native scans never install and
+        // keep their exact stop wording.
+        self.pass.install_decode_cursors(facts.decode_cursors);
         self
+    }
+
+    /// Look up this object's installed decode cursor (see
+    /// [`super::scan_pass::ScanPassOwner::decode_cursor`]).
+    pub(crate) fn decode_cursor(&self, key: &DecodeCursorKey) -> Option<&DecodeCursor> {
+        self.pass.decode_cursor(key)
+    }
+
+    /// Test-only: process-liveness probes performed for decode-cursor
+    /// reclamation on this budget's owner.
+    #[cfg(test)]
+    pub(crate) fn decode_liveness_probes(&self) -> u64 {
+        self.pass.decode_liveness_probes()
+    }
+
+    /// Record (or advance) one object's decode cursor through the pass
+    /// owner, joining the budget's shared retained-byte accounting (see
+    /// [`super::scan_pass::ScanPassOwner::record_decode_cursor`]).
+    /// Returns whether stored.
+    pub(crate) fn record_decode_cursor(
+        &mut self,
+        key: DecodeCursorKey,
+        cursor: DecodeCursor,
+    ) -> bool {
+        let limit = self.retained_byte_limit();
+        let pass = &mut self.pass;
+        let retained = &mut self.retained_cache_bytes;
+        pass.record_decode_cursor(key, cursor, retained, limit)
+    }
+
+    /// `(done, total, tables)` for one view's cursors (see
+    /// [`super::scan_pass::ScanPassOwner::view_scan_progress`]).
+    pub(crate) fn view_scan_progress(
+        &self,
+        pid: u32,
+        start_time: Option<u64>,
+    ) -> Option<(usize, usize, usize)> {
+        self.pass.view_scan_progress(pid, start_time)
+    }
+
+    /// The view's named in-progress gap, if it holds unfinished cursors
+    /// (see [`super::scan_pass::ScanPassOwner::view_in_progress_gap`]).
+    pub(crate) fn view_in_progress_gap(
+        &self,
+        pid: u32,
+        start_time: Option<u64>,
+    ) -> Option<(String, String)> {
+        self.pass.view_in_progress_gap(pid, start_time)
+    }
+
+    /// Order one view's object groups oldest-unfinished-first (see
+    /// [`super::scan_pass::ScanPassOwner::order_groups_for_resume`]).
+    pub(crate) fn order_groups_for_resume<'a>(
+        &self,
+        pid: u32,
+        start_time: Option<u64>,
+        groups: BTreeMap<ObjectKey, Vec<&'a MapEntry>>,
+    ) -> Vec<(ObjectKey, Vec<&'a MapEntry>)> {
+        self.pass.order_groups_for_resume(pid, start_time, groups)
+    }
+
+    /// Order one pass's member pids oldest-unfinished-first (see
+    /// [`super::scan_pass::ScanPassOwner::order_pids_for_resume`]).
+    pub(crate) fn order_pids_for_resume(&self, pids: &mut Vec<u32>) {
+        self.pass.order_pids_for_resume(pids)
+    }
+
+    /// Reserve capped selection slots for the oldest unfinished members
+    /// (see [`super::scan_pass::ScanPassOwner::reserve_unfinished_selection`]).
+    pub(crate) fn reserve_unfinished_selection(
+        &self,
+        selected: &mut Vec<u32>,
+        eligible: &BTreeSet<u32>,
+        cap: usize,
+    ) {
+        self.pass
+            .reserve_unfinished_selection(selected, eligible, cap)
     }
 
     #[cfg(test)]
@@ -8397,6 +8532,10 @@ pub(crate) fn final_maps_refusal_for_test(
 
 #[cfg(test)]
 mod tests {
+    use super::super::scan_pass::{
+        MappingFingerprintEntry, SCAN_IN_PROGRESS_SUBJECT, SweepFrontier, decode_cursor_bytes,
+        scan_in_progress_reason,
+    };
     use super::*;
 
     /// The scheduling latch match is exact membership, never a substring
@@ -21445,6 +21584,11 @@ int main(int argc, char **argv) {
             ];
             assert!(budget.record_decode_cursor(key, cursor));
         }
+        assert_eq!(
+            budget.view_scan_progress(7, Some(9)),
+            Some((2, 3, 2)),
+            "the progress tuple feeds gap filtering directly"
+        );
         let gap = budget
             .view_in_progress_gap(7, Some(9))
             .expect("unfinished view names its gap");

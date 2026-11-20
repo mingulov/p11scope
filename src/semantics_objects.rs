@@ -1470,6 +1470,33 @@ impl ObjectSemantics {
         self.state.abandon_domain(domain, ledger)
     }
 
+    /// Sealed production input: advance one resumable domain retirement
+    /// by at most `*units` leaf units (see
+    /// [`state::DomainRetirement`]); returns true when it completed.
+    pub(crate) fn retire_domain_step(
+        &mut self,
+        retirement: &mut state::DomainRetirement,
+        ledger: &mut journal::StagingLedger,
+        effects: &mut ObjectEffects,
+        units: &mut usize,
+    ) -> bool {
+        self.state
+            .retire_domain_step(retirement, ledger, effects, units)
+    }
+
+    /// Test-only: leaf units the retirement cursor charged so far.
+    #[cfg(test)]
+    pub(crate) fn test_retire_units(&self) -> usize {
+        self.state.test_retire_units()
+    }
+
+    /// Test-only: `rows` live sessions, views and pending tickets under
+    /// one domain (registered if absent).
+    #[cfg(test)]
+    pub(crate) fn populate_domain_rows_for_test(&mut self, domain: ObjectDomain, rows: usize) {
+        self.state.populate_domain_rows_for_test(domain, rows);
+    }
+
     /// Sealed production input: per-call disposal for one abandoned
     /// effect-free call (converted ticket or `None` when never
     /// converted). Returns `None` for a non-effect-free ticket (fail

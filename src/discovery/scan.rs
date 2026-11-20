@@ -5815,17 +5815,24 @@ fn capture_scan_reason(reason: &str) -> bool {
     )
 }
 
-/// Budget-exhaustion reasons for the failed-bracket keep (owner
-/// data-always rule 2026-11-09, controller R1): the bracket keeps its
-/// decoded modules only when EVERY failing half names one of these —
-/// the budget bought a full allowance of decode work and only the
-/// re-validation ran dry, so the decoded modules publish with the
-/// failure named, never an empty view. Any other failing half (a proven
-/// mapping change, an unreadable maps snapshot, a lost generation)
-/// keeps the fail-closed clear. Maps byte/entry ceilings are truncated
+/// Budget-exhaustion reasons: the capture's own limits (owner
+/// data-always rule 2026-11-09, controller R1). The failed-bracket keep
+/// uses the work-excluded subset below; the full set stays for
+/// [`names_capture_budget_stop`]. Maps byte/entry ceilings are truncated
 /// snapshots, not an exhausted allowance, so they stay out of this set.
 fn bracket_budget_exhaustion(reason: &str) -> bool {
     BUDGET_EXHAUSTION_REASONS.contains(&reason)
+}
+
+/// Budget-exhaustion reasons that keep decoded modules past a failed
+/// bracket: every [`bracket_budget_exhaustion`] reason EXCEPT the work
+/// ceiling. A work-starved bracket clears (fail-closed, the v0.7.0
+/// contract): the work budget is gone, so its modules' pins cannot
+/// succeed, and publishing them only feeds the fail-closed key
+/// rejection until the capture stops counting under a newcomer flood
+/// (the v0.7.1 regression). Keeps for other starvations are unchanged.
+fn bracket_keep_exhaustion(reason: &str) -> bool {
+    bracket_budget_exhaustion(reason) && reason != WORK_CEILING_REASON
 }
 
 const BUDGET_EXHAUSTION_REASONS: [&str; 7] = [
@@ -8244,9 +8251,9 @@ fn scan_view_examined_mode(
     // No pending module escapes until the second complete snapshot, dependency
     // comparisons and final generation check have all succeeded. A failed bracket
     // remains an explicit occurrence even when a later scan or manifest attaches.
-    // The one exception is a budget-starved bracket over a live view
-    // (below): decoded modules publish with the failure named, never
-    // silently dropped.
+    // The one exception is a non-work budget-starved bracket over a live
+    // view (below): decoded modules publish with the failure named,
+    // never silently dropped. A work-starved bracket clears instead.
     // Each module's check verdict, outside the closure so a later starved
     // step cannot throw a proven change away: `Some(false)` is a module
     // the check itself proved changed, `Some(true)` passed, `None` never
@@ -8299,31 +8306,34 @@ fn scan_view_examined_mode(
                     format!("{SCAN_GENERATION_CHANGED_REASON}: {reason}"),
                 ));
             }
-            // A budget-starved bracket keeps what the scan decoded: the
-            // budget bought a full allowance of decode work and only the
-            // re-validation ran dry, so the decoded modules publish with
-            // the bracket failure named above — never an empty view (owner
-            // data-always rule 2026-11-09). The live pin must still hold
+            // A budget-starved bracket other than a work-starved one keeps
+            // what the scan decoded: the budget bought a full allowance
+            // of decode work and only the re-validation ran dry, so the
+            // decoded modules publish with the bracket failure named
+            // above — never an empty view (owner data-always rule
+            // 2026-11-09). A work-starved bracket clears instead: its
+            // pins cannot succeed, so publishing would only feed the
+            // fail-closed key rejection. The live pin must still hold
             // (a dead pin is a proven change). The keep needs EVERY
-            // failing half to name a budget reason: a passed half beside
-            // a starved half keeps, but one starved half never overrides
-            // a genuine failure in the other (a proven mapping change, an
-            // unreadable maps snapshot, a lost generation, a truncated
-            // maps ceiling). This arm always has at least one Err, so no
-            // separate sticky-stop check is needed: a stop both halves
-            // agree on keeps, anything else clears. The check's own
-            // failure reasons are read, not the sticky stop:
-            // DetailedLegacy IO exhaustion names its ceiling without
-            // setting one.
+            // failing half to name a kept budget reason: a passed half
+            // beside a starved half keeps, but one starved half never
+            // overrides a genuine failure in the other (a proven mapping
+            // change, an unreadable maps snapshot, a lost generation, a
+            // truncated maps ceiling, a work-starved half). This arm
+            // always has at least one Err, so no separate sticky-stop
+            // check is needed: a stop both halves agree on keeps,
+            // anything else clears. The check's own failure reasons are
+            // read, not the sticky stop: DetailedLegacy IO exhaustion
+            // names its ceiling without setting one.
             // Absence evidence always needs the full bracket.
             let resource_starved = validation
                 .as_ref()
                 .err()
-                .is_none_or(|reason| bracket_budget_exhaustion(reason))
+                .is_none_or(|reason| bracket_keep_exhaustion(reason))
                 && generation
                     .as_ref()
                     .err()
-                    .is_none_or(|reason| bracket_budget_exhaustion(reason));
+                    .is_none_or(|reason| bracket_keep_exhaustion(reason));
             if resource_starved && view.still_the_same() {
                 // A module the check PROVED changed is dropped with its
                 // mapping-changed row, like the healthy arm; only passed

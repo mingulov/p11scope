@@ -1423,12 +1423,13 @@ struct OpenEntry {
     end: Option<StagedEnd>,
     abandon: Option<StagedAbandon>,
     corroborated_return: Option<u64>,
-    /// The return value the call's observed return reported: the
-    /// corroborating ordinary CALL, or the admitted claim at conversion
-    /// (the claim leaves the store there). Evidence an abandonment's
-    /// per-call disposal must not erase (see
-    /// [`JournalAdapter::abandonment_disposes_here`]).
-    returned_rv: Option<u64>,
+    /// Whether a return already observed for this invocation (the
+    /// corroborating ordinary CALL, or the admitted claim at conversion,
+    /// where the claim leaves the store) carried negative authority:
+    /// evidence an abandonment's per-call disposal must not erase (see
+    /// [`JournalAdapter::abandonment_disposes_here`]). A flag, so the
+    /// retained entry keeps its charged layout.
+    negative_return: bool,
     converted_ticket: Option<CallToken>,
     converted_for: Option<JournalDomainKey>,
     end_converted: bool,
@@ -2708,7 +2709,7 @@ impl JournalAdapter {
                 end: None,
                 abandon: None,
                 corroborated_return: None,
-                returned_rv: None,
+                negative_return: false,
                 converted_ticket: None,
                 converted_for: None,
                 end_converted: false,
@@ -2984,7 +2985,8 @@ impl JournalAdapter {
         if let Some((key, _, _)) = matches.first() {
             let entry = self.open.get_mut(key).expect("matched open entry");
             entry.corroborated_return = Some(ordinal);
-            entry.returned_rv = Some(event.rv);
+            entry.negative_return |=
+                !super::state::return_leaves_no_lifecycle_effect(entry.function, event.rv);
             return JournalDisposition::ReturnObserved;
         }
         if let Some(index) = refused_matches.first() {
@@ -8131,7 +8133,7 @@ impl JournalAdapter {
             return false;
         }
         let neutral = |rv: u64| super::state::return_leaves_no_lifecycle_effect(entry.function, rv);
-        entry.returned_rv.is_none_or(neutral)
+        !entry.negative_return
             && self
                 .claims
                 .get(&identity_of_begin(&entry.begin))
@@ -9511,6 +9513,7 @@ impl JournalAdapter {
     /// Register, convert (refused, begins, terminals, abandonments),
     /// settle, prune. Infallible by construction; a model surprise taints
     /// the key and fails the seal closed.
+    #[allow(clippy::too_many_arguments)] // The validated domain carries its prepaid replay storage and its classified disposals.
     fn convert_and_settle(
         &mut self,
         model: &mut ObjectSemantics,
@@ -9693,15 +9696,11 @@ impl JournalAdapter {
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     self.retained_member_dec(identity, RetainedMember::Open(native));
                     let entry = self.open.get_mut(&native).expect("staged begin");
-                    // The claim leaves the store here: its return value
-                    // stays with the original as disposal evidence. A
-                    // non-neutral value already observed is never
-                    // overwritten by a neutral one.
-                    if entry.returned_rv.is_none_or(|rv| {
-                        super::state::return_leaves_no_lifecycle_effect(function, rv)
-                    }) {
-                        entry.returned_rv = Some(claim.rv);
-                    }
+                    // The claim leaves the store here: a negative return
+                    // it carried stays with the original as disposal
+                    // evidence (the flag only ever sets).
+                    entry.negative_return |=
+                        !super::state::return_leaves_no_lifecycle_effect(function, claim.rv);
                     entry.converted_ticket = Some(token);
                     entry.converted_for = Some(key);
                     entry.call_key = Some(call_key);

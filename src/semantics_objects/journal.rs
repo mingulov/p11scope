@@ -24451,6 +24451,112 @@ pub(crate) mod tests {
         );
     }
 
+    /// Randomized mixtures of effect-free read abandonments (reason,
+    /// conversion order, corroborated return value or none) on one key:
+    /// I2 -- the key is refused exactly when some abandoned call's
+    /// observed return carries negative authority; otherwise every
+    /// abandonment disposes per call with exactly one named loss gap, the
+    /// healthy calls stay held and no refusal sticks.
+    #[test]
+    fn seal_mixed_read_abandonments_refuse_exactly_on_negative_evidence() {
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_REASON_ENTRY_COLLISION, JOURNAL_REASON_EXEC_EXIT,
+        };
+        use pkcs11_types::CkRv;
+        let returns = [
+            None,
+            Some(CkRv::OK.0),
+            Some(CkRv::BUFFER_TOO_SMALL.0),
+            Some(CkRv::FUNCTION_FAILED.0),
+            Some(CkRv::SESSION_HANDLE_INVALID.0),
+            Some(CkRv::OBJECT_HANDLE_INVALID.0),
+            Some(CkRv::CRYPTOKI_NOT_INITIALIZED.0),
+        ];
+        let getattr = function_id("C_GetAttributeValue");
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let (mut doomed_cases, mut disposed_cases) = (0, 0);
+        for case in 0..96 {
+            let calls = 1 + next(4);
+            let converted = next(2) == 0;
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest_function_n("C_GetAttributeValue", calls as usize + 1);
+            let mut begins = Vec::new();
+            for sequence in 1..=calls {
+                let begin = begin_bytes(1, sequence, getattr, 0);
+                scene.ingest(&begin);
+                begins.push(begin);
+            }
+            let bootstrap = scene.bootstrap(proof, 0);
+            if converted {
+                scene.seal(&bootstrap).expect("opens convert");
+            }
+            let (mut abandoned, mut negative) = (0u64, false);
+            for (index, begin) in begins.iter().enumerate() {
+                if next(3) == 0 {
+                    continue;
+                }
+                let sequence = index as u64 + 1;
+                let returned = returns[next(returns.len() as u64) as usize];
+                if let Some(rv) = returned {
+                    assert_eq!(
+                        scene.ingest_ordinary(ordinary_for(begin, rv)),
+                        JournalDisposition::ReturnObserved,
+                        "case {case}"
+                    );
+                    negative |= !crate::semantics_objects::state::return_leaves_no_lifecycle_effect(
+                        getattr, rv,
+                    );
+                }
+                let reason = if next(2) == 0 {
+                    JOURNAL_REASON_EXEC_EXIT
+                } else {
+                    JOURNAL_REASON_ENTRY_COLLISION
+                };
+                let abandon = abandon_bytes(1, sequence, reason, (COOKIE, EXEC));
+                assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+                abandoned += 1;
+            }
+            // New history so the seal is never a vacant repeat.
+            scene.ingest(&begin_bytes(1, calls + 1, getattr, 0));
+            let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+            let outcome = scene.seal(&bootstrap);
+            let refused = scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused;
+            assert_eq!(refused, negative, "case {case}: {outcome:?}");
+            if negative {
+                assert!(outcome.is_err(), "case {case}");
+                doomed_cases += 1;
+                continue;
+            }
+            disposed_cases += usize::from(abandoned > 0);
+            outcome.unwrap_or_else(|failure| panic!("case {case}: {failure:?}"));
+            assert_eq!(
+                scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+                abandoned,
+                "case {case}: one named loss gap per disposed call"
+            );
+            assert_eq!(
+                scene.model.project().usage.pending_calls as u64,
+                calls + 1 - abandoned,
+                "case {case}: healthy calls stay held"
+            );
+        }
+        assert!(
+            doomed_cases > 0 && disposed_cases > 0,
+            "both outcomes exercised"
+        );
+    }
+
     #[test]
     fn seal_converted_getattributes_abandonment_disposes_and_key_continues() {
         // Fix7 converted twin: an unbounded abandonment staged on an

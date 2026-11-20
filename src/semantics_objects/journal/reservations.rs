@@ -10,11 +10,14 @@ use std::mem::size_of;
 
 const ROLES: usize = 5;
 
-/// Intrusive-index capacity: every table whose chain-node codes fit the
-/// `u16` link encoding stays indexed, including the production 4,096-slot
-/// staging table. Only capacities past this correctness bound keep the
-/// linear scans; no table today is one. This bound sizes no memory: the
-/// slot layout, bucket count and prepaid allocation are unchanged.
+/// Intrusive-index capacity (conservative cutoff 13,106 indexed,
+/// 13,107 linear, controller-approved): tables at or below this stay
+/// indexed, including the production 4,096-slot staging table. The
+/// encoding itself could cover 13,107 (max code 65,534 below the
+/// 65,535 sentinel); the cutoff stays one slot conservative. Only
+/// capacities past it keep the linear scans; no table today is one.
+/// This bound sizes no memory: the slot layout, bucket count and
+/// prepaid allocation are unchanged.
 const MAX_INDEXED: usize = (u16::MAX as usize - 1) / ROLES;
 /// Chain buckets per index (the key and id indexes share the shape).
 /// At most five memberships per slot hash here; at staging capacity
@@ -1188,8 +1191,12 @@ mod tests {
 
     #[test]
     fn resource_reservations_staging_capacity_keeps_one_exact_prepaid_allocation() {
-        // The production staging table keeps its exact single prepaid
-        // allocation: indexing the 4,096 slots adds no heap memory.
+        // The production staging table keeps one prepaid allocation whose
+        // bytes match the current layout (single-allocation plus
+        // accounting consistency). This does not pin the layout size
+        // itself: byte parity across revisions is checked by comparing
+        // the measured `allocation_bytes` (1,081,344 for 4,096 `()`
+        // slots here) rather than by this oracle.
         use crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
 
         let expected = ReservationTable::<()>::allocation_bytes(MAX_UNSETTLED_STAGED).unwrap();
@@ -1485,5 +1492,196 @@ mod tests {
         table.release(Role::H8Open, key(3)).unwrap();
         assert_eq!((table.census(), table.bytes()), (0, 0));
         table.release_role(Role::Raw);
+    }
+
+    #[test]
+    fn resource_reservations_high_slot_release_preserves_colliding_chain_across_reuse() {
+        // Three same-bucket Association keys with the middle member in
+        // high slot 4,095: releasing it (plus its Raw sibling) must
+        // sever exactly its links, so the two survivors stay reachable
+        // with their exact IDs and bytes after slot 4,095 is reused for
+        // an Association key in another bucket. Pins the severed-chain
+        // gap a high-slot unlink skip would leave.
+        use crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
+
+        let mut table = ReservationTable::try_new(MAX_UNSETTLED_STAGED).unwrap();
+        for value in 1..=4_094u64 {
+            let id = table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
+            assert_eq!(id.0, value);
+        }
+        let bucket_of =
+            |value| ReservationTable::<()>::key_bucket(Role::Association, key(value));
+        let bucket = bucket_of(200_001);
+        let mut colliding = vec![200_001u64];
+        for value in 200_002..300_000u64 {
+            if bucket_of(value) == bucket {
+                colliding.push(value);
+                if colliding.len() == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(colliding.len(), 3, "three same-bucket Association keys");
+        let (a_assoc, b_assoc, c_assoc) = (colliding[0], colliding[1], colliding[2]);
+        let (a_raw, b_raw, c_raw) = (100_001u64, 100_002u64, 100_003u64);
+        let a_id = table.insert(Role::Raw, key(a_raw), None, 10, ()).unwrap();
+        assert_eq!(a_id.0, 4_095);
+        assert_eq!(
+            table.insert(Role::Association, key(a_assoc), Some(a_id), 20, ()),
+            Ok(a_id)
+        );
+        assert_eq!(
+            table.key_slot_for_test(Role::Association, key(a_assoc)),
+            Some(4_094)
+        );
+        let b_id = table.insert(Role::Raw, key(b_raw), None, 10, ()).unwrap();
+        assert_eq!(b_id.0, 4_096);
+        assert_eq!(
+            table.insert(Role::Association, key(b_assoc), Some(b_id), 20, ()),
+            Ok(b_id)
+        );
+        assert_eq!(
+            table.key_slot_for_test(Role::Association, key(b_assoc)),
+            Some(4_095)
+        );
+        table.release(Role::Raw, key(1)).unwrap();
+        assert_eq!(table.reservation(Role::Raw, key(1)), None);
+        let c_id = table.insert(Role::Raw, key(c_raw), None, 10, ()).unwrap();
+        assert_eq!(c_id.0, 4_097);
+        assert_eq!(
+            table.insert(Role::Association, key(c_assoc), Some(c_id), 20, ()),
+            Ok(c_id)
+        );
+        assert_eq!(
+            table.key_slot_for_test(Role::Association, key(c_assoc)),
+            Some(0)
+        );
+        table
+            .release(Role::Association, key(b_assoc))
+            .expect("the high-slot member releases");
+        table.release(Role::Raw, key(b_raw)).unwrap();
+        assert_eq!(table.reservation(Role::Association, key(b_assoc)), None);
+        assert_eq!(table.member_bytes(Role::Association, key(b_assoc)), None);
+        assert_eq!(table.reservation(Role::Raw, key(b_raw)), None);
+        assert_eq!(table.reservation(Role::Association, key(a_assoc)), Some(a_id));
+        assert_eq!(table.member_bytes(Role::Association, key(a_assoc)), Some(20));
+        assert_eq!(table.member_bytes(Role::Raw, key(a_raw)), Some(10));
+        assert_eq!(table.reservation(Role::Association, key(c_assoc)), Some(c_id));
+        assert_eq!(table.member_bytes(Role::Association, key(c_assoc)), Some(20));
+        assert_eq!(table.member_bytes(Role::Raw, key(c_raw)), Some(10));
+        let mut d_assoc = 300_001u64;
+        while bucket_of(d_assoc) == bucket {
+            d_assoc += 1;
+        }
+        let d_raw = 100_004u64;
+        let d_id = table.insert(Role::Raw, key(d_raw), None, 11, ()).unwrap();
+        assert_eq!(d_id.0, 4_098);
+        assert_eq!(
+            table.key_slot_for_test(Role::Raw, key(d_raw)),
+            Some(4_095),
+            "the replacement reuses the freed high slot"
+        );
+        assert_eq!(
+            table.insert(Role::Association, key(d_assoc), Some(d_id), 21, ()),
+            Ok(d_id)
+        );
+        assert_eq!(table.reservation(Role::Association, key(a_assoc)), Some(a_id));
+        assert_eq!(table.member_bytes(Role::Association, key(a_assoc)), Some(20));
+        assert_eq!(table.member_bytes(Role::Raw, key(a_raw)), Some(10));
+        assert_eq!(table.id_slot_for_test(a_id), Some(4_094));
+        assert_eq!(table.reservation(Role::Association, key(c_assoc)), Some(c_id));
+        assert_eq!(table.member_bytes(Role::Association, key(c_assoc)), Some(20));
+        assert_eq!(table.member_bytes(Role::Raw, key(c_raw)), Some(10));
+        assert_eq!(table.id_slot_for_test(c_id), Some(0));
+        assert_eq!(table.reservation(Role::Association, key(b_assoc)), None);
+        assert_eq!(table.reservation(Role::Raw, key(b_raw)), None);
+        assert!(table.reservation_is_released(b_id));
+        assert_eq!(table.reservation(Role::Association, key(d_assoc)), Some(d_id));
+        assert_eq!(table.member_bytes(Role::Association, key(d_assoc)), Some(21));
+        assert_eq!(table.member_bytes(Role::Raw, key(d_raw)), Some(11));
+        assert_eq!(table.id_slot_for_test(d_id), Some(4_095));
+    }
+
+    #[test]
+    fn resource_reservations_literal_13106_exercises_last_slot_and_highest_lane() {
+        // Literal cutover pin (13,106 indexed, 13,107 linear): fill
+        // 13,106, merge four single-role donors into last slot 13,105 so
+        // it holds five aliases (id lane 4) and the Association role
+        // (key lane 4, node code 65,529), release every alias, refuse a
+        // new ID after minting u64::MAX, and verify the literal 13,107
+        // fallback.
+        assert_eq!(MAX_INDEXED, 13_106);
+        let mut table = ReservationTable::try_new(13_106).unwrap();
+        assert!(table.indexed());
+        for value in 1..=13_101u64 {
+            table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
+        }
+        let h8 = table.insert(Role::H8Open, key(500_001), None, 2, ()).unwrap();
+        let model = table.insert(Role::Model, key(500_002), None, 3, ()).unwrap();
+        let staged = table.insert(Role::H9Staged, key(500_003), None, 4, ()).unwrap();
+        let assoc = table
+            .insert(Role::Association, key(500_004), None, 5, ())
+            .unwrap();
+        let target = table.insert(Role::Raw, key(500_005), None, 1, ()).unwrap();
+        assert_eq!(table.key_slot_for_test(Role::Raw, key(500_005)), Some(13_105));
+        let head = table.merge(target, h8).unwrap();
+        assert_eq!(head, target);
+        assert_eq!(table.merge(head, model).unwrap(), target);
+        assert_eq!(table.merge(target, staged).unwrap(), target);
+        assert_eq!(table.merge(target, assoc).unwrap(), target);
+        assert_eq!((table.census(), table.bytes()), (13_102, 13_101 + 15));
+        for (role, value) in [
+            (Role::Raw, 500_005),
+            (Role::H8Open, 500_001),
+            (Role::Model, 500_002),
+            (Role::H9Staged, 500_003),
+            (Role::Association, 500_004),
+        ] {
+            assert_eq!(
+                table.key_slot_for_test(role, key(value)),
+                Some(13_105),
+                "last slot holds every lane"
+            );
+        }
+        for id in [target, h8, model, staged, assoc] {
+            assert_eq!(
+                table.id_slot_for_test(id),
+                Some(13_105),
+                "last slot holds every alias through lane 4"
+            );
+        }
+        assert_eq!(table.reservation(Role::Association, key(500_004)), Some(target));
+        for (role, value) in [
+            (Role::Raw, 500_005),
+            (Role::H8Open, 500_001),
+            (Role::Model, 500_002),
+            (Role::H9Staged, 500_003),
+            (Role::Association, 500_004),
+        ] {
+            table.release(role, key(value)).unwrap();
+        }
+        assert_eq!((table.census(), table.bytes()), (13_101, 13_101));
+        for id in [target, h8, model, staged, assoc] {
+            assert!(table.reservation_is_released(id));
+        }
+        table.next = u64::MAX;
+        assert_eq!(
+            table.insert(Role::Raw, key(600_001), None, 1, ()),
+            Err(Refusal::Full)
+        );
+        let mut fallback = ReservationTable::try_new(13_107).unwrap();
+        assert!(!fallback.indexed());
+        let a = fallback.insert(Role::Raw, key(1), None, 1, ()).unwrap();
+        let b = fallback.insert(Role::Model, key(2), None, 1, ()).unwrap();
+        fallback.merge(a, b).unwrap();
+        fallback
+            .insert(Role::H8Open, key(3), Some(a), 2, ())
+            .unwrap();
+        assert_eq!(fallback.key_slot_for_test(Role::Raw, key(1)), Some(0));
+        assert_eq!(fallback.id_slot_for_test(b), Some(0));
+        fallback.release(Role::Raw, key(1)).unwrap();
+        fallback.release(Role::Model, key(2)).unwrap();
+        fallback.release(Role::H8Open, key(3)).unwrap();
+        assert_eq!((fallback.census(), fallback.bytes()), (0, 0));
     }
 }

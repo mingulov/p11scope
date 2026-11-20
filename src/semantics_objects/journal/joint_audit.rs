@@ -31,6 +31,7 @@ use crate::semantics_objects::{
     CallKey, MAX_FIND_HANDLES, MAX_INPUT_HANDLES, MAX_RESULT_HANDLES, MAX_TEMPLATE_ATTRIBUTES,
 };
 use crate::semantics_objects::{ObjectDomain, ObjectEffect, ObjectSemantics};
+use std::collections::BTreeSet;
 use std::mem::size_of;
 
 /// No Clone or scalar constructor. The original provenance is moved intact;
@@ -857,6 +858,11 @@ fn check_positive_binding(
         return Err(RawQuantumRefusal::Admission);
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECONCILE_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Take the owner's pending ingest-break void: its failure, its prepaid
@@ -1952,10 +1958,16 @@ impl IngestedJointQuantum {
     /// Once every original has filled, settle each provisional consumer
     /// against the exact scope exactly as binding would have: one the
     /// filled failures name stays Pending for its negative; a disjoint
-    /// S1-only history becomes negative-only; a disjoint Joint history
-    /// stays positive and must hold its current binding (the check the
-    /// provisional bound waived). Nothing read or delivered a consumer
+    /// S1-only history becomes negative-only; a disjoint Joint history on
+    /// an ingested frame stays positive and must hold its current binding
+    /// (the check the provisional bound waived; a disposed frame never
+    /// needs positive authority). Nothing read or delivered a consumer
     /// while the fills ran.
+    ///
+    /// One pass: the filled scopes are gathered once into an ordered set,
+    /// so each consumer costs one membership lookup. Each consumer settles
+    /// on its own, so a binding refusal leaves the rest provisional for
+    /// the retry.
     fn reconcile_provisional(
         &mut self,
         ports: &JointPublicationPorts<'_>,
@@ -1963,29 +1975,38 @@ impl IngestedJointQuantum {
         if !self.provisional || self.audit_fill.is_some() || self.raw_fill.is_some() {
             return Ok(());
         }
-        let (_, _, bindings, _) = ports.read();
-        for index in 0..self.consumers.len() {
-            let consumer = &self.consumers[index];
-            if !consumer.provisional || self.exactly_affects(&consumer.target) {
-                continue;
-            }
-            if consumer.mode == FeedMode::Joint {
-                check_positive_binding(bindings, &consumer.target)?;
+        let mut exact = BTreeSet::new();
+        for failure in self.original_failures() {
+            match &failure.scope {
+                super::SealFailureScope::Unqualified => {}
+                super::SealFailureScope::Domain(domain) => {
+                    exact.insert(*domain);
+                }
+                super::SealFailureScope::AffectedDomains(domains) => {
+                    exact.extend(domains.iter().copied());
+                }
             }
         }
+        let disposed = matches!(self.ingress, FrameIngress::Disposed(_));
+        let (_, _, bindings, _) = ports.read();
         for index in 0..self.consumers.len() {
             if !self.consumers[index].provisional {
                 continue;
             }
-            self.consumers[index].provisional = false;
-            let target = self.consumers[index].target;
-            if self.consumers[index].mode != FeedMode::Joint
-                && !self.exactly_affects(&target)
-                && self.consumers[index].state == ConsumerState::Pending
-            {
-                self.consumers[index].state = ConsumerState::NegativeOnly;
-                self.pending -= 1;
+            #[cfg(test)]
+            RECONCILE_PROBES.with(|probes| probes.set(probes.get() + 1));
+            let consumer = &self.consumers[index];
+            if !exact.contains(&consumer.target.bootstrap().domain()) {
+                if consumer.mode == FeedMode::Joint {
+                    if !disposed {
+                        check_positive_binding(bindings, &consumer.target)?;
+                    }
+                } else if consumer.state == ConsumerState::Pending {
+                    self.consumers[index].state = ConsumerState::NegativeOnly;
+                    self.pending -= 1;
+                }
             }
+            self.consumers[index].provisional = false;
         }
         self.provisional = false;
         self.cursor = self
@@ -1994,6 +2015,13 @@ impl IngestedJointQuantum {
             .position(|consumer| consumer.state == ConsumerState::Pending)
             .unwrap_or(self.consumers.len());
         Ok(())
+    }
+
+    /// Reconcile membership lookups this thread made (one per
+    /// provisional consumer, independent of the filled scope's width).
+    #[cfg(test)]
+    pub(crate) fn reconcile_probes_for_test() -> usize {
+        RECONCILE_PROBES.with(std::cell::Cell::get)
     }
 
     fn advance_consumer(&mut self, state: ConsumerState) {

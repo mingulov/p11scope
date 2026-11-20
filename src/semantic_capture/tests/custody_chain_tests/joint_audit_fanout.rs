@@ -32526,6 +32526,8 @@ fn joint_deferred_s1only_negative_keeps_disjoint_s1only_history_negative_only() 
             .any(|state| state.0 == disjoint),
         "precondition: the posed S1-only history is a consumer"
     );
+    let consumers = frame.consumer_states_for_test().len();
+    let probes_before = IngestedJointQuantum::reconcile_probes_for_test();
     let h0 = fixture.scene.real.h0.clone();
     let mut polls = 0usize;
     while frame.awaits_fill_for_test() {
@@ -32579,6 +32581,11 @@ fn joint_deferred_s1only_negative_keeps_disjoint_s1only_history_negative_only() 
     assert_eq!(
         state, "NegativeOnly",
         "a disjoint S1-only history never waits on a positive seal"
+    );
+    let probes = IngestedJointQuantum::reconcile_probes_for_test() - probes_before;
+    assert!(
+        (1..=consumers).contains(&probes),
+        "the reconcile is one pass: {probes} membership lookups for {consumers} consumers"
     );
 }
 

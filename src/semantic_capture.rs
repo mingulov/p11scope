@@ -1894,6 +1894,31 @@ impl SemanticCapture {
         self.take_drift_tolerated.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Whether a retained take accepts live epochs ahead of the
+    /// effective ones: the same words at local, fault, sticky and
+    /// record flags with a strictly advanced global, while the
+    /// router's newest observation for the key already carries
+    /// disclosed global churn (and no miss-era uncertainty).
+    /// Mirrors the router's own taint inheritance: later global
+    /// advances reuse the first one's reload-not-excluded
+    /// disclosure instead of re-queueing. Untainted, miss-tainted,
+    /// non-global or backward moves refuse.
+    #[cfg_attr(not(test), allow(dead_code))] // Consulted by take validation with the taint.
+    fn accept_live_ahead(
+        live: CompleteEpochs,
+        effective: CompleteEpochs,
+        back_global_tainted: bool,
+        back_miss_tainted: bool,
+    ) -> bool {
+        live.local == effective.local
+            && live.fault == effective.fault
+            && live.sticky == effective.sticky
+            && live.record_flags == effective.record_flags
+            && live.global > effective.global
+            && back_global_tainted
+            && !back_miss_tainted
+    }
+
     /// Request a partition refresh for a key whose take raced live
     /// truth: the next tick re-observes it through the normal
     /// joined sweep, so the router follows current truth and the

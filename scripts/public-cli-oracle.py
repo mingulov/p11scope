@@ -840,6 +840,25 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) >= 1
         and type(evidence.get("coverage_retired_slots", 0)) is int
         and evidence.get("coverage_retired_slots", 0) == 68)
+    # Quiet composition (same ruling): a vng guest can carry the fixed
+    # R1 disclosure plus the already-ruled lone quiet discovery skip
+    # (tick-quantum deferral, exact counts). Either skip order
+    # qualifies; the cause pair is unchanged (the quiet row adds no
+    # cause beyond "skipped"). Shape mirrors run 44798792754
+    # (v7.4-rc2: lossy [skipped, coverage_retired_slots],
+    # [discovery, R1] skips, slots=68, gaps=0, exact 64065).
+    # Accepted strict and relaxed alike (the host twin is the same
+    # shape); a further gap or cause stays a new shape.
+    ok_coverage_retired_quiet = (
+        cell == "mt-system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped", "coverage_retired_slots"]
+        and (skip_entries == [DISCLOSABLE_DISCOVERY_SKIP, COVERAGE_RETIRED_SKIP]
+             or skip_entries == [COVERAGE_RETIRED_SKIP, DISCLOSABLE_DISCOVERY_SKIP])
+        and evidence.get("modules_skipped") == []
+        and evidence.get("pid_descendant_gaps", 0) == 0
+        and type(evidence.get("coverage_retired_slots", 0)) is int
+        and evidence.get("coverage_retired_slots", 0) == 68)
     # Ambient-burst lane, evidence-only: count cover is not proof, so
     # the census join annotates the failure detail below and never
     # accepts a cell (a real gap-for-gap join needs per-gap identity
@@ -893,7 +912,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
                 or ok_loader_quiet or ok_coverage_retired
-                or ok_coverage_retired_noise,
+                or ok_coverage_retired_noise or ok_coverage_retired_quiet,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and
@@ -907,7 +926,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         if burst_note is not None:
             gap_detail += "; " + burst_note
         require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet
-                or ok_coverage_retired,
+                or ok_coverage_retired or ok_coverage_retired_quiet,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")

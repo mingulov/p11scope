@@ -1266,6 +1266,99 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_coverage_retired_quiet_passes_in_strict_mode(self):
+        # Quiet composition: the fixed R1 disclosure plus the lone
+        # quiet discovery skip qualifies strict with exact counts.
+        # Shape mirrors run 44798792754 (v7.4-rc2: lossy [skipped,
+        # coverage_retired_slots], [discovery, R1] skips, slots=68,
+        # gaps=0).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"], "owned-provider-counts")
+
+    def test_coverage_retired_quiet_reversed_passes_in_strict_mode(self):
+        # Skip order is not load-bearing: the same pair in reverse
+        # order qualifies strict too.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"], "owned-provider-counts")
+
+    def test_coverage_retired_quiet_passes_when_allowed(self):
+        # The quiet composition qualifies relaxed too (the host twin
+        # is the same shape).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_coverage_retired_quiet_with_gap_fails(self):
+        # A further descendant gap on top of the quiet composition
+        # stays a new shape and still fails, strict and relaxed alike.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True,
+                                         want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_coverage_retired_quiet_with_count_mismatch_fails(self):
+        # The quiet arm never waives exact owned counts: the disclosed
+        # pair with a 39/40 deficit still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 39
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
     def test_loader_quiet_passes_on_system_in_strict_mode(self):
         # The loader-quiet cell disjunct covers system too: the same
         # transient shape (lone named skip, one unavailable, zero

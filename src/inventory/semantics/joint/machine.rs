@@ -1717,6 +1717,43 @@ impl LiveJointMachine {
         frame.set_posed_failure_for_test(failure);
     }
 
+    /// Consumer states of the retained Audited frame, if one stands:
+    /// (feed id, state label, streak, parked) in cursor order. Empty
+    /// when no frame stands.
+    #[cfg(test)]
+    pub(crate) fn frame_consumer_states_for_test(
+        &self,
+    ) -> Vec<(
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId,
+        &'static str,
+        u32,
+        bool,
+    )> {
+        match self.phase.as_ref() {
+            Some(Phase::Audited {
+                frame: Some(frame), ..
+            }) => frame.consumer_states_for_test(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Drive the retained Audited frame's park directly with a
+    /// controlled budget (no watchdog clock): yields and resumes
+    /// like the production park path. Panics without a frame.
+    #[cfg(test)]
+    pub(crate) fn park_for_test(
+        &mut self,
+        budget: &mut usize,
+    ) -> crate::semantics_objects::journal::joint_audit::ParkProgress {
+        let Some(Phase::Audited { frame, .. }) = self.phase.as_mut() else {
+            panic!("the park probe needs the Audited phase");
+        };
+        let Some(frame) = frame.as_mut() else {
+            panic!("the park probe needs the retained frame");
+        };
+        frame.park_stuck_consumers_bounded(budget)
+    }
+
     /// The current transaction's Collected, across every phase that
     /// carries one (the same coverage as `h0_guard_trip_for_test`).
     #[cfg(test)]
@@ -1884,6 +1921,18 @@ impl LiveJointMachine {
             return None;
         }
         self.rearm_eligible = false;
+        // Preserve the retained frame's stuck provenance before the
+        // abandon consumes the frame: proven-stuck consumers (streak,
+        // park or failure) narrow the discard — and the void scope
+        // after it — to their feeds, so touched-but-healthy sessions
+        // keep their fresh and carried work for retry. An ambiguous
+        // frame (no provenance) keeps the touched-set scope.
+        let proven_stuck = match self.phase.as_ref() {
+            Some(Phase::Audited {
+                frame: Some(frame), ..
+            }) => frame.provenance_stuck_feed_ids(),
+            _ => Vec::new(),
+        };
         let frame = self.take_abandoned_frame();
         coordinator.abandon_unfinished_joint_publication(lane, frame, reason.to_string());
         if coordinator.publication_pending() {
@@ -1891,15 +1940,20 @@ impl LiveJointMachine {
             return None;
         }
         // An applied abandon strands staged-but-unreduced calls whose
-        // history the void will fence; discard exactly the feeds that
-        // staged this quantum (pure disposal: custody released
-        // exactly, no reduction, no preservation, no replay) and count
-        // them as the stuck session's named loss, so the recovery
-        // verifies against exactly its own history. Every other feed
-        // is untouched. An unapplied abandon staged nothing, so this
-        // discards zero there.
-        let (stuck_feeds, discarded_calls, discarded_feeds) =
-            coordinator.discard_stuck_session_staged();
+        // history the void will fence; discard exactly the stuck
+        // session's feeds (pure disposal: custody released exactly,
+        // no reduction, no preservation, no replay) and count them as
+        // the stuck session's named loss, so the recovery verifies
+        // against exactly its own history. Provenance narrows the set
+        // to proven-stuck feeds and spares touched-but-healthy ones
+        // for retry; without provenance every feed that staged this
+        // quantum is the stuck session. An unapplied abandon staged
+        // nothing, so this discards zero there.
+        let (stuck_feeds, discarded_calls, discarded_feeds) = if proven_stuck.is_empty() {
+            coordinator.discard_stuck_session_staged()
+        } else {
+            coordinator.discard_proven_stuck_session(&proven_stuck)
+        };
         // A refusal at Auditing came before the audit ran: the machine
         // still holds the ingested quantum, and the coordinator its
         // untaken H3 disposition. Take that slot exactly as the audit
@@ -3420,6 +3474,10 @@ impl LiveJointMachine {
                     return (Phase::Voiding, Ok(Step::Continue));
                 }
                 if self.producers.journal_linked() {
+                    // The void runs sliced through resumable phases:
+                    // the start only begins it, and sweep or recovery
+                    // slices run in Phase::Voiding (progressing, not
+                    // unpaid) before disposal and collection.
                     let started = match coordinator.joint_capture_mut().start_void_ingest_break() {
                         Ok(started) => {
                             self.unpaid_void_yields = 0;
@@ -3458,8 +3516,10 @@ impl LiveJointMachine {
                         // scoped void strands nothing more: the
                         // re-arm already discarded the stuck session,
                         // and healthy history survived the void
-                        // itself, so it files the void's gap here and
-                        // collects without the staged phase.
+                        // itself. One that published inside its start
+                        // files the void's gap here and collects
+                        // without the staged phase; a sliced recovery
+                        // takes the same skip at Voiding completion.
                         let scoped = matches!(
                             coordinator.joint_capture_mut().take_last_void_scope(),
                             Some(
@@ -3546,13 +3606,34 @@ impl LiveJointMachine {
                 if !done {
                     return (Phase::Voiding, Ok(Step::Continue));
                 }
-                // Sweep complete: the owner published the fenced void.
-                // Start the resumable staged disposal below, retaining
-                // the failure and exact per-feed reduction state while
-                // deferring gap disclosure and collection until disposal
-                // completes, then back to Idle to collect above the
-                // fence. Pinned by the held-call twin and the
-                // long-bucket twin.
+                // Sweep/recovery complete: the owner published the
+                // fenced void. A scoped void strands nothing more
+                // (the re-arm already discarded the stuck session),
+                // so it files the void's gap and returns to Idle to
+                // collect, skipping the staged phase; a stream void
+                // starts the resumable staged disposal below,
+                // retaining the failure and exact per-feed reduction
+                // state while deferring gap disclosure and collection
+                // until disposal completes, then back to Idle to
+                // collect above the fence. Pinned by the held-call
+                // twin and the long-bucket twin.
+                let scoped = matches!(
+                    coordinator.joint_capture_mut().take_last_void_scope(),
+                    Some(
+                        crate::semantics_objects::journal::joint_driver::JointVoidScope::Scoped
+                    )
+                );
+                if scoped {
+                    coordinator.note_scope_gap(
+                        crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
+                        format!(
+                            "joint_void_{}_history_loss",
+                            crate::semantics_objects::journal::joint_driver::INGEST_BREAK_VOID_GAP
+                                .label()
+                        ),
+                    );
+                    return (Phase::Idle, Ok(Step::Continue));
+                }
                 coordinator.start_staged_disposal();
                 (Phase::VoidingStaged, Ok(Step::Continue))
             }
@@ -4510,15 +4591,70 @@ impl LiveJointMachine {
                                     // every frame behind it. A fresh
                                     // stall clock covers the resumed
                                     // frame (forced-fallback deliveries
-                                    // take budgeted polls).
-                                    let barrier =
-                                        coordinator.joint_capture().adapter().has_seal_barrier();
+                                    // take budgeted polls). The barrier
+                                    // scan and the park run bounded
+                                    // (one stride per tick) on a small
+                                    // watchdog reserve, not the tick's
+                                    // remaining budget, so a tight tick
+                                    // never starves the trip decision;
+                                    // either may still yield and resume
+                                    // next tick on huge tables (the
+                                    // stall clock keeps running, so a
+                                    // genuinely wedged frame still
+                                    // trips).
+                                    let mut watchdog_budget =
+                                        crate::semantics_objects::journal::SCOPED_RECOVERY_SLICE;
+                                    let barrier = match coordinator
+                                        .joint_capture_mut()
+                                        .adapter_mut()
+                                        .has_seal_barrier_bounded(&mut watchdog_budget)
+                                    {
+                                        crate::semantics_objects::journal::BarrierCheck::Barrier => {
+                                            true
+                                        }
+                                        crate::semantics_objects::journal::BarrierCheck::Clear => {
+                                            false
+                                        }
+                                        crate::semantics_objects::journal::BarrierCheck::Yielded => {
+                                            return (
+                                                Phase::Audited {
+                                                    frame,
+                                                    identity,
+                                                    base,
+                                                },
+                                                Ok(Step::Yield),
+                                            );
+                                        }
+                                    };
                                     let parked = if barrier {
                                         0
                                     } else {
-                                        frame
-                                            .as_mut()
-                                            .map_or(0, |frame| frame.park_stuck_consumers())
+                                        match frame.as_mut().map(|frame| {
+                                            frame.park_stuck_consumers_bounded(&mut watchdog_budget)
+                                        }) {
+                                            None | Some(
+                                                crate::semantics_objects::journal::joint_audit::ParkProgress::Done(
+                                                    0,
+                                                ),
+                                            ) => 0,
+                                            Some(
+                                                crate::semantics_objects::journal::joint_audit::ParkProgress::Done(
+                                                    parked,
+                                                ),
+                                            ) => parked,
+                                            Some(
+                                                crate::semantics_objects::journal::joint_audit::ParkProgress::Yielded,
+                                            ) => {
+                                                return (
+                                                    Phase::Audited {
+                                                        frame,
+                                                        identity,
+                                                        base,
+                                                    },
+                                                    Ok(Step::Yield),
+                                                );
+                                            }
+                                        }
                                     };
                                     if parked > 0 {
                                         self.audit_no_progress_polls = 0;

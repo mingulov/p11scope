@@ -13355,19 +13355,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.note_scope_gap("unfinished joint publication abandoned".to_string(), reason);
     }
 
-    /// Dispose the abandoned quantum's stranded staged Joint calls
-    /// (running-rearm and idle-void recovery only; the exit hold
-    /// never recovers so it never needs this): an applied abandon —
-    /// or an idle ingest-break void — strands staged-but-unreduced
-    /// calls, and the recovery's fallback verification trips over
-    /// them. Every call counts as disposed
-    /// history, with observed completions preserved as
-    /// unknown-key rows. A no-op unless calls were staged.
-    pub(crate) fn drop_abandoned_joint_staged(&mut self) {
-        let ledger = self.joint_capture.ledger_mut();
-        self.registry.drop_abandoned_joint_staged(ledger);
-    }
-
     /// Start the resumable stranded staged disposal after a void sweep:
     /// snapshot retained feeds; the machine drives
     /// `poll_staged_disposal` until it completes before collecting.
@@ -13406,6 +13393,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) {
         let ledger = self.joint_capture.ledger_mut();
         self.registry.discard_quantum_touched_staged(ledger)
+    }
+
+    /// Discard exactly the proven-stuck feeds' stranded staged calls
+    /// as watchdog stuck-session loss (scoped running-rearm recovery
+    /// with frame provenance only): touched-but-healthy feeds keep
+    /// their queues for retry. Returns the stuck feed ids (nonempty
+    /// at discard), the discarded staged-call total and the number of
+    /// feeds that held any.
+    pub(crate) fn discard_proven_stuck_session(
+        &mut self,
+        stuck_ids: &[crate::discovery::caller_registry::instance_input::RegistryInstanceId],
+    ) -> (
+        Vec<crate::discovery::caller_registry::instance_input::RegistryInstanceId>,
+        u64,
+        u64,
+    ) {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.discard_proven_stuck_staged(ledger, stuck_ids)
     }
 
     /// Record the watchdog scoped break for the stuck session just

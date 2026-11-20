@@ -1681,6 +1681,10 @@ enum ScopedRecoveryPhase {
     /// Refuse decided abandonment keys past the cursor (tainted
     /// images keep precedence: their keys are skipped).
     PreserveDoom { after: Option<JournalDomainKey> },
+    /// Mark owed taint-overflow keys past the adapter cursor (one
+    /// unit per key). The refusals already published when their
+    /// taints overflowed, so seals refuse throughout the drain.
+    OverflowDrain,
     /// Drain tainted images' open entries past the cursor (absence
     /// plus census plus refund per entry).
     TaintDrainOpen { after: Option<JournalNativeKey> },
@@ -1774,6 +1778,19 @@ pub(crate) struct JournalAdapter {
     /// bounded fallback: no per-image retention, no silent admission.
     tainted_images: BTreeSet<(u64, u64)>,
     taint_overflow: bool,
+    /// Taint-overflow key marks still owed: images whose taint
+    /// overflowed the retained set, each with its resume cursor
+    /// into its per-image key list. The irreversible refusal
+    /// (overflow latch plus dropped sighting) publishes at enqueue;
+    /// the per-key marks land through the bounded drain, one unit
+    /// per key, so one credit never marks a whole image at once.
+    /// Bounded by the keyed images; an overflowed image admits no
+    /// new keys, so cursors never invalidate.
+    taint_overflow_pending: BTreeMap<(u64, u64), usize>,
+    /// Resume cursor for the overflow drain: the image completed
+    /// last (`None` restarts at the first pending image, wrapping
+    /// past newly enqueued predecessors).
+    taint_overflow_after: Option<(u64, u64)>,
     /// Shed-only taint provenance (JK-19b): tainted images whose only
     /// cause is a shed refusal, hence eligible to lift on timely
     /// binding. Any non-shed taint promotes the image to permanent by
@@ -1940,6 +1957,8 @@ impl JournalAdapter {
             image_keys: BTreeMap::new(),
             tainted_images: BTreeSet::new(),
             taint_overflow: false,
+            taint_overflow_pending: BTreeMap::new(),
+            taint_overflow_after: None,
             shed_only_taints: BTreeSet::new(),
             derived_absent: BTreeMap::new(),
             lifted_images: BTreeSet::new(),
@@ -2127,6 +2146,7 @@ impl JournalAdapter {
             ScopedRecoveryPhase::Preserve { .. } => "preserve",
             ScopedRecoveryPhase::PreserveTaint { .. } => "preserve-taint",
             ScopedRecoveryPhase::PreserveDoom { .. } => "preserve-doom",
+            ScopedRecoveryPhase::OverflowDrain => "overflow-drain",
             ScopedRecoveryPhase::TaintDrainOpen { .. } => "taint-drain-open",
             ScopedRecoveryPhase::TaintDrainRefused { .. } => "taint-drain-refused",
             ScopedRecoveryPhase::Fence { .. } => "fence",
@@ -3319,6 +3339,10 @@ impl JournalAdapter {
 
     /// Record only the irreversible image evidence. A raw batch marks its
     /// images together, then disposes the existing bounded staging once.
+    /// Past the retention cap this publishes the refusal (overflow
+    /// latch plus dropped sighting, so seals refuse at once) and
+    /// enqueues the image's key marks for the bounded drain: no
+    /// per-key scan runs here.
     fn note_image_taint(&mut self, image: (u64, u64)) {
         if !self.tainted_images.contains(&image)
             && self.tainted_images.len() >= self.limits.image_sightings
@@ -3330,17 +3354,72 @@ impl JournalAdapter {
             if self.sightings.remove(&image).is_some() {
                 self.claims_prune_dirty = true;
             }
-            if let Some(keys) = self.image_keys.get(&image).cloned() {
-                for key in keys {
-                    let lived = self.key_is_live(key);
-                    if let Some(state) = self.keys.get_mut(&key) {
-                        state.tainted = true;
-                    }
-                    self.claims_prune_dirty |= lived;
-                }
+            if self.image_keys.contains_key(&image) {
+                self.taint_overflow_pending.entry(image).or_insert(0);
             }
         } else if self.tainted_images.insert(image) {
             self.claims_prune_dirty = true;
+        }
+    }
+
+    /// Whether taint-overflow key marks are still owed.
+    pub(crate) fn has_taint_overflow_pending(&self) -> bool {
+        !self.taint_overflow_pending.is_empty()
+    }
+
+    /// Mark one slice of owed taint-overflow keys past the adapter
+    /// cursor: each marked key charges one unit, the image cursor
+    /// and per-image indices persist across yields, and completed
+    /// images leave the pending set. Marks are idempotent (tainted
+    /// sticks) and the refusal already published at enqueue, so
+    /// yielding and resuming never double-applies and seals refuse
+    /// throughout the drain. Returns true when nothing is owed.
+    pub(crate) fn drain_taint_overflow_slice(
+        &mut self,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        loop {
+            if self.taint_overflow_pending.is_empty() {
+                self.taint_overflow_after = None;
+                return true;
+            }
+            if *left == 0 {
+                return false;
+            }
+            let next = match self.taint_overflow_after {
+                None => self.taint_overflow_pending.keys().next().copied(),
+                Some(done) => self
+                    .taint_overflow_pending
+                    .range((std::ops::Bound::Excluded(done), std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(image, _)| *image),
+            };
+            let Some(image) = next else {
+                // The cursor ran past every pending image (newly
+                // enqueued predecessors): wrap to the first.
+                self.taint_overflow_after = None;
+                continue;
+            };
+            let at = self.taint_overflow_pending[&image];
+            let key = self
+                .image_keys
+                .get(&image)
+                .and_then(|listed| listed.get(at))
+                .copied();
+            let Some(key) = key else {
+                self.taint_overflow_pending.remove(&image);
+                self.taint_overflow_after = Some(image);
+                continue;
+            };
+            let lived = self.key_is_live(key);
+            if let Some(state) = self.keys.get_mut(&key) {
+                state.tainted = true;
+            }
+            self.claims_prune_dirty |= lived;
+            self.taint_overflow_pending.insert(image, at + 1);
+            *left -= 1;
+            *budget = budget.saturating_sub(1);
         }
     }
 
@@ -8188,6 +8267,11 @@ impl JournalAdapter {
                         return false;
                     }
                 }
+                ScopedRecoveryPhase::OverflowDrain => {
+                    if !self.overflow_drain_slice(recovery, &mut left, budget) {
+                        return false;
+                    }
+                }
                 ScopedRecoveryPhase::TaintDrainOpen { after } => {
                     if !self.taint_drain_open_slice(recovery, after, &mut left, budget) {
                         return false;
@@ -8570,16 +8654,36 @@ impl JournalAdapter {
             self.doom_abandoned_key(model, recovery, key);
         }
         if examined < allowance {
-            if recovery.preserve_taint.is_empty() {
-                recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
-            } else {
-                recovery.phase = ScopedRecoveryPhase::TaintDrainOpen { after: None };
-            }
+            recovery.phase = ScopedRecoveryPhase::OverflowDrain;
             true
         } else {
             recovery.phase = ScopedRecoveryPhase::PreserveDoom { after: last };
             false
         }
+    }
+
+    /// Mark one slice of owed taint-overflow keys (one unit per
+    /// key, cursors in the adapter): returns true when nothing is
+    /// owed. Runs after every taint decision applied, so no later
+    /// phase can enqueue more. When the drain exhausts, recoveries
+    /// with decided taints continue into the entry drain, the rest
+    /// into the fence.
+    fn overflow_drain_slice(
+        &mut self,
+        recovery: &mut ScopedRecovery,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        if !self.drain_taint_overflow_slice(left, budget) {
+            recovery.phase = ScopedRecoveryPhase::OverflowDrain;
+            return false;
+        }
+        if recovery.preserve_taint.is_empty() {
+            recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+        } else {
+            recovery.phase = ScopedRecoveryPhase::TaintDrainOpen { after: None };
+        }
+        true
     }
 
     /// Drain one slice of open entries past the cursor for decided

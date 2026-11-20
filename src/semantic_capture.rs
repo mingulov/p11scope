@@ -1903,7 +1903,6 @@ impl SemanticCapture {
     /// advances reuse the first one's reload-not-excluded
     /// disclosure instead of re-queueing. Untainted, miss-tainted,
     /// non-global or backward moves refuse.
-    #[cfg_attr(not(test), allow(dead_code))] // Consulted by take validation with the taint.
     fn accept_live_ahead(
         live: CompleteEpochs,
         effective: CompleteEpochs,
@@ -2260,7 +2259,20 @@ impl SemanticCapture {
             return Err(Refusal::WitnessStale);
         }
         if state.epochs != effective {
-            return Err(Refusal::EpochDrift);
+            // Live truth ahead of a tainted scan still validates:
+            // the same local words with an advanced global past
+            // disclosed churn. Anything else races for the refresh
+            // scan to prove.
+            let (global_tainted, miss_tainted) = self
+                .router
+                .partition_back_taint(receipt.domain, receipt.image, receipt.endpoint.file_slot)
+                .unwrap_or((false, false));
+            if !retained
+                || !Self::accept_live_ahead(state.epochs, effective, global_tainted, miss_tainted)
+            {
+                return Err(Refusal::EpochDrift);
+            }
+            tolerated = true;
         }
         // Truth must not move under the live re-read: a newer
         // standing than the validated one races the take (the next

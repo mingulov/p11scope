@@ -7558,6 +7558,7 @@ impl JournalAdapter {
         let mut effects = ObjectEffects::default();
         let mut doomed: BTreeSet<JournalDomainKey> = BTreeSet::new();
         let mut taint: BTreeSet<(u64, u64)> = BTreeSet::new();
+        let mut neutral_absent: Vec<((u64, u64), JournalNativeKey, u32)> = Vec::new();
         for (key, entry) in self.open.iter() {
             if only_wiped.is_some_and(|wiped| !wiped.contains(key)) {
                 continue;
@@ -7566,6 +7567,15 @@ impl JournalAdapter {
                 abandon_disposition(staged.abandon.reason())
                     == Some(AbandonDisposition::UnboundedInvalidation)
             }) {
+                continue;
+            }
+            if is_neutral_function(entry.function) {
+                // Neutral abandonments carry no continuing object
+                // effects: the void fence suffices, so the wipe
+                // preserves no doom and taints no image for them.
+                // Their late terminals stay expected-absent (the
+                // wipe filter only covers unterminated calls).
+                neutral_absent.push((entry.image, *key, entry.function));
                 continue;
             }
             let live = self.live_keys_for_image(entry.image);
@@ -7596,6 +7606,9 @@ impl JournalAdapter {
                     }
                 }
             }
+        }
+        for (image, key, function) in neutral_absent {
+            self.note_derived_absence(image, key, function);
         }
         for image in taint {
             self.taint_image(image, TaintCause::UnclaimedInvalidation);
@@ -8296,6 +8309,14 @@ impl JournalAdapter {
             if !unbounded {
                 continue;
             }
+            if is_neutral_function(entry.function) {
+                // Neutral abandonments carry no continuing object
+                // effects: the scoped wipe preserves no doom and
+                // taints no image for them. The wipe records their
+                // late terminals expected-absent (see the wipe
+                // filter); this decide-only pass just skips them.
+                continue;
+            }
             let image = entry.image;
             let shape = shape_of_entry(entry);
             let basis = self.preserve_basis_for_image(recovery, image);
@@ -8681,12 +8702,20 @@ impl JournalAdapter {
             }
             // Neutral wiped BEGINs excuse their late terminals at
             // ingest (their void-wipe evidence routes them to plain
-            // S1); anything else taints fail-closed there.
+            // S1); anything else taints fail-closed there. A wiped
+            // neutral call found already abandoned unboundedly is
+            // excused too: its abandonment disposed per-call with no
+            // continuing object effects, so a straddling terminal is
+            // the wipe working as intended, not new evidence.
+            let abandoned_neutral = entry.abandon.is_some_and(|staged| {
+                abandon_disposition(staged.abandon.reason())
+                    == Some(AbandonDisposition::UnboundedInvalidation)
+            }) && is_neutral_function(entry.function);
             if entry.end.is_none()
-                && entry.abandon.is_none()
                 && !entry.begin.no_end()
                 && entry.corroborated_return.is_none()
-                && disposes_unclaimable_original(entry.function)
+                && (entry.abandon.is_none() && disposes_unclaimable_original(entry.function)
+                    || abandoned_neutral)
             {
                 self.note_derived_absence(entry.image, key, entry.function);
             }
@@ -8820,6 +8849,58 @@ impl JournalAdapter {
         }
     }
 
+    /// Refuse one key permanently for its mutating unbounded
+    /// abandonment: invalidate its proof (reported), mark it, dispose
+    /// its staged entries, and refuse the seal with the tainted-domain
+    /// gap. Both seal-time doom paths (a staged mutating
+    /// abandonment, a model disagreement on per-call disposal) share
+    /// this exact refusal.
+    fn doom_key_for_abandonment(
+        &mut self,
+        model: &mut ObjectSemantics,
+        key: JournalDomainKey,
+        bootstrap: &BootstrapReceipt,
+        live: &[JournalDomainKey],
+    ) -> SealFailure {
+        let image = (key.cookie, key.exec);
+        let domain = ObjectDomain::sealed(&bootstrap.proof());
+        let effects = model.abandon_domain(domain, &mut self.ledger);
+        let lived = self.key_is_live(key);
+        self.keys.get_mut(&key).expect("sealed key").refused = true;
+        self.claims_prune_dirty |= lived;
+        let drop: BTreeSet<JournalNativeKey> = self
+            .open
+            .iter()
+            .filter(|(_, entry)| {
+                entry.image == image
+                    && (self.converts_here(key, live, entry) || entry.converted_for == Some(key))
+            })
+            .map(|(native, _)| *native)
+            .collect();
+        self.remove_open_where(|native, _| drop.contains(native));
+        let mut kept = Vec::with_capacity(self.refused.len());
+        let mut dropped = Vec::new();
+        for refused in self.refused.iter() {
+            if !self.refused_converts_here(key, live, refused) {
+                kept.push(*refused);
+            } else {
+                dropped.push(*refused);
+            }
+        }
+        self.refused = kept;
+        for refused in &dropped {
+            self.retained_refused_dec(refused);
+        }
+        SealFailure {
+            take_failed: None,
+            gap: JournalGap::DomainTainted,
+            effects,
+            h3_voided: None,
+            fence: None,
+            scope: SealFailureScope::Unqualified,
+        }
+    }
+
     /// Conversion and settlement after every structural rule passed. The
     /// only remaining failures are model surprises, which fail closed.
     #[allow(clippy::too_many_arguments)] // One validated domain keeps its original audit and prepaid replay storage.
@@ -8835,60 +8916,82 @@ impl JournalAdapter {
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
-        // Unbounded abandonment of this key's calls staged at or below
-        // the frontier refuses this key permanently: invalidate its
-        // proof (reported), mark it, dispose its staged entries, and
-        // refuse the seal. Already-converted calls count: their
-        // abandonments refuse and dispose here, never prune silently.
-        // A sibling's abandonment belongs to its own seal; unclaimed
-        // shapes barriered before conversion.
-        let unbounded = self.open.values().any(|entry| {
-            self.abandons_here(key, &live, entry)
-                && entry.begin_ordinal <= frontier
-                && entry.abandon.is_some_and(|staged| {
+        // Unbounded abandonment of this key's mutating calls staged
+        // at or below the frontier refuses this key permanently:
+        // invalidate its proof (reported), mark it, dispose its
+        // staged entries, and refuse the seal. Already-converted
+        // calls count: their abandonments refuse and dispose here,
+        // never prune silently. A sibling's abandonment belongs to
+        // its own seal; unclaimed shapes barriered before conversion.
+        //
+        // Neutral (effect-free S1) abandonments dispose per-call
+        // instead: they apply no object effect and carry no
+        // interference, so each names its own loss gap while the key
+        // keeps sealing its other calls. One mutating abandonment
+        // still dooms the whole key (fail closed).
+        let mut dooming = false;
+        let mut disposable: Vec<JournalNativeKey> = Vec::new();
+        for (native, entry) in &self.open {
+            if !self.abandons_here(key, &live, entry)
+                || entry.begin_ordinal > frontier
+                || !entry.abandon.is_some_and(|staged| {
                     staged.ordinal <= frontier
                         && abandon_disposition(staged.abandon.reason())
                             == Some(AbandonDisposition::UnboundedInvalidation)
                 })
-        });
-        if unbounded {
-            let domain = ObjectDomain::sealed(&bootstrap.proof());
-            let effects = model.abandon_domain(domain, &mut self.ledger);
-            let lived = self.key_is_live(key);
-            self.keys.get_mut(&key).expect("sealed key").refused = true;
-            self.claims_prune_dirty |= lived;
-            let drop: BTreeSet<JournalNativeKey> = self
-                .open
-                .iter()
-                .filter(|(_, entry)| {
-                    entry.image == image
-                        && (self.converts_here(key, &live, entry)
-                            || entry.converted_for == Some(key))
-                })
-                .map(|(native, _)| *native)
-                .collect();
-            self.remove_open_where(|native, _| drop.contains(native));
-            let mut kept = Vec::with_capacity(self.refused.len());
-            let mut dropped = Vec::new();
-            for refused in self.refused.iter() {
-                if !self.refused_converts_here(key, &live, refused) {
-                    kept.push(*refused);
-                } else {
-                    dropped.push(*refused);
+            {
+                continue;
+            }
+            if is_neutral_function(entry.function) {
+                disposable.push(*native);
+            } else {
+                dooming = true;
+                break;
+            }
+        }
+        if dooming {
+            return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
+        }
+        // Per-call disposal for neutral abandonments: the model
+        // releases each ticket first (fail closed on disagreement),
+        // then adapter staging drops with expected absences for late
+        // terminals. The key stays live and the seal continues
+        // below; the disposal gaps join the seal's effects.
+        let mut disposed = ObjectEffects::default();
+        if !disposable.is_empty() {
+            let mut tickets: Vec<(JournalNativeKey, Option<CallToken>)> = Vec::new();
+            for native in &disposable {
+                tickets.push((
+                    *native,
+                    self.open
+                        .get(native)
+                        .expect("partitioned abandonment")
+                        .converted_ticket,
+                ));
+            }
+            let mut agreed = true;
+            for (_, ticket) in &tickets {
+                match model.dispose_abandoned_neutral(*ticket, &mut self.ledger) {
+                    Some(effects) => disposed.effects.extend(effects.effects),
+                    None => {
+                        agreed = false;
+                        break;
+                    }
                 }
             }
-            self.refused = kept;
-            for refused in &dropped {
-                self.retained_refused_dec(refused);
+            if !agreed {
+                return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
             }
-            return Err(SealFailure {
-                take_failed: None,
-                gap: JournalGap::DomainTainted,
-                effects,
-                h3_voided: None,
-                fence: None,
-                scope: SealFailureScope::Unqualified,
-            });
+            for (native, _) in &tickets {
+                let entry = *self.open.get(native).expect("disposed abandonment");
+                self.note_derived_absence(entry.image, *native, entry.function);
+                if entry.converted_ticket.is_none() {
+                    let identity = identity_of_begin(&entry.begin);
+                    let _ = self.consume_claim(&identity, key);
+                }
+            }
+            let dropped: BTreeSet<JournalNativeKey> = disposable.into_iter().collect();
+            self.remove_open_where(|native, _| dropped.contains(native));
         }
         // This key's bounded abandonments need their corroborating
         // returns within the frontier; otherwise the bound is not ready
@@ -8904,7 +9007,9 @@ impl JournalAdapter {
                 })
         });
         if unready {
-            return Err(self.wait(SealWait::AbandonReturnPending));
+            let mut failure = self.wait(SealWait::AbandonReturnPending);
+            failure.effects.effects.extend(disposed.effects);
+            return Err(failure);
         }
         // Every refused begin of this key at or below the frontier needs
         // its bound within the frontier; otherwise the seal waits.
@@ -8914,10 +9019,24 @@ impl JournalAdapter {
                 && refused.corroborated_return.is_none_or(|at| at > frontier)
         });
         if refused_unready {
-            return Err(self.wait(SealWait::RefusedReturnPending));
+            let mut failure = self.wait(SealWait::RefusedReturnPending);
+            failure.effects.effects.extend(disposed.effects);
+            return Err(failure);
         }
-        self.validate_invocation_claims(key, &live, frontier, audit)?;
-        self.convert_and_settle(model, key, bootstrap, frontier, model_fence, replay)
+        if let Err(mut failure) = self.validate_invocation_claims(key, &live, frontier, audit) {
+            failure.effects.effects.extend(disposed.effects);
+            return Err(failure);
+        }
+        match self.convert_and_settle(model, key, bootstrap, frontier, model_fence, replay) {
+            Ok(mut success) => {
+                success.effects.effects.extend(disposed.effects);
+                Ok(success)
+            }
+            Err(mut failure) => {
+                failure.effects.effects.extend(disposed.effects);
+                Err(failure)
+            }
+        }
     }
 
     fn validate_invocation_claims(

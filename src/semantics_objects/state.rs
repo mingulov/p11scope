@@ -4406,6 +4406,40 @@ impl ModelState {
         effects
     }
 
+    /// Per-call disposal for one abandoned neutral (effect-free S1)
+    /// call: its outcome is recorded lost under the named gap and its
+    /// pending ticket released, without voiding its domain's bootstrap
+    /// or retiring any other view. Neutral calls apply no object
+    /// effect and carry no interference, so their abandonment ends at
+    /// the call while the incarnation keeps sealing. Only the
+    /// journal's per-call disposal path calls this, with a converted
+    /// ticket (`Some`) or `None` when the abandoned call never
+    /// converted (a bare loss gap, no ticket to release). A missing
+    /// ticket counts stale and disposes; a non-neutral ticket is
+    /// refused (`None`, fail closed) so the caller keeps whole-key
+    /// refusal for it.
+    pub(super) fn dispose_abandoned_neutral(
+        &mut self,
+        token: Option<CallToken>,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> Option<ObjectEffects> {
+        let mut effects = ObjectEffects::default();
+        let Some(token) = token else {
+            self.gap_effect(&mut effects, ObjectGap::OutcomeLost);
+            return Some(effects);
+        };
+        let Some(call) = self.pending.get(&token) else {
+            self.gap_effect(&mut effects, ObjectGap::StaleToken);
+            return Some(effects);
+        };
+        if call.kind != CallKind::Neutral {
+            return None;
+        }
+        self.gap_effect(&mut effects, ObjectGap::OutcomeLost);
+        self.remove_call(token, ledger);
+        Some(effects)
+    }
+
     // -----------------------------------------------------------------------
     // projection and cost
     // -----------------------------------------------------------------------

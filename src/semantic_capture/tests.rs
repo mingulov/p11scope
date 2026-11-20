@@ -2698,10 +2698,10 @@ fn joint_partition_refresh_offers_no_birth() {
     );
 }
 
-/// A cadence sweep re-observes a take-raced key without a tick:
-/// the seal stalled in Audited queues the interest, the sweep
+/// A cadence step re-observes a take-raced key without a tick:
+/// the seal stalled in Audited queues the interest, the step
 /// scans it, the router follows current truth, and the retried
-/// take validates. The sweep counts its scans beside the
+/// take validates. The step counts its scans beside the
 /// seal-bootstrap arms.
 #[test]
 fn joint_take_refresh_sweep_recovers_raced_take() {
@@ -2721,7 +2721,11 @@ fn joint_take_refresh_sweep_recovers_raced_take() {
     assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
     assert_eq!(harness.capture.take_refresh_scans(), 0);
     let scans_before = harness.io.attempts.len();
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert!(
         harness.io.attempts.len() > scans_before,
         "the sweep re-observes the key without a tick"
@@ -2749,9 +2753,9 @@ fn joint_take_refresh_sweep_recovers_raced_take() {
     assert_eq!(harness.capture.take_drift_tolerated(), 1);
 }
 
-/// A stale cadence-sweep interest drops silently: an attachment
-/// slot that no longer resolves never reaches the scan, and the
-/// drain still consumes the interest.
+/// A stale cadence-step interest drops silently (charged): an
+/// attachment slot that no longer resolves never reaches the
+/// scan, and the step still consumes the interest.
 #[test]
 fn joint_take_refresh_sweep_drops_stale_slot() {
     let (mut harness, witness, _) = birth_sealed_witness();
@@ -2764,11 +2768,16 @@ fn joint_take_refresh_sweep_drops_stale_slot() {
     );
     assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
     let scans_before = harness.io.attempts.len();
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 9, "the rejected lookup still spends its credit");
     assert_eq!(
         harness.capture.refresh_interest_count_for_test(),
         0,
-        "the drain consumes the interest"
+        "the step consumes the interest"
     );
     assert_eq!(
         harness.io.attempts.len(),
@@ -2782,70 +2791,7 @@ fn joint_take_refresh_sweep_drops_stale_slot() {
     );
 }
 
-/// A cadence sweep shares the per-tick scan cap: with the cap at
-/// one and two queued keys, exactly one scans. The drain still
-/// consumes both interests; the unscanned key re-requests on its
-/// next raced take.
-#[test]
-fn joint_take_refresh_sweep_bounded_by_scan_cap() {
-    let (mut harness, witness, _) = birth_sealed_witness();
-    let receipt = &witness.candidate.receipt;
-    // A second scannable key for the same bound image: a distinct
-    // attachment slot whose endpoint names file 1.
-    let sibling = harness
-        .io
-        .endpoints
-        .as_ref()
-        .expect("scripted endpoints")
-        .iter()
-        .find(|(_, endpoint)| endpoint.file_slot == 1)
-        .map(|(slot, _)| *slot);
-    let sibling_slot = match sibling {
-        Some(slot) => slot,
-        None => {
-            let slot = 7;
-            let endpoint = crate::semantic_capture::Endpoint {
-                object: crate::discovery::identity::PinnedObjectId(1),
-                file_slot: 1,
-                offset: 0x1200,
-            };
-            harness
-                .io
-                .endpoints
-                .as_mut()
-                .expect("scripted endpoints")
-                .insert(slot, endpoint);
-            slot
-        }
-    };
-    harness.capture.request_partition_refresh(
-        receipt.image,
-        receipt.endpoint.file_slot,
-        receipt.attachment_slot,
-        receipt.pin.pid(),
-    );
-    harness
-        .capture
-        .request_partition_refresh(receipt.image, 1, sibling_slot, receipt.pin.pid());
-    assert_eq!(harness.capture.refresh_interest_count_for_test(), 2);
-    harness.capture.limits.scans = 1;
-    let scans_before = harness.io.attempts.len();
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
-    assert_eq!(
-        harness.capture.refresh_interest_count_for_test(),
-        0,
-        "the drain consumes every interest"
-    );
-    assert_eq!(
-        harness.io.attempts.len(),
-        scans_before + 1,
-        "the sweep stops at the shared scan cap"
-    );
-    assert_eq!(report.scans, 1);
-    assert_eq!(harness.capture.take_refresh_scans(), 1);
-}
-
-/// A cadence sweep preserves its unscanned interest for the next
+/// A cadence step preserves its unscanned interest for the next
 /// pass: with the cap at one and two queued keys, exactly one
 /// scans and the other stays queued instead of dropping.
 #[test]
@@ -2890,11 +2836,16 @@ fn joint_take_refresh_sweep_preserves_unscanned_for_next_pass() {
     assert_eq!(harness.capture.refresh_interest_count_for_test(), 2);
     harness.capture.limits.scans = 1;
     let scans_before = harness.io.attempts.len();
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 9, "the step spends one credit");
     assert_eq!(
         harness.io.attempts.len(),
         scans_before + 1,
-        "the sweep stops at the shared scan cap"
+        "the step stops at the shared scan cap"
     );
     assert_eq!(report.scans, 1);
     assert_eq!(
@@ -2902,33 +2853,33 @@ fn joint_take_refresh_sweep_preserves_unscanned_for_next_pass() {
         1,
         "the unscanned interest stays for the next pass"
     );
-}
-
-/// The cadence sweep resolves interest pids through the
-/// current binding pins (as the tick resolves its targets): the
-/// accessor carries the witness's own pin, so the sweep's guard
-/// finds it. Without these pins the production scan would
-/// resolve no pid and skip every key.
-#[test]
-fn joint_take_refresh_sweep_targets_current_binding_pins() {
-    let (harness, witness, _) = birth_sealed_witness();
-    let pins = harness.capture.refresh_target_pins();
-    assert!(
-        pins.iter()
-            .any(|pin| Arc::ptr_eq(pin, &witness.candidate.receipt.pin)),
-        "the sweep targets the bound pin"
+    // The next eligible step scans the queued key.
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(report.scans, 1, "the next pass resumes the queue");
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        0,
+        "the resume drains the queue"
     );
 }
 
-/// A cadence sweep with no queued interests scans nothing and
-/// counts nothing: stalled seals that never raced a take keep
-/// their behavior exactly.
+/// A cadence step with no queued interests scans nothing,
+/// spends nothing and counts nothing: stalled seals that never
+/// raced a take keep their behavior exactly.
 #[test]
 fn joint_take_refresh_sweep_no_interests_no_scan() {
     let (mut harness, _, _) = birth_sealed_witness();
     assert_eq!(harness.capture.refresh_interest_count_for_test(), 0);
     let scans_before = harness.io.attempts.len();
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 10, "an idle step spends nothing");
     assert_eq!(
         harness.io.attempts.len(),
         scans_before,
@@ -2937,7 +2888,195 @@ fn joint_take_refresh_sweep_no_interests_no_scan() {
     assert_eq!(harness.capture.take_refresh_scans(), 0);
     assert!(
         report.observations.is_empty() && report.scans == 0,
-        "an idle sweep reports nothing"
+        "an idle step reports nothing"
+    );
+}
+
+/// A cadence step spends one credit per pass: with two queued
+/// keys and one credit, exactly one scans and the other stays
+/// for the next credited pass.
+#[test]
+fn joint_take_refresh_sweep_budgeted_single_step_per_pass() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let sibling = harness
+        .io
+        .endpoints
+        .as_ref()
+        .expect("scripted endpoints")
+        .iter()
+        .find(|(_, endpoint)| endpoint.file_slot == 1)
+        .map(|(slot, _)| *slot);
+    let sibling_slot = match sibling {
+        Some(slot) => slot,
+        None => {
+            let slot = 7;
+            let endpoint = crate::semantic_capture::Endpoint {
+                object: crate::discovery::identity::PinnedObjectId(1),
+                file_slot: 1,
+                offset: 0x1200,
+            };
+            harness
+                .io
+                .endpoints
+                .as_mut()
+                .expect("scripted endpoints")
+                .insert(slot, endpoint);
+            slot
+        }
+    };
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    harness
+        .capture
+        .request_partition_refresh(receipt.image, 1, sibling_slot, receipt.pin.pid());
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 2);
+    let scans_before = harness.io.attempts.len();
+    let mut budget = 1;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 0, "the step spends its one credit");
+    assert_eq!(report.scans, 1, "one credit scans one key");
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before + 1,
+        "exactly one scan attempt"
+    );
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        1,
+        "the second key stays for the next pass"
+    );
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(report.scans, 0, "an exhausted credit scans nothing");
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before + 1,
+        "an exhausted credit does zero new I/O"
+    );
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        1,
+        "an exhausted credit preserves the queue"
+    );
+    budget = 1;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(report.scans, 1, "the next credited pass resumes");
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        0,
+        "the resume drains the queue"
+    );
+}
+
+/// An exhausted credit preserves every interest with zero new
+/// I/O: the step returns before the storage read, audit,
+/// endpoint lookup and scan.
+#[test]
+fn joint_take_refresh_sweep_exhausted_budget_preserves_without_io() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
+    let scans_before = harness.io.attempts.len();
+    let mut budget = 0;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 0, "an exhausted step spends nothing more");
+    assert_eq!(report.scans, 0, "an exhausted credit scans nothing");
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before,
+        "an exhausted credit does zero new I/O"
+    );
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        1,
+        "an exhausted credit preserves the interest"
+    );
+    assert_eq!(harness.capture.take_refresh_scans(), 0);
+}
+
+/// A past service deadline preserves every interest with zero
+/// new I/O, exactly as an exhausted credit does.
+#[test]
+fn joint_take_refresh_sweep_past_deadline_preserves_without_io() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
+    let scans_before = harness.io.attempts.len();
+    let mut budget = 10;
+    let deadline = harness.io.now();
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 10, "a past deadline spends nothing");
+    assert_eq!(report.scans, 0, "a past deadline scans nothing");
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before,
+        "a past deadline does zero new I/O"
+    );
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        1,
+        "a past deadline preserves the interest"
+    );
+}
+
+/// A cadence scan clamps its window to the service deadline:
+/// the attempt never runs past the machine's remaining budget
+/// window.
+#[test]
+fn joint_take_refresh_sweep_clamps_scan_to_service_deadline() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(report.scans, 1, "the clamped step still attempts its key");
+    let (_, attempt_deadline) = harness
+        .io
+        .attempts
+        .last()
+        .copied()
+        .expect("one scan attempt");
+    assert!(
+        attempt_deadline <= deadline,
+        "the attempt window clamps to the service deadline"
     );
 }
 
@@ -3037,7 +3176,10 @@ fn joint_retained_take_refuses_live_ahead_with_recorded_absence() {
     let (report, _) = harness.route(&mut raw);
     assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
     assert_eq!(
-        harness.capture.router.partition_back_taint(domain, image, file),
+        harness
+            .capture
+            .router
+            .partition_back_taint(domain, image, file),
         Some((true, false)),
         "the continuation taints the scan"
     );
@@ -3060,7 +3202,11 @@ fn joint_retained_take_refuses_live_ahead_with_recorded_absence() {
         "the raced take queues its refresh"
     );
     assert_eq!(harness.capture.take_drift_tolerated(), 0);
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(
         report.observations,
         vec![ObserveOutcome::New],
@@ -3107,7 +3253,10 @@ fn joint_retained_take_refuses_live_ahead_with_moved_storage_null() {
     let (report, _) = harness.route(&mut raw);
     assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
     assert_eq!(
-        harness.capture.router.partition_back_taint(domain, image, file),
+        harness
+            .capture
+            .router
+            .partition_back_taint(domain, image, file),
         Some((true, false)),
         "the continuation taints the scan"
     );
@@ -3129,7 +3278,11 @@ fn joint_retained_take_refuses_live_ahead_with_moved_storage_null() {
             .has_refresh_interest_for_test(cookie, exec, file),
         "the raced take queues its refresh"
     );
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(
         report.observations,
         vec![ObserveOutcome::New],
@@ -3192,7 +3345,11 @@ fn joint_retained_take_refuses_live_ahead_with_changed_ranges() {
             .has_refresh_interest_for_test(cookie, exec, file),
         "the raced take queues its refresh"
     );
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(
         report.observations,
         vec![ObserveOutcome::New],
@@ -3255,7 +3412,11 @@ fn joint_retained_take_refresh_recovers_healthy_global_churn() {
             .has_refresh_interest_for_test(cookie, exec, file),
         "the raced take queues its refresh"
     );
-    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    let mut budget = 10;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(
         report.observations,
         vec![ObserveOutcome::Continued],

@@ -1981,6 +1981,29 @@ impl SemanticCapture {
         std::mem::take(&mut *interests).into_iter().collect()
     }
 
+    /// Pop one take-requested refresh interest (smallest key) for
+    /// the budgeted cadence step. Fail-soft: a contended queue
+    /// waits for the next eligible step.
+    fn take_one_refresh_interest(&self) -> Option<((u64, u64, u32), RefreshInterest)> {
+        let mut interests = self.refresh_interests.try_lock().ok()?;
+        let key = interests.keys().next().copied()?;
+        interests.remove_entry(&key)
+    }
+
+    /// Re-queue one unprocessed refresh interest for the next
+    /// eligible step (per-pass bound, cap or deadline yielded).
+    /// Fail-soft: a contended or full queue drops the interest and
+    /// the next raced take re-requests it.
+    fn requeue_refresh_interest(&self, key: (u64, u64, u32), interest: RefreshInterest) {
+        let Ok(mut interests) = self.refresh_interests.try_lock() else {
+            return;
+        };
+        if !interests.contains_key(&key) && interests.len() >= MAX_PENDING {
+            return;
+        }
+        interests.insert(key, interest);
+    }
+
     /// Take-refresh keys re-scanned by cadence sweeps
     /// (diagnostic only): the stop disclosure reads this beside
     /// the seal-bootstrap arms.
@@ -1999,95 +2022,111 @@ impl SemanticCapture {
             .is_ok_and(|interests| !interests.is_empty())
     }
 
-    /// Pins of all current bindings (production reach for the
-    /// cadence sweep's scan targets): the sweep resolves each
-    /// interest's pid through these, exactly as the tick resolves
-    /// its targets. Cloned Arcs only; bounded by the binding cap.
-    pub(crate) fn refresh_target_pins(&self) -> Vec<Arc<PidPin>> {
-        self.bindings
-            .values()
-            .filter(|binding| binding.current)
-            .map(|binding| binding.pin.clone())
-            .collect()
-    }
-
-    /// One bounded no-call take-refresh sweep through the same
-    /// owned Session: re-observe take-raced keys between seal
-    /// retries (machine cadence). `targets` carries the current
-    /// binding pins (see [`Self::refresh_target_pins`]), as the
-    /// tick's targets do: an empty slice would resolve no pid
-    /// and skip every key. See the shared helper below.
+    /// One bounded no-call take-refresh step through the same
+    /// owned Session: re-observe one take-raced key between seal
+    /// retries (machine cadence). The pin comes from the key's
+    /// own canonical binding, never a global pin list. See the
+    /// budgeted helper below.
     pub(crate) fn sweep_take_refresh(
         &mut self,
         session: &mut Session,
-        targets: &[Arc<PidPin>],
+        budget: &mut usize,
+        service_deadline: Instant,
     ) -> TickReport {
-        self.sweep_take_refresh_with(&mut SessionIo { session, targets })
+        self.sweep_take_refresh_with(
+            &mut SessionIo {
+                session,
+                targets: &[],
+            },
+            budget,
+            service_deadline,
+        )
     }
 
-    /// Re-observe take-raced keys between seal retries (machine
-    /// cadence): drain queued refresh interests and scan them
-    /// outside any tick, like the tick's joined sweep but with no
-    /// collection or routing. The caller stashes the report for
-    /// the next tick merge, so re-observed receipts and resolved
-    /// outcomes join a batch instead of dropping. Bounded by the
-    /// shared per-tick scan cap; stale interests drop silently
-    /// and re-request on the next raced take. Generic I/O
-    /// variant; production wraps the live Session above, twins
-    /// drive it with scripted I/O, and the substituted lane
+    /// Re-observe one take-raced key between seal retries (machine
+    /// cadence): a single credited step outside any tick, like one
+    /// tick joined-scan but with no collection or routing. The
+    /// caller stashes the report for the next tick merge, so a
+    /// re-observed receipt and resolved outcomes join a batch
+    /// instead of dropping. Debit before work: an exhausted
+    /// credit or a past service deadline preserves every interest
+    /// with zero new I/O. One interest per pass; unprocessed keys
+    /// stay queued for the next eligible step. Stale interests
+    /// drop silently (charged) and re-request on the next raced
+    /// take. Scan windows clamp to the service deadline. Generic
+    /// I/O variant; production wraps the live Session above,
+    /// twins drive it with scripted I/O, and the substituted lane
     /// drives it with held I/O.
     // The I/O seam stays sealed: `CaptureIo` is private, so only
     // in-crate descendants can implement or name it; this bound
     // merely lets those callers pass their own I/O through.
     #[allow(private_bounds)]
-    pub(crate) fn sweep_take_refresh_with(&mut self, io: &mut impl CaptureIo) -> TickReport {
+    pub(crate) fn sweep_take_refresh_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        budget: &mut usize,
+        service_deadline: Instant,
+    ) -> TickReport {
+        let mut report = TickReport::default();
+        if *budget == 0 || io.now() >= service_deadline {
+            return report;
+        }
+        if !self.has_queued_take_refresh() {
+            return report;
+        }
+        if report.scans >= self.limits.scans
+            || self.image_failed
+            || self.exhausted
+            || self.sticky != 0
+        {
+            return report;
+        }
+        *budget = budget.saturating_sub(1);
         // One storage_null snapshot per scan pass for the Q1(b) gate.
         self.router.note_storage_null(io.storage_null());
-        let mut report = TickReport::default();
         if !self.audit(io, &mut report) {
             return report;
         }
-        // Resolve drained interests fresh, as in the tick's joined
-        // sweep: a call-driven interest for the same key would win
-        // there, but the sweep runs with no new calls, so every
-        // resolved interest scans. Stale slots drop silently and
-        // re-request on the next raced take.
-        let mut interests = BTreeMap::new();
-        for ((cookie, exec, file), interest) in self.take_refresh_interests() {
-            let key = (cookie, exec, file);
-            let Some(endpoint) = io.endpoint(interest.attachment_slot) else {
-                continue;
-            };
-            if endpoint.file_slot != file {
-                continue;
-            }
-            interests.insert(
-                key,
-                (
-                    interest.image,
-                    endpoint,
-                    interest.attachment_slot,
-                    interest.pid,
-                ),
-            );
+        let Some((key, interest)) = self.take_one_refresh_interest() else {
+            return report;
+        };
+        let Some(endpoint) = io.endpoint(interest.attachment_slot) else {
+            return report;
+        };
+        if endpoint.file_slot != key.2 {
+            return report;
         }
-        // BTreeMap order is deterministic; the sweep leaves the
-        // tick's cyclic cursor alone. Refresh scans carry no birth
-        // cut: they re-prove the partition without offering.
-        for (_key, interest) in interests {
-            if report.scans >= self.limits.scans
-                || self.image_failed
-                || self.exhausted
-                || self.sticky != 0
-            {
-                break;
+        if report.scans >= self.limits.scans
+            || self.image_failed
+            || self.exhausted
+            || self.sticky != 0
+            || io.now() >= service_deadline
+        {
+            self.requeue_refresh_interest(key, interest);
+            return report;
+        }
+        // The sweep leaves the tick's cyclic cursor alone. Refresh
+        // scans carry no birth cut: they re-prove the partition
+        // without offering.
+        match self.scan_one_joined_key(
+            io,
+            (
+                interest.image,
+                endpoint,
+                interest.attachment_slot,
+                interest.pid,
+            ),
+            None,
+            &mut report,
+            Some(service_deadline),
+            true,
+        ) {
+            JoinedScanOutcome::Scanned => {
+                self.take_refresh_scans = self.take_refresh_scans.saturating_add(1);
             }
-            match self.scan_one_joined_key(io, interest, None, &mut report) {
-                JoinedScanOutcome::Scanned => {
-                    self.take_refresh_scans = self.take_refresh_scans.saturating_add(1);
-                }
-                JoinedScanOutcome::Skipped => {}
-                JoinedScanOutcome::Break => break,
+            JoinedScanOutcome::Skipped => {}
+            JoinedScanOutcome::Break => {
+                self.requeue_refresh_interest(key, interest);
             }
         }
         self.stamp_disposition(&mut report);
@@ -2099,7 +2138,10 @@ impl SemanticCapture {
     /// `birth_cut` is the tick's cut for call-driven interests and
     /// `None` for refresh interests (no birth offered). The tick
     /// advances its cyclic cursor on `Scanned`; the cadence sweep
-    /// leaves the cursor alone.
+    /// leaves the cursor alone. The cadence step passes its service
+    /// deadline to clamp the scan window and looks its pin up from
+    /// the key's own canonical binding instead of the tick's
+    /// target slice.
     fn scan_one_joined_key(
         &mut self,
         io: &mut impl CaptureIo,
@@ -2109,21 +2151,40 @@ impl SemanticCapture {
             crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
         )>,
         report: &mut TickReport,
+        service_deadline: Option<Instant>,
+        direct_pin: bool,
     ) -> JoinedScanOutcome {
         let (image, endpoint, slot, pid) = interest;
-        let Some(pin) = io.target(pid) else {
-            return JoinedScanOutcome::Skipped;
+        let pin = if direct_pin {
+            let Some(binding) = self.bindings.get(&image.task_cookie) else {
+                return JoinedScanOutcome::Skipped;
+            };
+            if binding.domain != self.router.domain()
+                || !binding.current
+                || binding.image != image
+                || binding.pin.pid() != pid
+            {
+                return JoinedScanOutcome::Skipped;
+            }
+            binding.pin.clone()
+        } else {
+            let Some(pin) = io.target(pid) else {
+                return JoinedScanOutcome::Skipped;
+            };
+            let Some(binding) = self.bindings.get(&image.task_cookie) else {
+                return JoinedScanOutcome::Skipped;
+            };
+            if binding.domain != self.router.domain()
+                || !binding.current
+                || binding.image != image
+                || pin.pid() != pid
+                || !Arc::ptr_eq(&pin, &binding.pin)
+            {
+                return JoinedScanOutcome::Skipped;
+            }
+            pin
         };
-        let Some(binding) = self.bindings.get(&image.task_cookie) else {
-            return JoinedScanOutcome::Skipped;
-        };
-        if binding.domain != self.router.domain()
-            || !binding.current
-            || binding.image != image
-            || pin.pid() != pid
-            || !Arc::ptr_eq(&pin, &binding.pin)
-            || !pin.still_the_same()
-        {
+        if !pin.still_the_same() {
             return JoinedScanOutcome::Skipped;
         }
         let now = io.now();
@@ -2144,7 +2205,10 @@ impl SemanticCapture {
         };
         report.scans += 1;
         let fence = self.router.fence();
-        let attempt_deadline = slice_end.min(proof_deadline);
+        let mut attempt_deadline = slice_end.min(proof_deadline);
+        if let Some(service) = service_deadline {
+            attempt_deadline = attempt_deadline.min(service);
+        }
         let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
         let healthy = self.audit(io, report);
         // The break is recorded from the already-obtained result
@@ -4640,7 +4704,14 @@ impl SemanticCapture {
             } else {
                 birth_cut.clone()
             };
-            match self.scan_one_joined_key(io, joined_interests[&key], birth_cut, &mut report) {
+            match self.scan_one_joined_key(
+                io,
+                joined_interests[&key],
+                birth_cut,
+                &mut report,
+                None,
+                false,
+            ) {
                 JoinedScanOutcome::Scanned => {
                     self.joined_refresh_cursor = Some(key);
                 }

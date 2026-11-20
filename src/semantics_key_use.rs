@@ -2449,13 +2449,25 @@ impl FamilyState {
     /// Accumulate one mechanism-less completion: no family evidence,
     /// so the row names its unknown with `no_mechanism` and counts
     /// no family completion (mirroring the size side's
-    /// absent-evidence reasons). First unknown reason wins, like the
-    /// unlisted arm; later valued evidence still pins and clears.
+    /// absent-evidence reasons). The absent reason is weak: it only
+    /// fills a blank unknown, never overwrites counted evidence, and
+    /// later counted mechanism evidence replaces it.
     pub(crate) fn accumulate_no_mechanism(&mut self) {
         use crate::keymeta::REASON_NO_MECHANISM;
         if self.status == InferredStatus::Unknown && self.reason.is_none() {
             self.reason = Some(REASON_NO_MECHANISM);
         }
+    }
+
+    /// Whether counted mechanism evidence may still name this
+    /// unknown: blank, or carrying only the weak zero-evidence
+    /// absent reason (the size side's weakest-unknown rule).
+    fn accepts_evidence_reason(&self) -> bool {
+        self.status == InferredStatus::Unknown
+            && matches!(
+                self.reason,
+                None | Some(crate::keymeta::REASON_NO_MECHANISM)
+            )
     }
 
     /// Accumulate one mechanism-present completion (§4.4): first
@@ -2473,7 +2485,9 @@ impl FamilyState {
         // Every mechanism-present terminal is family evidence.
         self.completions = self.completions.saturating_add(1);
         let Some(family) = infer_family(mechanism) else {
-            if self.status == InferredStatus::Unknown && self.reason.is_none() {
+            // Counted evidence replaces the weak absent reason, so both
+            // arrival orders agree; the first counted reason still wins.
+            if self.accepts_evidence_reason() {
                 self.reason = Some(REASON_UNLISTED_MECHANISM);
             }
             return;
@@ -3409,8 +3423,9 @@ impl KeyUseReducer {
                                 // evidence (of its operation-key
                                 // limit), so it counts.
                                 state.completions = state.completions.saturating_add(1);
-                                if state.status == InferredStatus::Unknown && state.reason.is_none()
-                                {
+                                // The counted wrap replaces the weak absent
+                                // reason, like the unlisted arm above.
+                                if state.accepts_evidence_reason() {
                                     state.reason = Some(REASON_OPERATION_KEY_ONLY);
                                 }
                             } else {

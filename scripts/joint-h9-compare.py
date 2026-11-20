@@ -707,8 +707,12 @@ def validate_snapshot(document):
              == (document["reason"] == "none"),
              "snapshot status/reason disagree")
     if document["status"] != "populated":
+        if document["reason"] == "live_joint_feed_absent":
+            detail = "live joint feed absent; full joint coverage required"
+        else:
+            detail = "joint evidence absent"
         raise LedgerError(f"snapshot status {document['status']}"
-                          f" reason {document['reason']}: joint evidence absent")
+                          f" reason {document['reason']}: {detail}")
     _require(type(document["sessions"]) is list, "snapshot sessions must be a list")
     session_ids = []
     for position, row in enumerate(document["sessions"]):

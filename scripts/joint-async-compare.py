@@ -859,8 +859,12 @@ def validate_snapshot(document, tag):
              == (document["reason"] == "none"),
              f"{tag}: snapshot status/reason disagree")
     if document["status"] != "populated":
+        if document["reason"] == "live_joint_feed_absent":
+            detail = "live joint feed absent; full joint coverage required"
+        else:
+            detail = "joint evidence absent"
         raise LedgerError(f"{tag}: snapshot status {document['status']}"
-                          f" reason {document['reason']}: joint evidence absent")
+                          f" reason {document['reason']}: {detail}")
     _require(type(document["sessions"]) is list,
              f"{tag}: snapshot sessions must be a list")
     session_ids = []

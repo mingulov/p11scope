@@ -600,19 +600,30 @@ class BrowserCells(unittest.TestCase):
             and gap.get("subject") == "Joint birth unavailable; retained S1")
         # Ruled contract: folded browsers (exited before Joint birth,
         # or folded after sealing rows) report partial with the named
-        # live_joint_feed_absent reason beside retained rows; a
-        # no-live-feed reason with no rows (or beside live instances
-        # that never got a live feed) still means never covered. The
-        # bootstrap literal stays inline for the observer-first wiring
-        # twin below.
+        # live_joint_feed_absent reason beside retained rows; the folded
+        # reason with no rows, or beside live instances that never got a
+        # live feed, still means never covered. Bootstrap means no birth
+        # ever seated, so zero retained rows: a rowed bootstrap pair is
+        # refused, and a rowless one still means never covered. Both
+        # literals stay inline for the observer-first wiring twin below.
         rows = observations.get("key_operations") or []
-        if (observations.get("reason") in ("bootstrap_unavailable",
-                                           "live_joint_feed_absent")
-                and _bootstrap_cover_missing(rows, browser_instances)):
-            self.fail(
-                "late browser never covered (no live per-key tracking); "
-                f"birth refusals={birth_refusals}; "
-                f"observation gaps={observations.get('gaps')}")
+        reason = observations.get("reason")
+        never_covered = (
+            "late browser never covered (no live per-key tracking); "
+            f"birth refusals={birth_refusals}; "
+            f"observation gaps={observations.get('gaps')}")
+        if reason == "live_joint_feed_absent":
+            self.assertEqual(
+                observations.get("status"), "partial",
+                "live_joint_feed_absent must commit partial")
+            if _bootstrap_cover_missing(rows, browser_instances):
+                self.fail(never_covered)
+        elif reason == "bootstrap_unavailable":
+            self.assertEqual(
+                len(rows), 0,
+                "bootstrap_unavailable carries no retained rows; folded "
+                "rows must commit partial/live_joint_feed_absent")
+            self.fail(never_covered)
         self.assertGreater(len(rows), 0, "no key-operation rows at all")
         completed_signs = sum(
             row.get("completed", 0) for row in rows
@@ -2162,15 +2173,14 @@ def healthy_sessions(opened=2, inherited=0, closed=1, async_opened=0,
 
 
 def _bootstrap_cover_missing(rows, browser_instances):
-    """True when a no-live-feed reason must fail the FF-FIRST-BG cell.
+    """True when the folded reason must fail the FF-FIRST-BG cell.
 
-    The caller has already established a no-live-feed reason
-    (``bootstrap_unavailable`` or the ruled ``live_joint_feed_absent``;
-    the bootstrap literal stays inline at the call site so the
-    observer-first wiring twin still sees it). Rows are tolerated
-    only on the folded leg: live browser instances mean no live
-    per-key tracking for retained callers, and no rows still means
-    never covered.
+    The caller has already established the ruled
+    ``live_joint_feed_absent`` reason (both no-live-feed literals stay
+    inline at the call site so the observer-first wiring twin still
+    sees them). Rows are tolerated only on the folded leg: live
+    browser instances mean no live per-key tracking for retained
+    callers, and no rows still means never covered.
     """
     return not rows or bool(browser_instances)
 

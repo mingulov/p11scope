@@ -1223,6 +1223,61 @@ struct ScriptIo {
     fault_cell: Arc<std::sync::atomic::AtomicU64>,
     concurrent_raise: bool,
     storage_null: Option<u64>,
+    /// Native-call spy for the budgeted cadence twins: every
+    /// substituted native leaf counts here, so a twin can hold the
+    /// leaves done against the credits spent.
+    spy: NativeSpy,
+    /// Cadence twins pose production's empty target slice: a cadence
+    /// step must never resolve its pin through `target`.
+    targets_absent: bool,
+    /// Scripted clock costs of the storage, health and custody
+    /// leaves (scan cost is `scan_advance`): a service deadline can
+    /// pass during any of them, exactly as a real call overruns it.
+    storage_advance: Duration,
+    health_advance: Duration,
+    custody_advance: Duration,
+}
+
+/// Counts of substituted native leaves (and leaf units) a capture
+/// step performed. Interior mutability because some leaves read
+/// through shared borrows.
+#[derive(Default)]
+struct NativeSpy {
+    storage: std::cell::Cell<usize>,
+    health: std::cell::Cell<usize>,
+    /// Whole retained-attachment readbacks (descriptor table, static
+    /// sides and file identity in one call).
+    attachment: std::cell::Cell<usize>,
+    /// Strided descriptor readbacks and the entries they compared.
+    readback_strides: std::cell::Cell<usize>,
+    readback_entries: std::cell::Cell<usize>,
+    readback_max_stride: std::cell::Cell<usize>,
+    /// Static-side walk strides and the units they visited.
+    side_strides: std::cell::Cell<usize>,
+    side_units: std::cell::Cell<usize>,
+    side_max_stride: std::cell::Cell<usize>,
+    /// Final retained-target file-identity checks.
+    target_checks: std::cell::Cell<usize>,
+    custody: std::cell::Cell<usize>,
+    target: std::cell::Cell<usize>,
+}
+impl NativeSpy {
+    fn bump(cell: &std::cell::Cell<usize>, by: usize) {
+        cell.set(cell.get() + by);
+    }
+    /// Native leaves (one map/stat/pidfd call or one bounded stride)
+    /// so far, scans excluded (the caller adds its scan attempts).
+    fn leaves(&self) -> usize {
+        self.storage.get()
+            + self.health.get()
+            // One whole readback pays its descriptor lookups, its
+            // static-side walk and its identity check together.
+            + self.attachment.get() * 3
+            + self.readback_strides.get()
+            + self.side_strides.get()
+            + self.target_checks.get()
+            + self.custody.get()
+    }
 }
 impl ScriptIo {
     fn new(domain: NativeDomainId) -> Self {
@@ -1302,6 +1357,11 @@ impl ScriptIo {
             fault_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             concurrent_raise: false,
             storage_null: None,
+            spy: NativeSpy::default(),
+            targets_absent: false,
+            storage_advance: Duration::ZERO,
+            health_advance: Duration::ZERO,
+            custody_advance: Duration::ZERO,
         }
     }
     fn call_image(&mut self, cookie: u64, exec_id: u64, fault: u32) {
@@ -1381,6 +1441,8 @@ impl CaptureIo for ScriptIo {
         }
     }
     fn health(&mut self) -> Result<Health, ()> {
+        NativeSpy::bump(&self.spy.health, 1);
+        self.now += self.health_advance;
         let result = self.health.pop_front().unwrap_or(Ok(self.last_health));
         if let Ok(health) = result {
             self.last_health = health;
@@ -1409,6 +1471,7 @@ impl CaptureIo for ScriptIo {
         &self,
         slot: u32,
     ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal> {
+        NativeSpy::bump(&self.spy.attachment, 1);
         if let Some(refusal) = self.attachment_refusal {
             return Err(refusal);
         }
@@ -1456,7 +1519,8 @@ impl CaptureIo for ScriptIo {
         })
     }
     fn target(&self, _: u32) -> Option<Arc<PidPin>> {
-        Some(self.pin.clone())
+        NativeSpy::bump(&self.spy.target, 1);
+        (!self.targets_absent).then(|| self.pin.clone())
     }
     fn scan(
         &mut self,
@@ -1526,6 +1590,8 @@ impl CaptureIo for ScriptIo {
         self.scan(&job, deadline, fence, current)
     }
     fn storage_null(&mut self) -> Option<u64> {
+        NativeSpy::bump(&self.spy.storage, 1);
+        self.now += self.storage_advance;
         self.storage_null
     }
 }
@@ -2996,6 +3062,7 @@ fn joint_take_refresh_sweep_exhausted_budget_preserves_without_io() {
     );
     assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
     let scans_before = harness.io.attempts.len();
+    harness.io.spy = NativeSpy::default();
     let mut budget = 0;
     let deadline = harness.io.now() + Duration::from_secs(10);
     let report = harness
@@ -3003,6 +3070,11 @@ fn joint_take_refresh_sweep_exhausted_budget_preserves_without_io() {
         .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(budget, 0, "an exhausted step spends nothing more");
     assert_eq!(report.scans, 0, "an exhausted credit scans nothing");
+    assert_eq!(
+        harness.io.spy.leaves(),
+        0,
+        "an exhausted credit reads no storage, health, attachment or custody"
+    );
     assert_eq!(
         harness.io.attempts.len(),
         scans_before,
@@ -3030,6 +3102,7 @@ fn joint_take_refresh_sweep_past_deadline_preserves_without_io() {
     );
     assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
     let scans_before = harness.io.attempts.len();
+    harness.io.spy = NativeSpy::default();
     let mut budget = 10;
     let deadline = harness.io.now();
     let report = harness
@@ -3037,6 +3110,11 @@ fn joint_take_refresh_sweep_past_deadline_preserves_without_io() {
         .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(budget, 10, "a past deadline spends nothing");
     assert_eq!(report.scans, 0, "a past deadline scans nothing");
+    assert_eq!(
+        harness.io.spy.leaves(),
+        0,
+        "a past deadline reads no storage, health, attachment or custody"
+    );
     assert_eq!(
         harness.io.attempts.len(),
         scans_before,
@@ -3077,6 +3155,354 @@ fn joint_take_refresh_sweep_clamps_scan_to_service_deadline() {
     assert!(
         attempt_deadline <= deadline,
         "the attempt window clamps to the service deadline"
+    );
+}
+
+/// Race the sealed birth's take against global churn, so its key is
+/// queued for a cadence refresh that has real work to do (the frozen
+/// router missed a continuation).
+fn raced_refresh_witness() -> (
+    JointBirthHarness,
+    RetainedBirthWitness,
+    crate::semantics_objects::journal::tests::NativeBirthRows,
+) {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.global = 1;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness.capture.has_queued_take_refresh(),
+        "precondition: the raced take queued its key"
+    );
+    // Count only the cadence's own leaves from here.
+    harness.io.spy = NativeSpy::default();
+    harness.io.attempts.clear();
+    (harness, witness, rows)
+}
+
+/// Native leaves the scripted I/O performed so far, scans included.
+fn cadence_leaves(io: &ScriptIo) -> usize {
+    io.spy.leaves() + io.attempts.len()
+}
+
+/// Fill the capture with more than one stride of table entries the
+/// cadence must not walk under one credit: pending records awaiting a
+/// join and non-current bindings of other tasks.
+fn seed_tables_past_stride(harness: &mut JointBirthHarness, entries: u64) {
+    for index in 0..entries {
+        harness.io.call(1_000 + index, 0);
+        let record = harness.io.records.pop_back().expect("scripted call");
+        harness.capture.awaiting.insert(
+            u64::MAX / 2 + index,
+            Awaiting {
+                record,
+                endpoint: None,
+                collected_origin: None,
+            },
+        );
+        harness.capture.bindings.insert(
+            1_000 + index,
+            TaskBinding {
+                domain: harness.capture.router.domain(),
+                image: ImageIdentity {
+                    task_cookie: 1_000 + index,
+                    exec_id: 0,
+                },
+                pin: Arc::new(PidPin::open(std::process::id()).unwrap()),
+                current: false,
+            },
+        );
+    }
+}
+
+/// Every native leaf of a cadence refresh is paid for before it runs:
+/// one credit per pass never buys more than one storage read, health
+/// read, readback or side stride, custody check or scan, yet the
+/// cursor still converges, re-observes the key and lets the retried
+/// take validate. The pin comes from the key's canonical binding, so
+/// production's empty target slice is posed and never consulted.
+#[test]
+fn joint_take_refresh_cadence_pays_each_native_leaf_first() {
+    let (mut harness, witness, mut rows) = raced_refresh_witness();
+    harness.io.targets_absent = true;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut observations = Vec::new();
+    let mut passes = 0;
+    while harness.capture.has_queued_take_refresh() {
+        passes += 1;
+        assert!(passes <= 64, "the cursor converges one credit at a time");
+        let before = cadence_leaves(&harness.io);
+        let mut budget = 1;
+        let report = harness
+            .capture
+            .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+        let spent = 1 - budget;
+        let leaves = cadence_leaves(&harness.io) - before;
+        assert!(
+            leaves <= spent,
+            "pass {passes}: {leaves} native leaves on {spent} credit"
+        );
+        observations.extend(report.observations);
+    }
+    assert!(
+        harness.io.spy.readback_max_stride.get() <= 64
+            && harness.io.spy.side_max_stride.get() <= 64,
+        "no stride reads more than one credit's entries"
+    );
+    assert_eq!(observations, vec![ObserveOutcome::Continued]);
+    assert_eq!(harness.capture.take_refresh_scans(), 1);
+    assert_eq!(
+        harness.io.spy.target.get(),
+        0,
+        "the cadence never resolves its pin through the tick's targets"
+    );
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the retried take validates against current truth");
+}
+
+/// A healthy cadence refresh does no whole-table work under one
+/// credit: with more than a stride of pending records and bindings,
+/// no pass walks more entries than its credits pay for, and the
+/// already-bound key refreshes without the pin's binding walk.
+#[test]
+fn joint_take_refresh_cadence_walks_no_table_past_its_credit() {
+    let (mut harness, witness, mut rows) = raced_refresh_witness();
+    seed_tables_past_stride(&mut harness, 100);
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut observations = Vec::new();
+    let mut passes = 0;
+    while harness.capture.has_queued_take_refresh() {
+        passes += 1;
+        assert!(passes <= 64, "the cursor converges");
+        let before = harness.capture.walk_units_for_test;
+        let mut budget = 1;
+        let report = harness
+            .capture
+            .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+        let spent = 1 - budget;
+        let walked = harness.capture.walk_units_for_test - before;
+        assert!(
+            walked <= 64 * spent,
+            "pass {passes}: walked {walked} entries on {spent} credit"
+        );
+        observations.extend(report.observations);
+    }
+    assert_eq!(observations, vec![ObserveOutcome::Continued]);
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the retried take validates against current truth");
+}
+
+/// A cadence health read that sees the fault era move does no table
+/// work and applies nothing: with a populated pending queue it emits
+/// no invalidation or resolution, withholds all evidence, keeps the
+/// key, and leaves the move to the next tick's audit.
+#[test]
+fn joint_take_refresh_cadence_defers_moved_fault_to_the_tick() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    seed_tables_past_stride(&mut harness, 100);
+    harness.io.health.push_back(Ok(Health {
+        fault: 1,
+        sticky: 0,
+    }));
+    let walked = harness.capture.walk_units_for_test;
+    let scans = harness.io.attempts.len();
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut budget = 64;
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert!(
+        report.outcomes.is_empty(),
+        "a moved era is not applied by the cadence"
+    );
+    assert!(report.current.is_empty() && report.observations.is_empty());
+    assert_eq!(harness.io.attempts.len(), scans, "no scan after a move");
+    assert_eq!(
+        harness.capture.walk_units_for_test, walked,
+        "no table walk under the cadence credit"
+    );
+    assert!(
+        harness.capture.has_queued_take_refresh(),
+        "the key waits for a later step"
+    );
+}
+
+/// A failed cadence health read does no table work either: no
+/// coverage failure is applied from the cadence, nothing is emitted,
+/// and the key waits.
+#[test]
+fn joint_take_refresh_cadence_defers_failed_health_to_the_tick() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    seed_tables_past_stride(&mut harness, 100);
+    harness.io.health.push_back(Err(()));
+    let walked = harness.capture.walk_units_for_test;
+    let raises = harness.io.raises;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut budget = 64;
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert!(report.outcomes.is_empty(), "no coverage failure from here");
+    assert_eq!(harness.io.raises, raises, "no fault raise from here");
+    assert_eq!(harness.capture.walk_units_for_test, walked);
+    assert!(harness.capture.has_queued_take_refresh());
+}
+
+/// A scan that runs past the service window starts no post-scan
+/// audit: the health read is not started after the window closed, the
+/// result yields no positive evidence, and the key is kept for a later
+/// step that recovers it.
+#[test]
+fn joint_take_refresh_cadence_starts_no_audit_after_the_window() {
+    let (mut harness, witness, mut rows) = raced_refresh_witness();
+    harness.io.scan_advance = Duration::from_millis(2);
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let mut budget = 64;
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.io.attempts.len(), 1, "the window opened one scan");
+    assert_eq!(
+        harness.io.spy.health.get(),
+        1,
+        "only the pre-scan health read ran; none started after the window"
+    );
+    assert!(report.current.is_empty() && report.observations.is_empty());
+    assert!(report.scan_refusals.contains(&ImageQueryRefusal::Deadline));
+    assert!(
+        harness.capture.has_queued_take_refresh(),
+        "a service yield keeps the key"
+    );
+    harness.io.scan_advance = Duration::ZERO;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut observations = Vec::new();
+    for _ in 0..8 {
+        if !harness.capture.has_queued_take_refresh() {
+            break;
+        }
+        let mut budget = 64;
+        observations.extend(
+            harness
+                .capture
+                .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline)
+                .observations,
+        );
+    }
+    assert_eq!(observations, vec![ObserveOutcome::Continued]);
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the later step recovers the take");
+}
+
+/// A storage read that overruns the service window starts no health
+/// read, custody check or scan, and keeps the key.
+#[test]
+fn joint_take_refresh_cadence_yields_after_a_slow_storage_read() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    harness.io.storage_advance = Duration::from_millis(2);
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.io.spy.storage.get(), 1);
+    assert_eq!(harness.io.spy.health.get(), 0, "no health read after it");
+    assert_eq!(harness.io.spy.custody.get(), 0, "no custody check after it");
+    assert!(harness.io.attempts.is_empty(), "no scan after it");
+    assert!(harness.capture.has_queued_take_refresh(), "the key waits");
+}
+
+/// A health read that overruns the window starts no custody check or
+/// scan, and keeps the key.
+#[test]
+fn joint_take_refresh_cadence_yields_after_a_slow_health_read() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    harness.io.health_advance = Duration::from_millis(2);
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.io.spy.health.get(), 1);
+    assert_eq!(harness.io.spy.custody.get(), 0, "no custody check after it");
+    assert!(harness.io.attempts.is_empty(), "no scan after it");
+    assert!(harness.capture.has_queued_take_refresh(), "the key waits");
+}
+
+/// A custody check that overruns the window dispatches no scan, and
+/// keeps the key.
+#[test]
+fn joint_take_refresh_cadence_yields_after_a_slow_custody_check() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    harness.io.custody_advance = Duration::from_millis(2);
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.io.spy.custody.get(), 1, "custody runs through the seam");
+    assert!(harness.io.attempts.is_empty(), "no scan after it");
+    assert!(harness.capture.has_queued_take_refresh(), "the key waits");
+}
+
+/// The cadence refreshes only the key's canonical binding: an interest
+/// naming a moved exec generation of the bound task never scans and
+/// is consumed.
+#[test]
+fn joint_take_refresh_cadence_refuses_a_mismatched_binding() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    harness.io.targets_absent = true;
+    let receipt = &witness.candidate.receipt;
+    let moved = ImageIdentity {
+        task_cookie: receipt.image.task_cookie,
+        exec_id: receipt.image.exec_id + 1,
+    };
+    harness.io.spy = NativeSpy::default();
+    harness.io.attempts.clear();
+    harness.capture.request_partition_refresh(
+        moved,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert!(harness.io.attempts.is_empty(), "a moved generation never scans");
+    assert_eq!(harness.io.spy.storage.get(), 0, "nor reads anything");
+    assert!(
+        !harness.capture.has_queued_take_refresh(),
+        "the stale interest is consumed"
     );
 }
 

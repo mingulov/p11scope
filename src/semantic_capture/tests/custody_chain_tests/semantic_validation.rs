@@ -550,6 +550,7 @@ impl CaptureIo for HeldIo {
         self.scan_proof(self.targets[&pin.pid()].1, endpoint, fence)
     }
     fn storage_null(&mut self) -> Option<u64> {
+        NativeSpy::bump(&self.script.spy.storage, 1);
         Some(self.storage_null)
     }
 }

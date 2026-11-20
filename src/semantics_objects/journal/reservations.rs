@@ -208,6 +208,12 @@ pub(super) struct ReservationTable<C> {
     /// `key_slot`, `id_slot` and free-slot searches.
     #[cfg(test)]
     test_slot_visits: std::cell::Cell<usize>,
+    /// Test-only sweep cost counter: independently counted slot
+    /// visits plus chain-link reads (head, predecessor and
+    /// target-successor loads) across `release_role_step`. The
+    /// reported `spent` must match this count on every step.
+    #[cfg(test)]
+    test_sweep_visits: std::cell::Cell<usize>,
 }
 
 impl<C> ReservationTable<C> {
@@ -241,6 +247,8 @@ impl<C> ReservationTable<C> {
             free_head,
             #[cfg(test)]
             test_slot_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_sweep_visits: std::cell::Cell::new(0),
         })
     }
 
@@ -298,10 +306,12 @@ impl<C> ReservationTable<C> {
 
     /// Resumable chain unlink for the budgeted void sweep: at most
     /// `budget` link reads this call (`INDEX_NONE` in `prev` starts at
-    /// the head). Returns whether the splice completed and the units
-    /// spent (head read plus predecessor reads, never above `budget`).
-    /// A yielded unlink leaves the chain unchanged, so resuming from
-    /// the returned predecessor is exact.
+    /// the head). Returns whether the splice completed, the units
+    /// spent (head read plus predecessor reads, never above `budget`)
+    /// and the independently counted link reads performed (head plus
+    /// predecessor plus target-successor loads). A yielded unlink
+    /// leaves the chain unchanged, so resuming from the returned
+    /// predecessor is exact.
     fn chain_unlink_resumable(
         heads: &mut [u16; INDEX_BUCKETS],
         slots: &mut [TableSlot<C>],
@@ -310,35 +320,40 @@ impl<C> ReservationTable<C> {
         node: u16,
         prev: &mut u16,
         budget: usize,
-    ) -> (bool, usize) {
+    ) -> (bool, usize, usize) {
         if budget == 0 {
-            return (false, 0);
+            return (false, 0, 0);
         }
         let mut spent = 0;
+        let mut actual = 0;
         if *prev == INDEX_NONE {
             spent += 1;
+            actual += 1;
             if heads[bucket] == node {
+                actual += 1;
                 heads[bucket] = slots[node_slot(node)].next[plane][node_lane(node)];
-                return (true, spent);
+                return (true, spent, actual);
             }
             *prev = heads[bucket];
             assert_ne!(*prev, INDEX_NONE, "indexed node linked");
             if spent >= budget {
-                return (false, spent);
+                return (false, spent, actual);
             }
         }
         while spent < budget {
             spent += 1;
+            actual += 1;
             let next = slots[node_slot(*prev)].next[plane][node_lane(*prev)];
             if next == node {
+                actual += 1;
                 slots[node_slot(*prev)].next[plane][node_lane(*prev)] =
                     slots[node_slot(node)].next[plane][node_lane(node)];
-                return (true, spent);
+                return (true, spent, actual);
             }
             *prev = next;
             assert_ne!(*prev, INDEX_NONE, "indexed node linked");
         }
-        (false, spent)
+        (false, spent, actual)
     }
 
     /// Pop the first vacant slot from the intrusive free list.
@@ -378,6 +393,18 @@ impl<C> ReservationTable<C> {
     #[cfg(test)]
     pub(super) fn reset_test_slot_visits_for_test(&self) {
         self.test_slot_visits.set(0);
+    }
+
+    /// Test-only read of the sweep cost counter.
+    #[cfg(test)]
+    pub(super) fn test_sweep_visits_for_test(&self) -> usize {
+        self.test_sweep_visits.get()
+    }
+
+    /// Test-only reset of the sweep cost counter.
+    #[cfg(test)]
+    pub(super) fn reset_test_sweep_visits_for_test(&self) {
+        self.test_sweep_visits.set(0);
     }
 
     pub(super) fn reservation(&self, role: Role, key: RoleKey) -> Option<ReservationId> {
@@ -465,7 +492,7 @@ impl<C> ReservationTable<C> {
                 return (false, spent);
             }
             if let Some(mut pending) = cursor.pending_alias_unlink.take() {
-                let (done, used) = Self::chain_unlink_resumable(
+                let (done, used, actual) = Self::chain_unlink_resumable(
                     &mut self.id_heads,
                     &mut self.slots,
                     pending.plane,
@@ -475,6 +502,9 @@ impl<C> ReservationTable<C> {
                     budget - spent,
                 );
                 spent += used;
+                #[cfg(test)]
+                self.test_sweep_visits
+                    .set(self.test_sweep_visits.get() + actual);
                 if !done {
                     cursor.pending_alias_unlink = Some(pending);
                     debug_assert!(spent <= budget);
@@ -513,7 +543,7 @@ impl<C> ReservationTable<C> {
                 continue;
             }
             if let Some(mut pending) = cursor.pending_key.take() {
-                let (done, used) = Self::chain_unlink_resumable(
+                let (done, used, actual) = Self::chain_unlink_resumable(
                     &mut self.key_heads,
                     &mut self.slots,
                     pending.plane,
@@ -523,6 +553,9 @@ impl<C> ReservationTable<C> {
                     budget - spent,
                 );
                 spent += used;
+                #[cfg(test)]
+                self.test_sweep_visits
+                    .set(self.test_sweep_visits.get() + actual);
                 if !done {
                     cursor.pending_key = Some(pending);
                     debug_assert!(spent <= budget);
@@ -542,6 +575,9 @@ impl<C> ReservationTable<C> {
             }
             let at = cursor.next_slot;
             spent += 1;
+            #[cfg(test)]
+            self.test_sweep_visits
+                .set(self.test_sweep_visits.get() + 1);
             let key = self.slots[at]
                 .operation
                 .as_ref()
@@ -1724,5 +1760,70 @@ mod tests {
         fallback.release(Role::Model, key(2)).unwrap();
         fallback.release(Role::H8Open, key(3)).unwrap();
         assert_eq!((fallback.census(), fallback.bytes()), (0, 0));
+    }
+
+    #[test]
+    fn resource_reservations_void_credit_counts_every_slot_and_link_read() {
+        // 512 standalone H8 members in the 4,096 staging table force
+        // multi-credit cleanup at 64 units. Each step's independently
+        // counted slot visits plus link reads (bucket-head,
+        // predecessor and target-successor loads across the key and
+        // id chains) must not exceed its credit, and the reported
+        // spent must match that count. The same void driven one unit
+        // at a time must also stay within one read per step.
+        const BULK: u64 = 512;
+        const BASE: u64 = 500_000;
+        for budget in [64usize, 1usize] {
+            let mut table = ReservationTable::try_new(4_096).unwrap();
+            for ordinal in 0..BULK {
+                table
+                    .insert(
+                        Role::H8Open,
+                        RoleKey {
+                            namespace: 0,
+                            value: BASE + ordinal,
+                        },
+                        None,
+                        10,
+                        (),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(table.population(Role::H8Open), BULK as usize);
+            let mut cursor = ReleaseRoleCursor::new();
+            let mut steps = 0;
+            let mut saw_partial = false;
+            loop {
+                table.reset_test_sweep_visits_for_test();
+                let (done, spent) =
+                    table.release_role_step(Role::H8Open, &mut cursor, budget);
+                let actual = table.test_sweep_visits_for_test();
+                assert!(
+                    spent <= budget,
+                    "credit {budget} reported {spent} above its budget"
+                );
+                assert!(
+                    actual <= budget,
+                    "credit {budget} performed {actual} leaf reads \
+                     (reported {spent})"
+                );
+                assert_eq!(
+                    spent, actual,
+                    "credit {budget} must debit every leaf read it performs"
+                );
+                steps += 1;
+                if done {
+                    break;
+                }
+                saw_partial = true;
+                assert!(steps < 20_000, "the void sweep must complete");
+            }
+            assert!(
+                saw_partial,
+                "credit {budget} must need several steps for 512 H8"
+            );
+            assert_eq!(table.population(Role::H8Open), 0);
+            assert_eq!((table.census(), table.bytes()), (0, 0));
+        }
     }
 }

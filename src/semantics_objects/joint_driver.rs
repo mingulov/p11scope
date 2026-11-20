@@ -391,6 +391,16 @@ impl JointCaptureOwner {
         &mut self,
         budget: &mut usize,
     ) -> Result<RecoveryProgress, RawQuantumRefusal> {
+        // A deferred adapter rejection (an unlocalized raw refusal not
+        // yet driven by its negative frame, or one whose frame was
+        // abandoned) finishes first under this budget: no collection
+        // runs over half-refused staging. Its result waits for its frame.
+        if self.adapter.rejection_pending() {
+            let (adapter, model) = self.parts();
+            if !adapter.drive_rejections(model, budget) {
+                return Ok(RecoveryProgress::Yielded);
+            }
+        }
         if self.adapter.invalidated
             || self.adapter.stopped
             || self.adapter.consumed_through == u64::MAX
@@ -412,14 +422,26 @@ impl JointCaptureOwner {
             if !resuming {
                 // A model-domain retirement the aborted recovery left
                 // mid-rows still completes first (its refusal already
-                // published); everything else is subsumed as before.
-                let standing = self
-                    .adapter
-                    .scoped_recovery
-                    .take()
-                    .and_then(|aborted| aborted.model_retire);
+                // published), and the effects it already applied ride
+                // the stream void's failure (they happened; their
+                // consumers must see them). The partial fence/wipe work
+                // is subsumed as before. The carried effects are paid
+                // on top of the stream void's own bound.
+                let (standing, carried) = match self.adapter.scoped_recovery.take() {
+                    Some(aborted) => (aborted.model_retire, aborted.effects),
+                    None => (None, super::ObjectEffects::default()),
+                };
+                let carried_bytes = carried
+                    .effects
+                    .len()
+                    .checked_mul(2)
+                    .and_then(|slots| {
+                        slots.checked_mul(size_of::<crate::semantics_objects::ObjectEffect>())
+                    })
+                    .ok_or(RawQuantumRefusal::Capacity)?;
                 let bytes =
                     super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+                        .and_then(|bytes| bytes.checked_add(carried_bytes))
                         .ok_or(RawQuantumRefusal::Capacity)?;
                 let lease = self
                     .adapter
@@ -432,6 +454,7 @@ impl JointCaptureOwner {
                 let upper = self.adapter.consumed_through;
                 let mut recovery = self.adapter.begin_stream_recovery(upper, bytes, lease);
                 recovery.model_retire = standing;
+                recovery.effects = carried;
                 self.adapter.scoped_recovery = Some(recovery);
             }
         }
@@ -511,7 +534,13 @@ impl JointCaptureOwner {
             // stream-wide; scoped voids must not set it.
             self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
             self.last_void_scope = Some(JointVoidScope::Stream);
-            self.carry_pending_void(failure, recovery.bytes, recovery.lease);
+            self.carry_pending_void(
+                failure,
+                recovery.bytes,
+                recovery
+                    .lease
+                    .expect("a break void carries its prepaid lease"),
+            );
             return Ok(RecoveryProgress::Done(true));
         }
         let mut domains: Vec<crate::semantics_objects::ObjectDomain> = recovery
@@ -538,7 +567,13 @@ impl JointCaptureOwner {
             fence: Some(recovery.upper),
         };
         self.last_void_scope = Some(JointVoidScope::Scoped);
-        self.carry_pending_void(failure, recovery.bytes, recovery.lease);
+        self.carry_pending_void(
+            failure,
+            recovery.bytes,
+            recovery
+                .lease
+                .expect("a break void carries its prepaid lease"),
+        );
         Ok(RecoveryProgress::Done(true))
     }
 
@@ -2591,7 +2626,7 @@ impl RawJointQuantum {
                 self.disposal_gap(&owner.adapter, unlocalized)
             };
             if pre_key {
-                owner.adapter.refuse_disposed_raw(
+                owner.adapter.refuse_disposed_raw_deferred(
                     &mut owner.model,
                     self.affecting_images()
                         .filter(|image| open_images.contains(image)),
@@ -2599,7 +2634,7 @@ impl RawJointQuantum {
                     gap,
                 )
             } else {
-                owner.adapter.refuse_disposed_raw(
+                owner.adapter.refuse_disposed_raw_deferred(
                     &mut owner.model,
                     self.affecting_images(),
                     unlocalized,

@@ -1194,6 +1194,38 @@ impl RetainedFileFacts {
             .map(|(key, cursor)| (key.clone(), cursor.clone()))
             .collect()
     }
+
+    /// Whether the carried bundle holds any decode cursor: a bundle
+    /// without cursors keeps the legacy collection-gap verdict path
+    /// verbatim, so single-shot postures never see the progress states.
+    pub(crate) fn has_decode_cursors(&self) -> bool {
+        !self.decode_cursors.is_empty()
+    }
+
+    /// `(done, total, tables)` over the whole carried bundle: completed
+    /// objects, cursor-known objects, and cached tables decoded so far.
+    /// `None` when no cursor is unfinished (no live in-progress gap to
+    /// name). Totals only — per-view wording stays with the scan.
+    pub(crate) fn scan_progress_totals(&self) -> Option<(usize, usize, usize)> {
+        let total = self.decode_cursors.len();
+        if total == 0 {
+            return None;
+        }
+        let done = self
+            .decode_cursors
+            .values()
+            .filter(|cursor| cursor.complete)
+            .count();
+        if done == total {
+            return None;
+        }
+        let tables = self
+            .decode_cursors
+            .values()
+            .map(|cursor| cursor.cached_tables.len())
+            .sum();
+        Some((done, total, tables))
+    }
 }
 
 /// Accounted bytes of the carried decode-cursor map. Kept separate from

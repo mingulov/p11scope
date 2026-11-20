@@ -44,8 +44,9 @@ use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
-    BudgetConsumption, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest,
-    ScannedModule, Skipped, scan_process_view_examined, scan_skip_truncates,
+    BudgetConsumption, COLLECTION_STOP_REASON, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome,
+    ScanRequest, ScannedModule, Skipped, WORK_CEILING_REASON, scan_process_view_examined,
+    scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
@@ -1294,6 +1295,20 @@ fn scan_pinned_member_inner(
     }
     for skip in pin_skips {
         gaps.push(PidGap::member(pid, skip));
+    }
+    // Resume member state: while this member holds unfinished cursors,
+    // drop its raw pass-budget stops (pinning and post-scan phases
+    // republish the sticky stop against a spent budget): the scan's
+    // in-progress gap names the continuation. Members without unfinished
+    // cursors keep every gap verbatim, so a stall stays loud.
+    if budget
+        .view_scan_progress(pid, generation.start_time)
+        .is_some()
+    {
+        gaps.retain(|gap| {
+            !(gap.reason.contains(WORK_CEILING_REASON)
+                || gap.reason.contains(COLLECTION_STOP_REASON))
+        });
     }
     let mapping_scan_completed = outcome.mapping_scan_completed();
     let (modules, status) = match outcome {

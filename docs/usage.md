@@ -3005,8 +3005,15 @@ every file it examines. One pass also shares a single 16M-unit
 discovery work allowance across every member it scans (each decoded
 table word costs one unit; snapshot bytes ride the I/O window, never
 the work allowance, so re-reads cannot stall a pass before any
-decode); an allowance reached mid-pass names its gap and the next
-pass continues with a renewed allowance. Each pass carries its
+decode). A provider larger than one pass resumes across passes from
+per-object decode cursors: each pass records how far every object's
+table and interface sweeps reached, and the next pass continues from
+those frontiers instead of restarting, oldest-unfinished-first, so
+any app size is found. An allowance reached mid-pass names its
+in-progress gap (done/total objects plus decoded tables) and the
+next pass continues with a renewed allowance; a run stopped early
+keeps one live in-progress gap in its terminal view instead of an
+`exhausted` final state. Each pass carries its
 file-derived inspection,
 export, loader and table-refusal facts into the next pass, keyed and
 pinned by file identity, size and change time. An unchanged object is read

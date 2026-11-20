@@ -1019,6 +1019,13 @@ impl Presentation {
         if let Some(gap) = silent_bootstrap_gap(&object_observations, semantic_edges.len(), &gaps) {
             gaps.push(gap);
         }
+        // A run stopped before its scans converged names the live
+        // in-progress state; per-pass in-progress gaps never accumulate,
+        // so this is the only terminal in-progress row, and a converged
+        // run shows none.
+        if let Some(gap) = coordinator.live_scan_progress_gap() {
+            gaps.push(gap);
+        }
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let dropped_pairs = coordinator.pruned_pair_totals();

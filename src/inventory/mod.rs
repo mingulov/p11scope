@@ -7161,17 +7161,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             let completion = self.coordinator.take_cgroup_completion().ok_or_else(|| {
                 anyhow::anyhow!("cgroup publication did not supply its owned completion")
             })?;
+            let warning = completion.driver_warning();
             cgroup.continuation = Some(completion.state);
             report.scan_callers = completion.scan_callers;
-            report.events.extend(completion.events);
-            if completion.outcome
-                != crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Complete
-            {
-                self.warn(&format!(
-                    "p11scope: cgroup collection incomplete: {}",
-                    completion.outcome.reason()
-                ));
+            if let Some(warning) = warning {
+                self.warn(&warning);
             }
+            report.events.extend(completion.events);
         }
         // The deferred scan seal runs post-commit on the cgroup path:
         // the commit above absorbed this pass's lowering (the mint's

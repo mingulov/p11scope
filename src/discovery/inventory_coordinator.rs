@@ -168,6 +168,41 @@ pub(crate) struct CgroupCompletion {
     pub(crate) admitted: usize,
     /// Validated callers in this pass, including already-published same images.
     pub(crate) scan_callers: usize,
+    /// Structured resume progress (done, total, tables) when this pass
+    /// holds unfinished decode cursors: the driver warning and the
+    /// terminal projection translate a work stop with genuine progress
+    /// into a continuation instead of a terminal exhaustion verdict.
+    /// `None` once converged (or when no scan ever ran).
+    pub(crate) progress: Option<(usize, usize, usize)>,
+}
+
+impl CgroupCompletion {
+    /// The driver's stderr line for this completion: a work stop with
+    /// genuine resumable progress warns as a continuation (done/total),
+    /// while completed passes stay silent and every other incomplete
+    /// outcome keeps its raw reason.
+    pub(crate) fn driver_warning(&self) -> Option<String> {
+        if self.outcome == ScopedCollectionOutcome::Complete {
+            return None;
+        }
+        match (self.outcome, self.progress) {
+            (
+                ScopedCollectionOutcome::Incomplete(
+                    crate::inspect_system::inventory_cgroup::ScopedCollectionGap::Membership(
+                        crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit,
+                    ),
+                ),
+                Some((done, total, tables)),
+            ) => Some(format!(
+                "p11scope: cgroup collection in progress: {}",
+                crate::discovery::scan_pass::scan_in_progress_reason(done, total, tables)
+            )),
+            _ => Some(format!(
+                "p11scope: cgroup collection incomplete: {}",
+                self.outcome.reason()
+            )),
+        }
+    }
 }
 
 /// Static reason carried when a scan defers past its deadline. The
@@ -842,6 +877,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// cgroup serial collector installs and takes this bundle; the other
     /// scopes keep their own budget lifetimes.
     cgroup_file_facts: crate::discovery::scan::RetainedFileFacts,
+    /// Last valid scan-progress summary while the carried bundle is out
+    /// with the worker: the completed pass stashes it as it takes the
+    /// bundle back, and collecting the next job stashes the same
+    /// summary as the bundle leaves. The live terminal gap reads this
+    /// (never the moved bundle), so progress stays named across the
+    /// handoff; a discarded worker keeps the last valid summary.
+    last_scan_progress: Option<(usize, usize, usize)>,
     scanned_owners: BTreeSet<ProcessViewId>,
     churned_owners: BTreeSet<ProcessViewId>,
     next_window: u64,
@@ -1395,6 +1437,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_cgroup: None,
             completed_cgroup: None,
             cgroup_file_facts: crate::discovery::scan::RetainedFileFacts::default(),
+            last_scan_progress: None,
             scanned_owners: BTreeSet::new(),
             churned_owners: BTreeSet::new(),
             next_window: 0,
@@ -5074,6 +5117,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.cgroup_collector_observed(state, limits, control, max_scan_pids, None)
     }
 
+    /// Stash the last valid progress summary before the bundle leaves
+    /// for a worker. Only non-empty bundles update the stash (an empty
+    /// take is a first pass or a post-discard restart, never new
+    /// information); a converged bundle clears it.
+    fn stash_scan_progress(&mut self) {
+        if self.cgroup_file_facts.has_decode_cursors() {
+            self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
+        }
+    }
+
+    /// The live in-progress gap for the terminal view: when decode
+    /// cursors are unfinished (a run stopped before converging), the
+    /// terminal names it with global done/total instead of leaving the
+    /// incompleteness silent. `None` once converged (or when no scan
+    /// ever ran): per-pass in-progress gaps never accumulate, so the
+    /// converged terminal shows no stale gap. Reads the carried bundle
+    /// first, the stashed summary while the worker owns the bundle.
+    pub(crate) fn live_scan_progress_gap(&self) -> Option<crate::inventory_present::GapView> {
+        self.cgroup_file_facts
+            .scan_progress_totals()
+            .or(self.last_scan_progress)
+            .map(|(done, total, tables)| crate::inventory_present::GapView {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: crate::discovery::scan_pass::SCAN_IN_PROGRESS_SUBJECT.to_string(),
+                reason: crate::discovery::scan_pass::scan_in_progress_reason(done, total, tables),
+                budget: None,
+                repeats: 1,
+            })
+    }
+
     pub(crate) fn cgroup_collector_observed(
         &mut self,
         state: CgroupWalkState,
@@ -5092,9 +5167,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Hand the previous pass's file-derived facts to this pass's fresh
         // budget. The take happens only after the request is known valid:
         // a refused collector keeps the facts for the next attempt.
+        // The root Arc clones first so the scope borrow ends before the
+        // stash and take borrow mutably.
+        let root = Arc::clone(dir);
+        self.stash_scan_progress();
         let carried = std::mem::take(&mut self.cgroup_file_facts);
         let request = CgroupCollectRequest {
-            root: Arc::clone(dir),
+            root,
             fence: self.cgroup_fence.issue(),
             state,
             limits,
@@ -5162,6 +5241,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // coordinator without facts, so the next pass re-reads instead of
         // reusing anything stale.
         self.cgroup_file_facts = collection.take_retained_file_facts();
+        self.stash_scan_progress();
         let work = collection.work();
         let events = self
             .adapter
@@ -5219,6 +5299,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             events: Vec::new(),
             admitted: 0,
             scan_callers: 0,
+            progress: None,
         });
     }
 
@@ -12787,14 +12868,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 });
             } else if outcome != ScopedCollectionOutcome::Complete {
                 allowed_callers.clear();
-                self.registry.record_gap(RegistryGap {
-                    caller: None,
-                    module: None,
-                    pid: None,
-                    subject: "cgroup scope transaction incomplete".into(),
-                    reason: outcome.reason().into(),
-                    budget: None,
-                });
+                // A shared-work stop with genuine resumable progress
+                // records no terminal verdict here: the per-pass view
+                // already names the continuation, and the live terminal
+                // gap does. Only stalls without resumable progress
+                // enter the terminal history.
+                let translated = matches!(
+                    outcome,
+                    ScopedCollectionOutcome::Incomplete(
+                        crate::inspect_system::inventory_cgroup::ScopedCollectionGap::Membership(
+                            crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit
+                        )
+                    )
+                ) && self.cgroup_file_facts.scan_progress_totals().is_some();
+                if !translated {
+                    self.registry.record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: None,
+                        subject: "cgroup scope transaction incomplete".into(),
+                        reason: outcome.reason().into(),
+                        budget: None,
+                    });
+                }
             } else {
                 cgroup_proof_complete = true;
             }
@@ -12886,6 +12982,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 events: completion.events,
                 admitted: completion.admitted,
                 scan_callers: completion.scan_callers,
+                progress: self.cgroup_file_facts.scan_progress_totals(),
             });
             // A cgroup-scope capture opens the same native lane, so its
             // pass seam releases departed native state exactly like the
@@ -20847,7 +20944,12 @@ pub(crate) mod tests {
     fn cgroup_passes_resume_when_the_scan_window_binds_first() {
         const ALLOWANCE: u64 = 30_000;
         const BLOB_BYTES: usize = 2_400_000;
-        const MAX_PASSES: usize = 15;
+        // A work-starved bracket clears its publication (flood contract),
+        // so the table publishes only once a pass completes both sweeps
+        // and the bracket inside the window (~28K words/pass over a
+        // 300K-word object, then the interface sweep alike): bound for
+        // full convergence, not first decode.
+        const MAX_PASSES: usize = 30;
         let dir = tempfile::tempdir().unwrap();
         let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
         let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
@@ -21157,7 +21259,12 @@ pub(crate) mod tests {
         use std::os::unix::fs::MetadataExt as _;
         const ALLOWANCE: u64 = 30_000;
         const BLOB_BYTES: usize = 2_400_000;
-        const MAX_PASSES: usize = 15;
+        // A work-starved bracket clears its publication (flood contract),
+        // so the table publishes only once a pass completes both sweeps
+        // and the bracket inside the window (~28K words/pass over a
+        // 300K-word object, then the interface sweep alike): bound for
+        // full convergence, not first decode.
+        const MAX_PASSES: usize = 30;
         let dir = tempfile::tempdir().unwrap();
         let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
         let provider_inode = std::fs::metadata(&provider).unwrap().ino();

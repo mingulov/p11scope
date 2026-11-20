@@ -5,6 +5,7 @@
 use super::MAX_UNSETTLED_STAGED;
 use super::reservations::{
     Refusal, ReleaseRoleCursor, ReservationId, ReservationTable, Role, RoleKey,
+    SingleReleaseCursor,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SEMANTIC_RESOURCE_LIMIT, SemanticResourceReserver,
@@ -70,6 +71,12 @@ pub(crate) struct StagingLedger {
     // slot/link work. No insert, merge or transfer may run until the
     // sweep completes (the machine defers collection meanwhile).
     h8_void: Option<ReleaseRoleCursor>,
+}
+
+/// Opaque cursor for one budgeted staged release: the disposal holds
+/// it across credits until its head's chain unlink finishes.
+pub(crate) struct LedgerReleaseCursor {
+    inner: Option<SingleReleaseCursor<Option<ResourceLease>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +161,64 @@ impl StagingLedger {
         self.table
             .as_ref()
             .map_or(0, |table| table.role_bytes_for_test(Role::H8Open) as u64)
+    }
+
+    /// Test-only list of retained staged keys as (namespace, value):
+    /// the high-occupancy twin finds the held head among them.
+    #[cfg(test)]
+    pub(crate) fn staged_keys_for_test(&self) -> Vec<(u64, u64)> {
+        self.table.as_ref().map_or(Vec::new(), |table| {
+            table
+                .staged_keys_for_test()
+                .iter()
+                .map(|key| (key.namespace, key.value))
+                .collect()
+        })
+    }
+
+    /// Test-only bucket for a model token: brute-force colliding
+    /// survivors around a staged head's bucket.
+    #[cfg(test)]
+    pub(crate) fn model_bucket_for_test(value: u64) -> usize {
+        ReservationTable::<Option<ResourceLease>>::model_bucket_for_test(value)
+    }
+
+    /// Test-only bucket for a staged (namespace, value) key.
+    #[cfg(test)]
+    pub(crate) fn staged_bucket_for_test(namespace: u64, value: u64) -> usize {
+        ReservationTable::<Option<ResourceLease>>::staged_bucket_for_test(namespace, value)
+    }
+
+    /// Test-only read of the lookup cost counter.
+    #[cfg(test)]
+    pub(crate) fn test_slot_visits_for_test(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.test_slot_visits_for_test())
+    }
+
+    /// Test-only reset of the lookup cost counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_slot_visits_for_test(&self) {
+        if let Some(table) = self.table.as_ref() {
+            table.reset_test_slot_visits_for_test();
+        }
+    }
+
+    /// Test-only read of the sweep cost counter.
+    #[cfg(test)]
+    pub(crate) fn test_sweep_visits_for_test(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.test_sweep_visits_for_test())
+    }
+
+    /// Test-only reset of the sweep cost counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_sweep_visits_for_test(&self) {
+        if let Some(table) = self.table.as_ref() {
+            table.reset_test_sweep_visits_for_test();
+        }
     }
 
     /// Audit custody uses this ledger's existing pool, never a supplied budget.
@@ -439,6 +504,66 @@ impl StagingLedger {
 
     pub(crate) fn release(&mut self, ticket: u64, _bytes: u64) {
         self.release_role(Role::H9Staged, Self::key(ticket));
+    }
+
+    /// Initial cursor for a collected staged release (native tag plus
+    /// ticket). Empty ledgers hold no work and complete at once.
+    pub(crate) fn release_cursor_collected(
+        &self,
+        native: crate::attach::capture::NativeDomainId,
+        ticket: u64,
+    ) -> LedgerReleaseCursor {
+        let inner = self.table.as_ref().map(|table| {
+            table.single_release_cursor(
+                Role::H9Staged,
+                RoleKey {
+                    namespace: native.journal_tag(),
+                    value: ticket,
+                },
+            )
+        });
+        LedgerReleaseCursor { inner }
+    }
+
+    /// Initial cursor for a plain staged release (namespace zero).
+    /// Empty ledgers hold no work and complete at once.
+    pub(crate) fn release_cursor(&self, ticket: u64) -> LedgerReleaseCursor {
+        let inner = self.table.as_ref().map(|table| {
+            table.single_release_cursor(Role::H9Staged, Self::key(ticket))
+        });
+        LedgerReleaseCursor { inner }
+    }
+
+    /// Drive one staged release for at most `budget` leaf units.
+    /// Returns whether the release completed and the units spent
+    /// (never above `budget`). Completion drops the removed charge,
+    /// refunding its pool lease exactly like the synchronous release.
+    pub(crate) fn release_step(
+        &mut self,
+        cursor: &mut LedgerReleaseCursor,
+        budget: usize,
+    ) -> (bool, usize) {
+        let Some(inner) = cursor.inner.as_mut() else {
+            return (true, 0);
+        };
+        let Some(table) = self.table.as_mut() else {
+            cursor.inner = None;
+            return (true, 0);
+        };
+        let (done, spent, actual, result) = table.release_single_step(inner, budget);
+        #[cfg(not(test))]
+        let _ = actual;
+        #[cfg(test)]
+        debug_assert_eq!(
+            spent, actual,
+            "budgeted release must debit every leaf unit it performs"
+        );
+        if done {
+            cursor.inner = None;
+            drop(result);
+        }
+        debug_assert!(spent <= budget);
+        (done, spent)
     }
 
     pub(crate) fn charge_h8open(&mut self, ordinal: u64, bytes: u64) -> Result<(), LedgerRefusal> {

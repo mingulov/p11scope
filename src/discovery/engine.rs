@@ -17323,18 +17323,36 @@ impl Engine {
     }
 
     /// The retirement justification for one view's committed pins
-    /// (admission owner 3): liveness-derived, one place. 3b1
-    /// preserves current retirements; 3b2 fails unreadable pins
-    /// closed (keep + named gap) instead of retiring them.
-    pub(crate) fn retirement_proof_for(&self, view: ProcessViewId) -> RetirementProof {
+    /// (admission owner 3): liveness-derived, one place. `None`
+    /// means the generation is unreadable — fail closed (keep pins
+    /// + named gap) instead of retiring it.
+    pub(crate) fn retirement_proof_for(&self, view: ProcessViewId) -> Option<RetirementProof> {
         let Some(live) = self.views.iter().find(|held| held.id() == view) else {
-            return classify_retirement(false, None, None);
+            return classify_retirement(false, Err("untracked".to_string()));
         };
-        classify_retirement(
-            true,
-            live.original_exited().ok(),
-            Some(live.still_the_same()),
-        )
+        classify_retirement(true, live.original_generation_state())
+    }
+
+    /// Retires one view's pins from a candidate set, or keeps them
+    /// with a named gap when the generation is unreadable (fail
+    /// closed: leak-then-prove beats retire-then-lose). The gap row
+    /// is fixed text, so repeat deferrals dedupe to one row.
+    fn retire_view_or_keep_with_gap(
+        &mut self,
+        pins: &mut crate::discovery::identity::PinnedObjects,
+        view: ProcessViewId,
+    ) {
+        match self.retirement_proof_for(view) {
+            Some(proof) => {
+                pins.retire_view_only_if_proven_gone(view, proof);
+            }
+            None => {
+                self.mark_partial(
+                    "live discovery generation",
+                    "a queued retirement could not verify the generation when applied; its committed pins were kept",
+                );
+            }
+        }
     }
 
     fn refresh_request_snapshot(&self) -> BTreeMap<u32, u64> {
@@ -18029,7 +18047,12 @@ impl Engine {
             .collect();
         let mut pinned = snapshot.pinned;
         for view in &removed_views {
-            let proof = self.retirement_proof_for(*view);
+            // Publication restore syncs pins to surviving views; the
+            // removed views are already untracked, so the prover always
+            // grants management removal (re-admit re-proves).
+            let proof = self
+                .retirement_proof_for(*view)
+                .unwrap_or(RetirementProof::OperatorRemoval);
             pinned.retire_view_only_if_proven_gone(*view, proof);
         }
         let modules: Vec<_> = snapshot
@@ -18706,8 +18729,7 @@ impl Engine {
         let assemble_start = crate::attach::monotonic_ns();
         let mut pinned = self.pinned.clone();
         for view in retirements {
-            let proof = self.retirement_proof_for(*view);
-            pinned.retire_view_only_if_proven_gone(*view, proof);
+            self.retire_view_or_keep_with_gap(&mut pinned, *view);
         }
         let skipped = pinned.reapply_rejected_keys(keys);
         let raw_modules = self
@@ -20916,8 +20938,7 @@ impl Engine {
         }
         let mut cleaned_pins = candidate.pinned.clone();
         for view in stale_views {
-            let proof = self.retirement_proof_for(*view);
-            cleaned_pins.retire_view_only_if_proven_gone(*view, proof);
+            self.retire_view_or_keep_with_gap(&mut cleaned_pins, *view);
         }
         let cleaned_modules: Vec<_> = candidate
             .modules
@@ -31156,8 +31177,7 @@ impl Engine {
         {
             let mut candidate_pins = self.pinned.clone();
             for view in removed {
-                let proof = self.retirement_proof_for(*view);
-                candidate_pins.retire_view_only_if_proven_gone(*view, proof);
+                self.retire_view_or_keep_with_gap(&mut candidate_pins, *view);
             }
             let mut pin_skipped = Vec::new();
             for (view, _, pins) in refreshed {
@@ -31190,8 +31210,7 @@ impl Engine {
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
         let mut candidate_pins = self.pinned.clone();
         for view in removed {
-            let proof = self.retirement_proof_for(*view);
-            candidate_pins.retire_view_only_if_proven_gone(*view, proof);
+            self.retire_view_or_keep_with_gap(&mut candidate_pins, *view);
         }
         let mut raw_modules: Vec<_> = self
             .modules
@@ -31682,9 +31701,12 @@ impl Engine {
         self.close_cgroup_admissions_at_removal(&victims);
         self.settle_leader_exits_at_removal(victims.iter().copied());
         for id in &victims {
-            // Capacity eviction is a management decision (the prover maps
-            // live views there); re-admit re-proves from scratch.
-            let proof = self.retirement_proof_for(*id);
+            // Capacity eviction is a management decision even when the
+            // victim's generation is unreadable: tracking ends
+            // regardless (pins follow views; re-admit re-proves).
+            let proof = self
+                .retirement_proof_for(*id)
+                .unwrap_or(RetirementProof::OperatorRemoval);
             self.pinned.retire_view_only_if_proven_gone(*id, proof);
             self.scan_inputs.remove(id);
         }

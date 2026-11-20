@@ -34,24 +34,23 @@ pub enum RetirementProof {
 }
 
 /// Classifies one view's retirement justification from live state:
-/// untracked views follow their views out; provably exited
-/// originals carry [`RetirementProof::Exited`]; changed generations
-/// carry [`RetirementProof::IdentityChanged`]; anything else is a
-/// management decision. 3b1 preserves current retirements; 3b2 fails
-/// the unreadable cases closed (keep pins + named gap).
+/// untracked views follow their views out (management); provably
+/// exited originals carry [`RetirementProof::Exited`] (reuse proves
+/// the original is gone); a live-same generation retires only by
+/// management decision; an unreadable generation yields nothing —
+/// fail closed (keep pins + named gap at the call site).
 pub fn classify_retirement(
     tracked: bool,
-    exited: Option<bool>,
-    same: Option<bool>,
-) -> RetirementProof {
+    state: Result<crate::process::OriginalGenerationState, String>,
+) -> Option<RetirementProof> {
+    use crate::process::OriginalGenerationState::{Current, Exited, Reused};
     if !tracked {
-        RetirementProof::OperatorRemoval
-    } else if exited == Some(true) {
-        RetirementProof::Exited
-    } else if same == Some(false) {
-        RetirementProof::IdentityChanged
-    } else {
-        RetirementProof::OperatorRemoval
+        return Some(RetirementProof::OperatorRemoval);
+    }
+    match state {
+        Ok(Exited) | Ok(Reused) => Some(RetirementProof::Exited),
+        Ok(Current) => Some(RetirementProof::OperatorRemoval),
+        Err(_) => None,
     }
 }
 
@@ -387,52 +386,53 @@ impl std::ops::Index<&u32> for RefreshQueue {
 mod tests {
     use super::*;
 
-    /// Owner 3b1 table: the retirement prover maps live state to
-    /// the one justification it admits. Untracked views follow
-    /// their views out (management); provably exited originals
-    /// carry Exited; changed generations carry IdentityChanged;
-    /// anything else is a management decision (3b1 preserves
-    /// current retirements; 3b2 fails the unreadable cases closed).
+    /// Owner 3b table: the retirement prover maps live state to
+    /// the one justification it admits, or nothing when the
+    /// generation is unreadable (fail closed: keep pins + named
+    /// gap). Untracked views follow their views out (management);
+    /// provably exited originals carry Exited (reuse proves the
+    /// original is gone); a live-same generation retires only by
+    /// management decision (capacity eviction); exec-changed
+    /// generations carry IdentityChanged. Replace/prune N/A: only
+    /// successful scans yield refreshed tuples (failures land in
+    /// `failed_scan_pids` + rows), so their incoming is proven by
+    /// construction.
     #[test]
-    fn admission_owner3b1_retirement_proofs() {
+    fn admission_owner3b_retirement_proofs() {
         use super::{RetirementProof, classify_retirement};
+        use crate::process::OriginalGenerationState::{Current, Exited, Reused};
         // Untracked views follow their views out whatever the pins say.
-        for exited in [None, Some(false), Some(true)] {
-            for same in [None, Some(false), Some(true)] {
-                assert_eq!(
-                    classify_retirement(false, exited, same),
-                    RetirementProof::OperatorRemoval,
-                    "untracked: {exited:?} {same:?}"
-                );
-            }
-        }
-        // A provably exited original carries Exited.
-        for same in [None, Some(false), Some(true)] {
+        for state in [
+            Ok(Current),
+            Ok(Exited),
+            Ok(Reused),
+            Err("unreadable".to_string()),
+        ] {
             assert_eq!(
-                classify_retirement(true, Some(true), same),
-                RetirementProof::Exited,
-                "exited: {same:?}"
+                classify_retirement(false, state.clone()),
+                Some(RetirementProof::OperatorRemoval),
+                "untracked: {state:?}"
             );
         }
-        // A changed generation carries IdentityChanged.
-        for exited in [None, Some(false)] {
+        // A provably exited original carries Exited; reuse proves
+        // the original is gone, so it carries Exited too.
+        for state in [Ok(Exited), Ok(Reused)] {
             assert_eq!(
-                classify_retirement(true, exited, Some(false)),
-                RetirementProof::IdentityChanged,
-                "changed: {exited:?}"
+                classify_retirement(true, state.clone()),
+                Some(RetirementProof::Exited),
+                "gone: {state:?}"
             );
         }
-        // Live-same views retire only by management decision
-        // (capacity eviction); re-admit re-proves. Unreadable pins
-        // map here in 3b1 (current behavior preserved); 3b2 fails
-        // them closed instead.
+        // A live-same generation retires only by management decision
+        // (capacity eviction); re-admit re-proves.
         assert_eq!(
-            classify_retirement(true, Some(false), Some(true)),
-            RetirementProof::OperatorRemoval
+            classify_retirement(true, Ok(Current)),
+            Some(RetirementProof::OperatorRemoval)
         );
+        // An unreadable generation keeps its pins (fail closed).
         assert_eq!(
-            classify_retirement(true, None, None),
-            RetirementProof::OperatorRemoval
+            classify_retirement(true, Err("unreadable".to_string())),
+            None
         );
     }
 

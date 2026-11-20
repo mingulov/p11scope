@@ -28597,6 +28597,44 @@ fn rt_add_deferral_budget_exhaustion_retries_pending_next_interval() {
     }));
 }
 
+/// Owner 3b2 twin: an unreadable generation keeps its committed pins
+/// with a named gap instead of retiring (fail closed:
+/// leak-then-prove beats retire-then-lose). The row projects generic
+/// (no new wire surface).
+#[test]
+fn unprovable_generation_keeps_pins_with_a_named_gap() {
+    let mut engine = Engine::empty();
+    // Pin while provable, then lose readability (hidepid-style): the
+    // committed pins must survive the retirement attempt.
+    let view = ProcessView::open(ProcessViewId(7), std::process::id()).unwrap();
+    engine.views.push(view);
+    let module = crate::discovery::identity::test_fixture::small_owned_module(&engine.views[0]);
+    let mut pins = pin_test_modules(&engine.views[0], std::slice::from_ref(&module));
+    assert!(pins.view_claims(ProcessViewId(7)).is_some());
+    engine.views[0] =
+        crate::process::unprovable_process_view_for_test(ProcessViewId(7), std::process::id())
+            .unwrap();
+    assert_eq!(engine.retirement_proof_for(ProcessViewId(7)), None);
+    engine.retire_view_or_keep_with_gap(&mut pins, ProcessViewId(7));
+    assert!(
+        pins.view_claims(ProcessViewId(7)).is_some(),
+        "unproven keeps its committed pins"
+    );
+    let row = engine
+        .counters
+        .object_skips
+        .iter()
+        .find(|skip| skip.subject == "live discovery generation")
+        .expect("the keep files its named gap");
+    assert_eq!(
+        row.reason,
+        "a queued retirement could not verify the generation when applied; its committed pins were kept"
+    );
+    let projected = crate::render::capture_skipped_out(row);
+    assert_eq!(projected.name, "discovery subject");
+    assert_eq!(projected.reason, "discovery unavailable");
+}
+
 /// Mutation caught: cancellation/shutdown finalization must turn every
 /// still-pending scan into published loss evidence.
 #[test]

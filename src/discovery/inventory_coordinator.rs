@@ -5101,8 +5101,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             control,
             max_scan_pids,
             scan_budget: self.collector_budget(
-                crate::discovery::scan::CaptureWorkBudget::for_inventory(work)
-                    .with_retained_file_facts(carried),
+                crate::discovery::scan::CaptureWorkBudget::for_inventory(
+                    crate::discovery::scan_pass::ScanPassOwner::cgroup_pass_limits(work),
+                )
+                .with_retained_file_facts(carried),
                 false,
             ),
             observer,
@@ -21825,7 +21827,9 @@ exit 0
             control: control.clone(),
             max_scan_pids: None,
             scan_budget: coordinator.collector_budget(
-                crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+                crate::discovery::scan::CaptureWorkBudget::for_inventory(
+                    crate::discovery::scan_pass::ScanPassOwner::cgroup_pass_limits(work),
+                ),
                 false,
             ),
             observer: None,

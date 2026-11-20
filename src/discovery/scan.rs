@@ -576,6 +576,12 @@ pub struct InventoryDiscoveryLimits {
 }
 
 impl InventoryDiscoveryLimits {
+    /// The retained-file ceilings, for pass-limit reshaping that keeps
+    /// the run's retained maps.
+    pub(crate) fn retained(&self) -> InventoryRetainedLimits {
+        self.retained
+    }
+
     pub fn new(
         per_operation_bytes: u64,
         window: InventoryWindowLimits,
@@ -1751,7 +1757,7 @@ impl CaptureWorkBudget {
     /// bytes collection-work conversion. Parsed entries are charged
     /// separately through `spend`, so converting the bytes too would
     /// debit one pandoc-sized walk (55 MB = 1.7M units) against the
-    /// 1 MiB cgroup collection allowance and stop the whole pass. Still
+    /// shared pass allowance and stop the whole pass early. Still
     /// polls the collection stop (0 units) so an operator stop or
     /// deadline reaches the read without charging it.
     pub(crate) fn record_window_io(&mut self, bytes: usize) {

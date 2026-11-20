@@ -16,9 +16,9 @@
 use super::scan::{
     ActiveInventoryWindow, BudgetDomain, COLLECTION_STOP_REASON, CollectionWork,
     DEFAULT_WORK_CEILING, DiscoveryPolicy, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InspectedFileKey, InventoryWindowLimits, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON,
-    ScanCheckpoint, ScanLimits, TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, WindowId,
-    WindowReceipt, WindowToken,
+    InspectedFileKey, InventoryDiscoveryLimits, InventoryWindowLimits, SCAN_CLOCK_REASON,
+    SCAN_DEADLINE_REASON, ScanCheckpoint, ScanLimits, TABLE_WINDOW_CEILING_REASON,
+    WORK_CEILING_REASON, WindowId, WindowReceipt, WindowToken,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -436,6 +436,27 @@ impl ScanPassOwner {
             hash_resume: BTreeMap::new(),
             hash_resume_seq: 0,
         }
+    }
+
+    /// The cgroup pass interval's discovery limits: the run's byte,
+    /// decode, retained and per-operation ceilings with a pass-sized work
+    /// window carrying the shared per-pass allowance — the same ceiling
+    /// as the shared pass allowance it charges 1:1, never the narrower
+    /// engine owner-scan window the run config sizes. A pass scans whole
+    /// members (megabytes of provider data each); an allowance reached
+    /// mid-pass names its gap and the next pass continues with a renewed
+    /// allowance.
+    pub(crate) fn cgroup_pass_limits(work: InventoryDiscoveryLimits) -> InventoryDiscoveryLimits {
+        let window = InventoryWindowLimits::new(
+            work.window.io_bytes,
+            DEFAULT_WORK_CEILING,
+            work.window.decoded_tables,
+            work.window.decoded_entries,
+            work.window.interfaces,
+        )
+        .expect("cgroup pass window keeps the run's non-zero ceilings");
+        InventoryDiscoveryLimits::new(work.per_operation_bytes, window, work.retained())
+            .expect("cgroup pass window keeps the run's byte ceiling")
     }
 
     pub(crate) fn cursor(&self) -> &ResumeCursor {

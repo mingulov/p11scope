@@ -1298,6 +1298,40 @@ struct RefreshInterest {
 /// this many entries.
 const REFRESH_STRIDE: usize = crate::discovery::engine::GRAPH_STRIDE;
 
+/// Most credits one cadence router observation may take: its join's
+/// whole bounded work is paid up front, and a join costing more than
+/// this is left to the tick's joined sweep (counted as deferred), so
+/// every join the cadence keeps fits one ordinary pass.
+const REFRESH_ACCEPT_CREDITS: usize = 8 * REFRESH_STRIDE;
+
+/// Position of a stepped cadence health read. The live read is a
+/// continuity audit of several native reads (the ftrace switch, each
+/// hook program's statistics, the sticky and fault cells); the cadence
+/// runs it one read per credit, so the service window is checked
+/// before every read. Program IDs and the miss growth seen so far ride
+/// the walk until its last read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HealthWalk {
+    pub(crate) step: u32,
+    pub(crate) ids: [u32; 4],
+    pub(crate) grew: bool,
+    pub(crate) sticky: u64,
+}
+
+/// One stepped health read's verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HealthStep {
+    /// More reads remain; resume from the walk.
+    More,
+    /// The complete read: the fault and sticky cells.
+    Read { fault: u64, sticky: u64 },
+    /// A hook missed since the last tick audit: the tick's audit
+    /// raises the era; the cadence applies nothing.
+    Moved,
+    /// A read or check failed (coverage latched as by the audit).
+    Failed,
+}
+
 /// Position of a strided static-side walk over the Session's link
 /// registry for one receipt slot: the next link, the next member slot
 /// inside it, and the sides found so far. Meaningful only under the
@@ -1354,9 +1388,10 @@ impl<T> std::ops::DerefMut for Revised<T> {
 
 /// Take-refresh cadence telemetry (diagnostic only, counts only):
 /// keys re-scanned, cursor yields that kept work for a later pass,
-/// interests consumed without a scan (a stale key or a full queue),
-/// health moves deferred to the next tick's audit, and paid-for
-/// progress a foreign change discarded (re-earned on a later pass).
+/// interests consumed without a scan or refused at ingress (a stale
+/// key, a full or contended queue), work deferred to the next tick (a
+/// moved health read, or a join too large for a cadence pass), and
+/// paid-for progress a foreign change discarded (re-earned later).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TakeRefreshCounts {
     pub(crate) scans: u64,
@@ -1381,15 +1416,15 @@ struct HeldRefresh {
     stage: RefreshStage,
 }
 
-/// Resumable cadence stages after the pick (which pays for the storage
-/// snapshot). Every stage is one credit unit, debited before its work,
-/// except `Accept`, whose router join walks the pending table and pays
-/// its leaf units up front. Pre-scan progress carries the attachment
-/// revision it was proven under; a scan result carries the router
-/// revision it was taken against as well.
+/// Resumable cadence stages after the pick (a memory lookup). Every
+/// stage is one credit unit, debited before its native read, except
+/// `Accept`, whose router join pays its whole bounded work up front.
+/// Pre-scan progress carries the attachment revision it was proven
+/// under; a scan result carries the router revision it was taken
+/// against as well.
 enum RefreshStage {
-    /// Health read, accepted only as the unchanged steady state.
-    PreAudit,
+    /// Stepped health read, accepted only as the unchanged steady state.
+    PreAudit { walk: HealthWalk },
     /// DESCRIPTORS readback, one stride per credit.
     Readback { next: u32, session: u64 },
     /// Static-side walk, one stride per credit.
@@ -1398,8 +1433,14 @@ enum RefreshStage {
     Custody { session: u64 },
     /// One scan window, clamped to the service deadline.
     Scan { session: u64 },
-    /// Post-scan health read over the obtained result.
-    PostAudit(Box<ScannedRefresh>),
+    /// Stepped post-scan health read over the obtained result.
+    PostAudit {
+        scanned: Box<ScannedRefresh>,
+        walk: HealthWalk,
+    },
+    /// The Q1(b) storage_null sample, taken after the scan that
+    /// supplied the epochs (never carried from an earlier pass).
+    Storage(Box<ScannedRefresh>),
     /// Retained target and its file-identity check.
     Target(Box<ScannedRefresh>),
     /// Router observation and receipt.
@@ -1413,6 +1454,8 @@ struct ScannedRefresh {
     fence: u64,
     result: Result<ImageScanProof, ImageQueryRefusal>,
     watched: Option<RetainedInventoryTarget>,
+    /// The storage_null sample taken after this scan.
+    storage: Option<u64>,
     session: u64,
     router: u64,
 }
@@ -1439,11 +1482,10 @@ enum AcceptMode {
     },
 }
 
-/// Outcome of one joined-sweep key scan, shared by the tick's
-/// joined sweep and the cadence sweep: the guards, scan,
-/// audit and accept run as one behavior on both paths, so a
-/// future guard change cannot silently diverge the tick from
-/// the cadence re-observation.
+/// Outcome of one tick joined-sweep key scan. The cadence runs its
+/// own staged equivalent (`refresh_stage`: custody, scan, post-scan
+/// audit, storage sample, accept); a guard change here must be made
+/// there deliberately too.
 enum JoinedScanOutcome {
     /// The key scanned (attempted): counted, accepted or
     /// refused into the report.
@@ -1540,13 +1582,27 @@ trait CaptureIo {
     fn attachment_readback_len(&self) -> u32 {
         0
     }
-    /// One receipt readback stride (one lookup per entry).
+    /// One receipt readback stride (one lookup per entry), starting
+    /// no lookup at or after `deadline`: the entries compared, fewer
+    /// than `len` when the window closed mid-stride.
     fn attachment_readback_stride(
         &mut self,
         _start: u32,
-        _len: u32,
-    ) -> Result<(), CurrentReceiptRefusal> {
-        Ok(())
+        len: u32,
+        _deadline: Instant,
+    ) -> Result<u32, CurrentReceiptRefusal> {
+        Ok(len)
+    }
+    /// One step of the stepped health read (at most one native read).
+    /// Fixtures without a stepped audit read their whole health at once.
+    fn health_stride(&mut self, _walk: &mut HealthWalk) -> HealthStep {
+        match self.health() {
+            Ok(health) => HealthStep::Read {
+                fault: health.fault,
+                sticky: health.sticky,
+            },
+            Err(()) => HealthStep::Failed,
+        }
     }
     /// One static-side walk stride for a receipt slot. Fixtures
     /// without a link registry report both sides present.
@@ -1763,8 +1819,13 @@ impl CaptureIo for SessionIo<'_> {
         &mut self,
         start: u32,
         len: u32,
-    ) -> Result<(), CurrentReceiptRefusal> {
-        self.session.semantic_receipt_readback_stride(start, len)
+        deadline: Instant,
+    ) -> Result<u32, CurrentReceiptRefusal> {
+        self.session
+            .semantic_receipt_readback_stride(start, len, Some(deadline))
+    }
+    fn health_stride(&mut self, walk: &mut HealthWalk) -> HealthStep {
+        self.session.audit_image_continuity_step(walk)
     }
     fn attachment_sides_stride(&self, slot: u32, walk: &mut SidesWalk, units: usize) -> SidesStep {
         self.session
@@ -1873,6 +1934,9 @@ pub(crate) struct SemanticCapture {
     /// follows current truth and the retried take validates. Takes
     /// request under shared borrows; the tick drains.
     refresh_interests: Mutex<BTreeMap<(u64, u64, u32), RefreshInterest>>,
+    /// Refresh requests refused at ingress (a full queue or a
+    /// contended lock): counted in the cadence's dropped total.
+    refresh_ingress_refused: AtomicU64,
     /// Take-refresh keys re-scanned by cadence sweeps
     /// (diagnostic only): counted under the exclusive sweep
     /// borrow; the stop disclosure reads this beside the
@@ -2003,6 +2067,7 @@ impl SemanticCapture {
             miss_raises: 0,
             take_drift_tolerated: AtomicU64::new(0),
             refresh_interests: Mutex::new(BTreeMap::new()),
+            refresh_ingress_refused: AtomicU64::new(0),
             take_refresh_scans: 0,
             take_refresh_held: None,
             take_refresh_audit_deferred: false,
@@ -2151,10 +2216,11 @@ impl SemanticCapture {
     /// truth: the next tick re-observes it through the normal
     /// joined sweep, so the router follows current truth and the
     /// retried take validates. One interest per key (a repeat
-    /// request renews it); beyond the pending cap interests drop
-    /// silently and re-request as needed. Fail-soft throughout: a
-    /// dropped request only delays the refresh to the next raced
-    /// take, never fails it.
+    /// request renews it); beyond the pending cap, or on a contended
+    /// queue, the request is refused as a counted gap (see
+    /// [`Self::take_refresh_counts`]) and re-requested by the next
+    /// raced take. Fail-soft throughout: a refused request only
+    /// delays the refresh, never fails the take.
     pub(crate) fn request_partition_refresh(
         &self,
         image: ImageIdentity,
@@ -2163,10 +2229,12 @@ impl SemanticCapture {
         pid: u32,
     ) {
         let Ok(mut interests) = self.refresh_interests.try_lock() else {
+            self.refresh_ingress_refused.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let key = (image.task_cookie, image.exec_id, file_slot);
         if !interests.contains_key(&key) && interests.len() >= MAX_PENDING {
+            self.refresh_ingress_refused.fetch_add(1, Ordering::Relaxed);
             return;
         }
         interests.insert(
@@ -2260,10 +2328,15 @@ impl SemanticCapture {
                 .is_ok_and(|interests| !interests.is_empty())
     }
 
-    /// Take-refresh cadence telemetry (diagnostic only).
+    /// Take-refresh cadence telemetry (diagnostic only). The dropped
+    /// total includes requests refused at ingress.
     pub(crate) fn take_refresh_counts(&self) -> TakeRefreshCounts {
         TakeRefreshCounts {
             scans: self.take_refresh_scans,
+            dropped: self
+                .take_refresh_counts
+                .dropped
+                .saturating_add(self.refresh_ingress_refused.load(Ordering::Relaxed)),
             ..self.take_refresh_counts
         }
     }
@@ -2297,19 +2370,23 @@ impl SemanticCapture {
     ///
     /// Each stage is one credit unit, debited first, and runs only
     /// while credit remains and the service window is open: the
-    /// interest pick plus the storage snapshot, the health read, each
-    /// DESCRIPTORS readback stride and static-side walk stride of at
-    /// most [`REFRESH_STRIDE`] entries, the custody check, the scan,
-    /// the post-scan health read, and the retained target's identity
-    /// check. The router observation pays its pending-table walk and
-    /// resolutions up front. A spent credit or a closed window yields
-    /// with the held interest and its stage kept for the next pass.
+    /// interest pick, each native read of the stepped health audit,
+    /// each DESCRIPTORS readback stride (no lookup starts after the
+    /// window closes, even mid-stride) and static-side walk stride of
+    /// at most [`REFRESH_STRIDE`] entries, the custody check, the
+    /// scan, each read of the post-scan audit, the storage_null
+    /// sample tied to that scan, and the retained target's identity
+    /// check. The router observation pays its join's whole bounded
+    /// work up front; a join costing more than
+    /// [`REFRESH_ACCEPT_CREDITS`] is left to the tick. A spent credit
+    /// or a closed window yields with the held interest and its stage
+    /// kept for the next pass.
     /// Progress carries the attachment revision it was proven under,
     /// and a scan result the router revision it was taken against; a
     /// foreign change withholds the stale part (counted) and the
     /// interest re-earns it. Health that moved is never applied here:
-    /// the cursor defers it to the next tick's audit, withholds the
-    /// evidence and requeues the interest. At most one interest
+    /// the cursor defers it (and an oversized join) to the next tick,
+    /// withholds the evidence and requeues the interest. At most one interest
     /// starts per pass; stale interests are consumed and counted.
     /// Generic I/O variant; production wraps the live Session above,
     /// twins drive it with scripted I/O, and the substituted lane
@@ -2358,23 +2435,24 @@ impl SemanticCapture {
                 let Some((key, interest)) = self.take_one_refresh_interest() else {
                     break;
                 };
-                // The pick's credit pays the binding lookup and the
-                // storage read; a stale key is consumed on it.
+                // The pick's credit pays the binding lookup; a stale
+                // key is consumed on it. The storage_null sample waits
+                // for the scan it gates.
                 *budget -= 1;
                 let Some((endpoint, pin)) = self.refresh_binding(io, key, interest) else {
                     self.take_refresh_counts.dropped =
                         self.take_refresh_counts.dropped.saturating_add(1);
                     break;
                 };
-                // One storage_null snapshot per scan pass for the Q1(b) gate.
-                self.router.note_storage_null(io.storage_null());
                 self.take_refresh_held = Some(HeldRefresh {
                     key,
                     interest,
                     endpoint,
                     pin,
                     attached: true,
-                    stage: RefreshStage::PreAudit,
+                    stage: RefreshStage::PreAudit {
+                        walk: HealthWalk::default(),
+                    },
                 });
                 continue;
             };
@@ -2434,24 +2512,37 @@ impl SemanticCapture {
         }
     }
 
-    /// One health read accepted only as the unchanged steady state the
-    /// last applied audit left: same fault, no sticky, same miss
-    /// raises. Anything else (or a failed read) is left for the next
-    /// tick's audit to apply; the cursor never invalidates, resolves
-    /// or prunes from here.
-    fn refresh_health_steady(&mut self, io: &mut impl CaptureIo) -> bool {
-        let Ok(health) = io.health() else {
-            return false;
-        };
-        let (_, raises) = io.hook_miss_totals();
-        health.fault == self.fault
-            && health.sticky == 0
-            && self.sticky == 0
-            && raises == self.miss_raises
+    /// One step of the stepped health read (one native read, paid by
+    /// the caller). The complete read is accepted only as the
+    /// unchanged steady state the last applied audit left: same
+    /// fault, no sticky, same miss raises (`Some(true)`). Anything
+    /// else (a moved or failed read) is `Some(false)`, left for the
+    /// next tick's audit to apply; the cursor never invalidates,
+    /// resolves or prunes from here. `None`: more reads remain.
+    fn refresh_health_step(
+        &mut self,
+        io: &mut impl CaptureIo,
+        walk: &mut HealthWalk,
+    ) -> Option<bool> {
+        match io.health_stride(walk) {
+            HealthStep::More => None,
+            HealthStep::Read { fault, sticky } => {
+                let (_, raises) = io.hook_miss_totals();
+                Some(
+                    fault == self.fault
+                        && sticky == 0
+                        && self.sticky == 0
+                        && raises == self.miss_raises,
+                )
+            }
+            HealthStep::Moved | HealthStep::Failed => Some(false),
+        }
     }
 
-    /// Defer a moved or failed health read to the next tick's audit:
-    /// no further cadence I/O until it runs, the interest requeued.
+    /// Defer work to the next tick: a moved or failed health read (its
+    /// audit applies it) or a join too large for a cadence pass (its
+    /// joined sweep re-observes the key). No further cadence I/O until
+    /// the tick's audit runs; the interest is requeued for it.
     fn defer_refresh_audit(&mut self, key: (u64, u64, u32), interest: RefreshInterest) {
         self.take_refresh_audit_deferred = true;
         self.take_refresh_counts.deferred = self.take_refresh_counts.deferred.saturating_add(1);
@@ -2522,14 +2613,22 @@ impl SemanticCapture {
             held.stage = RefreshStage::Readback { next: 0, session };
             return RefreshFlow::Continue;
         }
-        match std::mem::replace(&mut held.stage, RefreshStage::PreAudit) {
-            RefreshStage::PreAudit => {
+        match std::mem::replace(
+            &mut held.stage,
+            RefreshStage::PreAudit {
+                walk: HealthWalk::default(),
+            },
+        ) {
+            RefreshStage::PreAudit { mut walk } => {
                 *budget -= 1;
-                if !self.refresh_health_steady(io) {
-                    self.defer_refresh_audit(held.key, held.interest);
-                    return RefreshFlow::Done;
-                }
-                held.stage = RefreshStage::Readback { next: 0, session };
+                held.stage = match self.refresh_health_step(io, &mut walk) {
+                    None => RefreshStage::PreAudit { walk },
+                    Some(true) => RefreshStage::Readback { next: 0, session },
+                    Some(false) => {
+                        self.defer_refresh_audit(held.key, held.interest);
+                        return RefreshFlow::Done;
+                    }
+                };
             }
             RefreshStage::Readback { next, session } => {
                 let total = io.attachment_readback_len();
@@ -2543,13 +2642,16 @@ impl SemanticCapture {
                 }
                 *budget -= 1;
                 let len = (total - next).min(REFRESH_STRIDE as u32);
-                held.stage = match io.attachment_readback_stride(next, len) {
-                    Ok(()) if next + len >= total => RefreshStage::Sides {
+                // A stride the window closed mid-way keeps its compared
+                // prefix: the loop yields and the next pass resumes at
+                // the first unread entry.
+                held.stage = match io.attachment_readback_stride(next, len, service_deadline) {
+                    Ok(read) if next + read.min(len) >= total => RefreshStage::Sides {
                         walk: SidesWalk::default(),
                         session,
                     },
-                    Ok(()) => RefreshStage::Readback {
-                        next: next + len,
+                    Ok(read) => RefreshStage::Readback {
+                        next: next + read.min(len),
                         session,
                     },
                     Err(_) => {
@@ -2631,23 +2733,34 @@ impl SemanticCapture {
                     self.release_refresh(held.key, held.interest);
                     return RefreshFlow::Done;
                 }
-                held.stage = RefreshStage::PostAudit(Box::new(ScannedRefresh {
-                    job,
-                    fence,
-                    result,
-                    watched: None,
-                    session,
-                    router: Revised::revision(&self.router),
-                }));
+                held.stage = RefreshStage::PostAudit {
+                    scanned: Box::new(ScannedRefresh {
+                        job,
+                        fence,
+                        result,
+                        watched: None,
+                        storage: None,
+                        session,
+                        router: Revised::revision(&self.router),
+                    }),
+                    walk: HealthWalk::default(),
+                };
             }
-            RefreshStage::PostAudit(scanned) => {
+            RefreshStage::PostAudit { scanned, mut walk } => {
                 if !self.refresh_scan_current(io, held, &scanned) {
                     return RefreshFlow::Done;
                 }
                 *budget -= 1;
-                if !self.refresh_health_steady(io) {
-                    self.defer_refresh_audit(held.key, held.interest);
-                    return RefreshFlow::Done;
+                match self.refresh_health_step(io, &mut walk) {
+                    None => {
+                        held.stage = RefreshStage::PostAudit { scanned, walk };
+                        return RefreshFlow::Continue;
+                    }
+                    Some(true) => {}
+                    Some(false) => {
+                        self.defer_refresh_audit(held.key, held.interest);
+                        return RefreshFlow::Done;
+                    }
                 }
                 if io.now() >= scanned.job.deadline {
                     self.refuse_refresh_scan(&scanned.job, ImageQueryRefusal::Deadline, report);
@@ -2658,6 +2771,17 @@ impl SemanticCapture {
                     self.refuse_refresh_scan(&scanned.job, refusal, report);
                     return RefreshFlow::Done;
                 }
+                held.stage = RefreshStage::Storage(scanned);
+            }
+            RefreshStage::Storage(mut scanned) => {
+                if !self.refresh_scan_current(io, held, &scanned) {
+                    return RefreshFlow::Done;
+                }
+                *budget -= 1;
+                // Q1(b): sampled after the scan, so a storage_null move
+                // the scan's epochs could reflect is always seen (the
+                // native miss arm counts before it globalizes).
+                scanned.storage = io.storage_null();
                 held.stage = if held.attached {
                     RefreshStage::Target(scanned)
                 } else {
@@ -2681,12 +2805,25 @@ impl SemanticCapture {
                     self.release_refresh(held.key, held.interest);
                     return RefreshFlow::Done;
                 }
-                // The observation joins every pending call of the key:
-                // it walks the router's pending table and emits each
-                // resolution, so it pays both up front (bounded by the
-                // pending cap).
-                let units = self.router.pending_len().saturating_mul(2);
-                let cost = 1 + units.div_ceil(REFRESH_STRIDE);
+                let Ok(proof) = &scanned.result else {
+                    return RefreshFlow::Done;
+                };
+                // The observation's mapping comparison and its joins
+                // (every pending row visited, each matching row's epoch,
+                // range and partition search) pay their whole bounded
+                // work up front. A join no cadence pass may buy is the
+                // tick's to make.
+                // Units: the router's bound, plus one emission per
+                // resolved pending row.
+                let units = self
+                    .router
+                    .observe_work_bound(proof)
+                    .saturating_add(self.router.pending_len());
+                let cost = units.div_ceil(REFRESH_STRIDE).max(1);
+                if cost > REFRESH_ACCEPT_CREDITS {
+                    self.defer_refresh_audit(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
                 if *budget < cost {
                     held.stage = RefreshStage::Accept(scanned);
                     return RefreshFlow::Yield;
@@ -2697,8 +2834,11 @@ impl SemanticCapture {
                     fence,
                     result,
                     watched,
+                    storage,
                     ..
                 } = *scanned;
+                // The sample tied to this scan gates its observation.
+                self.router.note_storage_null(storage);
                 if let Ok(proof) = result {
                     self.accept_scan_with(
                         io,
@@ -2718,11 +2858,12 @@ impl SemanticCapture {
     }
 
     /// Scan one joined-sweep key: the tick's per-key guards, scan,
-    /// post-scan audit and accept, shared with the cadence sweep.
-    /// `birth_cut` is the tick's cut for call-driven interests and
-    /// `None` for refresh interests (no birth offered). The tick
-    /// advances its cyclic cursor on `Scanned`; the cadence sweep
-    /// leaves the cursor alone.
+    /// post-scan audit and accept (tick only; the cadence runs the
+    /// staged equivalent in `refresh_stage`, which a guard change here
+    /// must follow deliberately). `birth_cut` is the tick's cut for
+    /// call-driven interests and `None` for refresh interests (no
+    /// birth offered). The tick advances its cyclic cursor on
+    /// `Scanned`.
     fn scan_one_joined_key(
         &mut self,
         io: &mut impl CaptureIo,
@@ -5321,7 +5462,7 @@ impl SemanticCapture {
             {
                 break;
             }
-            // One shared per-key scan with the cadence sweep; the
+            // One per-key scan (the cadence stages its own); the
             // cursor advances per scanned key, as before (its move
             // from before the scan to after is unobservable: the
             // cursor is only read at the next sweep start).

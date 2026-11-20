@@ -896,6 +896,10 @@ pub(crate) struct InstanceRouter {
     /// coverage failure, proven absence or retirement drops it.
     era_carry: BTreeMap<(ImageKey, u32), Observed>,
     carry_ranges: usize,
+    /// Test-only join work meter: pending rows visited plus the ranges
+    /// and partitions each routing decision compared.
+    #[cfg(test)]
+    join_units: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct ObservationLoss {
@@ -980,7 +984,22 @@ impl InstanceRouter {
             miss_era_pending: false,
             era_carry: BTreeMap::new(),
             carry_ranges: 0,
+            #[cfg(test)]
+            join_units: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Join work done so far (test-only meter): pending rows visited
+    /// and the ranges and partitions routing decisions compared.
+    #[cfg(test)]
+    pub(crate) fn join_units_for_test(&self) -> usize {
+        self.join_units.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn meter_join(&self, units: usize) {
+        self.join_units
+            .fetch_add(units, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn instances_minted(&self) -> usize {
@@ -1859,6 +1878,49 @@ impl InstanceRouter {
         )
     }
 
+    /// An upper bound on the elementary work (entries visited or
+    /// compared) one [`Self::observe`] of `proof` does against the
+    /// router as it stands: the epoch-list search, the appeared-range
+    /// check, the mapping comparisons (sort and merge) against the back
+    /// and carried observations, the partition mint, and every pending
+    /// row's visit plus, for a matching row, its routing decision
+    /// (lookups, epoch search, range and partition scans). Frees are
+    /// not counted. A caller that pays this before observing has paid
+    /// for every comparison the observation and its joins can make.
+    pub(crate) fn observe_work_bound(&self, proof: &ImageScanProof) -> usize {
+        let key = (ImageKey::from(proof.image()), proof.file_slot());
+        let fresh = proof.ranges().len();
+        let list = self.observed.get(&key);
+        let entries = list.map_or(0, VecDeque::len);
+        let widest = list
+            .into_iter()
+            .flatten()
+            .map(|observed| observed.ranges.len() + observed.partitions.len())
+            .max()
+            .unwrap_or(0)
+            // The new observation's own ranges and partitions.
+            .max(fresh.saturating_mul(2));
+        let back = list
+            .and_then(VecDeque::back)
+            .map_or(0, |observed| observed.ranges.len());
+        let carried = self
+            .era_carry
+            .get(&key)
+            .map_or(0, |observed| observed.ranges.len());
+        let log = |n: usize| n.max(2).ilog2() as usize;
+        let sort = |n: usize| n.saturating_mul(2 + log(n));
+        // Fixed-cost lookups (sets and maps of bounded size) per decision.
+        const LOOKUPS: usize = 8;
+        let observation = LOOKUPS
+            .saturating_add(entries)
+            .saturating_add(fresh.saturating_mul(2 + log(widest)))
+            .saturating_add(sort(back.saturating_add(fresh)))
+            .saturating_add(sort(carried.saturating_add(fresh)))
+            .saturating_add(fresh.saturating_mul(2));
+        let route = LOOKUPS.saturating_add(entries).saturating_add(widest);
+        observation.saturating_add(self.pending.len().saturating_mul(route))
+    }
+
     #[cfg(test)]
     pub(crate) fn observe_legacy(
         &mut self,
@@ -2329,6 +2391,8 @@ impl InstanceRouter {
             };
         };
         if let Some(observed) = list.iter().find(|o| o.epochs.matches(&entry)) {
+            #[cfg(test)]
+            self.meter_join(observed.ranges.len() + observed.partitions.len());
             let route = route_ip(observed, facts);
             let tainted = observed.continued_across_global && matches!(route, Route::Joined(_));
             return (route, tainted);
@@ -2355,6 +2419,8 @@ impl InstanceRouter {
         let mut kept = VecDeque::with_capacity(self.pending.len());
         let pending = std::mem::take(&mut self.pending);
         for call in pending {
+            #[cfg(test)]
+            self.meter_join(1);
             if ImageKey::from(call.facts.image) != image || stamp_file(&call.facts) != Some(file) {
                 kept.push_back(call);
                 continue;

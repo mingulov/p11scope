@@ -719,6 +719,49 @@ impl InstanceTracking {
         )
     }
 
+    /// One step of the cadence's stepped health read: at most one
+    /// native read per call (the ftrace switch, one hook program's
+    /// statistics, the sticky cell, the fault cell), with the audit's
+    /// checks. Read-only: it never raises the fault era or moves the
+    /// miss baseline, so a grown miss is `Moved` and the tick's next
+    /// audit (which re-reads the monotonic counters) raises it. A
+    /// failed check latches coverage, exactly as the audit does.
+    pub(super) fn audit_step(
+        &self,
+        ebpf: &Ebpf,
+        coverage: &super::image_query::CoverageControl,
+        walk: &mut crate::semantic_capture::HealthWalk,
+    ) -> crate::semantic_capture::HealthStep {
+        audit_image_hooks_step_with(
+            coverage,
+            self.refused.is_none(),
+            self.links.len(),
+            &self.program_ids,
+            &self.active_program_names(),
+            walk,
+            || Ok(std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")?),
+            |name| {
+                let fd = ebpf
+                    .program(name)
+                    .with_context(|| format!("program {name}"))?
+                    .fd()
+                    .with_context(|| format!("program {name} fd"))?;
+                prog_stats(fd.as_fd())
+            },
+            |name| {
+                Ok(self
+                    .hook_misses
+                    .lock()
+                    .map_err(|_| anyhow!("image hook miss baseline poisoned"))?
+                    .get(name)
+                    .copied()
+                    .unwrap_or(0))
+            },
+            || InstanceMaps { ebpf }.sticky(),
+            || InstanceMaps { ebpf }.fault(),
+        )
+    }
+
     fn load_hooks(ebpf: &mut Ebpf, btf: &Btf) -> Result<LoadedInstancePrograms> {
         let host =
             super::host_btf::shared().context("loading required vmlinux BTF for instance hooks")?;
@@ -2554,48 +2597,102 @@ fn validate_hook_health_with(
     read_ftrace: impl FnOnce() -> Result<String>,
     read_stats: impl FnOnce() -> Result<Vec<(&'static str, HookStats)>>,
 ) -> Result<BTreeMap<&'static str, u32>> {
+    check_hook_links(link_count)?;
+    check_ftrace(&read_ftrace()?)?;
+    let mut ids = BTreeMap::new();
+    for (name, stats) in read_stats()? {
+        check_hook_stat(expected, name, &stats)?;
+        ensure!(
+            ids.insert(name, stats.program_id).is_none(),
+            "image hook identity/statistics unavailable"
+        );
+    }
+    check_hook_ids(ids.values().copied())?;
+    Ok(ids)
+}
+
+/// Every instance hook is attached.
+fn check_hook_links(link_count: usize) -> Result<()> {
     ensure!(
         link_count == INSTANCE_PROGRAMS.len(),
         "partial image hook attachment"
     );
+    Ok(())
+}
+
+/// The ftrace switch the hooks need is on.
+fn check_ftrace(enabled: &str) -> Result<()> {
     ensure!(
-        read_ftrace()?.trim() == "1",
+        enabled.trim() == "1",
         "ftrace must be enabled for image continuity"
     );
-    let mut ids = BTreeMap::new();
-    for (name, stats) in read_stats()? {
-        // A load baseline names the active hook set (legacy or 7.3+);
-        // without one only the legacy names validate.
-        let known = match expected {
-            Some(baseline) => baseline.contains_key(name),
-            None => INSTANCE_PROGRAMS
-                .iter()
-                .any(|(required, _)| *required == name),
-        };
+    Ok(())
+}
+
+/// One hook program's statistics name a known program with its loaded
+/// identity. A load baseline names the active hook set (legacy or
+/// 7.3+); without one only the legacy names validate.
+fn check_hook_stat(
+    expected: Option<&BTreeMap<&'static str, u32>>,
+    name: &str,
+    stats: &HookStats,
+) -> Result<()> {
+    let known = match expected {
+        Some(baseline) => baseline.contains_key(name),
+        None => INSTANCE_PROGRAMS
+            .iter()
+            .any(|(required, _)| *required == name),
+    };
+    ensure!(
+        stats.program_id != 0 && known,
+        "image hook identity/statistics unavailable"
+    );
+    if let Some(expected) = expected {
         ensure!(
-            stats.program_id != 0 && known && ids.insert(name, stats.program_id).is_none(),
-            "image hook identity/statistics unavailable"
+            expected.get(name) == Some(&stats.program_id),
+            "image hook identity changed"
         );
-        if let Some(expected) = expected {
-            ensure!(
-                expected.get(name) == Some(&stats.program_id),
-                "image hook identity changed"
-            );
-        }
     }
+    Ok(())
+}
+
+/// The complete hook set: one distinct program ID per instance hook.
+fn check_hook_ids(ids: impl Iterator<Item = u32>) -> Result<()> {
+    let ids: Vec<u32> = ids.collect();
     ensure!(
         ids.len() == INSTANCE_PROGRAMS.len(),
         "missing image hook statistics"
     );
     ensure!(
-        ids.values()
+        ids.iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>()
             .len()
             == ids.len(),
         "image hook program IDs collide"
     );
-    Ok(ids)
+    Ok(())
+}
+
+/// One hook's recursion-miss counter against the last audit's
+/// baseline: whether it grew. A counter that went backwards, or any
+/// miss of the exec-release hook, is permanent.
+fn check_hook_miss(name: &str, now: u64, before: u64) -> Result<bool> {
+    ensure!(now >= before, "image hook miss counter regressed");
+    ensure!(
+        now == before || (name != INSTANCE_PROGRAMS[3].0 && name != EXEC_RELEASE_MMAP_PROGRAM),
+        "image exec-release hook missed"
+    );
+    Ok(now > before)
+}
+
+/// The fault and sticky cells an audit may accept.
+fn check_fault_cells(sticky: u64, fault: u64) -> Result<()> {
+    ensure!(
+        sticky == 0 && fault <= u64::from(u32::MAX),
+        "instance continuity fault/exhaustion"
+    );
+    Ok(())
 }
 
 fn activate_image_coverage_with(
@@ -2615,6 +2712,74 @@ fn activate_image_coverage_with(
         coverage.fail();
     }
     result
+}
+
+/// One step of the stepped, read-only health audit (see
+/// `InstanceTracking::audit_step`): step 0 reads the ftrace switch, one
+/// step per hook program reads its statistics, then the sticky cell,
+/// then the fault cell. Each step starts at most one of the injected
+/// native reads. A grown miss is `Moved` (no raise, no baseline move);
+/// any failed read or check latches coverage and is `Failed`.
+#[allow(clippy::too_many_arguments)] // Each live read stays an injectable seam for the stepped-audit twins.
+pub(super) fn audit_image_hooks_step_with(
+    coverage: &super::image_query::CoverageControl,
+    active: bool,
+    link_count: usize,
+    expected: &BTreeMap<&'static str, u32>,
+    names: &[&'static str],
+    walk: &mut crate::semantic_capture::HealthWalk,
+    read_ftrace: impl FnOnce() -> Result<String>,
+    read_stat: impl FnOnce(&'static str) -> Result<HookStats>,
+    baseline: impl FnOnce(&'static str) -> Result<u64>,
+    read_sticky: impl FnOnce() -> Result<u64>,
+    read_fault: impl FnOnce() -> Result<u64>,
+) -> crate::semantic_capture::HealthStep {
+    use crate::semantic_capture::HealthStep;
+    let result = (|| -> Result<HealthStep> {
+        ensure!(active && coverage.enabled(), "image continuity unavailable");
+        ensure!(
+            names.len() == walk.ids.len(),
+            "image hook identity/statistics unavailable"
+        );
+        let step = walk.step as usize;
+        walk.step = walk.step.saturating_add(1);
+        if step == 0 {
+            check_hook_links(link_count)?;
+            check_ftrace(&read_ftrace()?)?;
+            return Ok(HealthStep::More);
+        }
+        if let Some(&name) = names.get(step - 1) {
+            let stats = read_stat(name)?;
+            check_hook_stat(Some(expected), name, &stats)?;
+            walk.ids[step - 1] = stats.program_id;
+            walk.grew |= check_hook_miss(name, stats.recursion_misses, baseline(name)?)?;
+            if step == names.len() {
+                check_hook_ids(walk.ids.iter().copied())?;
+                if walk.grew {
+                    return Ok(HealthStep::Moved);
+                }
+            }
+            return Ok(HealthStep::More);
+        }
+        if step == names.len() + 1 {
+            walk.sticky = read_sticky()?;
+            return Ok(HealthStep::More);
+        }
+        let fault = read_fault()?;
+        check_fault_cells(walk.sticky, fault)?;
+        ensure!(
+            coverage.enabled(),
+            "image continuity failed during health audit"
+        );
+        Ok(HealthStep::Read {
+            fault,
+            sticky: walk.sticky,
+        })
+    })();
+    result.unwrap_or_else(|_| {
+        coverage.fail();
+        HealthStep::Failed
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // Each live read stays an injectable seam for the latch and fault-era twins.
@@ -2650,24 +2815,14 @@ pub(super) fn audit_image_hooks_with(
         // under an exec storm, so the latch costs nothing in practice.
         let mut grew = false;
         for (name, now) in &seen {
-            let before = misses.get(name).copied().unwrap_or(0);
-            ensure!(*now >= before, "image hook miss counter regressed");
-            ensure!(
-                *now == before
-                    || (*name != INSTANCE_PROGRAMS[3].0 && *name != EXEC_RELEASE_MMAP_PROGRAM),
-                "image exec-release hook missed"
-            );
-            grew |= *now > before;
+            grew |= check_hook_miss(name, *now, misses.get(name).copied().unwrap_or(0))?;
         }
         if grew {
             raise_fault()?;
         }
         *misses = seen;
         let (sticky, fault) = read_faults()?;
-        ensure!(
-            sticky == 0 && fault <= u64::from(u32::MAX),
-            "instance continuity fault/exhaustion"
-        );
+        check_fault_cells(sticky, fault)?;
         ensure!(
             coverage.enabled(),
             "image continuity failed during health audit"
@@ -2926,6 +3081,121 @@ mod tests {
             assert!(super::decode_prog_stats(&info, length).is_err());
         }
         assert!(super::decode_prog_stats(&info, 216).is_ok());
+    }
+
+    /// Run the stepped audit to its verdict over scripted reads,
+    /// counting the native reads each step starts.
+    fn stepped_audit(
+        coverage: &super::super::image_query::CoverageControl,
+        stats: &[(&'static str, super::HookStats)],
+        baseline: u64,
+        sticky: u64,
+        fault: u64,
+        link_count: usize,
+        ftrace: &str,
+    ) -> (crate::semantic_capture::HealthStep, Vec<usize>) {
+        use crate::semantic_capture::{HealthStep, HealthWalk};
+        let expected = healthy_hook_stats()
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect();
+        let names: Vec<&'static str> = super::INSTANCE_PROGRAMS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        let mut walk = HealthWalk::default();
+        let mut reads = Vec::new();
+        loop {
+            let count = std::cell::Cell::new(0);
+            let step = super::audit_image_hooks_step_with(
+                coverage,
+                true,
+                link_count,
+                &expected,
+                &names,
+                &mut walk,
+                || {
+                    count.set(count.get() + 1);
+                    Ok(ftrace.into())
+                },
+                |name| {
+                    count.set(count.get() + 1);
+                    stats
+                        .iter()
+                        .find(|(known, _)| *known == name)
+                        .map(|(_, stats)| *stats)
+                        .ok_or_else(|| anyhow::anyhow!("no statistics"))
+                },
+                |_| Ok(baseline),
+                || {
+                    count.set(count.get() + 1);
+                    Ok(sticky)
+                },
+                || {
+                    count.set(count.get() + 1);
+                    Ok(fault)
+                },
+            );
+            reads.push(count.get());
+            if step != HealthStep::More {
+                return (step, reads);
+            }
+            assert!(reads.len() <= 8, "the stepped audit ends");
+        }
+    }
+
+    /// The stepped cadence audit starts at most one native read per
+    /// step, accepts the healthy set, reports grown misses as a move
+    /// without raising, and latches coverage on every audit failure.
+    #[test]
+    fn production_stepped_hook_audit_reads_once_per_step() {
+        use crate::semantic_capture::HealthStep;
+        let coverage = super::super::image_query::CoverageControl::test_owner(true);
+        let (step, reads) = stepped_audit(&coverage, &healthy_hook_stats(), 0, 0, 3, 4, "1");
+        assert_eq!(
+            step,
+            HealthStep::Read {
+                fault: 3,
+                sticky: 0
+            }
+        );
+        assert_eq!(reads, vec![1; 7], "one native read per step");
+        assert!(coverage.enabled());
+        let mut grown = healthy_hook_stats();
+        grown[0].1.recursion_misses = 1;
+        let (step, _) = stepped_audit(&coverage, &grown, 0, 0, 3, 4, "1");
+        assert_eq!(step, HealthStep::Moved, "a grown miss is left to the tick");
+        assert!(coverage.enabled(), "a move is not a failure");
+        for case in 0..6 {
+            let coverage = super::super::image_query::CoverageControl::test_owner(true);
+            let mut stats = healthy_hook_stats();
+            let (mut baseline, mut sticky, mut fault, mut links, mut ftrace) = (0, 0, 0, 4, "1");
+            match case {
+                0 => ftrace = "0",
+                1 => links = 3,
+                2 => stats[1].1.program_id += 100,
+                3 => sticky = 1,
+                4 => fault = u64::from(u32::MAX) + 1,
+                _ => {
+                    // A regressed miss counter.
+                    baseline = 2;
+                }
+            }
+            let (step, _) =
+                stepped_audit(&coverage, &stats, baseline, sticky, fault, links, ftrace);
+            assert_eq!(step, HealthStep::Failed, "stepped case {case} was accepted");
+            assert!(!coverage.enabled(), "stepped case {case} latches coverage");
+        }
+        let mut exec = healthy_hook_stats();
+        exec[3].1.recursion_misses = 1;
+        let coverage = super::super::image_query::CoverageControl::test_owner(true);
+        let (step, _) = stepped_audit(&coverage, &exec, 0, 0, 0, 4, "1");
+        assert_eq!(
+            step,
+            HealthStep::Failed,
+            "an exec-release miss is permanent"
+        );
+        assert!(!coverage.enabled());
     }
 
     #[test]

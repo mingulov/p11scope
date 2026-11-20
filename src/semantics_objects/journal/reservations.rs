@@ -160,7 +160,7 @@ impl<C> TableSlot<C> {
 /// merge or transfer until the sweep completes.
 pub(super) struct ReleaseRoleCursor {
     next_slot: usize,
-    pending_key: Option<PendingUnlink>,
+    pending_key: Option<PendingKeyUnlink>,
     pending_alias_slot: Option<usize>,
     pending_alias_lane: usize,
     pending_alias_unlink: Option<PendingUnlink>,
@@ -176,6 +176,24 @@ struct PendingUnlink {
     /// target-successor load still owns one leaf unit: the next step
     /// reads the successor and completes the splice.
     splice_ready: bool,
+}
+
+/// One charged slot snapshot: the retained key for the visited role
+/// (if any), occupancy, other-role vacancy, and aliases.
+struct SlotSnapshot {
+    key: Option<RoleKey>,
+    occupied: bool,
+    other_vacant: bool,
+    aliases: [Option<ReservationId>; ROLES],
+}
+
+/// One swept membership's key unlink with its visit snapshot: whether
+/// the slot vacates once this membership leaves, plus its aliases for
+/// the alias-unlink queue. Retained (never re-read) across yields.
+struct PendingKeyUnlink {
+    unlink: PendingUnlink,
+    other_vacant: bool,
+    aliases: [Option<ReservationId>; ROLES],
 }
 
 impl ReleaseRoleCursor {
@@ -320,6 +338,8 @@ enum SingleReleaseState<C> {
         bucket: usize,
         node: u16,
         result: Option<(usize, C)>,
+        other_vacant: bool,
+        aliases: [Option<ReservationId>; ROLES],
     },
     UnlinkingAliases {
         slot: usize,
@@ -514,6 +534,37 @@ impl<C> ReservationTable<C> {
                 .and_then(|op| op.roles[role.index()].as_ref())
                 .map(|member| member.key),
         )
+    }
+
+    /// Budgeted sweep/scan slot snapshot through the single gate: one
+    /// charged slot access (1 leaf). The caller retains the snapshot
+    /// across yields, so later vacancy and alias decisions never
+    /// re-read the slot.
+    fn budgeted_slot_snapshot(
+        &self,
+        at: usize,
+        role: Role,
+        budget: &mut LeafBudget,
+    ) -> Option<SlotSnapshot> {
+        if !budget.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        let operation = self.slots[at].operation.as_ref();
+        Some(SlotSnapshot {
+            key: operation
+                .and_then(|op| op.roles[role.index()].as_ref())
+                .map(|member| member.key),
+            occupied: operation.is_some(),
+            other_vacant: operation.is_none_or(|op| {
+                op.roles
+                    .iter()
+                    .enumerate()
+                    .all(|(lane, member)| lane == role.index() || member.is_none())
+            }),
+            aliases: operation.map_or([None; ROLES], |op| op.aliases),
+        })
     }
 
     /// Push a node onto its bucket chain. State is taken explicitly
@@ -908,14 +959,14 @@ impl<C> ReservationTable<C> {
                 continue;
             }
             if let Some(mut pending) = cursor.pending_key.take() {
-                let done = self.chain_unlink_step(&mut pending, gate);
+                let done = self.chain_unlink_step(&mut pending.unlink, gate);
                 if !done {
                     cursor.pending_key = Some(pending);
                     return false;
                 }
                 let at = cursor.next_slot;
-                if self.slot_is_vacant(at) {
-                    self.clear_vacated_slot(at, cursor);
+                if pending.other_vacant {
+                    self.clear_vacated_slot(at, cursor, pending.aliases);
                 } else {
                     cursor.next_slot = at + 1;
                 }
@@ -925,10 +976,10 @@ impl<C> ReservationTable<C> {
                 return true;
             }
             let at = cursor.next_slot;
-            let Some(key) = self.budgeted_slot_key(at, role, gate) else {
+            let Some(snapshot) = self.budgeted_slot_snapshot(at, role, gate) else {
                 return false;
             };
-            if let Some(key) = key {
+            if let Some(key) = snapshot.key {
                 let member = self.slots[at]
                     .operation
                     .as_mut()
@@ -938,49 +989,46 @@ impl<C> ReservationTable<C> {
                 self.bytes -= member.bytes;
                 drop(member);
                 if indexed {
-                    cursor.pending_key = Some(PendingUnlink {
-                        plane: KEY_LINKS,
-                        bucket: Self::key_bucket(role, key),
-                        node: node_code(at, role.index()),
-                        prev: INDEX_NONE,
-                        splice_ready: false,
+                    cursor.pending_key = Some(PendingKeyUnlink {
+                        unlink: PendingUnlink {
+                            plane: KEY_LINKS,
+                            bucket: Self::key_bucket(role, key),
+                            node: node_code(at, role.index()),
+                            prev: INDEX_NONE,
+                            splice_ready: false,
+                        },
+                        other_vacant: snapshot.other_vacant,
+                        aliases: snapshot.aliases,
                     });
                     continue;
                 }
+                if snapshot.other_vacant {
+                    self.clear_vacated_slot(at, cursor, snapshot.aliases);
+                    continue;
+                }
+                cursor.next_slot = at + 1;
+                continue;
             }
-            if self.slot_is_vacant(at) {
-                self.clear_vacated_slot(at, cursor);
+            if snapshot.occupied && snapshot.other_vacant {
+                self.clear_vacated_slot(at, cursor, snapshot.aliases);
             } else {
                 cursor.next_slot = at + 1;
             }
         }
     }
 
-    fn slot_is_vacant(&self, at: usize) -> bool {
-        // RED scaffolding (fix round 5): the vacancy re-read is a real
-        // leaf the sweep performs after its unlink leaves. Counted
-        // without a debit until the snapshot fold charges it.
-        #[cfg(test)]
-        self.test_unbudgeted_reads
-            .set(self.test_unbudgeted_reads.get() + 1);
-        self.slots[at]
-            .operation
-            .as_ref()
-            .is_some_and(|operation| operation.roles.iter().all(Option::is_none))
-    }
-
-    /// Clear a vacated slot and queue its alias unlinks in the cursor.
-    /// The slot's chain links stay (dangling but linked) until each alias
-    /// splice completes; lookups skip the cleared operation meanwhile.
-    /// Unindexed tables never linked aliases, so they finish immediately.
-    fn clear_vacated_slot(&mut self, at: usize, cursor: &mut ReleaseRoleCursor) {
-        // RED scaffolding (fix round 5): the alias snapshot is a real
-        // leaf read after the last unlink unit. Counted without a
-        // debit until the snapshot fold charges it.
-        #[cfg(test)]
-        self.test_unbudgeted_reads
-            .set(self.test_unbudgeted_reads.get() + 1);
-        let aliases = self.slots[at].operation.as_ref().unwrap().aliases;
+    /// Clear a vacated slot and queue its retained alias unlinks in
+    /// the cursor. The slot's chain links stay (dangling but linked)
+    /// until each alias splice completes; lookups skip the cleared
+    /// operation meanwhile. Unindexed tables never linked aliases, so
+    /// they finish immediately. Reads nothing: vacancy was decided
+    /// and aliases snapshotted at the charged visit.
+    fn clear_vacated_slot(
+        &mut self,
+        at: usize,
+        cursor: &mut ReleaseRoleCursor,
+        aliases: [Option<ReservationId>; ROLES],
+    ) {
         self.slots[at].operation = None;
         self.live -= 1;
         if !self.indexed() {
@@ -1461,13 +1509,11 @@ impl<C> ReservationTable<C> {
         }
     }
 
-    /// One budgeted step of a single membership release: at most
-    /// `budget` leaf units, each pre-debited through the single gate
-    /// (bucket-head load, candidate inspection, next-link/successor
-    /// load, linear slot visit — one unit each, never beyond
-    /// exhaustion). Returns whether the release completed, the units
-    /// spent and the independently counted leaf reads (both never
-    /// above `budget`), plus the removed bytes and charge when a
+    /// One budgeted step of a single membership release through the
+    /// shared pre-debit `gate` (bucket-head load, candidate
+    /// inspection, next-link/successor load, linear slot visit — one
+    /// unit each, never beyond exhaustion). Returns whether the
+    /// release completed plus the removed bytes and charge when a
     /// membership was found and the unlink finished. A missing key
     /// completes with `None` after its bounded lookup. An empty
     /// bucket costs its head load. The caller holds `cursor` across
@@ -1475,68 +1521,35 @@ impl<C> ReservationTable<C> {
     pub(super) fn release_single_step(
         &mut self,
         cursor: &mut SingleReleaseCursor<C>,
-        budget: usize,
-    ) -> (bool, usize, usize, Option<(usize, C)>) {
-        #[cfg(test)]
-        let observed_before = self.test_leaf_reads.get();
-        if budget == 0 {
-            if matches!(cursor.state, SingleReleaseState::Done) {
-                return (true, 0, 0, None);
-            }
-            return (false, 0, 0, None);
+        gate: &mut LeafBudget,
+    ) -> (bool, Option<(usize, C)>) {
+        if matches!(cursor.state, SingleReleaseState::Done) {
+            return (true, None);
         }
-        let mut gate = LeafBudget::new(budget);
         loop {
             if gate.remaining() == 0 {
-                let spent = gate.spent();
-                #[cfg(test)]
-                let actual = self.test_leaf_reads.get() - observed_before;
-                #[cfg(not(test))]
-                let actual = spent;
-                debug_assert!(spent <= budget);
-                debug_assert_eq!(spent, actual);
-                return (false, spent, actual, None);
+                return (false, None);
             }
             let state = std::mem::replace(&mut cursor.state, SingleReleaseState::Done);
             match state {
                 SingleReleaseState::Done => {
                     cursor.state = SingleReleaseState::Done;
-                    let spent = gate.spent();
-                    #[cfg(test)]
-                    let actual = self.test_leaf_reads.get() - observed_before;
-                    #[cfg(not(test))]
-                    let actual = spent;
-                    debug_assert!(spent <= budget);
-                    debug_assert_eq!(spent, actual);
-                    return (true, spent, actual, None);
+                    return (true, None);
                 }
                 SingleReleaseState::FindingHead { bucket } => {
-                    let Some(current) = self.budgeted_head(KEY_LINKS, bucket, &mut gate) else {
+                    let Some(current) = self.budgeted_head(KEY_LINKS, bucket, gate) else {
                         cursor.state = SingleReleaseState::FindingHead { bucket };
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (false, spent, actual, None);
+                        return (false, None);
                     };
                     if current == INDEX_NONE {
                         cursor.state = SingleReleaseState::Done;
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (true, spent, actual, None);
+                        return (true, None);
                     }
                     cursor.state = SingleReleaseState::FindingInspect {
                         bucket,
                         current,
                         prev: INDEX_NONE,
                     };
-                    continue;
                 }
                 SingleReleaseState::FindingInspect {
                     bucket,
@@ -1545,34 +1558,24 @@ impl<C> ReservationTable<C> {
                 } => {
                     if current == INDEX_NONE {
                         cursor.state = SingleReleaseState::Done;
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (true, spent, actual, None);
+                        return (true, None);
                     }
                     let slot = node_slot(current);
                     let lane = node_lane(current);
                     let role = cursor.role;
                     let target = cursor.key;
-                    let Some(found) = self.budgeted_match(slot, lane, role, target, &mut gate)
-                    else {
+                    let Some(snapshot) = self.budgeted_slot_snapshot(slot, role, gate) else {
                         cursor.state = SingleReleaseState::FindingInspect {
                             bucket,
                             current,
                             prev,
                         };
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (false, spent, actual, None);
+                        return (false, None);
                     };
-                    if found {
+                    // Buckets mix lanes on collision: the node owns its
+                    // own lane's membership, so the lane must match
+                    // exactly (pure check on the retained snapshot).
+                    if lane == role.index() && snapshot.key == Some(target) {
                         let role_index = role.index();
                         let member = self.slots[slot]
                             .operation
@@ -1589,6 +1592,8 @@ impl<C> ReservationTable<C> {
                             bucket,
                             node,
                             result: Some(result),
+                            other_vacant: snapshot.other_vacant,
+                            aliases: snapshot.aliases,
                         };
                         continue;
                     }
@@ -1597,7 +1602,6 @@ impl<C> ReservationTable<C> {
                         current,
                         prev,
                     };
-                    continue;
                 }
                 SingleReleaseState::FindingNext {
                     bucket,
@@ -1606,62 +1610,37 @@ impl<C> ReservationTable<C> {
                 } => {
                     let slot = node_slot(current);
                     let lane = node_lane(current);
-                    let Some(next) = self.budgeted_next(slot, KEY_LINKS, lane, &mut gate) else {
+                    let Some(next) = self.budgeted_next(slot, KEY_LINKS, lane, gate) else {
                         cursor.state = SingleReleaseState::FindingNext {
                             bucket,
                             current,
                             prev,
                         };
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (false, spent, actual, None);
+                        return (false, None);
                     };
                     if next == INDEX_NONE {
                         cursor.state = SingleReleaseState::Done;
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (true, spent, actual, None);
+                        return (true, None);
                     }
                     cursor.state = SingleReleaseState::FindingInspect {
                         bucket,
                         current: next,
                         prev: current,
                     };
-                    continue;
                 }
                 SingleReleaseState::FindingLinear { next_slot } => {
                     if next_slot >= self.slots.len() {
                         cursor.state = SingleReleaseState::Done;
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (true, spent, actual, None);
+                        return (true, None);
                     }
                     let at = next_slot;
                     let role = cursor.role;
-                    let Some(key) = self.budgeted_slot_key(at, role, &mut gate) else {
+                    let Some(snapshot) = self.budgeted_slot_snapshot(at, role, gate) else {
                         cursor.state = SingleReleaseState::FindingLinear { next_slot };
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (false, spent, actual, None);
+                        return (false, None);
                     };
                     let target = cursor.key;
-                    if key == Some(target) {
+                    if snapshot.key == Some(target) {
                         let role_index = role.index();
                         let member = self.slots[at]
                             .operation
@@ -1671,21 +1650,14 @@ impl<C> ReservationTable<C> {
                         self.populations[role_index] -= 1;
                         self.bytes -= member.bytes;
                         let result = (member.bytes, member.charge);
-                        if self.slot_is_vacant(at) {
+                        if snapshot.other_vacant {
                             self.slots[at].operation = None;
                             self.live -= 1;
                         }
                         cursor.state = SingleReleaseState::Done;
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (true, spent, actual, Some(result));
+                        return (true, Some(result));
                     }
                     cursor.state = SingleReleaseState::FindingLinear { next_slot: at + 1 };
-                    continue;
                 }
                 SingleReleaseState::UnlinkingKey {
                     slot,
@@ -1693,11 +1665,13 @@ impl<C> ReservationTable<C> {
                     bucket,
                     node,
                     mut result,
+                    other_vacant,
+                    aliases,
                 } => {
                     let target_slot = node_slot(node);
                     let target_lane = node_lane(node);
                     let Some(successor) =
-                        self.budgeted_next(target_slot, KEY_LINKS, target_lane, &mut gate)
+                        self.budgeted_next(target_slot, KEY_LINKS, target_lane, gate)
                     else {
                         cursor.state = SingleReleaseState::UnlinkingKey {
                             slot,
@@ -1705,14 +1679,10 @@ impl<C> ReservationTable<C> {
                             bucket,
                             node,
                             result,
+                            other_vacant,
+                            aliases,
                         };
-                        let spent = gate.spent();
-                        #[cfg(test)]
-                        let actual = self.test_leaf_reads.get() - observed_before;
-                        #[cfg(not(test))]
-                        let actual = spent;
-                        debug_assert!(spent <= budget);
-                        return (false, spent, actual, None);
+                        return (false, None);
                     };
                     if prev_code == INDEX_NONE {
                         self.key_heads[bucket] = successor;
@@ -1721,15 +1691,7 @@ impl<C> ReservationTable<C> {
                             successor;
                     }
                     let taken = result.take().expect("pending release keeps its charge");
-                    if self.slot_is_vacant(slot) {
-                        // RED scaffolding (fix round 5): the alias
-                        // snapshot is a real leaf read after the last
-                        // unlink unit. Counted without a debit until
-                        // the snapshot fold charges it.
-                        #[cfg(test)]
-                        self.test_unbudgeted_reads
-                            .set(self.test_unbudgeted_reads.get() + 1);
-                        let aliases = self.slots[slot].operation.as_ref().unwrap().aliases;
+                    if other_vacant {
                         self.slots[slot].operation = None;
                         self.live -= 1;
                         cursor.state = SingleReleaseState::UnlinkingAliases {
@@ -1742,13 +1704,7 @@ impl<C> ReservationTable<C> {
                         continue;
                     }
                     cursor.state = SingleReleaseState::Done;
-                    let spent = gate.spent();
-                    #[cfg(test)]
-                    let actual = self.test_leaf_reads.get() - observed_before;
-                    #[cfg(not(test))]
-                    let actual = spent;
-                    debug_assert!(spent <= budget);
-                    return (true, spent, actual, Some(taken));
+                    return (true, Some(taken));
                 }
                 SingleReleaseState::UnlinkingAliases {
                     slot,
@@ -1774,7 +1730,7 @@ impl<C> ReservationTable<C> {
                             });
                         }
                         let mut unlink = pending.take().unwrap();
-                        let done = self.chain_unlink_step(&mut unlink, &mut gate);
+                        let done = self.chain_unlink_step(&mut unlink, gate);
                         if !done {
                             cursor.state = SingleReleaseState::UnlinkingAliases {
                                 slot,
@@ -1783,13 +1739,7 @@ impl<C> ReservationTable<C> {
                                 pending: Some(unlink),
                                 result,
                             };
-                            let spent = gate.spent();
-                            #[cfg(test)]
-                            let actual = self.test_leaf_reads.get() - observed_before;
-                            #[cfg(not(test))]
-                            let actual = spent;
-                            debug_assert!(spent <= budget);
-                            return (false, spent, actual, None);
+                            return (false, None);
                         }
                         lane += 1;
                         if gate.remaining() == 0 {
@@ -1800,26 +1750,14 @@ impl<C> ReservationTable<C> {
                                 pending: None,
                                 result,
                             };
-                            let spent = gate.spent();
-                            #[cfg(test)]
-                            let actual = self.test_leaf_reads.get() - observed_before;
-                            #[cfg(not(test))]
-                            let actual = spent;
-                            debug_assert!(spent <= budget);
-                            return (false, spent, actual, None);
+                            return (false, None);
                         }
                         continue;
                     }
                     Self::free_push(&mut self.free_head, &mut self.slots, slot);
                     let taken = result.take().expect("pending release keeps its charge");
                     cursor.state = SingleReleaseState::Done;
-                    let spent = gate.spent();
-                    #[cfg(test)]
-                    let actual = self.test_leaf_reads.get() - observed_before;
-                    #[cfg(not(test))]
-                    let actual = spent;
-                    debug_assert!(spent <= budget);
-                    return (true, spent, actual, Some(taken));
+                    return (true, Some(taken));
                 }
             }
         }
@@ -2958,15 +2896,13 @@ mod tests {
             let mut sum_reads = 0usize;
             loop {
                 table.reset_test_leaf_reads_for_test();
-                let (done, spent, actual, _) = table.release_single_step(&mut cursor, budget);
+                let mut gate = LeafBudget::new(budget);
+                let (done, _) = table.release_single_step(&mut cursor, &mut gate);
+                let spent = gate.spent();
                 let reads = table.test_leaf_reads_for_test();
                 assert_eq!(
-                    spent, actual,
-                    "seed {seed}: reported {spent} must equal observed {actual}"
-                );
-                assert_eq!(
-                    reads, actual,
-                    "seed {seed}: unified counter {reads} must equal step reads {actual}"
+                    spent, reads,
+                    "seed {seed}: spent {spent} must equal reads {reads}"
                 );
                 assert!(
                     spent <= budget,
@@ -3152,8 +3088,10 @@ mod tests {
         for name in ["fn release_single_step", "fn release_role_step"] {
             let start = source.find(name).expect("budgeted fn present");
             let rest = &source[start..];
-            let end = rest
-                .find("\n    fn ")
+            let end = ["\n    fn ", "\n    pub(super) fn ", "\n    pub(crate) fn "]
+                .iter()
+                .filter_map(|marker| rest.find(marker))
+                .min()
                 .map(|offset| start + offset)
                 .unwrap_or(source.len());
             let body = &source[start..end];

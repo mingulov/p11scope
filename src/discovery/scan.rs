@@ -21160,6 +21160,545 @@ int main(int argc, char **argv) {
         second.finish_window(window).unwrap();
     }
 
+    /// One cursor key plus an empty-fingerprint cursor for cursor-table
+    /// twins: `complete` and `seq` as given.
+    fn decode_cursor_for_test(
+        pid: u32,
+        start_time: u64,
+        inode: u64,
+        complete: bool,
+        seq: u64,
+    ) -> (DecodeCursorKey, DecodeCursor) {
+        let file = File::open("/bin/sh").unwrap();
+        let key = DecodeCursorKey {
+            pid,
+            start_time,
+            file: InspectedFileKey {
+                device: Device { major: 8, minor: 1 },
+                inode,
+                pin: pin_of(&file).unwrap(),
+                fd_dev: 7,
+            },
+            exec: None,
+        };
+        let cursor = DecodeCursor {
+            fingerprint: Vec::new(),
+            tables: SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            interfaces: SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            anchors: None,
+            cached_tables: Vec::new(),
+            cached_interfaces: Vec::new(),
+            unlinked: Vec::new(),
+            targets: Vec::new(),
+            complete,
+            validated: complete,
+            seq,
+        };
+        (key, cursor)
+    }
+
+    /// The in-progress gap wording is pinned exactly (done/total plus
+    /// decoded tables): the per-pass view names it while unfinished.
+    #[test]
+    fn scan_in_progress_reason_pins_done_total_wording() {
+        assert_eq!(
+            scan_in_progress_reason(2, 5, 7),
+            "scan in progress: 2 of 5 objects finished (7 tables decoded so far); \
+             the next pass resumes where this one stopped"
+        );
+        assert_eq!(SCAN_IN_PROGRESS_SUBJECT, "scan_in_progress");
+    }
+
+    /// End-of-view continuation naming: while the view holds
+    /// unfinished cursors, raw pass-budget stops (plain and composed)
+    /// drop and the in-progress gap names the continuation; without
+    /// unfinished cursors — none, another view's, or only completed —
+    /// every gap stays verbatim, so a stall keeps its exact raw wording.
+    #[test]
+    fn continued_view_gap_drops_raw_stops_only_while_unfinished() {
+        let skips = || {
+            vec![
+                Skipped {
+                    subject: "m".into(),
+                    reason: WORK_CEILING_REASON.into(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: format!("prefix: {COLLECTION_STOP_REASON}"),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: "unrelated refusal".into(),
+                },
+            ]
+        };
+        // Unfinished cursor in this view: raw stops drop, gap named.
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key, cursor) = decode_cursor_for_test(7, 9, 11, false, 0);
+        assert!(budget.record_decode_cursor(key, cursor));
+        let mut skipped = skips();
+        let gap = continued_view_gap(&mut skipped, &budget, 7, Some(9))
+            .expect("an unfinished view names its continuation");
+        assert_eq!(gap.0, SCAN_IN_PROGRESS_SUBJECT);
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|skip| skip.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unrelated refusal"],
+            "raw pass-budget stops drop while unfinished"
+        );
+        // Negative: no cursors, everything stays verbatim.
+        let bare = CaptureWorkBudget::default();
+        let mut skipped = skips();
+        assert_eq!(continued_view_gap(&mut skipped, &bare, 7, Some(9)), None);
+        assert_eq!(skipped.len(), 3, "a stall keeps its exact raw wording");
+        // Negative: unfinished cursors in another view do not filter.
+        let mut skipped = skips();
+        assert_eq!(continued_view_gap(&mut skipped, &budget, 8, Some(9)), None);
+        assert_eq!(skipped.len(), 3);
+        // Negative: only completed cursors do not filter.
+        let mut done =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key, cursor) = decode_cursor_for_test(7, 9, 11, true, 0);
+        assert!(done.record_decode_cursor(key, cursor));
+        let mut skipped = skips();
+        assert_eq!(continued_view_gap(&mut skipped, &done, 7, Some(9)), None);
+        assert_eq!(skipped.len(), 3);
+    }
+
+    /// Cursor reclamation under a tight byte ceiling: dead generations
+    /// go first, then the oldest completed cursor; a live unfinished
+    /// cursor is never evicted, and a refusal keeps the old cursor.
+    #[test]
+    fn record_decode_cursor_reclaims_dead_then_oldest_completed_never_live_unfinished() {
+        let live_pid = std::process::id();
+        let live_start = crate::process::process_start_time(live_pid).unwrap();
+        // No such pid: every cursor keyed here reads dead.
+        let dead_pid = u32::MAX - 1;
+        let cursor = |pid: u32, start: u64, inode: u64, complete: bool, seq: u64| {
+            let (key, mut cursor) = decode_cursor_for_test(pid, start, inode, complete, seq);
+            // One fingerprint entry per cursor so bytes differ by size.
+            cursor.fingerprint = vec![
+                MappingFingerprintEntry {
+                    start: 0,
+                    end: 0x1000,
+                    file_offset: 0,
+                    permissions: *b"rw-p",
+                };
+                16
+            ];
+            (key, cursor)
+        };
+        let one = {
+            let (key, cursor) = cursor(1, 2, 3, true, 0);
+            decode_cursor_bytes(&key, &cursor)
+        };
+        // Two cursors fit, three do not.
+        let limits = || tight_export_limits(one * 2 + one / 2);
+        let mut budget = CaptureWorkBudget::for_inventory(limits())
+            .with_retained_file_facts(RetainedFileFacts::default());
+        // Oldest completed, then a dead unfinished generation.
+        let (old_key, old) = cursor(11, 12, 21, true, 0);
+        assert!(budget.record_decode_cursor(old_key.clone(), old));
+        let (dead_key, dead) = cursor(dead_pid, 13, 22, false, 1);
+        assert!(budget.record_decode_cursor(dead_key.clone(), dead));
+        // A live unfinished cursor evicts the dead generation first
+        // (not the oldest completed: dead work can never resume).
+        let (live_key, live) = cursor(live_pid, live_start, 23, false, 2);
+        assert!(budget.record_decode_cursor(live_key.clone(), live));
+        assert!(
+            budget.decode_cursor(&dead_key).is_none(),
+            "the dead generation reclaims first"
+        );
+        assert!(
+            budget.decode_cursor(&old_key).is_some(),
+            "the oldest completed survives while dead entries exist"
+        );
+        assert!(budget.decode_cursor(&live_key).is_some());
+        // One more completed cursor evicts the oldest completed now that
+        // no dead entries remain; the live unfinished cursor stays.
+        let (new_key, new) = cursor(31, 32, 24, true, 3);
+        assert!(budget.record_decode_cursor(new_key.clone(), new));
+        assert!(
+            budget.decode_cursor(&old_key).is_none(),
+            "the oldest completed reclaims next"
+        );
+        assert!(
+            budget.decode_cursor(&live_key).is_some(),
+            "a live unfinished cursor is never evicted"
+        );
+        // A single cursor bigger than the ceiling refuses without
+        // destroying anything carried.
+        let (big_key, mut big) = cursor(41, 42, 25, false, 4);
+        big.fingerprint = vec![
+            MappingFingerprintEntry {
+                start: 0,
+                end: 0x1000,
+                file_offset: 0,
+                permissions: *b"rw-p",
+            };
+            1 << 20
+        ];
+        assert!(!budget.record_decode_cursor(big_key, big));
+        assert!(
+            budget.decode_cursor(&live_key).is_some() && budget.decode_cursor(&new_key).is_some(),
+            "a refused insertion keeps the carried cursors"
+        );
+        assert_eq!(
+            budget.take_retained_file_facts().cursor_counts(),
+            (2, 1),
+            "the live unfinished plus the new completed cursor carry to the next pass"
+        );
+    }
+
+    /// Group order: unfinished objects oldest-first (stable), everything
+    /// else in B-tree order; without unfinished cursors the order is
+    /// byte-identical to the input.
+    #[test]
+    fn decode_resume_orders_unfinished_objects_oldest_first() {
+        let maps = parse_maps(
+            b"1000-2000 r-xp 00000000 08:01 7 /lib/a.so\n3000-4000 r--p 00000000 08:01 7 /lib/a.so\n5000-6000 r-xp 00000000 08:01 8 /lib/b.so\n7000-8000 r--p 00000000 08:01 8 /lib/b.so\n9000-a000 r-xp 00000000 08:01 9 /lib/c.so\nb000-c000 r--p 00000000 08:01 9 /lib/c.so\n",
+        )
+        .unwrap();
+        let groups = candidate_groups(&maps);
+        assert_eq!(groups.len(), 3);
+        let order = |ordered: Vec<(ObjectKey, Vec<&MapEntry>)>| {
+            ordered.iter().map(|(key, _)| key.inode).collect::<Vec<_>>()
+        };
+        // Negative control: no cursors, B-tree order preserved exactly.
+        let bare = CaptureWorkBudget::default();
+        assert_eq!(
+            order(bare.order_groups_for_resume(7, Some(9), groups.clone())),
+            vec![7, 8, 9]
+        );
+        // Unfinished B (seq 5) and A (seq 2): oldest first, C stays last.
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for (inode, seq) in [(8u64, 5u64), (7u64, 2u64)] {
+            let (key, cursor) = decode_cursor_for_test(7, 9, inode, false, seq);
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        assert_eq!(
+            order(budget.order_groups_for_resume(7, Some(9), groups)),
+            vec![7, 8, 9],
+            "unfinished oldest-first (A seq 2 before B seq 5), C last"
+        );
+    }
+
+    /// Member order: pids holding unfinished cursors scan first,
+    /// oldest-first; without unfinished cursors the order is untouched.
+    #[test]
+    fn order_pids_for_resume_scans_unfinished_members_first() {
+        let mut bare = vec![5u32, 3, 9];
+        CaptureWorkBudget::default().order_pids_for_resume(&mut bare);
+        assert_eq!(bare, vec![5, 3, 9], "no cursors: order untouched");
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for (pid, seq) in [(9u32, 1u64), (5u32, 0u64)] {
+            let (key, cursor) = decode_cursor_for_test(pid, 7, u64::from(pid) + 100, false, seq);
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        let mut pids = vec![5u32, 3, 9];
+        budget.order_pids_for_resume(&mut pids);
+        assert_eq!(
+            pids,
+            vec![5, 9, 3],
+            "unfinished oldest-first, the rest stable"
+        );
+    }
+
+    /// The view gap reports done/total/cached-tables while unfinished
+    /// and vanishes once everything completes (or for other views).
+    #[test]
+    fn view_in_progress_gap_reports_done_total_tables() {
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        // Two completed (one cached table each) plus one unfinished.
+        for (inode, complete, tables) in [
+            (11u64, true, 1usize),
+            (12u64, true, 1usize),
+            (13u64, false, 0usize),
+        ] {
+            let (key, mut cursor) = decode_cursor_for_test(7, 9, inode, complete, inode);
+            cursor.cached_tables = vec![
+                crate::discovery::scan::ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries: Vec::new(),
+                    null_entries: Vec::new(),
+                    unpinned: Vec::new(),
+                    address: 0x1000,
+                    file_offset: Some(0x200),
+                    live_return: false,
+                    manifest_supported: false,
+                    extension_impossible: false,
+                };
+                tables
+            ];
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        let gap = budget
+            .view_in_progress_gap(7, Some(9))
+            .expect("unfinished view names its gap");
+        assert_eq!(gap.0, SCAN_IN_PROGRESS_SUBJECT);
+        assert_eq!(
+            gap.1,
+            "scan in progress: 2 of 3 objects finished (2 tables decoded so far); \
+             the next pass resumes where this one stopped"
+        );
+        assert_eq!(
+            budget.view_in_progress_gap(8, Some(9)),
+            None,
+            "other views get no gap"
+        );
+    }
+
+    /// Cursor admission without pressure performs zero process-liveness
+    /// probes: 64 unfinished cursors with ample headroom insert and update
+    /// with no `/proc` census ahead of the fit check.
+    #[test]
+    fn cursor_admission_without_pressure_probes_no_processes() {
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for index in 0..64u32 {
+            let pid = u32::MAX - index;
+            let (key, cursor) =
+                decode_cursor_for_test(pid, u64::from(index) + 1000, u64::from(index), false, 0);
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        assert_eq!(
+            budget.decode_liveness_probes(),
+            0,
+            "in-budget inserts probe no processes"
+        );
+        // Updates (same keys, advanced frontiers) stay probe-free too.
+        for index in 0..64u32 {
+            let pid = u32::MAX - index;
+            let (key, mut cursor) =
+                decode_cursor_for_test(pid, u64::from(index) + 1000, u64::from(index), false, 0);
+            cursor.tables.word = 10;
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        assert_eq!(
+            budget.decode_liveness_probes(),
+            0,
+            "in-budget updates probe no processes"
+        );
+    }
+
+    /// Reclamation under pressure probes each distinct generation once:
+    /// cursors sharing one generation cost one probe, and victim selection
+    /// reuses the cached result instead of repeating process I/O.
+    #[test]
+    fn cursor_reclamation_probes_each_generation_once() {
+        let cursor = |pid: u32, start: u64, inode: u64, complete: bool, seq: u64| {
+            let (key, mut cursor) = decode_cursor_for_test(pid, start, inode, complete, seq);
+            cursor.fingerprint = vec![
+                MappingFingerprintEntry {
+                    start: 0,
+                    end: 0x1000,
+                    file_offset: 0,
+                    permissions: *b"rw-p",
+                };
+                16
+            ];
+            (key, cursor)
+        };
+        let one = {
+            let (key, cursor) = cursor(1, 2, 3, true, 0);
+            decode_cursor_bytes(&key, &cursor)
+        };
+        let limits = || tight_export_limits(one * 2 + one / 2);
+        let mut budget = CaptureWorkBudget::for_inventory(limits())
+            .with_retained_file_facts(RetainedFileFacts::default());
+        // Two cursors sharing one dead generation plus room for one more.
+        let (first_key, first) = cursor(u32::MAX - 1, 1001, 21, false, 0);
+        assert!(budget.record_decode_cursor(first_key.clone(), first));
+        let (second_key, second) = cursor(u32::MAX - 1, 1001, 22, false, 1);
+        assert!(budget.record_decode_cursor(second_key.clone(), second));
+        assert_eq!(budget.decode_liveness_probes(), 0);
+        // A third cursor forces pressure: its own generation is never a
+        // victim, so the one distinct candidate generation probes once
+        // and victim selection reuses it.
+        let (third_key, third) = cursor(u32::MAX - 2, 1002, 23, false, 2);
+        assert!(budget.record_decode_cursor(third_key.clone(), third));
+        assert_eq!(
+            budget.decode_liveness_probes(),
+            1,
+            "one probe per distinct generation, reused across victim selection"
+        );
+        assert!(
+            budget.decode_cursor(&first_key).is_none(),
+            "the oldest dead generation reclaims first"
+        );
+        assert!(budget.decode_cursor(&third_key).is_some());
+        // A fourth cursor reuses the cached generation and probes only
+        // the new one.
+        let (fourth_key, fourth) = cursor(u32::MAX - 3, 1003, 24, false, 3);
+        assert!(budget.record_decode_cursor(fourth_key, fourth));
+        assert_eq!(
+            budget.decode_liveness_probes(),
+            2,
+            "each distinct generation probes once per pass"
+        );
+        assert!(
+            budget.decode_cursor(&second_key).is_none(),
+            "the oldest dead generation reclaims first"
+        );
+    }
+
+    /// Reclamation under pressure respects a set stop: the insertion is
+    /// refused without an unbounded probe run (fit-first inserts, which
+    /// need no probes, still record their resume points while stopped).
+    #[test]
+    fn cursor_reclamation_stops_when_the_pass_stops() {
+        let cursor = |pid: u32, start: u64, inode: u64, complete: bool, seq: u64| {
+            let (key, mut cursor) = decode_cursor_for_test(pid, start, inode, complete, seq);
+            cursor.fingerprint = vec![
+                MappingFingerprintEntry {
+                    start: 0,
+                    end: 0x1000,
+                    file_offset: 0,
+                    permissions: *b"rw-p",
+                };
+                16
+            ];
+            (key, cursor)
+        };
+        let one = {
+            let (key, cursor) = cursor(1, 2, 3, true, 0);
+            decode_cursor_bytes(&key, &cursor)
+        };
+        let mut budget = CaptureWorkBudget::for_inventory(tight_export_limits(one * 2 + one / 2))
+            .with_retained_file_facts(RetainedFileFacts::default());
+        let (first_key, first) = cursor(u32::MAX - 1, 1001, 21, false, 0);
+        assert!(budget.record_decode_cursor(first_key.clone(), first));
+        let (second_key, second) = cursor(u32::MAX - 2, 1002, 22, false, 1);
+        assert!(budget.record_decode_cursor(second_key.clone(), second));
+        // Stop the pass through its window work ceiling (a windowless
+        // charge refuses without setting the sticky stop).
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let _scan = budget.checkpoint(window.clone()).unwrap();
+        assert!(!budget.charge((1 << 20) + 1), "the pass is stopped");
+        assert!(budget.stopped_reason().is_some());
+        let probes_before = budget.decode_liveness_probes();
+        let (third_key, third) = cursor(u32::MAX - 3, 1003, 23, false, 2);
+        assert!(
+            !budget.record_decode_cursor(third_key.clone(), third),
+            "pressure admission refuses while the pass is stopped"
+        );
+        assert_eq!(
+            budget.decode_liveness_probes(),
+            probes_before,
+            "no probe run starts past a set stop"
+        );
+        assert!(
+            budget.decode_cursor(&first_key).is_some()
+                && budget.decode_cursor(&second_key).is_some(),
+            "a refused insertion keeps the carried cursors"
+        );
+    }
+
+    /// A capped rarity selection that excludes the oldest unfinished
+    /// member reserves it a slot: under a 1-slot cap the newer rare
+    /// member must yield to the unfinished one (whose progress the next
+    /// pass resumes), instead of starving it behind selection order.
+    #[test]
+    fn capped_selection_reserves_slots_for_unfinished_members() {
+        let old: Vec<MapEntry> =
+            parse_maps(b"1000-2000 r-xp 00000000 08:01 7 /lib/common.so\n").unwrap();
+        let new: Vec<MapEntry> = parse_maps(
+            b"1000-2000 r-xp 00000000 08:01 7 /lib/common.so\n3000-4000 r-xp 00000000 08:01 8 /lib/rare.so\n",
+        )
+        .unwrap();
+        let sweep = vec![(1001u32, old), (1002u32, new)];
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key, cursor) = decode_cursor_for_test(1001, 70, 71, false, 0);
+        assert!(budget.record_decode_cursor(key, cursor));
+        let mut selected = crate::discovery::engine::select_deep_scan_candidates(&sweep, 1);
+        assert_eq!(
+            selected,
+            vec![1002],
+            "rarity alone picks the newer rare member (setup pin)"
+        );
+        let eligible = BTreeSet::from([1001u32, 1002u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 1);
+        assert_eq!(
+            selected,
+            vec![1001],
+            "the oldest unfinished member is reserved its slot under the cap"
+        );
+    }
+
+    /// Capped reservation prefers the oldest eligible unfinished member:
+    /// it displaces the rarity-lowest tail, or a younger unfinished
+    /// member when the missing one is older — never the reverse — and
+    /// skips ineligible pids and members already selected.
+    #[test]
+    fn capped_selection_reservation_prefers_oldest_eligible_unfinished() {
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for (pid, seq) in [(1001u32, 0u64), (1002u32, 5u64)] {
+            let (key, cursor) = decode_cursor_for_test(pid, 70, u64::from(pid), false, seq);
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        // The missing oldest displaces the rarity-lowest tail member.
+        let mut selected = vec![2001u32, 2002u32];
+        let eligible = BTreeSet::from([1001u32, 2001u32, 2002u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 2);
+        assert_eq!(
+            selected,
+            vec![2001, 1001],
+            "the oldest unfinished member displaces the tail"
+        );
+        // A cap full of younger unfinished work yields to an older
+        // missing member (strict oldest-first across passes).
+        let mut selected = vec![1002u32];
+        let eligible = BTreeSet::from([1001u32, 1002u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 1);
+        assert_eq!(
+            selected,
+            vec![1001],
+            "a missing older member displaces a younger unfinished one"
+        );
+        // A missing newer member waits behind selected older work.
+        let mut selected = vec![1001u32];
+        let eligible = BTreeSet::from([1001u32, 1002u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 1);
+        assert_eq!(
+            selected,
+            vec![1001],
+            "a missing newer member never displaces older unfinished work"
+        );
+        // An ineligible missing member never enters, even with a free slot.
+        let mut selected = vec![1001u32];
+        let eligible = BTreeSet::from([1001u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 2);
+        assert_eq!(
+            selected,
+            vec![1001],
+            "an ineligible missing member never enters the selection"
+        );
+        // A missing member fills a free slot oldest-first.
+        let mut selected = vec![2001u32];
+        let eligible = BTreeSet::from([1001u32, 2001u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 2);
+        assert_eq!(
+            selected,
+            vec![2001, 1001],
+            "a missing member fills a free slot oldest-first"
+        );
+    }
+
     /// Budgets that never carried file facts refuse a full map without
     /// scanning for evictable entries; a carried budget still reclaims.
     #[test]

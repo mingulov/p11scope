@@ -158,6 +158,19 @@ LINKED_KEY_SIZES_LOOKALIKE_TEXT = LINKED_KEY_SIZES_TEXT.split(
 LINKED_KEY_SIZES_UNRELATED_UNKNOWN_TEXT = LINKED_KEY_SIZES_TEXT + \
     "p11scope: other diagnostic: raw_malformed=unknown\n"
 
+#: The healthy transcript with an appended bare decoder label (no
+#: fields): the second label-anchored line makes the single-record
+#: proof unprovable, so the gate must refuse (codex fix2 residual,
+#: exact transcript).
+LINKED_KEY_SIZES_BARE_LABEL_TEXT = LINKED_KEY_SIZES_TEXT + \
+    "p11scope: joint decoder:\n"
+
+#: The healthy transcript with an appended decoder record missing
+#: the space after the label: the malformed second record must not
+#: vanish from the count (codex fix2 residual, exact transcript).
+LINKED_KEY_SIZES_NOSPACE_TEXT = LINKED_KEY_SIZES_TEXT + \
+    "p11scope: joint decoder:raw_malformed=3 raw_malformed_unprovable=0\n"
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -269,6 +282,8 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-unrelated-zero": key_sizes_rows(),
             "linked-key-sizes-lookalike": key_sizes_rows(),
             "linked-key-sizes-unrelated-unknown": key_sizes_rows(),
+            "linked-key-sizes-bare-label": key_sizes_rows(),
+            "linked-key-sizes-nospace": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -327,6 +342,10 @@ class JournalGateTests(unittest.TestCase):
                 "rc": 0, "text": LINKED_KEY_SIZES_LOOKALIKE_TEXT},
             "linked-key-sizes-unrelated-unknown": {
                 "rc": 0, "text": LINKED_KEY_SIZES_UNRELATED_UNKNOWN_TEXT},
+            "linked-key-sizes-bare-label": {
+                "rc": 0, "text": LINKED_KEY_SIZES_BARE_LABEL_TEXT},
+            "linked-key-sizes-nospace": {
+                "rc": 0, "text": LINKED_KEY_SIZES_NOSPACE_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -899,6 +918,42 @@ class JournalGateTests(unittest.TestCase):
         (row,) = self.read_rows(out)
         self.assertTrue(row["pass"])
         self.assertEqual(row["qualification"], "qualified")
+
+    def test_key_sizes_run_with_healthy_zero_and_bare_decoder_label_fails(self):
+        # Non-vacuity (codex fix2 residual, exact transcript): the
+        # healthy zero plus an appended bare `p11scope: joint
+        # decoder:` line must refuse as unprovable: the bare label
+        # is a second label-anchored candidate, so no single record
+        # is provable.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-bare-label",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_healthy_zero_and_nospace_decoder_record_fails(self):
+        # Non-vacuity (codex fix2 residual, exact transcript): the
+        # healthy zero plus an appended `p11scope: joint
+        # decoder:raw_malformed=3 ...` line (missing the space after
+        # the label) must refuse as unprovable: the malformed second
+        # record must not vanish from the count.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-nospace",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
 
     def test_unknown_object_is_a_harness_error(self):
         result, out = self.run_gate(KERNEL, object_name="detailed")

@@ -6,7 +6,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [Unreleased]
+## [0.8.0]
 
 ### Added
 
@@ -80,6 +80,9 @@ versioned separately and are opaque, exact dispatch keys.
   per-row lines; mechanism-less terminals keep no entry and row
   counters stay exact. Version 8 is taken by the separate Task 7
   provider section; versions 1–7 stay frozen and byte-stable.
+- More providers' creation templates yield curves and parameter
+  sets for every key type, so fewer new-key fields stay unknown;
+  unknowns keep their named reasons.
 
 ### Changed
 
@@ -230,6 +233,27 @@ versioned separately and are opaque, exact dispatch keys.
   module's departed identity alongside the member units; each
   identity lands inside that same member traversal, so no separate
   module pass runs uncharged.
+- Captures that kept per-key rows but lost the live feed (a
+  brief Firefox run, for example) now report `partial` with the
+  named `live_joint_feed_absent` reason and show the retained
+  rows in text beside a one-line coverage note, instead of
+  `unavailable` with no rows. Completions with no mechanism
+  name family `unknown` with the `no mechanism` reason.
+- Late providers attach promptly under process churn: newcomer
+  admission keeps up with floods (501/501 admitted at 500
+  newcomers, 1001/1001 at 1,000, 0 rejected), so a provider
+  first loaded after capture start no longer attaches late or
+  never — measured before at 0 of 309,861 joined calls. An
+  overloaded pass defers work with a named unfinished row
+  instead of dropping it.
+- High-rate key operations lose no records to the reservation
+  table: lookups and allocation stay indexed at any occupancy,
+  removing the 13.8–19.1% record loss measured at 5,000 calls/s
+  over 4 endpoints (0 in 3/3 fixed cells). The 4096 bound is
+  unchanged.
+- A run's repeated gaps fold into counted aggregates, so gap
+  volume stays flat on long captures while every loss keeps its
+  name and exact count.
 
 ## [0.7.1] - 2026-11-17
 

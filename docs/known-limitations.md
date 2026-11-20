@@ -597,7 +597,7 @@ joined. If the event ring itself overflows, the overflowed records
 are counted and named as event loss; the affected calls are not
 silently dropped. Sustained rates above 6,250 key operations per
 second with exact per-call rows need the independent event reader,
-planned for 0.8.0.
+planned for 0.9.
 
 ### System key operations without a manifest show no per-key rows
 
@@ -860,7 +860,7 @@ re-measure. Narrow the scope (`--pid`, `--cgroup`) or pass
 
 In v0.7.0, diagnostics on stderr can be lost silently in three
 cases. Capture data and the report file are not affected in any of
-these cases, and fixes are planned for 0.8.0:
+these cases, and fixes are planned for 0.9:
 
 - p11scope runs as a different user than the owner of the terminal or
   pipe it writes to (for example `su bob -c 'p11scope ...'` on alice's
@@ -1758,7 +1758,13 @@ holding retained slots, so retained callers plateau (3 h soak:
 Private_Dirty + SwapPss +2.56 MiB/h incl. swap, callers flat at 174
 with 0 refusals; that soak folded 0, the fold itself is evidenced by
 the lifetime twin and fold cells) instead of climbing toward the
-4096-caller refusal.
+4096-caller refusal. Also shipped in 0.8.0: inferred key families
+and size classes from operation mechanisms and output lengths
+(families in both modes, sizes behind the `--key-sizes` opt-in,
+PQC parameter sets included), and new-site creation-template
+metadata (a successful creation return promotes its own observed
+template cells, and HKDF and Edwards/Montgomery keys label without
+a query).
 
 - Ordering-evidence pre-arm exactness producer for non-`run` scopes,
   inventory Detailed-subset activation, and same-granularity rewrite proof
@@ -1801,10 +1807,9 @@ the lifetime twin and fold cells) instead of climbing toward the
   within one pass only — a plain side admitted in an earlier pass
   still leaves a later pre side refused.
 - An independent event reader for sustained 10,000 key
-  operations per second with exact per-call rows (0.8.0).
-- Inferred key family and size class from operation mechanisms and
-  output lengths (0.8.0).
-- Creation-template curves and parameter sets (0.8.0).
+  operations per second with exact per-call rows (0.9).
+- Relaxed creation-template curves and parameter sets for all key
+  types (0.8.0).
 - Narrower count-only windows at high key-operation rates (a later release).
 - A kernel-side witness for library loads after the main thread
   exits (a later release).

@@ -236,7 +236,7 @@ and never proves an app identity. See the app identity rows of
   coordinator then folds the row into the exact
   `budgets.callers.retired` aggregate (additive within v1) and removes
   it; rows that carried attributed calls fold their edges and instances
-  into the per-module `departed_use` aggregate first (v0.7.2; counted
+  into the per-module `departed_use` aggregate first (v0.8.0; counted
   in `budgets.callers.retired_with_calls`), so a busy host never fills
   the caller budget with churn. Contract change: exited callers no
   longer appear in `callers[]`, and their rows no longer appear in
@@ -436,7 +436,7 @@ and never proves an app identity. See the app identity rows of
   Witness gaps never carry a `pid`; the sole published tgid of an
   unbound row is its image's historical `pid_host` in `pids` above —
   the incarnation behind it is still what could not be identified.
-  `departed_use` (v0.7.2) is `null`, or this module's exact
+  `departed_use` (v0.8.0) is `null`, or this module's exact
   aggregate of folded departed callers: proven-exited caller rows
   whose edges and instances left the snapshot after a presentation
   rendered them. The key is new but the fold moves rows out of
@@ -1010,11 +1010,11 @@ and never proves an app identity. See the app identity rows of
 - `budgets`: every budgeted resource with its own limit, occupancy
   source, and loss counter — `callers` (additive within v1:
   `retired` counts proven-ended caller rows removed after rendering;
-  `retired_with_calls` (v0.7.2) counts those that folded attributed
+  `retired_with_calls` (v0.8.0) counts those that folded attributed
   calls; `occupied` is the retained census, so `occupied + retired`
   is every caller incarnation the capture ever admitted), `modules`
   (physical module instances), `edges` (caller relationships;
-  additive within v1, v0.7.2: `folded`/`folded_entries` count the
+  additive within v1, v0.8.0: `folded`/`folded_entries` count the
   edge rows and entries folded into the departed aggregate),
   `endpoints` (the
   retained attach-endpoint census: the sum of admitted per-module
@@ -1133,20 +1133,20 @@ Additive budgets are:
 
 - `callers.retired`: proven-ended caller-incarnation rows retired into the
   counted aggregate after a presentation rendered them (see `callers[]`).
-- `callers.retired_with_calls` (v0.7.2): of those, rows that folded
+- `callers.retired_with_calls` (v0.8.0): of those, rows that folded
   attributed calls into `modules[].departed_use`, counted once per
   caller. The remainder exited without attributed calls.
 - `callers.late_refused`: late mapping notes refused for a retired caller
   incarnation. Counted, never merged into a fresh `callers[]` row; the
   refusal is retained as bounded caller-ID ranges, so a long capture still
   refuses every retired ID exactly without one entry per retired caller.
-- `edges.folded`, `edges.folded_entries` (v0.7.2): edge rows folded
+- `edges.folded`, `edges.folded_entries` (v0.8.0): edge rows folded
   into the departed aggregate and their summed entry counts. A
   streamed edge missing from the final snapshot is folded, never
   lost, exactly when these count it.
-- `instances.folded` (v0.7.2): instance rows folded into the
+- `instances.folded` (v0.8.0): instance rows folded into the
   departed aggregate.
-- `departed_use` (v0.7.2): `{mech_overflow, identities_dropped}` —
+- `departed_use` (v0.8.0): `{mech_overflow, identities_dropped}` —
   run-wide departed-fold overflow totals (the per-module rows carry
   the detail).
 - `native_departed`: `{pair_dropped_rows, pair_dropped_base,

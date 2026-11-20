@@ -19,6 +19,11 @@ pub(crate) enum SealReplayPhase {
     /// Only the actual validated ABANDON-9/outcome_lost conversion mints
     /// this exact-subject history disposition. It never grants S1 replay.
     BoundedLoss,
+    /// Only the actual per-call disposal of an effect-free unbounded
+    /// abandonment mints this: the call's named loss span and its exact
+    /// staged head's terminal. Distinct from a bounded provider-effects
+    /// cut: it grants no S1 invalidation and no loss bound.
+    CallLoss,
     SettlementTail,
 }
 
@@ -86,7 +91,7 @@ impl SealedObjectPrefix {
         let step = self.replay_steps.get(position)?;
         (matches!(
             step.phase,
-            SealReplayPhase::End | SealReplayPhase::BoundedLoss
+            SealReplayPhase::End | SealReplayPhase::BoundedLoss | SealReplayPhase::CallLoss
         ) && self.call_for_step(step) == Some(original))
         .then_some((position, step))
     }
@@ -192,14 +197,12 @@ impl ReplayBounds {
             .values()
             .filter(|entry| entry.end.is_some() && !entry.end_converted)
             .count();
+        // Every staged abandonment may own one terminal step: a bounded
+        // loss or a per-call disposal (dooming ones never convert).
         let abandoned = adapter
             .open
             .values()
-            .filter(|entry| {
-                entry.abandon.is_some_and(|staged| {
-                    staged.abandon.reason() == super::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-                })
-            })
+            .filter(|entry| entry.abandon.is_some())
             .count();
         let pending = model.replay_pending_count();
         let steps = refused
@@ -380,6 +383,19 @@ impl ReplayPreparation {
         effects: Range<usize>,
     ) {
         self.terminal(SealReplayPhase::BoundedLoss, key, token, cut, effects);
+    }
+
+    /// The owner calls this only after the model's actual per-call
+    /// disposal of the exact converted original; `cut` is the
+    /// abandonment's own ordinal.
+    pub(super) fn call_loss(
+        &mut self,
+        key: CallKey,
+        token: CallToken,
+        cut: u64,
+        effects: Range<usize>,
+    ) {
+        self.terminal(SealReplayPhase::CallLoss, key, token, cut, effects);
     }
 
     fn terminal(

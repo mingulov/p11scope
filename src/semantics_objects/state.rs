@@ -213,6 +213,20 @@ pub(crate) fn return_class(function: u32, rv: u64, malformed: bool) -> Outcome {
     }
 }
 
+/// Whether one observed return leaves no lifecycle or object effect the
+/// model would apply: `Ok`, `Partial` (`GetAttributes`) and a plain
+/// `Failed`. `InvalidHandle`, `SessionInvalid`, `Pending` and `Ambiguous`
+/// (which includes `CKR_CRYPTOKI_NOT_INITIALIZED`, evidence of an unseen
+/// finalization) carry negative authority or a possible effect. This is the
+/// single rule every disposal that drops a call's observed return reads:
+/// the unclaimable-original disposal and the per-call abandonment disposal.
+pub(crate) fn return_leaves_no_lifecycle_effect(function: u32, rv: u64) -> bool {
+    matches!(
+        return_class(function, rv, false),
+        Outcome::Ok | Outcome::Partial | Outcome::Failed
+    )
+}
+
 /// Whether the model accepts a canonical function ordinal at all
 /// (object, lifecycle or neutral): the journal's modeled-affecting test.
 pub(super) fn is_modeled_function(function: u32) -> bool {

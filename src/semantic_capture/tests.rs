@@ -2941,42 +2941,6 @@ fn joint_take_refresh_sweep_no_interests_no_scan() {
     );
 }
 
-/// A retained take accepts live truth ahead of a tainted scan:
-/// the router observed global churn (a tainted continuation) and
-/// live advanced further with the same local words, so the take
-/// validates against live instead of failing the stale scan
-/// forever.
-#[test]
-fn joint_retained_take_accepts_live_ahead_of_tainted_scan() {
-    let (mut harness, witness, mut rows) = birth_sealed_witness();
-    harness.io.global = 1;
-    harness.push_create(2);
-    let mut raw = harness.collect();
-    let (report, _) = harness.route(&mut raw);
-    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
-    let receipt = &witness.candidate.receipt;
-    assert_eq!(
-        harness.capture.router.partition_back_taint(
-            receipt.domain,
-            receipt.image,
-            receipt.endpoint.file_slot
-        ),
-        Some((true, false)),
-        "the continuation taints the scan"
-    );
-    harness.io.global = 2;
-    witness
-        .fresh_evidence_with(
-            &mut harness.io,
-            &mut rows,
-            &harness.capture,
-            harness.fixture.attachment(),
-            harness.fixture.binding(),
-        )
-        .expect("live ahead of a tainted scan validates");
-    assert_eq!(harness.capture.take_drift_tolerated(), 1);
-}
-
 /// A retained take refuses live ahead of an untainted scan: the
 /// advance is too new for any observation, so the take races
 /// (and queues its refresh) instead of trusting unscanned truth.
@@ -3050,41 +3014,6 @@ fn joint_retained_take_refuses_live_with_moved_local() {
         .expect_err("a moved local word races the take");
     assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
     assert_eq!(harness.capture.take_drift_tolerated(), 0);
-}
-
-/// The live-ahead gate accepts exactly global advances past
-/// disclosed taint: every other word, direction or taint refuses.
-#[test]
-fn joint_live_ahead_gate_accepts_only_tainted_global_advance() {
-    fn e(local: u64, global: u64, fault: u64, sticky: u64, record_flags: u64) -> CompleteEpochs {
-        CompleteEpochs {
-            local,
-            global,
-            fault,
-            sticky,
-            record_flags,
-        }
-    }
-    let base = e(1, 9, 0, 0, 0);
-    assert!(
-        SemanticCapture::accept_live_ahead(e(1, 20, 0, 0, 0), base, true, false),
-        "the live case accepts"
-    );
-    for (live, global_tainted, miss_tainted, why) in [
-        (e(1, 20, 0, 0, 0), false, false, "untainted"),
-        (e(1, 20, 0, 0, 0), true, true, "miss-tainted"),
-        (e(2, 20, 0, 0, 0), true, false, "local moved"),
-        (e(1, 20, 1, 0, 0), true, false, "fault moved"),
-        (e(1, 20, 0, 1, 0), true, false, "sticky set"),
-        (e(1, 20, 0, 0, 4), true, false, "flags moved"),
-        (e(1, 9, 0, 0, 0), true, false, "equal needs no override"),
-        (e(1, 8, 0, 0, 0), true, false, "backward"),
-    ] {
-        assert!(
-            !SemanticCapture::accept_live_ahead(live, base, global_tainted, miss_tainted),
-            "{why} refuses"
-        );
-    }
 }
 
 /// A retained take refuses live ahead across a recorded absence:

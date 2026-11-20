@@ -2205,6 +2205,123 @@ mod tests {
         }
     }
 
+    /// NSS vendor PQC key-exchange ids (NSS `lib/util/pkcs11n.h`,
+    /// `CKM_NSS` = `0xCE534350`): the ML-KEM keygen (+48) and
+    /// encapsulate/decapsulate (+49) ids infer ML-KEM, the legacy
+    /// Kyber keygen id (+45) infers ML-KEM under its own named note,
+    /// and the ECDHE keygen id (+47, every curve including X25519 —
+    /// `lib/ssl/ssl3ecc.c` `ssl_CreateECDHEPrivateKey`) infers EC.
+    /// Owner direction 2026-11-20 (Firefox post-quantum key exchange
+    /// is the demo): these four vendor ids are the deliberate
+    /// exception to the §4.2 vendor-infers-nothing rule.
+    #[test]
+    fn nss_vendor_pqc_ids_infer_family() {
+        use KeyFamily::*;
+        for (id, family) in [
+            (0xCE53_4380u64, MlKem), // CKM_NSS_ML_KEM_KEY_PAIR_GEN
+            (0xCE53_4381u64, MlKem), // CKM_NSS_ML_KEM
+            (0xCE53_437Du64, MlKem), // CKM_NSS_KYBER_KEY_PAIR_GEN (legacy Kyber)
+            (0xCE53_437Fu64, Ec), // CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN
+        ] {
+            assert_eq!(infer_family(id), Some(family), "id 0x{id:08x}");
+        }
+        // Neighbors stay unlisted: the legacy Kyber use id is out of
+        // scope, and hostile-width aliases never match (full-width
+        // equality like every §4.2 set).
+        for id in [
+            0xCE53_437Eu64, // CKM_NSS_KYBER (out of scope)
+            0xCE53_4381u64 | (1 << 32),
+            0xCE53_4381u64 | (1 << 16),
+            0xCE53_437Fu64 | (1 << 32),
+        ] {
+            assert_eq!(infer_family(id), None, "id 0x{id:x} infers nothing");
+        }
+    }
+
+    /// The NSS encapsulate/decapsulate id sizes exactly like standard
+    /// ML-KEM (FIPS 203 Table 2); the three vendor keygen ids are
+    /// family-only (no length map — keygen carries no §5.1 position).
+    #[test]
+    fn nss_vendor_kem_sizes() {
+        use EvidenceTag::*;
+        for (octets, set) in [
+            (768, "ml_kem_512"),
+            (1088, "ml_kem_768"),
+            (1568, "ml_kem_1024"),
+        ] {
+            for tag in [EncapsulateOutput, DecapsulateInput] {
+                assert_eq!(
+                    classify_size(Some(0xCE53_4381), tag, octets),
+                    SizeOutcome::Inferred(SizeDetail::PqcSet {
+                        parameter_set: set,
+                        octets,
+                    }),
+                    "{octets} octets"
+                );
+            }
+        }
+        assert_eq!(
+            classify_size(Some(0xCE53_4381), DecapsulateInput, 769),
+            SizeOutcome::Unknown {
+                reason: REASON_UNMAPPED_LENGTH
+            }
+        );
+        for id in [0xCE53_437Du64, 0xCE53_437Fu64, 0xCE53_4380u64] {
+            for tag in [EncapsulateOutput, DecapsulateInput] {
+                assert_eq!(
+                    classify_size(Some(id), tag, 1088),
+                    SizeOutcome::Unsupported {
+                        reason: REASON_FAMILY_ONLY_SUBSET
+                    },
+                    "keygen id 0x{id:08x} is family-only"
+                );
+            }
+        }
+    }
+
+    /// §4.5 over the NSS vendor ids: the ECDHE keygen id qualifies
+    /// Montgomery (NSS generates X25519 through it), and the ML-KEM
+    /// vendor ids behave exactly like standard ML-KEM.
+    #[test]
+    fn nss_vendor_ids_under_family_compatibility() {
+        use EstablishedKind as E;
+        use KeyFamily as F;
+        assert!(families_compatible(
+            F::Ec,
+            0xCE53_437F,
+            E::Ec {
+                curve: SafeCurve::Secp256r1
+            }
+        ));
+        assert!(families_compatible(F::Ec, 0xCE53_437F, E::Montgomery));
+        assert!(families_compatible(
+            F::MlKem,
+            0xCE53_4381,
+            E::MlKem { set: "ml_kem_768" }
+        ));
+        assert!(!families_compatible(
+            F::MlKem,
+            0xCE53_4381,
+            E::MlDsa { set: "ml_dsa_65" }
+        ));
+        assert!(size_compatible(
+            &SizeDetail::PqcSet {
+                parameter_set: "ml_kem_768",
+                octets: 1088,
+            },
+            0xCE53_4381,
+            E::MlKem { set: "ml_kem_768" }
+        ));
+        assert!(!size_compatible(
+            &SizeDetail::PqcSet {
+                parameter_set: "ml_kem_768",
+                octets: 1088,
+            },
+            0xCE53_4381,
+            E::MlKem { set: "ml_kem_512" }
+        ));
+    }
+
     /// Family value/display spellings (§10.2 enum + §10.3 fragments).
     #[test]
     fn family_spellings() {

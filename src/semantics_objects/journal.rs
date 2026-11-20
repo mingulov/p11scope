@@ -16111,6 +16111,227 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn seal_post_collection_reread_absorbs_without_void() {
+        // A seal-time fault move outside a clean collection bracket is a
+        // post-collection fault: the collected interval is proved by its
+        // bracket, so the seal absorbs the move (re-baseline, trip the
+        // absence chain) and converts instead of voiding staged proof.
+        // No void bucket counts it: absorbs are not voids.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        assert_eq!(scene.adapter.last_fault, Some(7));
+        // New history under a clean bracket; the seal-time cell moved
+        // after the collection closed.
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let reaudit = scene.audit();
+        let moved = ScriptedFaultCell::steady(9);
+        let success = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect("post-collection reread absorbs");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "absorb voids nothing");
+        assert_eq!(
+            after.audit_fault_changed_reread, 0,
+            "absorbs count no void bucket"
+        );
+        assert_eq!(scene.adapter.last_fault, Some(9));
+        assert!(
+            scene.adapter.last_audit_failure.is_some(),
+            "absorb still trips the absence chain"
+        );
+        assert_eq!(scene.adapter.voided_through_for_test(), 0);
+    }
+
+    #[test]
+    fn seal_between_collection_fault_absorbs_without_void() {
+        // Chain twin of the reread absorb above: a fault that landed
+        // between two collections (clean bracket, baseline behind) is
+        // post-collection too, so the seal adopts the new era and
+        // converts instead of voiding.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        let success = scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect("between-collection fault absorbs");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "absorb voids nothing");
+        assert_eq!(
+            after.audit_fault_changed_chain, 0,
+            "absorbs count no void bucket"
+        );
+        assert_eq!(scene.adapter.last_fault, Some(8));
+        assert!(
+            scene.adapter.last_audit_failure.is_some(),
+            "absorb still trips the absence chain"
+        );
+        assert_eq!(scene.adapter.voided_through_for_test(), 0);
+    }
+
+    #[test]
+    fn repeat_fault_observation_absorbs_silently() {
+        // A second seal observing an already-absorbed fault era (stale
+        // bracket, cell steady at the absorbed era) absorbs silently:
+        // no void, no re-trip, no bucket.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let reaudit = scene.audit();
+        let moved = ScriptedFaultCell::steady(9);
+        scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect("first observation absorbs");
+        let tripped = scene.adapter.last_audit_failure;
+        assert_eq!(scene.adapter.last_fault, Some(9));
+        scene.attest();
+        let again = begin_bytes(1, 3, create, 0);
+        scene.ingest(&again);
+        scene.ingest(&end_bytes(&again, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let stale = scene.audit();
+        let steady = ScriptedFaultCell::steady(9);
+        let success = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &stale,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &steady,
+            )
+            .expect("repeat observation absorbs");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "absorbs void nothing");
+        assert_eq!(
+            (
+                after.audit_fault_changed_chain,
+                after.audit_fault_changed_reread
+            ),
+            (0, 0),
+            "absorbs count no void bucket"
+        );
+        assert_eq!(scene.adapter.last_audit_failure, tripped);
+    }
+
+    #[test]
+    fn seal_regressed_fault_cell_still_voids() {
+        // Fail-closed twin of the absorbs above: a seal-time cell
+        // reading below the pinned baseline is a broken reader (the
+        // native cell never regresses), so the seal still voids.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        let frontier = scene.adapter.consumed_frontier();
+        let reaudit = scene.audit();
+        let regressed = ScriptedFaultCell::steady(5);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &regressed,
+            )
+            .expect_err("regressed cell voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 1);
+    }
+
+    #[test]
     fn audit_void_gaps_cover_every_void_arm_gap_in_order() {
         // The drain's gap order is load-bearing: it drives disclosure
         // and parallels the coordinator baseline. It must name exactly
@@ -17612,6 +17833,120 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.image_refused((COOKIE, EXEC)),
             "a void-wiped destroy abandon still taints"
+        );
+    }
+
+    #[test]
+    fn void_wiped_destroy_end_disposes_without_taint() {
+        // A void-wiped state-changing terminal is expected fallout of
+        // fenced known loss, not new contradiction evidence: the void
+        // already disclosed the loss, so the straddling END disposes
+        // (never proves) with telemetry instead of tainting the image.
+        // The disposed call stays unproven; only the image-wide taint
+        // goes, so later births still succeed.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        let mut scene = Scene::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 50);
+        assert_eq!(
+            scene.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped destroy terminal must not taint"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .contradiction_diagnosis()
+                .terminal_before_begin,
+            1,
+            "the disposal still counts telemetry"
+        );
+    }
+
+    #[test]
+    fn void_wiped_destroy_abandon_disposes_without_taint() {
+        // ABANDON half of the void-wipe destroy twin above: the void
+        // records every wiped BEGIN expected-absent regardless of
+        // function, so the straddling abandon disposes without taint.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        scene.adapter.void_staged();
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(
+            scene.ingest(&abandon),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "a void-wiped destroy abandon must not taint"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .contradiction_diagnosis()
+                .terminal_before_begin,
+            1,
+            "the disposal still counts telemetry"
+        );
+    }
+
+    #[test]
+    fn scoped_wipe_destroy_end_disposes_without_taint() {
+        // Scoped twin of the void-wipe destroy twin: a watchdog scoped
+        // void sheds its stuck session the same way, so a state-changing
+        // terminal arriving for a scoped-wiped BEGIN disposes without
+        // tainting the image either.
+        use super::joint_driver::JointVoidScope;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        let mut harness = OwnerHarness::new(image_default());
+        let destroy = function_id("C_DestroyObject");
+        let mut begin = begin_bytes(1, 1, destroy, 0);
+        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
+        begin[126] = 1;
+        let proof = harness.attest();
+        harness.ingest(&begin);
+        // Direct fixture ingests mark the stream broken; the watchdog
+        // scenario models a linked lane with its stream position
+        // intact, so clear the flag before the scoped break.
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 50);
+        assert_eq!(
+            harness.ingest(&end),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
+        );
+        assert!(
+            !harness.owner.adapter().image_refused((COOKIE, EXEC)),
+            "a scoped-wiped destroy terminal must not taint"
         );
     }
 
@@ -27177,6 +27512,138 @@ pub(crate) mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let bootstrap = scene.bootstrap(proof, 0);
         scene.seal(&bootstrap).expect("sole key seals");
+        let mut other = AttestationFixture::new(image_default());
+        assert_eq!(
+            scene.adapter.attest_key(&other.admit()),
+            Err(AttestationRefusal::ImageSealed)
+        );
+    }
+
+    #[test]
+    fn fenced_sibling_allows_post_void_rebirth() {
+        // A void wipes every staged claim, so a converted sibling whose
+        // conversion is entirely fenced holds nothing left to
+        // re-examine: a new key for the image binds and births above
+        // the fence instead of refusing ImageSealed, so later births
+        // still succeed after a fault/break/H3 void.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        // H3-loss void: fences every key and wipes staged proof without
+        // invalidating the stream.
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        let fence = scene.adapter.consumed_through;
+        let state = scene.adapter.keys.get(&proof.key).expect("fenced key");
+        assert!(state.void_fence > 0);
+        assert!(
+            state.sealed_through <= state.void_fence,
+            "the sibling conversion is entirely fenced"
+        );
+        let mut other = AttestationFixture::new(image_default());
+        let rebind = scene
+            .adapter
+            .attest_key(&other.admit())
+            .expect("fenced sibling rebirths");
+        assert_ne!(rebind.key, proof.key);
+        let grant = SessionBirthGrant::scripted(
+            rebind,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        BootstrapReceipt::attest(&scene.adapter, &grant).expect("rebirth births above the fence");
+    }
+
+    #[test]
+    fn reconverted_sibling_blocks_new_key() {
+        // Fail-closed twin of the post-void rebirth above: once the
+        // fenced sibling converts fresh history above its fence, it is
+        // actively converting again, so a further new key refuses
+        // ImageSealed as before.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        let fence = scene.adapter.consumed_through;
+        // The void cleared admission claims: re-attest for the new history.
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene.seal_at(&resume, 7).expect("post-void history seals");
+        let state = scene.adapter.keys.get(&proof.key).expect("reconverted key");
+        assert!(
+            state.sealed_through > state.void_fence,
+            "the sibling converts above its fence again"
+        );
         let mut other = AttestationFixture::new(image_default());
         assert_eq!(
             scene.adapter.attest_key(&other.admit()),

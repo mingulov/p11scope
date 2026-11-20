@@ -3074,6 +3074,16 @@ impl SemanticCapture {
         ))
     }
 
+    /// Pose the H0 fault era directly (test-only): the chain twin mints
+    /// its pending original at the old era, then poses the new era that
+    /// production would have reached via a clean intermediate tick, so
+    /// the watermark epoch matches the chain audit without re-ticking.
+    /// Production moves fault only through health audit with invalidation.
+    #[cfg(test)]
+    pub(crate) fn pose_fault_for_test(&mut self, fault: u64) {
+        self.fault = fault;
+    }
+
     /// Borrow the original pending records; no copied queue or manufactured
     /// allocation accompanies the lane's continuation inspection.
     pub(crate) fn pending_h3_originals(&self) -> impl Iterator<Item = PendingH3Original<'_>> {

@@ -2105,6 +2105,23 @@ impl JournalAdapter {
         self.invalidated
     }
 
+    /// Test-only read of one image's preservation basis progress:
+    /// (live keys collected so far, whether the basis is complete),
+    /// or (0, false) when no recovery stands or the image is
+    /// untouched. One-credit machine twins assert the built count
+    /// grows by at most one leaf per poll.
+    #[cfg(test)]
+    pub(crate) fn preserve_basis_progress_for_test(&self, image: (u64, u64)) -> (usize, bool) {
+        match self
+            .scoped_recovery
+            .as_ref()
+            .and_then(|recovery| recovery.preserve_live.get(&image))
+        {
+            Some(basis) => (basis.live.len(), true),
+            None => (0, false),
+        }
+    }
+
     /// Whether a lost-quantum fence can resync the next collection: the
     /// post-flag mirror of the fail-closed arms in `resolve_birth_cut`. A
     /// stopped adapter never resyncs; on a linked lane a spent consumption
@@ -11162,7 +11179,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 29] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 32] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -11206,6 +11223,13 @@ pub(crate) mod tests {
         // Fix round 5: the unwrap twin drives a full unwrap call
         // through the joint scene, appended for the same reason.
         "C_UnwrapKey",
+        // Fix round 7: effect-free-read disposal twins (pure-read
+        // Access) and operation-mutating doom guards
+        // (OperationImport, operation-feeding Access), appended
+        // for the same reason.
+        "C_GetObjectSize",
+        "C_SetOperationState",
+        "C_DigestKey",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface
@@ -21429,14 +21453,15 @@ pub(crate) mod tests {
 
     impl OwnerHarness {
         fn new(image: ImageIdentity) -> Self {
+            Self::new_with_limits(image, JournalLimits::policy())
+        }
+
+        fn new_with_limits(image: ImageIdentity, limits: JournalLimits) -> Self {
             use crate::semantics_edge::resources::SemanticResourcePool;
             let descriptors = publish_object_descriptors();
             assert!(verify_object_descriptors(&descriptors));
             let pool = SemanticResourcePool::default();
-            let owner = super::joint_driver::JointCaptureOwner::new(
-                JournalLimits::policy(),
-                pool.reserver(),
-            );
+            let owner = super::joint_driver::JointCaptureOwner::new(limits, pool.reserver());
             let mut harness = Self {
                 owner,
                 pool,
@@ -22379,6 +22404,399 @@ pub(crate) mod tests {
                 .proof_refused_for_test(sibling_proof),
             "the unclaimed sibling stays unrefused"
         );
+    }
+
+    /// Attest `n` distinct live keys on the default image through
+    /// genuine admissions (one fixture per key: distinct native
+    /// domains share the image). Fixtures stay alive for the test;
+    /// proofs are in attestation order. No seal runs between
+    /// attestations, so no key converts and the image-sealed arm
+    /// stays quiet.
+    fn attest_image_keys(
+        harness: &mut OwnerHarness,
+        n: usize,
+    ) -> (Vec<JournalDomainProof>, Vec<AttestationFixture>) {
+        let mut proofs = Vec::with_capacity(n);
+        let mut fixtures = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut fixture = AttestationFixture::new(image_default());
+            let admitted = fixture.admit_session_function(SESSION, "C_CreateObject");
+            let proof = harness
+                .owner
+                .adapter_mut()
+                .attest_key(&admitted)
+                .expect("key attests");
+            fixtures.push(fixture);
+            proofs.push(proof);
+        }
+        let mut keys: Vec<JournalDomainKey> = proofs.iter().map(|proof| proof.key).collect();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "every attestation mints a distinct key");
+        (proofs, fixtures)
+    }
+
+    #[test]
+    fn scoped_preserve_basis_builds_one_key_per_credit() {
+        // Fix7 machine twin (Codex fix4 finding 1): 65 live keys
+        // share one image with a single unclaimed mutating
+        // abandonment. The scoped void must build the preservation
+        // liveness basis one key per recovery credit — never
+        // snapshotting all 65 in one unit — then taint the image
+        // with no key refused.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::{JointVoidScope, RecoveryProgress};
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let image = (COOKIE, EXEC);
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 65);
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, image);
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        for proof in &proofs {
+            assert!(
+                harness.owner.adapter().key_is_live(proof.key),
+                "precondition: every key is live before the void"
+            );
+        }
+        assert_eq!(
+            harness.owner.adapter().live_keys_for_image(image).len(),
+            65,
+            "precondition: one image holds 65 live keys"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proofs[0].key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        let mut calls = 0u64;
+        let mut prev_built = 0usize;
+        let mut saw_partial = false;
+        let voided = loop {
+            let mut budget = 1usize;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded void never refuses its own budget");
+            calls += 1;
+            let (built, done) = harness
+                .owner
+                .adapter()
+                .preserve_basis_progress_for_test(image);
+            assert!(
+                built >= prev_built,
+                "the basis never shrinks ({prev_built} -> {built})"
+            );
+            assert!(
+                built - prev_built <= 1,
+                "one credit builds at most one basis key ({prev_built} -> {built})"
+            );
+            saw_partial |= built > 0 && !done;
+            prev_built = built;
+            assert!(calls < 10_000, "the bounded void always terminates");
+            match progress {
+                RecoveryProgress::Done(voided) => break voided,
+                RecoveryProgress::Yielded => {}
+            }
+        };
+        assert!(voided, "the scoped void applies");
+        assert!(
+            saw_partial,
+            "the 65-key basis builds incrementally across credits"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert!(
+            harness.owner.adapter().image_tainted_for_test(image),
+            "the unclaimed abandonment taints its image"
+        );
+        for proof in &proofs {
+            assert!(
+                !harness.owner.adapter().proof_refused_for_test(*proof),
+                "taint precedence refuses no key"
+            );
+        }
+        assert!(
+            harness.owner.adapter().open.is_empty(),
+            "the drained image keeps no opens"
+        );
+    }
+
+    #[test]
+    fn scoped_taint_overflow_marks_one_key_per_credit_with_immediate_refusal() {
+        // Fix7 machine twin (Codex fix4 finding 1): with the taint
+        // set already full, tainting a 65-key image must publish
+        // the irreversible image refusal first and then mark keys
+        // one per recovery credit. A healthy second image keeps
+        // custody throughout.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::{JointVoidScope, RecoveryProgress};
+
+        let limits = JournalLimits {
+            image_sightings: 2,
+            ..JournalLimits::policy()
+        };
+        let mut harness = OwnerHarness::new_with_limits(image_default(), limits);
+        let create = function_id("C_CreateObject");
+        let image = (COOKIE, EXEC);
+        let healthy = (COOKIE + 20, EXEC);
+        let (proofs, mut fixtures) = attest_image_keys(&mut harness, 65);
+        let mut healthy_fixture = AttestationFixture::new(ImageIdentity {
+            task_cookie: healthy.0,
+            exec_id: healthy.1,
+        });
+        let healthy_admitted = healthy_fixture.admit_session_function(SESSION, "C_CreateObject");
+        let healthy_proof = harness
+            .owner
+            .adapter_mut()
+            .attest_key(&healthy_admitted)
+            .expect("healthy key attests");
+        fixtures.push(healthy_fixture);
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, image);
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        let healthy_begin = begin_bytes_image(2, 1, create, 0, healthy);
+        assert_eq!(
+            harness.ingest(&healthy_begin),
+            JournalDisposition::BeginAdmitted,
+            "the healthy image stages its own call"
+        );
+        harness
+            .owner
+            .adapter_mut()
+            .taint_image_for_test((COOKIE + 10, EXEC));
+        harness
+            .owner
+            .adapter_mut()
+            .taint_image_for_test((COOKIE + 11, EXEC));
+        assert_eq!(
+            harness.owner.adapter().tainted_images.len(),
+            2,
+            "precondition: the taint set is full before the void"
+        );
+        assert!(
+            !harness.owner.adapter().image_tainted_for_test(image),
+            "precondition: the 65-key image is untainted before the void"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proofs[0].key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        let marked = |harness: &OwnerHarness| {
+            harness
+                .owner
+                .adapter()
+                .keys
+                .iter()
+                .filter(|(key, state)| (key.cookie, key.exec) == image && state.tainted)
+                .count()
+        };
+        let mut calls = 0u64;
+        let mut prev_built = 0usize;
+        let mut prev_marked = 0usize;
+        let mut refused_at: Option<u64> = None;
+        let mut marked_at_refusal = 0usize;
+        let voided = loop {
+            let mut budget = 1usize;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded void never refuses its own budget");
+            calls += 1;
+            let (built, _) = harness
+                .owner
+                .adapter()
+                .preserve_basis_progress_for_test(image);
+            assert!(
+                built >= prev_built && built - prev_built <= 1,
+                "one credit builds at most one basis key ({prev_built} -> {built})"
+            );
+            prev_built = built;
+            let now_marked = marked(&harness);
+            assert!(
+                now_marked >= prev_marked && now_marked - prev_marked <= 1,
+                "one credit marks at most one overflow key ({prev_marked} -> {now_marked})"
+            );
+            prev_marked = now_marked;
+            if refused_at.is_none() && harness.owner.adapter().image_tainted_for_test(image) {
+                refused_at = Some(calls);
+                marked_at_refusal = now_marked;
+            }
+            assert!(calls < 10_000, "the bounded void always terminates");
+            match progress {
+                RecoveryProgress::Done(voided) => break voided,
+                RecoveryProgress::Yielded => {}
+            }
+        };
+        assert!(voided, "the scoped void applies");
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        let refused_at = refused_at.expect("the overflow publishes its refusal");
+        assert!(
+            marked_at_refusal <= 1,
+            "the refusal lands before the marks (poll {refused_at} marked {marked_at_refusal})"
+        );
+        assert_eq!(
+            marked(&harness),
+            65,
+            "every overflowed key is eventually marked"
+        );
+        for proof in &proofs {
+            assert!(
+                !harness.owner.adapter().proof_refused_for_test(*proof),
+                "taint precedence refuses no key"
+            );
+        }
+        assert!(
+            harness.owner.adapter().key_is_live(healthy_proof.key),
+            "the healthy image keeps a live key"
+        );
+        assert!(
+            !harness.owner.adapter().image_tainted_for_test(healthy),
+            "the healthy image stays untainted"
+        );
+        assert!(
+            harness.owner.adapter().open.contains_key(&(2, 1)),
+            "the healthy image keeps its staged call"
+        );
+    }
+
+    #[test]
+    fn stream_void_preserves_one_key_per_credit() {
+        // Fix7 machine twin (Codex fix4 finding 1, batch path): a
+        // stream void over 65 live keys with one unclaimed mutating
+        // abandonment must slice across credits — one key per poll
+        // through preservation — instead of deciding synchronously,
+        // and still fence every key, drain every open, invalidate
+        // the stream and scope the failure to every domain.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::{JointVoidScope, RecoveryProgress};
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let image = (COOKIE, EXEC);
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 65);
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, image);
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        let upper = harness.owner.adapter().consumed_through_for_test();
+        harness.owner.adapter_mut().break_stream_for_test();
+        let mut calls = 0u64;
+        let mut prev_built = 0usize;
+        let voided = loop {
+            let mut budget = 1usize;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded void never refuses its own budget");
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(
+                    progress,
+                    RecoveryProgress::Yielded,
+                    "one credit never decides a 65-key stream void at once"
+                );
+            }
+            let (built, _) = harness
+                .owner
+                .adapter()
+                .preserve_basis_progress_for_test(image);
+            assert!(
+                built >= prev_built && built - prev_built <= 1,
+                "one credit builds at most one basis key ({prev_built} -> {built})"
+            );
+            prev_built = built;
+            assert!(calls < 10_000, "the bounded void always terminates");
+            match progress {
+                RecoveryProgress::Done(voided) => break voided,
+                RecoveryProgress::Yielded => {}
+            }
+        };
+        assert!(voided, "the stream void applies");
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Stream),
+            "the probe takes the stream branch"
+        );
+        assert!(
+            harness.owner.adapter().image_tainted_for_test(image),
+            "the unclaimed abandonment taints its image"
+        );
+        for proof in &proofs {
+            assert!(
+                !harness.owner.adapter().proof_refused_for_test(*proof),
+                "taint precedence refuses no key"
+            );
+            assert_eq!(
+                harness
+                    .owner
+                    .adapter()
+                    .keys
+                    .get(&proof.key)
+                    .expect("fenced key")
+                    .void_fence,
+                upper,
+                "the stream void fences every key"
+            );
+        }
+        assert!(
+            harness.owner.adapter().open.is_empty(),
+            "the stream void drains every open"
+        );
+        assert!(
+            harness.owner.adapter().invalidated_for_test(),
+            "the stream void invalidates the stream"
+        );
+        assert_eq!(
+            harness.owner.adapter().voided_through_for_test(),
+            upper,
+            "the stream void records its fence"
+        );
+        match &harness
+            .owner
+            .pending_void_for_test()
+            .expect("the void carries its failure")
+            .scope
+        {
+            SealFailureScope::AffectedDomains(domains) => assert_eq!(
+                domains.len(),
+                proofs.len(),
+                "the stream failure scopes every domain"
+            ),
+            scope => panic!("the stream failure scopes every domain, got {scope:?}"),
+        }
     }
 
     #[test]
@@ -23334,6 +23752,373 @@ pub(crate) mod tests {
         scene
             .seal_at(&rebirth, 8)
             .expect("post-void rebirth binds the later sign");
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("rebound key")
+                .refused,
+            "the rebirth keeps the key live"
+        );
+    }
+
+    #[test]
+    fn seal_abandoned_getattributes_disposes_per_call_and_key_continues() {
+        // Fix7: an exit-time unbounded abandonment of an effect-free
+        // GetAttributes read disposes per-call with a named loss gap
+        // instead of dooming the whole key: the seal succeeds, the
+        // converted read stays held, the key stays live, and a later
+        // read on the same key binds.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function_n("C_GetAttributeValue", 3);
+        let getattr = function_id("C_GetAttributeValue");
+        scene.ingest(&begin_bytes(1, 1, getattr, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        scene.ingest(&begin_bytes(1, 2, getattr, 0));
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        let success = scene
+            .seal(&bootstrap)
+            .expect("effect-free abandonment disposes per-call, key seals");
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the per-call disposal names its loss gap: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            success.prefix.settled().is_empty(),
+            "the disposed call settles nothing"
+        );
+        assert_eq!(success.prefix.open_keys().len(), 1);
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one disposed call names one loss gap"
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live after an effect-free abandonment"
+        );
+        scene.ingest(&begin_bytes(1, 3, getattr, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later read binds on the live key");
+        assert_eq!(scene.model.project().usage.pending_calls, 2);
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "no refusal sticks for an effect-free abandonment"
+        );
+    }
+
+    #[test]
+    fn seal_converted_getattributes_abandonment_disposes_and_key_continues() {
+        // Fix7 converted twin: an unbounded abandonment staged on an
+        // already-converted GetAttributes read releases its model
+        // ticket per-call (no whole-key doom) while the key keeps
+        // sealing.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function_n("C_GetAttributeValue", 3);
+        let getattr = function_id("C_GetAttributeValue");
+        scene.ingest(&begin_bytes(1, 1, getattr, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.ingest(&begin_bytes(1, 2, getattr, 0));
+        let success = scene
+            .seal(&bootstrap)
+            .expect("converted effect-free abandonment disposes per-call");
+        assert_eq!(
+            scene.model.project().usage.pending_calls,
+            1,
+            "one ticket released, one converted"
+        );
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the per-call disposal names its loss gap: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key keeps sealing after a converted effect-free abandonment"
+        );
+        scene.ingest(&begin_bytes(1, 3, getattr, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later read binds on the live key");
+    }
+
+    #[test]
+    fn seal_abandoned_wrapkey_disposes_per_call() {
+        // Fix7: C_WrapKey is a pure-read Access (it reads two keys and
+        // emits bytes without mutating stored or operation state), so
+        // its abandonment disposes per-call while the key keeps
+        // sealing.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function_n("C_WrapKey", 3);
+        let wrap = function_id("C_WrapKey");
+        scene.ingest(&begin_bytes(1, 1, wrap, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        scene.ingest(&begin_bytes(1, 2, wrap, 0));
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        scene
+            .seal(&bootstrap)
+            .expect("pure-read Access abandonment disposes per-call");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one disposed call names one loss gap"
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live after a pure-read Access abandonment"
+        );
+        scene.ingest(&begin_bytes(1, 3, wrap, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later call binds on the live key");
+    }
+
+    #[test]
+    fn seal_abandoned_getobjectsize_disposes_per_call() {
+        // Fix7: C_GetObjectSize is a pure size query (the model does
+        // not even count it as a key use), so its abandonment
+        // disposes per-call while the key keeps sealing.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function_n("C_GetObjectSize", 3);
+        let size = function_id("C_GetObjectSize");
+        scene.ingest(&begin_bytes(1, 1, size, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        scene.ingest(&begin_bytes(1, 2, size, 0));
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        scene
+            .seal(&bootstrap)
+            .expect("size-query abandonment disposes per-call");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one disposed call names one loss gap"
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live after a size-query abandonment"
+        );
+        scene.ingest(&begin_bytes(1, 3, size, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later call binds on the live key");
+    }
+
+    #[test]
+    fn seal_abandoned_signinit_still_dooms_key() {
+        // Fix7 guard: C_SignInit establishes session operation state
+        // (a later Sign on the same session depends on it), so its
+        // abandonment is not effect-free and still dooms the whole
+        // key (fail closed).
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_SignInit");
+        let init = function_id("C_SignInit");
+        scene.ingest(&begin_bytes(1, 1, init, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("operation-establishing abandonment still dooms");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the operation-establishing abandonment keeps its permanent refusal"
+        );
+    }
+
+    #[test]
+    fn seal_abandoned_setoperationstate_still_dooms_key() {
+        // Fix7 guard: C_SetOperationState imports saved operation
+        // state into the session (an OperationImport mutation), so
+        // its abandonment still dooms the whole key (fail closed).
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_SetOperationState");
+        let restore = function_id("C_SetOperationState");
+        scene.ingest(&begin_bytes(1, 1, restore, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("operation-import abandonment still dooms");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the operation-import abandonment keeps its permanent refusal"
+        );
+    }
+
+    #[test]
+    fn seal_abandoned_digestkey_still_dooms_key() {
+        // Fix7 guard: C_DigestKey feeds its key into the session
+        // digest operation (an operation-state mutation), so its
+        // abandonment still dooms the whole key (fail closed).
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_DigestKey");
+        let feed = function_id("C_DigestKey");
+        scene.ingest(&begin_bytes(1, 1, feed, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("operation-feeding abandonment still dooms");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the operation-feeding abandonment keeps its permanent refusal"
+        );
+    }
+
+    #[test]
+    fn void_with_staged_getattributes_abandonment_preserves_key_and_rebirths() {
+        // Fix7 preserve twin: a void wiping a staged effect-free
+        // GetAttributes abandonment preserves no doom and taints no
+        // image — the fence suffices for pure reads, so the key
+        // rebirths above the fence and a later read binds.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_GetAttributeValue");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 1, getattr, 0);
+        scene.ingest(&outer);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("voided key")
+                .refused,
+            "the void preserves no doom for an effect-free abandonment"
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "the void taints no image for an effect-free abandonment"
+        );
+        // The key rebirths above the fence and a later read binds.
+        let fence = scene.adapter.consumed_through;
+        let reproof = scene.attest_function("C_GetAttributeValue");
+        assert_eq!(reproof, proof);
+        scene.ingest(&begin_bytes(1, 2, getattr, 0));
+        let grant = SessionBirthGrant::scripted(
+            reproof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene
+            .seal_at(&rebirth, 8)
+            .expect("post-void rebirth binds the later read");
         assert!(
             !scene
                 .adapter

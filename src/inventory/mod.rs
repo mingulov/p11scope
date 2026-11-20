@@ -4625,17 +4625,18 @@ impl ClassicDriver<'_> {
         // Read the lifetime counts before the take hands the live
         // Session away: after it the lane reads zeros.
         let counts = SemanticStopCounts::read(lane, &mut *self.coordinator);
-        // Snapshot the retained-decoder total with the stop counts,
+        // Read the retained-decoder total with the stop counts,
         // before the take hands the live session away: the verbose
-        // tails print after the release, so without this they would
-        // read unknown on every real run.
-        self.coordinator
-            .note_joint_decoder_malformed(lane.joint_decoder_malformed());
+        // tails print after the release, so without the snapshot
+        // they would read unknown on every real run. Stored only
+        // on a successful transfer, beside the stop disclosure.
+        let decoder = lane.joint_decoder_malformed();
         let handed_off = match lane.take_joined_session() {
             Ok(_) => !lane.is_finished(),
             Err(_) => return,
         };
         if handed_off {
+            self.coordinator.note_joint_decoder_malformed(decoder);
             let mut warn = WarnSink {
                 display: &mut self.display,
             };
@@ -4788,6 +4789,22 @@ impl ClassicDriver<'_> {
                     .expect("winding lane");
                 SemanticStopCounts::read(lane, &mut *self.coordinator)
             };
+            // Read the retained-decoder total with the stop counts,
+            // before the take hands the live session away. Stored
+            // only on a successful transfer, beside the stop
+            // disclosure, so the tails keep proving the total after
+            // the domain retires.
+            let decoder = {
+                let retiring = self.retiring.as_mut().expect("a winding lane retires");
+                let lane = retiring
+                    .winding
+                    .as_ref()
+                    .expect("winding")
+                    .lane
+                    .as_ref()
+                    .expect("winding lane");
+                lane.joint_decoder_malformed()
+            };
             let session = {
                 let retiring = self.retiring.as_mut().expect("a winding lane retires");
                 let lane = retiring
@@ -4819,6 +4836,7 @@ impl ClassicDriver<'_> {
                     .is_some_and(|lane| !lane.is_finished())
                 {
                     winding.joined = true;
+                    self.coordinator.note_joint_decoder_malformed(decoder);
                     // The join reads the shared once-gate but never arms
                     // it: a later stop still owes its held-for-exit gap.
                     let mut warn = WarnSink {
@@ -5934,9 +5952,13 @@ impl Drop for ClassicDriver<'_> {
         {
             // Snapshot the winding lane's decoder total before the
             // exit hold takes it out of reach: the tails print after
-            // this drop.
-            self.coordinator
-                .note_joint_decoder_malformed(lane.joint_decoder_malformed());
+            // this drop. An already-joined shell skips it: the join
+            // stored the total while the drain still read, and the
+            // shell now reads unknown.
+            if !winding.joined {
+                self.coordinator
+                    .note_joint_decoder_malformed(lane.joint_decoder_malformed());
+            }
             ExitRetention::hold(lane);
         }
         let Some(pending) = self.pending_install.take() else {
@@ -29479,11 +29501,7 @@ mod promotion_driver_tests {
             CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
         driver.completion_source = Some(Box::new(source));
         driver.on_tick();
-        assert_eq!(
-            driver.retiring_domain(),
-            None,
-            "the retry mint retires A"
-        );
+        assert_eq!(driver.retiring_domain(), None, "the retry mint retires A");
         assert_eq!(
             driver.coordinator.joint_decoder_diagnosis(),
             Some(0),
@@ -29545,7 +29563,6 @@ mod promotion_driver_tests {
             "the drop keeps the join snapshot instead of the shell unknown"
         );
     }
-
 
     #[test]
     fn joint_winding_retire_refused_then_ok_retries_without_reaping() {

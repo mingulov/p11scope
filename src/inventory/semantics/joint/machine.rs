@@ -40,8 +40,8 @@ use crate::semantics_objects::journal::joint_driver::{
     RawQuantumIdentity, RawQuantumRefusal,
 };
 use crate::semantics_objects::journal::{
-    EndpointClass, FaultEpoch, FaultReadError, JournalAdapter, JournalDomainProof,
-    SessionClosureGrant, SessionDrainGrant,
+    ConsumptionOrdinal, EndpointClass, FaultEpoch, FaultReadError, JournalAdapter,
+    JournalDomainProof, SessionClosureGrant, SessionDrainGrant,
 };
 use p11scope_ebpf_common::event_type;
 use std::time::{Duration, Instant};
@@ -1342,6 +1342,24 @@ pub(crate) struct FinishNoProgressTrip {
     pub(crate) stalled: Duration,
 }
 
+/// One completed watchdog barrier decision retained in the stalled
+/// frame: a barrier-free scan can consume exactly its reserve, which
+/// would otherwise starve the park on every retry (a fresh full scan
+/// each tick). The next tick reuses the retained decision and hands
+/// its reserve to the park instead. The decision invalidates when
+/// the frame or the frontier changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WatchdogBarrierDecision {
+    identity: RawQuantumIdentity,
+    frontier: ConsumptionOrdinal,
+    barrier: bool,
+}
+impl WatchdogBarrierDecision {
+    fn matches(&self, identity: RawQuantumIdentity, frontier: ConsumptionOrdinal) -> Option<bool> {
+        (self.identity == identity && self.frontier == frontier).then_some(self.barrier)
+    }
+}
+
 /// Scheduling state over the original owner, not an alternate capture/model.
 pub(crate) struct LiveJointMachine {
     producers: SessionDrainProducers,
@@ -1403,6 +1421,11 @@ pub(crate) struct LiveJointMachine {
     /// wall-time bound fired. Set once per demand, never cleared:
     /// the trip latches the disposition and the lane is held past it.
     audit_no_progress_trip: Option<FinishNoProgressTrip>,
+    /// The last completed watchdog barrier decision for the stalled
+    /// frame, if its scan finished: reused while the same frame and
+    /// frontier stand, so a scan that consumed its whole reserve
+    /// still leaves the next tick's reserve to the park.
+    watchdog_barrier_decision: Option<WatchdogBarrierDecision>,
     /// Set when the running service latched an audit-step refusal (at
     /// Auditing, or at Audited with its retained frame) the exit
     /// abandon can dispose in full; cleared by the re-arm. Every other
@@ -1521,6 +1544,7 @@ impl LiveJointMachine {
             finish_no_progress_trip: None,
             audit_no_progress_polls: 0,
             audit_no_progress_trip: None,
+            watchdog_barrier_decision: None,
             rearm_eligible: false,
             running_rearms: 0,
             rearm_window: [None; RUNNING_REARM_LIMIT as usize],
@@ -3418,7 +3442,6 @@ impl LiveJointMachine {
                 self.absence_binding = 0;
                 self.absence_after = None;
                 self.absence_entry = 0;
-                let work = budget.remaining_actions.min(MAX_PENDING);
                 // A Joint fault never stops S1: a linked stream broken
                 // while ingesting fences the consumed history and
                 // re-syncs above it on this collect, refusing no key.
@@ -3501,6 +3524,15 @@ impl LiveJointMachine {
                             ),
                         );
                     }
+                }
+                // Recompute the collection allowance after recovery:
+                // the void above spent from this same budget, so a
+                // pre-recovery allowance is stale. A tick with no
+                // budget left yields before I/O; collection resumes
+                // next tick.
+                let work = budget.remaining_actions.min(MAX_PENDING);
+                if work == 0 {
+                    return (Phase::Idle, Ok(Step::Yield));
                 }
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(
@@ -4497,29 +4529,61 @@ impl LiveJointMachine {
                                     // next tick on huge tables (the
                                     // stall clock keeps running, so a
                                     // genuinely wedged frame still
-                                    // trips).
+                                    // trips). A completed barrier
+                                    // decision is retained while the
+                                    // same frame and frontier stand,
+                                    // so a scan that consumed its
+                                    // whole reserve still leaves the
+                                    // next tick's reserve to the park.
                                     let mut watchdog_budget =
                                         crate::semantics_objects::journal::SCOPED_RECOVERY_SLICE;
-                                    let barrier = match coordinator
-                                        .joint_capture_mut()
-                                        .adapter_mut()
-                                        .has_seal_barrier_bounded(&mut watchdog_budget)
+                                    // Reuse the retained barrier decision
+                                    // while the same frame and frontier
+                                    // stand: a clear scan that consumed
+                                    // its whole reserve hands this
+                                    // tick's reserve to the park
+                                    // instead of rescanning. A changed
+                                    // frame or frontier rescans.
+                                    let frontier =
+                                        coordinator.joint_capture().adapter().consumed_frontier();
+                                    let barrier = match self
+                                        .watchdog_barrier_decision
+                                        .as_ref()
+                                        .and_then(|decision| decision.matches(identity, frontier))
                                     {
-                                        crate::semantics_objects::journal::BarrierCheck::Barrier => {
-                                            true
-                                        }
-                                        crate::semantics_objects::journal::BarrierCheck::Clear => {
-                                            false
-                                        }
-                                        crate::semantics_objects::journal::BarrierCheck::Yielded => {
-                                            return (
-                                                Phase::Audited {
-                                                    frame,
+                                        Some(barrier) => barrier,
+                                        None => {
+                                            let mut scan_budget = watchdog_budget;
+                                            let barrier = match coordinator
+                                                .joint_capture_mut()
+                                                .adapter_mut()
+                                                .has_seal_barrier_bounded(&mut scan_budget)
+                                            {
+                                                crate::semantics_objects::journal::BarrierCheck::Barrier => {
+                                                    true
+                                                }
+                                                crate::semantics_objects::journal::BarrierCheck::Clear => {
+                                                    false
+                                                }
+                                                crate::semantics_objects::journal::BarrierCheck::Yielded => {
+                                                    return (
+                                                        Phase::Audited {
+                                                            frame,
+                                                            identity,
+                                                            base,
+                                                        },
+                                                        Ok(Step::Yield),
+                                                    );
+                                                }
+                                            };
+                                            watchdog_budget = scan_budget;
+                                            self.watchdog_barrier_decision =
+                                                Some(WatchdogBarrierDecision {
                                                     identity,
-                                                    base,
-                                                },
-                                                Ok(Step::Yield),
-                                            );
+                                                    frontier,
+                                                    barrier,
+                                                });
+                                            barrier
                                         }
                                     };
                                     let parked = if barrier {
@@ -6311,6 +6375,59 @@ mod binding_reservation_tests {
             super::pregrant_close_reason(red, true),
             Some(PregrantCloseReason::Custody),
             "the first failing conjunct wins"
+        );
+    }
+
+    /// A retained watchdog barrier decision hits only for its own
+    /// stalled frame and frontier: a changed frame or a changed
+    /// frontier misses and rescans instead of reusing a stale
+    /// decision.
+    #[test]
+    fn watchdog_barrier_decision_invalidates_on_frame_or_frontier_change() {
+        use super::WatchdogBarrierDecision;
+        use crate::semantics_objects::journal::ConsumptionOrdinal;
+        use crate::semantics_objects::journal::joint_driver::RawQuantumIdentity;
+        let decision = WatchdogBarrierDecision {
+            identity: RawQuantumIdentity::for_test(7),
+            frontier: ConsumptionOrdinal::for_test(9),
+            barrier: false,
+        };
+        assert_eq!(
+            decision.matches(
+                RawQuantumIdentity::for_test(7),
+                ConsumptionOrdinal::for_test(9)
+            ),
+            Some(false),
+            "the same frame and frontier hit"
+        );
+        assert_eq!(
+            decision.matches(
+                RawQuantumIdentity::for_test(8),
+                ConsumptionOrdinal::for_test(9)
+            ),
+            None,
+            "a changed frame rescans"
+        );
+        assert_eq!(
+            decision.matches(
+                RawQuantumIdentity::for_test(7),
+                ConsumptionOrdinal::for_test(10)
+            ),
+            None,
+            "a changed frontier rescans"
+        );
+        let barrier = WatchdogBarrierDecision {
+            identity: RawQuantumIdentity::for_test(7),
+            frontier: ConsumptionOrdinal::for_test(9),
+            barrier: true,
+        };
+        assert_eq!(
+            barrier.matches(
+                RawQuantumIdentity::for_test(7),
+                ConsumptionOrdinal::for_test(9)
+            ),
+            Some(true),
+            "a retained barrier reuses too"
         );
     }
 }

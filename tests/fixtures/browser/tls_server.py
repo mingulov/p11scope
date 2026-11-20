@@ -166,7 +166,14 @@ class FlowServer:
     ``cert_requests_sent`` (connections where the server's outbound
     CertificateRequest flight was observed: selection began),
     ``handshakes_ok`` (completed handshakes), ``client_certs_presented``
-    (peer cert seen at handshake time, independent of requests),
+    (peer cert seen at handshake time, independent of requests;
+    resumed handshakes present the original cert without signing),
+    ``sessions_reused`` (completed handshakes that resumed: no
+    CertificateVerify, so no client signature),
+    ``full_presented`` (completed full handshakes with a presented
+    cert: the exact expected client-signature count),
+    ``handshake_sessions`` (per-handshake ``reused``/``version``/
+    ``presented`` records, in completion order),
     ``empty_certs`` (full handshake with an empty client certificate),
     ``selection_stalls`` (peers that saw CertificateRequest and never
     finished: stuck at selection), ``client_cert_alerts``
@@ -190,6 +197,9 @@ class FlowServer:
     requests_served: int = 0
     client_certs_presented: int = 0
     handshakes_ok: int = 0
+    sessions_reused: int = 0
+    full_presented: int = 0
+    handshake_sessions: list[dict] = field(default_factory=list)
     spoke_tls: int = 0
     client_hello_complete: int = 0
     cert_requests_sent: int = 0
@@ -223,15 +233,34 @@ class FlowServer:
 
         The peer certificate is read at handshake time, independently of
         any later HTTP request: a presented cert counts even when no
-        request is ever served.
+        request is ever served. Session resumption is recorded per
+        handshake too: a resumed handshake presents the original cert
+        without a CertificateVerify, so only full presented
+        handshakes predict a client signature.
         """
         self.handshakes_ok += 1
         try:
             peer = tls_conn.getpeercert(binary_form=True)
         except Exception:
             peer = None
-        if peer:
+        presented = bool(peer)
+        if presented:
             self.client_certs_presented += 1
+        try:
+            reused = bool(tls_conn.session_reused)
+        except Exception:
+            reused = False
+        try:
+            version = tls_conn.version() or "unknown"
+        except Exception:
+            version = "unknown"
+        if reused:
+            self.sessions_reused += 1
+        elif presented:
+            self.full_presented += 1
+        self.handshake_sessions.append(
+            {"reused": reused, "version": version, "presented": presented}
+        )
 
     @property
     def port(self) -> int:

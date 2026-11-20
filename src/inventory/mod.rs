@@ -4255,6 +4255,10 @@ impl ClassicDriver<'_> {
         warn: &mut WarnSink<'_>,
         winding_disclosed: Option<&mut bool>,
     ) -> (String, crate::inventory_semantics::SemanticCaptureSummary) {
+        // Snapshot the retained-decoder total before anything
+        // consumes the lane: the hold drops the live drain, and the
+        // verbose tails print after it.
+        coordinator.note_joint_decoder_malformed(lane.joint_decoder_malformed());
         // Poll the EVENTS ring-loss counter before anything reads
         // the stop counts: loss since the last publish discloses
         // here, so the stop line and the served summary carry it
@@ -4621,6 +4625,12 @@ impl ClassicDriver<'_> {
         // Read the lifetime counts before the take hands the live
         // Session away: after it the lane reads zeros.
         let counts = SemanticStopCounts::read(lane, &mut *self.coordinator);
+        // Snapshot the retained-decoder total with the stop counts,
+        // before the take hands the live session away: the verbose
+        // tails print after the release, so without this they would
+        // read unknown on every real run.
+        self.coordinator
+            .note_joint_decoder_malformed(lane.joint_decoder_malformed());
         let handed_off = match lane.take_joined_session() {
             Ok(_) => !lane.is_finished(),
             Err(_) => return,
@@ -5922,6 +5932,11 @@ impl Drop for ClassicDriver<'_> {
             && let Some(winding) = retiring.winding.as_mut()
             && let Some(lane) = winding.lane.take()
         {
+            // Snapshot the winding lane's decoder total before the
+            // exit hold takes it out of reach: the tails print after
+            // this drop.
+            self.coordinator
+                .note_joint_decoder_malformed(lane.joint_decoder_malformed());
             ExitRetention::hold(lane);
         }
         let Some(pending) = self.pending_install.take() else {

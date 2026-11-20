@@ -1085,8 +1085,7 @@ impl<C> ReservationTable<C> {
                     spent += 1;
                     actual += 1;
                     #[cfg(test)]
-                    self.test_slot_visits
-                        .set(self.test_slot_visits.get() + 1);
+                    self.test_slot_visits.set(self.test_slot_visits.get() + 1);
                     let slot = node_slot(current);
                     let lane = node_lane(current);
                     let role_index = cursor.role.index();
@@ -1138,8 +1137,7 @@ impl<C> ReservationTable<C> {
                     spent += 1;
                     actual += 1;
                     #[cfg(test)]
-                    self.test_slot_visits
-                        .set(self.test_slot_visits.get() + 1);
+                    self.test_slot_visits.set(self.test_slot_visits.get() + 1);
                     let role_index = cursor.role.index();
                     let target = cursor.key;
                     let found = self.slots[at].operation.as_ref().is_some_and(|op| {
@@ -1164,9 +1162,7 @@ impl<C> ReservationTable<C> {
                         debug_assert!(spent <= budget);
                         return (true, spent, actual, Some(result));
                     }
-                    cursor.state = SingleReleaseState::FindingLinear {
-                        next_slot: at + 1,
-                    };
+                    cursor.state = SingleReleaseState::FindingLinear { next_slot: at + 1 };
                     continue;
                 }
                 SingleReleaseState::UnlinkingKey {
@@ -1179,10 +1175,8 @@ impl<C> ReservationTable<C> {
                     spent += 1;
                     actual += 1;
                     #[cfg(test)]
-                    self.test_sweep_visits
-                        .set(self.test_sweep_visits.get() + 1);
-                    let successor =
-                        self.slots[node_slot(node)].next[KEY_LINKS][node_lane(node)];
+                    self.test_sweep_visits.set(self.test_sweep_visits.get() + 1);
+                    let successor = self.slots[node_slot(node)].next[KEY_LINKS][node_lane(node)];
                     if prev_code == INDEX_NONE {
                         self.key_heads[bucket] = successor;
                     } else {
@@ -1191,8 +1185,7 @@ impl<C> ReservationTable<C> {
                     }
                     let taken = result.take().expect("pending release keeps its charge");
                     if self.slot_is_vacant(slot) {
-                        let aliases =
-                            self.slots[slot].operation.as_ref().unwrap().aliases;
+                        let aliases = self.slots[slot].operation.as_ref().unwrap().aliases;
                         self.slots[slot].operation = None;
                         self.live -= 1;
                         cursor.state = SingleReleaseState::UnlinkingAliases {
@@ -2260,18 +2253,12 @@ mod tests {
             namespace: 0,
             value: second,
         };
-        table
-            .insert(Role::H8Open, key_first, None, 10, ())
-            .unwrap();
+        table.insert(Role::H8Open, key_first, None, 10, ()).unwrap();
         table
             .insert(Role::H8Open, key_second, None, 10, ())
             .unwrap();
-        let at_first = table
-            .key_slot_for_test(Role::H8Open, key_first)
-            .unwrap();
-        let at_second = table
-            .key_slot_for_test(Role::H8Open, key_second)
-            .unwrap();
+        let at_first = table.key_slot_for_test(Role::H8Open, key_first).unwrap();
+        let at_second = table.key_slot_for_test(Role::H8Open, key_second).unwrap();
         let bucket = ReservationTable::<()>::key_bucket(Role::H8Open, key_first);
         assert_eq!(
             bucket,

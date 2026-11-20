@@ -4,8 +4,7 @@
 
 use super::MAX_UNSETTLED_STAGED;
 use super::reservations::{
-    Refusal, ReleaseRoleCursor, ReservationId, ReservationTable, Role, RoleKey,
-    SingleReleaseCursor,
+    Refusal, ReleaseRoleCursor, ReservationId, ReservationTable, Role, RoleKey, SingleReleaseCursor,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SEMANTIC_RESOURCE_LIMIT, SemanticResourceReserver,
@@ -528,9 +527,10 @@ impl StagingLedger {
     /// Initial cursor for a plain staged release (namespace zero).
     /// Empty ledgers hold no work and complete at once.
     pub(crate) fn release_cursor(&self, ticket: u64) -> LedgerReleaseCursor {
-        let inner = self.table.as_ref().map(|table| {
-            table.single_release_cursor(Role::H9Staged, Self::key(ticket))
-        });
+        let inner = self
+            .table
+            .as_ref()
+            .map(|table| table.single_release_cursor(Role::H9Staged, Self::key(ticket)));
         LedgerReleaseCursor { inner }
     }
 

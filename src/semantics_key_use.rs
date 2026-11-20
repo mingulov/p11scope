@@ -4096,10 +4096,8 @@ impl FeedDisposalCursor {
                     return (false, spent);
                 }
                 spent += 1;
-                let mut throwaway =
-                    self.throwaway.take().expect("joint finalizes once");
-                let mut preserved =
-                    self.preserved.take().expect("joint finalizes once");
+                let mut throwaway = self.throwaway.take().expect("joint finalizes once");
+                let mut preserved = self.preserved.take().expect("joint finalizes once");
                 {
                     let mut outer = NoSink;
                     let mut tee = KeyUseTee::new(

@@ -1204,13 +1204,14 @@ enum EdgeRetirePhase {
 /// [`EdgeSemantics::would_retire_scope`]).
 #[derive(Debug, Clone)]
 pub(crate) enum RetirePeek {
-    /// Zero-leaf observe (gate failure, unsealed/COUNT_ONLY, PENDING
-    /// queue, lifecycle guard miss): caller pops for 1 unit and runs
-    /// observe synchronously with no pre-charge (0 reads).
+    /// Zero-leaf observe (downgrade-gate failure, unsealed/COUNT_ONLY,
+    /// PENDING queue): caller pops for 1 unit and runs observe
+    /// synchronously with no pre-charge (0 reads). Lifecycle guard
+    /// misses are Bounded (their synchronous observe may read).
     NoOp,
     /// Bounded observe (Init/Update/Direct/Async, 2-machine
-    /// OPERATION_NOT_INITIALIZED): caller reserve-checks HEAD_WORST
-    /// and runs atomically.
+    /// OPERATION_NOT_INITIALIZED, lifecycle guard miss):
+    /// caller reserve-checks HEAD_WORST and runs atomically.
     Bounded,
     /// Whole-scope retire (caller uses budgeted invalidation):
     /// `count_reconciliations` mirrors sync (true for
@@ -1664,20 +1665,29 @@ impl EdgeSemantics {
         }
     }
 
-    /// Login/logout clears the slot's operations, mirroring
-    /// `apply_auth` exactly: context-specific `C_Login` is exempt, and
-    /// `OK`/`PIN_LOCKED` both proceed (both prove the token answered
-    /// with changed auth state).
+    /// Whether one login/logout call retires its slot's operations,
+    /// shared by the synchronous reducer ([`Self::apply_auth`]) and the
+    /// feed peek ([`Self::would_retire_scope`]) so the two cannot drift:
+    /// context-specific `C_Login` with `OK` is exempt, and only
+    /// `OK`/`PIN_LOCKED` proceed (both prove the token answered with
+    /// changed auth state).
+    fn auth_retires_slot(call: &SemanticCall) -> bool {
+        if call.function == "C_Login" && call.user_type == 2 && call.rv == CkRv::OK.0 {
+            return false;
+        }
+        call.rv == CkRv::OK.0 || call.rv == CkRv::PIN_LOCKED.0
+    }
+
+    /// Login/logout clears the slot's operations: the scope predicate
+    /// above decides, then every session proven on the call's slot
+    /// ends cancelled (machines, pendings, floated async).
     fn apply_auth<S: OperationSink>(
         &mut self,
         call: &SemanticCall,
         origin: &EffectOrigin,
         sink: &mut S,
     ) {
-        if call.function == "C_Login" && call.user_type == 2 && call.rv == CkRv::OK.0 {
-            return;
-        }
-        if call.rv != CkRv::OK.0 && call.rv != CkRv::PIN_LOCKED.0 {
+        if !Self::auth_retires_slot(call) {
             return;
         }
         let Some(slot) = self.open.get(&call.session).copied() else {
@@ -2451,8 +2461,10 @@ impl EdgeSemantics {
     /// gate/descriptor/lifecycle condition helpers with
     /// [`Self::observe_inner`] so the two cannot drift (only the
     /// downgrade-cause counting differs, which the peek correctly
-    /// omits). LOGIN/LOGOUT resolve their slot from the live open map
-    /// (like sync); without an open for the session they no-op.
+    /// omits). LOGIN/LOGOUT share the synchronous auth scope predicate
+    /// ([`Self::auth_retires_slot`]) and resolve their slot from the
+    /// live open map (like sync); exempt and slot-less logins observe
+    /// Bounded.
     pub(crate) fn would_retire_scope(&self, call: &SemanticCall) -> RetirePeek {
         if !call.attributable || !call.authorized || !call.unambiguous || call.count_only {
             return RetirePeek::NoOp;
@@ -2497,7 +2509,7 @@ impl EdgeSemantics {
                         post: SessionPost::Open { slot: call.slot_id },
                     })
                 } else {
-                    RetirePeek::NoOp
+                    RetirePeek::Bounded
                 }
             }
             x if x == lifecycle::CLOSE_SESSION => {
@@ -2508,7 +2520,7 @@ impl EdgeSemantics {
                         post: SessionPost::Close,
                     })
                 } else {
-                    RetirePeek::NoOp
+                    RetirePeek::Bounded
                 }
             }
             x if x == lifecycle::CLOSE_ALL_SESSIONS => {
@@ -2518,7 +2530,7 @@ impl EdgeSemantics {
                         close_all: true,
                     })
                 } else {
-                    RetirePeek::NoOp
+                    RetirePeek::Bounded
                 }
             }
             x if x == lifecycle::FINALIZE => {
@@ -2527,12 +2539,12 @@ impl EdgeSemantics {
                         count_reconciliations: false,
                     }
                 } else {
-                    RetirePeek::NoOp
+                    RetirePeek::Bounded
                 }
             }
             x if x == lifecycle::LOGIN || x == lifecycle::LOGOUT => {
-                if call.rv != CkRv::OK.0 && call.rv != CkRv::PIN_LOCKED.0 {
-                    return RetirePeek::NoOp;
+                if !Self::auth_retires_slot(call) {
+                    return RetirePeek::Bounded;
                 }
                 #[cfg(test)]
                 self.bump_edge_read_for_test();
@@ -2541,7 +2553,7 @@ impl EdgeSemantics {
                         slot,
                         close_all: false,
                     }),
-                    None => RetirePeek::NoOp,
+                    None => RetirePeek::Bounded,
                 }
             }
             x if x == lifecycle::SESSION_CANCEL => {
@@ -2555,7 +2567,7 @@ impl EdgeSemantics {
                         ambiguous: call.rv == CkRv::OPERATION_CANCEL_FAILED.0 && selected > 1,
                     })
                 } else {
-                    RetirePeek::NoOp
+                    RetirePeek::Bounded
                 }
             }
             x if x == lifecycle::SET_OPERATION_STATE => {
@@ -2565,7 +2577,7 @@ impl EdgeSemantics {
                         end_unknown: false,
                     })
                 } else {
-                    RetirePeek::NoOp
+                    RetirePeek::Bounded
                 }
             }
             _ => RetirePeek::Bounded,

@@ -29428,6 +29428,126 @@ mod promotion_driver_tests {
     }
 
     #[test]
+    fn promotion_join_and_retire_retains_the_decoder_total_for_the_tail() {
+        // The healthy promotion path hands the live session away at
+        // join and retires the domain: the join snapshots the posed
+        // healthy zero while the drain still reads, so the tails
+        // prove zero after retirement instead of unknown (codex fix2
+        // residual).
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_scripted_decoder_malformed_for_test(Some(0));
+        driver.semantic = Some(lane);
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        let (source, _, _) = CountingSource::scripted(None);
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        // The seal drains before the first retire poll, as in
+        // production (a finished lane retains no frame past the take).
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        assert!(
+            driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding")
+                .joined,
+            "the first tick joins the promotion lane"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(0),
+            "the join retains the posed healthy zero"
+        );
+        let (source, _, _) =
+            CountingSource::scripted(Some(SessionNativeCompletion::scripted(domain)));
+        driver.completion_source = Some(Box::new(source));
+        driver.on_tick();
+        assert_eq!(
+            driver.retiring_domain(),
+            None,
+            "the retry mint retires A"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(0),
+            "retirement keeps the joined total for the tails"
+        );
+    }
+
+    #[test]
+    fn dropped_joined_winding_lane_keeps_the_decoder_total_for_the_tail() {
+        // A promotion lane that joined but still awaits its mint at
+        // driver drop: the join snapshot stands, and the drop must
+        // not overwrite it with the shell's unknown (the take
+        // cleared the posed total, as production loses its live
+        // drain). Codex fix2 residual.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        {
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), true);
+            lane.set_scripted_decoder_malformed_for_test(Some(4));
+            driver.semantic = Some(lane);
+            let domain = install_promotion_for_wind_down(&mut driver);
+            quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+            let (source, _, _) = CountingSource::scripted(None);
+            driver.completion_source = Some(Box::new(source));
+            driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+            driver
+                .retiring
+                .as_mut()
+                .expect("retiring")
+                .winding
+                .as_mut()
+                .expect("winding")
+                .lane
+                .as_mut()
+                .expect("lane")
+                .set_test_joint_frame(false);
+            driver.on_tick();
+            assert!(
+                driver
+                    .retiring
+                    .as_ref()
+                    .expect("retiring")
+                    .winding
+                    .as_ref()
+                    .expect("winding")
+                    .joined,
+                "the tick joins but the empty mint holds retirement"
+            );
+            assert_eq!(
+                driver.retiring_domain(),
+                Some(domain),
+                "retirement stays pending without a mint"
+            );
+        }
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            Some(4),
+            "the drop keeps the join snapshot instead of the shell unknown"
+        );
+    }
+
+
+    #[test]
     fn joint_winding_retire_refused_then_ok_retries_without_reaping() {
         // A refused retire retains its proof; the retry retires on
         // the drained seal without reaping the wound-down again. The

@@ -260,6 +260,16 @@ pub(crate) enum JointVoidScope {
     Scoped,
 }
 
+/// Progress of one bounded void call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RecoveryProgress {
+    /// The void finished: whether the lane was voided.
+    Done(bool),
+    /// Budget exhausted mid-recovery: call again next tick to resume
+    /// (custody and cursors persist; nothing double-applies).
+    Yielded,
+}
+
 /// A void's original failure and the lease that paid for it.
 pub(crate) struct PendingVoid {
     pub(crate) failure: SealFailure,
@@ -359,71 +369,143 @@ impl JointCaptureOwner {
     /// like any unlocalized loss. A watchdog scoped break takes the
     /// same path narrowed to its stuck session (fence, wipe and
     /// failure scope only; no invalidation, no re-sync, no global
-    /// cut), and a stream break subsumes any pending scoped one. The
-    /// void's storage is prepaid from the ledger's reserver as in
+    /// cut), sliced through the budget with resumable cursors, and a
+    /// stream break subsumes any pending scoped one. The void's
+    /// storage is prepaid from the ledger's reserver as in
     /// `dispose_without_ingest`; a refusal keeps the fail-closed
-    /// refusal. Returns whether the lane was voided; the caller then
-    /// records the void's own gap ([`INGEST_BREAK_VOID_GAP`]) and
-    /// takes the void's scope for the follow-up disposal.
-    pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
-        let adapter = &self.adapter;
-        if adapter.invalidated || adapter.stopped || adapter.consumed_through == u64::MAX {
-            return Ok(false);
+    /// refusal and (for scoped breaks) the pending scope for retry.
+    /// On [`RecoveryProgress::Done`] the caller records the void's own
+    /// gap ([`INGEST_BREAK_VOID_GAP`]) and takes the void's scope for
+    /// the follow-up disposal; on `Yielded` it yields without
+    /// collecting and resumes next tick.
+    pub(crate) fn void_ingest_break_bounded(
+        &mut self,
+        budget: &mut usize,
+    ) -> Result<RecoveryProgress, RawQuantumRefusal> {
+        if self.adapter.invalidated
+            || self.adapter.stopped
+            || self.adapter.consumed_through == u64::MAX
+        {
+            return Ok(RecoveryProgress::Done(false));
         }
-        let stream_broken = adapter.stream_broken;
-        // A stream break subsumes any pending scoped break (the stream
-        // void wipes its whole scope); otherwise a pending scoped
-        // break voids exactly its stuck session. Neither runs twice.
-        let scoped = if stream_broken {
+        // A stream break aborts any scoped recovery in progress (its
+        // lease refunds on drop; the stream void below subsumes the
+        // partial fence/wipe/preserve work) and, after the same
+        // preflight, subsumes any pending scoped break.
+        if self.adapter.stream_broken {
+            self.adapter.scoped_recovery = None;
+            let bytes =
+                super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+                    .ok_or(RawQuantumRefusal::Capacity)?;
+            let lease = self
+                .adapter
+                .ledger
+                .resource_reserver()
+                .ok_or(RawQuantumRefusal::ForeignLedger)?
+                .reserve(bytes)
+                .map_err(RawQuantumRefusal::Resource)?;
             self.adapter.drop_scoped_break();
-            None
-        } else {
-            self.adapter.take_scoped_break()
-        };
-        if !stream_broken && scoped.is_none() {
-            return Ok(false);
+            let failure = self
+                .adapter
+                .void_ingest_break_inner(&mut self.model, INGEST_BREAK_VOID_GAP);
+            // The stream watermark breaks absence/attach chains
+            // stream-wide; scoped voids must not set it (see below).
+            self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+            self.last_void_scope = Some(JointVoidScope::Stream);
+            self.carry_pending_void(failure, bytes, lease);
+            return Ok(RecoveryProgress::Done(true));
         }
-        let bytes = super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
-            .ok_or(RawQuantumRefusal::Capacity)?;
-        let lease = self
-            .adapter
-            .ledger
-            .resource_reserver()
-            .ok_or(RawQuantumRefusal::ForeignLedger)?
-            .reserve(bytes)
-            .map_err(RawQuantumRefusal::Resource)?;
-        // A scoped void fails exactly its stuck domains; the re-arm
-        // already discarded their heads, so delivery replays nothing
-        // (verifying empty against empty) and closes the feeds for
-        // reseed, like a stream void's delivery to its wiped feeds.
-        // Healthy domains are outside the failure's scope and seal
-        // through it.
-        let (failure, scope) = match scoped {
-            Some(break_scope) => (
-                self.adapter.void_ingest_break_scoped_inner(
-                    &mut self.model,
-                    INGEST_BREAK_VOID_GAP,
-                    break_scope,
-                ),
-                JointVoidScope::Scoped,
-            ),
-            None => (
+        // Resume a scoped recovery in progress, or start one from the
+        // pending break. Observe the pending break while prepaying: a
+        // refused preflight keeps the scope for retry instead of
+        // dropping it, and neither break runs twice.
+        let mut recovery = match self.adapter.scoped_recovery.take() {
+            Some(recovery) => recovery,
+            None => {
+                if !self.adapter.scoped_break_pending() {
+                    return Ok(RecoveryProgress::Done(false));
+                }
+                let bytes =
+                    super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
+                        .ok_or(RawQuantumRefusal::Capacity)?;
+                let lease = self
+                    .adapter
+                    .ledger
+                    .resource_reserver()
+                    .ok_or(RawQuantumRefusal::ForeignLedger)?
+                    .reserve(bytes)
+                    .map_err(RawQuantumRefusal::Resource)?;
+                // The lease exists: take the break the peek observed.
+                let Some(break_scope) = self.adapter.take_scoped_break() else {
+                    // The peek held Some single-threaded; refund rather
+                    // than void without a scope if that ever changes.
+                    drop(lease);
+                    return Ok(RecoveryProgress::Done(false));
+                };
+                let upper = self.adapter.consumed_through;
                 self.adapter
-                    .void_ingest_break_inner(&mut self.model, INGEST_BREAK_VOID_GAP),
-                JointVoidScope::Stream,
-            ),
+                    .begin_scoped_recovery(break_scope, upper, bytes, lease)
+            }
         };
-        self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
-        self.last_void_scope = Some(scope);
-        // Keep the abandonment (sessions Uncertain(OutcomeLost), views
-        // and objects retired, bootstrap voided) for the next audit
-        // frame's consumers. The next audit frame (ingested or
-        // disposed) takes the void in a slot of its own, and every
-        // void needs a re-sync and an ingest first, so an older void
-        // is always delivered before a newer one can apply. Should
-        // that ever change, the guard below keeps the first void's
-        // failure but raises its fence and unions its scope, so the
-        // delivered void covers both breaks.
+        // Drive slices until the budget exhausts or the recovery
+        // completes. A scoped void fails exactly its stuck domains;
+        // the re-arm already discarded their heads, so delivery
+        // replays nothing (verifying empty against empty) and closes
+        // the feeds for reseed. Healthy domains are outside the
+        // failure's scope and seal through it; no watermark, no
+        // invalidation, no global cut.
+        loop {
+            if *budget == 0 {
+                self.adapter.scoped_recovery = Some(recovery);
+                return Ok(RecoveryProgress::Yielded);
+            }
+            let (adapter, model) = self.parts();
+            if adapter.recover_scoped_slice(model, &mut recovery, budget) {
+                break;
+            }
+        }
+        let mut domains: Vec<crate::semantics_objects::ObjectDomain> = recovery
+            .scope
+            .domains
+            .iter()
+            .filter_map(|key| {
+                self.adapter.keys.get(key).map(|state| {
+                    crate::semantics_objects::ObjectDomain::sealed(&super::JournalDomainProof {
+                        key: *key,
+                        era: state.era,
+                    })
+                })
+            })
+            .collect();
+        domains.sort();
+        domains.dedup();
+        let failure = SealFailure {
+            scope: super::SealFailureScope::AffectedDomains(domains),
+            gap: INGEST_BREAK_VOID_GAP,
+            effects: recovery.effects,
+            h3_voided: None,
+            fence: Some(recovery.upper),
+        };
+        self.last_void_scope = Some(JointVoidScope::Scoped);
+        self.carry_pending_void(failure, recovery.bytes, recovery.lease);
+        Ok(RecoveryProgress::Done(true))
+    }
+
+    /// Keep the void's abandonment (sessions Uncertain(OutcomeLost),
+    /// views and objects retired, bootstrap voided) for the next
+    /// audit frame's consumers. The next audit frame (ingested or
+    /// disposed) takes the void in a slot of its own, and every void
+    /// needs a re-sync and an ingest first, so an older void is always
+    /// delivered before a newer one can apply. Should that ever
+    /// change, the guard below keeps the first void's failure but
+    /// raises its fence and unions its scope, so the delivered void
+    /// covers both breaks.
+    fn carry_pending_void(
+        &mut self,
+        failure: SealFailure,
+        bytes: usize,
+        lease: crate::semantics_edge::resources::ResourceLease,
+    ) {
         match self.pending_void.as_mut() {
             Some(pending) => {
                 pending.failure.fence = pending.failure.fence.max(failure.fence);
@@ -437,7 +519,23 @@ impl JointCaptureOwner {
                 });
             }
         }
-        Ok(true)
+    }
+
+    /// Test-only synchronous void: drives the bounded recovery to
+    /// completion with unbounded budget. Production (the machine)
+    /// uses [`Self::void_ingest_break_bounded`] and yields.
+    #[cfg(test)]
+    pub(crate) fn void_ingest_break(&mut self) -> Result<bool, RawQuantumRefusal> {
+        let mut budget = usize::MAX;
+        loop {
+            match self.void_ingest_break_bounded(&mut budget)? {
+                RecoveryProgress::Done(voided) => return Ok(voided),
+                RecoveryProgress::Yielded => {
+                    // Unbounded budget never yields; loop defensively.
+                    budget = usize::MAX;
+                }
+            }
+        }
     }
 
     /// Take the last void's scope, if a void ran: the Idle caller uses

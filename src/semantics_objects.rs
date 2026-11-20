@@ -1377,6 +1377,13 @@ impl ObjectSemantics {
         self.state.register_domain(domain)
     }
 
+    /// Count one voided pending key that holds no model domain (see
+    /// the state method): the journal child calls this for
+    /// unregistered H3-loss keys instead of manufacturing a domain.
+    pub(crate) fn count_unregistered_loss(&mut self) {
+        self.state.count_unregistered_loss()
+    }
+
     /// Admit one logical call at its reference entry cut.
     ///
     /// Producer obligation: never re-deliver a begin the model may have

@@ -948,6 +948,15 @@ impl ModelState {
         effects.push(ObjectEffect::Unresolved { call, reason });
     }
 
+    /// Count one voided pending key that holds no model domain: the
+    /// loss lands as a bare OutcomeLost gap, without creating a model
+    /// domain solely to emit it. Registered keys count through
+    /// `outcome_lost` instead, so each affected domain counts exactly
+    /// once.
+    pub(super) fn count_unregistered_loss(&mut self) {
+        self.gap(ObjectGap::OutcomeLost);
+    }
+
     /// Explicitly register a domain record (counted against the instance
     /// budget). Idempotent while held. Under the cap, ended domains with no
     /// remaining claims are pruned first. A recently pruned identity is

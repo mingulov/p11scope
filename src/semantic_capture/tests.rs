@@ -1242,6 +1242,13 @@ struct ScriptIo {
     /// Units the scripted static-side walk visits before it finds
     /// both sides (more than one stride by default).
     side_walk_units: usize,
+    /// Scripted clock cost of each descriptor lookup a readback
+    /// stride starts: the service deadline can pass mid-stride.
+    readback_advance: Duration,
+    /// Native operations one scripted health read performs (the live
+    /// read is a continuity audit of several reads); each one costs
+    /// `health_advance` and counts in the spy.
+    health_ops: usize,
 }
 
 /// Counts of substituted native leaves (and leaf units) a capture
@@ -1370,6 +1377,8 @@ impl ScriptIo {
             custody_advance: Duration::ZERO,
             attachment_revision: 0,
             side_walk_units: 130,
+            readback_advance: Duration::ZERO,
+            health_ops: 1,
         }
     }
     fn call_image(&mut self, cookie: u64, exec_id: u64, fault: u32) {
@@ -1449,8 +1458,10 @@ impl CaptureIo for ScriptIo {
         }
     }
     fn health(&mut self) -> Result<Health, ()> {
-        NativeSpy::bump(&self.spy.health, 1);
-        self.now += self.health_advance;
+        for _ in 0..self.health_ops {
+            NativeSpy::bump(&self.spy.health, 1);
+            self.now += self.health_advance;
+        }
         let result = self.health.pop_front().unwrap_or(Ok(self.last_health));
         if let Ok(health) = result {
             self.last_health = health;
@@ -1607,14 +1618,39 @@ impl CaptureIo for ScriptIo {
         &mut self,
         _start: u32,
         len: u32,
-    ) -> Result<(), CurrentReceiptRefusal> {
+        deadline: Instant,
+    ) -> Result<u32, CurrentReceiptRefusal> {
         NativeSpy::bump(&self.spy.readback_strides, 1);
-        NativeSpy::bump(&self.spy.readback_entries, len as usize);
-        let max = self.spy.readback_max_stride.get().max(len as usize);
+        let mut read = 0;
+        while read < len && self.now < deadline {
+            NativeSpy::bump(&self.spy.readback_entries, 1);
+            self.now += self.readback_advance;
+            read += 1;
+        }
+        let max = self.spy.readback_max_stride.get().max(read as usize);
         self.spy.readback_max_stride.set(max);
         match self.attachment_refusal {
             Some(refusal) => Err(refusal),
-            None => Ok(()),
+            None => Ok(read),
+        }
+    }
+    fn health_stride(&mut self, walk: &mut HealthWalk) -> HealthStep {
+        NativeSpy::bump(&self.spy.health, 1);
+        self.now += self.health_advance;
+        walk.step += 1;
+        if (walk.step as usize) < self.health_ops {
+            return HealthStep::More;
+        }
+        let result = self.health.pop_front().unwrap_or(Ok(self.last_health));
+        match result {
+            Ok(health) => {
+                self.last_health = health;
+                HealthStep::Read {
+                    fault: health.fault,
+                    sticky: health.sticky,
+                }
+            }
+            Err(()) => HealthStep::Failed,
         }
     }
     fn attachment_sides_stride(&self, _slot: u32, walk: &mut SidesWalk, units: usize) -> SidesStep {
@@ -3484,21 +3520,26 @@ fn joint_take_refresh_cadence_starts_no_audit_after_the_window() {
         .expect("the later step recovers the take");
 }
 
-/// A storage read that overruns the service window starts no health
-/// read, custody check or scan, and keeps the key.
+/// The storage read belongs to the scan it gates: it runs after the
+/// scan (paid and window-checked like any leaf), and one that overruns
+/// the service window starts no target check and commits nothing.
 #[test]
 fn joint_take_refresh_cadence_yields_after_a_slow_storage_read() {
     let (mut harness, _, _) = raced_refresh_witness();
     harness.io.storage_advance = Duration::from_millis(2);
     let deadline = harness.io.now() + Duration::from_millis(1);
     let mut budget = 64;
-    harness
+    let report = harness
         .capture
         .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.io.attempts.len(), 1, "the sample follows the scan");
     assert_eq!(harness.io.spy.storage.get(), 1);
-    assert_eq!(harness.io.spy.health.get(), 0, "no health read after it");
-    assert_eq!(harness.io.spy.custody.get(), 0, "no custody check after it");
-    assert!(harness.io.attempts.is_empty(), "no scan after it");
+    assert_eq!(
+        harness.io.spy.target_checks.get(),
+        0,
+        "no target check after it"
+    );
+    assert!(report.observations.is_empty(), "nothing commits after it");
     assert!(harness.capture.has_queued_take_refresh(), "the key waits");
 }
 
@@ -3683,6 +3724,421 @@ fn joint_take_refresh_cadence_withholds_receipt_on_failed_readback() {
         0,
         "no identity check for an unproven attachment"
     );
+}
+
+/// A storage_null move that lands between the pick and a resumed
+/// scan still splits the load: the Q1(b) sample is tied to the scan
+/// that supplies the epochs, never to an earlier pass.
+#[test]
+fn joint_take_refresh_cadence_splits_on_a_storage_move_after_the_pick() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let old_ids = receipt.ids.clone();
+    let (domain, image, file) = (receipt.domain, receipt.image, receipt.endpoint.file_slot);
+    harness.io.storage_null = Some(5);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    // The pick alone: the interest is held, nothing scanned yet.
+    let attempts = harness.io.attempts.len();
+    let mut budget = 1;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(budget, 0, "the pick spent the credit");
+    assert_eq!(harness.io.attempts.len(), attempts, "no cadence scan yet");
+    assert!(harness.capture.has_queued_take_refresh(), "the key is held");
+    // The native miss arm counts storage_null, then globalizes.
+    harness.io.storage_null = Some(6);
+    harness.io.global = 3;
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::New],
+        "the resumed refresh mints past the storage move"
+    );
+    let new_ids = harness
+        .capture
+        .router
+        .current_instances(domain, image, file);
+    assert_ne!(old_ids, new_ids, "the mint moves to a different ID");
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("the old witness is stale after the mint");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::WitnessStale
+    );
+}
+
+/// Scan ranges padded past one stride, the call's executable range
+/// last, so each routing decision compares them all.
+fn padded_ranges(padding: u64) -> Vec<MapRange> {
+    let mut ranges: Vec<MapRange> = (0..padding)
+        .map(|index| {
+            let start = 0x1000_0000 + index * 0x2000;
+            MapRange::new(start, start + 0x1000, 0x10_0000 + index * 0x1000, false)
+        })
+        .collect();
+    ranges.push(MapRange::new(0x7000_0000, 0x7000_6000, 0, true));
+    ranges
+}
+
+/// Route `rows` genuine pending calls for the harness key, stamped at
+/// the scripted epochs (newer than any observation, so they wait).
+fn seed_pending_joins(harness: &mut JointBirthHarness, rows: u64) {
+    let (_, endpoint) = harness.fixture.endpoint_for("C_CreateObject");
+    let stamp = InstanceStamp {
+        flags: instance::STAMP_VALID,
+        file_slot_plus1: endpoint.file_slot as u16 + 1,
+        epoch: harness.io.local,
+        global: harness.io.global,
+        fault: 0,
+    };
+    let domain = harness.capture.router.domain();
+    let image = harness.io.current_image;
+    for token in 0..rows {
+        let route = harness.capture.router.route(CallFacts {
+            token: 0x5000_0000 + token,
+            domain,
+            image,
+            entry: stamp,
+            ret: stamp,
+            ip: EntryIp::new(0x7000_0000 + endpoint.offset),
+            attached_offset: Some(endpoint.offset),
+        });
+        assert_eq!(route, Route::Pending, "the call waits for a scan");
+    }
+}
+
+/// The cadence observation pays for its joins' range and partition
+/// work, not only for the rows: with genuine pending calls whose range
+/// sits behind more than a stride of others, no pass compares more
+/// than its credits buy, an underpaid accept yields with its stage
+/// kept, and a later pass with enough credit resolves every call.
+#[test]
+fn joint_take_refresh_cadence_pays_the_join_range_work_first() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    harness.io.scan_ranges = Some(padded_ranges(69));
+    harness.io.global = 2;
+    seed_pending_joins(&mut harness, 64);
+    assert_eq!(harness.capture.router.pending_len(), 64);
+    let joined = harness.capture.router.counters().joined;
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut observations = Vec::new();
+    for pass in 0..8 {
+        let before = harness.capture.router.join_units_for_test();
+        let mut budget = 64;
+        let report =
+            harness
+                .capture
+                .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+        let spent = 64 - budget;
+        let units = harness.capture.router.join_units_for_test() - before;
+        assert!(
+            units <= 64 * spent,
+            "pass {pass}: {units} join units on {spent} credit"
+        );
+        observations.extend(report.observations);
+    }
+    assert!(
+        observations.is_empty(),
+        "a 64-credit pass never buys this join"
+    );
+    assert_eq!(harness.capture.router.pending_len(), 64, "every call waits");
+    assert!(harness.capture.has_queued_take_refresh(), "the key is held");
+    assert_eq!(harness.io.attempts.len(), 1, "the held scan is not re-run");
+    let before = harness.capture.router.join_units_for_test();
+    let mut budget = 1024;
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    let spent = 1024 - budget;
+    let units = harness.capture.router.join_units_for_test() - before;
+    assert!(units <= 64 * spent, "{units} join units on {spent} credit");
+    assert_eq!(report.observations, vec![ObserveOutcome::New]);
+    assert_eq!(harness.capture.router.pending_len(), 0);
+    assert_eq!(
+        harness.capture.router.counters().joined - joined,
+        64,
+        "every pending call joins exactly once"
+    );
+}
+
+/// A join too large for any cadence pass is left to the tick, which
+/// re-observes every queued interest: the cadence commits nothing,
+/// compares nothing, counts the deferral and keeps the interest
+/// queued, then idles until the tick has run.
+#[test]
+fn joint_take_refresh_cadence_hands_an_oversized_join_to_the_tick() {
+    let (mut harness, witness, _) = raced_refresh_witness();
+    let receipt = &witness.candidate.receipt;
+    let key = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    harness.io.scan_ranges = Some(padded_ranges(69));
+    harness.io.global = 2;
+    seed_pending_joins(
+        &mut harness,
+        crate::discovery::instances::MAX_PENDING as u64,
+    );
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let before = harness.capture.router.join_units_for_test();
+    let mut observations = Vec::new();
+    for _ in 0..4 {
+        let mut budget = 4096;
+        observations.extend(
+            harness
+                .capture
+                .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline)
+                .observations,
+        );
+    }
+    assert!(observations.is_empty(), "the cadence commits nothing");
+    assert_eq!(
+        harness.capture.router.join_units_for_test(),
+        before,
+        "nor compares anything"
+    );
+    assert_eq!(harness.capture.take_refresh_counts().deferred, 1);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(key.0, key.1, key.2),
+        "the interest waits for the tick"
+    );
+    let leaves = cadence_leaves(&harness.io);
+    let mut budget = 4096;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(cadence_leaves(&harness.io), leaves, "idle until the tick");
+}
+
+/// A descriptor readback stride starts no lookup after the service
+/// window closes, even mid-stride, and the next pass resumes at the
+/// first unread entry instead of re-reading the table.
+#[test]
+fn joint_take_refresh_cadence_starts_no_lookup_after_the_window() {
+    let (mut harness, witness, mut rows) = raced_refresh_witness();
+    harness.io.readback_advance = Duration::from_millis(2);
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(
+        harness.io.spy.readback_entries.get(),
+        1,
+        "no lookup starts after the window"
+    );
+    assert!(harness.io.attempts.is_empty(), "no scan after it");
+    assert!(harness.capture.has_queued_take_refresh(), "the key waits");
+    harness.io.readback_advance = Duration::ZERO;
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::Continued]
+    );
+    assert_eq!(
+        harness.io.spy.readback_entries.get(),
+        p11scope_ebpf_common::MAX_DESCRIPTORS as usize,
+        "the readback resumed at the first unread entry"
+    );
+    assert_eq!(harness.capture.take_refresh_counts().restarts, 0);
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the resumed refresh recovers the take");
+}
+
+/// The cadence health read is several native operations (a continuity
+/// audit): each one is paid and window-checked on its own, so none
+/// starts after the window closes, and the next pass resumes the read.
+#[test]
+fn joint_take_refresh_cadence_starts_no_health_op_after_the_window() {
+    let (mut harness, witness, mut rows) = raced_refresh_witness();
+    harness.io.health_ops = 7;
+    harness.io.health_advance = Duration::from_millis(2);
+    let deadline = harness.io.now() + Duration::from_millis(1);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(
+        harness.io.spy.health.get(),
+        1,
+        "no health operation starts after the window"
+    );
+    assert_eq!(harness.io.spy.custody.get(), 0);
+    assert!(harness.io.attempts.is_empty());
+    harness.io.health_advance = Duration::ZERO;
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::Continued]
+    );
+    assert_eq!(
+        harness.io.spy.health.get(),
+        14,
+        "the pre- and post-scan reads each ran once, resumed not restarted"
+    );
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the resumed refresh recovers the take");
+}
+
+/// A refresh request refused at ingress (a full queue or a contended
+/// lock) is a counted gap; a renewal of a queued key at capacity is
+/// not refused.
+#[test]
+fn joint_take_refresh_cadence_counts_requests_refused_at_ingress() {
+    let (harness, witness, _) = raced_refresh_witness();
+    let receipt = &witness.candidate.receipt;
+    let pid = receipt.pin.pid();
+    let capture = &harness.capture;
+    let dropped = capture.take_refresh_counts().dropped;
+    let max = crate::discovery::instances::MAX_PENDING;
+    let request = |cookie: u64| {
+        capture.request_partition_refresh(
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 0,
+            },
+            0,
+            0,
+            pid,
+        );
+    };
+    for cookie in 0..(max - capture.refresh_interest_count_for_test()) as u64 {
+        request(10_000 + cookie);
+    }
+    assert_eq!(capture.refresh_interest_count_for_test(), max);
+    request(10_000);
+    assert_eq!(
+        capture.take_refresh_counts().dropped,
+        dropped,
+        "a renewal at capacity is kept"
+    );
+    request(10_000 + max as u64);
+    assert_eq!(
+        capture.take_refresh_counts().dropped,
+        dropped + 1,
+        "a request past the cap is a counted gap"
+    );
+    {
+        let _held = capture.refresh_interests.lock().unwrap();
+        request(10_000);
+    }
+    assert_eq!(
+        capture.take_refresh_counts().dropped,
+        dropped + 2,
+        "a contended request is a counted gap"
+    );
+}
+
+/// A post-scan health read that moved discards the paid scan: nothing
+/// is observed, the deferral is counted, the interest is requeued, and
+/// the cadence does no further I/O before the tick's audit.
+#[test]
+fn joint_take_refresh_cadence_defers_a_moved_post_scan_audit() {
+    let (mut harness, _, _) = raced_refresh_witness();
+    let steady = harness.io.last_health;
+    harness.io.health.push_back(Ok(steady));
+    harness.io.health.push_back(Ok(Health {
+        fault: steady.fault + 1,
+        sticky: 0,
+    }));
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut budget = 64;
+    let report = harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.io.attempts.len(), 1, "the scan ran");
+    assert_eq!(harness.io.spy.health.get(), 2);
+    assert!(report.observations.is_empty() && report.current.is_empty());
+    assert!(report.outcomes.is_empty());
+    assert_eq!(harness.capture.take_refresh_counts().deferred, 1);
+    assert!(harness.capture.has_queued_take_refresh(), "requeued");
+    let leaves = cadence_leaves(&harness.io);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(cadence_leaves(&harness.io), leaves, "idle until the tick");
+}
+
+/// A deferred cadence resumes only after the tick's audit has applied
+/// the health it deferred: before, a pass does no I/O; after, the key
+/// re-observes and the take validates.
+#[test]
+fn joint_take_refresh_cadence_resumes_after_the_tick_audit() {
+    let (mut harness, witness, mut rows) = raced_refresh_witness();
+    harness.io.health.push_back(Err(()));
+    let deadline = harness.io.now() + Duration::from_secs(10);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(harness.capture.take_refresh_counts().deferred, 1);
+    let leaves = cadence_leaves(&harness.io);
+    let mut budget = 64;
+    harness
+        .capture
+        .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
+    assert_eq!(
+        cadence_leaves(&harness.io),
+        leaves,
+        "blocked before the audit"
+    );
+    let mut report = TickReport::default();
+    assert!(
+        harness.capture.audit(&mut harness.io, &mut report),
+        "the tick audit applies the steady health"
+    );
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::Continued]
+    );
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the resumed refresh recovers the take");
 }
 
 /// A retained take refuses live ahead of an untainted scan: the

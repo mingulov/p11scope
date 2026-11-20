@@ -436,6 +436,19 @@ impl super::Session {
             .map_err(|_| ImageQueryRefusal::Coverage)
     }
 
+    /// One step of the cadence's stepped, read-only continuity health
+    /// read (at most one native read); see `InstanceTracking::audit_step`.
+    pub(crate) fn audit_image_continuity_step(
+        &self,
+        walk: &mut crate::semantic_capture::HealthWalk,
+    ) -> crate::semantic_capture::HealthStep {
+        if !self.policy.wants_instance_hooks() {
+            return crate::semantic_capture::HealthStep::Failed;
+        }
+        self.instance
+            .audit_step(&self.ebpf, &self.image_coverage, walk)
+    }
+
     /// Hook recursion-miss total and miss-caused fault raises (counts only).
     pub(crate) fn hook_miss_totals(&self) -> (u64, u64) {
         self.instance.miss_totals()

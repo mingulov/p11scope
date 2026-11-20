@@ -4299,6 +4299,7 @@ fn semantic_receipt_readback(
         descriptors.len(),
         0,
         p11scope_ebpf_common::MAX_DESCRIPTORS,
+        || true,
         |index| {
             descriptors
                 .get(index as usize)
@@ -4306,23 +4307,27 @@ fn semantic_receipt_readback(
                 .ok_or(Refusal::Attachment)
         },
     )
+    .map(|_| ())
 }
 
 /// One receipt readback range `start..start + len`: the table must be
 /// the canonical size, the policy allowlisted, and every entry read
-/// must equal the canonical descriptor. One `read` per entry.
+/// must equal the canonical descriptor. One `read` per entry, each
+/// started only while `open` holds: the entries compared, fewer than
+/// `len` when `open` closed first (a partial prefix, not a refusal).
 fn semantic_receipt_readback_range(
     policy: CapturePolicy,
     table_len: usize,
     start: u32,
     len: u32,
+    mut open: impl FnMut() -> bool,
     mut read: impl FnMut(
         u32,
     ) -> std::result::Result<
         SlotSemantics,
         crate::semantic_capture::CurrentReceiptRefusal,
     >,
-) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+) -> std::result::Result<u32, crate::semantic_capture::CurrentReceiptRefusal> {
     use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
     let canonical = &*crate::kinds::DESCRIPTORS;
     if policy != CapturePolicy::Allowlisted || table_len != canonical.len() {
@@ -4333,11 +4338,14 @@ fn semantic_receipt_readback_range(
         return Err(Refusal::Attachment);
     }
     for index in start..end {
+        if !open() {
+            return Ok(index - start);
+        }
         if read(index)? != canonical[index as usize] {
             return Err(Refusal::Attachment);
         }
     }
-    Ok(())
+    Ok(len)
 }
 
 fn semantic_receipt_query_refusal(
@@ -12131,7 +12139,10 @@ impl Session {
         crate::semantic_capture::CurrentReceiptRefusal,
     > {
         use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
-        self.semantic_receipt_readback_stride(0, self.semantic_receipt_readback_len())?;
+        let len = self.semantic_receipt_readback_len();
+        if self.semantic_receipt_readback_stride(0, len, None)? != len {
+            return Err(Refusal::Attachment);
+        }
         let mut walk = crate::semantic_capture::SidesWalk::default();
         if self.semantic_receipt_sides_stride(slot, &mut walk, usize::MAX)
             != crate::semantic_capture::SidesStep::Found
@@ -12154,13 +12165,15 @@ impl Session {
 
     /// One stride of the receipt's DESCRIPTORS readback: one map lookup
     /// per entry in `start..start + len`, each compared with the
-    /// canonical table. A complete readback is the strides over
+    /// canonical table and none started at or after `deadline`. The
+    /// entries compared; a complete readback is the strides over
     /// `0..semantic_receipt_readback_len()`.
     pub(crate) fn semantic_receipt_readback_stride(
         &self,
         start: u32,
         len: u32,
-    ) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+        deadline: Option<std::time::Instant>,
+    ) -> std::result::Result<u32, crate::semantic_capture::CurrentReceiptRefusal> {
         use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
         let map = self.ebpf.map("DESCRIPTORS").ok_or(Refusal::Attachment)?;
         let descriptors: Array<_, SlotSemantics> =
@@ -12170,6 +12183,7 @@ impl Session {
             descriptors.len() as usize,
             start,
             len,
+            || deadline.is_none_or(|deadline| std::time::Instant::now() < deadline),
             |index| descriptors.get(&index, 0).map_err(|_| Refusal::Attachment),
         )
     }

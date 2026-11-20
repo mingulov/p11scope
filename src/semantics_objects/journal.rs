@@ -1614,11 +1614,12 @@ pub(crate) struct ScopedRecovery {
     /// from observing an earlier doom's refusal.
     preserve_doomed: BTreeSet<JournalDomainKey>,
     preserve_taint: BTreeSet<(u64, u64)>,
-    /// Fixed liveness basis per decided image: the live keys and the
-    /// key-table membership snapshotted when preservation first
-    /// touched the image, so every slice decides against the same
-    /// original basis.
-    preserve_live: BTreeMap<(u64, u64), PreservedLiveness>,
+    /// Fixed liveness basis per decided image, built incrementally
+    /// under the recovery budget: live keys collected so far plus
+    /// the key-table membership and scan extent frozen at first
+    /// touch, so every slice decides against the same original
+    /// basis. Decisions read only completed bases.
+    preserve_basis: BTreeMap<(u64, u64), PreservedBasis>,
     /// Keys whose abandonment refusal already applied (the doom pass
     /// runs once per key across slices).
     doomed_done: BTreeSet<JournalDomainKey>,
@@ -1626,12 +1627,21 @@ pub(crate) struct ScopedRecovery {
     phase: ScopedRecoveryPhase,
 }
 
-/// One image's fixed preservation liveness: the live keys at first
-/// touch plus whether the key table names the image at all.
+/// One image's preservation liveness basis under construction:
+/// live keys collected so far, key-table membership and scan
+/// extent frozen at first touch, resume cursor into the frozen
+/// extent, and completion. The per-image key list never removes
+/// or reorders, so indices below the frozen length stay stable
+/// across slices; keys attested after first touch stay out of
+/// this basis (fail closed: their absence routes toward taint,
+/// never toward a forged doom).
 #[derive(Clone)]
-struct PreservedLiveness {
+struct PreservedBasis {
     live: Vec<JournalDomainKey>,
     keyed: bool,
+    next: usize,
+    frozen_len: usize,
+    done: bool,
 }
 
 /// Outcome of one bounded barrier scan.
@@ -2147,9 +2157,9 @@ impl JournalAdapter {
         match self
             .scoped_recovery
             .as_ref()
-            .and_then(|recovery| recovery.preserve_live.get(&image))
+            .and_then(|recovery| recovery.preserve_basis.get(&image))
         {
-            Some(basis) => (basis.live.len(), true),
+            Some(basis) => (basis.live.len(), basis.done),
             None => (0, false),
         }
     }
@@ -8123,7 +8133,7 @@ impl JournalAdapter {
             wiped_refused: BTreeSet::new(),
             preserve_doomed: BTreeSet::new(),
             preserve_taint: BTreeSet::new(),
-            preserve_live: BTreeMap::new(),
+            preserve_basis: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
             phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
         }
@@ -8306,13 +8316,17 @@ impl JournalAdapter {
         }
     }
 
-    /// Decide preservation for one slice of wiped opens past the
-    /// cursor: every erased unbounded abandonment names its doomed
-    /// incarnation or its tainted image. Decisions collect only;
-    /// nothing applies until the separate bounded pass, and every
-    /// slice decides against the same fixed per-image liveness
-    /// basis, so a later abandonment never observes an earlier
-    /// doom's refusal. Returns true when the set exhausts.
+    /// Decide preservation for wiped opens past the cursor, one
+    /// unit per decided entry plus one unit per examined basis key:
+    /// every erased unbounded abandonment names its doomed
+    /// incarnation or its tainted image. The cursor is the last
+    /// decided entry, so an entry whose basis is still building
+    /// revisits without re-charge until its basis completes and it
+    /// decides. Decisions collect only; nothing applies until the
+    /// separate bounded pass, and every slice decides against the
+    /// same fixed per-image liveness basis, so a later abandonment
+    /// never observes an earlier doom's refusal. Returns true when
+    /// the set exhausts.
     fn preserve_slice(
         &self,
         recovery: &mut ScopedRecovery,
@@ -8320,110 +8334,151 @@ impl JournalAdapter {
         left: &mut usize,
         budget: &mut usize,
     ) -> bool {
-        let allowance = *left;
-        let range = match after {
-            None => recovery.wiped_open.range((
-                std::ops::Bound::<JournalNativeKey>::Unbounded,
-                std::ops::Bound::<JournalNativeKey>::Unbounded,
-            )),
-            Some(last) => recovery
-                .wiped_open
-                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
-        };
-        let mut examined = 0usize;
-        let mut last = after;
-        let mut keys: Vec<JournalNativeKey> = Vec::new();
-        for key in range {
-            if examined >= allowance {
-                break;
+        let mut decided = after;
+        loop {
+            if *left == 0 {
+                recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
+                return false;
             }
-            examined += 1;
-            last = Some(*key);
-            keys.push(*key);
-        }
-        *left -= examined;
-        *budget = budget.saturating_sub(examined);
-        for key in keys {
-            let Some(entry) = self.open.get(&key) else {
-                continue;
+            let next = match decided {
+                None => recovery.wiped_open.iter().next().copied(),
+                Some(last) => recovery
+                    .wiped_open
+                    .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                    .next()
+                    .copied(),
             };
-            let unbounded = entry.abandon.is_some_and(|staged| {
-                abandon_disposition(staged.abandon.reason())
-                    == Some(AbandonDisposition::UnboundedInvalidation)
-            });
-            if !unbounded {
-                continue;
-            }
-            if abandonment_disposes_per_call(entry.function) {
+            let Some(native) = next else {
+                recovery.phase = ScopedRecoveryPhase::PreserveTaint { after: None };
+                return true;
+            };
+            let shaped = self.open.get(&native).and_then(|entry| {
+                let unbounded = entry.abandon.is_some_and(|staged| {
+                    abandon_disposition(staged.abandon.reason())
+                        == Some(AbandonDisposition::UnboundedInvalidation)
+                });
                 // Effect-free abandonments carry no continuing
                 // object effects: the scoped wipe preserves no doom
                 // and taints no image for them. The wipe records
                 // their late terminals expected-absent (see the
                 // wipe filter); this decide-only pass just skips
                 // them.
+                if !unbounded || abandonment_disposes_per_call(entry.function) {
+                    return None;
+                }
+                Some((entry.image, shape_of_entry(entry)))
+            });
+            let Some((image, shape)) = shaped else {
+                // Gone, bounded, or effect-free: settled for one unit.
+                decided = Some(native);
+                *left -= 1;
+                *budget = budget.saturating_sub(1);
                 continue;
+            };
+            // A decision needs its image's completed basis first;
+            // built keys persist across yields, so this entry
+            // revisits until the basis completes. A basis that
+            // completes on the slice's last unit still yields: the
+            // decision itself costs one unit next slice.
+            if !self.preserve_basis_step(&mut recovery.preserve_basis, image, left, budget) {
+                recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
+                return false;
             }
-            let image = entry.image;
-            let shape = shape_of_entry(entry);
-            let basis = self.preserve_basis_for_image(recovery, image);
-            // Mirror the batch preservation decision per entry: a
-            // sole live key is doomed, a keyless image is tainted,
-            // and a shared image dooms its live claimants (or taints
-            // when no claimant names the shape).
-            match basis.live.as_slice() {
-                [sole] => {
-                    recovery.preserve_doomed.insert(*sole);
-                }
-                [] if !basis.keyed => {
-                    recovery.preserve_taint.insert(image);
-                }
-                [] => {}
-                _ => {
-                    let claimants: Vec<JournalDomainKey> = self
-                        .claimants_naming(&shape)
-                        .map(|m| {
-                            m.iter()
-                                .filter(|(key, ordinals)| {
-                                    !ordinals.is_empty() && basis.live.contains(key)
-                                })
-                                .map(|(key, _)| *key)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if claimants.is_empty() {
-                        recovery.preserve_taint.insert(image);
-                    } else {
-                        recovery.preserve_doomed.extend(claimants);
+            if *left == 0 {
+                recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
+                return false;
+            }
+            // Mirror the batch preservation decision: a sole live
+            // key is doomed, a keyless image is tainted, and a
+            // shared image dooms its live claimants (or taints when
+            // no claimant names the shape). The decision computes
+            // under the basis borrow, then applies.
+            let (doomed, tainted) = {
+                let basis = recovery
+                    .preserve_basis
+                    .get(&image)
+                    .expect("completed basis");
+                match basis.live.as_slice() {
+                    [sole] => (vec![*sole], false),
+                    [] if !basis.keyed => (Vec::new(), true),
+                    [] => (Vec::new(), false),
+                    _ => {
+                        let claimants: Vec<JournalDomainKey> = self
+                            .claimants_naming(&shape)
+                            .map(|m| {
+                                m.iter()
+                                    .filter(|(key, ordinals)| {
+                                        !ordinals.is_empty() && basis.live.contains(key)
+                                    })
+                                    .map(|(key, _)| *key)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if claimants.is_empty() {
+                            (Vec::new(), true)
+                        } else {
+                            (claimants, false)
+                        }
                     }
                 }
+            };
+            if tainted {
+                recovery.preserve_taint.insert(image);
             }
-        }
-        if examined < allowance {
-            recovery.phase = ScopedRecoveryPhase::PreserveTaint { after: None };
-            true
-        } else {
-            recovery.phase = ScopedRecoveryPhase::Preserve { after: last };
-            false
+            recovery.preserve_doomed.extend(doomed);
+            decided = Some(native);
+            *left -= 1;
+            *budget = budget.saturating_sub(1);
         }
     }
 
-    /// One image's fixed preservation liveness: the snapshot taken
-    /// when preservation first touched the image, or a fresh
-    /// snapshot when this touch is the first.
-    fn preserve_basis_for_image(
+    /// Advance one image's preservation basis by up to `*left` keys:
+    /// first touch freezes key-table membership and the scan
+    /// extent, then each examined key appends when live. Charges
+    /// one unit per examined key. Returns true when the basis
+    /// completes. Shared by the sliced scoped pass (which yields
+    /// across credits) and atomic callers (which loop to
+    /// completion).
+    fn preserve_basis_step(
         &self,
-        recovery: &mut ScopedRecovery,
+        bases: &mut BTreeMap<(u64, u64), PreservedBasis>,
         image: (u64, u64),
-    ) -> PreservedLiveness {
-        if let Some(basis) = recovery.preserve_live.get(&image) {
-            return basis.clone();
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let build = bases.entry(image).or_insert_with(|| {
+            let listed = self.image_keys.get(&image);
+            PreservedBasis {
+                live: Vec::new(),
+                keyed: listed.is_some(),
+                next: 0,
+                frozen_len: listed.map_or(0, Vec::len),
+                done: false,
+            }
+        });
+        if build.done {
+            return true;
         }
-        let basis = PreservedLiveness {
-            live: self.live_keys_for_image(image),
-            keyed: self.image_keys.contains_key(&image),
-        };
-        recovery.preserve_live.insert(image, basis.clone());
-        basis
+        let extent = build.frozen_len;
+        while build.next < extent && *left > 0 {
+            let key = self
+                .image_keys
+                .get(&image)
+                .and_then(|listed| listed.get(build.next))
+                .copied();
+            build.next += 1;
+            *left -= 1;
+            *budget = budget.saturating_sub(1);
+            if let Some(key) = key
+                && self.key_is_live(key)
+            {
+                build.live.push(key);
+            }
+        }
+        if build.next >= extent {
+            build.done = true;
+        }
+        build.done
     }
 
     /// Mark one slice of decided image taints past the cursor: the
@@ -22589,20 +22644,24 @@ pub(crate) mod tests {
                 .void_ingest_break_bounded(&mut budget)
                 .expect("the bounded void never refuses its own budget");
             calls += 1;
-            let (built, done) = harness
-                .owner
-                .adapter()
-                .preserve_basis_progress_for_test(image);
-            assert!(
-                built >= prev_built,
-                "the basis never shrinks ({prev_built} -> {built})"
-            );
-            assert!(
-                built - prev_built <= 1,
-                "one credit builds at most one basis key ({prev_built} -> {built})"
-            );
-            saw_partial |= built > 0 && !done;
-            prev_built = built;
+            // The terminal poll retires the recovery, so per-poll
+            // growth pins only while it stands.
+            if progress == RecoveryProgress::Yielded {
+                let (built, done) = harness
+                    .owner
+                    .adapter()
+                    .preserve_basis_progress_for_test(image);
+                assert!(
+                    built >= prev_built,
+                    "the basis never shrinks ({prev_built} -> {built})"
+                );
+                assert!(
+                    built - prev_built <= 1,
+                    "one credit builds at most one basis key ({prev_built} -> {built})"
+                );
+                saw_partial |= built > 0 && !done;
+                prev_built = built;
+            }
             assert!(calls < 10_000, "the bounded void always terminates");
             match progress {
                 RecoveryProgress::Done(voided) => break voided,
@@ -22610,6 +22669,7 @@ pub(crate) mod tests {
             }
         };
         assert!(voided, "the scoped void applies");
+        assert_eq!(prev_built, 65, "the basis completes before the void lands");
         assert!(
             saw_partial,
             "the 65-key basis builds incrementally across credits"
@@ -22726,24 +22786,28 @@ pub(crate) mod tests {
                 .void_ingest_break_bounded(&mut budget)
                 .expect("the bounded void never refuses its own budget");
             calls += 1;
-            let (built, _) = harness
-                .owner
-                .adapter()
-                .preserve_basis_progress_for_test(image);
-            assert!(
-                built >= prev_built && built - prev_built <= 1,
-                "one credit builds at most one basis key ({prev_built} -> {built})"
-            );
-            prev_built = built;
-            let now_marked = marked(&harness);
-            assert!(
-                now_marked >= prev_marked && now_marked - prev_marked <= 1,
-                "one credit marks at most one overflow key ({prev_marked} -> {now_marked})"
-            );
-            prev_marked = now_marked;
-            if refused_at.is_none() && harness.owner.adapter().image_tainted_for_test(image) {
-                refused_at = Some(calls);
-                marked_at_refusal = now_marked;
+            // The terminal poll retires the recovery, so per-poll
+            // growth pins only while it stands.
+            if progress == RecoveryProgress::Yielded {
+                let (built, _) = harness
+                    .owner
+                    .adapter()
+                    .preserve_basis_progress_for_test(image);
+                assert!(
+                    built >= prev_built && built - prev_built <= 1,
+                    "one credit builds at most one basis key ({prev_built} -> {built})"
+                );
+                prev_built = built;
+                let now_marked = marked(&harness);
+                assert!(
+                    now_marked >= prev_marked && now_marked - prev_marked <= 1,
+                    "one credit marks at most one overflow key ({prev_marked} -> {now_marked})"
+                );
+                prev_marked = now_marked;
+                if refused_at.is_none() && harness.owner.adapter().image_tainted_for_test(image) {
+                    refused_at = Some(calls);
+                    marked_at_refusal = now_marked;
+                }
             }
             assert!(calls < 10_000, "the bounded void always terminates");
             match progress {
@@ -22758,6 +22822,7 @@ pub(crate) mod tests {
             "the probe takes the scoped branch"
         );
         let refused_at = refused_at.expect("the overflow publishes its refusal");
+        assert_eq!(prev_built, 65, "the basis completes before the void lands");
         assert!(
             marked_at_refusal <= 1,
             "the refusal lands before the marks (poll {refused_at} marked {marked_at_refusal})"
@@ -22829,15 +22894,19 @@ pub(crate) mod tests {
                     "one credit never decides a 65-key stream void at once"
                 );
             }
-            let (built, _) = harness
-                .owner
-                .adapter()
-                .preserve_basis_progress_for_test(image);
-            assert!(
-                built >= prev_built && built - prev_built <= 1,
-                "one credit builds at most one basis key ({prev_built} -> {built})"
-            );
-            prev_built = built;
+            // The terminal poll retires the recovery, so per-poll
+            // growth pins only while it stands.
+            if progress == RecoveryProgress::Yielded {
+                let (built, _) = harness
+                    .owner
+                    .adapter()
+                    .preserve_basis_progress_for_test(image);
+                assert!(
+                    built >= prev_built && built - prev_built <= 1,
+                    "one credit builds at most one basis key ({prev_built} -> {built})"
+                );
+                prev_built = built;
+            }
             assert!(calls < 10_000, "the bounded void always terminates");
             match progress {
                 RecoveryProgress::Done(voided) => break voided,
@@ -22845,6 +22914,7 @@ pub(crate) mod tests {
             }
         };
         assert!(voided, "the stream void applies");
+        assert_eq!(prev_built, 65, "the basis completes before the void lands");
         assert_eq!(
             harness.owner.take_last_void_scope(),
             Some(JointVoidScope::Stream),

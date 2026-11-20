@@ -2803,8 +2803,10 @@ impl SemanticCapture {
                 // move inside the bracket cannot be placed before or
                 // after the sealed epochs: withhold the proof (counted)
                 // and keep the router's reference; the re-scan proves
-                // post-move truth. An unreadable sample keeps the
-                // legacy rule.
+                // post-move truth. An unreadable pre-scan sample falls
+                // back to the readable post-scan one (fail closed: a
+                // proven move since the last observation mints); only
+                // an unreadable post-scan sample keeps the legacy rule.
                 let before = scanned.storage;
                 let after = io.storage_null();
                 if before.is_some() && after.is_some() && before != after {
@@ -2813,7 +2815,7 @@ impl SemanticCapture {
                     self.release_refresh(held.key, held.interest);
                     return RefreshFlow::Done;
                 }
-                scanned.storage = after.and(before);
+                scanned.storage = after;
                 held.stage = if held.attached {
                     RefreshStage::Target(scanned)
                 } else {

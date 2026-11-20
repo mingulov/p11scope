@@ -514,8 +514,11 @@ for KERNEL in "$@"; do
     echo "# journal rc=$J_RC"
     # Both journal roots loaded, from the raw probe rows (the report
     # below gates counts, but only budgets gate presence, so the pair
-    # is checked explicitly for the unbudgeted kernels too).
-    PAIR_OUT="0 0"
+    # is checked explicitly for the unbudgeted kernels too). The third
+    # field is the probe parse status (1 valid, 0 unreadable or
+    # corrupt): a malformed suffix must refuse qualification, never
+    # erase confirmed loads into a valid no-load claim.
+    PAIR_OUT="0 0 0"
     if [ -f "$J_PROBE" ]; then
         PAIR_OUT=$(python3 - "$J_PROBE" "$KEY_SIZES" <<'PY'
 import json,sys
@@ -523,6 +526,7 @@ pair = ("p11_entry_journal", "p11_return_journal")
 if len(sys.argv) > 2 and sys.argv[2] == "1":
     pair = pair + ("p11_entry_journal_length", "p11_return_journal_length")
 loaded = set()
+parse_ok = 1
 try:
     with open(sys.argv[1], encoding="ascii") as stream:
         for line in stream:
@@ -530,15 +534,17 @@ try:
             if row.get("record") == "load" and row.get("loaded") is True:
                 loaded.add(row.get("root"))
 except (OSError, ValueError):
-    print("0 0")
-else:
-    print(("1" if all(root in loaded for root in pair) else "0"),
-          ("1" if any(root in loaded for root in pair) else "0"))
+    parse_ok = 0
+print(("1" if all(root in loaded for root in pair) else "0"),
+      ("1" if any(root in loaded for root in pair) else "0"),
+      parse_ok)
 PY
-) || PAIR_OUT="0 0"
+) || PAIR_OUT="0 0 0"
     fi
     PAIR_OK=${PAIR_OUT%% *}
-    PAIR_ANY=${PAIR_OUT##* }
+    PAIR_REST=${PAIR_OUT#* }
+    PAIR_ANY=${PAIR_REST%% *}
+    PROBE_OK=${PAIR_REST##* }
     if [ "$CONTROL" = 1 ]; then
         # Refusal control: the finite pre-Multi refusal, no loaded
         # journal row, no crash. A load or a crash is FAIL.
@@ -548,6 +554,9 @@ PY
         fi
         if [ "$J_RC" = 0 ]; then
             add_reason "observer exited 0 on a pre-Multi kernel"
+        fi
+        if [ "$PROBE_OK" != 1 ]; then
+            add_reason "probe rows unreadable or corrupt"
         fi
         if [ "$PAIR_ANY" = 1 ]; then
             add_reason "journal pair loaded on a pre-Multi kernel"
@@ -580,6 +589,9 @@ PY
             0) ;;
             *) add_reason "observer exited rc=$J_RC, want 0" ;;
         esac
+        if [ "$PROBE_OK" != 1 ]; then
+            add_reason "probe rows unreadable or corrupt"
+        fi
         if [ "$PAIR_ANY" = 1 ]; then
             add_reason "journal pair loaded although the build omits the object"
         fi
@@ -681,13 +693,18 @@ PY
             OBSERVED="journal_unavailable"
         fi
     fi
-    if [ "$PAIR_OK" != 1 ]; then
-        if [ ! -f "$J_PROBE" ]; then
-            add_reason "no probe rows (probe file missing)"
-        elif [ "$PAIR_ANY" = 1 ]; then
-            add_reason "journal pair incomplete (one root missing)"
-        else
-            add_reason "journal pair missing from probe rows"
+    if [ ! -f "$J_PROBE" ]; then
+        add_reason "no probe rows (probe file missing)"
+    else
+        if [ "$PROBE_OK" != 1 ]; then
+            add_reason "probe rows unreadable or corrupt"
+        fi
+        if [ "$PAIR_OK" != 1 ]; then
+            if [ "$PAIR_ANY" = 1 ]; then
+                add_reason "journal pair incomplete (one root missing)"
+            else
+                add_reason "journal pair missing from probe rows"
+            fi
         fi
     fi
     LEDGERS=0

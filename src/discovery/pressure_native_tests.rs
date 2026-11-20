@@ -38,11 +38,11 @@
 //! - `pressure_live256_all_blocked_twin_refuses_once` (privileged): the
 //!   separately declared all-blocked/N+1 twin: exactly one head deferral
 //!   (no truncation, no dropped age, one unfinished row), FIFO progress,
-//!   and eventual head admission through later service ticks. No capacity
-//!   reset. (Keeps its historical name; the refusal body was re-cut to
-//!   defer-not-drop per the r5 controller ruling on r3 PARTIAL 62dd42525,
-//!   which accepts approved design section 5.2 over the superseded
-//!   refuse-on-full pins.)
+//!   and eventual head admission once a kill-one leg frees a view slot.
+//!   No capacity reset. (Keeps its historical name; the refusal body was
+//!   re-cut to defer-not-drop per the r5 controller ruling on r3 PARTIAL
+//!   62dd42525, which accepts approved design section 5.2 over the
+//!   superseded refuse-on-full pins.)
 //! - `pressure_live256_unparked_head_control_admits` (privileged): the
 //!   twin's fullness control. The identical arming with an empty request
 //!   map admits the same head with zero loss, proving the deferral pins
@@ -3944,8 +3944,12 @@ fn pressure_all_blocked_fail_control_selects_eligible() {
 /// impossible because phase 1 spent the 256 capture-lifetime loader IDs.
 /// Only progress, the sticky unfinished row and the head's eventual
 /// admission are pinned: the deferral leaves PARTIAL evidence, never
-/// loss, and later ticks admit the deferred head. Own episode, own
-/// capture, fresh ticket budget.
+/// loss. Admission needs a free view slot — at 256 resident views none
+/// frees on its own, and the requestless head is P3-ineligible (the
+/// probe gates on a queued request) — so a kill-one leg sacrifices an
+/// owned child after the ledgers and the head admits through the
+/// ordinary newcomer window. Own episode, own capture, fresh ticket
+/// budget.
 ///
 /// Cgroup-scoped by determinism, not by product need (the 257 cell's
 /// pattern): under System scope ambient EXECs share the burst batches,
@@ -4442,32 +4446,24 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
         1,
         "{WHAT}: the one unfinished row persists across service"
     );
-    // Eventual admission (the defer-not-drop liveness half): later
-    // service ticks enumerate the deferred head as a newcomer and admit
-    // it with no loader ticket (provider-free), proving the deferral was
-    // not a drop. Either a live ticketless view, or a P3 probationary
-    // completion (no view at capacity) — the head is the only newcomer
-    // in the scope during the suffix, so any probationary delta is its
-    // completion.
+    // At-capacity wait (negative control, part 2): all 256 views stay
+    // resident (every owned child lives), so no slot frees during the
+    // suffix. The deferred head holds no queued request, hence the P3
+    // probationary probe — which gates on one — never runs for it: no
+    // view, no ticket, no loss, still the live newcomer every tick. The
+    // kill-one leg below frees a slot and proves the wait ends.
     assert_eq!(
         engine.loader_arms, 256,
         "{WHAT}: the suffix arms nothing new"
     );
-    match engine
-        .views
-        .iter()
-        .find(|view| view.pid() == head_pid && view.still_the_same())
-    {
-        Some(view) => assert!(
-            engine.loader_registry.ids_for_view(view.id()).is_empty(),
-            "{WHAT}: the admitted head holds no loader context"
-        ),
-        None => assert!(
-            engine.probationary_completions > probation_before_suffix,
-            "{WHAT}: the viewless head completed through the probationary probe (head queued: {})",
-            engine.refresh_queue.contains_key(&head_pid),
-        ),
-    }
+    assert!(
+        engine.views.iter().all(|view| view.pid() != head_pid),
+        "{WHAT}: the deferred head still holds no view at capacity"
+    );
+    assert_eq!(
+        engine.probationary_completions, probation_before_suffix,
+        "{WHAT}: no probationary completion without a queued request"
+    );
     assert_no_ambient_arms(&engine, &owned2, WHAT);
     for view in &engine.views {
         if owned2.contains(&view.pid()) {
@@ -4504,6 +4500,93 @@ fn pressure_live256_all_blocked_twin_refuses_once() {
             child.pid()
         );
     }
+
+    // Eventual admission (the defer-not-drop liveness half): free one
+    // view slot and the deferred head admits through the ordinary
+    // newcomer window — proving the deferral was a wait, not a drop.
+    // Runs after the ledgers so the sacrificed child emitted both
+    // bursts; it is removed from the population so the final teardown
+    // neither reaps it twice nor waits on its gate.
+    let truncated_before_kill = engine.discovery_truncated;
+    let exit_ended_before_kill = engine.exit_ended_truncations;
+    assert_ne!(
+        population.children[0].role, "head",
+        "{WHAT}: the sacrificed child is an owned provider, never the head"
+    );
+    let sacrificed = population.children[0].pid();
+    assert_ne!(sacrificed, head_pid);
+    let sacrifice_code = population.children[0].terminate(WHAT);
+    assert_eq!(
+        sacrifice_code, 0,
+        "{WHAT}: sacrificed child {sacrificed} exits clean"
+    );
+    assert!(
+        proc_reaped(sacrificed),
+        "{WHAT}: sacrificed child {sacrificed} must reap"
+    );
+    population.children.remove(0);
+    let mut admitted_tick = None;
+    for tick in 0..20u32 {
+        engine
+            .drain_discovery_shallow(&mut session, true)
+            .unwrap_or_else(|error| panic!("{WHAT}: admission drain {tick} failed: {error:#}"));
+        engine
+            .service_backlog_quantum(&mut session)
+            .unwrap_or_else(|error| panic!("{WHAT}: admission service {tick} failed: {error:#}"));
+        let head_view = engine
+            .views
+            .iter()
+            .any(|view| view.pid() == head_pid && view.still_the_same());
+        println!(
+            "t8: {WHAT}: admission tick {tick}: views={} head_view={head_view} minted={} truncated={}",
+            engine.views.len(),
+            minted_ids(&engine).len(),
+            engine.discovery_truncated,
+        );
+        if head_view {
+            admitted_tick = Some(tick);
+            break;
+        }
+    }
+    assert!(
+        admitted_tick.is_some(),
+        "{WHAT}: the deferred head admits once a slot frees"
+    );
+    let head_view = engine
+        .views
+        .iter()
+        .find(|view| view.pid() == head_pid && view.still_the_same())
+        .unwrap_or_else(|| panic!("{WHAT}: the admitted head holds a live view"));
+    assert!(
+        engine.loader_registry.ids_for_view(head_view.id()).is_empty(),
+        "{WHAT}: the admitted head holds no loader context"
+    );
+    assert_eq!(
+        engine.loader_arms, 256,
+        "{WHAT}: the admitted head consumes no loader ticket"
+    );
+    assert_eq!(
+        engine.newcomer_ages.dropped_unknown, 0,
+        "{WHAT}: the kill leg drops no age"
+    );
+    assert_eq!(
+        engine.discovery_truncated - truncated_before_kill,
+        engine.exit_ended_truncations - exit_ended_before_kill,
+        "{WHAT}: any kill-leg truncation growth is exit-explained"
+    );
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.subject == "live discovery refresh"
+                && skip.reason
+                    == "refresh requests exceeded the bounded pending queue; work remains unfinished")
+            .count(),
+        1,
+        "{WHAT}: the one unfinished row persists across the kill leg"
+    );
+    assert_no_ambient_arms(&engine, &owned2, WHAT);
     let serial_delta = engine
         .refresh_queue
         .last_serial_for_test()

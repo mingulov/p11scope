@@ -3616,10 +3616,14 @@ impl AttestedSemanticLane {
             // handoff still happened: production takes the live
             // Session here, so finished, the retained frame and the
             // machine answer go with it. A later `is_finished`
-            // reads false, exactly like a taken live lane.
+            // reads false, exactly like a taken live lane. The
+            // posed decoder total goes with it too: production
+            // reads unknown after the handoff (no live drain), so
+            // the tests must as well.
             self.test_finished = false;
             self.test_joint_frame = false;
             self.test_joint_machine = false;
+            self.scripted_decoder_malformed = None;
             return Ok(None);
         }
         let Some(live) = self.live.as_mut() else {

@@ -1509,8 +1509,7 @@ mod tests {
             let id = table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
             assert_eq!(id.0, value);
         }
-        let bucket_of =
-            |value| ReservationTable::<()>::key_bucket(Role::Association, key(value));
+        let bucket_of = |value| ReservationTable::<()>::key_bucket(Role::Association, key(value));
         let bucket = bucket_of(200_001);
         let mut colliding = vec![200_001u64];
         for value in 200_002..300_000u64 {
@@ -1563,11 +1562,23 @@ mod tests {
         assert_eq!(table.reservation(Role::Association, key(b_assoc)), None);
         assert_eq!(table.member_bytes(Role::Association, key(b_assoc)), None);
         assert_eq!(table.reservation(Role::Raw, key(b_raw)), None);
-        assert_eq!(table.reservation(Role::Association, key(a_assoc)), Some(a_id));
-        assert_eq!(table.member_bytes(Role::Association, key(a_assoc)), Some(20));
+        assert_eq!(
+            table.reservation(Role::Association, key(a_assoc)),
+            Some(a_id)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Association, key(a_assoc)),
+            Some(20)
+        );
         assert_eq!(table.member_bytes(Role::Raw, key(a_raw)), Some(10));
-        assert_eq!(table.reservation(Role::Association, key(c_assoc)), Some(c_id));
-        assert_eq!(table.member_bytes(Role::Association, key(c_assoc)), Some(20));
+        assert_eq!(
+            table.reservation(Role::Association, key(c_assoc)),
+            Some(c_id)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Association, key(c_assoc)),
+            Some(20)
+        );
         assert_eq!(table.member_bytes(Role::Raw, key(c_raw)), Some(10));
         let mut d_assoc = 300_001u64;
         while bucket_of(d_assoc) == bucket {
@@ -1585,19 +1596,37 @@ mod tests {
             table.insert(Role::Association, key(d_assoc), Some(d_id), 21, ()),
             Ok(d_id)
         );
-        assert_eq!(table.reservation(Role::Association, key(a_assoc)), Some(a_id));
-        assert_eq!(table.member_bytes(Role::Association, key(a_assoc)), Some(20));
+        assert_eq!(
+            table.reservation(Role::Association, key(a_assoc)),
+            Some(a_id)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Association, key(a_assoc)),
+            Some(20)
+        );
         assert_eq!(table.member_bytes(Role::Raw, key(a_raw)), Some(10));
         assert_eq!(table.id_slot_for_test(a_id), Some(4_094));
-        assert_eq!(table.reservation(Role::Association, key(c_assoc)), Some(c_id));
-        assert_eq!(table.member_bytes(Role::Association, key(c_assoc)), Some(20));
+        assert_eq!(
+            table.reservation(Role::Association, key(c_assoc)),
+            Some(c_id)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Association, key(c_assoc)),
+            Some(20)
+        );
         assert_eq!(table.member_bytes(Role::Raw, key(c_raw)), Some(10));
         assert_eq!(table.id_slot_for_test(c_id), Some(0));
         assert_eq!(table.reservation(Role::Association, key(b_assoc)), None);
         assert_eq!(table.reservation(Role::Raw, key(b_raw)), None);
         assert!(table.reservation_is_released(b_id));
-        assert_eq!(table.reservation(Role::Association, key(d_assoc)), Some(d_id));
-        assert_eq!(table.member_bytes(Role::Association, key(d_assoc)), Some(21));
+        assert_eq!(
+            table.reservation(Role::Association, key(d_assoc)),
+            Some(d_id)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Association, key(d_assoc)),
+            Some(21)
+        );
         assert_eq!(table.member_bytes(Role::Raw, key(d_raw)), Some(11));
         assert_eq!(table.id_slot_for_test(d_id), Some(4_095));
     }
@@ -1616,14 +1645,23 @@ mod tests {
         for value in 1..=13_101u64 {
             table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
         }
-        let h8 = table.insert(Role::H8Open, key(500_001), None, 2, ()).unwrap();
-        let model = table.insert(Role::Model, key(500_002), None, 3, ()).unwrap();
-        let staged = table.insert(Role::H9Staged, key(500_003), None, 4, ()).unwrap();
+        let h8 = table
+            .insert(Role::H8Open, key(500_001), None, 2, ())
+            .unwrap();
+        let model = table
+            .insert(Role::Model, key(500_002), None, 3, ())
+            .unwrap();
+        let staged = table
+            .insert(Role::H9Staged, key(500_003), None, 4, ())
+            .unwrap();
         let assoc = table
             .insert(Role::Association, key(500_004), None, 5, ())
             .unwrap();
         let target = table.insert(Role::Raw, key(500_005), None, 1, ()).unwrap();
-        assert_eq!(table.key_slot_for_test(Role::Raw, key(500_005)), Some(13_105));
+        assert_eq!(
+            table.key_slot_for_test(Role::Raw, key(500_005)),
+            Some(13_105)
+        );
         let head = table.merge(target, h8).unwrap();
         assert_eq!(head, target);
         assert_eq!(table.merge(head, model).unwrap(), target);
@@ -1650,7 +1688,10 @@ mod tests {
                 "last slot holds every alias through lane 4"
             );
         }
-        assert_eq!(table.reservation(Role::Association, key(500_004)), Some(target));
+        assert_eq!(
+            table.reservation(Role::Association, key(500_004)),
+            Some(target)
+        );
         for (role, value) in [
             (Role::Raw, 500_005),
             (Role::H8Open, 500_001),

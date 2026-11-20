@@ -434,10 +434,7 @@ impl JointCaptureOwner {
         // delivered void covers both breaks.
         match self.pending_void.as_mut() {
             Some(pending) => {
-                pending.failure.fence = pending
-                    .failure
-                    .fence
-                    .max(cleanup.failure.fence);
+                pending.failure.fence = pending.failure.fence.max(cleanup.failure.fence);
             }
             None => {
                 self.pending_void = Some(cleanup);

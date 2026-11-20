@@ -2551,4 +2551,39 @@ pub(crate) mod tests {
             "a permanent take fact ranks with fallback"
         );
     }
+
+    /// Failure selection ranks a stale-witness take with the
+    /// fallback it keeps: the mismatch is a real ending, never a
+    /// transient unknown, so it must not lose to (or mask) one.
+    #[test]
+    fn failure_rank_orders_stale_witness_with_fallback() {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        fn failure(
+            gap: JournalGap,
+            take_failed: Option<crate::attach::BirthObservationRefusal>,
+        ) -> SealFailure {
+            SealFailure {
+                scope: SealFailureScope::Unqualified,
+                gap,
+                effects: ObjectEffects::default(),
+                h3_voided: None,
+                fence: None,
+                take_failed,
+            }
+        }
+        let stale = failure_rank(&failure(
+            JournalGap::BootstrapMismatch,
+            Some(Refusal::RetainedWitnessMismatch),
+        ));
+        let unknown = failure_rank(&failure(
+            JournalGap::BootstrapMismatch,
+            Some(Refusal::CurrentPartition),
+        ));
+        let fallback = failure_rank(&failure(JournalGap::BootstrapMismatch, None));
+        assert_eq!(stale, fallback, "a stale-witness take ranks with fallback");
+        assert!(
+            unknown < stale,
+            "a transient take still ranks below the stale-witness ending"
+        );
+    }
 }

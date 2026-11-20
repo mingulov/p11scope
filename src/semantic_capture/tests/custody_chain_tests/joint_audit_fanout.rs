@@ -17969,6 +17969,184 @@ fn watchdog_entry_consumer_park_no_trip() {
     );
 }
 
+/// The parked-consumer gap counts every head the forced fallback
+/// degraded across its delivery slices, not just the terminal slice's
+/// single head: three queued calls replay over three slices, so the
+/// public gap ends with `(3 calls)`.
+#[test]
+fn watchdog_park_gap_counts_every_replayed_head() {
+    const ROW: &str = "park gap exact count";
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    watchdog_drive_to_applied(&mut fixture);
+    let target = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+        .next()
+        .expect("one stuck target")
+        .0;
+    let failure = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .scripted_failure(
+            crate::semantics_objects::journal::JournalGap::BoundNotReady,
+            target.bootstrap(),
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+    fixture.machine.pose_frame_failure_for_test(failure);
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    let mut published = false;
+    for _ in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(JointServiceProgress::Pending) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        published,
+        "{ROW}: the frame completes past its parked consumer"
+    );
+    let feed = watchdog_feed_states(&fixture, 0);
+    assert_eq!(feed.len(), 1, "{ROW}: one stuck incarnation");
+    assert_eq!(
+        feed[0].1.1, 0,
+        "{ROW}: the parked feed stages nothing after"
+    );
+    assert_eq!(
+        feed[0].1.3, 3,
+        "{ROW}: all three queued calls replay through the forced fallback"
+    );
+    assert_eq!(
+        feed[0].1.6, 0,
+        "{ROW}: the forced fallback disposes nothing as loss"
+    );
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    let mut reasons: Vec<String> = registry
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == "joint stuck consumer parked")
+        .map(|gap| gap.reason.clone())
+        .collect();
+    reasons.extend(
+        registry
+            .staged_gaps_for_test()
+            .into_iter()
+            .filter(|gap| gap.subject == "joint stuck consumer parked")
+            .map(|gap| gap.reason),
+    );
+    assert_eq!(reasons.len(), 1, "{ROW}: one park gap lands: {reasons:?}");
+    assert!(
+        reasons[0].ends_with("(3 calls)"),
+        "{ROW}: the park gap counts all three replayed heads, got {:?}",
+        reasons[0]
+    );
+}
+
+/// Parking runs bounded and resumes: an empty budget yields with
+/// the park cursor persisting, and the next call parks the streaked
+/// consumer and completes. The parked consumer then degrades with
+/// its named gap and the frame completes.
+#[test]
+fn watchdog_park_runs_bounded_and_resumes() {
+    const ROW: &str = "park bounded resume";
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::joint_audit::ParkProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    watchdog_drive_to_applied(&mut fixture);
+    let target = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+        .next()
+        .expect("one stuck target")
+        .0;
+    let failure = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .scripted_failure(
+            crate::semantics_objects::journal::JournalGap::BoundNotReady,
+            target.bootstrap(),
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+    fixture.machine.pose_frame_failure_for_test(failure);
+    match fixture.service(1) {
+        Ok(JointServiceProgress::Pending) => {}
+        other => panic!("{ROW}: the retry pends, got {other:?}"),
+    }
+    let states = fixture.machine.frame_consumer_states_for_test();
+    assert_eq!(states.len(), 1, "{ROW}: one consumer");
+    assert_eq!(states[0].1, "Pending", "{ROW}: the consumer pends");
+    assert!(states[0].2 > 0, "{ROW}: the retry streaks");
+    let mut empty = 0usize;
+    assert_eq!(
+        fixture.machine.park_for_test(&mut empty),
+        ParkProgress::Yielded,
+        "{ROW}: an empty budget yields the park"
+    );
+    let mut budget = 10usize;
+    assert_eq!(
+        fixture.machine.park_for_test(&mut budget),
+        ParkProgress::Done(1),
+        "{ROW}: the resumed park parks the streaked consumer"
+    );
+    let states = fixture.machine.frame_consumer_states_for_test();
+    assert!(states[0].3, "{ROW}: the consumer parks");
+    let mut published = false;
+    for _ in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(JointServiceProgress::Pending) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        published,
+        "{ROW}: the frame completes past its parked consumer"
+    );
+    assert!(
+        watchdog_scope_gaps(&fixture)
+            .iter()
+            .any(|(subject, _)| subject == "joint stuck consumer parked"),
+        "{ROW}: the park stages its named gap"
+    );
+}
+
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck
 /// foreign call (in-flight, never attested) bars seals; the trip
 /// re-arms with scoped recovery that sheds the barrier with loss
@@ -18120,6 +18298,115 @@ fn watchdog_entry_unapplied_rearm_keeps_carried() {
         None,
         "{ROW}: no new trip stands after healthy work"
     );
+}
+
+/// A healthy session that stages in the abandoned quantum keeps its
+/// fresh and carried work across a provenanced re-arm: A (file 0)
+/// stalls with a retry while B (file 1) holds one carried and one
+/// fresh head in the same quantum. The re-arm discards only A's
+/// proven-stuck feed; B retains both heads for retry instead of
+/// losing its whole queue to the touched set.
+#[test]
+fn watchdog_same_quantum_healthy_stage_survives_rearm() {
+    const ROW: &str = "same-quantum healthy stage survives";
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    let (mut fixture, _end_a) = watchdog_prefix_scene(ROW);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 5);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 6);
+    fixture.scene.push(pid, 0, "C_SignFinal", 7);
+    fixture.scene.push(pid, 1, "C_SignUpdate", 8);
+    watchdog_drive_to_applied(&mut fixture);
+    let stuck = watchdog_feed_states(&fixture, 0);
+    let held = watchdog_feed_states(&fixture, 1);
+    assert!(stuck[0].1.1 > 0, "{ROW}: A stages fresh work");
+    assert_eq!(
+        held[0].1.1, 2,
+        "{ROW}: B stages one carried plus one fresh head"
+    );
+    // A stalls with a retry while B stays unvisited: pose a retry
+    // failure for A's domain and drive one delivery. A and B share
+    // one caller (same pid), so match A's target by its staged
+    // depth (three fresh heads) instead of by caller.
+    let target_a = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+        .map(|(target, _)| target)
+        .find(|target| {
+            fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .joint_staged_count(target)
+                == Some(3)
+        })
+        .expect("A's three-head target");
+    let failure = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .scripted_failure(
+            crate::semantics_objects::journal::JournalGap::BoundNotReady,
+            target_a.bootstrap(),
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+    // A is unfinished (Future, awaiting input) and B is Pending;
+    // neither retried nor parked, so the posed failure alone proves
+    // A stuck while B stays clean.
+    let states = fixture.machine.frame_consumer_states_for_test();
+    assert_eq!(
+        states
+            .iter()
+            .map(|(_, state, _, _)| *state)
+            .collect::<Vec<_>>(),
+        ["Future", "Pending"],
+        "{ROW}: A waits for input ahead of pending B"
+    );
+    assert!(
+        states
+            .iter()
+            .all(|(_, _, streak, parked)| *streak == 0 && !*parked),
+        "{ROW}: no streak or park before the posed failure"
+    );
+    fixture.machine.pose_frame_failure_for_test(failure);
+    match fixture.service(1) {
+        Ok(JointServiceProgress::Pending) => {}
+        other => panic!("{ROW}: A's retry pends, got {other:?}"),
+    }
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1),
+        Err(SemanticRefusal::Unavailable),
+        "{ROW}: the transient refusal latches"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(true),
+        "{ROW}: the applied quantum re-arms"
+    );
+    let stuck = watchdog_feed_states(&fixture, 0);
+    let held = watchdog_feed_states(&fixture, 1);
+    assert_eq!(stuck[0].1.1, 0, "{ROW}: A discards its staged queue");
+    assert!(
+        stuck[0].1.6 > 0,
+        "{ROW}: A's stuck loss counts exactly its depth"
+    );
+    assert_eq!(
+        held[0].1.1, 2,
+        "{ROW}: B retains its carried and fresh heads across the re-arm"
+    );
+    assert_eq!(held[0].1.6, 0, "{ROW}: B disposes nothing");
+    assert_eq!(held[0].1.0, FeedMode::Joint, "{ROW}: B stays Joint");
 }
 
 /// Table-driven entry-point coverage for per-session watchdog

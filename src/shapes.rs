@@ -44,10 +44,17 @@ pub fn expected_shapes(reg: &MechanismRegistry) -> std::collections::BTreeMap<u6
 }
 
 /// Every mechanism id safe mode approves: the complete official 3.2
-/// catalog plus configured registered ids. Presence is approval; the value is
-/// only an optional decoder shape. When the union exceeds `MECH_SHAPE`
-/// capacity, [`select_publishable`] publishes the official-first prefix and
-/// the unpublished tail keeps counting through the unregistered path.
+/// catalog, configured registered ids, plus the listed vendor
+/// key-creation/derivation/wrap ids
+/// (`crate::vendor_mechanisms::VENDOR_MECHANISMS`) — the same set the
+/// userspace standard-layout publication gate already admits by name
+/// (controller ruling 2026-11-11 clause 2), so the BPF journal lane
+/// publishes them by number instead of withholding them. Presence is
+/// approval; the value is only an optional decoder shape (a configured
+/// registry shape for a listed id wins over the vendor default). When
+/// the union exceeds `MECH_SHAPE` capacity, [`select_publishable`]
+/// publishes the official-first prefix and the unpublished tail keeps
+/// counting through the unregistered path.
 pub fn approved_mechanisms(reg: &MechanismRegistry) -> BTreeMap<u64, u32> {
     let mut approved = PKCS11_3_2_OFFICIAL_MECHANISMS
         .iter()
@@ -60,13 +67,17 @@ pub fn approved_mechanisms(reg: &MechanismRegistry) -> BTreeMap<u64, u32> {
             .unwrap_or(shape::NONE);
         approved.insert(mechanism, code);
     }
+    for (id, _) in crate::vendor_mechanisms::VENDOR_MECHANISMS {
+        approved.entry(*id).or_insert(shape::NONE);
+    }
     approved
 }
 
 /// The deterministic publishable prefix of an approval union, capped at
 /// `MECH_SHAPE` capacity: the official PKCS#11 3.2 catalog first
-/// (ascending), then the remaining registered ids (ascending). Returns the
-/// subset to publish and how many approved ids stay unpublished.
+/// (ascending), then the remaining registered and listed vendor ids
+/// (ascending). Returns the subset to publish and how many approved ids
+/// stay unpublished.
 pub fn select_publishable(approved: &BTreeMap<u64, u32>) -> (BTreeMap<u64, u32>, u64) {
     let cap = MAX_MECH_SHAPES as usize;
     if approved.len() <= cap {
@@ -265,7 +276,11 @@ mod tests {
         // A version change is a deliberate catalog decision, not a number
         // to update casually. The official 3.2 catalog is unchanged at 463;
         // the approved union adds the two proposed 3.3 external-mu
-        // registrations (0x403b/0x403c) from the embedded default registry.
+        // registrations (0x403b/0x403c) from the embedded default registry
+        // plus the 53 listed vendor ids from
+        // `crate::vendor_mechanisms::VENDOR_MECHANISMS` (journal-lane
+        // publication by number for vendor key creation; the vendor
+        // catalog is disjoint from the official/registered union).
         let official = PKCS11_3_2_OFFICIAL_MECHANISMS
             .iter()
             .map(|mechanism| mechanism.0)
@@ -276,8 +291,8 @@ mod tests {
         let approved = approved_mechanisms(&registry);
         assert_eq!(
             approved.len(),
-            465,
-            "official/registered overlap must deduplicate"
+            518,
+            "official/registered/vendor overlap must deduplicate"
         );
         assert!(official.iter().all(|id| approved.contains_key(id)));
         assert_eq!(approved.get(&0), Some(&shape::NONE));
@@ -294,7 +309,7 @@ mod tests {
         );
         let approved = approved_mechanisms(&registry);
 
-        assert_eq!(approved.len(), 464);
+        assert_eq!(approved.len(), 517);
         assert_eq!(approved.get(&u64::MAX), Some(&shape::NONE));
     }
 

@@ -3598,7 +3598,7 @@ impl Session {
                         anyhow::anyhow!("private counter backend or active registry mismatch")
                     })?;
                 session.selection = super::BackendSelection::Multi;
-                session.links = super::activate_after_preparation_with(Ok(()), || {
+                *session.links = super::activate_after_preparation_with(Ok(()), || {
                     super::attach_lifecycle_with(
                         &mut session.ebpf,
                         Self::attach_lifecycle_program,
@@ -3644,7 +3644,7 @@ impl Session {
         )
         .map_err(map_counter_verifier_budget_refusal)?;
         // The keepalive is already in Session before the first real producer.
-        session.links = super::activate_after_preparation_with(Ok(()), || {
+        *session.links = super::activate_after_preparation_with(Ok(()), || {
             super::attach_lifecycle_with(
                 &mut session.ebpf,
                 Self::attach_lifecycle_program,

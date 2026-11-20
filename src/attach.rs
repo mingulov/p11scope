@@ -1947,7 +1947,7 @@ pub struct Session {
     pid_health: pid_continuity::OwnerHealth,
     prepared_owner_limit: u64,
     pid_lifecycle: Option<PidLifecycleTap>,
-    links: Vec<RegisteredLink>,
+    links: RevisedLinks,
     /// Task 3 Stage A continuity witness: hook links, watched files and the
     /// refusal reason when instance routing is unavailable.
     instance: InstanceTracking,
@@ -2566,6 +2566,63 @@ pub(crate) enum ProbeSide {
 
 pub(crate) type StaticEndpoint = (u32, ProbeSide);
 
+/// Strided form of the static-side membership test for one slot. Every
+/// step costs at least one unit: a link skipped (not a wanted static
+/// side, or no members left) costs one, and a wanted link costs one
+/// per member slot compared. The walk stops early once both sides are
+/// found, so a complete walk agrees with [`current_static_sides_from`].
+fn static_sides_stride_from(
+    links: &[RegisteredLink],
+    slot: u32,
+    walk: &mut crate::semantic_capture::SidesWalk,
+    units: usize,
+) -> crate::semantic_capture::SidesStep {
+    use crate::semantic_capture::SidesStep;
+    let mut left = units;
+    loop {
+        if walk.entry && walk.ret {
+            return SidesStep::Found;
+        }
+        let Some(link) = links.get(walk.link) else {
+            return SidesStep::Missing;
+        };
+        if left == 0 {
+            return SidesStep::More;
+        }
+        let side = match link.producer() {
+            ProducerProgram::UProbe(program) => static_probe_side(program),
+            _ => None,
+        };
+        let wanted = match side {
+            Some(ProbeSide::Entry) => !walk.entry,
+            Some(ProbeSide::Return) => !walk.ret,
+            None => false,
+        };
+        let members = link.slots();
+        if !wanted || walk.offset >= members.len() {
+            left -= 1;
+            walk.link += 1;
+            walk.offset = 0;
+            continue;
+        }
+        let take = left.min(members.len() - walk.offset);
+        let found = members[walk.offset..walk.offset + take].contains(&slot);
+        left -= take;
+        walk.offset += take;
+        if found {
+            match side {
+                Some(ProbeSide::Entry) => walk.entry = true,
+                Some(ProbeSide::Return) => walk.ret = true,
+                None => {}
+            }
+        }
+        if found || walk.offset >= members.len() {
+            walk.link += 1;
+            walk.offset = 0;
+        }
+    }
+}
+
 fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoint> {
     links
         .iter()
@@ -2589,6 +2646,37 @@ fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoin
 enum IndividualLinkId {
     Perf(UProbeLinkId),
     Multi(OwnedFd),
+}
+
+/// The Session's link registry with a revision that moves on every
+/// mutable borrow. A resumable reader (the cadence receipt proof) keeps
+/// its walk position only while the revision it started under still
+/// holds; shared reads leave it alone. Any `&mut` access counts as a
+/// change, so a borrow that only looked still restarts the reader
+/// (conservative, never stale).
+struct RevisedLinks {
+    links: Vec<RegisteredLink>,
+    revision: u64,
+}
+impl RevisedLinks {
+    fn new() -> Self {
+        Self {
+            links: Vec::new(),
+            revision: 0,
+        }
+    }
+}
+impl std::ops::Deref for RevisedLinks {
+    type Target = Vec<RegisteredLink>;
+    fn deref(&self) -> &Self::Target {
+        &self.links
+    }
+}
+impl std::ops::DerefMut for RevisedLinks {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.revision = self.revision.wrapping_add(1);
+        &mut self.links
+    }
 }
 
 /// One link whose lifetime this session owns. Static, loader/export, and
@@ -4197,15 +4285,57 @@ pub(crate) fn reseal_test_attachment(
     seal_test_attachment(subset, domain, pins)
 }
 
+/// Whole-table receipt readback over an already-read descriptor list,
+/// through the same per-entry comparison the live strides use.
+#[cfg(test)]
 fn semantic_receipt_readback(
     policy: CapturePolicy,
     descriptors: Result<Vec<SlotSemantics>>,
 ) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
     use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
-    if policy != CapturePolicy::Allowlisted
-        || descriptors.map_err(|_| Refusal::Attachment)? != *crate::kinds::DESCRIPTORS
-    {
+    let descriptors = descriptors.map_err(|_| Refusal::Attachment)?;
+    semantic_receipt_readback_range(
+        policy,
+        descriptors.len(),
+        0,
+        p11scope_ebpf_common::MAX_DESCRIPTORS,
+        |index| {
+            descriptors
+                .get(index as usize)
+                .copied()
+                .ok_or(Refusal::Attachment)
+        },
+    )
+}
+
+/// One receipt readback range `start..start + len`: the table must be
+/// the canonical size, the policy allowlisted, and every entry read
+/// must equal the canonical descriptor. One `read` per entry.
+fn semantic_receipt_readback_range(
+    policy: CapturePolicy,
+    table_len: usize,
+    start: u32,
+    len: u32,
+    mut read: impl FnMut(
+        u32,
+    ) -> std::result::Result<
+        SlotSemantics,
+        crate::semantic_capture::CurrentReceiptRefusal,
+    >,
+) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+    use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+    let canonical = &*crate::kinds::DESCRIPTORS;
+    if policy != CapturePolicy::Allowlisted || table_len != canonical.len() {
         return Err(Refusal::Attachment);
+    }
+    let end = start.checked_add(len).ok_or(Refusal::Attachment)?;
+    if end as usize > canonical.len() {
+        return Err(Refusal::Attachment);
+    }
+    for index in start..end {
+        if read(index)? != canonical[index as usize] {
+            return Err(Refusal::Attachment);
+        }
     }
     Ok(())
 }
@@ -8077,7 +8207,7 @@ impl Session {
             track_short_lived,
             stats_slots,
         )?;
-        session.links = activate_after_preparation_with(Ok(()), || {
+        *session.links = activate_after_preparation_with(Ok(()), || {
             attach_lifecycle_with(
                 &mut session.ebpf,
                 Self::attach_lifecycle_program,
@@ -8636,7 +8766,7 @@ impl Session {
                 prepared_owner_limit: prepared_owner_limit
                     .expect("identity preparation retained exact owner limit"),
                 pid_lifecycle,
-                links: Vec::new(),
+                links: RevisedLinks::new(),
                 instance: InstanceTracking::default(),
                 cleanup_worker: Some(CleanupWorker::pre_start()),
                 producer_detach: OwnedProducerDetach::NotStarted,
@@ -10172,7 +10302,7 @@ impl Session {
                 "p11_entry"
             };
             let mut entry_programs = BTreeSet::new();
-            for link in &self.links {
+            for link in self.links.iter() {
                 if !link.slots().contains(&slot.index) {
                     continue;
                 }
@@ -10397,7 +10527,7 @@ impl Session {
         }
         // Resolve every fallible singles program/type lookup before the gap
         // ledger or live registry can change, as the synchronous path does.
-        for link in &self.links {
+        for link in self.links.iter() {
             if let RegisteredLink::UProbe { program, slot, .. } = link
                 && requested.contains(slot)
             {
@@ -10979,7 +11109,7 @@ impl Session {
         match family {
             TerminalProducerFamily::Registered => {
                 let mut outcomes = Vec::new();
-                for link in std::mem::take(&mut self.links) {
+                for link in std::mem::take(&mut *self.links) {
                     let producer = link.producer();
                     let slots: Vec<u32> = link.slots().to_vec();
                     match take_owned_links(&mut self.ebpf, link) {
@@ -12001,12 +12131,75 @@ impl Session {
         crate::semantic_capture::CurrentReceiptRefusal,
     > {
         use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
-        semantic_receipt_readback(self.policy, self.semantic_descriptors())?;
-        let sides = self.current_static_sides();
-        if !sides.contains(&(slot, ProbeSide::Entry)) || !sides.contains(&(slot, ProbeSide::Return))
+        self.semantic_receipt_readback_stride(0, self.semantic_receipt_readback_len())?;
+        let mut walk = crate::semantic_capture::SidesWalk::default();
+        if self.semantic_receipt_sides_stride(slot, &mut walk, usize::MAX)
+            != crate::semantic_capture::SidesStep::Found
         {
             return Err(Refusal::Attachment);
         }
+        self.semantic_receipt_target_tail(slot)
+    }
+
+    /// Revision of the link registry (see [`RevisedLinks`]): a strided
+    /// receipt proof resumes only under the revision it started under.
+    pub(crate) fn attachment_revision(&self) -> u64 {
+        self.links.revision
+    }
+
+    /// Descriptor entries one complete receipt readback compares.
+    pub(crate) fn semantic_receipt_readback_len(&self) -> u32 {
+        p11scope_ebpf_common::MAX_DESCRIPTORS
+    }
+
+    /// One stride of the receipt's DESCRIPTORS readback: one map lookup
+    /// per entry in `start..start + len`, each compared with the
+    /// canonical table. A complete readback is the strides over
+    /// `0..semantic_receipt_readback_len()`.
+    pub(crate) fn semantic_receipt_readback_stride(
+        &self,
+        start: u32,
+        len: u32,
+    ) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+        use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+        let map = self.ebpf.map("DESCRIPTORS").ok_or(Refusal::Attachment)?;
+        let descriptors: Array<_, SlotSemantics> =
+            Array::try_from(map).map_err(|_| Refusal::Attachment)?;
+        semantic_receipt_readback_range(
+            self.policy,
+            descriptors.len() as usize,
+            start,
+            len,
+            |index| descriptors.get(&index, 0).map_err(|_| Refusal::Attachment),
+        )
+    }
+
+    /// One stride of the receipt's static-side walk for `slot`: visits
+    /// at most `units` links and member slots from `walk`, noting the
+    /// entry and return sides found. `Found` once both are seen,
+    /// `Missing` when the registry ends first, `More` when the stride
+    /// ran out. The position means something only under the
+    /// [`Self::attachment_revision`] it was taken under.
+    pub(crate) fn semantic_receipt_sides_stride(
+        &self,
+        slot: u32,
+        walk: &mut crate::semantic_capture::SidesWalk,
+        units: usize,
+    ) -> crate::semantic_capture::SidesStep {
+        static_sides_stride_from(&self.links, slot, walk, units)
+    }
+
+    /// The receipt's final retained-target check after a complete
+    /// readback and side walk: the retained static entry, its watched
+    /// object and one file-identity check.
+    pub(crate) fn semantic_receipt_target_tail(
+        &self,
+        slot: u32,
+    ) -> std::result::Result<
+        crate::discovery::identity::RetainedInventoryTarget,
+        crate::semantic_capture::CurrentReceiptRefusal,
+    > {
+        use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
         let retained = self.retained_static.get(&slot).ok_or(Refusal::Attachment)?;
         if retained.slot.index != slot {
             return Err(Refusal::Attachment);
@@ -12531,7 +12724,7 @@ impl Drop for Session {
             .counter_banks
             .as_ref()
             .map(|banks| Arc::clone(&banks.keepalive));
-        for link in std::mem::take(&mut self.links) {
+        for link in std::mem::take(&mut *self.links) {
             let producer = link.producer();
             if let Ok(links) = take_owned_links(&mut self.ebpf, link) {
                 owned.extend(links.into_iter().map(|link| {
@@ -20519,6 +20712,77 @@ mod tests {
             path,
             abi,
             held: None,
+        }
+    }
+
+    /// The strided static-side walk the cadence receipt proof resumes
+    /// agrees with the whole-set membership test for every slot and
+    /// every stride size, including strides that split a multi link's
+    /// member list and walks that end early.
+    #[test]
+    fn static_sides_stride_agrees_with_the_side_set() {
+        use crate::semantic_capture::{SidesStep, SidesWalk};
+        let multi = |program: &'static str, slots: Vec<u32>| RegisteredLink::MultiUProbe {
+            program,
+            slots,
+            fds: vec![File::open("/dev/null").unwrap().into()],
+            registration: None,
+        };
+        let links = vec![
+            multi("p11_entry", (0..100).collect()),
+            multi("p11_return", (0..100).filter(|slot| *slot != 57).collect()),
+            RegisteredLink::UProbe {
+                program: "p11_entry",
+                slot: 200,
+                id: dummy_uprobe_link_id(),
+                registration: None,
+            },
+            RegisteredLink::UProbe {
+                program: "p11_return",
+                slot: 200,
+                id: dummy_uprobe_link_id(),
+                registration: None,
+            },
+            RegisteredLink::UProbe {
+                program: "p11_entry",
+                slot: 201,
+                id: dummy_uprobe_link_id(),
+                registration: None,
+            },
+        ];
+        let sides = current_static_sides_from(&links);
+        for slot in (0..110).chain([200, 201, 202]) {
+            let expected = sides.contains(&(slot, ProbeSide::Entry))
+                && sides.contains(&(slot, ProbeSide::Return));
+            for stride in [1, 7, 64, usize::MAX] {
+                let mut walk = SidesWalk::default();
+                let mut strides = 0;
+                let verdict = loop {
+                    strides += 1;
+                    assert!(strides < 1_000, "the walk always advances");
+                    match static_sides_stride_from(&links, slot, &mut walk, stride) {
+                        SidesStep::More => continue,
+                        verdict => break verdict,
+                    }
+                };
+                assert_eq!(
+                    verdict == SidesStep::Found,
+                    expected,
+                    "slot {slot} stride {stride}"
+                );
+            }
+        }
+        // Total units across all strides stay within one visit of each
+        // link plus each member compared.
+        let members: usize = links.iter().map(|link| link.slots().len()).sum();
+        let mut walk = SidesWalk::default();
+        let mut strides = 0;
+        while static_sides_stride_from(&links, 202, &mut walk, 64) == SidesStep::More {
+            strides += 1;
+        }
+        assert!(strides < (links.len() + members).div_ceil(64));
+        for link in links {
+            std::mem::forget(link);
         }
     }
 

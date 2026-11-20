@@ -27847,6 +27847,21 @@ fn pending_h3_from_stash(
     pending_h3_with_sibling(unmatched_complete, false, audit_fault)
 }
 
+fn pending_h3_from_stash_with_collect(
+    unmatched_complete: bool,
+    collect_fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    audit_fault: &impl crate::semantics_objects::journal::FaultEpoch,
+) -> PendingH3Scene {
+    pending_h3_with_subject_before_audit_with_collect(
+        unmatched_complete,
+        false,
+        false,
+        collect_fault,
+        audit_fault,
+        |_, _| {},
+    )
+}
+
 fn pending_h3_with_sibling(
     unmatched_complete: bool,
     dispose_sibling: bool,
@@ -27879,6 +27894,24 @@ fn pending_h3_with_subject_before_audit(
     unmatched_complete: bool,
     dispose_sibling: bool,
     exact_subject: bool,
+    audit_fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    before_audit: impl FnOnce(&mut CanonicalFanoutScene, &IngestedRaw),
+) -> PendingH3Scene {
+    pending_h3_with_subject_before_audit_with_collect(
+        unmatched_complete,
+        dispose_sibling,
+        exact_subject,
+        &BirthFault,
+        audit_fault,
+        before_audit,
+    )
+}
+
+fn pending_h3_with_subject_before_audit_with_collect(
+    unmatched_complete: bool,
+    dispose_sibling: bool,
+    exact_subject: bool,
+    collect_fault: &impl crate::semantics_objects::journal::FaultEpoch,
     audit_fault: &impl crate::semantics_objects::journal::FaultEpoch,
     before_audit: impl FnOnce(&mut CanonicalFanoutScene, &IngestedRaw),
 ) -> PendingH3Scene {
@@ -27938,7 +27971,7 @@ fn pending_h3_with_subject_before_audit(
         fixture.scene.admit_providers(a, caller, &[1]);
         fixture.scene.push(a, 1, "C_SignInit", 3);
     }
-    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let mut raw = fixture.scene.collect_with_fault(collect_fault);
     let first = {
         let mut h0 = fixture.scene.real.h0.0.borrow_mut();
         let HeldH0 { capture, io, .. } = &mut *h0;
@@ -29319,6 +29352,82 @@ fn joint_reread_plus_h3_pending_keeps_pending_and_absorbs_nothing() {
             q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
             Ok(QuantumSealProgress::AwaitFutureInput),
             "the pending frame awaits future H0 input, it never converts"
+        );
+    }
+}
+
+#[test]
+fn joint_chain_plus_h3_pending_carries_baseline_and_defers() {
+    // Mixed chain + H3 pending at the frame boundary: a
+    // between-collection native move (bracket 1/1 against a pinned 0)
+    // must not strand the frame on the stale pin. The frame refuses
+    // with H3Pending (never Ok, never a void), carries the audited
+    // close into the pin, and defers to future H0 input once the
+    // live producer owns its exact floor.
+    struct ChangedFault;
+    impl crate::semantics_objects::journal::FaultEpoch for ChangedFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(1)
+        }
+    }
+    let PendingH3Scene {
+        mut fixture,
+        frame: mut q1,
+        ..
+    } = pending_h3_from_stash_with_collect(false, &ChangedFault, &ChangedFault);
+    let failure = q1
+        .failure_for_test()
+        .expect("mixed chain+H3 must refuse, never absorb");
+    assert_eq!(
+        failure.gap,
+        crate::semantics_objects::journal::JournalGap::H3Pending
+    );
+    assert!(matches!(
+        q1.audit_for_test().h3_for_test(),
+        H3DispositionEvidence::Clean {
+            staged_max: 3,
+            pending_floor: Some(4),
+        }
+    ));
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(1),
+        "the verified chain close rides the pending refusal"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 0, "pending voids nothing");
+    assert_eq!(
+        diagnosis.audit_fault_absorbed_chain, 0,
+        "no absorb across pending H3"
+    );
+    assert_eq!(diagnosis.audit_fault_absorbed_reread, 0);
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::AwaitFutureInput),
+            "the owned pending frame defers, it never sticks on the old pin"
         );
     }
 }

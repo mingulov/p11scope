@@ -424,7 +424,7 @@ impl<N: JointNativeIo, W: ReadyBirthLookup + ?Sized> JointBirthEvidenceSource
         let mut native = self
             .native
             .try_borrow_mut()
-            .map_err(|_| BirthObservationRefusal::CurrentPartition)?;
+            .map_err(|_| BirthObservationRefusal::SessionBorrowed)?;
         native.recheck_birth(witness, self.capture, self.attached, binding)
     }
 }

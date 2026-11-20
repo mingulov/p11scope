@@ -389,8 +389,8 @@ impl RetainedBirthWitness {
         self.validate_scope(attachment, binding)?;
         let deadline = Instant::now()
             .checked_add(capture.limits.scan_slice)
-            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
-        capture.validate_birth_candidate(
+            .ok_or(crate::attach::BirthObservationRefusal::TakeDeadline)?;
+        let before = capture.validate_birth_candidate(
             &mut SessionIo {
                 session,
                 targets: &[],
@@ -409,7 +409,7 @@ impl RetainedBirthWitness {
                 self.receipt.birth(),
             )?
         };
-        capture.validate_birth_candidate(
+        let after = capture.validate_birth_candidate(
             &mut SessionIo {
                 session,
                 targets: &[],
@@ -418,7 +418,10 @@ impl RetainedBirthWitness {
             true,
         )?;
         if Instant::now() >= deadline {
-            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+            return Err(crate::attach::BirthObservationRefusal::TakeDeadline);
+        }
+        if before || after {
+            capture.note_take_drift_tolerated();
         }
         Ok(evidence)
     }
@@ -443,8 +446,8 @@ impl RetainedBirthWitness {
         let deadline = io
             .now()
             .checked_add(capture.limits.scan_slice)
-            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
-        capture.validate_birth_candidate(io, &self.candidate, true)?;
+            .ok_or(crate::attach::BirthObservationRefusal::TakeDeadline)?;
+        let before = capture.validate_birth_candidate(io, &self.candidate, true)?;
         let evidence = crate::attach::observe_retained_birth(
             rows,
             binding,
@@ -452,9 +455,12 @@ impl RetainedBirthWitness {
             &self.admission,
             self.receipt.birth(),
         )?;
-        capture.validate_birth_candidate(io, &self.candidate, true)?;
+        let after = capture.validate_birth_candidate(io, &self.candidate, true)?;
         if io.now() >= deadline {
-            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+            return Err(crate::attach::BirthObservationRefusal::TakeDeadline);
+        }
+        if before || after {
+            capture.note_take_drift_tolerated();
         }
         Ok(evidence)
     }
@@ -1831,9 +1837,14 @@ impl SemanticCapture {
     /// Retained takes that succeeded across same-instance drift
     /// (diagnostic only): the stop disclosure reads this beside
     /// the seal-bootstrap arms.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired to the stop disclosure with the bump.
     pub(crate) fn take_drift_tolerated(&self) -> u64 {
         self.take_drift_tolerated.load(Ordering::Relaxed)
+    }
+
+    /// Count one retained take that succeeded across same-instance
+    /// drift (diagnostic only).
+    fn note_take_drift_tolerated(&self) {
+        self.take_drift_tolerated.fetch_add(1, Ordering::Relaxed);
     }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins
@@ -2016,15 +2027,25 @@ impl SemanticCapture {
 
     /// Read-only birth checks never run H0's mutating audit or consume pending
     /// originals. The next actual H0 tick publishes every negative/resolution.
+    ///
+    /// Returns whether the take tolerated same-instance drift: a
+    /// retained receipt whose instance still names the current
+    /// partition validates the live re-read against current truth
+    /// instead of failing the stale receipt forever. Registration
+    /// (`retained == false`) keeps demanding the newest exact
+    /// observation. Every current-truth check stays strict under
+    /// tolerance: capture, custody, attachment, health, fence and
+    /// the live re-read must all agree with now.
     fn validate_birth_candidate(
         &self,
         io: &mut impl CaptureIo,
         candidate: &H0BirthCandidate,
         retained: bool,
-    ) -> Result<(), crate::attach::BirthObservationRefusal> {
+    ) -> Result<bool, crate::attach::BirthObservationRefusal> {
         use crate::attach::BirthObservationRefusal as Refusal;
+        use crate::discovery::instances::BirthPartitionStanding;
         if candidate.capture != self.identity {
-            return Err(Refusal::CurrentPartition);
+            return Err(Refusal::CaptureDrift);
         }
         self.birth_health_with(io)?;
         let receipt = &candidate.receipt;
@@ -2041,15 +2062,17 @@ impl SemanticCapture {
             return Err(Refusal::CustodyLost);
         }
         if !retained && io.now() >= receipt.deadline {
-            return Err(Refusal::CurrentPartition);
+            return Err(Refusal::TakeDeadline);
         }
-        // A seal reuses the same retained witness on every retry, so
-        // a witness that no longer matches current truth (its fence
-        // went stale, its epochs moved) is a definitive negative,
-        // not a contended attempt: name it so delivery falls back
-        // promptly instead of retrying through the watchdog delay.
-        if !self.receipt_partition_matches(receipt) {
-            return Err(Refusal::RetainedWitnessMismatch);
+        let mut tolerated = false;
+        let mut effective = receipt.epochs;
+        match self.birth_standing(receipt) {
+            BirthPartitionStanding::Current => {}
+            BirthPartitionStanding::Continuous { epochs } if retained => {
+                tolerated = true;
+                effective = epochs;
+            }
+            _ => return Err(Refusal::WitnessStale),
         }
         if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint) {
             return Err(Refusal::AttachmentMismatch);
@@ -2082,14 +2105,40 @@ impl SemanticCapture {
                 receipt.attachment_slot,
                 deadline,
             )
-            .map_err(|_| Refusal::CurrentPartition)?;
+            .map_err(|refusal| match refusal {
+                CurrentReceiptRefusal::Custody => Refusal::CustodyLost,
+                CurrentReceiptRefusal::Attachment => Refusal::AttachmentMismatch,
+                CurrentReceiptRefusal::Epoch => Refusal::EpochDrift,
+                CurrentReceiptRefusal::Deadline => Refusal::TakeDeadline,
+                // A failed native read stays unclassified: unknown,
+                // not negative. Domain, Partition and Stopped cannot
+                // come out of a receipt-state read.
+                _ => Refusal::CurrentPartition,
+            })?;
         self.birth_health_with(io)?;
-        if io.now() >= deadline
-            || state.image != receipt.image
-            || state.epochs != receipt.epochs
-            || !self.receipt_partition_matches(receipt)
-        {
-            return Err(Refusal::CurrentPartition);
+        if io.now() >= deadline {
+            return Err(Refusal::TakeDeadline);
+        }
+        if state.image != receipt.image {
+            return Err(Refusal::WitnessStale);
+        }
+        if state.epochs != effective {
+            return Err(Refusal::EpochDrift);
+        }
+        // Truth must not move under the live re-read: a newer
+        // standing than the validated one races the take (the next
+        // tick re-takes), while a break kills the birth. The strict
+        // path never tolerates, so any move breaks its candidate.
+        let moved = match self.birth_standing(receipt) {
+            BirthPartitionStanding::Current => effective != receipt.epochs,
+            BirthPartitionStanding::Continuous { epochs } if retained => epochs != effective,
+            BirthPartitionStanding::Continuous { .. } => {
+                return Err(Refusal::WitnessStale);
+            }
+            BirthPartitionStanding::Broken => return Err(Refusal::WitnessStale),
+        };
+        if moved {
+            return Err(Refusal::EpochDrift);
         }
         if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
             || !Arc::ptr_eq(
@@ -2100,7 +2149,7 @@ impl SemanticCapture {
         {
             return Err(Refusal::AttachmentMismatch);
         }
-        Ok(())
+        Ok(tolerated)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2297,7 +2346,7 @@ impl SemanticCapture {
     ) -> Result<RetainedBirthWitness, crate::attach::BirthObservationRefusal> {
         let deadline = Instant::now()
             .checked_add(self.limits.scan_slice)
-            .ok_or(crate::attach::BirthObservationRefusal::CurrentPartition)?;
+            .ok_or(crate::attach::BirthObservationRefusal::TakeDeadline)?;
         self.validate_birth_candidate(
             &mut SessionIo {
                 session,
@@ -2322,7 +2371,7 @@ impl SemanticCapture {
             false,
         )?;
         if Instant::now() >= deadline {
-            return Err(crate::attach::BirthObservationRefusal::CurrentPartition);
+            return Err(crate::attach::BirthObservationRefusal::TakeDeadline);
         }
         Ok(witness)
     }
@@ -2433,6 +2482,20 @@ impl SemanticCapture {
     }
     fn receipt_partition_matches(&self, receipt: &CurrentPartitionReceipt) -> bool {
         self.router.current_partition_matches(
+            receipt.domain,
+            receipt.image,
+            receipt.endpoint.file_slot,
+            receipt.epochs,
+            receipt.fence,
+            &receipt.ids,
+        )
+    }
+
+    fn birth_standing(
+        &self,
+        receipt: &CurrentPartitionReceipt,
+    ) -> crate::discovery::instances::BirthPartitionStanding {
+        self.router.birth_partition_standing(
             receipt.domain,
             receipt.image,
             receipt.endpoint.file_slot,

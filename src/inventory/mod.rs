@@ -2170,8 +2170,12 @@ fn run_with_terminal_budget(
             subjects.refusals_after_first_rearm,
         ));
         let bootstraps = coordinator.joint_seal_bootstrap_diagnosis();
+        let drift_tolerated = semantic_lane
+            .as_ref()
+            .map_or(0, |lane| lane.take_drift_tolerated());
         inventory_diagnostic(&crate::inventory_semantics::joint_bootstraps_line(
             &bootstraps,
+            drift_tolerated,
         ));
     }
     // Output attempts first; only then may an unsettled retirement's drop
@@ -9679,8 +9683,12 @@ fn run_dashboard(
             subjects.refusals_after_first_rearm,
         ));
         let bootstraps = coordinator.joint_seal_bootstrap_diagnosis();
+        let drift_tolerated = semantic_lane
+            .as_ref()
+            .map_or(0, |lane| lane.take_drift_tolerated());
         display.notice(&crate::inventory_semantics::joint_bootstraps_line(
             &bootstraps,
+            drift_tolerated,
         ));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.

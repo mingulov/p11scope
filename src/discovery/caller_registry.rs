@@ -4252,9 +4252,17 @@ pub(crate) struct CallerRegistry {
     /// Images whose Joint feeds a fenced void just ended, queued for
     /// one reseed birth each: the Joint machine drains this to re-arm
     /// their router retries, so the next continued observation offers
-    /// a fresh birth at/above the fence. Bounded; beyond the cap the
-    /// feed stays S1Only with its deferred gap (no silent recovery).
+    /// a fresh birth at/above the fence. Take-failure fallbacks
+    /// queue here too (see `joint_take_reseed_spent`). Bounded;
+    /// beyond the cap the feed stays S1Only with its deferred gap
+    /// (no silent recovery).
     joint_reseed_queue: Vec<p11scope_ebpf_common::ImageIdentity>,
+    /// Take-failure reseeds spent per image (task cookie, exec id):
+    /// an unfenced take-failure fallback queues one reseed birth so
+    /// the session recovers, but a persistently failing truth must
+    /// not reseed forever. Fenced voids do not spend this budget
+    /// (each void already required Joint progress to void).
+    joint_take_reseed_spent: BTreeMap<(u64, u64), u8>,
     /// Calls shed unrouted after S1 proved a caller other than
     /// every bound one: counted as foreign not-attributed beside
     /// the bound callers' key-operation rows.
@@ -4492,6 +4500,7 @@ impl CallerRegistry {
             key_projection: None,
             joint_direct_fallback: 0,
             joint_reseed_queue: Vec::new(),
+            joint_take_reseed_spent: BTreeMap::new(),
             foreign_unrouted_calls: 0,
             settlement_latency: None,
             module_init: BTreeMap::new(),

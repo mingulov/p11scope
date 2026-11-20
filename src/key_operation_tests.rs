@@ -24294,6 +24294,89 @@ fn key_operation_take_failure_fallback_queues_bounded_reseed() {
     );
 }
 
+/// Take-failure reseeds are bounded per image: the first three
+/// endings queue, the fourth stays terminal, so persistently
+/// failing truth never loops fallback-reseed forever. Endings
+/// without a take failure, and fenced endings (the void arm owns
+/// those), never spend the budget.
+#[test]
+fn key_operation_take_reseed_bound_per_image() {
+    let mut fresh = GuardedScene::new();
+    let bootstrap = fresh.scene.bootstrap();
+    let joint_key = fresh.key(1);
+    assert!(
+        fresh
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = fresh.register(1);
+    let (facts, position) =
+        fresh.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    fresh.observe(&joint_key, position, facts);
+    fresh
+        .registry
+        .publish_with_ledger(fresh.scene.adapter.ledger_mut());
+    // End the feed once through the real delivery so eligibility
+    // is honest, then exercise the bound directly.
+    let mut failure = fresh.scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.take_failed = Some(crate::attach::BirthObservationRefusal::WitnessStale);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = fresh.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &fresh.scene.model,
+        fresh.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        FailureApplyOutcome::FellBack { replayed: 1 }
+    ));
+    let queued = fresh.registry.drain_joint_reseed_queue();
+    assert_eq!(queued.len(), 1, "the delivery queues the first reseed");
+    let image = queued[0];
+    let take_failed = Some(crate::attach::BirthObservationRefusal::WitnessStale);
+    assert!(
+        !fresh
+            .registry
+            .maybe_queue_take_reseed(&joint_key, image, None, false),
+        "an ending without a take failure queues nothing"
+    );
+    assert!(
+        !fresh
+            .registry
+            .maybe_queue_take_reseed(&joint_key, image, take_failed, true),
+        "a fenced ending uses the void arm, not the budget"
+    );
+    assert!(
+        fresh
+            .registry
+            .maybe_queue_take_reseed(&joint_key, image, take_failed, false),
+        "the second ending queues"
+    );
+    assert!(
+        fresh
+            .registry
+            .maybe_queue_take_reseed(&joint_key, image, take_failed, false),
+        "the third ending queues"
+    );
+    assert!(
+        !fresh
+            .registry
+            .maybe_queue_take_reseed(&joint_key, image, take_failed, false),
+        "the fourth ending stays terminal"
+    );
+    assert_eq!(
+        fresh.registry.drain_joint_reseed_queue().len(),
+        2,
+        "only the second and third endings queued"
+    );
+}
+
 /// A transiently failed fresh-evidence take is unknown, not
 /// negative: its delivery retries with staging and Joint mode intact
 /// (the next tick takes again) instead of falling the whole session

@@ -642,6 +642,36 @@ impl EpochKey {
     }
 }
 
+/// Standing of a retained birth receipt against the router's
+/// current partition (see
+/// [`InstanceRouter::birth_partition_standing`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BirthPartitionStanding {
+    /// The receipt is still the newest accepted observation.
+    Current,
+    /// The same instance moved to newer epochs: the take validates
+    /// the live re-read against these current epochs instead of the
+    /// stale receipt.
+    Continuous {
+        /// The newest observation's epochs (sticky and record
+        /// flags validated zero, like the receipt's).
+        epochs: CompleteEpochs,
+    },
+    /// Truth broke with the receipt (remap, retirement, fence,
+    /// fault or eviction): the birth is dead.
+    Broken,
+}
+
+impl fmt::Debug for BirthPartitionStanding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Current => formatter.write_str("Current"),
+            Self::Continuous { .. } => formatter.write_str("Continuous(<private>)"),
+            Self::Broken => formatter.write_str("Broken"),
+        }
+    }
+}
+
 /// Partitions of one stable observation, keyed by load base.
 #[derive(Clone, Debug)]
 struct Observed {
@@ -1268,6 +1298,84 @@ impl InstanceRouter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Standing of a retained birth receipt against the current
+    /// partition: still newest, moved on with the same instance, or
+    /// broken with it. Registration keeps demanding
+    /// [`Self::current_partition_matches`]; a retained seal take
+    /// validates a `Continuous` receipt against current truth
+    /// instead of failing the stale receipt forever.
+    pub(crate) fn birth_partition_standing(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        file: u32,
+        epochs: CompleteEpochs,
+        fence: u64,
+        ids: &[InstanceId],
+    ) -> BirthPartitionStanding {
+        let image = ImageKey::from(image);
+        if domain != self.domain
+            || RetirementLedger::index(image.cookie).is_none()
+            || file >= instance::FILE_SLOTS
+            || self.authority_failed
+            || self.image_failed
+            || self.sticky != 0
+            || self.miss_latched
+            || self.image_retired(image)
+            || self.faulted.contains(&(image, file))
+            || fence != self.fence
+            || epochs.fault != self.fault
+            || epochs.sticky != 0
+            || epochs.record_flags != 0
+            || [epochs.local, epochs.global, epochs.fault]
+                .into_iter()
+                .any(|value| value > u64::from(u32::MAX))
+            || ids.is_empty()
+        {
+            return BirthPartitionStanding::Broken;
+        }
+        let Some(current) = self
+            .observed
+            .get(&(image, file))
+            .and_then(|list| list.back())
+        else {
+            return BirthPartitionStanding::Broken;
+        };
+        if !current
+            .partitions
+            .iter()
+            .filter_map(|(_, id)| *id)
+            .eq(ids.iter().copied())
+        {
+            // New partitions minted past the birth (a remap, reload,
+            // exec or new incarnation): the birth's instance is gone.
+            return BirthPartitionStanding::Broken;
+        }
+        if current.epochs
+            == (EpochKey {
+                local: epochs.local,
+                global: epochs.global,
+                fault: epochs.fault,
+            })
+        {
+            return BirthPartitionStanding::Current;
+        }
+        // Same instance at newer epochs (unattributable global churn
+        // the router already disclosed as reload-not-excluded where
+        // tainted): the take validates against current truth. A
+        // same-triple refresh that merely preserved taint still
+        // matches above, so only a genuine advance lands here.
+        BirthPartitionStanding::Continuous {
+            epochs: CompleteEpochs {
+                local: current.epochs.local,
+                global: current.epochs.global,
+                fault: current.epochs.fault,
+                sticky: 0,
+                record_flags: 0,
+            },
+        }
     }
 
     /// Registration needs the newest exact accepted observation. Historical

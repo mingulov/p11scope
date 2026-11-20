@@ -26167,9 +26167,11 @@ fn joint_commit_io_foreign_and_busy_reads_preserve_originals() {
             );
             if busy {
                 assert_eq!(fault.fault_epoch(), Err(FaultReadError::Unreadable));
+                // Borrow contention names itself; the refusal still
+                // precedes either native read and still retries.
                 assert!(matches!(
                     births.take_for(&targets[0], own),
-                    Err(BirthObservationRefusal::CurrentPartition)
+                    Err(BirthObservationRefusal::SessionBorrowed)
                 ));
                 assert_eq!(
                     reads.get(),

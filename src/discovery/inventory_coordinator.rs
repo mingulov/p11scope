@@ -38227,6 +38227,57 @@ mod scan_freshness_tests {
         );
     }
 
+    /// Own-spend accrual: a mid-queue member that tripped a budget stop
+    /// without the full allowance still accrues when its own turn spent
+    /// the pass allowance — the member that actually spent the window,
+    /// not the inherited-shortage boundary. A boundary member with small
+    /// own spend never accrues (see
+    /// `budget_stop_without_full_allowance_never_accrues`).
+    #[test]
+    fn hog_with_large_own_spend_accrues_without_full_allowance() {
+        let mut coordinator = freshness_coordinator();
+        let pid = std::process::id();
+        let live = crate::process::process_start_time(pid).unwrap();
+        let hog_spend = coordinator
+            .engine
+            .budget
+            .pass_owner_ref()
+            .work_allowance_for_scheduling();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            pid,
+            Some(crate::inspect_system::MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        catalog.processes[0].work_disposition =
+            crate::inspect_system::MemberWorkDisposition::StoppedDuringScan {
+                full_allowance: false,
+            };
+        catalog.processes[0].own_work = hog_spend;
+        catalog.skipped.push(crate::inspect_system::PidGap {
+            pid: Some(pid),
+            subject: "libcopy.so".into(),
+            reason: crate::discovery::scan::WORK_CEILING_REASON.into(),
+            generic: false,
+        });
+        for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
+            coordinator.note_applied_scan_tasks(&catalog);
+        }
+        assert_eq!(
+            coordinator.budget_stop_streaks_for_test(),
+            BTreeMap::from([((pid, Some(live)), BUDGET_STOP_DEMOTE_AFTER)]),
+            "a hog accrues on its own spend, without the full allowance"
+        );
+        assert_eq!(
+            coordinator.tiers_for_selection().demoted,
+            BTreeSet::from([pid]),
+            "past the bound the hog scans after never-scanned pids"
+        );
+    }
+
     /// Adopted bug-1 twin (ported): an unproven generation never
     /// accrues; a later completion with a proven start-time examines
     /// normally with no surviving streak.

@@ -1435,7 +1435,7 @@ enum RefreshFlow {
 enum AcceptMode {
     Tick,
     Refresh {
-        watched: Option<RetainedInventoryTarget>,
+        watched: Option<Box<RetainedInventoryTarget>>,
     },
 }
 
@@ -2706,7 +2706,9 @@ impl SemanticCapture {
                         &job,
                         fence,
                         report,
-                        AcceptMode::Refresh { watched },
+                        AcceptMode::Refresh {
+                            watched: watched.map(Box::new),
+                        },
                     );
                 }
                 return RefreshFlow::Done;
@@ -4725,7 +4727,7 @@ impl SemanticCapture {
                         .insert(job.key(), ImageQueryRefusal::Custody);
                     return;
                 }
-                Some(watched)
+                Some(watched.map(|watched| *watched))
             }
             AcceptMode::Tick => None,
         };

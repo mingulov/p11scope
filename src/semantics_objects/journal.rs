@@ -3711,6 +3711,17 @@ fn attribute_cell(kind: u8, status: u8, value: u16) -> AttrObservation {
                     7 => Some(FieldValue::Curve(
                         p11scope_ebpf_common::object_policy::SafeCurve::Ed448,
                     )),
+                    // Relaxed-dialect fix1: additive curve codes; 1..7
+                    // stay frozen.
+                    8 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::Secp256k1,
+                    )),
+                    9 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::BrainpoolP256r1,
+                    )),
+                    10 => Some(FieldValue::Curve(
+                        p11scope_ebpf_common::object_policy::SafeCurve::BrainpoolP384r1,
+                    )),
                     _ => None,
                 },
                 Some(kind) => {
@@ -14544,7 +14555,8 @@ pub(crate) mod tests {
     /// R2 new-site: the wire→journal curve mapping is exact on all
     /// seven codes — the three secp codes plus the four
     /// Montgomery/Edwards codes. Swapping two codes must fail here,
-    /// not surface as a mislabeled curve downstream.
+    /// not surface as a mislabeled curve downstream. Fix1 adds the
+    /// three secp256k1/brainpool codes additively (1..7 frozen).
     #[test]
     fn object_journal_curve_codes_map_to_exact_curves() {
         use p11scope_ebpf_common::object_policy::SafeCurve;
@@ -14556,6 +14568,9 @@ pub(crate) mod tests {
             (5u16, SafeCurve::X448, "x448"),
             (6u16, SafeCurve::Ed25519, "ed25519"),
             (7u16, SafeCurve::Ed448, "ed448"),
+            (8u16, SafeCurve::Secp256k1, "secp256k1"),
+            (9u16, SafeCurve::BrainpoolP256r1, "brainpoolp256r1"),
+            (10u16, SafeCurve::BrainpoolP384r1, "brainpoolp384r1"),
         ] {
             assert_eq!(
                 attribute_cell(6, 1, code),
@@ -14567,11 +14582,13 @@ pub(crate) mod tests {
                 "wire curve code {code} decodes to {name}"
             );
         }
-        assert_eq!(
-            attribute_cell(6, 1, 8).status(),
-            QueryStatus::Unsupported,
-            "an out-of-range curve code retains nothing"
-        );
+        for code in [0u16, 11, u16::MAX] {
+            assert_eq!(
+                attribute_cell(6, 1, code).status(),
+                QueryStatus::Unsupported,
+                "an out-of-range curve code {code} retains nothing"
+            );
+        }
     }
 
     /// Controller KEYMETA-T1 rulings 2026-11-16, ruling 2: the

@@ -384,7 +384,23 @@ pub(crate) fn established_type_kind(key_type: u16) -> Option<EstablishedKind> {
         }),
         0x04 => Some(EstablishedKind::X9_42Dh),
         0x10 => Some(EstablishedKind::GenericSecret { bytes: 0 }),
+        0x13 => Some(EstablishedKind::Des),
+        0x14 => Some(EstablishedKind::Des2),
+        0x15 => Some(EstablishedKind::Des3),
         0x1f => Some(EstablishedKind::Aes { bytes: 0 }),
+        0x25 => Some(EstablishedKind::Camellia),
+        0x26 => Some(EstablishedKind::Aria),
+        // Relaxed-dialect fix1: HMAC key types share the generic-secret
+        // kind (their material is a sized byte string, labeled like one;
+        // HMAC mechanisms infer the generic-secret family).
+        0x27..=0x2e | 0x36..=0x3d | 0x43..=0x45 => {
+            Some(EstablishedKind::GenericSecret { bytes: 0 })
+        }
+        0x2f => Some(EstablishedKind::Seed),
+        0x30..=0x32 => Some(EstablishedKind::Gost),
+        0x33 => Some(EstablishedKind::Chacha20),
+        0x34 => Some(EstablishedKind::Poly1305),
+        0x35 => Some(EstablishedKind::AesXts),
         0x40 => Some(EstablishedKind::Edwards {
             curve: SafeCurve::Ed25519,
         }),
@@ -474,7 +490,7 @@ pub(crate) fn families_compatible(
         // The Firefox TLS 1.3 case: ECDH results established as
         // generic secret, then HKDF.
         (F::Hkdf, E::Hkdf { .. } | E::GenericSecret { .. }) => true,
-        // Inert while both stay unlisted in the KeyType set.
+        // Fix1: live now that DES/DES3 key types establish.
         (F::Des3, E::Des3 | E::Des2) => true,
         (F::MlKem, E::MlKem { .. }) => true,
         (F::MlDsa, E::MlDsa { .. }) => true,
@@ -534,6 +550,11 @@ pub(crate) fn size_compatible(
                 SafeCurve::Secp256r1 => 32,
                 SafeCurve::Secp384r1 => 48,
                 SafeCurve::Secp521r1 => 66,
+                // Fix1: secp256k1 and brainpool P-256r1 share the
+                // 32-octet field (64-octet raw signatures);
+                // brainpool P-384r1 shares the 48-octet field.
+                SafeCurve::Secp256k1 | SafeCurve::BrainpoolP256r1 => 32,
+                SafeCurve::BrainpoolP384r1 => 48,
                 // Montgomery/Edwards curves never reach here: the
                 // family gate above already refused them for ECDSA
                 // mechanisms (only ECDH1 qualifies, and derive calls

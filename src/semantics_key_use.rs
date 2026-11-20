@@ -2004,6 +2004,10 @@ pub(crate) fn metadata_label(label: crate::semantics_objects::KeyLabel) -> &'sta
             SafeCurve::X448 => "x448",
             SafeCurve::Ed25519 => "ed25519",
             SafeCurve::Ed448 => "ed448",
+            // Relaxed-dialect fix1 (v9): secp256k1 + brainpool.
+            SafeCurve::Secp256k1 => "ec_secp256k1",
+            SafeCurve::BrainpoolP256r1 => "ec_brainpoolp256r1",
+            SafeCurve::BrainpoolP384r1 => "ec_brainpoolp384r1",
         },
         // R2 new-site: HKDF and generic-secret sizes in bits.
         KeyLabel::Hkdf { value_len } => match value_len {

@@ -554,8 +554,10 @@ impl ViewRecord {
         if let Some(class) = scalar(SafeAttributeKind::Class) {
             let compatible = match key_type {
                 // R2 new-site: HKDF keys are secret-key objects, like
-                // AES and generic_secret.
-                0x1f | 0x10 | 0x42 => class == 4,
+                // AES and generic_secret. Fix1: HMAC keys too (their
+                // material is a sized byte string, labeled like a
+                // generic secret below).
+                0x1f | 0x10 | 0x42 | 0x27..=0x2e | 0x36..=0x3d | 0x43..=0x45 => class == 4,
                 0x00 | 0x03 => class == 2 || class == 3,
                 // Controller KEYMETA-T1 rulings 2026-11-16, ruling 1:
                 // Edwards/Montgomery keys are public/private-key
@@ -580,6 +582,13 @@ impl ViewRecord {
                 scalar(SafeAttributeKind::ValueLen).map(|value_len| KeyLabel::Hkdf { value_len })
             }
             0x10 => scalar(SafeAttributeKind::ValueLen)
+                .map(|value_len| KeyLabel::GenericSecret { value_len }),
+            // Relaxed-dialect fix1: HMAC key types (MD5/SHA-1/RIPEMD/
+            // SHA-2/SHA-3/BLAKE2/SHA-512 HMAC per OASIS 3.2) join the
+            // established byte size exactly like a generic secret —
+            // their material is a sized byte string, and the key_type
+            // field keeps the exact HMAC numeric beside the label.
+            0x27..=0x2e | 0x36..=0x3d | 0x43..=0x45 => scalar(SafeAttributeKind::ValueLen)
                 .map(|value_len| KeyLabel::GenericSecret { value_len }),
             0x00 => scalar(SafeAttributeKind::ModulusBits)
                 .map(|modulus_bits| KeyLabel::Rsa { modulus_bits }),
@@ -3050,9 +3059,14 @@ impl ModelState {
             FieldState::Value(FieldValue::Scalar(value)) => Some(value),
             _ => None,
         };
-        if scalar(SafeAttributeKind::Class) != Some(3)
-            || scalar(SafeAttributeKind::KeyType) != Some(0)
-        {
+        if scalar(SafeAttributeKind::Class) != Some(3) {
+            return None;
+        }
+        let key_type = scalar(SafeAttributeKind::KeyType)?;
+        // RSA uses the mate's size; EC-family keys use the mate's
+        // curve. Anything else stays unlabeled.
+        let want_ec = matches!(key_type, 0x03 | 0x40 | 0x41);
+        if key_type != 0 && !want_ec {
             return None;
         }
         let mate = view.pair_mate?;
@@ -3067,7 +3081,27 @@ impl ModelState {
             return None;
         }
         match mate_view.label() {
-            Some(KeyLabel::Rsa { modulus_bits }) => Some(KeyLabel::Rsa { modulus_bits }),
+            Some(KeyLabel::Rsa { modulus_bits }) if key_type == 0 => {
+                Some(KeyLabel::Rsa { modulus_bits })
+            }
+            // Relaxed-dialect fix1 (R9): an EC-family private half
+            // inherits the pair-mate public half's established curve
+            // — `CKA_EC_PARAMS` lives in the public template, so the
+            // private half never carries it. Same no-new-read argument
+            // as RSA. Edwards/Montgomery mismatch rules still apply:
+            // the inherited curve must suit the private half's own
+            // key type, never just the mate's.
+            Some(KeyLabel::Ec { curve }) if want_ec => {
+                // Same per-type curve rule as `label()`: 0x03 takes
+                // any established curve, Edwards/Montgomery take
+                // their own.
+                let matched = match key_type {
+                    0x40 => matches!(curve, SafeCurve::Ed25519 | SafeCurve::Ed448),
+                    0x41 => matches!(curve, SafeCurve::X25519 | SafeCurve::X448),
+                    _ => true,
+                };
+                matched.then_some(KeyLabel::Ec { curve })
+            }
             _ => None,
         }
     }

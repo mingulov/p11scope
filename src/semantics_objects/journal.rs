@@ -1568,11 +1568,31 @@ pub(crate) struct ScopedRecovery {
     /// Exact wipe membership, built by classification.
     wiped_open: BTreeSet<JournalNativeKey>,
     wiped_refused: BTreeSet<CallIdentity>,
-    /// Keys whose abandonment refusal already applied (preserve runs
-    /// once per key across slices).
+    /// Preservation decisions, collected against one fixed liveness
+    /// basis across all decide slices and applied in a separate
+    /// bounded pass: keys to refuse, images to taint. Deciding
+    /// everything before applying anything keeps a later decision
+    /// from observing an earlier doom's refusal.
+    preserve_doomed: BTreeSet<JournalDomainKey>,
+    preserve_taint: BTreeSet<(u64, u64)>,
+    /// Fixed liveness basis per decided image: the live keys and the
+    /// key-table membership snapshotted when preservation first
+    /// touched the image, so every slice decides against the same
+    /// original basis.
+    preserve_live: BTreeMap<(u64, u64), PreservedLiveness>,
+    /// Keys whose abandonment refusal already applied (the doom pass
+    /// runs once per key across slices).
     doomed_done: BTreeSet<JournalDomainKey>,
     /// Current phase and its resume cursor.
     phase: ScopedRecoveryPhase,
+}
+
+/// One image's fixed preservation liveness: the live keys at first
+/// touch plus whether the key table names the image at all.
+#[derive(Clone)]
+struct PreservedLiveness {
+    live: Vec<JournalDomainKey>,
+    keyed: bool,
 }
 
 /// Outcome of one bounded barrier scan.
@@ -1603,8 +1623,20 @@ enum ScopedRecoveryPhase {
     ClassifyOpen { after: Option<JournalNativeKey> },
     /// Classify refused begins from the index.
     ClassifyRefused { index: usize },
-    /// Preserve abandonments for wiped opens past the cursor.
+    /// Decide preservation for wiped opens past the cursor
+    /// (collect only; nothing applies yet).
     Preserve { after: Option<JournalNativeKey> },
+    /// Mark decided image taints past the cursor (irreversible
+    /// first, so no later seal can use a doomed image).
+    PreserveTaint { after: Option<(u64, u64)> },
+    /// Refuse decided abandonment keys past the cursor (tainted
+    /// images keep precedence: their keys are skipped).
+    PreserveDoom { after: Option<JournalDomainKey> },
+    /// Drain tainted images' open entries past the cursor (absence
+    /// plus census plus refund per entry).
+    TaintDrainOpen { after: Option<JournalNativeKey> },
+    /// Drain tainted images' refused begins (read/write cursors).
+    TaintDrainRefused { read: usize, write: usize },
     /// Fence stuck domains from the index.
     Fence { index: usize },
     /// Release and drop wiped opens past the cursor.
@@ -2044,6 +2076,10 @@ impl JournalAdapter {
             ScopedRecoveryPhase::ClassifyOpen { .. } => "classify-open",
             ScopedRecoveryPhase::ClassifyRefused { .. } => "classify-refused",
             ScopedRecoveryPhase::Preserve { .. } => "preserve",
+            ScopedRecoveryPhase::PreserveTaint { .. } => "preserve-taint",
+            ScopedRecoveryPhase::PreserveDoom { .. } => "preserve-doom",
+            ScopedRecoveryPhase::TaintDrainOpen { .. } => "taint-drain-open",
+            ScopedRecoveryPhase::TaintDrainRefused { .. } => "taint-drain-refused",
             ScopedRecoveryPhase::Fence { .. } => "fence",
             ScopedRecoveryPhase::WipeOpen { .. } => "wipe-open",
             ScopedRecoveryPhase::WipeRefused { .. } => "wipe-refused",
@@ -3035,7 +3071,13 @@ impl JournalAdapter {
         }
     }
 
-    fn taint_image(&mut self, image: (u64, u64), cause: TaintCause) {
+    /// Record one image taint irreversibly (provenance plus the
+    /// mark), without dropping anything: returns whether the mark
+    /// is new. A later seal already refuses the image once the mark
+    /// lands; entry removal follows through a bounded drain. The
+    /// synchronous [`Self::taint_image`] below marks then drains
+    /// inline for its existing callers.
+    fn taint_image_mark(&mut self, image: (u64, u64), cause: TaintCause) -> bool {
         self.contradictions.note(cause);
         if cause == TaintCause::OtherCallerRefused {
             // A shed-taint is lift-eligible only when it lands on a
@@ -3043,7 +3085,7 @@ impl JournalAdapter {
             // not gain eligibility. Past the provenance cap the taint
             // lands but never lifts (fail closed).
             if self.is_tainted(image) {
-                return;
+                return false;
             }
             if self.shed_only_taints.len() < self.limits.image_sightings {
                 self.shed_only_taints.insert(image);
@@ -3053,10 +3095,17 @@ impl JournalAdapter {
             // re-taint of a shed-tainted image still inside its grace.
             self.shed_only_taints.remove(&image);
             if self.is_tainted(image) {
-                return;
+                return false;
             }
         }
         self.note_image_taint(image);
+        true
+    }
+
+    fn taint_image(&mut self, image: (u64, u64), cause: TaintCause) {
+        if !self.taint_image_mark(image, cause) {
+            return;
+        }
         // Opens dropped by this taint leave their terminals
         // expected-absent: record their keys so the unmatched
         // terminals do not promote a shed-taint to permanent. The
@@ -8007,6 +8056,9 @@ impl JournalAdapter {
             effects: ObjectEffects::default(),
             wiped_open: BTreeSet::new(),
             wiped_refused: BTreeSet::new(),
+            preserve_doomed: BTreeSet::new(),
+            preserve_taint: BTreeSet::new(),
+            preserve_live: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
             phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
         }
@@ -8043,7 +8095,27 @@ impl JournalAdapter {
                     }
                 }
                 ScopedRecoveryPhase::Preserve { after } => {
-                    if !self.preserve_slice(model, recovery, after, &mut left, budget) {
+                    if !self.preserve_slice(recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::PreserveTaint { after } => {
+                    if !self.preserve_taint_slice(recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::PreserveDoom { after } => {
+                    if !self.preserve_doom_slice(model, recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::TaintDrainOpen { after } => {
+                    if !self.taint_drain_open_slice(recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::TaintDrainRefused { read, write } => {
+                    if !self.taint_drain_refused_slice(recovery, read, write, &mut left, budget) {
                         return false;
                     }
                 }
@@ -8169,15 +8241,15 @@ impl JournalAdapter {
         }
     }
 
-    /// Preserve one slice of wiped opens past the cursor: every
-    /// erased unbounded abandonment refuses its incarnation or taints
-    /// its image before the wipe. Entries an earlier taint already
-    /// dropped are covered by that taint and skipped. Each doomed key
-    /// refuses once across slices. Returns true when the set
-    /// exhausts.
+    /// Decide preservation for one slice of wiped opens past the
+    /// cursor: every erased unbounded abandonment names its doomed
+    /// incarnation or its tainted image. Decisions collect only;
+    /// nothing applies until the separate bounded pass, and every
+    /// slice decides against the same fixed per-image liveness
+    /// basis, so a later abandonment never observes an earlier
+    /// doom's refusal. Returns true when the set exhausts.
     fn preserve_slice(
-        &mut self,
-        model: &mut ObjectSemantics,
+        &self,
         recovery: &mut ScopedRecovery,
         after: Option<JournalNativeKey>,
         left: &mut usize,
@@ -8207,8 +8279,6 @@ impl JournalAdapter {
         *left -= examined;
         *budget = budget.saturating_sub(examined);
         for key in keys {
-            // An earlier taint in this pass may already have dropped
-            // (and released) this entry with its image: covered.
             let Some(entry) = self.open.get(&key) else {
                 continue;
             };
@@ -8221,17 +8291,17 @@ impl JournalAdapter {
             }
             let image = entry.image;
             let shape = shape_of_entry(entry);
-            let live = self.live_keys_for_image(image);
+            let basis = self.preserve_basis_for_image(recovery, image);
             // Mirror the batch preservation decision per entry: a
             // sole live key is doomed, a keyless image is tainted,
             // and a shared image dooms its live claimants (or taints
             // when no claimant names the shape).
-            match live.as_slice() {
+            match basis.live.as_slice() {
                 [sole] => {
-                    self.doom_abandoned_key(model, recovery, *sole);
+                    recovery.preserve_doomed.insert(*sole);
                 }
-                [] if !self.image_keys.contains_key(&image) => {
-                    self.taint_image(image, TaintCause::UnclaimedInvalidation);
+                [] if !basis.keyed => {
+                    recovery.preserve_taint.insert(image);
                 }
                 [] => {}
                 _ => {
@@ -8240,24 +8310,22 @@ impl JournalAdapter {
                         .map(|m| {
                             m.iter()
                                 .filter(|(key, ordinals)| {
-                                    !ordinals.is_empty() && live.contains(key)
+                                    !ordinals.is_empty() && basis.live.contains(key)
                                 })
                                 .map(|(key, _)| *key)
                                 .collect()
                         })
                         .unwrap_or_default();
                     if claimants.is_empty() {
-                        self.taint_image(image, TaintCause::UnclaimedInvalidation);
+                        recovery.preserve_taint.insert(image);
                     } else {
-                        for claimant in claimants {
-                            self.doom_abandoned_key(model, recovery, claimant);
-                        }
+                        recovery.preserve_doomed.extend(claimants);
                     }
                 }
             }
         }
         if examined < allowance {
-            recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+            recovery.phase = ScopedRecoveryPhase::PreserveTaint { after: None };
             true
         } else {
             recovery.phase = ScopedRecoveryPhase::Preserve { after: last };
@@ -8265,9 +8333,223 @@ impl JournalAdapter {
         }
     }
 
-    /// Refuse one abandoned key once across preserve slices: its
-    /// model domain (if held) abandons, and the key refuses. Later
-    /// slices skip keys already doomed here.
+    /// One image's fixed preservation liveness: the snapshot taken
+    /// when preservation first touched the image, or a fresh
+    /// snapshot when this touch is the first.
+    fn preserve_basis_for_image(
+        &self,
+        recovery: &mut ScopedRecovery,
+        image: (u64, u64),
+    ) -> PreservedLiveness {
+        if let Some(basis) = recovery.preserve_live.get(&image) {
+            return basis.clone();
+        }
+        let basis = PreservedLiveness {
+            live: self.live_keys_for_image(image),
+            keyed: self.image_keys.contains_key(&image),
+        };
+        recovery.preserve_live.insert(image, basis.clone());
+        basis
+    }
+
+    /// Mark one slice of decided image taints past the cursor: the
+    /// irreversible mark lands before any further seal can run, so a
+    /// later seal already refuses the image while its entries still
+    /// await the bounded drain. Returns true when the set exhausts.
+    fn preserve_taint_slice(
+        &mut self,
+        recovery: &mut ScopedRecovery,
+        after: Option<(u64, u64)>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => recovery.preserve_taint.range((
+                std::ops::Bound::<(u64, u64)>::Unbounded,
+                std::ops::Bound::<(u64, u64)>::Unbounded,
+            )),
+            Some(last) => recovery
+                .preserve_taint
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut images: Vec<(u64, u64)> = Vec::new();
+        for image in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*image);
+            images.push(*image);
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for image in images {
+            self.taint_image_mark(image, TaintCause::UnclaimedInvalidation);
+        }
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::PreserveDoom { after: None };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::PreserveTaint { after: last };
+            false
+        }
+    }
+
+    /// Refuse one slice of decided abandonment keys past the cursor:
+    /// image taint takes precedence (keys on a tainted image are
+    /// skipped). Each doomed key refuses once across slices. Returns
+    /// true when the set exhausts.
+    fn preserve_doom_slice(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        after: Option<JournalDomainKey>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => recovery.preserve_doomed.range((
+                std::ops::Bound::<JournalDomainKey>::Unbounded,
+                std::ops::Bound::<JournalDomainKey>::Unbounded,
+            )),
+            Some(last) => recovery
+                .preserve_doomed
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut keys: Vec<JournalDomainKey> = Vec::new();
+        for key in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*key);
+            keys.push(*key);
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for key in keys {
+            self.doom_abandoned_key(model, recovery, key);
+        }
+        if examined < allowance {
+            if recovery.preserve_taint.is_empty() {
+                recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+            } else {
+                recovery.phase = ScopedRecoveryPhase::TaintDrainOpen { after: None };
+            }
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::PreserveDoom { after: last };
+            false
+        }
+    }
+
+    /// Drain one slice of open entries past the cursor for decided
+    /// tainted images: each affected entry records its absence,
+    /// leaves the census and refunds its custody exactly once. The
+    /// taint marks already landed, so no new entry for a drained
+    /// image can arrive mid-pass. Returns true when the map exhausts.
+    fn taint_drain_open_slice(
+        &mut self,
+        recovery: &mut ScopedRecovery,
+        after: Option<JournalNativeKey>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => self.open.range((
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+            )),
+            Some(last) => self
+                .open
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut dropped: Vec<(JournalNativeKey, (u64, u64), u32)> = Vec::new();
+        for (key, entry) in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*key);
+            if recovery.preserve_taint.contains(&entry.image) {
+                dropped.push((*key, entry.image, entry.function));
+            }
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for (key, image, function) in dropped {
+            self.note_derived_absence(image, key, function);
+            let removed = self.open.remove(&key).expect("drained open");
+            if removed.converted_ticket.is_none() {
+                self.retained_member_dec(
+                    identity_of_begin(&removed.begin),
+                    RetainedMember::Open(key),
+                );
+            }
+            self.ledger.release_h8open(removed.begin_ordinal);
+        }
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::TaintDrainRefused { read: 0, write: 0 };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::TaintDrainOpen { after: last };
+            false
+        }
+    }
+
+    /// Drain one slice of refused begins with read/write cursors,
+    /// dropping tainted images' members (census decremented) and
+    /// keeping the rest in place: returns true when the list
+    /// exhausts, truncating to the survivors.
+    fn taint_drain_refused_slice(
+        &mut self,
+        recovery: &mut ScopedRecovery,
+        read: usize,
+        write: usize,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let mut examined = 0usize;
+        let mut read = read;
+        let mut write = write;
+        while read < self.refused.len() && examined < allowance {
+            examined += 1;
+            let refused = self.refused[read];
+            if recovery.preserve_taint.contains(&refused.image) {
+                self.retained_refused_dec(&refused);
+            } else {
+                if write != read {
+                    self.refused[write] = refused;
+                }
+                write += 1;
+            }
+            read += 1;
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        if read >= self.refused.len() {
+            self.refused.truncate(write);
+            recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::TaintDrainRefused { read, write };
+            false
+        }
+    }
+
+    /// Refuse one decided abandoned key once across doom slices:
+    /// its model domain (if held) abandons, and the key refuses.
+    /// Later slices skip keys already doomed here.
     fn doom_abandoned_key(
         &mut self,
         model: &mut ObjectSemantics,
@@ -8446,9 +8728,8 @@ impl JournalAdapter {
         *budget = budget.saturating_sub(examined);
         if read >= self.refused.len() {
             self.refused.truncate(write);
-            // Drop emptied census members left by the removals above.
-            self.retained_counts
-                .retain(|_, members| !members.is_empty());
+            // The decrement above already removes emptied census
+            // members, so no whole-census sweep is needed here.
             recovery.phase = ScopedRecoveryPhase::Done;
             true
         } else {

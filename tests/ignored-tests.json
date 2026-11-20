@@ -1994,6 +1994,12 @@
     },
     {
       "file": "src/inventory/privileged_tests.rs",
+      "path": "inventory::privileged_tests::privileged_key_sizes_journal_seals_with_length_pair",
+      "reason": "privileged: live journal lane seals with key sizes on FULL, refuses without the length pair (serial)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
       "reason": "privileged: live linked fault fails coverage without latching, finish publishes (serial; omitted journal build asserts the refusal)",
       "cell": "privileged"

@@ -43,6 +43,9 @@
  *                    calls/s per endpoint (ring-rate cells)
  *   --pace-us N      (mech) pace iterations onto an absolute N-us
  *                    deadline grid; overruns re-anchor, never catch up
+ *   --rsa-sign       (mech) generate one RSA-2048 keypair per module at setup
+ *                    and CKM_SHA256_RSA_PKCS-sign once per iteration, so
+ *                    --key-sizes legs observe a classified size (gate-1 journal)
  *   --chain SPEC     (exec-chain) comma list of HOW:EXE steps, HOW = leader|thread
  *   --gen K          (internal) exec generation, set by the chain itself
  *   --ledger-singletons opt-in: flush each returned call as a singleton entry
@@ -169,9 +172,12 @@ enum {
     I_OpenSession = 12, I_CloseSession = 13, I_Login = 18, I_Logout = 19,
     I_DestroyObject = 22, I_EncryptInit = 29, I_Encrypt = 30, I_DigestInit = 37,
     I_Digest = 38, I_SignInit = 42, I_Sign = 43, I_VerifyInit = 48, I_Verify = 49, I_GenerateKey = 58,
+    I_GenerateKeyPair = 59,
     I_WaitForSlotEvent = 67,
 };
 #define CKM_SHA256 0x250UL
+#define CKM_SHA256_RSA_PKCS 0x40UL
+#define CKM_RSA_PKCS_KEY_PAIR_GEN 0x00UL
 #define CKM_SHA256_HMAC 0x251UL
 #define CKM_GENERIC_SECRET_KEY_GEN 0x350UL
 #define CKM_AES_KEY_GEN 0x1080UL
@@ -431,6 +437,53 @@ static CK_OBJECT_HANDLE keygen(int m, CK_SESSION_HANDLE s, unsigned long mech, u
     return h;
 }
 
+/* One RSA-2048 keypair for --rsa-sign: session objects, sign/verify only.
+ * Returns the private handle, stores the public one; dies on failure so a
+ * broken keygen fails the workload instead of silently dropping the signs. */
+static CK_OBJECT_HANDLE rsa_keypair(int m, CK_SESSION_HANDLE s, int phase, CK_OBJECT_HANDLE *pub) {
+    unsigned long pubclass = 2 /* CKO_PUBLIC_KEY */, privclass = 3 /* CKO_PRIVATE_KEY */;
+    unsigned long ktype = 0 /* CKK_RSA */, bits = 2048;
+    unsigned char no = 0, yes = 1, exp[] = {1, 0, 1};
+    CK_ATTRIBUTE pubt[] = {
+        {0x0 /* CKA_CLASS */, &pubclass, sizeof pubclass},
+        {0x100 /* CKA_KEY_TYPE */, &ktype, sizeof ktype},
+        {0x1 /* CKA_TOKEN */, &no, 1},
+        {0x10a /* CKA_VERIFY */, &yes, 1},
+        {0x121 /* CKA_MODULUS_BITS */, &bits, sizeof bits},
+        {0x122 /* CKA_PUBLIC_EXPONENT */, exp, sizeof exp},
+    };
+    CK_ATTRIBUTE privt[] = {
+        {0x0 /* CKA_CLASS */, &privclass, sizeof privclass},
+        {0x100 /* CKA_KEY_TYPE */, &ktype, sizeof ktype},
+        {0x1 /* CKA_TOKEN */, &no, 1},
+        {0x108 /* CKA_SIGN */, &yes, 1},
+    };
+    CK_MECHANISM mm = {CKM_RSA_PKCS_KEY_PAIR_GEN, 0, 0};
+    CK_OBJECT_HANDLE hpub = 0, hpriv = 0;
+    if (CALL(m, phase, I_GenerateKeyPair, CKM_RSA_PKCS_KEY_PAIR_GEN,
+             CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_ATTRIBUTE *, CK_ULONG, CK_ATTRIBUTE *,
+                       CK_ULONG, CK_OBJECT_HANDLE *, CK_OBJECT_HANDLE *),
+             s, &mm, pubt, 6, privt, 4, &hpub, &hpriv) ||
+        !hpub || !hpriv || hpub == hpriv)
+        die("C_GenerateKeyPair (RSA-2048)");
+    *pub = hpub;
+    return hpriv;
+}
+
+/* One CKM_SHA256_RSA_PKCS sign for --rsa-sign: 256-byte signature, the
+ * classified RSA-2048 size under --key-sizes. */
+static void rsa_sign_once(int m, CK_SESSION_HANDLE s, CK_OBJECT_HANDLE privkey, int phase) {
+    unsigned char in[32] = {1}, sig[512];
+    CK_ULONG siglen;
+    CK_MECHANISM mech = {CKM_SHA256_RSA_PKCS, 0, 0};
+    CALL(m, phase, I_SignInit, CKM_SHA256_RSA_PKCS,
+         CK_RV (*)(CK_SESSION_HANDLE, CK_MECHANISM *, CK_OBJECT_HANDLE), s, &mech, privkey);
+    siglen = sizeof sig;
+    CALL(m, phase, I_Sign, CKM_SHA256_RSA_PKCS,
+         CK_RV (*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG, unsigned char *, CK_ULONG *), s, in,
+         sizeof in, sig, &siglen);
+}
+
 /* One iteration: 10 table calls, mechanisms 0x250 0x1080 0x1087 0x350 0x251. */
 static void iteration(int m, CK_SESSION_HANDLE s, int phase) {
     unsigned char in[64] = {1}, out[128];
@@ -531,6 +584,7 @@ struct options {
     const char *mode, *gate, *gate2, *pre_init_gate, *chain;
     long iters, delay_ms, sleep_us, pace_us;
     int hold, gate_before_setup, late_from, single_call, h6_control, c8_warm_initial, hot_loop;
+    int rsa_sign;
     unsigned long h6_deadline, h6_leg_deadline;
 };
 static struct options opt = {.gate = "-", .pre_init_gate = "-", .iters = 4, .late_from = -1,
@@ -659,11 +713,14 @@ static void mech_generation(long iters, int gated) {
                              0x108 /* CKA_SIGN */, PH_SETUP, 0);
             if (!hot_aes || !hot_mac) die("hot-loop key setup failed");
         }
+        CK_OBJECT_HANDLE rsa_pub = 0, rsa_priv = 0;
+        if (opt.rsa_sign) rsa_priv = rsa_keypair(m, s[m], PH_SETUP, &rsa_pub);
         for (long i = 0; i < iters * (m + 1); i++) {
             if (opt.hot_loop)
                 hot_iteration(m, s[m], hot_aes, hot_mac, PH_MAIN);
             else
                 iteration(m, s[m], PH_MAIN);
+            if (opt.rsa_sign) rsa_sign_once(m, s[m], rsa_priv, PH_MAIN);
             if (opt.sleep_us > 0) usleep((useconds_t)opt.sleep_us);
             pace_next(&pace_deadline, opt.pace_us);
         }
@@ -672,6 +729,12 @@ static void mech_generation(long iters, int gated) {
                  CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s[m], hot_aes);
             CALL(m, PH_TEARDOWN, I_DestroyObject, NO_MECH,
                  CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s[m], hot_mac);
+        }
+        if (opt.rsa_sign) {
+            CALL(m, PH_TEARDOWN, I_DestroyObject, NO_MECH,
+                 CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s[m], rsa_priv);
+            CALL(m, PH_TEARDOWN, I_DestroyObject, NO_MECH,
+                 CK_RV (*)(CK_SESSION_HANDLE, CK_OBJECT_HANDLE), s[m], rsa_pub);
         }
     }
     flush_ledger();
@@ -903,6 +966,7 @@ int main(int argc, char **argv) {
         if (!strcmp(a, "--c8-warm-initial")) { opt.c8_warm_initial = 1; continue; }
         if (!strcmp(a, "--hold")) { opt.hold = 1; continue; }
         if (!strcmp(a, "--hot-loop")) { opt.hot_loop = 1; continue; }
+        if (!strcmp(a, "--rsa-sign")) { opt.rsa_sign = 1; continue; }
         if (!strcmp(a, "--gate-before-setup")) { opt.gate_before_setup = 1; continue; }
         if (!strcmp(a, "--late")) { opt.late_from = 0; continue; }
         if (!v) { fprintf(stderr, "missing value for %s\n", a); return 2; }

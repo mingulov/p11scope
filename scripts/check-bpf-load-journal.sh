@@ -388,7 +388,7 @@ LEDGER_LOG=$TMPDIR/ledger-$KERNEL.log
 # startups: a 6.18 leg admitted its caller only after a 45 s window
 # closed and collected nothing. The ledger is killed when the observer
 # exits whether or not its iterations finished.
-SOFTHSM2_CONF="$CONF" "$WORKLOAD" mech --cell jwork --module "$MODULE" --iters 80 --sleep-us 1000000 --hold >>"$LEDGER_LOG" 2>&1 &
+SOFTHSM2_CONF="$CONF" "$WORKLOAD" mech --cell jwork --module "$MODULE" --iters 80 --sleep-us 1000000 --rsa-sign --hold >>"$LEDGER_LOG" 2>&1 &
 LEDGER_PID=$!
 cleanup_ledger() {
     kill "$LEDGER_PID" 2>/dev/null || true
@@ -631,6 +631,22 @@ PY
         add_reason "semantic lane never sealed"
     elif ! grep -Eq 'semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, lost [0-9]+, bindings [1-9][0-9]*' "$J_TXT"; then
         add_reason "linked lane idle (no joined calls)"
+    fi
+    # Size-path proof under --key-sizes: the workload RSA-signs every
+    # iteration, so key rows must render and the -v per-row detail
+    # must name the classified size (proving lengths joined through
+    # the 648-byte decode into key rows), and no END record may
+    # decode as malformed (a decode regression would strand every
+    # sized call there).
+    if [ "$KEY_SIZES" = 1 ] && [ -f "$J_TXT" ]; then
+        if ! grep -Eq 'key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+' "$J_TXT"; then
+            add_reason "key rows never rendered under --key-sizes"
+        elif ! grep -q 'RSA 2048' "$J_TXT"; then
+            add_reason "no classified RSA-2048 size under --key-sizes"
+        fi
+        if ! grep -q 'audit_malformed=0 ' "$J_TXT"; then
+            add_reason "malformed journal records under --key-sizes"
+        fi
     fi
     OBSERVED="unknown"
     if [ -f "$J_TXT" ]; then

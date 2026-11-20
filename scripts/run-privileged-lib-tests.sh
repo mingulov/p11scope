@@ -536,6 +536,12 @@ inventory::privileged_tests::privileged_joint_init_latches_producer_linkage
 inventory::privileged_tests::privileged_key_operations_linked_lane_pumps_live_discovery
 inventory::privileged_tests::privileged_key_operations_live_discovery_fault_refuses_without_latching
 inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag
+# Sizes lane: on a FULL build the lane seals with key_sizes (the length
+# pair loads on this kernel); on a build without the length programs
+# the sizes request refuses loudly. One System-scope capture (about
+# half a minute); on builds that omit the journal the cell reports
+# inapplicable. Prints KEY_SIZES_JOURNAL lines.
+inventory::privileged_tests::privileged_key_sizes_journal_seals_with_length_pair
 inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching
 inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed
 # v0.5.0 headline end to end: inventory --system --manifest over a live

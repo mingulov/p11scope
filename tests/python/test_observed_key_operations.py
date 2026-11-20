@@ -830,6 +830,57 @@ class ObservedRsaTests(unittest.TestCase):
                              tuple(ORACLE.CURVE_LABELS)
                              + ("x25519", "x448", "ed25519", "ed448"))
 
+    def test_oracle_v9_tables_match_v9_schema(self):
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v9.schema.json",
+                  encoding="utf-8") as stream:
+            schema = json.load(stream)
+        defs = schema["$defs"]
+        with self.subTest("version const"):
+            self.assertEqual(schema["properties"]["version"]["const"], 9)
+            self.assertEqual(ORACLE.OBSERVATIONS_VERSION_V9, 9)
+        with self.subTest("METADATA_LABELS_V9"):
+            self.assertEqual(set(ORACLE.METADATA_LABELS_V9),
+                             set(defs["metadata_label"]["enum"]))
+            self.assertEqual(tuple(ORACLE.METADATA_LABELS_V9),
+                             tuple(ORACLE.METADATA_LABELS_V6)
+                             + tuple(ORACLE.RELAXED_METADATA_LABELS))
+            self.assertEqual(len(ORACLE.RELAXED_METADATA_LABELS), 3)
+        with self.subTest("OBJECT_LABELS_V9"):
+            label = defs["object_row"]["properties"]["label"]["enum"]
+            self.assertEqual(set(ORACLE.OBJECT_LABELS_V9),
+                             set(label) - {None})
+            self.assertEqual(tuple(ORACLE.OBJECT_LABELS_V9),
+                             tuple(ORACLE.OBJECT_LABELS_V6)
+                             + tuple(ORACLE.RELAXED_METADATA_LABELS))
+        with self.subTest("v9 scalar values"):
+            key_type = defs["metadata_field_key_type"]["properties"]["value"]["enum"]
+            self.assertEqual(
+                set(ORACLE.METADATA_FIELD_VALUES_V9["key_type"]),
+                set(key_type) - {None})
+            self.assertEqual(
+                tuple(ORACLE.METADATA_FIELD_VALUES_V9["key_type"]),
+                tuple([0, 1, 2, 3, 4, 5] + list(range(0x10, 0x4c))))
+            klass = defs["metadata_field_class"]["properties"]["value"]["enum"]
+            self.assertEqual(
+                set(ORACLE.METADATA_FIELD_VALUES_V9["class"]),
+                set(klass) - {None})
+            for field, lo, hi in (("value_len", 1, 4096),
+                                  ("modulus_bits", 256, 16384)):
+                value = defs[f"metadata_field_{field}"]["properties"]["value"]
+                self.assertEqual(value["type"], ["integer", "null"], field)
+                self.assertEqual((value["minimum"], value["maximum"]),
+                                 (lo, hi), field)
+                span = ORACLE.METADATA_FIELD_VALUES_V9[field]
+                self.assertEqual((span.start, span.stop - 1), (lo, hi), field)
+        with self.subTest("CURVE_LABELS_V9"):
+            curve = defs["metadata_field_curve"]["properties"]["value"]["enum"]
+            self.assertEqual(set(ORACLE.CURVE_LABELS_V9), set(curve) - {None})
+            self.assertEqual(tuple(ORACLE.CURVE_LABELS_V9),
+                             tuple(ORACLE.CURVE_LABELS_V6)
+                             + ("secp256k1", "brainpoolp256r1",
+                                "brainpoolp384r1"))
+
     def test_h9_v5_section_checks_structurally(self):
         # v5 shape with the cell's RSA key rows: the PQC content rides
         # the object views (key_type 74, parameter_set 2, ml_dsa_65
@@ -908,7 +959,9 @@ class ObservedRsaTests(unittest.TestCase):
                                         "unexpected object metadata label"):
                 ORACLE.check_section(mutated)
         with self.subTest("unknown versions refused"):
-            for version in (0, 7, 99):
+            # 9 joins the shape-refused (v9 rows carry inferred keys
+            # like v7; this v5-shaped section lacks them).
+            for version in (0, 7, 9, 99):
                 mutated = copy.deepcopy(section)
                 mutated["version"] = version
                 with self.assertRaises(ORACLE.OracleRefusal):

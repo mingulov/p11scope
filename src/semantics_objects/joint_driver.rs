@@ -410,7 +410,14 @@ impl JointCaptureOwner {
             let resuming =
                 matches!(self.adapter.scoped_recovery, Some(ref recovery) if recovery.stream);
             if !resuming {
-                self.adapter.scoped_recovery = None;
+                // A model-domain retirement the aborted recovery left
+                // mid-rows still completes first (its refusal already
+                // published); everything else is subsumed as before.
+                let standing = self
+                    .adapter
+                    .scoped_recovery
+                    .take()
+                    .and_then(|aborted| aborted.model_retire);
                 let bytes =
                     super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
                         .ok_or(RawQuantumRefusal::Capacity)?;
@@ -423,7 +430,8 @@ impl JointCaptureOwner {
                     .map_err(RawQuantumRefusal::Resource)?;
                 self.adapter.drop_scoped_break();
                 let upper = self.adapter.consumed_through;
-                let recovery = self.adapter.begin_stream_recovery(upper, bytes, lease);
+                let mut recovery = self.adapter.begin_stream_recovery(upper, bytes, lease);
+                recovery.model_retire = standing;
                 self.adapter.scoped_recovery = Some(recovery);
             }
         }

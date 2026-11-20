@@ -20,7 +20,7 @@ use super::{
     FindResult, HandleInput, KeyLabel, KnownScope, Lifetime, LostOutcome, METADATA_FIELDS,
     MechanismEvidence, MetadataView, ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap,
     ObjectHandle, ObjectId, ObjectLimits, ObjectProjection, ObjectView, OriginFact, OutputEvidence,
-    QueryStatus, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
+    QueryStatus, RefCut, ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin,
     SessionState, SessionView, SlotScope, StateEstimate, StateUsage, ViewOrigin, field_index,
 };
 use crate::semantics::{KNOWN_CANCEL_FLAGS, cancel_operation_mask, direct_cancel_flag};
@@ -254,6 +254,68 @@ fn call_kind(function: u32) -> Option<CallKind> {
         | lifecycle::SESSION_CANCEL
         | lifecycle::CRYPTOKI_INITIALIZE => Some(CallKind::Lifecycle(slot.lifecycle)),
         _ => None,
+    }
+}
+
+/// One resumable retirement of a held domain: the per-row cursor behind
+/// both the atomic abandonment/void disposals and the sliced recovery
+/// passes that charge one leaf unit per row ([`ModelState::retire_domain_step`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DomainRetirement {
+    domain: ObjectDomain,
+    kind: RetireKind,
+    stage: RetireStage,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RetireKind {
+    /// Unbounded-abandonment disposal (`abandon_domain`): retire, fence
+    /// and release every call, void proof under `Loss`.
+    Abandon,
+    /// A voided interval (`outcome_lost(Voided)`): retire continuity,
+    /// void proof under `OutcomeLost`, raise the fence to the bound.
+    Void(RefCut),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetireStage {
+    Start,
+    Views(Option<(SessionIncarnation, ObjectHandle)>),
+    Sessions(Option<SessionHandle>),
+    Bindings,
+    FenceCalls(Option<CallKey>),
+    RemoveCalls(Option<CallKey>),
+    Finish,
+    Done,
+}
+
+impl DomainRetirement {
+    pub(crate) fn abandon(domain: ObjectDomain) -> Self {
+        Self {
+            domain,
+            kind: RetireKind::Abandon,
+            stage: RetireStage::Start,
+        }
+    }
+
+    pub(crate) fn void(domain: ObjectDomain, upper: RefCut) -> Self {
+        Self {
+            domain,
+            kind: RetireKind::Void(upper),
+            stage: RetireStage::Start,
+        }
+    }
+
+    fn reason(&self) -> ObjectGap {
+        match self.kind {
+            RetireKind::Abandon => ObjectGap::Loss,
+            RetireKind::Void(_) => ObjectGap::OutcomeLost,
+        }
+    }
+
+    /// Whether the retirement completed.
+    pub(crate) fn done(&self) -> bool {
+        self.stage == RetireStage::Done
     }
 }
 
@@ -826,6 +888,9 @@ pub(super) struct ModelState {
     recently_pruned: VecDeque<ObjectDomain>,
     recently_pruned_set: BTreeSet<ObjectDomain>,
     gaps: BTreeMap<ObjectGap, u64>,
+    /// Test-only: leaf units charged by the retirement cursor.
+    #[cfg(test)]
+    test_retire_units: usize,
 }
 
 fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
@@ -944,6 +1009,75 @@ impl ModelState {
             recently_pruned: VecDeque::new(),
             recently_pruned_set: BTreeSet::new(),
             gaps: BTreeMap::new(),
+            #[cfg(test)]
+            test_retire_units: 0,
+        }
+    }
+
+    /// Test-only: leaf units the retirement cursor charged so far.
+    #[cfg(test)]
+    pub(super) fn test_retire_units(&self) -> usize {
+        self.test_retire_units
+    }
+
+    /// Test-only: give one held (registering if absent) domain `rows`
+    /// live sessions, each with one live view, plus `rows` pending call
+    /// tickets, so a retirement has many model rows under one domain.
+    #[cfg(test)]
+    pub(super) fn populate_domain_rows_for_test(&mut self, domain: ObjectDomain, rows: usize) {
+        if !self.domains.contains_key(&domain) {
+            self.register_domain(domain).expect("domain registers");
+        }
+        self.domains.get_mut(&domain).expect("domain").bootstrap = Some(0);
+        let base = self.next_token + 1_000;
+        for index in 0..rows as u64 {
+            let session = self
+                .alloc_session(
+                    domain,
+                    SessionHandle::new(10_000 + index).expect("session handle"),
+                    SessionOrigin::Opened,
+                    SlotScope::reference_known(0, 0),
+                )
+                .expect("session opens");
+            self.alloc_view(
+                domain,
+                session,
+                ObjectHandle::new(20_000 + index).expect("object handle"),
+                ViewOrigin::FirstObserved,
+                Birth::Unknown,
+                [FieldState::Unknown; METADATA_FIELDS],
+                Lifetime::Live,
+            )
+            .expect("view binds");
+            let token = CallToken(base + index);
+            let key = CallKey::reference(base + index);
+            let begin = 30_000 + index;
+            self.pending.insert(
+                token,
+                PendingCall {
+                    domain,
+                    key,
+                    begin,
+                    entry_ns: 100,
+                    function: crate::kinds::function_id("C_SignInit").expect("catalog"),
+                    kind: CallKind::Object(ObjectAction::Access),
+                    session: HandleInput::Absent,
+                    inputs: [HandleInput::Absent, HandleInput::Absent],
+                    requested: [None, None],
+                    derive_protocol: DeriveResultProtocol::Unavailable,
+                    entry_mechanism: MechClass::Value,
+                    entry_output: OutputEvidence::NotCaptured,
+                    scope: SlotScope::Unknown,
+                    completion: None,
+                    fenced: false,
+                    begin_applied: false,
+                    end_applied: false,
+                    snapshot: EMPTY_SNAPSHOT,
+                },
+            );
+            let state = self.domains.get_mut(&domain).expect("domain");
+            state.keys.insert(key, token);
+            state.cuts.insert(begin);
         }
     }
 
@@ -4407,17 +4541,181 @@ impl ModelState {
         ledger: &mut super::journal::StagingLedger,
     ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
-        self.gap(ObjectGap::Loss);
-        if let Err(unheld) = self.held(domain) {
-            self.gap_effect(&mut effects, unheld);
-            return effects;
-        }
-        self.clear_domain(domain, ObjectGap::Loss, &mut effects);
-        for token in self.domain_calls(domain) {
-            self.remove_call(token, ledger);
-        }
-        self.void_bootstrap(domain, ObjectGap::Loss, &mut effects, ledger);
+        let mut retirement = DomainRetirement::abandon(domain);
+        let mut units = usize::MAX;
+        let done = self.retire_domain_step(&mut retirement, ledger, &mut effects, &mut units);
+        debug_assert!(done, "an unbounded retirement completes");
         effects
+    }
+
+    /// Advance one resumable domain retirement ([`DomainRetirement`]) by
+    /// at most `*units` leaf units, debiting each unit before its row is
+    /// read: the start (held check plus the published refusal), one per
+    /// examined binding, live session or call ticket, and the closing
+    /// bookkeeping. Returns true when the retirement completed. The
+    /// refusal publishes on the first unit (bootstrap and initialization
+    /// cleared), so no call in the domain qualifies while later rows
+    /// retire across credits; the row order and the effects are exactly
+    /// the atomic order: views, sessions, leftover bindings, then (for an
+    /// abandonment) call fences and call storage, then the closing
+    /// fence/generation bookkeeping. The atomic [`Self::abandon_domain`]
+    /// and the voided [`Self::outcome_lost`] arm run this same cursor
+    /// with an unlimited budget, so there is one implementation.
+    pub(super) fn retire_domain_step(
+        &mut self,
+        retirement: &mut DomainRetirement,
+        ledger: &mut super::journal::StagingLedger,
+        effects: &mut ObjectEffects,
+        units: &mut usize,
+    ) -> bool {
+        let domain = retirement.domain;
+        let reason = retirement.reason();
+        loop {
+            if retirement.stage == RetireStage::Done {
+                return true;
+            }
+            if *units == 0 {
+                return false;
+            }
+            *units -= 1;
+            #[cfg(test)]
+            {
+                self.test_retire_units += 1;
+            }
+            match retirement.stage {
+                RetireStage::Start => {
+                    if matches!(retirement.kind, RetireKind::Abandon) {
+                        self.gap(ObjectGap::Loss);
+                    }
+                    if let Err(unheld) = self.held(domain) {
+                        self.gap_effect(effects, unheld);
+                        retirement.stage = RetireStage::Done;
+                        continue;
+                    }
+                    let state = self.domains.get_mut(&domain).expect("held domain");
+                    state.bootstrap = None;
+                    state.initialized = false;
+                    retirement.stage = RetireStage::Views(None);
+                }
+                RetireStage::Views(after) => {
+                    let next = {
+                        let bindings = &self.domains[&domain].bindings;
+                        match after {
+                            None => bindings.iter().next(),
+                            Some(last) => bindings
+                                .range((
+                                    std::ops::Bound::Excluded(last),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .next(),
+                        }
+                        .map(|(key, binding)| (*key, *binding))
+                    };
+                    match next {
+                        None => retirement.stage = RetireStage::Sessions(None),
+                        Some((key, binding)) => {
+                            retirement.stage = RetireStage::Views(Some(key));
+                            if let Binding::View(id) = binding {
+                                self.end_view(id, Lifetime::Retired(reason), effects);
+                            }
+                        }
+                    }
+                }
+                RetireStage::Sessions(after) => {
+                    let next = {
+                        let live = &self.domains[&domain].live_sessions;
+                        match after {
+                            None => live.iter().next(),
+                            Some(last) => live
+                                .range((
+                                    std::ops::Bound::Excluded(last),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .next(),
+                        }
+                        .map(|(handle, s)| (*handle, *s))
+                    };
+                    match next {
+                        None => retirement.stage = RetireStage::Bindings,
+                        Some((handle, s)) => {
+                            retirement.stage = RetireStage::Sessions(Some(handle));
+                            self.end_session(s, SessionEnd::Uncertain(reason), effects);
+                        }
+                    }
+                }
+                RetireStage::Bindings => {
+                    let next = self.domains[&domain].bindings.keys().next().copied();
+                    match next {
+                        // Removal always succeeds, so the first key is
+                        // always a fresh row.
+                        Some((s, h)) => self.set_binding(domain, s, h, None),
+                        None => {
+                            retirement.stage = match retirement.kind {
+                                RetireKind::Abandon => RetireStage::FenceCalls(None),
+                                RetireKind::Void(_) => RetireStage::Finish,
+                            };
+                        }
+                    }
+                }
+                RetireStage::FenceCalls(after) => {
+                    let next = {
+                        let keys = &self.domains[&domain].keys;
+                        match after {
+                            None => keys.iter().next(),
+                            Some(last) => keys
+                                .range((
+                                    std::ops::Bound::Excluded(last),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .next(),
+                        }
+                        .map(|(key, token)| (*key, *token))
+                    };
+                    match next {
+                        None => retirement.stage = RetireStage::RemoveCalls(None),
+                        Some((key, token)) => {
+                            retirement.stage = RetireStage::FenceCalls(Some(key));
+                            self.fence(token);
+                        }
+                    }
+                }
+                RetireStage::RemoveCalls(after) => {
+                    let next = {
+                        let keys = &self.domains[&domain].keys;
+                        match after {
+                            None => keys.iter().next(),
+                            Some(last) => keys
+                                .range((
+                                    std::ops::Bound::Excluded(last),
+                                    std::ops::Bound::Unbounded,
+                                ))
+                                .next(),
+                        }
+                        .map(|(key, token)| (*key, *token))
+                    };
+                    match next {
+                        None => retirement.stage = RetireStage::Finish,
+                        Some((key, token)) => {
+                            retirement.stage = RetireStage::RemoveCalls(Some(key));
+                            self.remove_call(token, ledger);
+                        }
+                    }
+                }
+                RetireStage::Finish => {
+                    // Every view, session and binding already retired
+                    // above, so this is the closing bookkeeping only.
+                    self.void_bootstrap(domain, reason, effects, ledger);
+                    if let RetireKind::Void(upper) = retirement.kind {
+                        self.gap(ObjectGap::OutcomeLost);
+                        if let Some(state) = self.domains.get_mut(&domain) {
+                            state.fence_floor = max_opt(state.fence_floor, Some(upper.0));
+                        }
+                    }
+                    retirement.stage = RetireStage::Done;
+                }
+                RetireStage::Done => unreachable!("checked above"),
+            }
+        }
     }
 
     /// Per-call disposal for one abandoned effect-free call
@@ -4512,14 +4810,15 @@ impl ModelState {
                 (domain, upper.0)
             }
             LostOutcome::Voided(domain, upper) => {
-                if let Err(unheld) = self.held(domain) {
-                    self.gap_effect(&mut effects, unheld);
-                    return effects;
-                }
                 // The void proves the interval lost, not over: in-flight
-                // refusals stay until a covering bound arrives.
-                self.void_bootstrap(domain, ObjectGap::OutcomeLost, &mut effects, ledger);
-                (domain, upper.0)
+                // refusals stay until a covering bound arrives. One
+                // implementation with the resumable retirement cursor.
+                let mut retirement = DomainRetirement::void(domain, upper);
+                let mut units = usize::MAX;
+                let done =
+                    self.retire_domain_step(&mut retirement, ledger, &mut effects, &mut units);
+                debug_assert!(done, "an unbounded retirement completes");
+                return effects;
             }
         };
         self.gap(ObjectGap::OutcomeLost);
@@ -6679,6 +6978,82 @@ mod tests {
             fx.state
                 .invalidate(AffectedScope::Domain(fx.domain), ObjectGap::Loss, ledger);
         });
+    }
+
+    /// I3 for model rows: the resumable domain retirement charges at
+    /// most its budget per poll, yields across polls when the domain
+    /// holds more rows than one credit, and produces exactly the atomic
+    /// disposal's effects, gaps and residual usage (both kinds, several
+    /// row counts and per-poll budgets).
+    #[test]
+    fn domain_retirement_cursor_matches_atomic_and_bounds_each_poll() {
+        let domain = ObjectDomain::reference(1, 1, 1, 1, 1);
+        for rows in [0usize, 1, 63, 64, 65, 97] {
+            for per_poll in [1usize, 7, 64] {
+                for abandon in [true, false] {
+                    let build = || {
+                        let mut state = ModelState::new(ObjectLimits::policy());
+                        state.populate_domain_rows_for_test(domain, rows);
+                        state
+                    };
+                    let upper = RefCut::reference(40_000);
+                    let mut atomic = build();
+                    let mut ledger = super::super::journal::StagingLedger::new();
+                    let expected = if abandon {
+                        atomic.abandon_domain(domain, &mut ledger)
+                    } else {
+                        atomic.outcome_lost(LostOutcome::Voided(domain, upper), &mut ledger)
+                    };
+                    let mut sliced = build();
+                    let mut ledger = super::super::journal::StagingLedger::new();
+                    let mut retirement = if abandon {
+                        DomainRetirement::abandon(domain)
+                    } else {
+                        DomainRetirement::void(domain, upper)
+                    };
+                    let mut effects = ObjectEffects::default();
+                    let mut polls = 0usize;
+                    loop {
+                        let before = sliced.test_retire_units();
+                        let mut units = per_poll;
+                        let done = sliced.retire_domain_step(
+                            &mut retirement,
+                            &mut ledger,
+                            &mut effects,
+                            &mut units,
+                        );
+                        let spent = sliced.test_retire_units() - before;
+                        assert!(spent <= per_poll, "a poll charges at most its credit");
+                        assert_eq!(spent, per_poll - units, "every row is debited");
+                        polls += 1;
+                        assert!(polls < 100_000, "the retirement terminates");
+                        if done {
+                            break;
+                        }
+                        assert_eq!(units, 0, "a poll yields only on an empty credit");
+                    }
+                    assert!(retirement.done());
+                    let rows_total = if abandon { 4 * rows } else { 2 * rows };
+                    if rows_total + 2 > per_poll {
+                        assert!(polls > 1, "rows={rows} per_poll={per_poll}: yields");
+                    }
+                    assert_eq!(
+                        effects.effects, expected.effects,
+                        "rows={rows} abandon={abandon}"
+                    );
+                    assert_eq!(sliced.gaps, atomic.gaps);
+                    assert_eq!(sliced.project().usage, atomic.project().usage);
+                    let (a, b) = (&atomic.domains[&domain], &sliced.domains[&domain]);
+                    assert_eq!(
+                        (a.bootstrap, a.initialized, a.fence_floor, a.generation),
+                        (b.bootstrap, b.initialized, b.fence_floor, b.generation)
+                    );
+                    assert!(b.bindings.is_empty() && b.live_sessions.is_empty());
+                    // An abandonment releases every ticket; a void keeps them.
+                    assert_eq!(b.keys.len(), if abandon { 0 } else { rows });
+                }
+            }
+        }
     }
 
     // Domain abandonment flushes the queued release before

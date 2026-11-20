@@ -1638,6 +1638,12 @@ pub(crate) struct ScopedRecovery {
     /// Keys whose abandonment refusal already applied (the doom pass
     /// runs once per key across slices).
     doomed_done: BTreeSet<JournalDomainKey>,
+    /// The one model-domain retirement in progress (a doomed key's
+    /// abandonment or a fenced key's voided interval). Its adapter-side
+    /// refusal or fence already published; its model rows (views,
+    /// sessions, bindings, call tickets) retire one leaf unit each under
+    /// the shared slice budget, resuming across credits.
+    model_retire: Option<super::state::DomainRetirement>,
     /// Current phase and its resume cursor.
     phase: ScopedRecoveryPhase,
 }
@@ -1652,7 +1658,9 @@ pub(crate) struct ScopedRecovery {
 /// never toward a forged doom).
 #[derive(Clone)]
 struct PreservedBasis {
-    live: Vec<JournalDomainKey>,
+    /// Indexed membership: a decision's claimant check is one lookup
+    /// per claimant, never a scan of the completed basis.
+    live: BTreeSet<JournalDomainKey>,
     keyed: bool,
     next: usize,
     frozen_len: usize,
@@ -7748,33 +7756,11 @@ impl JournalAdapter {
                 }
             }
             let basis = bases.get(&entry.image).expect("completed basis");
-            match basis.live.as_slice() {
-                [sole] => {
-                    doomed.insert(*sole);
-                }
-                [] if !basis.keyed => {
-                    taint.insert(entry.image);
-                }
-                [] => {}
-                _ => {
-                    let claimants: Vec<JournalDomainKey> = self
-                        .claimants_naming(&shape_of_entry(entry))
-                        .map(|m| {
-                            m.iter()
-                                .filter(|(key, ordinals)| {
-                                    !ordinals.is_empty() && basis.live.contains(key)
-                                })
-                                .map(|(key, _)| *key)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if claimants.is_empty() {
-                        taint.insert(entry.image);
-                    } else {
-                        doomed.extend(claimants);
-                    }
-                }
+            let (keys, tainted) = self.preserve_decision(basis, &shape_of_entry(entry));
+            if tainted {
+                taint.insert(entry.image);
             }
+            doomed.extend(keys);
         }
         for (image, key, function) in neutral_absent {
             self.note_derived_absence(image, key, function);
@@ -8280,6 +8266,7 @@ impl JournalAdapter {
             preserve_taint: BTreeSet::new(),
             preserve_basis: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
+            model_retire: None,
             phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
         }
     }
@@ -8311,6 +8298,7 @@ impl JournalAdapter {
             preserve_taint: BTreeSet::new(),
             preserve_basis: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
+            model_retire: None,
             phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
         }
     }
@@ -8587,52 +8575,92 @@ impl JournalAdapter {
                 recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
                 return false;
             }
-            if *left == 0 {
+            // The same decision as the batch path, charged at its
+            // actual row cost (one unit plus one per claim it reads),
+            // debited before the read: a decision that does not fit
+            // this slice yields and runs whole in a fresh one.
+            let cost = {
+                let basis = recovery
+                    .preserve_basis
+                    .get(&image)
+                    .expect("completed basis");
+                self.preserve_decision_cost(basis, &shape)
+            };
+            if cost > *left {
+                if cost > SCOPED_RECOVERY_SLICE {
+                    // Never fits one credit: fail closed for this image
+                    // (a counted, named taint), one unit.
+                    recovery.preserve_taint.insert(image);
+                    decided = Some(native);
+                    *left -= 1;
+                    *budget = budget.saturating_sub(1);
+                    continue;
+                }
                 recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
                 return false;
             }
-            // Mirror the batch preservation decision: a sole live
-            // key is doomed, a keyless image is tainted, and a
-            // shared image dooms its live claimants (or taints when
-            // no claimant names the shape). The decision computes
-            // under the basis borrow, then applies.
+            *left -= cost;
+            *budget = budget.saturating_sub(cost);
             let (doomed, tainted) = {
                 let basis = recovery
                     .preserve_basis
                     .get(&image)
                     .expect("completed basis");
-                match basis.live.as_slice() {
-                    [sole] => (vec![*sole], false),
-                    [] if !basis.keyed => (Vec::new(), true),
-                    [] => (Vec::new(), false),
-                    _ => {
-                        let claimants: Vec<JournalDomainKey> = self
-                            .claimants_naming(&shape)
-                            .map(|m| {
-                                m.iter()
-                                    .filter(|(key, ordinals)| {
-                                        !ordinals.is_empty() && basis.live.contains(key)
-                                    })
-                                    .map(|(key, _)| *key)
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if claimants.is_empty() {
-                            (Vec::new(), true)
-                        } else {
-                            (claimants, false)
-                        }
-                    }
-                }
+                self.preserve_decision(basis, &shape)
             };
             if tainted {
                 recovery.preserve_taint.insert(image);
             }
             recovery.preserve_doomed.extend(doomed);
             decided = Some(native);
-            *left -= 1;
-            *budget = budget.saturating_sub(1);
         }
+    }
+
+    /// The one preservation decision for an unbounded abandonment
+    /// against its image's completed basis (batch and sliced paths): a
+    /// sole live key is doomed, a keyless image is tainted, and a shared
+    /// image dooms its live claimants (or taints when no claimant names
+    /// the shape). Membership is an indexed lookup per claimant.
+    fn preserve_decision(
+        &self,
+        basis: &PreservedBasis,
+        shape: &StagedShape,
+    ) -> (Vec<JournalDomainKey>, bool) {
+        match basis.live.len() {
+            1 => (basis.live.iter().copied().collect(), false),
+            0 => (Vec::new(), !basis.keyed),
+            _ => {
+                let claimants: Vec<JournalDomainKey> = self
+                    .claimants_naming(shape)
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(key, ordinals)| {
+                                !ordinals.is_empty() && basis.live.contains(key)
+                            })
+                            .map(|(key, _)| *key)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let tainted = claimants.is_empty();
+                (claimants, tainted)
+            }
+        }
+    }
+
+    /// Leaf units [`Self::preserve_decision`] reads: one, plus (for a
+    /// shared image) one per claimant and per queued claim of the
+    /// identity. Computed from map lengths without reading claims.
+    fn preserve_decision_cost(&self, basis: &PreservedBasis, shape: &StagedShape) -> usize {
+        if basis.live.len() < 2 {
+            return 1;
+        }
+        let claims = self.claims.get(&shape.identity).map_or(0, |claimants| {
+            claimants
+                .values()
+                .map(VecDeque::len)
+                .fold(claimants.len(), usize::saturating_add)
+        });
+        claims.saturating_add(1)
     }
 
     /// Advance one image's preservation basis by up to `*left` keys:
@@ -8652,7 +8680,7 @@ impl JournalAdapter {
         let build = bases.entry(image).or_insert_with(|| {
             let listed = self.image_keys.get(&image);
             PreservedBasis {
-                live: Vec::new(),
+                live: BTreeSet::new(),
                 keyed: listed.is_some(),
                 next: 0,
                 frozen_len: listed.map_or(0, Vec::len),
@@ -8675,7 +8703,7 @@ impl JournalAdapter {
             if let Some(key) = key
                 && self.key_is_live(key)
             {
-                build.live.push(key);
+                build.live.insert(key);
             }
         }
         if build.next >= extent {
@@ -8742,39 +8770,52 @@ impl JournalAdapter {
         left: &mut usize,
         budget: &mut usize,
     ) -> bool {
-        let allowance = *left;
-        let range = match after {
-            None => recovery.preserve_doomed.range((
-                std::ops::Bound::<JournalDomainKey>::Unbounded,
-                std::ops::Bound::<JournalDomainKey>::Unbounded,
-            )),
-            Some(last) => recovery
-                .preserve_doomed
-                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
-        };
-        let mut examined = 0usize;
         let mut last = after;
-        let mut keys: Vec<JournalDomainKey> = Vec::new();
-        for key in range {
-            if examined >= allowance {
-                break;
+        loop {
+            if !self.drive_model_retirement(model, recovery, left, budget) || *left == 0 {
+                recovery.phase = ScopedRecoveryPhase::PreserveDoom { after: last };
+                return false;
             }
-            examined += 1;
-            last = Some(*key);
-            keys.push(*key);
+            let next = match last {
+                None => recovery.preserve_doomed.iter().next(),
+                Some(key) => recovery
+                    .preserve_doomed
+                    .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                    .next(),
+            }
+            .copied();
+            let Some(key) = next else {
+                recovery.phase = ScopedRecoveryPhase::OverflowDrain;
+                return true;
+            };
+            *left -= 1;
+            *budget = budget.saturating_sub(1);
+            last = Some(key);
+            self.doom_abandoned_key(recovery, key);
         }
-        *left -= examined;
-        *budget = budget.saturating_sub(examined);
-        for key in keys {
-            self.doom_abandoned_key(model, recovery, key);
+    }
+
+    /// Drive the recovery's standing model-domain retirement, if any,
+    /// under the slice: one leaf unit per model row, debited before the
+    /// row is read. Returns true when none stands (or it just completed).
+    fn drive_model_retirement(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let Some(retirement) = recovery.model_retire.as_mut() else {
+            return true;
+        };
+        let before = *left;
+        let done =
+            model.retire_domain_step(retirement, &mut self.ledger, &mut recovery.effects, left);
+        *budget = budget.saturating_sub(before - *left);
+        if done {
+            recovery.model_retire = None;
         }
-        if examined < allowance {
-            recovery.phase = ScopedRecoveryPhase::OverflowDrain;
-            true
-        } else {
-            recovery.phase = ScopedRecoveryPhase::PreserveDoom { after: last };
-            false
-        }
+        done
     }
 
     /// Mark one slice of owed taint-overflow keys (one unit per
@@ -8914,12 +8955,7 @@ impl JournalAdapter {
     /// Refuse one decided abandoned key once across doom slices:
     /// its model domain (if held) abandons, and the key refuses.
     /// Later slices skip keys already doomed here.
-    fn doom_abandoned_key(
-        &mut self,
-        model: &mut ObjectSemantics,
-        recovery: &mut ScopedRecovery,
-        key: JournalDomainKey,
-    ) {
+    fn doom_abandoned_key(&mut self, recovery: &mut ScopedRecovery, key: JournalDomainKey) {
         if self.is_tainted((key.cookie, key.exec)) || !recovery.doomed_done.insert(key) {
             return;
         }
@@ -8928,14 +8964,16 @@ impl JournalAdapter {
             .get(&key)
             .map(|state| (state.era, state.model_registered))
             .expect("doomed key");
-        if registered {
-            let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-            let refused = model.abandon_domain(domain, &mut self.ledger);
-            recovery.effects.effects.extend(refused.effects);
-        }
+        // The refusal publishes first; the model rows then retire under
+        // the shared budget (the same order and effects as the atomic
+        // abandonment).
         let lived = self.key_is_live(key);
         self.keys.get_mut(&key).expect("doomed key").refused = true;
         self.claims_prune_dirty |= lived;
+        if registered {
+            let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
+            recovery.model_retire = Some(super::state::DomainRetirement::abandon(domain));
+        }
     }
 
     /// Fence one slice of stuck domains from the index (void fence
@@ -8949,19 +8987,19 @@ impl JournalAdapter {
         left: &mut usize,
         budget: &mut usize,
     ) -> bool {
-        let allowance = *left;
-        let mut examined = 0usize;
-        let mut keys: Vec<JournalDomainKey> = Vec::new();
-        for key in recovery.scope.domains.iter().skip(index) {
-            if examined >= allowance {
-                break;
+        let mut index = index;
+        loop {
+            if !self.drive_model_retirement(model, recovery, left, budget) || *left == 0 {
+                recovery.phase = ScopedRecoveryPhase::Fence { index };
+                return false;
             }
-            examined += 1;
-            keys.push(*key);
-        }
-        *left -= examined;
-        *budget = budget.saturating_sub(examined);
-        for key in keys {
+            let Some(key) = recovery.scope.domains.get(index).copied() else {
+                recovery.phase = ScopedRecoveryPhase::WipeOpen { after: None };
+                return true;
+            };
+            *left -= 1;
+            *budget = budget.saturating_sub(1);
+            index += 1;
             let Some(state) = self.keys.get_mut(&key) else {
                 continue;
             };
@@ -8971,23 +9009,10 @@ impl JournalAdapter {
             }
             let era = state.era;
             let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-            let lost = model.outcome_lost(
-                super::LostOutcome::Voided(
-                    domain,
-                    RefCut::sealed(ConsumptionOrdinal(recovery.upper)),
-                ),
-                &mut self.ledger,
-            );
-            recovery.effects.effects.extend(lost.effects);
-        }
-        if examined < allowance {
-            recovery.phase = ScopedRecoveryPhase::WipeOpen { after: None };
-            true
-        } else {
-            recovery.phase = ScopedRecoveryPhase::Fence {
-                index: index + examined,
-            };
-            false
+            recovery.model_retire = Some(super::state::DomainRetirement::void(
+                domain,
+                RefCut::sealed(ConsumptionOrdinal(recovery.upper)),
+            ));
         }
     }
 
@@ -9006,55 +9031,42 @@ impl JournalAdapter {
         left: &mut usize,
         budget: &mut usize,
     ) -> bool {
-        let allowance = *left;
-        let range = match after {
-            None => self.keys.range((
-                std::ops::Bound::<JournalDomainKey>::Unbounded,
-                std::ops::Bound::<JournalDomainKey>::Unbounded,
-            )),
-            Some(last) => self
-                .keys
-                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
-        };
-        let mut examined = 0usize;
         let mut last = after;
-        let mut fenced: Vec<(JournalDomainKey, u64, bool)> = Vec::new();
-        for (key, state) in range {
-            if examined >= allowance {
-                break;
+        loop {
+            if !self.drive_model_retirement(model, recovery, left, budget) || *left == 0 {
+                recovery.phase = ScopedRecoveryPhase::FenceAll { after: last };
+                return false;
             }
-            examined += 1;
-            last = Some(*key);
-            fenced.push((*key, state.era, state.model_registered));
-        }
-        *left -= examined;
-        *budget = budget.saturating_sub(examined);
-        for (key, era, registered) in fenced {
-            {
+            let next = match last {
+                None => self.keys.keys().next(),
+                Some(key) => self
+                    .keys
+                    .range((std::ops::Bound::Excluded(key), std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(key, _)| key),
+            }
+            .copied();
+            let Some(key) = next else {
+                recovery.phase = ScopedRecoveryPhase::WipeOpen { after: None };
+                return true;
+            };
+            *left -= 1;
+            *budget = budget.saturating_sub(1);
+            last = Some(key);
+            let (era, registered) = {
                 let state = self.keys.get_mut(&key).expect("fenced key");
                 state.void_fence = state.void_fence.max(recovery.upper);
                 state.bootstraps.clear();
-            }
+                (state.era, state.model_registered)
+            };
             let proof = JournalDomainProof { key, era };
             recovery.stream_scope.push(proof.domain());
-            if !registered {
-                continue;
-            }
-            let lost = model.outcome_lost(
-                super::LostOutcome::Voided(
+            if registered {
+                recovery.model_retire = Some(super::state::DomainRetirement::void(
                     proof.domain(),
                     RefCut::sealed(ConsumptionOrdinal(recovery.upper)),
-                ),
-                &mut self.ledger,
-            );
-            recovery.effects.effects.extend(lost.effects);
-        }
-        if examined < allowance {
-            recovery.phase = ScopedRecoveryPhase::WipeOpen { after: None };
-            true
-        } else {
-            recovery.phase = ScopedRecoveryPhase::FenceAll { after: last };
-            false
+                ));
+            }
         }
     }
 
@@ -23172,6 +23184,125 @@ pub(crate) mod tests {
             harness.owner.adapter().open.contains_key(&(2, 1)),
             "the healthy image keeps its staged call"
         );
+    }
+
+    /// Drive one owner void to completion under `per_poll` credits,
+    /// asserting no poll charges model rows past its credit. Returns the
+    /// poll count and the per-poll model row maximum.
+    fn drive_void_counting_model_rows(
+        harness: &mut OwnerHarness,
+        per_poll: usize,
+    ) -> (usize, usize) {
+        use super::joint_driver::RecoveryProgress;
+        let mut polls = 0usize;
+        let mut max_rows = 0usize;
+        loop {
+            let before = harness.owner.model().test_retire_units();
+            let mut budget = per_poll;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded void never refuses its own budget");
+            let rows = harness.owner.model().test_retire_units() - before;
+            assert!(
+                rows <= per_poll,
+                "a poll retires at most its credit of model rows"
+            );
+            max_rows = max_rows.max(rows);
+            polls += 1;
+            assert!(polls < 100_000, "the bounded void always terminates");
+            if let RecoveryProgress::Done(voided) = progress {
+                assert!(voided, "the void applies");
+                return (polls, max_rows);
+            }
+        }
+    }
+
+    /// I3, stream fence: one registered key holding 97 model sessions,
+    /// views and tickets. The stream fence publishes the key's fence and
+    /// then retires its model rows one leaf unit each across credits,
+    /// never the whole domain under the key's single unit, and still
+    /// delivers every retirement effect in the failure.
+    #[test]
+    fn stream_fence_retires_one_keys_model_rows_per_credit() {
+        let mut harness = OwnerHarness::new(image_default());
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let proof = proofs[0];
+        harness
+            .owner
+            .model_mut()
+            .populate_domain_rows_for_test(proof.domain(), 97);
+        harness
+            .owner
+            .adapter_mut()
+            .keys
+            .get_mut(&proof.key)
+            .expect("attested key")
+            .model_registered = true;
+        harness.owner.adapter_mut().break_stream_for_test();
+        let (polls, max_rows) = drive_void_counting_model_rows(&mut harness, 64);
+        assert!(polls > 1, "97 model rows never retire under one credit");
+        assert!(max_rows > 1, "the rows really ran through the cursor");
+        let failure = harness
+            .owner
+            .pending_void_for_test()
+            .expect("the void carries its failure");
+        let ended = failure
+            .effects
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, ObjectEffect::SessionEnded { .. }))
+            .count();
+        let retired = failure
+            .effects
+            .effects
+            .iter()
+            .filter(|effect| matches!(effect, ObjectEffect::Retired { .. }))
+            .count();
+        assert_eq!(
+            (ended, retired),
+            (97, 97),
+            "every row's retirement publishes"
+        );
+    }
+
+    /// I3, preserve doom: the same 97-row registered key doomed by an
+    /// unbounded mutating abandonment during a stream void. Its refusal
+    /// publishes first; its model rows then retire across credits.
+    #[test]
+    fn stream_doom_retires_one_keys_model_rows_per_credit() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let (proofs, _fixtures) = attest_image_keys(&mut harness, 1);
+        let proof = proofs[0];
+        harness
+            .owner
+            .model_mut()
+            .populate_domain_rows_for_test(proof.domain(), 97);
+        harness
+            .owner
+            .adapter_mut()
+            .keys
+            .get_mut(&proof.key)
+            .expect("attested key")
+            .model_registered = true;
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(harness.ingest(&abandon), JournalDisposition::AbandonStaged);
+        harness.owner.adapter_mut().break_stream_for_test();
+        let (polls, _) = drive_void_counting_model_rows(&mut harness, 64);
+        assert!(polls > 2, "doom plus fence rows span several credits");
+        assert!(
+            harness.owner.adapter().proof_refused_for_test(proof)
+                || harness
+                    .owner
+                    .adapter()
+                    .image_tainted_for_test((COOKIE, EXEC)),
+            "the abandonment's refusal sticks"
+        );
+        assert_eq!(harness.owner.model().project().usage.pending_calls, 0);
     }
 
     #[test]

@@ -101,6 +101,38 @@ pub(crate) fn is_neutral_function(function: u32) -> bool {
     NEUTRAL_S1_FUNCTIONS.contains(&name)
 }
 
+/// Pure-read object calls whose abandonment disposes per-call:
+/// C_GetAttributeValue (attribute query), C_GetObjectSize (size
+/// query) and C_WrapKey (two-key read emitting bytes). Each reads
+/// bindings without creating, destroying, converting, rebinding,
+/// establishing or feeding session operation state. Exact
+/// catalog-name membership, never action-derived: sibling Access
+/// calls (key-bearing Inits, DigestKey) and OperationImport
+/// (SetOperationState) mutate operation state and keep dooming.
+pub(crate) const DISPOSABLE_ABANDONMENT_READS: [&str; 3] =
+    ["C_GetAttributeValue", "C_GetObjectSize", "C_WrapKey"];
+
+/// Whether one abandoned call disposes per-call with its own
+/// outcome_lost gap instead of dooming its key: effect-neutral S1
+/// operations plus the pure-read object calls above. An abandoned
+/// call never reached its END, so a pure read holds only its BEGIN
+/// snapshot (no resolved joins, no references, no established
+/// metadata -- those happen at END); it affects neither object
+/// state nor session operation state, so its removal hides no
+/// genuine interference and needs no void or retire. Every other
+/// function keeps whole-key doom (fail closed). Unknown ordinals
+/// never dispose.
+pub(crate) fn abandonment_disposes_per_call(function: u32) -> bool {
+    if is_neutral_function(function) {
+        return true;
+    }
+    let Some(name) = pkcs11_module::function_name(usize::try_from(function).unwrap_or(usize::MAX))
+    else {
+        return false;
+    };
+    DISPOSABLE_ABANDONMENT_READS.contains(&name)
+}
+
 /// Whether one unclaimable original may be disposed with its observed
 /// call instead of holding the key's next seal. Disposal is safe only
 /// when the call cannot change a later call's resolution: effect-neutral
@@ -7586,12 +7618,12 @@ impl JournalAdapter {
             }) {
                 continue;
             }
-            if is_neutral_function(entry.function) {
-                // Neutral abandonments carry no continuing object
-                // effects: the void fence suffices, so the wipe
-                // preserves no doom and taints no image for them.
-                // Their late terminals stay expected-absent (the
-                // wipe filter only covers unterminated calls).
+            if abandonment_disposes_per_call(entry.function) {
+                // Effect-free abandonments carry no continuing
+                // object effects: the void fence suffices, so the
+                // wipe preserves no doom and taints no image for
+                // them. Their late terminals stay expected-absent
+                // (the wipe filter only covers unterminated calls).
                 neutral_absent.push((entry.image, *key, entry.function));
                 continue;
             }
@@ -8326,12 +8358,13 @@ impl JournalAdapter {
             if !unbounded {
                 continue;
             }
-            if is_neutral_function(entry.function) {
-                // Neutral abandonments carry no continuing object
-                // effects: the scoped wipe preserves no doom and
-                // taints no image for them. The wipe records their
-                // late terminals expected-absent (see the wipe
-                // filter); this decide-only pass just skips them.
+            if abandonment_disposes_per_call(entry.function) {
+                // Effect-free abandonments carry no continuing
+                // object effects: the scoped wipe preserves no doom
+                // and taints no image for them. The wipe records
+                // their late terminals expected-absent (see the
+                // wipe filter); this decide-only pass just skips
+                // them.
                 continue;
             }
             let image = entry.image;
@@ -8717,22 +8750,23 @@ impl JournalAdapter {
                     RetainedMember::Open(key),
                 );
             }
-            // Neutral wiped BEGINs excuse their late terminals at
-            // ingest (their void-wipe evidence routes them to plain
-            // S1); anything else taints fail-closed there. A wiped
-            // neutral call found already abandoned unboundedly is
-            // excused too: its abandonment disposed per-call with no
-            // continuing object effects, so a straddling terminal is
-            // the wipe working as intended, not new evidence.
-            let abandoned_neutral = entry.abandon.is_some_and(|staged| {
+            // Effect-free wiped BEGINs excuse their late terminals
+            // at ingest (their void-wipe evidence routes them to
+            // plain S1); anything else taints fail-closed there. A
+            // wiped effect-free call found already abandoned
+            // unboundedly is excused too: its abandonment disposed
+            // per-call with no continuing object effects, so a
+            // straddling terminal is the wipe working as intended,
+            // not new evidence.
+            let abandoned_disposable = entry.abandon.is_some_and(|staged| {
                 abandon_disposition(staged.abandon.reason())
                     == Some(AbandonDisposition::UnboundedInvalidation)
-            }) && is_neutral_function(entry.function);
+            }) && abandonment_disposes_per_call(entry.function);
             if entry.end.is_none()
                 && !entry.begin.no_end()
                 && entry.corroborated_return.is_none()
                 && (entry.abandon.is_none() && disposes_unclaimable_original(entry.function)
-                    || abandoned_neutral)
+                    || abandoned_disposable)
             {
                 self.note_derived_absence(entry.image, key, entry.function);
             }
@@ -8866,12 +8900,12 @@ impl JournalAdapter {
         }
     }
 
-    /// Refuse one key permanently for its mutating unbounded
-    /// abandonment: invalidate its proof (reported), mark it, dispose
-    /// its staged entries, and refuse the seal with the tainted-domain
-    /// gap. Both seal-time doom paths (a staged mutating
-    /// abandonment, a model disagreement on per-call disposal) share
-    /// this exact refusal.
+    /// Refuse one key permanently for its non-effect-free
+    /// unbounded abandonment: invalidate its proof (reported), mark
+    /// it, dispose its staged entries, and refuse the seal with the
+    /// tainted-domain gap. Both seal-time doom paths (a staged
+    /// non-effect-free abandonment, a model disagreement on
+    /// per-call disposal) share this exact refusal.
     fn doom_key_for_abandonment(
         &mut self,
         model: &mut ObjectSemantics,
@@ -8941,11 +8975,12 @@ impl JournalAdapter {
         // never prune silently. A sibling's abandonment belongs to
         // its own seal; unclaimed shapes barriered before conversion.
         //
-        // Neutral (effect-free S1) abandonments dispose per-call
-        // instead: they apply no object effect and carry no
-        // interference, so each names its own loss gap while the key
-        // keeps sealing its other calls. One mutating abandonment
-        // still dooms the whole key (fail closed).
+        // Effect-free (neutral S1 or pure-read object)
+        // abandonments dispose per-call instead: they apply no
+        // object effect and carry no interference, so each names
+        // its own loss gap while the key keeps sealing its other
+        // calls. One non-effect-free abandonment still dooms the
+        // whole key (fail closed).
         let mut dooming = false;
         let mut disposable: Vec<JournalNativeKey> = Vec::new();
         for (native, entry) in &self.open {
@@ -8959,7 +8994,7 @@ impl JournalAdapter {
             {
                 continue;
             }
-            if is_neutral_function(entry.function) {
+            if abandonment_disposes_per_call(entry.function) {
                 disposable.push(*native);
             } else {
                 dooming = true;
@@ -8969,11 +9004,12 @@ impl JournalAdapter {
         if dooming {
             return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
         }
-        // Per-call disposal for neutral abandonments: the model
-        // releases each ticket first (fail closed on disagreement),
-        // then adapter staging drops with expected absences for late
-        // terminals. The key stays live and the seal continues
-        // below; the disposal gaps join the seal's effects.
+        // Per-call disposal for effect-free abandonments: the
+        // model releases each ticket first (fail closed on
+        // disagreement), then adapter staging drops with expected
+        // absences for late terminals. The key stays live and the
+        // seal continues below; the disposal gaps join the seal's
+        // effects.
         let mut disposed = ObjectEffects::default();
         if !disposable.is_empty() {
             let mut tickets: Vec<(JournalNativeKey, Option<CallToken>)> = Vec::new();
@@ -8988,7 +9024,7 @@ impl JournalAdapter {
             }
             let mut agreed = true;
             for (_, ticket) in &tickets {
-                match model.dispose_abandoned_neutral(*ticket, &mut self.ledger) {
+                match model.dispose_abandoned_per_call(*ticket, &mut self.ledger) {
                     Some(effects) => disposed.effects.extend(effects.effects),
                     None => {
                         agreed = false;
@@ -12662,6 +12698,70 @@ pub(crate) mod tests {
             );
             assert!(!is_neutral_function(id));
         }
+    }
+
+    #[test]
+    fn abandonment_disposable_reads_are_pure_object_reads() {
+        // Fix7: per-call abandonment disposal covers neutral S1 plus
+        // exactly three pure-read object calls. Each read keeps its
+        // object row (query actions only), stays modeled and
+        // non-neutral; operation-establishing, operation-feeding,
+        // operation-importing and mutating calls never dispose.
+        use p11scope_ebpf_common::object_policy::ObjectAction;
+
+        assert_eq!(DISPOSABLE_ABANDONMENT_READS.len(), 3);
+        let mut sorted = DISPOSABLE_ABANDONMENT_READS;
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert_ne!(pair[0], pair[1], "disposable reads are distinct");
+        }
+        for (name, action) in [
+            ("C_GetAttributeValue", ObjectAction::GetAttributes),
+            ("C_GetObjectSize", ObjectAction::Access),
+            ("C_WrapKey", ObjectAction::Access),
+        ] {
+            let id = crate::kinds::function_id(name).expect("catalog");
+            let descriptor = crate::kinds::object_descriptor(name).expect("object row");
+            assert_eq!(descriptor.action, action, "{name} keeps its query action");
+            assert!(
+                crate::semantics_objects::state::is_modeled_function(id),
+                "{name} stays modeled"
+            );
+            assert!(!is_neutral_function(id), "{name} stays non-neutral");
+            assert!(
+                abandonment_disposes_per_call(id),
+                "{name} disposes per-call"
+            );
+        }
+        // Neutral members still dispose through the same predicate.
+        let sign = crate::kinds::function_id("C_Sign").expect("catalog");
+        assert!(abandonment_disposes_per_call(sign));
+        // Operation-establishing, operation-feeding,
+        // operation-importing and mutating calls keep dooming.
+        for name in [
+            "C_SignInit",
+            "C_EncryptInit",
+            "C_DigestKey",
+            "C_SetOperationState",
+            "C_CreateObject",
+            "C_DestroyObject",
+            "C_CopyObject",
+            "C_SetAttributeValue",
+            "C_GenerateKey",
+            "C_UnwrapKey",
+            "C_DeriveKey",
+            "C_FindObjects",
+            "C_OpenSession",
+            "C_Login",
+        ] {
+            let id = crate::kinds::function_id(name).expect("catalog");
+            assert!(
+                !abandonment_disposes_per_call(id),
+                "{name} keeps whole-key doom"
+            );
+        }
+        assert!(!abandonment_disposes_per_call(u32::MAX));
+        assert!(!abandonment_disposes_per_call(10_000));
     }
 
     #[test]
@@ -22445,8 +22545,8 @@ pub(crate) mod tests {
         // Fix7 machine twin (Codex fix4 finding 1): 65 live keys
         // share one image with a single unclaimed mutating
         // abandonment. The scoped void must build the preservation
-        // liveness basis one key per recovery credit — never
-        // snapshotting all 65 in one unit — then taint the image
+        // liveness basis one key per recovery credit -- never
+        // snapshotting all 65 in one unit -- then taint the image
         // with no key refused.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
 
@@ -22695,8 +22795,8 @@ pub(crate) mod tests {
     fn stream_void_preserves_one_key_per_credit() {
         // Fix7 machine twin (Codex fix4 finding 1, batch path): a
         // stream void over 65 live keys with one unclaimed mutating
-        // abandonment must slice across credits — one key per poll
-        // through preservation — instead of deciding synchronously,
+        // abandonment must slice across credits -- one key per poll
+        // through preservation -- instead of deciding synchronously,
         // and still fence every key, drain every open, invalidate
         // the stream and scope the failure to every domain.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;

@@ -928,7 +928,13 @@ impl IngestedJointQuantum {
         // Finished rejections from a frame that no longer exists have no
         // holder: they drop here, before this frame issues its own.
         adapter.drop_unclaimed_rejections(None);
-        let raw_failure = adapter.refuse_s1only_subjects(model);
+        // The S1-only negative settles inline when one credit covers it;
+        // otherwise the frame holds its ticket and fills it under the
+        // service budget before delivery.
+        let (raw_failure, raw_fill) = match adapter.refuse_s1only_subjects(model) {
+            Some((failure, pending)) => (Some(failure), pending),
+            None => (None, None),
+        };
         let mark = adapter.rejection_mark();
         let failure = adapter.audit_collected(model, &audit, fault).err();
         let audit_fill = failure
@@ -959,7 +965,7 @@ impl IngestedJointQuantum {
             _storage: storage,
             _void_storage: void_storage,
             audit_fill,
-            raw_fill: None,
+            raw_fill,
             parked: None,
         };
         assert!(

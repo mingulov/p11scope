@@ -427,13 +427,15 @@ impl JointCaptureOwner {
                 // consumers must see them). The partial fence/wipe work
                 // is subsumed as before. The carried effects are paid
                 // on top of the stream void's own bound.
-                let (standing, carried) = match self.adapter.scoped_recovery.take() {
-                    Some(aborted) => (aborted.model_retire, aborted.effects),
-                    None => (None, super::ObjectEffects::default()),
-                };
-                let carried_bytes = carried
-                    .effects
-                    .len()
+                // Reserve before taking: a refused reservation leaves the
+                // aborted recovery (its applied effects and its own lease)
+                // standing for the retry.
+                let carried_len = self
+                    .adapter
+                    .scoped_recovery
+                    .as_ref()
+                    .map_or(0, |aborted| aborted.effects.effects.len());
+                let carried_bytes = carried_len
                     .checked_mul(2)
                     .and_then(|slots| {
                         slots.checked_mul(size_of::<crate::semantics_objects::ObjectEffect>())
@@ -450,6 +452,10 @@ impl JointCaptureOwner {
                     .ok_or(RawQuantumRefusal::ForeignLedger)?
                     .reserve(bytes)
                     .map_err(RawQuantumRefusal::Resource)?;
+                let (standing, carried) = match self.adapter.scoped_recovery.take() {
+                    Some(aborted) => (aborted.model_retire, aborted.effects),
+                    None => (None, super::ObjectEffects::default()),
+                };
                 self.adapter.drop_scoped_break();
                 let upper = self.adapter.consumed_through;
                 let mut recovery = self.adapter.begin_stream_recovery(upper, bytes, lease);
@@ -471,8 +477,7 @@ impl JointCaptureOwner {
                     // taint-overflow marks so they always drain, then
                     // report idle only once nothing is owed.
                     if self.adapter.has_taint_overflow_pending() {
-                        let mut left = super::SCOPED_RECOVERY_SLICE.min(*budget);
-                        if self.adapter.drain_taint_overflow_slice(&mut left, budget) {
+                        if self.adapter.drain_taint_overflow_slice(budget) {
                             return Ok(RecoveryProgress::Done(false));
                         }
                         return Ok(RecoveryProgress::Yielded);

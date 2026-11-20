@@ -39,11 +39,16 @@ versioned separately and are opaque, exact dispatch keys.
 - Inferred key families and sizes on `--key-operations` rows
   (section version 7): families infer from operation mechanisms in
   both modes, sizes infer from operation lengths with the new
-  `--key-sizes` opt-in (needs `--key-operations`, off by default;
-  without it every size reads unknown and no length word is
-  acquired). Text gains parenthetical tallies plus `-v` per-row
-  lines, CBOM qualification counts inferred use without reading
-  inferred facts, and versions 1–6 stay frozen and byte-stable.
+  `--key-sizes` opt-in (needs `--key-operations` and a FULL build,
+  off by default; without it operation-length sizes read unknown
+  and no length word is acquired, while families and
+  creation/token-reported sizes still show). A refused sizes start
+  retries the journal without sizes behind a `key sizes unavailable`
+  gap instead of voiding key rows, and ECDSA lengths publish the
+  size class unless the curve is established. Text gains
+  parenthetical tallies plus `-v` per-row lines, CBOM qualification
+  counts inferred use without reading inferred facts, and versions
+  1–6 stay frozen and byte-stable.
 
 ### Changed
 
@@ -99,6 +104,9 @@ versioned separately and are opaque, exact dispatch keys.
   fires only as the last resort, after the recovery save failed. The
   saved-fallback line names the actual owner (`mode 0600, readable
   only by <user>`; `root-only` only for root-owned files).
+- `run`, `inventory --cgroup` and `inventory --system` captures no
+  longer drop attached providers when processes turn over; calls no
+  longer go missing without a gap row.
 
 ## [0.7.1] - 2026-11-17
 

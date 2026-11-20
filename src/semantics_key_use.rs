@@ -2569,8 +2569,7 @@ impl SizeState {
         let weakest = self.status == InferredStatus::Unknown
             && matches!(
                 self.reason,
-                None
-                    | Some(REASON_SIZE_INFERENCE_OFF)
+                None | Some(REASON_SIZE_INFERENCE_OFF)
                     | Some(REASON_KEY_SIZES_UNAVAILABLE)
                     | Some(REASON_NO_LENGTH_EVIDENCE)
             );
@@ -2654,8 +2653,7 @@ impl SizeState {
                 // curve beside the standing label when the length
                 // agrees with it; the curve is established, never
                 // inferred from the length alone.
-                let detail =
-                    crate::keymeta::with_established_curve(detail, established, mechanism);
+                let detail = crate::keymeta::with_established_curve(detail, established, mechanism);
                 self.detail = Some((detail.clone(), tag));
                 self.status = InferredStatus::Inferred;
                 self.reason = None;

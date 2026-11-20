@@ -28770,15 +28770,7 @@ fn keymeta_sizes_unavailable_names_its_own_reason() {
     ctx.keyuse.set_key_sizes_unavailable();
     let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
     ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
-    ctx.end(
-        "C_Sign",
-        7,
-        CkRv::OK.0,
-        op_capture(),
-        200,
-        None,
-        None,
-    );
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
     let inferred = ctx
         .inference(ids[0].as_u64(), "sign", "key", "unknown")
         .expect("the sign row infers");

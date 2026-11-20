@@ -138,7 +138,7 @@ pub(crate) fn validate_journal_group_pair(entry_program: &str, return_program: &
 /// stash with the flag on, exactly one row with the flag off (the
 /// loader overrides `max_entries` to 1, so the off-state reservation
 /// is one row).
-pub(crate) fn evidence_start_entries(key_sizes: bool) -> u32 {
+pub(crate) const fn evidence_start_entries(key_sizes: bool) -> u32 {
     if key_sizes { 16_384 } else { 1 }
 }
 

@@ -87,7 +87,10 @@ privacy review and no separate re-review is outstanding). The
 section is APPROVED and its length capture is IMPLEMENTED behind
 `--key-sizes` (controller ruling 2026-11-18: privacy wording is
 ours, owner sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2`
-+ `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with fix round 1). The
++ `rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
+rounds including the codex B1 fetch-mask over-read fix; Task 3
+join/publication landed; the Task 4 `--key-sizes` canary is an
+explicit outstanding item). The
 [Provider, token and mechanism info (v0.8.0 keymeta Task 7)](#provider-token-and-mechanism-info-v080-keymeta-task-7)
 section stays PROPOSED and carries no capture authority until reviewed.
 The R2 section also amends in place, APPROVED under the same reviews
@@ -2385,8 +2388,12 @@ versions 1–5 stay frozen and byte-stable.
 **Status: APPROVED and length-capture IMPLEMENTED behind `--key-sizes`
 (controller ruling 2026-11-18: privacy wording is ours, owner
 sign-off at 0.9.x; Task 2 reviews `rv-v080-keymeta-t2` +
-`rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with fix round 1).
-Join/publication (Task 3) and the Task 5 live matrix remain.**
+`rv-v080-keymeta-t2-sr` + `hy4-rv-v080-keymeta-t2` with 8 fix
+rounds including the codex B1 fetch-mask over-read fix; Task 3
+join/publication landed). The Task 4 `--key-sizes` canary
+(length-cell sentinels on every shape, lane v080-keymeta-t4b,
+blocked on the joint-seal view-void) and the Task 5 live matrix
+remain explicit outstanding items.**
 This section scopes section version 7 of
 `inventory-v1-object-observations-v7.schema.json`: the
 `inferred_family`/`inferred_size` row keys and the finite
@@ -2437,7 +2444,10 @@ registers on LP64 (the seventh word from the caller user stack)
 and from the user stack on ia32. Standard RSA octet lengths
 (128/256/384/512) name the standard size with the `length` source;
 other admitted octets show a masked class with the byte count;
-ECDSA raw lengths name P-256/P-384/P-521 with the `length` source;
+ECDSA raw lengths name the 256/384/521-bit size class with the
+`length` source (a length alone never names a curve — P-256,
+secp256k1 and brainpoolP256r1 share 64 octets — so the curve
+publishes only beside an established curve);
 PQC lengths name the parameter set; no bit range is rendered
 anywhere (owner 07:52). Wrapped-material lengths size the wrapped
 key, never the wrapping key. Family inference uses

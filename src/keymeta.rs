@@ -1019,8 +1019,7 @@ pub(crate) fn size_concise(detail: &SizeDetail) -> String {
         } => format!("RSA {class}"),
         SizeDetail::Rsa { .. } => "RSA (non-standard length)".to_string(),
         SizeDetail::Ec {
-            curve: Some(curve),
-            ..
+            curve: Some(curve), ..
         } => format!("EC {}", ec_curve_display(curve)),
         SizeDetail::Ec {
             curve: None,
@@ -1053,8 +1052,7 @@ pub(crate) fn size_verbose(detail: &SizeDetail, tag: EvidenceTag) -> String {
             masked_rsa_class(*modulus_bytes)
         ),
         SizeDetail::Ec {
-            curve: Some(curve),
-            ..
+            curve: Some(curve), ..
         } => {
             format!("EC {} (from {noun} length)", ec_curve_display(curve))
         }
@@ -1142,7 +1140,11 @@ pub(crate) fn with_established_curve(
     established: Option<EstablishedKind>,
     mechanism: Option<u64>,
 ) -> SizeDetail {
-    let SizeDetail::Ec { curve: None, octets } = detail else {
+    let SizeDetail::Ec {
+        curve: None,
+        octets,
+    } = detail
+    else {
         return detail;
     };
     let (Some(EstablishedKind::Ec { curve }), Some(mechanism)) = (established, mechanism) else {
@@ -1237,10 +1239,7 @@ fn grouped_thousands(value: u64) -> String {
 pub(crate) fn same_size(a: &SizeDetail, b: &SizeDetail) -> bool {
     // Tags never enter: same kind plus same size params only.
     match (a, b) {
-        (
-            SizeDetail::Ec { octets: x, .. },
-            SizeDetail::Ec { octets: y, .. },
-        ) => x == y,
+        (SizeDetail::Ec { octets: x, .. }, SizeDetail::Ec { octets: y, .. }) => x == y,
         _ => a == b,
     }
 }
@@ -1259,8 +1258,7 @@ pub(crate) fn concise_label(family: KeyFamily, detail: &SizeDetail) -> String {
         } => format!("{fam} {class}"),
         SizeDetail::Rsa { .. } => format!("{fam} (non-standard length)"),
         SizeDetail::Ec {
-            curve: Some(curve),
-            ..
+            curve: Some(curve), ..
         } => format!("{fam} {}", ec_curve_display(curve)),
         SizeDetail::Ec {
             curve: None,
@@ -3105,10 +3103,7 @@ mod tests {
             curve: None,
             octets: 64,
         };
-        assert_eq!(
-            concise_label(KeyFamily::Ec, &ec_class),
-            "EC 256-bit class"
-        );
+        assert_eq!(concise_label(KeyFamily::Ec, &ec_class), "EC 256-bit class");
         let eddsa = SizeDetail::Eddsa {
             curve: "ed25519",
             octets: 64,

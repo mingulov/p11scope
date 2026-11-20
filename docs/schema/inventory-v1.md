@@ -771,7 +771,8 @@ and never proves an app identity. See the app identity rows of
 - `observation.semantic_capture` (additive): the Detailed lane's
   sanitized summary, counts only —
   `{status, admitted_endpoints, refused_endpoints, continuity_cuts,
-  unrouted_returns, events_lost, stop_quiescence, final_drain}`.
+  unrouted_returns, events_lost, length_insert_failures,
+  length_stash_mismatches, stop_quiescence, final_drain}`.
   `status` is `disabled` (no manifests, no lane), `active`,
   `partial` (live with refused endpoints, declared loss, or
   `events_lost` above zero), `unavailable` (startup failed) or
@@ -785,7 +786,13 @@ and never proves an app identity. See the app identity rows of
   double counted with it). While the `native capture events loss
   unknown` gap is present, `events_lost` may undercount; the kernel
   counter is cumulative, so the next good read restores the exact
-  total. `stop_quiescence` is `not_requested`,
+  total. `length_insert_failures`/`length_stash_mismatches` count
+  length-stash retention losses under `--key-sizes` (a full stash
+  map, a stale row deleted instead of trusted); both stay zero
+  without the flag. While the `key sizes loss unknown` gap is
+  present, they may undercount; the kernel counters are
+  cumulative, so the next good read restores the exact totals.
+  `stop_quiescence` is `not_requested`,
   `quiesced` or `unproven`; `final_drain` is null before stop,
   then whether the terminal drain ran clean: both owned cursors
   drained exactly to the proven Q with no post-Q writer and no

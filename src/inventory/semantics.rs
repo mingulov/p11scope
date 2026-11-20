@@ -760,6 +760,19 @@ pub(crate) trait LaneTestIo {
     fn events_ring_loss_fails(&mut self) -> bool {
         false
     }
+    /// Scripted length-stash kernel counters (cumulative insert
+    /// failures, stash mismatches). None when the scripted lane
+    /// models no readable counter.
+    fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
+        None
+    }
+    /// Scripted length-stash read failure (models a failed EVIDENCE
+    /// counter read). False unless the script poses one; distinct
+    /// from `length_stash_loss` returning None, which models no
+    /// readable counter at all.
+    fn length_stash_loss_fails(&mut self) -> bool {
+        false
+    }
     /// Scripted collection saturation: the scripted tick stopped at
     /// its record quantum with more possibly waiting.
     fn collection_saturated(&self) -> bool {
@@ -961,6 +974,17 @@ pub(crate) struct AttestedSemanticLane {
     events_loss_unknown: bool,
     /// The unknown-loss gap was already recorded.
     events_loss_unknown_reported: bool,
+    /// Last cumulative length-stash kernel counters read
+    /// (insert failures, stash mismatches); rises disclose.
+    length_stash_seen: (u64, u64),
+    /// Cumulative disclosed length-stash losses; feed the summary.
+    length_stash_loss: (u64, u64),
+    /// A length-stash counter read failed: the summary may
+    /// undercount until a later good read restores the exact
+    /// cumulative totals. Latched, never cleared.
+    length_loss_unknown: bool,
+    /// The unknown-loss gap was already recorded.
+    length_loss_unknown_reported: bool,
     /// The most recent lane tick's collection stopped at its record
     /// quantum with more possibly waiting. The driver reads this
     /// right after a successful tick and commits promptly so the
@@ -2170,6 +2194,10 @@ impl AttestedSemanticLane {
             events_ring_loss: 0,
             events_loss_unknown: false,
             events_loss_unknown_reported: false,
+            length_stash_seen: (0, 0),
+            length_stash_loss: (0, 0),
+            length_loss_unknown: false,
+            length_loss_unknown_reported: false,
             last_collection_saturated: false,
             oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
@@ -2428,6 +2456,10 @@ impl AttestedSemanticLane {
             events_ring_loss: 0,
             events_loss_unknown: false,
             events_loss_unknown_reported: false,
+            length_stash_seen: (0, 0),
+            length_stash_loss: (0, 0),
+            length_loss_unknown: false,
+            length_loss_unknown_reported: false,
             last_collection_saturated: false,
             oversized_drop_shed: BTreeMap::new(),
             #[cfg(test)]
@@ -2655,6 +2687,75 @@ impl AttestedSemanticLane {
         let delta = total.saturating_sub(self.events_ring_loss_seen);
         self.events_ring_loss_seen = total;
         (delta > 0).then_some(delta)
+    }
+
+    /// Note disclosed length-stash losses (insert failures plus
+    /// stash mismatches); feeds the summary.
+    pub(crate) fn note_length_stash_loss(&mut self, insert: u64, mismatch: u64) {
+        self.length_stash_loss.0 = self.length_stash_loss.0.saturating_add(insert);
+        self.length_stash_loss.1 = self.length_stash_loss.1.saturating_add(mismatch);
+    }
+
+    /// Poll the length-stash kernel counters; per-counter deltas on a
+    /// rise. Same cumulative-counter contract as
+    /// [`Self::poll_events_ring_loss`]: a failed read latches the
+    /// unknown-loss flag and delays disclosure to the next good
+    /// read. Tests substitute the counters through [`LaneTestIo`].
+    pub(crate) fn poll_length_stash_loss(&mut self) -> (Option<u64>, Option<u64>) {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if test.length_stash_loss_fails() {
+                self.length_loss_unknown = true;
+                return (None, None);
+            }
+            let Some((insert, mismatch)) = test.length_stash_loss() else {
+                return (None, None);
+            };
+            return self.note_length_stash_totals(insert, mismatch);
+        }
+        let Some(live) = self.live.as_mut() else {
+            return (None, None);
+        };
+        match live.session.length_stash_loss() {
+            Ok((insert, mismatch)) => self.note_length_stash_totals(insert, mismatch),
+            Err(_) => {
+                self.length_loss_unknown = true;
+                (None, None)
+            }
+        }
+    }
+
+    /// Take the unknown-loss disclosure, once per lane (mirrors
+    /// [`Self::take_events_loss_unknown`]).
+    pub(crate) fn take_length_loss_unknown(&mut self) -> bool {
+        if self.length_loss_unknown && !self.length_loss_unknown_reported {
+            self.length_loss_unknown_reported = true;
+            return true;
+        }
+        false
+    }
+
+    /// Fold one cumulative counter read into the lane: per-counter
+    /// deltas on a rise. The kernel counters only grow, so the last
+    /// read stands as the next baseline.
+    fn note_length_stash_totals(
+        &mut self,
+        insert: u64,
+        mismatch: u64,
+    ) -> (Option<u64>, Option<u64>) {
+        let insert_delta = insert.saturating_sub(self.length_stash_seen.0);
+        let mismatch_delta = mismatch.saturating_sub(self.length_stash_seen.1);
+        self.length_stash_seen = (insert, mismatch);
+        (
+            (insert_delta > 0).then_some(insert_delta),
+            (mismatch_delta > 0).then_some(mismatch_delta),
+        )
+    }
+
+    /// Cumulative disclosed length-stash losses (insert failures,
+    /// stash mismatches): the summary's length-loss account.
+    pub(crate) fn length_stash_loss_disclosed(&self) -> (u64, u64) {
+        self.length_stash_loss
     }
 
     /// Whether the most recent lane tick's collection stopped at its
@@ -5555,6 +5656,8 @@ impl AttestedSemanticLane {
                 continuity_cuts: 0,
                 unrouted_returns: 0,
                 events_lost: self.events_ring_loss,
+                length_insert_failures: self.length_stash_loss_disclosed().0,
+                length_stash_mismatches: self.length_stash_loss_disclosed().1,
                 stop_quiescence,
                 final_drain: self.is_finished().then_some(self.final_drain),
             };
@@ -5571,6 +5674,8 @@ impl AttestedSemanticLane {
             continuity_cuts: live.continuity_cuts,
             unrouted_returns: live.unrouted_returns,
             events_lost: self.events_ring_loss,
+            length_insert_failures: self.length_stash_loss_disclosed().0,
+            length_stash_mismatches: self.length_stash_loss_disclosed().1,
             stop_quiescence,
             final_drain: live.finished.then_some(self.final_drain),
         }
@@ -5648,6 +5753,8 @@ pub(crate) struct SemanticCaptureSummary {
     pub continuity_cuts: u64,
     pub unrouted_returns: u64,
     pub events_lost: u64,
+    pub length_insert_failures: u64,
+    pub length_stash_mismatches: u64,
     pub stop_quiescence: SemanticStopQuiescence,
     pub final_drain: Option<bool>,
 }
@@ -5655,7 +5762,8 @@ pub(crate) struct SemanticCaptureSummary {
 impl SemanticCaptureSummary {
     /// The exact `observation.semantic_capture` shape: `{status,
     /// admitted_endpoints, refused_endpoints, continuity_cuts,
-    /// unrouted_returns, events_lost, stop_quiescence, final_drain}`.
+    /// unrouted_returns, events_lost, length_insert_failures,
+    /// length_stash_mismatches, stop_quiescence, final_drain}`.
     /// `final_drain` is null before stop, then a boolean.
     pub(crate) fn json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -5665,6 +5773,8 @@ impl SemanticCaptureSummary {
             "continuity_cuts": self.continuity_cuts,
             "unrouted_returns": self.unrouted_returns,
             "events_lost": self.events_lost,
+            "length_insert_failures": self.length_insert_failures,
+            "length_stash_mismatches": self.length_stash_mismatches,
             "stop_quiescence": self.stop_quiescence.label(),
             "final_drain": self.final_drain,
         })

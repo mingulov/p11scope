@@ -701,6 +701,28 @@ last 2 minutes. The broad inventory keeps running to the end of the
 window with exact call counts, and detailed-tracking probes stay
 attached until exit.
 
+### Operation-length key sizes need a FULL build, and the Task 4 canary is outstanding
+
+`--key-sizes` (with `--key-operations`) infers key sizes from
+operation lengths. Length capture loads only on FULL builds (P0
+omits the length programs); when the sizes start fails — for
+example a length program the verifier refuses — the journal retries
+without sizes behind a `key sizes unavailable` gap and key rows
+continue without operation-length sizes. The Task 4 privacy canary
+for `--key-sizes` (length-cell sentinels on every shape proving no
+payload byte reaches output, maps or logs) has not run yet; it is
+an explicit outstanding item, blocked behind the joint-seal
+view-void work.
+
+### ECDSA signature lengths publish the size class, never the curve
+
+A 64-octet ECDSA signature is P-256, secp256k1 or brainpoolP256r1
+(96-octet likewise P-384/brainpoolP384r1), so a length alone never
+names a curve: unestablished EC rows read `EC 256-bit class`
+(`ec_class` in JSON) and the curve name appears only beside an
+established curve. Endpoints whose aliased names disagree on the
+length shape keep the base pair and read `no length evidence`.
+
 ### Established key metadata can miss a repeated attribute past the eighth slot
 
 Key metadata promotes a successful creation call's own observed
@@ -878,10 +900,15 @@ capture usually lands a clean run.
 
 ### `run` with many short-lived children can rarely miss seconds of calls
 
-On several kernels (seen on 6.6 and 7.3.1), a `p11scope run` capture
-with many short-lived child processes can rarely (about 1 in 15–30
-runs in our tests) miss a few seconds of calls without recording a
-gap row for the interval. A fix is planned for 0.8.0.
+Fixed in 0.7.2: `run`, `inventory --cgroup` and `inventory --system`
+captures no longer drop attached providers when processes turn over,
+so calls no longer go missing without a gap row. Verified on
+6.6.157 at 100/100 (waves and descendants) and on 6.12.111 and
+7.4-rc2 at 20/20 (7.3.1 was not re-run). Before 0.7.2, on several
+kernels (seen on 6.6 and 7.3.1), a `p11scope run` capture with many
+short-lived child processes could rarely (about 1 in 15–30 runs in
+our tests) miss a few seconds of calls without recording a gap row
+for the interval.
 
 ### Stub-pool provider manifests cover one getter-call order
 

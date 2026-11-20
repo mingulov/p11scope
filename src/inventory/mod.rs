@@ -3836,6 +3836,7 @@ impl ClassicDriver<'_> {
         // it.
         if let Some(lane) = self.semantic.as_mut() {
             self.coordinator.poll_and_disclose_events_ring_loss(lane);
+            self.coordinator.poll_and_disclose_length_stash_loss(lane);
         }
         // One honest stop disclosure through the shared helper: the
         // same aggregate scan-refusal gap plus lifetime call-count
@@ -4244,6 +4245,7 @@ impl ClassicDriver<'_> {
         // here, so the stop line and the served summary carry it
         // even when the lane never publishes again.
         coordinator.poll_and_disclose_events_ring_loss(&mut lane);
+        coordinator.poll_and_disclose_length_stash_loss(&mut lane);
         // A recorded terminal graph refusal predates any later
         // verdict, so it wins as the abandon reason (§1.9, §6.4).
         // Next the machine's latched disposition refusal, so the
@@ -6153,7 +6155,7 @@ fn start_semantic_lane(
                             coordinator.note_key_sizes_unavailable();
                             note_semantic_lane_sealed(true, key_operations);
                             coordinator.note_semantic_sealed();
-                            return Some(lane);
+                            return Some(*lane);
                         }
                         RetryWithoutSizes::Refused(retry_refusal) => {
                             // The sizes failure keeps its own named
@@ -6231,8 +6233,9 @@ fn start_semantic_lane(
 
 /// Outcome of the sizes-off journal retry: a seated lane, a second
 /// refusal (the ordinary retry still follows), or a latched stop.
+/// The lane rides boxed: it dwarfs the other variants.
 enum RetryWithoutSizes {
-    Sealed(crate::inventory_semantics::AttestedSemanticLane),
+    Sealed(Box<crate::inventory_semantics::AttestedSemanticLane>),
     Refused(crate::inventory_semantics::SemanticRefusal),
     Stopped,
 }
@@ -6254,15 +6257,17 @@ fn retry_journal_without_sizes(
     if stopped() {
         return RetryWithoutSizes::Stopped;
     }
-    let (attach_subset, convert_subset) =
-        match seal_mint_start_subsets(coordinator, scan_subset) {
-            Ok(pair) => pair,
-            Err(refusals) => {
-                return RetryWithoutSizes::Refused(refusals.into_iter().next().unwrap_or(
-                    crate::inventory_semantics::SemanticRefusal::Unavailable,
-                ));
-            }
-        };
+    let (attach_subset, convert_subset) = match seal_mint_start_subsets(coordinator, scan_subset) {
+        Ok(pair) => pair,
+        Err(refusals) => {
+            return RetryWithoutSizes::Refused(
+                refusals
+                    .into_iter()
+                    .next()
+                    .unwrap_or(crate::inventory_semantics::SemanticRefusal::Unavailable),
+            );
+        }
+    };
     if stopped() {
         return RetryWithoutSizes::Stopped;
     }
@@ -6275,7 +6280,7 @@ fn retry_journal_without_sizes(
         Some(&spec),
         run_control,
     ) {
-        Ok(lane) => RetryWithoutSizes::Sealed(lane),
+        Ok(lane) => RetryWithoutSizes::Sealed(Box::new(lane)),
         Err(refusal) => RetryWithoutSizes::Refused(refusal),
     }
 }
@@ -17647,6 +17652,8 @@ mod tests {
             ring_loss: std::collections::VecDeque<u64>,
             ring_loss_fail: std::collections::VecDeque<bool>,
             ring_loss_polls: std::rc::Rc<std::cell::Cell<usize>>,
+            stash_loss: std::collections::VecDeque<(u64, u64)>,
+            stash_loss_fail: std::collections::VecDeque<bool>,
         }
 
         impl StubLaneIo {
@@ -17674,6 +17681,8 @@ mod tests {
                     ring_loss: std::collections::VecDeque::new(),
                     ring_loss_fail: std::collections::VecDeque::new(),
                     ring_loss_polls: std::rc::Rc::new(std::cell::Cell::new(0)),
+                    stash_loss: std::collections::VecDeque::new(),
+                    stash_loss_fail: std::collections::VecDeque::new(),
                 }
             }
         }
@@ -17769,6 +17778,14 @@ mod tests {
 
             fn events_ring_loss_fails(&mut self) -> bool {
                 self.ring_loss_fail.pop_front().unwrap_or(false)
+            }
+
+            fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
+                self.stash_loss.pop_front()
+            }
+
+            fn length_stash_loss_fails(&mut self) -> bool {
+                self.stash_loss_fail.pop_front().unwrap_or(false)
             }
 
             fn collection_saturated(&self) -> bool {
@@ -18289,6 +18306,160 @@ mod tests {
                 ),
                 (0, 5, 0, 5)
             );
+        }
+
+        #[test]
+        fn length_stash_loss_discloses_named_gap_and_summary_counts() {
+            let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
+            // One failed read, then (3,1), flat, then (5,4): the
+            // failure discloses one unknown gap, the rises one named
+            // gap with exact counts that coalesce and accumulate.
+            scene.stub.stash_loss_fail =
+                std::collections::VecDeque::from([true, false, false, false]);
+            scene.stub.stash_loss = std::collections::VecDeque::from([(3, 1), (3, 1), (5, 4)]);
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                seal_scope: Scope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                attach_backend: crate::attach::BackendSelection::Auto,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
+                semantic_staged: false,
+                seated_summary: None,
+                second_signal: None,
+                lifecycle: crate::inventory_promotion::lifecycle::SelectedLifecycleService::new(),
+                completion_source: None,
+                pending_install: None,
+                installed_promotion: None,
+                retiring: None,
+                joint_finish: JointFinishDriver::NotBegun,
+                stop_requested: false,
+                prearm_stop_probe: None,
+                prearm_probe_stop: None,
+                joint_first_error: None,
+                suspended: false,
+                joint_commit_pending: false,
+                joint_tick_refusal: None,
+                joint_commit_retries: 0,
+                #[cfg(test)]
+                terminal_seq_calls: 0,
+                #[cfg(test)]
+                reclaim_calls: Vec::new(),
+                #[cfg(test)]
+                joint_begin_calls: 0,
+                #[cfg(test)]
+                joint_step_calls: 0,
+                #[cfg(test)]
+                joint_commit_polls: 0,
+                #[cfg(test)]
+                take_promotion_work_calls: 0,
+                #[cfg(test)]
+                drive_pending_install_calls: 0,
+                #[cfg(test)]
+                service_caller_metadata_calls: 0,
+                #[cfg(test)]
+                commit_calls: 0,
+            };
+            let gaps_by_subject = |driver: &ClassicDriver<'_>, subject: &str| {
+                driver
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .zip(driver.coordinator.registry().gap_repeats().iter())
+                    .filter(|(gap, _)| gap.subject == subject)
+                    .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+                    .collect::<Vec<_>>()
+            };
+            let stash_counts = |driver: &ClassicDriver<'_>| {
+                let lane = driver.semantic.as_ref().unwrap();
+                let summary = lane.semantic_summary();
+                (
+                    lane.length_stash_loss_disclosed(),
+                    summary.length_insert_failures,
+                    summary.length_stash_mismatches,
+                )
+            };
+            // The first tick stages without committing: nothing disclosed.
+            driver.on_tick();
+            assert!(driver.semantic_staged, "the first tick stages");
+            assert!(gaps_by_subject(&driver, "key sizes loss unknown").is_empty());
+            assert!(gaps_by_subject(&driver, "key sizes lost some lengths").is_empty());
+            assert_eq!(stash_counts(&driver), ((0, 0), 0, 0));
+            // The failed read discloses one unknown gap, and no
+            // counted loss (the counters never answered).
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "key sizes loss unknown"),
+                [(
+                    "the length-stash counters could not be read; the summary may undercount until a later good read restores the exact cumulative totals"
+                        .to_string(),
+                    1
+                )],
+                "a failed read discloses one unknown gap"
+            );
+            assert!(gaps_by_subject(&driver, "key sizes lost some lengths").is_empty());
+            assert_eq!(stash_counts(&driver), ((0, 0), 0, 0));
+            // The rise to (3,1) discloses one named gap plus exact counts.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "key sizes lost some lengths"),
+                [(
+                    "the length stash dropped retention (a full map or a stale row; exact counts in the semantic capture summary)"
+                        .to_string(),
+                    1
+                )],
+                "a rise discloses one named gap"
+            );
+            assert_eq!(stash_counts(&driver), ((3, 1), 3, 1));
+            // A flat read discloses nothing new.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "key sizes lost some lengths").len(),
+                1
+            );
+            assert_eq!(
+                gaps_by_subject(&driver, "key sizes lost some lengths")[0].1,
+                1
+            );
+            assert_eq!(stash_counts(&driver), ((3, 1), 3, 1));
+            // The next rise accumulates onto the same gap row and counts.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert_eq!(
+                gaps_by_subject(&driver, "key sizes lost some lengths").len(),
+                1
+            );
+            assert_eq!(
+                gaps_by_subject(&driver, "key sizes lost some lengths")[0].1,
+                2,
+                "rises coalesce onto one gap row"
+            );
+            assert_eq!(stash_counts(&driver), ((5, 4), 5, 4));
         }
 
         #[test]

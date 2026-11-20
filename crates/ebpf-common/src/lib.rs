@@ -1569,7 +1569,8 @@ pub const RING_BYTES: u32 = 4096;
 
 /// EVENTS capacity for a capture whose journal (Joint key-operations)
 /// lane is active, sized at load; every other capture keeps
-/// [`RING_BYTES`]. A journaled call writes a 224 B START and a 632 B END,
+/// [`RING_BYTES`]. A journaled call writes a 224 B START and a 632 B END
+/// (648 B with `--key-sizes`, when the length trailer rides along),
 /// so 4 MiB holds about 0.45 s at 10,000 calls/s, less than one large
 /// quantum's seal; 16 MiB holds about 1.9 s and 32 MiB about 3.9 s. Since
 /// the default ring grew to 32 MiB this equals [`RING_BYTES`] (never

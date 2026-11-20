@@ -11689,6 +11689,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // cumulative and the last good value stands.
         if let Some(lane) = lane.as_deref_mut() {
             self.poll_and_disclose_events_ring_loss(lane);
+            self.poll_and_disclose_length_stash_loss(lane);
         }
         self.finalize_semantic_batches(lane);
         let applied = self.publish_registry(None)?;

@@ -15251,6 +15251,21 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         object.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n            if start_remove_for::<JOURNAL>(&key, true, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST)\n                .is_err()\n            {\n                unsafe { p11_object_fault() };\n                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n            }\n            if Record::LENGTH {\n                length_return_abandon(&key);\n            }\n            return 0;\n        }"),
         "object aggregate gate must retire, then return before any submit"
     );
+    // The journal ordinary_return aggregate gate deletes the stash
+    // row too (journal sessions never run aggregate today; the
+    // branch stays consistent for the day one does).
+    let journal = read("crates/ebpf/src/journal_roots.rs");
+    let journal_ordinary = between(
+        &journal,
+        "pub(crate) fn ordinary_return<Record: ReturnPayload>(",
+        "let mut image = ImageIdentity::default();",
+    );
+    assert!(
+        journal_ordinary.contains(
+            "if Record::LENGTH {\n                length_return_abandon(&key);\n            }\n            return 0;"
+        ),
+        "journal aggregate gate must delete the stash row before returning"
+    );
 
     let allowed = between(
         &ebpf,

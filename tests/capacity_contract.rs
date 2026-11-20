@@ -204,6 +204,9 @@ fn inventory_names_every_resource_with_its_exact_limit() {
     }
     assert_eq!(limit_of("stats_slots"), u64::from(MAX_SLOTS));
     assert_eq!(limit_of("start_inflight"), u64::from(START_ENTRIES));
+    // The flag-on stash reservation (evidence_start_entries(true));
+    // with --key-sizes off the loader overrides it to one row.
+    assert_eq!(limit_of("length_stash_inflight"), 16_384);
     assert_eq!(limit_of("rv_keys"), u64::from(RV_ENTRIES));
     assert_eq!(limit_of("descriptors"), u64::from(MAX_DESCRIPTORS));
     assert_eq!(limit_of("task_owners"), THREAD_OWNER_LIMIT);

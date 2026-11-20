@@ -3202,6 +3202,57 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Disclose a length-stash loss rise: exact counts feed the
+    /// summary, plus one named gap. Insert failures mean the stash
+    /// map was full (calls ran without retention); mismatches mean
+    /// a stale row was deleted, never trusted. The reason stays
+    /// stable so repeat rises coalesce onto one gap row; the exact
+    /// cumulative counts live in the summary.
+    fn disclose_length_stash_loss(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        insert: u64,
+        mismatch: u64,
+    ) {
+        lane.note_length_stash_loss(insert, mismatch);
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "key sizes lost some lengths".into(),
+            reason: "the length stash dropped retention (a full map or a \
+                 stale row; exact counts in the semantic capture summary)"
+                .into(),
+            budget: None,
+        });
+    }
+
+    /// Poll the length-stash counters and disclose the outcome
+    /// beside the ring loss: a rise stages the named loss gap with
+    /// exact counts; the first failed read stages one "loss
+    /// unknown" gap. Without `--key-sizes` the counters stay zero,
+    /// so the lane stays quiet.
+    pub(crate) fn poll_and_disclose_length_stash_loss(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+    ) {
+        let (insert, mismatch) = lane.poll_length_stash_loss();
+        if insert.is_some() || mismatch.is_some() {
+            self.disclose_length_stash_loss(lane, insert.unwrap_or(0), mismatch.unwrap_or(0));
+        }
+        if lane.take_length_loss_unknown() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "key sizes loss unknown".into(),
+                reason: "the length-stash counters could not be read; the summary may undercount until a later good read restores the exact cumulative totals"
+                    .into(),
+                budget: None,
+            });
+        }
+    }
+
     /// Resolve semantic batches a latched machine stranded behind
     /// its unfinished Joint publication, so the exit-hold abandon
     /// strands neither a Prepared blocker nor an unpublished batch.

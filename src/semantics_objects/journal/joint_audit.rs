@@ -437,7 +437,9 @@ impl AuditedFailure<'_> {
         {
             SealFailureDisposition::HistoryLoss
         } else {
-            disposition_of(self.failure.gap)
+            // Real loss above wins over a transient take: loss is
+            // evidence, a failed take is its absence.
+            self.failure.delivery_disposition()
         }
     }
 
@@ -473,7 +475,10 @@ impl AuditedFailure<'_> {
 }
 
 fn failure_rank(failure: &SealFailure) -> u8 {
-    match disposition_of(failure.gap) {
+    // Contention-failed takes rank as retry, below real endings: a
+    // transient take failure never masks a fallback or loss the
+    // frame must deliver.
+    match failure.delivery_disposition() {
         SealFailureDisposition::Retry => 0,
         SealFailureDisposition::Fallback => 1,
         SealFailureDisposition::HistoryLoss => 2,
@@ -2504,12 +2509,17 @@ pub(crate) mod tests {
     use super::super::{JournalGap, ObjectEffects, SealFailure, SealFailureScope};
     use super::failure_rank;
 
-    /// Failure selection ranks an unknown take below real endings: a
-    /// transient take failure never masks a fallback or loss the
-    /// frame must deliver.
+    /// Failure selection ranks a transient unknown take below real
+    /// endings: a transient take failure never masks a fallback or
+    /// loss the frame must deliver. A permanent take fact ranks with
+    /// the fallback it keeps.
     #[test]
     fn failure_rank_orders_unknown_take_below_endings() {
-        fn failure(gap: JournalGap, take_failed: bool) -> SealFailure {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        fn failure(
+            gap: JournalGap,
+            take_failed: Option<crate::attach::BirthObservationRefusal>,
+        ) -> SealFailure {
             SealFailure {
                 scope: SealFailureScope::Unqualified,
                 gap,
@@ -2519,12 +2529,26 @@ pub(crate) mod tests {
                 take_failed,
             }
         }
-        let unknown = failure_rank(&failure(JournalGap::BootstrapMismatch, true));
-        let fallback = failure_rank(&failure(JournalGap::BootstrapMismatch, false));
-        let loss = failure_rank(&failure(JournalGap::H3Loss, false));
-        let retry = failure_rank(&failure(JournalGap::H3Pending, false));
-        assert_eq!(unknown, retry, "an unknown take ranks as retry");
-        assert!(unknown < fallback, "an unknown take never masks a fallback");
-        assert!(unknown < loss, "an unknown take never masks loss");
+        let unknown = failure_rank(&failure(
+            JournalGap::BootstrapMismatch,
+            Some(Refusal::CurrentPartition),
+        ));
+        let permanent = failure_rank(&failure(
+            JournalGap::BootstrapMismatch,
+            Some(Refusal::MarkerNotReady),
+        ));
+        let fallback = failure_rank(&failure(JournalGap::BootstrapMismatch, None));
+        let loss = failure_rank(&failure(JournalGap::H3Loss, None));
+        let retry = failure_rank(&failure(JournalGap::H3Pending, None));
+        assert_eq!(unknown, retry, "a transient take ranks as retry");
+        assert!(
+            unknown < fallback,
+            "a transient take never masks a fallback"
+        );
+        assert!(unknown < loss, "a transient take never masks loss");
+        assert_eq!(
+            permanent, fallback,
+            "a permanent take fact ranks with fallback"
+        );
     }
 }

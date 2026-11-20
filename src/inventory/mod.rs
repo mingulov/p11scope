@@ -31867,6 +31867,20 @@ mod seal_readiness_tests {
             1,
             "the journal failures void key operations exactly once"
         );
+        let sizes_gaps = gaps_for_subject(&mut coordinator, "key sizes unavailable");
+        assert_eq!(sizes_gaps.len(), 1, "the sizes gap is present");
+        assert!(
+            sizes_gaps[0].1.contains("sizes-off retry also refused"),
+            "the double-refusal names the retry refusal: {}",
+            sizes_gaps[0].1
+        );
+        assert!(
+            !sizes_gaps[0]
+                .1
+                .contains("key operations continue without"),
+            "the double-refusal must not promise continued key operations: {}",
+            sizes_gaps[0].1
+        );
         assert!(
             !coordinator
                 .registry()

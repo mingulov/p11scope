@@ -102,6 +102,7 @@ p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1
 key operations: 2 keys on 1 provider; rev 12 populated; 1 session
   key row 1 object 9 sign key (rsa_2048): probably RSA (from mechanism); RSA 2048 (from signature length)
 p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0
+p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0
 """
 
 #: The --key-sizes shape with rendered rows but no classified size
@@ -112,7 +113,14 @@ p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1
 key operations: 1 key on 1 provider; rev 12 populated; 1 session
   key row 1 object 9 sign key (unknown): probably secret-key (from mechanism); size unknown (no length map for this mechanism)
 p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0
+p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0
 """
+
+#: The --key-sizes shape with a classified RSA size in the provider
+#: tally but no classified size in any per-key row: the exact-row
+#: check must fail it.
+LINKED_KEY_SIZES_RSA_ELSEWHERE_TEXT = LINKED_KEY_SIZES_NO_RSA_TEXT + \
+    "  RSA 2048: sign: 1 operation (probably secret-key: 1)\n"
 
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
@@ -217,6 +225,10 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-norows": key_sizes_rows(),
             "linked-key-sizes-norsa": key_sizes_rows(),
             "linked-key-sizes-malformed": key_sizes_rows(),
+            "linked-key-sizes-mixed": key_sizes_rows(),
+            "linked-key-sizes-no-decoder": key_sizes_rows(),
+            "linked-key-sizes-unprovable": key_sizes_rows(),
+            "linked-key-sizes-rsa-elsewhere": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -246,7 +258,27 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-malformed": {
                 "rc": 0,
                 "text": LINKED_KEY_SIZES_TEXT.replace(
-                    "audit_malformed=0 ", "audit_malformed=3 ")},
+                    "audit_malformed=0 ", "audit_malformed=3 ").replace(
+                    "raw_malformed=0 ", "raw_malformed=3 ")},
+            "linked-key-sizes-mixed": {
+                "rc": 0,
+                "text": LINKED_KEY_SIZES_TEXT.replace(
+                    "void_audit=0 ", "void_audit=1 ").replace(
+                    "audit_fault_changed_chain=0 ",
+                    "audit_fault_changed_chain=1 ").replace(
+                    "raw_malformed=0 ", "raw_malformed=3 ")},
+            "linked-key-sizes-no-decoder": {
+                "rc": 0,
+                "text": LINKED_KEY_SIZES_TEXT.replace(
+                    "p11scope: joint decoder: raw_malformed=0 "
+                    "raw_malformed_unprovable=0\n", "")},
+            "linked-key-sizes-unprovable": {
+                "rc": 0,
+                "text": LINKED_KEY_SIZES_TEXT.replace(
+                    "raw_malformed_unprovable=0",
+                    "raw_malformed_unprovable=1")},
+            "linked-key-sizes-rsa-elsewhere": {
+                "rc": 0, "text": LINKED_KEY_SIZES_RSA_ELSEWHERE_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -686,6 +718,70 @@ class JournalGateTests(unittest.TestCase):
                                     key_sizes="1")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("malformed journal records under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_mixed_cause_malformed_fails(self):
+        # Non-vacuity: a malformed record classified by a preceding
+        # FaultChanged cause leaves audit_malformed=0, but the raw
+        # decoder count is positive: the gate must fail on the raw
+        # count even though a healthy RSA row rendered.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-mixed",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("malformed journal records under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_without_decoder_line_fails(self):
+        # Non-vacuity: a missing terminal raw count refuses the
+        # --key-sizes leg even with a classified size and a clean
+        # audit split.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-no-decoder",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_unprovable_decoder_fails(self):
+        # Non-vacuity: an unprovable terminal raw count refuses the
+        # --key-sizes leg even with a classified size.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-unprovable",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_rsa_token_elsewhere_fails(self):
+        # Non-vacuity: an RSA token outside any per-key sign row
+        # (a provider tally) does not satisfy the classified-size
+        # proof: the per-key row still reads size unknown.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-rsa-elsewhere",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no classified RSA-2048 size under --key-sizes",
                       result.stdout)
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])

@@ -9188,10 +9188,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ) => (*base, *base, *base_since, *base_since),
             // A pruned dropped pair keeps its exact base as a tombstone:
             // the revival rebases past it exactly like an unpruned drop.
+            // A late-bound row (recorded before its caller's admission)
+            // rebases past its first sight instead: the pre-admission
+            // subtotal is unattributed, and only post-admission growth
+            // stages.
             None => {
+                let late = self
+                    .adapter
+                    .record(caller)
+                    .is_some_and(|record| row.recorded_at_ns < record.first_seen_ns);
+                let fresh = if late {
+                    let sight = row.entry_count;
+                    (sight, sight, held_first, held_first)
+                } else {
+                    (0, 0, 0, held_first)
+                };
                 self.pair_dropped_tombstones
                     .get(&key)
-                    .map_or((0, 0, 0, held_first), |pruned| {
+                    .map_or(fresh, |pruned| {
                         (
                             pruned.base,
                             pruned.base,
@@ -25597,6 +25611,37 @@ exit 0
     }
 
     #[test]
+    fn counts_for_a_late_bound_row_rebase_past_the_pre_admission_sight() {
+        // Late binding: the row was recorded before the admission (t0
+        // 40 < 50) with a first-sight count of 2 (pre-admission calls
+        // the edge never attributes). The bind rebases past that
+        // sight, so only post-admission growth stages: refresh to 5
+        // reads 3.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 3);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 40,
+                lossy: false,
+                pid_exit: false
+            }
+        );
+    }
+
+    #[test]
     fn counts_for_an_unbound_row_never_publish() {
         // R-C51-1 and DR-C51-PREADMIT: the row never binds, so its
         // first-sight count, its refreshes, and any later refresh all
@@ -28089,7 +28134,7 @@ exit 0
     #[test]
     fn demoted_place_marks_its_edge() {
         // Round 4, window anchor (R4-N2): a demoted placement marks its
-        // edge (caller-scoped, memoized once), so the oracle judges the
+        // module (one counted row per module), so the oracle judges the
         // segment-relative count upper-bound-only instead of exact.
         use crate::discovery::caller_registry::DEMOTED_COUNT_PLACED;
         use crate::discovery::inventory_attach_set::tests as fx;
@@ -28157,14 +28202,19 @@ exit 0
         assert_eq!(
             markers.len(),
             1,
-            "one demotion marker, memoized across placements: {:?}",
+            "one demotion marker, folded across placements: {:?}",
             registry.gaps()
         );
         assert_eq!(
             (markers[0].caller, markers[0].module),
-            (Some(caller), Some(id_b)),
-            "the marker scopes to the demoted edge: {:?}",
+            (None, Some(id_b)),
+            "the marker scopes to the demoted module: {:?}",
             markers[0]
+        );
+        assert!(
+            markers[0].reason.contains("(2 placements)"),
+            "both demoted advances merge into the one row: {}",
+            markers[0].reason
         );
         assert_ne!(id_a, id_b, "the history holder carries no marker");
     }

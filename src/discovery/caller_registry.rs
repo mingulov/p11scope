@@ -3959,6 +3959,27 @@ struct UnroutedAggregate {
     gap_index: Option<usize>,
 }
 
+/// One aggregated per-module demoted-placement marker: the placement
+/// count with the retained row's index once it lands. Keyed by
+/// (module, subject) so a late-bind storm folds into one counted gap
+/// per module instead of one gap per caller.
+struct DemotedPlacedAggregate {
+    placements: u64,
+    gap_index: Option<usize>,
+}
+
+/// Format an aggregated demoted-placement reason: the placement count
+/// plus the window-anchor disclosure every placed edge shares (each
+/// placed count covers a workload segment from its base read, never
+/// the whole workload).
+fn demoted_placed_reason(placements: u64) -> String {
+    format!(
+        "a demoted count placed post-demotion growth on this module ({} placement{}): each placed edge's count covers a workload segment starting at its base read, never the whole workload, so per-segment exactness is unverifiable and only the ledger window's upper bound applies",
+        placements,
+        if placements == 1 { "" } else { "s" },
+    )
+}
+
 /// Format an aggregated unrouted reason with the exact
 /// single-drain template: `{total} calls shed without a route
 /// ({label}={count} ...) with/from ...`. Labels sort by name
@@ -4067,6 +4088,14 @@ pub(crate) struct CallerRegistry {
     /// Aggregated subjects already counted as suppressed: a
     /// suppressed aggregate counts once, not once per merged drain.
     suppressed_aggregates: HashSet<(String, usize)>,
+    /// Aggregated demoted-placement markers by (module, subject):
+    /// repeated placements sum into one counted row instead of one
+    /// row per caller. Bounded by distinct (module, subject) pairs
+    /// (few modules, one subject).
+    demoted_placed_aggregates: BTreeMap<(ModuleKey, &'static str), DemotedPlacedAggregate>,
+    /// Aggregated markers already counted as suppressed: a suppressed
+    /// aggregate counts once, not once per merged placement.
+    suppressed_demoted_placed: BTreeSet<(ModuleKey, &'static str)>,
     /// Terminal/stop-time phase: set once the lane stops. Gaps staged
     /// from now on carry the terminal flag and may use the headroom
     /// above the bound; gaps staged before it keep the plain bound
@@ -4388,6 +4417,8 @@ impl CallerRegistry {
             gaps_suppressed: 0,
             unrouted_aggregates: HashMap::new(),
             suppressed_aggregates: HashSet::new(),
+            demoted_placed_aggregates: BTreeMap::new(),
+            suppressed_demoted_placed: BTreeSet::new(),
             terminal_phase: false,
             staged: Vec::new(),
             joint_publication: None,
@@ -7550,15 +7581,99 @@ impl CallerRegistry {
         }
     }
 
+    /// Merge one demoted placement into the (module, subject) counted
+    /// row: the first placement retains one module-level row, later
+    /// placements rewrite it in place with the new placement count.
+    /// The row keeps `repeats` 1 (consumers multiply count by
+    /// repeats, so a summed row must not count placements there). A
+    /// suppressed aggregate counts once per (module, subject), never
+    /// once per merged placement.
+    fn push_demoted_placed(&mut self, key: &ModuleKey, module: Option<ModuleId>) {
+        let memo = (key.clone(), DEMOTED_COUNT_PLACED);
+        let (reason, retained_index) = {
+            let aggregate = self
+                .demoted_placed_aggregates
+                .entry(memo.clone())
+                .or_insert(DemotedPlacedAggregate {
+                    placements: 0,
+                    gap_index: None,
+                });
+            aggregate.placements = aggregate.placements.saturating_add(1);
+            (
+                demoted_placed_reason(aggregate.placements),
+                aggregate.gap_index,
+            )
+        };
+        let reason = with_key(reason, module, key);
+        // A retained row rewrites in place (the dedupe key follows
+        // the new reason); repeats stays 1.
+        if let Some(index) = retained_index
+            && let Some(retained) = self.gaps.get_mut(index)
+            && retained.subject == DEMOTED_COUNT_PLACED
+            && retained.caller.is_none()
+            && retained.module == module
+        {
+            let old = std::mem::replace(&mut retained.reason, reason.clone());
+            self.gap_index.remove(&RegistryGap {
+                caller: None,
+                module,
+                pid: None,
+                subject: DEMOTED_COUNT_PLACED.into(),
+                reason: old,
+                budget: None,
+            });
+            self.gap_index.insert(
+                RegistryGap {
+                    caller: None,
+                    module,
+                    pid: None,
+                    subject: DEMOTED_COUNT_PLACED.into(),
+                    reason,
+                    budget: None,
+                },
+                index,
+            );
+            return;
+        }
+        // First landing (or a lost index): retain one row through
+        // the budgeted path. An aggregate suppressed once stays
+        // suppressed without recounting per merged placement.
+        if self.suppressed_demoted_placed.contains(&memo) {
+            return;
+        }
+        let gap = RegistryGap {
+            caller: None,
+            module,
+            pid: None,
+            subject: DEMOTED_COUNT_PLACED.into(),
+            reason,
+            budget: None,
+        };
+        let before = self.gaps.len();
+        let terminal = self.terminal_phase;
+        self.push_gap_as(gap.clone(), terminal);
+        if let Some(&index) = self.gap_index.get(&gap) {
+            if let Some(aggregate) = self.demoted_placed_aggregates.get_mut(&memo) {
+                aggregate.gap_index = Some(index);
+            }
+            debug_assert!(self.gaps.len() == before + 1 || self.gap_repeats[index] > 1);
+        } else {
+            // `push_gap` counted this distinct suppression; later
+            // merges of the same aggregate return early above.
+            self.suppressed_demoted_placed.insert(memo);
+        }
+    }
+
     /// One demoted count install (round 4, re-place): growth past the
     /// pair's accounted `base` accumulates onto the edge. The install
     /// is the edge's publication-start count plus the covered growth
     /// staged this publication — exact across any number of reads per
     /// commit — and still honors strict advance (an edge another pair
     /// already carried past the install keeps its maximum). Growth
-    /// starting past the edge's publication-start count marks the edge
-    /// (once per caller and module): its count is segment-relative, so
-    /// per-segment exactness is unverifiable (round 4, window anchor).
+    /// starting past the edge's publication-start count merges into
+    /// the module's counted marker: the placed count is
+    /// segment-relative, so per-segment exactness is unverifiable
+    /// (round 4, window anchor).
     fn apply_demoted_use(
         &mut self,
         caller: CallerId,
@@ -7576,17 +7691,7 @@ impl CallerRegistry {
             return;
         };
         if base > base_edge {
-            self.push_coverage_gap(
-                caller,
-                module,
-                Some(id),
-                DEMOTED_COUNT_PLACED,
-                "a demoted count placed post-demotion growth on this edge: the edge's count covers \
-                 a workload segment starting at the base read, never the whole workload, so \
-                 per-segment exactness is unverifiable and only the ledger window's upper bound \
-                 applies"
-                    .into(),
-            );
+            self.push_demoted_placed(module, Some(id));
         }
         let absolute = base.saturating_add(growth);
         let state = self
@@ -10416,6 +10521,52 @@ pub(crate) mod tests {
         registry.publish();
         assert_eq!(registry.gaps().len(), 1);
         assert_eq!(registry.gap_repeats(), &[2]);
+    }
+
+    #[test]
+    fn demoted_placements_fold_into_one_counted_gap_per_module() {
+        // Round 4, window anchor, folded: three demoted placements (two
+        // callers on a.so, one on b.so) retain one counted row per
+        // module instead of one row per caller. Each row keeps
+        // `repeats` 1: the count lives in the reason.
+        let mut registry = registry();
+        let info_a = module_info("/lib/a.so", 11, AdmissionState::Admitted);
+        let key_a = info_a.key.clone();
+        let info_b = module_info("/lib/b.so", 12, AdmissionState::Admitted);
+        let key_b = info_b.key.clone();
+        registry.note_mapping(CallerId(0), 50, info_a.clone(), 100);
+        registry.note_mapping(CallerId(1), 51, info_a, 100);
+        registry.note_mapping(CallerId(2), 52, info_b, 100);
+        registry.publish();
+        registry.note_counted_use(CallerId(0), &key_a, 5, 110, 120, 3);
+        registry.note_counted_use(CallerId(1), &key_a, 7, 130, 140, 4);
+        registry.note_counted_use(CallerId(2), &key_b, 9, 150, 160, 2);
+        registry.publish();
+        let markers: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == DEMOTED_COUNT_PLACED)
+            .collect();
+        assert_eq!(markers.len(), 2, "{:?}", registry.gaps());
+        assert_eq!(registry.gaps().len(), 2, "{:?}", registry.gaps());
+        let id_a = registry.module_id_for(&key_a).unwrap();
+        let id_b = registry.module_id_for(&key_b).unwrap();
+        for marker in &markers {
+            assert_eq!(marker.caller, None, "{marker:?}");
+        }
+        assert_eq!(registry.gap_repeats(), &[1, 1]);
+        let row_a = markers.iter().find(|gap| gap.module == Some(id_a)).unwrap();
+        let row_b = markers.iter().find(|gap| gap.module == Some(id_b)).unwrap();
+        assert!(
+            row_a.reason.contains("(2 placements)"),
+            "two placements on a.so: {}",
+            row_a.reason
+        );
+        assert!(
+            row_b.reason.contains("(1 placement)"),
+            "one placement on b.so: {}",
+            row_b.reason
+        );
     }
 
     #[test]

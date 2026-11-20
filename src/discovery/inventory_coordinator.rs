@@ -10341,19 +10341,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 base_since: split_since,
                             },
                         );
-                    } else if let Some(target) = self.pair_targets.get_mut(&key) {
-                        match target {
-                            PairTarget::Bound {
-                                staged, staged_ns, ..
-                            }
-                            | PairTarget::Pending {
-                                staged, staged_ns, ..
-                            } => {
-                                *staged = (*staged).max(top.count);
-                                *staged_ns = top.anchor_ns;
-                            }
-                            _ => {}
+                    } else if let Some(
+                        PairTarget::Bound {
+                            staged, staged_ns, ..
                         }
+                        | PairTarget::Pending {
+                            staged, staged_ns, ..
+                        },
+                    ) = self.pair_targets.get_mut(&key)
+                    {
+                        *staged = (*staged).max(top.count);
+                        *staged_ns = top.anchor_ns;
                     }
                     self.recoveries.insert(key, recovery);
                     continue;
@@ -13188,13 +13186,12 @@ fn split_withheld_growth(
             split_since = read.anchor_ns;
         }
     }
-    if let Some(held_read) = held {
-        if held_read.count > watermark
-            && held_read.retirement_usable
-            && held_read.count > split_top.map_or(split_base, |top| top.count)
-        {
-            split_top = Some(held_read);
-        }
+    if let Some(held_read) = held
+        && held_read.count > watermark
+        && held_read.retirement_usable
+        && held_read.count > split_top.map_or(split_base, |top| top.count)
+    {
+        split_top = Some(held_read);
     }
     (split_base, split_since, split_top)
 }

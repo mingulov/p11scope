@@ -151,10 +151,11 @@ impl RefreshQueue {
                 inserted: false,
             };
         }
-        if existing.is_none() && self.queue.len() >= MAX_PENDING_REFRESH {
-            if self.relieve_one(pid, views, collected_finish).is_none() {
-                return RefreshIntake::QueueFull { consumed };
-            }
+        if existing.is_none()
+            && self.queue.len() >= MAX_PENDING_REFRESH
+            && self.relieve_one(pid, views, collected_finish).is_none()
+        {
+            return RefreshIntake::QueueFull { consumed };
         }
         let Some(serial) = self.last_serial.checked_add(1) else {
             return RefreshIntake::SerialsExhausted {

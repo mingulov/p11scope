@@ -8695,10 +8695,9 @@ fn read_hash_chunk_with_resume(
     }
     let suffix_offset = offset + done as u64;
     let suffix = &mut bytes[done..];
-    let batch_allowed = match batch_spent.as_deref() {
-        Some(spent) => Some(batch_byte_allowance(*spent, suffix.len())),
-        None => None,
-    };
+    let batch_allowed = batch_spent
+        .as_deref()
+        .map(|spent| batch_byte_allowance(*spent, suffix.len()));
     let capture_allowed = budget.allowed_capture_io(suffix.len());
     let allowed = match &batch_allowed {
         Some(Ok(batch)) => capture_allowed.min(*batch),
@@ -10269,6 +10268,7 @@ impl PinOutcome {
 /// fix8 F2's budget stop): this object plus every remaining one waits
 /// under the named `detail` gap — never attempted (or closed back out
 /// before retention), never rejected.
+#[allow(clippy::too_many_arguments)] // Pin-stop filing takes the whole candidate context.
 fn record_pin_stop(
     pinned: &mut PinnedObjects,
     view: ProcessViewId,
@@ -10305,12 +10305,11 @@ fn record_scanned_candidate(
         // the open waits for the next tick with the whole view. Every
         // other outcome files its own named skip below; no outcome
         // here rejects the key.
-        Err(PinOutcome::Wait { cause, reason, .. })
-            if matches!(
-                cause,
-                WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop
-            ) =>
-        {
+        Err(PinOutcome::Wait {
+            cause: WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop,
+            reason,
+            ..
+        }) => {
             // Out of handles: the open waits for the next tick — or
             // names the terminal wait when the lane never retries
             // (one-shot inspect). No key rejection — nothing was
@@ -18543,7 +18542,7 @@ mod tests {
         assert!(retained.rejects(key), "the proven collision replays");
         assert_eq!(retained.pinned().count(), 0);
         assert!(
-            retained.sweep_match_keys().get(&key).is_none(),
+            !retained.sweep_match_keys().contains_key(&key),
             "a rejected key never matches"
         );
 

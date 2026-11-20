@@ -10728,8 +10728,10 @@ mod tests {
         let mut shapes = std::collections::BTreeMap::new();
         for delta in 1u64..=3000 {
             let mut f = BracketFixture::with_providers(8, true, &["provider2.so"]);
-            let mut budget = CaptureWorkBudget::default();
-            budget.table_candidates = MAX_TABLE_CANDIDATES;
+            let mut budget = CaptureWorkBudget {
+                table_candidates: MAX_TABLE_CANDIDATES,
+                ..Default::default()
+            };
             budget.set_work_ceiling_for_test(budget.work_units_count() + delta);
             let hints = f.provider_paths();
             let Ok(outcome) = f.run_with_hints(&hints, &mut budget) else {

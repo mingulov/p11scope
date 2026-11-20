@@ -51,12 +51,9 @@ const RSA_IDS: &[u64] = &[
     0x00000043, 0x00000044, 0x00000045, 0x00000046, 0x00000047, 0x00000060, 0x00000061, 0x00000062,
     0x00000063, 0x00000064, 0x00000065, 0x00000066, 0x00000067, 0x00001054, 0x00004001, 0x00004002,
 ];
-/// The EC family plus the NSS ECDHE keygen id (the §4.2
-/// exception's EC member — see [`ML_KEM_IDS`]).
 const EC_IDS: &[u64] = &[
     0x00001041, 0x00001042, 0x00001043, 0x00001044, 0x00001045, 0x00001046, 0x00001047, 0x00001048,
     0x00001049, 0x0000104a, 0x00001050, 0x00001051, 0x00001052, 0x00001053, 0x00004038, 0x00004039,
-    0xCE53_437F,
 ];
 const EDDSA_IDS: &[u64] = &[0x00001057];
 const XEDDSA_IDS: &[u64] = &[0x00004029];
@@ -141,10 +138,14 @@ const ECDH1_FAMILY_IDS: &[u64] = &[
     0x00001050, 0x00001051, 0x00001052, 0x00001053, 0x00004038, 0x00004039,
 ];
 /// §4.5 ECDH1 qualifier (Montgomery compatibility): ECMQV excluded.
-/// The trailing id is the NSS ECDHE keygen id (NSS generates X25519
-/// through it — `lib/ssl/ssl3ecc.c` `ssl_CreateECDHEPrivateKey`).
-const ECDH1_QUALIFIED_IDS: &[u64] =
-    &[0x00001050, 0x00001051, 0x00001053, 0x00004038, 0x00004039, 0xCE53_437F];
+const ECDH1_QUALIFIED_IDS: &[u64] = &[0x00001050, 0x00001051, 0x00001053, 0x00004038, 0x00004039];
+/// NSS `CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN`
+/// (`0xCE53_437F`, `CKM_NSS` +47): the §4.2 exception's EC member —
+/// infers EC, family-only, Montgomery-qualified (NSS generates
+/// X25519 through it — `lib/ssl/ssl3ecc.c`
+/// `ssl_CreateECDHEPrivateKey`). A single-id const beside the
+/// packed tables, like [`AES_XTS_ID`].
+const NSS_ECDHE_KEY_PAIR_GEN_ID: u64 = 0xCE53_437F;
 /// §5.2 NSS vendor keygen subset (family-only): the legacy Kyber
 /// keygen id (its own named note on [`ML_KEM_IDS`]), the ECDHE
 /// keygen id, and the ML-KEM keygen id. Keygen carries no §5.1
@@ -187,7 +188,7 @@ pub(crate) fn infer_family(mechanism: u64) -> Option<KeyFamily> {
     if RSA_IDS.binary_search(&mechanism).is_ok() {
         return Some(KeyFamily::Rsa);
     }
-    if EC_IDS.binary_search(&mechanism).is_ok() {
+    if EC_IDS.binary_search(&mechanism).is_ok() || mechanism == NSS_ECDHE_KEY_PAIR_GEN_ID {
         return Some(KeyFamily::Ec);
     }
     if EDDSA_IDS.binary_search(&mechanism).is_ok() {
@@ -473,7 +474,10 @@ pub(crate) fn families_compatible(
         (F::Ec, E::Ec { .. }) => true,
         // The Firefox X25519/X448 derive case: ECDH1-qualified only
         // (ECMQV and ECDSA uses stay conflicting).
-        (F::Ec, E::Montgomery) => ECDH1_QUALIFIED_IDS.binary_search(&mechanism).is_ok(),
+        (F::Ec, E::Montgomery) => {
+            ECDH1_QUALIFIED_IDS.binary_search(&mechanism).is_ok()
+                || mechanism == NSS_ECDHE_KEY_PAIR_GEN_ID
+        }
         (F::Eddsa, E::Edwards { .. }) => true,
         (F::Xeddsa, E::Montgomery) => true,
         (F::Dsa, E::Dsa) => true,

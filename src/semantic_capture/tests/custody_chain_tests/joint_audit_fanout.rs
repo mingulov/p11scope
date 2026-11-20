@@ -31289,7 +31289,6 @@ fn joint_abandoned_read_with_corroborated_negative_keeps_key_refusal() {
                 .unwrap();
             frame.bind_targets(&ports).unwrap();
             let _ = frame.seal_next(&mut ports, &mut births, &BirthFault);
-            drop(ports);
             assert!(
                 fixture
                     .scene

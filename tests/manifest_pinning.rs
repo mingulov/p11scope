@@ -1,5 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+use p11scope::discovery::refresh_queue::RetirementProof;
 use p11scope::discovery::scan::{CaptureWorkBudget, ScanLimits};
 use p11scope::manifest_input::{MAX_MANIFEST_BYTES, read_manifest};
 use p11scope::process::{MountNamespaceId, ProcessView, ProcessViewId};
@@ -1235,7 +1236,7 @@ fn retiring_one_shared_namespace_view_keeps_only_the_stable_views_claims() {
     assert_ne!(stale_target, stable_target);
 
     let removed = pinned
-        .remove_view(ProcessViewId(10))
+        .retire_view_only_if_proven_gone(ProcessViewId(10), RetirementProof::Exited)
         .expect("the stale view owns precise claims");
     reconciled.retain(|module| module.scanned.view != ProcessViewId(10));
     let plan = p11scope::plan::build_from_reconciled_modules(&reconciled);
@@ -1350,7 +1351,7 @@ fn retiring_a_rejected_provider_view_removes_its_unplanned_pins_and_raw_aliases(
     assert!(reconciled.is_empty(), "the provider itself was rejected");
 
     pinned
-        .remove_view(view_id)
+        .retire_view_only_if_proven_gone(view_id, RetirementProof::Exited)
         .expect("every scan-opened pin is owned before reconciliation");
 
     assert!(pinned.attach_path_for(unique_id).is_err());

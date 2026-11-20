@@ -37,7 +37,9 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistry};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
-use crate::discovery::refresh_queue::{RefreshIntake, RefreshQueue, RefreshRequest};
+use crate::discovery::refresh_queue::{
+    RefreshIntake, RefreshQueue, RefreshRequest, RetirementProof, classify_retirement,
+};
 use crate::discovery::scan::{
     CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
     ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
@@ -13253,8 +13255,7 @@ fn candidate_sources_without_view(
     modules: &[ReconciledModule],
     view: ProcessViewId,
 ) -> (PinnedObjects, Vec<ScannedModule>) {
-    let mut pinned = pinned.clone();
-    pinned.remove_view(view);
+    let pinned = pinned.clone().without_view(view);
     let modules = modules
         .iter()
         .filter(|module| module.scanned.view != view)
@@ -17321,6 +17322,21 @@ impl Engine {
         self.refresh_queue.clear_for_view(view, pid);
     }
 
+    /// The retirement justification for one view's committed pins
+    /// (admission owner 3): liveness-derived, one place. 3b1
+    /// preserves current retirements; 3b2 fails unreadable pins
+    /// closed (keep + named gap) instead of retiring them.
+    pub(crate) fn retirement_proof_for(&self, view: ProcessViewId) -> RetirementProof {
+        let Some(live) = self.views.iter().find(|held| held.id() == view) else {
+            return classify_retirement(false, None, None);
+        };
+        classify_retirement(
+            true,
+            live.original_exited().ok(),
+            Some(live.still_the_same()),
+        )
+    }
+
     fn refresh_request_snapshot(&self) -> BTreeMap<u32, u64> {
         self.refresh_queue.snapshot()
     }
@@ -18013,7 +18029,8 @@ impl Engine {
             .collect();
         let mut pinned = snapshot.pinned;
         for view in &removed_views {
-            pinned.remove_view(*view);
+            let proof = self.retirement_proof_for(*view);
+            pinned.retire_view_only_if_proven_gone(*view, proof);
         }
         let modules: Vec<_> = snapshot
             .modules
@@ -18689,7 +18706,8 @@ impl Engine {
         let assemble_start = crate::attach::monotonic_ns();
         let mut pinned = self.pinned.clone();
         for view in retirements {
-            pinned.remove_view(*view);
+            let proof = self.retirement_proof_for(*view);
+            pinned.retire_view_only_if_proven_gone(*view, proof);
         }
         let skipped = pinned.reapply_rejected_keys(keys);
         let raw_modules = self
@@ -20898,7 +20916,8 @@ impl Engine {
         }
         let mut cleaned_pins = candidate.pinned.clone();
         for view in stale_views {
-            cleaned_pins.remove_view(*view);
+            let proof = self.retirement_proof_for(*view);
+            cleaned_pins.retire_view_only_if_proven_gone(*view, proof);
         }
         let cleaned_modules: Vec<_> = candidate
             .modules
@@ -21563,7 +21582,7 @@ impl Engine {
             .map(ProcessView::id)
             .filter(|id| *id != view)
         {
-            subset.remove_view(other);
+            subset = subset.without_view(other);
         }
         subset.check_unchanged().unwrap_or(false)
     }
@@ -22208,7 +22227,12 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
+            candidate_pins.prune_view_pins_to_modules_proven(
+                view_id,
+                &surviving,
+                &[loader],
+                RetirementProof::IdentityChanged,
+            );
             (candidate_pins, raw_modules)
         } else if mode == LoaderScanMode::MetadataOnly && self.views[position].still_the_same() {
             // A metadata scan pinned its modules before their tables
@@ -22303,11 +22327,21 @@ impl Engine {
                 .filter(|module| module.view == view_id)
                 .cloned()
                 .collect();
-            candidate_pins.prune_view_pins_to_modules(view_id, &surviving, &[loader]);
+            candidate_pins.prune_view_pins_to_modules_proven(
+                view_id,
+                &surviving,
+                &[loader],
+                RetirementProof::IdentityChanged,
+            );
             (candidate_pins, raw_modules)
         } else {
             let mut candidate_pins = self.pinned.clone();
-            skipped.extend(candidate_pins.replace_view_pins(view_id, fresh_pins, &[loader]));
+            skipped.extend(candidate_pins.replace_view_pins_proven(
+                view_id,
+                fresh_pins,
+                &[loader],
+                RetirementProof::IdentityChanged,
+            ));
             let mut raw_modules: Vec<_> = self
                 .modules
                 .iter()
@@ -31122,11 +31156,17 @@ impl Engine {
         {
             let mut candidate_pins = self.pinned.clone();
             for view in removed {
-                candidate_pins.remove_view(*view);
+                let proof = self.retirement_proof_for(*view);
+                candidate_pins.retire_view_only_if_proven_gone(*view, proof);
             }
             let mut pin_skipped = Vec::new();
             for (view, _, pins) in refreshed {
-                pin_skipped.extend(candidate_pins.replace_view_pins(*view, pins.clone(), &[]));
+                pin_skipped.extend(candidate_pins.replace_view_pins_proven(
+                    *view,
+                    pins.clone(),
+                    &[],
+                    RetirementProof::IdentityChanged,
+                ));
             }
             for (_, _, pins) in new_views {
                 pin_skipped.extend(candidate_pins.absorb(pins.clone()));
@@ -31150,7 +31190,8 @@ impl Engine {
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();
         let mut candidate_pins = self.pinned.clone();
         for view in removed {
-            candidate_pins.remove_view(*view);
+            let proof = self.retirement_proof_for(*view);
+            candidate_pins.retire_view_only_if_proven_gone(*view, proof);
         }
         let mut raw_modules: Vec<_> = self
             .modules
@@ -31162,7 +31203,12 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         for (view, modules, pins) in refreshed {
-            skipped.extend(candidate_pins.replace_view_pins(*view, pins.clone(), &[]));
+            skipped.extend(candidate_pins.replace_view_pins_proven(
+                *view,
+                pins.clone(),
+                &[],
+                RetirementProof::IdentityChanged,
+            ));
             for module in modules {
                 merge_scanned_module_counted(
                     &mut raw_modules,
@@ -31636,7 +31682,10 @@ impl Engine {
         self.close_cgroup_admissions_at_removal(&victims);
         self.settle_leader_exits_at_removal(victims.iter().copied());
         for id in &victims {
-            self.pinned.remove_view(*id);
+            // Capacity eviction is a management decision (the prover maps
+            // live views there); re-admit re-proves from scratch.
+            let proof = self.retirement_proof_for(*id);
+            self.pinned.retire_view_only_if_proven_gone(*id, proof);
             self.scan_inputs.remove(id);
         }
         self.loader_contexts

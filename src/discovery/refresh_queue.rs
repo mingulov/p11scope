@@ -15,7 +15,45 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Fair-queue relief examinations per pass: one full sweep at most,
 /// never an unbounded `/proc` scan per arrival.
-pub(crate) const RELIEF_SCAN_PER_PASS: u32 = 256;
+pub const RELIEF_SCAN_PER_PASS: u32 = 256;
+
+/// Why one view's committed pins may go: the only retirement
+/// justifications the lifecycle admits. A failed rescan is NOT
+/// proof — it is unrepresentable here by construction — and keeps
+/// the committed pins with a named gap instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetirementProof {
+    /// The original generation provably exited (two-way dead).
+    Exited,
+    /// Observer management ended tracking (capacity eviction,
+    /// scope removal, publication restore): re-admit re-proves.
+    OperatorRemoval,
+    /// The generation provably changed under the view (exec):
+    /// old pins are superseded, never carried.
+    IdentityChanged,
+}
+
+/// Classifies one view's retirement justification from live state:
+/// untracked views follow their views out; provably exited
+/// originals carry [`RetirementProof::Exited`]; changed generations
+/// carry [`RetirementProof::IdentityChanged`]; anything else is a
+/// management decision. 3b1 preserves current retirements; 3b2 fails
+/// the unreadable cases closed (keep pins + named gap).
+pub fn classify_retirement(
+    tracked: bool,
+    exited: Option<bool>,
+    same: Option<bool>,
+) -> RetirementProof {
+    if !tracked {
+        RetirementProof::OperatorRemoval
+    } else if exited == Some(true) {
+        RetirementProof::Exited
+    } else if same == Some(false) {
+        RetirementProof::IdentityChanged
+    } else {
+        RetirementProof::OperatorRemoval
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RefreshRequest {
@@ -348,6 +386,55 @@ impl std::ops::Index<&u32> for RefreshQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner 3b1 table: the retirement prover maps live state to
+    /// the one justification it admits. Untracked views follow
+    /// their views out (management); provably exited originals
+    /// carry Exited; changed generations carry IdentityChanged;
+    /// anything else is a management decision (3b1 preserves
+    /// current retirements; 3b2 fails the unreadable cases closed).
+    #[test]
+    fn admission_owner3b1_retirement_proofs() {
+        use super::{RetirementProof, classify_retirement};
+        // Untracked views follow their views out whatever the pins say.
+        for exited in [None, Some(false), Some(true)] {
+            for same in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    classify_retirement(false, exited, same),
+                    RetirementProof::OperatorRemoval,
+                    "untracked: {exited:?} {same:?}"
+                );
+            }
+        }
+        // A provably exited original carries Exited.
+        for same in [None, Some(false), Some(true)] {
+            assert_eq!(
+                classify_retirement(true, Some(true), same),
+                RetirementProof::Exited,
+                "exited: {same:?}"
+            );
+        }
+        // A changed generation carries IdentityChanged.
+        for exited in [None, Some(false)] {
+            assert_eq!(
+                classify_retirement(true, exited, Some(false)),
+                RetirementProof::IdentityChanged,
+                "changed: {exited:?}"
+            );
+        }
+        // Live-same views retire only by management decision
+        // (capacity eviction); re-admit re-proves. Unreadable pins
+        // map here in 3b1 (current behavior preserved); 3b2 fails
+        // them closed instead.
+        assert_eq!(
+            classify_retirement(true, Some(false), Some(true)),
+            RetirementProof::OperatorRemoval
+        );
+        assert_eq!(
+            classify_retirement(true, None, None),
+            RetirementProof::OperatorRemoval
+        );
+    }
 
     /// Move pin (3a1): intake/complete/snapshot/clear round-trip
     /// through the seam (consumed renewals take a fresh serial,

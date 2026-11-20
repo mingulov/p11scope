@@ -666,7 +666,12 @@ impl Engine {
             }
         }
         let mut pinned = self.pinned.clone();
-        pinned.remove_view(owner);
+        pinned.retire_view_only_if_proven_gone(
+            owner,
+            // Scoped release is a management decision to stop tracking
+            // this owner: re-acquire re-proves from scratch.
+            crate::discovery::refresh_queue::RetirementProof::OperatorRemoval,
+        );
         let modules: Vec<_> = self
             .modules
             .iter()
@@ -1091,7 +1096,14 @@ impl Engine {
                 .into_iter()
                 .collect()
         };
-        let skips = pins.replace_view_pins(id, facts.pins, &preserve);
+        let skips = pins.replace_view_pins_proven(
+            id,
+            facts.pins,
+            &preserve,
+            // Reconciliation supersede: freshly gathered facts replace
+            // the previous generation's pins.
+            crate::discovery::refresh_queue::RetirementProof::IdentityChanged,
+        );
         if !skips.is_empty() {
             bail!("inventory reconciliation pin identity refused; existing claims retained");
         }

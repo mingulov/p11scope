@@ -30,6 +30,7 @@ use p11scope_manifest::manifest::{Manifest, Resolution};
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 
 use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, Held, TableHandle};
+use super::refresh_queue::RetirementProof;
 use crate::discovery::scan::{
     COLLECTION_STOP_REASON, CaptureWorkBudget, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
     InspectedFileKey, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON, ScannedEntry, ScannedModule,
@@ -2324,7 +2325,10 @@ impl PinnedObjects {
     /// keeping exact canonical entries available for ID reuse. The incoming
     /// pin set was built through the same `ProcessView`; unequal full identity
     /// for an equal raw key therefore follows the ordinary collision path.
-    pub(crate) fn replace_view_pins(
+    /// Retirement requires proof: callers replace through
+    /// [`replace_view_pins_proven`](Self::replace_view_pins_proven),
+    /// never this raw custody op.
+    fn replace_view_pins(
         &mut self,
         view: ProcessViewId,
         incoming: PinnedObjects,
@@ -2402,6 +2406,22 @@ impl PinnedObjects {
         skipped
     }
 
+    /// The only way to supersede one view's pins with a rescan's
+    /// incoming pins: the caller names the proof (admission owner 3)
+    /// that the previous generation is superseded. A failed rescan is
+    /// not a proof — it keeps the committed pins with a named gap at
+    /// the call site instead of calling here.
+    pub fn replace_view_pins_proven(
+        &mut self,
+        view: ProcessViewId,
+        incoming: PinnedObjects,
+        preserve: &[PinnedObjectId],
+        proof: RetirementProof,
+    ) -> Vec<Skipped> {
+        let _ = proof;
+        self.replace_view_pins(view, incoming, preserve)
+    }
+
     /// Drops one view's scan-owned raws that no surviving module references —
     /// neither as its own file nor as a table-entry dependency — and reclaims
     /// the pins left with no owner, with the same custody as
@@ -2412,8 +2432,11 @@ impl PinnedObjects {
     /// manifest or a pre-arm alias still owns. Kept modules keep their
     /// exact retained identities; only already-retired facts lose pins, so
     /// a later mutation of an unloaded file cannot poison the
-    /// capture-wide `check_unchanged`.
-    pub(crate) fn prune_view_pins_to_modules(
+    /// capture-wide `check_unchanged`. Retirement requires proof:
+    /// callers prune through
+    /// [`prune_view_pins_to_modules_proven`](Self::prune_view_pins_to_modules_proven),
+    /// never this raw custody op.
+    fn prune_view_pins_to_modules(
         &mut self,
         view: ProcessViewId,
         surviving: &[ScannedModule],
@@ -2486,6 +2509,22 @@ impl PinnedObjects {
                 raws.retain(|raw| self.raw_to_id.contains_key(raw));
             }
         }
+    }
+
+    /// The only way to prune one view's pins to its surviving modules:
+    /// the caller names the proof (admission owner 3) that the pruned
+    /// generation is gone. A failed rescan is not a proof — it keeps
+    /// the committed pins with a named gap at the call site instead of
+    /// calling here.
+    pub fn prune_view_pins_to_modules_proven(
+        &mut self,
+        view: ProcessViewId,
+        surviving: &[ScannedModule],
+        preserve: &[PinnedObjectId],
+        proof: RetirementProof,
+    ) {
+        let _ = proof;
+        self.prune_view_pins_to_modules(view, surviving, preserve)
     }
 
     /// Clears plan-derived table/target claims before the canonical raw module
@@ -2752,7 +2791,12 @@ impl PinnedObjects {
     /// Retires one accepted process generation without disturbing another view or a
     /// manifest that still owns the same opened object. Returns the exact claims that
     /// were removed so the caller can rebuild its plan from the remaining modules.
-    pub fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
+    ///
+    /// Retirement requires proof: callers retire through
+    /// [`retire_view_only_if_proven_gone`](Self::retire_view_only_if_proven_gone),
+    /// never this raw custody op. Pure scratch filtering uses
+    /// [`without_view`](Self::without_view) instead.
+    fn remove_view(&mut self, view: ProcessViewId) -> Option<ViewClaims> {
         let removed = self.ownership.remove(&view)?;
         self.bump_revision();
         let removed_raws = self.raw_ownership.remove(&view).unwrap_or_default();
@@ -2799,6 +2843,27 @@ impl PinnedObjects {
             !unowned.contains(id) && (!removed_raws.contains(raw) || retained_raws.contains(raw))
         });
         Some(removed)
+    }
+
+    /// The only way to retire one view's committed pins: the caller
+    /// names the proof (admission owner 3) that this generation is
+    /// gone. A failed rescan is not a proof — it keeps the pins with
+    /// a named gap at the call site instead of calling here.
+    pub fn retire_view_only_if_proven_gone(
+        &mut self,
+        view: ProcessViewId,
+        proof: RetirementProof,
+    ) -> Option<ViewClaims> {
+        let _ = proof;
+        self.remove_view(view)
+    }
+
+    /// Pure scratch filter: a clone without one view's pins. Query
+    /// helpers and comparison fixtures use this instead of mutating
+    /// committed custody; it retires nothing.
+    pub fn without_view(mut self, view: ProcessViewId) -> Self {
+        self.remove_view(view);
+        self
     }
 
     /// Whether `module`'s own file raw and every table-entry
@@ -13373,7 +13438,12 @@ mod tests {
         pins.proven_targets.insert((id1, 0x100));
         pins.proven_targets.insert((id2, 0x200));
 
-        pins.replace_view_pins(m1.view, PinnedObjects::empty(), &[]);
+        pins.replace_view_pins_proven(
+            m1.view,
+            PinnedObjects::empty(),
+            &[],
+            RetirementProof::IdentityChanged,
+        );
         assert!(
             !pins.by_id.contains_key(&id1),
             "the replaced view loses its pin"
@@ -13408,7 +13478,7 @@ mod tests {
             pins.proven_targets
         );
 
-        pins.remove_view(m2.view);
+        pins.retire_view_only_if_proven_gone(m2.view, RetirementProof::Exited);
         assert!(
             !pins.by_id.contains_key(&id2),
             "the retired view loses its pin"
@@ -13527,7 +13597,12 @@ mod tests {
         pins.proven_targets.insert((ida, 0x100));
         pins.proven_targets.insert((idb, 0x200));
 
-        pins.prune_view_pins_to_modules(ma.view, &[ma], &[]);
+        pins.prune_view_pins_to_modules_proven(
+            ma.view,
+            &[ma],
+            &[],
+            RetirementProof::IdentityChanged,
+        );
 
         assert!(
             !pins.by_id.contains_key(&idb),
@@ -18825,21 +18900,31 @@ mod tests {
         let mut rescan = image_pins(&[(real(1), "aaaaaaaa", 1)]);
         own_all_raws(&mut rescan);
         reconcile_scanned_modules(std::slice::from_ref(&first_module), &mut rescan);
-        pins.replace_view_pins(first_module.view, rescan, &[]);
+        pins.replace_view_pins_proven(
+            first_module.view,
+            rescan,
+            &[],
+            RetirementProof::IdentityChanged,
+        );
         assert_pins_consistent("replace", &pins);
 
         // The gap shape: raw ownership lost while claims survive (never from
         // production scans, but the replace path must survive it anyway).
         // View 17 keeps its claims while its id loses every owned raw.
         pins.raw_ownership.clear();
-        pins.replace_view_pins(first_module.view, PinnedObjects::empty(), &[]);
+        pins.replace_view_pins_proven(
+            first_module.view,
+            PinnedObjects::empty(),
+            &[],
+            RetirementProof::IdentityChanged,
+        );
         assert_pins_consistent("replace-after-gap", &pins);
         assert!(
             pins.by_id.is_empty() && pins.raw_to_id.is_empty(),
             "unowned pins are collected, not stranded"
         );
 
-        pins.remove_view(second_module.view);
+        pins.retire_view_only_if_proven_gone(second_module.view, RetirementProof::Exited);
         assert_pins_consistent("remove", &pins);
     }
 
@@ -19988,10 +20073,18 @@ mod tests {
         let _ = pins.absorb(PinnedObjects::empty());
         assert_eq!(pins.revision(), 1);
         // A replace bumps twice (the replace plus the incoming merge).
-        let _ = pins.replace_view_pins(ProcessViewId(3), PinnedObjects::empty(), &[]);
+        let _ = pins.replace_view_pins_proven(
+            ProcessViewId(3),
+            PinnedObjects::empty(),
+            &[],
+            RetirementProof::IdentityChanged,
+        );
         assert_eq!(pins.revision(), 3);
         // Removing a view that was never there changes nothing.
-        assert!(pins.remove_view(ProcessViewId(9)).is_none());
+        assert!(
+            pins.retire_view_only_if_proven_gone(ProcessViewId(9), RetirementProof::Exited)
+                .is_none()
+        );
         assert_eq!(pins.revision(), 3);
         // The gate counts the skip; the next sweep needs a new revision.
         let mut gate = crate::timing::PinSweepGate::new();
@@ -20137,7 +20230,7 @@ mod tests {
         );
         let reserve = pool.reserver();
         let mut expected = source.clone();
-        expected.remove_view(ProcessViewId(1));
+        expected.retire_view_only_if_proven_gone(ProcessViewId(1), RetirementProof::Exited);
         let expected_skipped = expected.reapply_rejected_keys(&BTreeSet::from([rejected]));
         let source_revision = source.revision();
         let initial_charge = pool.snapshot().charged_bytes;

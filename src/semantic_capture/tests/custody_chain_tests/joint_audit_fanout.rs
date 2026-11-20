@@ -18334,10 +18334,11 @@ fn watchdog_barrier_clear_reserve_parks_next_tick() {
     );
 }
 
-/// An Idle tick that spends its whole budget on scoped recovery must
-/// not collect on the stale pre-recovery allowance: with exactly the
-/// recovery's cost in budget, the tick completes the void, then
-/// yields before I/O with the drain untouched.
+/// An Idle tick that spends its budget on scoped recovery must not
+/// collect on the stale pre-recovery allowance: with exactly the
+/// entry cost in budget, the tick completes the void, then collects
+/// at most the honest remainder (the unspent empty-completion unit,
+/// if any) instead of the whole pre-recovery allowance.
 #[test]
 fn idle_recovery_yields_collection_when_budget_spent() {
     const ROW: &str = "recovery spends before collection";
@@ -18363,51 +18364,113 @@ fn idle_recovery_yields_collection_when_budget_spent() {
         );
         scene
     }
-    // Measure the Idle-entry cost (absence scan plus scoped
-    // recovery) through the service path on a twin scene: one unit
-    // per service until the break is consumed and no recovery
-    // stands. Each service must spend exactly its unit.
-    let mut measure = stuck_idle_scene();
-    let mut cost = 0usize;
+    // Measure the exact Idle-entry cost on twin scenes in two
+    // components. The absence scan runs first on a break-pending
+    // scene through one-unit services: each service that leaves the
+    // break pending spent exactly its unit on one scan step (a
+    // service cannot split one unit across the scan and recovery),
+    // and the scan attests nothing (keys_total is unchanged), so
+    // the recovery basis is identical everywhere. The recovery
+    // itself is measured through direct bounded calls on a second
+    // scene, where no collection can pollute the count.
+    let mut absence = stuck_idle_scene();
+    // The absence scan runs with the same drain contents as the
+    // measured tick below: stage identical bait first.
+    let bait_pid = std::process::id();
+    for (index, sequence) in (100..110u64).enumerate() {
+        let name = ["C_SignInit", "C_SignUpdate", "C_SignFinal"][index % 3];
+        absence.scene.push(bait_pid, 0, name, sequence);
+    }
+    let keys_before = absence
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis()
+        .keys_total;
+    let mut cost_absence = 0usize;
     for _ in 0..512 {
         let mut budget = JointWorkBudget {
             remaining_actions: 1,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
         };
-        measure
+        absence
             .service_with_budget(&mut budget)
             .unwrap_or_else(|reason| {
                 panic!("{ROW}: the measuring services never refuse: {reason:?}")
             });
+        if !absence
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_break_pending()
+        {
+            break;
+        }
+        assert_eq!(
+            absence.machine.diagnostic_snapshot_for_test().0,
+            "Idle",
+            "{ROW}: precondition: absence services stay Idle"
+        );
         assert_eq!(
             budget.remaining_actions, 0,
-            "{ROW}: precondition: each measuring service spends its unit"
+            "{ROW}: precondition: each absence service spends its unit"
         );
-        cost += 1;
-        let consumed = !measure
+        cost_absence += 1;
+    }
+    assert!(
+        !absence
             .scene
             .real
             .scene
             .coordinator
             .joint_capture()
             .adapter()
-            .scoped_break_pending();
-        let standing = measure
+            .scoped_break_pending(),
+        "{ROW}: precondition: the absence scan terminates"
+    );
+    assert_eq!(
+        absence
             .scene
             .real
             .scene
             .coordinator
             .joint_capture()
             .adapter()
-            .scoped_recovery_progress_for_test()
-            .is_some();
-        if consumed && !standing {
+            .joint_void_diagnosis()
+            .keys_total,
+        keys_before,
+        "{ROW}: precondition: the absence scan attests nothing"
+    );
+    let mut recovery = stuck_idle_scene();
+    let mut calls_rec = 0usize;
+    let mut cost_rec = 0usize;
+    for _ in 0..512 {
+        let mut allowance = 1usize;
+        let progress = recovery
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break_bounded(&mut allowance)
+            .unwrap_or_else(|reason| panic!("{ROW}: the measured void never refuses: {reason:?}"));
+        calls_rec += 1;
+        cost_rec += 1 - allowance;
+        if matches!(
+            progress,
+            crate::semantics_objects::journal::joint_driver::RecoveryProgress::Done(_)
+        ) {
             break;
         }
     }
-    assert!(cost > 0, "{ROW}: precondition: the recovery spends");
     assert!(
-        !measure
+        !recovery
             .scene
             .real
             .scene
@@ -18417,6 +18480,15 @@ fn idle_recovery_yields_collection_when_budget_spent() {
             .scoped_break_pending(),
         "{ROW}: precondition: the measured break is consumed"
     );
+    // Empty completion slices spend nothing but still need a live
+    // budget to run, so the single service below is budgeted by
+    // call count, not by spend. At most the final call spends
+    // nothing; its unit is the honest remainder collection may
+    // still use.
+    let phantom = calls_rec - cost_rec;
+    assert!(phantom <= 1, "{ROW}: precondition: at most one empty call");
+    let cost = calls_rec + cost_absence;
+    assert!(cost > 0, "{ROW}: precondition: the recovery spends");
     let mut fixture = stuck_idle_scene();
     assert!(
         fixture
@@ -18475,15 +18547,17 @@ fn idle_recovery_yields_collection_when_budget_spent() {
         "{ROW}: the recovery completed within the budget"
     );
     assert_eq!(
-        fixture.machine.diagnostic_snapshot_for_test().0,
-        "Idle",
-        "{ROW}: no collection starts on a spent tick"
-    );
-    assert_eq!(
         fixture.scene.drain.source().remaining(),
-        waiting,
-        "{ROW}: the drain stays untouched"
+        waiting - phantom,
+        "{ROW}: collection uses exactly the honest remainder"
     );
+    if phantom == 0 {
+        assert_eq!(
+            fixture.machine.diagnostic_snapshot_for_test().0,
+            "Idle",
+            "{ROW}: no collection starts on a spent tick"
+        );
+    }
 }
 
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck

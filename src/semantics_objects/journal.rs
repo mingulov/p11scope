@@ -366,6 +366,13 @@ pub(crate) use ledger::{LedgerRefusal, StagedResourceOrigin, StagingLedger};
 pub(crate) struct ConsumptionOrdinal(u64);
 
 impl ConsumptionOrdinal {
+    /// Test-only ordinal mint: cache-key twins need distinct
+    /// frontiers without collecting quanta.
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+
     pub(in crate::semantics_objects) fn cut(self) -> u64 {
         self.0
     }

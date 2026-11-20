@@ -188,6 +188,12 @@ impl StagingLedger {
         ReservationTable::<Option<ResourceLease>>::staged_bucket_for_test(namespace, value)
     }
 
+    /// Test-only bucket for a fallback association ticket.
+    #[cfg(test)]
+    pub(crate) fn assoc_bucket_for_test(ticket: u64) -> usize {
+        ReservationTable::<Option<ResourceLease>>::assoc_bucket_for_test(ticket)
+    }
+
     /// Test-only read of the lookup cost counter.
     #[cfg(test)]
     pub(crate) fn test_slot_visits_for_test(&self) -> usize {
@@ -217,6 +223,38 @@ impl StagingLedger {
     pub(crate) fn reset_test_leaf_reads_for_test(&self) {
         if let Some(table) = self.table.as_ref() {
             table.reset_test_leaf_reads_for_test();
+        }
+    }
+
+    /// Test-only read of the unbudgeted-read counter.
+    #[cfg(test)]
+    pub(crate) fn test_unbudgeted_reads_for_test(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.test_unbudgeted_reads_for_test())
+    }
+
+    /// Test-only reset of the unbudgeted-read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_unbudgeted_reads_for_test(&self) {
+        if let Some(table) = self.table.as_ref() {
+            table.reset_test_unbudgeted_reads_for_test();
+        }
+    }
+
+    /// Test-only read of the sync-walk counter.
+    #[cfg(test)]
+    pub(crate) fn test_preflight_reads_for_test(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.test_preflight_reads_for_test())
+    }
+
+    /// Test-only reset of the sync-walk counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_preflight_reads_for_test(&self) {
+        if let Some(table) = self.table.as_ref() {
+            table.reset_test_preflight_reads_for_test();
         }
     }
 

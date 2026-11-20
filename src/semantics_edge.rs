@@ -614,6 +614,14 @@ pub(crate) struct EdgeSemantics {
     // Drop order is declaration order. Keep the base/history owner after
     // every container, so a different reducer cannot spend an early refund.
     resource_owner: Option<ResourceLease>,
+    /// Test-only unified budgeted-read counter: every edge-map lookup
+    /// on a budgeted path (retire scan visits, decision lookups, peek
+    /// classifications, pending admission/eviction visits). Incremented
+    /// at the actual read site so per-poll `reads <= spent` assertions
+    /// observe real reads, never the debit. Unbudgeted (live S1) paths
+    /// bump it too; tests reset around the measured region.
+    #[cfg(test)]
+    test_edge_reads: std::cell::Cell<usize>,
 }
 
 impl Drop for EdgeSemantics {
@@ -792,6 +800,8 @@ impl EdgeSemantics {
         if descriptor.lifecycle == lifecycle::OPEN_SESSION && call.session == SESSION_NONE {
             return PendingRoute::Unroutable;
         }
+        #[cfg(test)]
+        self.bump_edge_read_for_test();
         if self.pending.contains_key(&(call.session, function)) {
             return PendingRoute::Duplicate;
         }
@@ -1336,6 +1346,25 @@ impl EdgeSemantics {
     #[cfg(test)]
     pub(crate) fn seed_machine_seq_for_test(&mut self, value: u64) {
         self.machine_seq = value;
+    }
+
+    /// Test-only bump of the unified edge-read counter: one per
+    /// edge-map lookup, at the actual read site.
+    #[cfg(test)]
+    fn bump_edge_read_for_test(&self) {
+        self.test_edge_reads.set(self.test_edge_reads.get() + 1);
+    }
+
+    /// Test-only read of the unified edge-read counter.
+    #[cfg(test)]
+    pub(crate) fn test_edge_reads_for_test(&self) -> usize {
+        self.test_edge_reads.get()
+    }
+
+    /// Test-only reset of the unified edge-read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_edge_reads_for_test(&self) {
+        self.test_edge_reads.set(0);
     }
 
     /// The downgrade gates (B3): only fully-authorized calls with
@@ -2317,6 +2346,11 @@ impl EdgeSemantics {
                         cursor.phase = EdgeInvalidationPhase::Pending;
                         continue;
                     };
+                    #[cfg(test)]
+                    {
+                        self.bump_edge_read_for_test();
+                        self.bump_edge_read_for_test();
+                    }
                     cursor.changed = true;
                     self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
                     match cursor.end {
@@ -2354,6 +2388,8 @@ impl EdgeSemantics {
                         return false;
                     }
                     let _ = self.pending.pop_first();
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
                     cursor.changed = true;
                     if budget.remaining() == 0 {
                         return false;
@@ -2368,6 +2404,8 @@ impl EdgeSemantics {
                         return false;
                     }
                     let _ = self.detached.pop_first();
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
                     cursor.changed = true;
                     if budget.remaining() == 0 {
                         return false;
@@ -2386,6 +2424,8 @@ impl EdgeSemantics {
                         return false;
                     }
                     let _ = self.open.pop_first();
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
                     cursor.changed = true;
                     self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
                     if budget.remaining() == 0 {
@@ -2494,6 +2534,8 @@ impl EdgeSemantics {
                 if call.rv != CkRv::OK.0 && call.rv != CkRv::PIN_LOCKED.0 {
                     return RetirePeek::NoOp;
                 }
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
                 match self.open.get(&call.session).copied() {
                     Some(slot) => RetirePeek::Subset(EdgeRetireScope::Slot {
                         slot,
@@ -2625,6 +2667,11 @@ impl EdgeSemantics {
                             }
                             cursor.active_done_upto = Some(next);
                             cursor.changed = true;
+                            #[cfg(test)]
+                            {
+                                self.bump_edge_read_for_test();
+                                self.bump_edge_read_for_test();
+                            }
                             let machine = self
                                 .active
                                 .remove(&next)
@@ -2743,6 +2790,8 @@ impl EdgeSemantics {
                             if !budget.try_charge() {
                                 return false;
                             }
+                            #[cfg(test)]
+                            self.bump_edge_read_for_test();
                             let had = self.open.remove(&session).is_some();
                             if had {
                                 self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
@@ -2757,6 +2806,8 @@ impl EdgeSemantics {
                             if !budget.try_charge() {
                                 return false;
                             }
+                            #[cfg(test)]
+                            self.bump_edge_read_for_test();
                             if !self.open.contains_key(&ins_session)
                                 && self.open.len() >= MAX_EDGE_SESSIONS
                             {
@@ -2812,6 +2863,8 @@ impl EdgeSemantics {
                             return false;
                         }
                         cursor.open_done_upto = Some(next);
+                        #[cfg(test)]
+                        self.bump_edge_read_for_test();
                         if self.open.get(&next) == Some(&slot) {
                             self.open.remove(&next);
                             self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
@@ -2833,6 +2886,8 @@ impl EdgeSemantics {
     /// directly (only the session's keys are visited); slot scopes
     /// scan all with a per-session predicate.
     fn retire_next_active(&self, cursor: &EdgeRetireCursor) -> Option<(u64, u16)> {
+        #[cfg(test)]
+        self.bump_edge_read_for_test();
         use std::ops::Bound::{Excluded, Included, Unbounded};
         match &cursor.scope {
             EdgeRetireScope::Session { session, .. }
@@ -2889,6 +2944,8 @@ impl EdgeSemantics {
                 })
             }
             EdgeRetireScope::Slot { slot, close_all } => {
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
                 if *close_all && cursor.slot_unproven_pass {
                     match self.open.get(&session) {
                         None => RetireActiveDecision::End(EndState::Unknown),
@@ -2916,6 +2973,8 @@ impl EdgeSemantics {
 
     /// Next pending key for the retire scan.
     fn retire_next_pending(&self, cursor: &EdgeRetireCursor) -> Option<(u64, u32)> {
+        #[cfg(test)]
+        self.bump_edge_read_for_test();
         use std::ops::Bound::{Excluded, Included, Unbounded};
         match &cursor.scope {
             EdgeRetireScope::Session { session, .. }
@@ -2948,13 +3007,19 @@ impl EdgeSemantics {
         match &cursor.scope {
             EdgeRetireScope::Session { .. } => true,
             EdgeRetireScope::SessionMachines { .. } => false,
-            EdgeRetireScope::Slot { slot, close_all } => match self.open.get(&next.0) {
-                Some(owner) => owner == slot,
-                None => *close_all,
-            },
+            EdgeRetireScope::Slot { slot, close_all } => {
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
+                match self.open.get(&next.0) {
+                    Some(owner) => owner == slot,
+                    None => *close_all,
+                }
+            }
             EdgeRetireScope::Selected {
                 session: _, flags, ..
             } => {
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
                 let pending = self.pending.get(next).expect("retire scan retained");
                 let descriptor = crate::kinds::descriptor(&pending.call.function)
                     .unwrap_or(SlotSemantics::COUNT_ONLY);
@@ -2971,6 +3036,8 @@ impl EdgeSemantics {
         &self,
         cursor: &EdgeRetireCursor,
     ) -> Option<(u64, u32, crate::semantics_objects::AsyncValue)> {
+        #[cfg(test)]
+        self.bump_edge_read_for_test();
         use std::ops::Bound::{Excluded, Unbounded};
         match &cursor.scope {
             EdgeRetireScope::SessionMachines { .. } => None,
@@ -2991,6 +3058,8 @@ impl EdgeSemantics {
         cursor: &EdgeRetireCursor,
         next: &(u64, u32, crate::semantics_objects::AsyncValue),
     ) -> RetireDetachedAction {
+        #[cfg(test)]
+        self.bump_edge_read_for_test();
         let id = self.detached.get(next).expect("retire scan retained");
         match &cursor.scope {
             EdgeRetireScope::Session { session, .. } => {
@@ -3002,12 +3071,16 @@ impl EdgeSemantics {
             }
             EdgeRetireScope::SessionMachines { .. } => RetireDetachedAction::Keep,
             EdgeRetireScope::Slot { slot, close_all } => match id.owner {
-                Some(owner) => match self.open.get(&owner) {
-                    Some(candidate) if candidate == slot => RetireDetachedAction::Float,
-                    Some(_) => RetireDetachedAction::Keep,
-                    None if *close_all => RetireDetachedAction::Float,
-                    None => RetireDetachedAction::Keep,
-                },
+                Some(owner) => {
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
+                    match self.open.get(&owner) {
+                        Some(candidate) if candidate == slot => RetireDetachedAction::Float,
+                        Some(_) => RetireDetachedAction::Keep,
+                        None if *close_all => RetireDetachedAction::Float,
+                        None => RetireDetachedAction::Keep,
+                    }
+                }
                 None => RetireDetachedAction::Keep,
             },
             EdgeRetireScope::Selected { session, flags, .. } => {
@@ -3030,6 +3103,8 @@ impl EdgeSemantics {
 
     /// Next open key for slot-scope scans.
     fn retire_next_open(&self, cursor: &EdgeRetireCursor) -> Option<u64> {
+        #[cfg(test)]
+        self.bump_edge_read_for_test();
         use std::ops::Bound::{Excluded, Unbounded};
         match cursor.open_done_upto {
             None => self.open.keys().next().copied(),
@@ -3238,6 +3313,8 @@ impl EdgeSemantics {
     fn capture_origin(&self, session: u64, descriptor: &SlotSemantics) -> CallOrigin {
         let bits = crate::semantics::operation_bits(descriptor.operations)
             .map(|(bit, _)| {
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
                 (
                     bit,
                     self.active
@@ -3338,16 +3415,26 @@ impl EdgeSemantics {
         let pending = self
             .pending
             .iter()
-            .min_by_key(|(_, value)| value.sequence)
+            .min_by_key(|(_, value)| {
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
+                value.sequence
+            })
             .map(|(key, _)| *key);
         let detached = self
             .detached
             .iter()
-            .min_by_key(|(_, value)| value.sequence)
+            .min_by_key(|(_, value)| {
+                #[cfg(test)]
+                self.bump_edge_read_for_test();
+                value.sequence
+            })
             .map(|(key, value)| (*key, value.sequence));
         let evicted: Option<(u64, SemanticCall, CallOrigin, Option<ResourceLease>)> =
             match (pending, detached) {
                 (Some(key), Some((detached_key, detached_sequence))) => {
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
                     if self.pending[&key].sequence <= detached_sequence {
                         self.pending
                             .remove(&key)
@@ -3384,6 +3471,8 @@ impl EdgeSemantics {
         };
         drop(call);
         for (bit, generation) in &origin.bits {
+            #[cfg(test)]
+            self.bump_edge_read_for_test();
             let live_matches = generation.is_some()
                 && self
                     .active
@@ -4448,5 +4537,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A one-unit retire reads only after its grant and retains the
+    /// charged visit across yields: the first unit takes the entry,
+    /// the terminal waits for later credit, and the resume ends the
+    /// machine with its exact terminal and custody.
+    #[test]
+    fn budgeted_retire_one_unit_retains_charged_visit_across_yield() {
+        use crate::semantics_objects::journal::LeafBudget;
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 100));
+        edge.observe(&init("C_SignInit", 7, RSA_PSS, 110));
+        assert_eq!(edge.active.len(), 1);
+        let origin = EffectOrigin {
+            function: "C_CloseSession".into(),
+            session: 7,
+            ts_ns: 120,
+        };
+        let mut cursor = edge.start_budgeted_retire(
+            EdgeRetireScope::Session {
+                session: 7,
+                end_unknown: false,
+                post: SessionPost::Close,
+            },
+            &origin,
+        );
+        let mut effects = Vec::new();
+        edge.reset_test_edge_reads_for_test();
+        let mut gate = LeafBudget::new(1);
+        assert!(
+            !edge.poll_retire_step(&mut cursor, &mut effects, &mut gate),
+            "one unit cannot finish visit + terminal"
+        );
+        assert_eq!(gate.spent(), 1, "the visit charges first");
+        assert_eq!(
+            edge.test_edge_reads_for_test(),
+            1,
+            "exactly the charged visit reads"
+        );
+        assert_eq!(edge.active.len(), 1, "the machine survives the yield");
+        assert!(effects.is_empty(), "no terminal before its credit");
+        edge.reset_test_edge_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        assert!(
+            edge.poll_retire_step(&mut cursor, &mut effects, &mut gate),
+            "the resume completes without re-reading the visit"
+        );
+        assert_eq!(
+            edge.test_edge_reads_for_test(),
+            gate.spent(),
+            "every later read is debited"
+        );
+        assert_eq!(edge.active.len(), 0);
+        assert_eq!(edge.open.len(), 0);
+        assert_eq!(effects.len(), 1, "exactly one terminal");
+        match &effects[0] {
+            OperationEffect::Ended { outcome, .. } => {
+                assert_eq!(*outcome, OperationOutcome::Cancelled)
+            }
+            _ => panic!("the retired machine ends Cancelled"),
+        }
+        assert_eq!(edge.cancelled, 1);
+        assert_eq!(edge.evidence.unmatched_closes, 0);
+    }
+
+    /// An empty scan still consumes its lookups: each phase's
+    /// next-entry read charges before it happens, so a retire over
+    /// an empty edge debits exactly its lookups and completes.
+    #[test]
+    fn budgeted_retire_empty_scan_consumes_its_lookups() {
+        use crate::semantics_objects::journal::LeafBudget;
+        let mut edge = EdgeSemantics::default();
+        let origin = EffectOrigin {
+            function: "C_CloseSession".into(),
+            session: 9,
+            ts_ns: 120,
+        };
+        let mut cursor = edge.start_budgeted_retire(
+            EdgeRetireScope::Session {
+                session: 9,
+                end_unknown: false,
+                post: SessionPost::Close,
+            },
+            &origin,
+        );
+        let mut effects = Vec::new();
+        edge.reset_test_edge_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        assert!(
+            edge.poll_retire_step(&mut cursor, &mut effects, &mut gate),
+            "an empty retire completes"
+        );
+        assert_eq!(
+            gate.spent(),
+            3,
+            "active + pending lookups and the open forget"
+        );
+        assert_eq!(
+            edge.test_edge_reads_for_test(),
+            3,
+            "each lookup reads exactly once"
+        );
+        assert!(effects.is_empty());
+        assert_eq!(edge.evidence.unmatched_closes, 1);
     }
 }

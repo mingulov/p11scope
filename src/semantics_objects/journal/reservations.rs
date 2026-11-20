@@ -329,6 +329,20 @@ pub(super) struct ReservationTable<C> {
     /// the accessor-only test forbids).
     #[cfg(test)]
     test_leaf_reads: std::cell::Cell<usize>,
+    /// Test-only unbudgeted-read counter (RED scaffolding, fix round
+    /// 5): slot vacancy/alias re-reads the sweep and single release
+    /// perform without a debit. Read only by the round-5 gate twin;
+    /// the snapshot fold removes these reads (and their bumps).
+    #[cfg(test)]
+    test_unbudgeted_reads: std::cell::Cell<usize>,
+    /// Test-only sync-walk counter: head/inspect/next/link reads of
+    /// the synchronous lookup paths (`key_slot`, `id_slot`, free
+    /// search/pop), counted with budgeted-split semantics (1 head +
+    /// 1 inspect + 1 next-link per node). Read only by the
+    /// round-5 mint twins: the budgeted disposal must never walk
+    /// synchronously, so its per-poll count is zero after the fix.
+    #[cfg(test)]
+    test_preflight_reads: std::cell::Cell<usize>,
 }
 
 impl<C> ReservationTable<C> {
@@ -364,6 +378,10 @@ impl<C> ReservationTable<C> {
             test_slot_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             test_leaf_reads: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_unbudgeted_reads: std::cell::Cell::new(0),
+            #[cfg(test)]
+            test_preflight_reads: std::cell::Cell::new(0),
         })
     }
 
@@ -656,6 +674,30 @@ impl<C> ReservationTable<C> {
         self.test_leaf_reads.set(0);
     }
 
+    /// Test-only read of the unbudgeted-read counter.
+    #[cfg(test)]
+    pub(super) fn test_unbudgeted_reads_for_test(&self) -> usize {
+        self.test_unbudgeted_reads.get()
+    }
+
+    /// Test-only reset of the unbudgeted-read counter.
+    #[cfg(test)]
+    pub(super) fn reset_test_unbudgeted_reads_for_test(&self) {
+        self.test_unbudgeted_reads.set(0);
+    }
+
+    /// Test-only read of the sync-walk counter.
+    #[cfg(test)]
+    pub(super) fn test_preflight_reads_for_test(&self) -> usize {
+        self.test_preflight_reads.get()
+    }
+
+    /// Test-only reset of the sync-walk counter.
+    #[cfg(test)]
+    pub(super) fn reset_test_preflight_reads_for_test(&self) {
+        self.test_preflight_reads.set(0);
+    }
+
     /// Test-only bucket for a model key: lets a high-occupancy twin
     /// brute-force survivors colliding with a staged head's bucket.
     #[cfg(test)]
@@ -674,6 +716,21 @@ impl<C> ReservationTable<C> {
     #[cfg(test)]
     pub(crate) fn staged_bucket_for_test(namespace: u64, value: u64) -> usize {
         Self::key_bucket(Role::H9Staged, RoleKey { namespace, value })
+    }
+
+    /// Test-only bucket for a fallback association ticket: lets a
+    /// churn twin pose retained tickets colliding with a mint's
+    /// bucket. Tickets live in namespace zero under the Association
+    /// role, exactly like [`StagingLedger::mint_keyassoc`].
+    #[cfg(test)]
+    pub(crate) fn assoc_bucket_for_test(ticket: u64) -> usize {
+        Self::key_bucket(
+            Role::Association,
+            RoleKey {
+                namespace: 0,
+                value: ticket,
+            },
+        )
     }
 
     /// Test-only list of retained staged keys: the machine twin finds
@@ -867,6 +924,12 @@ impl<C> ReservationTable<C> {
     }
 
     fn slot_is_vacant(&self, at: usize) -> bool {
+        // RED scaffolding (fix round 5): the vacancy re-read is a real
+        // leaf the sweep performs after its unlink leaves. Counted
+        // without a debit until the snapshot fold charges it.
+        #[cfg(test)]
+        self.test_unbudgeted_reads
+            .set(self.test_unbudgeted_reads.get() + 1);
         self.slots[at]
             .operation
             .as_ref()
@@ -878,6 +941,12 @@ impl<C> ReservationTable<C> {
     /// splice completes; lookups skip the cleared operation meanwhile.
     /// Unindexed tables never linked aliases, so they finish immediately.
     fn clear_vacated_slot(&mut self, at: usize, cursor: &mut ReleaseRoleCursor) {
+        // RED scaffolding (fix round 5): the alias snapshot is a real
+        // leaf read after the last unlink unit. Counted without a
+        // debit until the snapshot fold charges it.
+        #[cfg(test)]
+        self.test_unbudgeted_reads
+            .set(self.test_unbudgeted_reads.get() + 1);
         let aliases = self.slots[at].operation.as_ref().unwrap().aliases;
         self.slots[at].operation = None;
         self.live -= 1;
@@ -892,10 +961,16 @@ impl<C> ReservationTable<C> {
 
     fn key_slot(&self, role: Role, key: RoleKey) -> Option<usize> {
         if self.indexed() {
+            #[cfg(test)]
+            self.test_preflight_reads
+                .set(self.test_preflight_reads.get() + 1);
             let mut code = self.key_heads[Self::key_bucket(role, key)];
             while code != INDEX_NONE {
                 #[cfg(test)]
                 self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+                #[cfg(test)]
+                self.test_preflight_reads
+                    .set(self.test_preflight_reads.get() + 1);
                 let slot = node_slot(code);
                 let lane = node_lane(code);
                 // Buckets mix lanes on collision: the node owns its own
@@ -912,6 +987,9 @@ impl<C> ReservationTable<C> {
                 {
                     return Some(slot);
                 }
+                #[cfg(test)]
+                self.test_preflight_reads
+                    .set(self.test_preflight_reads.get() + 1);
                 code = self.slots[slot].next[KEY_LINKS][lane];
             }
             return None;
@@ -919,6 +997,9 @@ impl<C> ReservationTable<C> {
         self.slots.iter().position(|slot| {
             #[cfg(test)]
             self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+            #[cfg(test)]
+            self.test_preflight_reads
+                .set(self.test_preflight_reads.get() + 1);
             slot.operation.as_ref().is_some_and(|operation| {
                 operation.roles[role.index()]
                     .as_ref()
@@ -929,10 +1010,16 @@ impl<C> ReservationTable<C> {
 
     fn id_slot(&self, id: ReservationId) -> Option<usize> {
         if self.indexed() {
+            #[cfg(test)]
+            self.test_preflight_reads
+                .set(self.test_preflight_reads.get() + 1);
             let mut code = self.id_heads[Self::id_bucket(id)];
             while code != INDEX_NONE {
                 #[cfg(test)]
                 self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+                #[cfg(test)]
+                self.test_preflight_reads
+                    .set(self.test_preflight_reads.get() + 1);
                 let slot = node_slot(code);
                 let lane = node_lane(code);
                 if self.slots[slot]
@@ -942,6 +1029,9 @@ impl<C> ReservationTable<C> {
                 {
                     return Some(slot);
                 }
+                #[cfg(test)]
+                self.test_preflight_reads
+                    .set(self.test_preflight_reads.get() + 1);
                 code = self.slots[slot].next[ID_LINKS][lane];
             }
             return None;
@@ -949,6 +1039,9 @@ impl<C> ReservationTable<C> {
         self.slots.iter().position(|slot| {
             #[cfg(test)]
             self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+            #[cfg(test)]
+            self.test_preflight_reads
+                .set(self.test_preflight_reads.get() + 1);
             slot.operation
                 .as_ref()
                 .is_some_and(|operation| operation.aliases.contains(&Some(id)))
@@ -1078,6 +1171,9 @@ impl<C> ReservationTable<C> {
             None => {
                 let id = ReservationId(self.next + 1);
                 let at = if self.indexed() {
+                    #[cfg(test)]
+                    self.test_preflight_reads
+                        .set(self.test_preflight_reads.get() + 1);
                     Self::free_pop(&mut self.free_head, &mut self.slots)
                         .expect("preflight retained a slot")
                 } else {
@@ -1086,6 +1182,9 @@ impl<C> ReservationTable<C> {
                         .position(|slot| {
                             #[cfg(test)]
                             self.test_slot_visits.set(self.test_slot_visits.get() + 1);
+                            #[cfg(test)]
+                            self.test_preflight_reads
+                                .set(self.test_preflight_reads.get() + 1);
                             slot.operation.is_none()
                         })
                         .expect("preflight retained a slot")
@@ -1444,6 +1543,13 @@ impl<C> ReservationTable<C> {
                     }
                     let taken = result.take().expect("pending release keeps its charge");
                     if self.slot_is_vacant(slot) {
+                        // RED scaffolding (fix round 5): the alias
+                        // snapshot is a real leaf read after the last
+                        // unlink unit. Counted without a debit until
+                        // the snapshot fold charges it.
+                        #[cfg(test)]
+                        self.test_unbudgeted_reads
+                            .set(self.test_unbudgeted_reads.get() + 1);
                         let aliases = self.slots[slot].operation.as_ref().unwrap().aliases;
                         self.slots[slot].operation = None;
                         self.live -= 1;
@@ -2655,9 +2761,7 @@ mod tests {
                 }
             }
             let budget = [0usize, 1, 2, 63, 64, 65, 128][(xorshift_next(&mut rng) % 7) as usize];
-            let target = if !present.is_empty()
-                && xorshift_next(&mut rng).is_multiple_of(2)
-            {
+            let target = if !present.is_empty() && xorshift_next(&mut rng).is_multiple_of(2) {
                 let pick = (xorshift_next(&mut rng) % present.len() as u64) as usize;
                 present[pick]
             } else {
@@ -2817,5 +2921,71 @@ mod tests {
             }
         }
         assert_eq!(direct_reads, 2, "the fake body has two direct reads");
+    }
+
+    /// Budgeted release subcursors share one mutable gate: the single
+    /// release step must not mint a fresh gate, the ledger step must
+    /// take the gate (not a bare budget), and the feed disposal must
+    /// not debit subcursor work after it returns.
+    #[test]
+    fn budgeted_release_paths_share_one_gate() {
+        let reservations = include_str!("reservations.rs");
+        let start = reservations
+            .find("fn release_single_step")
+            .expect("budgeted fn present");
+        let rest = &reservations[start..];
+        let end = rest
+            .find("\n    fn ")
+            .map(|offset| start + offset)
+            .unwrap_or(reservations.len());
+        let body = &reservations[start..end];
+        assert!(
+            !body.contains("LeafBudget::new"),
+            "release_single_step must share the caller's gate, not mint one"
+        );
+        let ledger = include_str!("ledger.rs");
+        let start = ledger
+            .find("fn release_step")
+            .expect("ledger release step present");
+        let rest = &ledger[start..];
+        let end = rest
+            .find("\n    fn ")
+            .map(|offset| start + offset)
+            .unwrap_or(ledger.len());
+        let body = &ledger[start..end];
+        assert!(
+            body.contains("&mut LeafBudget"),
+            "ledger release_step must take the shared mutable gate"
+        );
+        let keyuse = include_str!("../../semantics_key_use.rs");
+        assert!(
+            !keyuse.contains("for _ in 0..used"),
+            "the feed disposal must not debit subcursor work after return"
+        );
+    }
+
+    /// Budgeted release drivers must not re-read a slot after its
+    /// charged visit: vacancy and alias facts come from the charged
+    /// visit's retained snapshot, never from a post-unlink reload.
+    #[test]
+    fn budgeted_release_paths_fold_slot_rereads_into_charged_visits() {
+        let source = include_str!("reservations.rs");
+        for name in ["fn release_single_step", "fn release_role_step"] {
+            let start = source.find(name).expect("budgeted fn present");
+            let rest = &source[start..];
+            let end = rest
+                .find("\n    fn ")
+                .map(|offset| start + offset)
+                .unwrap_or(source.len());
+            let body = &source[start..end];
+            assert!(
+                !body.contains("slot_is_vacant("),
+                "{name} must not reload vacancy after its charged visit"
+            );
+            assert!(
+                !body.contains(".operation.as_ref()"),
+                "{name} must not reload the slot after its charged visit"
+            );
+        }
     }
 }

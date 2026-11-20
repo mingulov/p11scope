@@ -2126,9 +2126,7 @@ fn run_with_terminal_budget(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
-        let decoder = semantic_lane
-            .as_ref()
-            .and_then(|lane| lane.joint_decoder_malformed());
+        let decoder = resolve_joint_decoder_malformed(semantic_lane.as_ref(), &coordinator);
         inventory_diagnostic(&crate::inventory_semantics::joint_decoder_line(decoder));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         inventory_diagnostic(&crate::inventory_semantics::joint_audit_subjects_line(
@@ -3326,6 +3324,19 @@ impl WarnSink<'_> {
 /// lane (plus the coordinator's binding count) before any handoff
 /// that would clear them. Counts only; no identities, paths or
 /// payloads.
+/// Resolve the terminal decoder total for the verbose tails: the
+/// seated lane's live drain while it reads, else the total retained
+/// at lane release (the healthy wound-down path hands the live
+/// session away before the tails print, so the live query alone
+/// would read unknown on every real run). Unknown without either.
+fn resolve_joint_decoder_malformed(
+    lane: Option<&crate::inventory_semantics::AttestedSemanticLane>,
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+) -> Option<u64> {
+    lane.and_then(|lane| lane.joint_decoder_malformed())
+        .or_else(|| coordinator.joint_decoder_diagnosis())
+}
+
 struct SemanticStopCounts {
     refusals: [u64; 12],
     overflow_refusals: u64,
@@ -9427,9 +9438,7 @@ fn run_dashboard(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
-        let decoder = semantic_lane
-            .as_ref()
-            .and_then(|lane| lane.joint_decoder_malformed());
+        let decoder = resolve_joint_decoder_malformed(semantic_lane.as_ref(), &coordinator);
         display.notice(&crate::inventory_semantics::joint_decoder_line(decoder));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         display.notice(&crate::inventory_semantics::joint_audit_subjects_line(
@@ -23113,6 +23122,148 @@ mod tests {
         coordinator
             .commit_batch(false)
             .expect("a later plain commit succeeds past the abandoned publication");
+    }
+
+    #[test]
+    fn scripted_decoder_total_answers_without_a_live_drain() {
+        // The posed retained-decoder total stands in for a live
+        // drain's terminal total, so the release snapshot and tail
+        // fallback run unprivileged.
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        assert_eq!(
+            lane.joint_decoder_malformed(),
+            None,
+            "an unposed substituted lane reads unknown"
+        );
+        lane.set_scripted_decoder_malformed_for_test(Some(0));
+        assert_eq!(
+            lane.joint_decoder_malformed(),
+            Some(0),
+            "the posed healthy zero answers"
+        );
+        lane.set_scripted_decoder_malformed_for_test(Some(3));
+        assert_eq!(
+            lane.joint_decoder_malformed(),
+            Some(3),
+            "the posed positive answers exactly"
+        );
+        lane.set_scripted_decoder_malformed_for_test(None);
+        assert_eq!(
+            lane.joint_decoder_malformed(),
+            None,
+            "posing no drain reads unknown again"
+        );
+    }
+
+    #[test]
+    fn complete_final_joint_lane_retains_the_decoder_total_for_the_tail() {
+        // The healthy wound-down path hands the live session away
+        // before the verbose tails print: the release snapshots the
+        // posed healthy zero while the drain still reads, so the
+        // tails prove zero instead of unknown.
+        let mut coordinator = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_test_joint_frame(false);
+        assert!(
+            matches!(
+                lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+                Ok(true)
+            ),
+            "the completing detach joins"
+        );
+        lane.set_scripted_decoder_malformed_for_test(Some(0));
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(lane);
+        driver.complete_final_joint_lane();
+        assert!(
+            driver.semantic.is_none(),
+            "the handoff releases the lane shell"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(0),
+            "the release retains the posed healthy zero"
+        );
+    }
+
+    #[test]
+    fn hold_joint_lane_for_exit_retains_the_decoder_total_for_the_tail() {
+        // Every abandon/disposition path funnels through the exit
+        // hold, which consumes the lane: the hold snapshots the
+        // posed positive at entry, before the live drain is gone.
+        let mut coordinator = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.set_scripted_decoder_malformed_for_test(Some(3));
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let _ = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "test hold",
+            "joint work abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            Some(3),
+            "the hold retains the posed positive exactly"
+        );
+    }
+
+    #[test]
+    fn dropped_winding_lane_retains_the_decoder_total_for_the_tail() {
+        // A promotion lane still winding down at driver drop is held
+        // for exit with its live drain intact but unreachable: the
+        // drop snapshots the posed total first, ahead of the tails.
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        {
+            let mut driver = driver_with_display(&mut coordinator, headless.display);
+            let mut lane = joint_lane(WindDownIo::completing(), false);
+            lane.set_scripted_decoder_malformed_for_test(Some(5));
+            driver.retiring = Some(RetiringDomain::winding(lane, true));
+        }
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            Some(5),
+            "the drop retains the winding lane's posed total"
+        );
+    }
+
+    #[test]
+    fn resolve_joint_decoder_malformed_prefers_live_then_retained() {
+        // The tails read the seated lane's live drain while it
+        // answers, else the last release snapshot, else unknown.
+        let mut coordinator = coordinator();
+        let mut live = joint_lane(WindDownIo::completing(), false);
+        live.set_scripted_decoder_malformed_for_test(Some(7));
+        coordinator.note_joint_decoder_malformed(Some(3));
+        assert_eq!(
+            resolve_joint_decoder_malformed(Some(&live), &coordinator),
+            Some(7),
+            "the live drain wins over a retained snapshot"
+        );
+        let quiet = joint_lane(WindDownIo::completing(), false);
+        assert_eq!(
+            resolve_joint_decoder_malformed(Some(&quiet), &coordinator),
+            Some(3),
+            "a drain-less seated lane falls back to the snapshot"
+        );
+        assert_eq!(
+            resolve_joint_decoder_malformed(None, &coordinator),
+            Some(3),
+            "a released lane falls back to the snapshot"
+        );
+        coordinator.note_joint_decoder_malformed(None);
+        assert_eq!(
+            resolve_joint_decoder_malformed(None, &coordinator),
+            None,
+            "no lane and no snapshot reads unknown"
+        );
     }
 
     #[test]

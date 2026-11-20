@@ -498,6 +498,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// the drain notes one gap per void above this baseline, so
     /// retries and owner replacement neither repeat nor lose a void.
     audit_voids_disclosed: [u64; 7],
+    /// The last lane-release snapshot of the retained EVENTS
+    /// decoder's malformed total (`None` means unknown: never
+    /// snapshotted, or the released lane had no readable drain).
+    /// The verbose tails fall back to it once the healthy
+    /// wound-down path has handed the live session away; each
+    /// release overwrites, so the value always names the last
+    /// released lane, never an earlier one.
+    retained_decoder_malformed: Option<u64>,
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     engine_collected_finish_calls: u64,
@@ -1299,6 +1307,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ),
             seal_diagnosis: semantics::SealDiagnosis::default(),
             audit_voids_disclosed: [0; 7],
+            retained_decoder_malformed: None,
             #[cfg(test)]
             engine_collected_finish_calls: 0,
             #[cfg(test)]
@@ -3358,6 +3367,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self,
     ) -> crate::semantics_objects::journal::JointVoidDiagnosis {
         self.joint_capture.adapter().joint_void_diagnosis()
+    }
+
+    /// Snapshot the released lane's retained-decoder total for the
+    /// verbose tails: call while the lane's drain still reads, before
+    /// the handoff takes the live session away. Each release
+    /// overwrites, so the retained value always names the last
+    /// released lane.
+    pub(crate) fn note_joint_decoder_malformed(&mut self, total: Option<u64>) {
+        self.retained_decoder_malformed = total;
+    }
+
+    /// The last lane-release decoder snapshot (`None` means unknown),
+    /// for the verbose tails once the seated lane no longer reads.
+    pub(crate) fn joint_decoder_diagnosis(&self) -> Option<u64> {
+        self.retained_decoder_malformed
     }
 
     /// Disclose audit voids as counted scope gaps (scope round): one
@@ -13516,6 +13540,36 @@ pub(crate) mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    /// The retained decoder snapshot defaults to unknown; each note
+    /// overwrites, so the tails always read the last released lane.
+    #[test]
+    fn joint_decoder_diagnosis_defaults_to_unknown_until_noted() {
+        let mut coordinator = coordinator();
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            None,
+            "no release yet means unknown"
+        );
+        coordinator.note_joint_decoder_malformed(Some(0));
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            Some(0),
+            "a healthy zero retains exactly"
+        );
+        coordinator.note_joint_decoder_malformed(Some(3));
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            Some(3),
+            "a later release overwrites the earlier lane"
+        );
+        coordinator.note_joint_decoder_malformed(None);
+        assert_eq!(
+            coordinator.joint_decoder_diagnosis(),
+            None,
+            "a drain-less release honestly clears back to unknown"
+        );
     }
 
     /// The run's `--key-sizes` request reaches the Joint key-use

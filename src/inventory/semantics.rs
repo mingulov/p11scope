@@ -1091,6 +1091,10 @@ pub(crate) struct AttestedSemanticLane {
     /// naming runs without a live machine.
     #[cfg(test)]
     scripted_rearm_refusal: Option<Option<RunningRearmRefusal>>,
+    /// Tests-only posed retained-decoder total: the release
+    /// snapshot and tail fallback run without a live drain.
+    #[cfg(test)]
+    scripted_decoder_malformed: Option<Option<u64>>,
     /// Tests-only count of `begin_joint_commit` calls.
     #[cfg(test)]
     joint_commit_begin_calls: usize,
@@ -2272,6 +2276,8 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             scripted_rearm_refusal: None,
             #[cfg(test)]
+            scripted_decoder_malformed: None,
+            #[cfg(test)]
             joint_commit_begin_calls: 0,
             #[cfg(test)]
             joint_service_calls: 0,
@@ -2533,6 +2539,8 @@ impl AttestedSemanticLane {
             scripted_running_rearms: None,
             #[cfg(test)]
             scripted_rearm_refusal: None,
+            #[cfg(test)]
+            scripted_decoder_malformed: None,
             #[cfg(test)]
             joint_commit_begin_calls: 0,
             #[cfg(test)]
@@ -2890,8 +2898,12 @@ impl AttestedSemanticLane {
     /// The retained EVENTS decoder's terminal malformed total, for the
     /// Joint-decoder line. `None` without a live lane or drain:
     /// unknown, never zero. Read-only; substituted test lanes carry
-    /// no retained drain and read unknown.
+    /// no retained drain and read unknown unless posed.
     pub(crate) fn joint_decoder_malformed(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(posed) = self.scripted_decoder_malformed {
+            return posed;
+        }
         self.live
             .as_ref()
             .and_then(|live| live.session.events_decoder_malformed())
@@ -3386,6 +3398,14 @@ impl AttestedSemanticLane {
         refusal: Option<RunningRearmRefusal>,
     ) {
         self.scripted_rearm_refusal = Some(refusal);
+    }
+
+    /// Pose the retained-decoder total the release snapshot and
+    /// tail fallback read (tests only): `Some(n)` stands in for a
+    /// live drain's terminal total, `None` for a lane without one.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_decoder_malformed_for_test(&mut self, total: Option<u64>) {
+        self.scripted_decoder_malformed = Some(total);
     }
 
     /// How many `begin_joint_commit` calls this lane served.

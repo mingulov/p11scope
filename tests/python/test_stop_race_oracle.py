@@ -18,7 +18,10 @@ FOREIGN = {"dev": [8, 1], "ino": 72, "sha256": "b" * 64}
 LOSS_COUNTERS = ("start_insert_failures", "unmatched_returns", "rv_update_failures",
                  "cgroup_scope_failures", "abi_refusals", "malformed_records",
                  "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures",
-                 "discovery_truncated", "task_uprobe_link_losses")
+                 "discovery_truncated", "task_uprobe_link_losses",
+                 # Live counting cover retired mid-capture (mirrors
+                 # check-capture-evidence.py COUNTERS; forces PARTIAL).
+                 "coverage_retired_slots")
 VERDICT_COUNTERS = (
     "semantic_capture_failures", "unregistered_mechanisms", "template_tail_failures",
     "process_tracking_fallbacks", "process_tracking_failures", "process_tracking_evictions",

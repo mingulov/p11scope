@@ -1556,7 +1556,7 @@ jobs:
               "shape_decode_failures", "shape_decode_total_failures", "discovery_conflicts",
               "discovery_uncorroborated", "module_ambiguous", "discovery_ring_loss",
               "discovery_state_failures", "discovery_read_failures", "discovery_truncated",
-              "task_uprobe_link_losses",
+              "task_uprobe_link_losses", "coverage_retired_slots",
           }
           ERRNOS = {
               "EPERM": (1, "Operation not permitted"),

@@ -33,6 +33,14 @@ static NEXT_RAW_QUANTUM: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawQuantumIdentity(u64);
+impl RawQuantumIdentity {
+    /// Test-only identity mint: cache-key twins need distinct
+    /// identities without collecting quanta.
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 /// Identity only, retained from an actual collected allocation. It cannot
 /// ingest, claim, create evidence or dispose any history.

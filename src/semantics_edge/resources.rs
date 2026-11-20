@@ -67,7 +67,9 @@ const _: () = {
     assert!(std::mem::size_of::<String>() == 24);
     // H9 adds the `id_exhaustions` u64 (368 = 360 + 8); the base
     // charge below still dominates the struct plus empty roots.
-    assert!(std::mem::size_of::<super::EdgeSemantics>() == 368);
+    // Test builds add one `Cell<usize>` budgeted-read counter (+8);
+    // the production layout stays 368.
+    assert!(std::mem::size_of::<super::EdgeSemantics>() == if cfg!(test) { 376 } else { 368 });
     assert!(OPEN_NODE + 32 <= OPEN_BINDING_CHARGE);
     assert!(ACTIVE_NODE + 32 <= ACTIVE_MACHINE_CHARGE);
     assert!(MECHANISM_NODE + 32 <= MECHANISM_CHARGE);

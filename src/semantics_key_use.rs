@@ -352,6 +352,11 @@ pub(crate) struct JointStaging {
     /// first, so one segment's worth is ever pended: bounded by
     /// [`JOINT_STAGING_CAPACITY`].
     pending_releases: Vec<(Option<crate::attach::capture::NativeDomainId>, u64, u64)>,
+    /// Test-only staged-queue read counter: every budgeted-disposal
+    /// peek/pop of the staged queue. Incremented at the actual access
+    /// so per-poll `reads <= spent` assertions observe real reads.
+    #[cfg(test)]
+    test_feed_reads: std::cell::Cell<usize>,
 }
 
 impl std::fmt::Debug for JointStaging {
@@ -400,6 +405,8 @@ impl JointStaging {
             segment_fence: None,
             resume_deferral_disclosed: None,
             pending_releases: Vec::new(),
+            #[cfg(test)]
+            test_feed_reads: std::cell::Cell::new(0),
         }
     }
 
@@ -808,6 +815,25 @@ impl JointStaging {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn staged_len(&self) -> usize {
         self.staged.len()
+    }
+
+    /// Test-only bump of the staged-queue read counter: one per
+    /// budgeted-disposal peek/pop, at the actual access.
+    #[cfg(test)]
+    fn bump_feed_read_for_test(&self) {
+        self.test_feed_reads.set(self.test_feed_reads.get() + 1);
+    }
+
+    /// Test-only read of the staged-queue read counter.
+    #[cfg(test)]
+    pub(crate) fn test_feed_reads_for_test(&self) -> usize {
+        self.test_feed_reads.get()
+    }
+
+    /// Test-only reset of the staged-queue read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_feed_reads_for_test(&self) {
+        self.test_feed_reads.set(0);
     }
 
     /// Read the original retained membership, without copying its payload or
@@ -4196,6 +4222,23 @@ impl FeedDisposalCursor {
         self.pending_lease.as_ref().map(|(bytes, _)| *bytes)
     }
 
+    /// Test-only read of the throwaway edge's unified read counter
+    /// (0 for pure feeds, which keep no throwaway).
+    #[cfg(test)]
+    pub(crate) fn throwaway_edge_reads_for_test(&self) -> usize {
+        self.throwaway
+            .as_ref()
+            .map_or(0, |edge| edge.test_edge_reads_for_test())
+    }
+
+    /// Test-only reset of the throwaway edge's unified read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_throwaway_edge_reads_for_test(&self) {
+        if let Some(edge) = self.throwaway.as_ref() {
+            edge.reset_test_edge_reads_for_test();
+        }
+    }
+
     /// Drive one feed's disposal through the shared pre-debit
     /// `gate`. Returns whether the feed completed. `fallback`
     /// carries the association ledger for Joint preservation (`None`
@@ -4329,6 +4372,8 @@ impl FeedDisposalCursor {
                     if !gate.try_charge() {
                         return false;
                     }
+                    #[cfg(test)]
+                    feed.bump_feed_read_for_test();
                     let head = feed.staged.pop_front().expect("pending head retained");
                     assert_eq!(
                         head.position, expected,
@@ -4347,6 +4392,8 @@ impl FeedDisposalCursor {
                     if !gate.try_charge() {
                         return false;
                     }
+                    #[cfg(test)]
+                    feed.bump_feed_read_for_test();
                     let head = feed.staged.pop_front().expect("pending head retained");
                     assert_eq!(
                         head.position, expected,
@@ -4360,6 +4407,8 @@ impl FeedDisposalCursor {
                     drop(self.pending_lease.take());
                     continue;
                 }
+                #[cfg(test)]
+                feed.bump_feed_read_for_test();
                 let front = feed.staged.front().expect("pending head retained");
                 assert_eq!(
                     front.position, expected,
@@ -4399,6 +4448,8 @@ impl FeedDisposalCursor {
                         }
                     }
                 }
+                #[cfg(test)]
+                feed.bump_feed_read_for_test();
                 let head = feed.staged.pop_front().expect("pending head retained");
                 assert_eq!(
                     head.position, expected,
@@ -4423,6 +4474,8 @@ impl FeedDisposalCursor {
                 drop(self.pending_lease.take());
                 continue;
             }
+            #[cfg(test)]
+            feed.bump_feed_read_for_test();
             let Some(front) = feed.staged.front() else {
                 if self.finalized {
                     return true;
@@ -4847,5 +4900,643 @@ mod disposal_tests {
                 "seed {seed}: queued + drain matches sync"
             );
         }
+    }
+
+    fn pending_call(session: u64, ts_ns: u64) -> SemanticCall {
+        SemanticCall {
+            function: "C_SignUpdate".into(),
+            rv: pkcs11_types::CkRv::PENDING.0,
+            session,
+            ts_ns,
+            ..SemanticCall::default()
+        }
+    }
+
+    /// Drive one feed disposal to completion with `budget`-unit
+    /// polls, asserting `reads <= spent <= budget` every poll over ALL
+    /// unified counters (reservation leaves + slot visits + unbudgeted
+    /// slot re-reads on both ledgers, staged-queue peeks/pops,
+    /// throwaway edge reads). Returns (polls, total spent, total
+    /// reads).
+    fn drive_disposal_checked(
+        cursor: &mut FeedDisposalCursor,
+        feed: &mut JointStaging,
+        ledger: &mut StagingLedger,
+        fallback: &mut StagingLedger,
+        keyuse: &mut KeyUseReducer,
+        budget: usize,
+        tag: &str,
+    ) -> (usize, usize, usize) {
+        let mut polls = 0usize;
+        let (mut total_spent, mut total_reads) = (0usize, 0usize);
+        loop {
+            ledger.reset_test_leaf_reads_for_test();
+            ledger.reset_test_slot_visits_for_test();
+            ledger.reset_test_unbudgeted_reads_for_test();
+            fallback.reset_test_leaf_reads_for_test();
+            fallback.reset_test_slot_visits_for_test();
+            fallback.reset_test_unbudgeted_reads_for_test();
+            feed.reset_test_feed_reads_for_test();
+            cursor.reset_throwaway_edge_reads_for_test();
+            let mut gate = LeafBudget::new(budget);
+            let done = cursor.poll(feed, ledger, Some(&mut *fallback), keyuse, &mut gate);
+            let spent = gate.spent();
+            let reads = ledger.test_leaf_reads_for_test()
+                + ledger.test_slot_visits_for_test()
+                + ledger.test_unbudgeted_reads_for_test()
+                + fallback.test_leaf_reads_for_test()
+                + fallback.test_slot_visits_for_test()
+                + fallback.test_unbudgeted_reads_for_test()
+                + feed.test_feed_reads_for_test()
+                + cursor.throwaway_edge_reads_for_test();
+            assert!(
+                spent <= budget,
+                "{tag} poll {polls} spent {spent} above {budget}"
+            );
+            assert!(
+                reads <= spent,
+                "{tag} poll {polls} reads {reads} above debited {spent}"
+            );
+            total_spent += spent;
+            total_reads += reads;
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        (polls, total_spent, total_reads)
+    }
+
+    /// Drive one feed disposal to completion with 64-unit polls,
+    /// asserting the reservation-level `reads <= spent <= 64` every
+    /// poll (budgeted leaves + slot visits + sync-walk reads on both
+    /// ledgers). Returns (polls, total sync-walk reads): the budgeted
+    /// disposal must never walk synchronously, so the total is zero
+    /// after the fix.
+    fn drive_disposal_reservation_checked(
+        cursor: &mut FeedDisposalCursor,
+        feed: &mut JointStaging,
+        ledger: &mut StagingLedger,
+        fallback: &mut StagingLedger,
+        keyuse: &mut KeyUseReducer,
+        tag: &str,
+    ) -> (usize, usize) {
+        let mut polls = 0usize;
+        let mut total_sync = 0usize;
+        loop {
+            ledger.reset_test_leaf_reads_for_test();
+            ledger.reset_test_slot_visits_for_test();
+            ledger.reset_test_preflight_reads_for_test();
+            fallback.reset_test_leaf_reads_for_test();
+            fallback.reset_test_slot_visits_for_test();
+            fallback.reset_test_preflight_reads_for_test();
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(feed, ledger, Some(&mut *fallback), keyuse, &mut gate);
+            let spent = gate.spent();
+            let sync =
+                ledger.test_preflight_reads_for_test() + fallback.test_preflight_reads_for_test();
+            let reads = ledger.test_leaf_reads_for_test()
+                + ledger.test_slot_visits_for_test()
+                + fallback.test_leaf_reads_for_test()
+                + fallback.test_slot_visits_for_test()
+                + sync;
+            assert!(spent <= 64, "{tag} poll {polls} spent {spent} above 64");
+            assert!(
+                reads <= spent,
+                "{tag} poll {polls} reservation reads {reads} above debited {spent}"
+            );
+            total_sync += sync;
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        (polls, total_sync)
+    }
+
+    /// Context-specific `C_Login` must not retire the slot's
+    /// operations: sync and feed disposal agree exactly (terminal
+    /// reason/count/order) for context-specific OK (exempt), ordinary
+    /// OK (retires), ordinary PIN_LOCKED (retires) and
+    /// context-specific PIN_LOCKED (retires: the exemption needs OK).
+    #[test]
+    fn feed_disposal_login_scope_matches_synchronous_observe() {
+        use pkcs11_types::CkRv;
+        for (user_type, rv, retired) in [
+            (2u32, CkRv::OK.0, false),
+            (1u32, CkRv::OK.0, true),
+            (1u32, CkRv::PIN_LOCKED.0, true),
+            (2u32, CkRv::PIN_LOCKED.0, true),
+        ] {
+            let tag = format!("user_type={user_type} rv={rv:#x}");
+            let heads = [
+                call("C_OpenSession", 7, CkRv::OK.0, 100),
+                init_call("C_SignInit", 7, 0x000d, 110),
+                SemanticCall {
+                    function: "C_Login".into(),
+                    session: 7,
+                    user_type,
+                    rv,
+                    ts_ns: 120,
+                    ..SemanticCall::default()
+                },
+                call("C_SignFinal", 7, CkRv::OK.0, 130),
+            ];
+            let instance =
+                crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(21);
+            let mut sync_edge = EdgeSemantics::default();
+            let mut sync_keyuse = KeyUseReducer::new();
+            let sync_pool = SemanticResourcePool::default();
+            let mut sync_fallback = StagingLedger::with_resources(sync_pool.reserver());
+            sync_fallback.prepare_capacity().unwrap();
+            let mut sync_effects = Vec::new();
+            for head in &heads {
+                let head_origin = EffectOrigin {
+                    function: head.function.clone(),
+                    session: head.session,
+                    ts_ns: head.ts_ns,
+                };
+                let mut effects = Vec::new();
+                sync_edge.observe_with_effects(head, &head_origin, &mut effects);
+                for effect in &effects {
+                    sync_keyuse.observe_effect(instance, effect, None, Some(&mut sync_fallback));
+                }
+                sync_effects.extend(effects);
+            }
+            let mut started = 0;
+            let mut ended = Vec::new();
+            for effect in &sync_effects {
+                match effect {
+                    OperationEffect::Started { .. } => started += 1,
+                    OperationEffect::Ended { outcome, .. } => ended.push(*outcome),
+                    _ => panic!("{tag}: unexpected sync effect"),
+                }
+            }
+            if retired {
+                assert_eq!(
+                    (started, ended.as_slice()),
+                    (1, [OperationOutcome::Cancelled].as_slice()),
+                    "{tag}: sync retires the active sign"
+                );
+            } else {
+                assert_eq!(
+                    (started, ended.as_slice()),
+                    (1, [OperationOutcome::Completed].as_slice()),
+                    "{tag}: sync completes the active sign"
+                );
+            }
+            let pool = SemanticResourcePool::default();
+            let mut ledger = StagingLedger::with_resources(pool.reserver());
+            ledger.prepare_capacity().unwrap();
+            let mut fallback = StagingLedger::with_resources(pool.reserver());
+            fallback.prepare_capacity().unwrap();
+            let mut feed = joint_feed();
+            for (index, head) in heads.iter().enumerate() {
+                let head_origin = EffectOrigin {
+                    function: head.function.clone(),
+                    session: head.session,
+                    ts_ns: head.ts_ns,
+                };
+                feed.stage(head.clone(), head_origin, (index + 1) as u64, &mut ledger)
+                    .unwrap();
+            }
+            let mut cursor = FeedDisposalCursor::new(instance, true);
+            let mut keyuse = KeyUseReducer::new();
+            let mut polls = 0;
+            loop {
+                let mut gate = LeafBudget::new(64);
+                let done = cursor.poll(
+                    &mut feed,
+                    &mut ledger,
+                    Some(&mut fallback),
+                    &mut keyuse,
+                    &mut gate,
+                );
+                polls += 1;
+                if done {
+                    break;
+                }
+                assert!(polls < 64, "{tag}: the disposal must complete");
+            }
+            assert_eq!(feed.staged_len(), 0, "{tag}");
+            assert_eq!(feed.history_disposed(), 4, "{tag}");
+            assert_eq!(
+                unknown_sums(&keyuse),
+                unknown_sums(&sync_keyuse),
+                "{tag}: terminal counts match sync"
+            );
+            assert_eq!(
+                keyuse.evidence(),
+                sync_keyuse.evidence(),
+                "{tag}: evidence matches sync"
+            );
+            assert_eq!(
+                (fallback.census(), fallback.charged_bytes()),
+                (sync_fallback.census(), sync_fallback.charged_bytes()),
+                "{tag}: fallback custody matches sync"
+            );
+            assert_eq!(keyuse.open().len(), 0, "{tag}: every open closed");
+            assert_eq!(keyuse.refused_opens().len(), 0, "{tag}: nothing refused");
+        }
+    }
+
+    /// 256 staged PENDING calls admit with no eviction: every poll
+    /// keeps its edge reads within its debit, the final completes
+    /// the bound machine, and the independently counted edge visits
+    /// are exactly route + capture per admission (no scan) plus the
+    /// finalize invalidation popping all 256 pendings.
+    #[test]
+    fn feed_disposal_256_staged_pending_admits_without_eviction() {
+        let tag = "pending-256";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(23);
+        feed.stage(
+            init_call("C_SignInit", 1, 0x000d, 100),
+            origin("C_SignInit", 1, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        for session in 1..=256u64 {
+            feed.stage(
+                pending_call(session, 100 + session),
+                origin("C_SignUpdate", session, 100 + session),
+                1 + session,
+                &mut ledger,
+            )
+            .unwrap();
+        }
+        feed.stage(
+            call("C_SignFinal", 1, 0, 500),
+            origin("C_SignFinal", 1, 500),
+            258,
+            &mut ledger,
+        )
+        .unwrap();
+        assert_eq!(feed.staged_len(), 258);
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let mut edge_reads = 0usize;
+        let mut polls = 0usize;
+        loop {
+            cursor.reset_throwaway_edge_reads_for_test();
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            let spent = gate.spent();
+            let throwaway = cursor.throwaway_edge_reads_for_test();
+            assert!(spent <= 64, "{tag} poll {polls} spent {spent} above 64");
+            assert!(
+                throwaway <= spent,
+                "{tag} poll {polls} edge reads {throwaway} above debited {spent}"
+            );
+            edge_reads += throwaway;
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        // One SIGN bit per PENDING: route lookup + origin capture, no
+        // scan at exactly the bound (256 <= MAX_EDGE_PENDING), then
+        // the finalize invalidation pops all 256 pendings.
+        assert_eq!(
+            crate::semantics_edge::MAX_EDGE_PENDING,
+            256,
+            "the twin poses exactly the bound"
+        );
+        assert_eq!(
+            edge_reads,
+            256 * 2 + 256,
+            "{tag}: 256 admissions x (route + capture) + 256 finalize pops"
+        );
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(feed.history_disposed(), 258, "{tag}");
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [1, 0, 0, 0],
+            "{tag}: the final completes the bound machine"
+        );
+        assert_eq!(ledger.staged(), 0, "{tag}: every H9 released");
+        assert_eq!(fallback.census(), 0, "{tag}: the assoc released");
+    }
+
+    /// The 257th staged PENDING evicts exactly the oldest record: the
+    /// scan visits every record once (257 visits) with the poll's edge
+    /// reads inside its debit, the evicted origin's live machine ends
+    /// Unknown, the later final finds no machine, and the finalize
+    /// invalidation pops the 256 survivors.
+    #[test]
+    fn feed_disposal_257th_staged_pending_evicts_oldest_resumably() {
+        let tag = "pending-257";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(25);
+        feed.stage(
+            init_call("C_SignInit", 1, 0x000d, 100),
+            origin("C_SignInit", 1, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        for session in 1..=257u64 {
+            feed.stage(
+                pending_call(session, 100 + session),
+                origin("C_SignUpdate", session, 100 + session),
+                1 + session,
+                &mut ledger,
+            )
+            .unwrap();
+        }
+        feed.stage(
+            call("C_SignFinal", 1, 0, 600),
+            origin("C_SignFinal", 1, 600),
+            259,
+            &mut ledger,
+        )
+        .unwrap();
+        assert_eq!(feed.staged_len(), 259);
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let mut edge_reads = 0usize;
+        let mut polls = 0usize;
+        loop {
+            cursor.reset_throwaway_edge_reads_for_test();
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            let spent = gate.spent();
+            let throwaway = cursor.throwaway_edge_reads_for_test();
+            assert!(spent <= 64, "{tag} poll {polls} spent {spent} above 64");
+            assert!(
+                throwaway <= spent,
+                "{tag} poll {polls} edge reads {throwaway} above debited {spent}"
+            );
+            edge_reads += throwaway;
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        // 257 admissions x (route + capture) + one 257-record oldest
+        // scan + the evicted origin's liveness check + its
+        // visit + terminal + the finalize invalidation popping the 256
+        // survivors: exactly one eviction.
+        assert_eq!(
+            edge_reads,
+            257 * 2 + 257 + 1 + 2 + 256,
+            "{tag}: one 257-visit scan, one Unknown end, 256 finalize pops"
+        );
+        assert!(polls > 6, "{tag}: the scan spans several credits");
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(feed.history_disposed(), 259, "{tag}");
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the evicted machine ends Unknown; the final finds nothing"
+        );
+        assert_eq!(ledger.staged(), 0, "{tag}: every H9 released");
+        assert_eq!(fallback.census(), 0, "{tag}: the assoc released");
+    }
+
+    /// Sequential fallback churn leaves 32 live tickets in bucket 105,
+    /// so the head's mint (ticket 15,509) walks 65 leaves (head + 32
+    /// candidates + 32 nexts): the drain debits every one through the
+    /// shared budget across polls instead of exceeding a whole credit.
+    #[test]
+    fn feed_disposal_fallback_mint_with_long_bucket_is_resumable() {
+        let tag = "mint-churn";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        assert_eq!(
+            StagingLedger::assoc_bucket_for_test(15_509),
+            105,
+            "the churn target bucket is pinned"
+        );
+        let bytes = std::mem::size_of::<crate::semantics_key_use::OpenKeyUse>() as u64;
+        let mut retained = 0usize;
+        for ticket in 1..15_509u64 {
+            let minted = fallback.mint_keyassoc(bytes).unwrap();
+            assert_eq!(minted, ticket, "sequential tickets");
+            if StagingLedger::assoc_bucket_for_test(ticket) == 105 {
+                retained += 1;
+            } else {
+                fallback.release_keyassoc(ticket);
+            }
+        }
+        assert_eq!(retained, 32, "32 live tickets collide in bucket 105");
+        assert_eq!(fallback.census(), 32);
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(27);
+        feed.stage(
+            init_call("C_SignInit", 4001, 0x000d, 100),
+            origin("C_SignInit", 4001, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let (polls, sync) = drive_disposal_reservation_checked(
+            &mut cursor,
+            &mut feed,
+            &mut ledger,
+            &mut fallback,
+            &mut keyuse,
+            tag,
+        );
+        assert!(polls > 1, "{tag}: the 65-leaf walk spans credits");
+        assert_eq!(sync, 0, "{tag}: no sync walk in the budgeted drain");
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(feed.history_disposed(), 1, "{tag}");
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the truncated open closes Unknown"
+        );
+        assert_eq!(
+            fallback.census(),
+            32,
+            "{tag}: survivors stay; the head assoc released exactly once"
+        );
+        assert_eq!(
+            fallback.charged_bytes(),
+            32 * bytes,
+            "{tag}: exact survivor custody"
+        );
+        assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
+    }
+
+    /// First use of a cold fallback prepares its table outside the
+    /// head poll: the head mints, preserves and releases normally
+    /// with every poll inside its debit.
+    #[test]
+    fn feed_disposal_cold_fallback_prepares_outside_head_poll() {
+        let tag = "mint-first-use";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(29);
+        feed.stage(
+            init_call("C_SignInit", 4002, 0x000d, 100),
+            origin("C_SignInit", 4002, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let (_, sync) = drive_disposal_reservation_checked(
+            &mut cursor,
+            &mut feed,
+            &mut ledger,
+            &mut fallback,
+            &mut keyuse,
+            tag,
+        );
+        assert_eq!(sync, 0, "{tag}: no sync walk in the budgeted drain");
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(feed.history_disposed(), 1, "{tag}");
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the truncated open closes Unknown"
+        );
+        assert_eq!(fallback.census(), 0, "{tag}: the assoc released");
+        assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
+    }
+
+    /// A pool-full fallback mint refuses the open without consuming
+    /// a ticket: the refused row closes Unknown at finalize with
+    /// explicit evidence, inside every poll's debit.
+    #[test]
+    fn feed_disposal_pool_refusal_refuses_open_without_ticket() {
+        let tag = "mint-pool-refusal";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(31);
+        feed.stage(
+            init_call("C_SignInit", 4003, 0x000d, 100),
+            origin("C_SignInit", 4003, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let (_, sync) = drive_disposal_reservation_checked(
+            &mut cursor,
+            &mut feed,
+            &mut ledger,
+            &mut fallback,
+            &mut keyuse,
+            tag,
+        );
+        assert_eq!(sync, 0, "{tag}: no sync walk in the budgeted drain");
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the refused open closes Unknown"
+        );
+        assert_eq!(
+            keyuse.evidence().rows_refused,
+            1,
+            "{tag}: exactly one refused row"
+        );
+        assert_eq!(fallback.census(), 0, "{tag}: no assoc minted");
+        pool.reference_set_limit(usize::MAX);
+        let ticket = fallback.mint_keyassoc(16).unwrap();
+        assert_eq!(ticket, 1, "{tag}: the refusal consumed no ticket");
+        fallback.release_keyassoc(ticket);
+    }
+
+    /// One-unit polls never read past their grant: every 1-unit poll
+    /// over a retiring feed debits exactly what it reads, refused
+    /// leaves resume with state and custody intact, and the retire
+    /// completes with its exact terminal.
+    #[test]
+    fn feed_disposal_one_unit_polls_never_read_past_grant() {
+        use pkcs11_types::CkRv;
+        let tag = "gate-one-unit";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(33);
+        let heads = [
+            call("C_OpenSession", 7, CkRv::OK.0, 100),
+            init_call("C_SignInit", 7, 0x000d, 110),
+            call("C_CloseSession", 7, CkRv::OK.0, 120),
+        ];
+        for (index, head) in heads.iter().enumerate() {
+            let head_origin = EffectOrigin {
+                function: head.function.clone(),
+                session: head.session,
+                ts_ns: head.ts_ns,
+            };
+            feed.stage(head.clone(), head_origin, (index + 1) as u64, &mut ledger)
+                .unwrap();
+        }
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        drive_disposal_checked(
+            &mut cursor,
+            &mut feed,
+            &mut ledger,
+            &mut fallback,
+            &mut keyuse,
+            1,
+            tag,
+        );
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(feed.history_disposed(), 3, "{tag}");
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 1, 0],
+            "{tag}: the close retires the open as Cancelled"
+        );
+        assert_eq!(ledger.staged(), 0, "{tag}: every H9 released");
+        assert_eq!(fallback.census(), 0, "{tag}: the assoc released");
     }
 }

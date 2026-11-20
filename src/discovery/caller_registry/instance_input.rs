@@ -3103,6 +3103,18 @@ impl CallerRegistry {
         });
     }
 
+    /// Test-only read of the disposal feed-visit counter.
+    #[cfg(test)]
+    pub(crate) fn test_disposal_reads_for_test(&self) -> usize {
+        self.test_disposal_reads.get()
+    }
+
+    /// Test-only reset of the disposal feed-visit counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_disposal_reads_for_test(&self) {
+        self.test_disposal_reads.set(0);
+    }
+
     /// Drive stranded staged disposal through the shared pre-debit
     /// gate (one leaf per feed visit, staged head, chain read,
     /// machine pop + terminal, payload drop, or open unbind).
@@ -3167,6 +3179,9 @@ impl CallerRegistry {
                 cursor.done_upto = Some(id);
                 continue;
             }
+            #[cfg(test)]
+            self.test_disposal_reads
+                .set(self.test_disposal_reads.get() + 1);
             let next_id = {
                 use std::ops::Bound::{Excluded, Unbounded};
                 let map = &self.instance_state.semantics;
@@ -7289,5 +7304,63 @@ mod joint_ending_reason_tests {
                 "{label} is snake_case"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod staged_disposal_gate_tests {
+    use super::*;
+    use crate::discovery::caller_registry::RegistryLimits;
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::StagingLedger;
+
+    fn empty_record(id: RegistryInstanceId) -> InstanceSemanticRecord {
+        InstanceSemanticRecord {
+            id,
+            caller: CallerId(1),
+            module: ModuleId(1),
+            api_returns: None,
+            saturated: false,
+            historical_only_returns: 0,
+            boundary: None,
+            last_reduced: None,
+            reasons: BTreeSet::new(),
+            lossy: false,
+            semantics: None,
+            authority_exhausted: false,
+            feed: crate::semantics_key_use::JointStaging::select_s1_only(),
+        }
+    }
+
+    /// Every disposal feed lookup charges before it reads: a zero
+    /// unit poll performs no lookup, and the terminal empty lookup
+    /// consumes its unit like any other visit.
+    #[test]
+    fn staged_disposal_terminal_lookup_consumes_its_unit() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        let id = RegistryInstanceId::from_raw(1);
+        registry
+            .instance_state
+            .semantics
+            .insert(id, empty_record(id));
+        registry.start_staged_disposal();
+        let (done, spent) = registry.poll_staged_disposal(&mut ledger, 0);
+        assert_eq!((done, spent), (false, 0));
+        assert_eq!(
+            registry.test_disposal_reads_for_test(),
+            0,
+            "a zero-unit poll performs no lookup"
+        );
+        registry.reset_test_disposal_reads_for_test();
+        let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+        let reads = registry.test_disposal_reads_for_test();
+        assert!(done, "the empty feed disposes");
+        assert_eq!(
+            (spent, reads),
+            (2, 2),
+            "the feed visit and the terminal empty lookup each charge first"
+        );
     }
 }

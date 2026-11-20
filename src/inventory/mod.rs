@@ -31462,6 +31462,51 @@ mod seal_readiness_tests {
         );
     }
 
+    /// A refused `--key-sizes` journal start retries the journal once
+    /// with sizes off: key rows keep flowing behind their own named
+    /// "key sizes unavailable" gap, never a voided key-operations view.
+    #[test]
+    fn key_sizes_journal_refusal_retries_journal_without_sizes() {
+        // Isolate from lines other tests on this thread noted: the
+        // recorder is thread-local and every read drains.
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with_start_queue(
+            vec![
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+                some_preparation(),
+            ],
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Ok(wind_down_lane(WindDownIo::completing())),
+            ],
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                    None,
+                )
+            },
+        );
+        assert!(lane.is_some(), "the sizes-off journal retry seats a lane");
+        assert_eq!(
+            gaps_for_subject(&mut coordinator, "key sizes unavailable").len(),
+            1,
+            "the failed sizes start discloses its own named gap"
+        );
+        assert!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
+            "key rows survive a sizes-only failure"
+        );
+    }
+
     #[test]
     fn seal_line_absent_without_manifest_subset() {
         // Isolate from lines other tests on this thread noted: the

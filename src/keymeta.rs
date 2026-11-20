@@ -3082,4 +3082,31 @@ mod tests {
             assert_eq!(reason_display(reason), display, "{reason}");
         }
     }
+
+    /// An ECDSA signature length alone never names a curve: 64-octet
+    /// signatures are P-256, secp256k1 or brainpoolP256r1 (96-octet
+    /// likewise P-384/brainpoolP384r1), so the inference publishes
+    /// the size class and the curve appears only beside an
+    /// established curve.
+    #[test]
+    fn ecdsa_length_alone_publishes_class_without_curve() {
+        use EvidenceTag::*;
+        const ECDSA: u64 = 0x1041;
+        for (octets, class) in [
+            (64, "EC 256-bit class"),
+            (96, "EC 384-bit class"),
+            (132, "EC 521-bit class"),
+        ] {
+            let SizeOutcome::Inferred(detail) = classify_size(Some(ECDSA), SignOutput, octets)
+            else {
+                panic!("{octets} octets still classifies");
+            };
+            assert_eq!(size_concise(&detail), class, "{octets} octets");
+            assert_eq!(
+                size_verbose(&detail, SignOutput),
+                format!("{class} (from signature length)"),
+                "{octets} octets"
+            );
+        }
+    }
 }

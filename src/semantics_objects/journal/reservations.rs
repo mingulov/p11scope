@@ -1087,6 +1087,61 @@ mod tests {
     }
 
     #[test]
+    fn joint_keepup_reservation_staging_capacity_lookups_and_allocation_stay_bounded() {
+        // Production staging capacity: the ledger's 4,096-slot table
+        // must stay indexed like the 1,024 table, not fall back to
+        // linear scans (measured: 44% of the service core in key_slot
+        // at 5k calls/s x 4 endpoints, 15-27% ring loss).
+        use crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
+
+        let capacity = MAX_UNSETTLED_STAGED;
+        let mut table = ReservationTable::try_new(capacity).unwrap();
+        table.reset_test_slot_visits_for_test();
+        let mut ids = Vec::new();
+        for value in 1..=(capacity as u64) {
+            let id = table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
+            for (role, bytes) in [
+                (Role::H8Open, 2),
+                (Role::Model, 3),
+                (Role::H9Staged, 4),
+                (Role::Association, 5),
+            ] {
+                table.insert(role, key(value), Some(id), bytes, ()).unwrap();
+            }
+            ids.push(id);
+        }
+        let fill_visits = table.test_slot_visits_for_test();
+        assert!(
+            fill_visits < capacity * 5 * 64,
+            "staging-capacity allocation must not scan the table: {fill_visits} visits"
+        );
+        table.reset_test_slot_visits_for_test();
+        let mut lookups = 0;
+        for value in (1..=(capacity as u64)).step_by(7) {
+            for role in [
+                Role::Raw,
+                Role::H8Open,
+                Role::Model,
+                Role::H9Staged,
+                Role::Association,
+            ] {
+                assert!(table.reservation(role, key(value)).is_some());
+                assert!(table.member_bytes(role, key(value)).is_some());
+                lookups += 2;
+            }
+        }
+        for id in ids.iter().step_by(7) {
+            assert!(table.id_slot_for_test(*id).is_some());
+            lookups += 1;
+        }
+        let visits = table.test_slot_visits_for_test();
+        assert!(
+            visits < lookups * 64,
+            "staging-capacity lookups must not scan the table: {visits} visits for {lookups} lookups"
+        );
+    }
+
+    #[test]
     fn resource_reservations_index_matches_linear_model() {
         use crate::semantics_objects::journal::tests::KeepupRng;
 

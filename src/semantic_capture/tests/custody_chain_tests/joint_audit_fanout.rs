@@ -27847,21 +27847,6 @@ fn pending_h3_from_stash(
     pending_h3_with_sibling(unmatched_complete, false, audit_fault)
 }
 
-fn pending_h3_from_stash_with_collect(
-    unmatched_complete: bool,
-    collect_fault: &impl crate::semantics_objects::journal::FaultEpoch,
-    audit_fault: &impl crate::semantics_objects::journal::FaultEpoch,
-) -> PendingH3Scene {
-    pending_h3_with_subject_before_audit_with_collect(
-        unmatched_complete,
-        false,
-        false,
-        collect_fault,
-        audit_fault,
-        |_, _| {},
-    )
-}
-
 fn pending_h3_with_sibling(
     unmatched_complete: bool,
     dispose_sibling: bool,
@@ -29374,7 +29359,26 @@ fn joint_chain_plus_h3_pending_carries_baseline_and_defers() {
         mut fixture,
         frame: mut q1,
         ..
-    } = pending_h3_from_stash_with_collect(false, &ChangedFault, &ChangedFault);
+    } = pending_h3_with_subject_before_audit_with_collect(
+        false,
+        false,
+        false,
+        &ChangedFault,
+        &ChangedFault,
+        |fixture, _| {
+            // The pending original was minted before the era move;
+            // pose the new era H0 reached via its clean gap tick, so
+            // the continuation watermark matches the chain audit.
+            fixture
+                .scene
+                .real
+                .h0
+                .0
+                .borrow_mut()
+                .capture
+                .pose_fault_for_test(1);
+        },
+    );
     let failure = q1
         .failure_for_test()
         .expect("mixed chain+H3 must refuse, never absorb");

@@ -334,13 +334,12 @@ impl<C> ReservationTable<C> {
             spent += 1;
             actual += 1;
             let successor =
-                slots[node_slot(pending.node)].next[pending.plane]
-                    [node_lane(pending.node)];
+                slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
             if pending.prev == INDEX_NONE {
                 heads[pending.bucket] = successor;
             } else {
-                slots[node_slot(pending.prev)].next[pending.plane]
-                    [node_lane(pending.prev)] = successor;
+                slots[node_slot(pending.prev)].next[pending.plane][node_lane(pending.prev)] =
+                    successor;
             }
             pending.splice_ready = false;
             return (true, spent, actual);
@@ -355,8 +354,8 @@ impl<C> ReservationTable<C> {
                 }
                 spent += 1;
                 actual += 1;
-                heads[pending.bucket] = slots[node_slot(pending.node)].next
-                    [pending.plane][node_lane(pending.node)];
+                heads[pending.bucket] =
+                    slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
                 return (true, spent, actual);
             }
             pending.prev = heads[pending.bucket];
@@ -368,8 +367,7 @@ impl<C> ReservationTable<C> {
         while spent < budget {
             spent += 1;
             actual += 1;
-            let next = slots[node_slot(pending.prev)].next[pending.plane]
-                [node_lane(pending.prev)];
+            let next = slots[node_slot(pending.prev)].next[pending.plane][node_lane(pending.prev)];
             if next == pending.node {
                 if spent >= budget {
                     pending.splice_ready = true;
@@ -377,9 +375,8 @@ impl<C> ReservationTable<C> {
                 }
                 spent += 1;
                 actual += 1;
-                slots[node_slot(pending.prev)].next[pending.plane]
-                    [node_lane(pending.prev)] = slots[node_slot(pending.node)]
-                    .next[pending.plane][node_lane(pending.node)];
+                slots[node_slot(pending.prev)].next[pending.plane][node_lane(pending.prev)] =
+                    slots[node_slot(pending.node)].next[pending.plane][node_lane(pending.node)];
                 return (true, spent, actual);
             }
             pending.prev = next;
@@ -413,6 +410,19 @@ impl<C> ReservationTable<C> {
     }
     pub(super) fn population(&self, role: Role) -> usize {
         self.populations[role.index()]
+    }
+
+    /// Test-only sum of one role's retained member bytes.
+    #[cfg(test)]
+    pub(super) fn role_bytes_for_test(&self, role: Role) -> usize {
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                slot.operation.as_ref()?.roles[role.index()]
+                    .as_ref()
+                    .map(|member| member.bytes)
+            })
+            .sum()
     }
 
     /// Test-only read of the lookup cost counter.
@@ -604,16 +614,13 @@ impl<C> ReservationTable<C> {
             let at = cursor.next_slot;
             spent += 1;
             #[cfg(test)]
-            self.test_sweep_visits
-                .set(self.test_sweep_visits.get() + 1);
+            self.test_sweep_visits.set(self.test_sweep_visits.get() + 1);
             let key = self.slots[at]
                 .operation
                 .as_ref()
                 .and_then(|operation| operation.roles[role.index()].as_ref())
                 .map(|member| member.key);
             if let Some(key) = key {
-                let bucket = Self::key_bucket(role, key);
-                let node = node_code(at, role.index());
                 let member = self.slots[at]
                     .operation
                     .as_mut()
@@ -625,8 +632,8 @@ impl<C> ReservationTable<C> {
                 if indexed {
                     cursor.pending_key = Some(PendingUnlink {
                         plane: KEY_LINKS,
-                        bucket,
-                        node,
+                        bucket: Self::key_bucket(role, key),
+                        node: node_code(at, role.index()),
                         prev: INDEX_NONE,
                         splice_ready: false,
                     });
@@ -1789,6 +1796,36 @@ mod tests {
         fallback.release(Role::Model, key(2)).unwrap();
         fallback.release(Role::H8Open, key(3)).unwrap();
         assert_eq!((fallback.census(), fallback.bytes()), (0, 0));
+        // Bulk release at the last linear slot (13,106): the sweep
+        // must not encode a node code for the unindexed table.
+        let mut last = ReservationTable::try_new(13_107).unwrap();
+        assert!(!last.indexed());
+        let first = last.insert(Role::Raw, key(1), None, 1, ()).unwrap();
+        for value in 2..=13_106u64 {
+            last.insert(Role::Raw, key(value), None, 1, ()).unwrap();
+        }
+        let doomed = last
+            .insert(Role::H8Open, key(500_001), None, 2, ())
+            .unwrap();
+        assert_eq!(
+            last.key_slot_for_test(Role::H8Open, key(500_001)),
+            Some(13_106)
+        );
+        last.release_role(Role::H8Open);
+        assert_eq!(last.population(Role::H8Open), 0);
+        assert_eq!(
+            last.reservation(Role::H8Open, key(500_001)),
+            None,
+            "the last-slot H8 membership is gone"
+        );
+        assert!(last.reservation_is_released(doomed));
+        assert_eq!((last.census(), last.bytes()), (13_106, 13_106));
+        assert_eq!(
+            last.reservation(Role::Raw, key(1)),
+            Some(first),
+            "preserved members stay reachable"
+        );
+        assert_eq!(last.member_bytes(Role::Raw, key(13_106)), Some(1));
     }
 
     #[test]
@@ -1824,8 +1861,7 @@ mod tests {
             let mut saw_partial = false;
             loop {
                 table.reset_test_sweep_visits_for_test();
-                let (done, spent) =
-                    table.release_role_step(Role::H8Open, &mut cursor, budget);
+                let (done, spent) = table.release_role_step(Role::H8Open, &mut cursor, budget);
                 let actual = table.test_sweep_visits_for_test();
                 assert!(
                     spent <= budget,

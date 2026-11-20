@@ -13571,6 +13571,14 @@ fn joint_machine_idle_void_with_colliding_h8_is_resumable_one_credit_at_a_time()
         .joint_capture()
         .ledger()
         .census();
+    let prime_h8_bytes = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .h8_bytes_for_test();
     let pool_before_bulk = fixture
         .scene
         .real
@@ -13780,10 +13788,6 @@ fn joint_machine_idle_void_with_colliding_h8_is_resumable_one_credit_at_a_time()
         "the void preserved every Model sibling"
     );
     let done_charged = void_done_charged.unwrap();
-    let prime_h8_bytes = bulk_charged
-        .checked_sub(done_charged)
-        .and_then(|removed| removed.checked_sub(BULK * H8_BYTES))
-        .expect("the void refunded at least the bulk H8 bytes");
     assert_eq!(
         done_charged,
         bulk_charged - prime_h8_bytes - BULK * H8_BYTES,

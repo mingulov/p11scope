@@ -122,6 +122,42 @@ p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0
 LINKED_KEY_SIZES_RSA_ELSEWHERE_TEXT = LINKED_KEY_SIZES_NO_RSA_TEXT + \
     "  RSA 2048: sign: 1 operation (probably secret-key: 1)\n"
 
+#: The mixed-cause shape (void_audit=1, audit_fault_changed_chain=1,
+#: audit_malformed=0, raw_malformed=3): the exact transcript codex
+#: used for the fix1 residual controls.
+_MIXED_CAUSE_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "void_audit=0 ", "void_audit=1 ").replace(
+    "audit_fault_changed_chain=0 ", "audit_fault_changed_chain=1 ").replace(
+    "raw_malformed=0 ", "raw_malformed=3 ")
+
+#: The mixed-cause transcript with a misleading earlier zero ahead of
+#: the terminal positive: the gate must refuse the duplicate, not
+#: qualify on the earlier zero.
+LINKED_KEY_SIZES_EARLIER_ZERO_TEXT = (
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0\n" + _MIXED_CAUSE_TEXT)
+
+#: The mixed-cause transcript with an unrelated diagnostic carrying
+#: raw_malformed=0 past the terminal positive: the unrelated zero
+#: must not mask the terminal count.
+LINKED_KEY_SIZES_UNRELATED_ZERO_TEXT = (
+    _MIXED_CAUSE_TEXT
+    + "p11scope: note: raw_malformed=0 from an earlier sample\n")
+
+#: The healthy transcript without any decoder line but with both
+#: tokens on an unrelated diagnostic: the lookalike fields must not
+#: satisfy the decoder proof.
+LINKED_KEY_SIZES_LOOKALIKE_TEXT = LINKED_KEY_SIZES_TEXT.split(
+    "p11scope: joint decoder:")[0] + \
+    "p11scope: other diagnostic: raw_malformed=0 " \
+    "raw_malformed_unprovable=0\n"
+
+#: The healthy transcript with an unrelated diagnostic naming
+#: raw_malformed=unknown: the terminal zero still qualifies, since
+#: only the exact decoder record counts.
+LINKED_KEY_SIZES_UNRELATED_UNKNOWN_TEXT = LINKED_KEY_SIZES_TEXT + \
+    "p11scope: other diagnostic: raw_malformed=unknown\n"
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -229,6 +265,10 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-no-decoder": key_sizes_rows(),
             "linked-key-sizes-unprovable": key_sizes_rows(),
             "linked-key-sizes-rsa-elsewhere": key_sizes_rows(),
+            "linked-key-sizes-earlier-zero": key_sizes_rows(),
+            "linked-key-sizes-unrelated-zero": key_sizes_rows(),
+            "linked-key-sizes-lookalike": key_sizes_rows(),
+            "linked-key-sizes-unrelated-unknown": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -279,6 +319,14 @@ class JournalGateTests(unittest.TestCase):
                     "raw_malformed_unprovable=1")},
             "linked-key-sizes-rsa-elsewhere": {
                 "rc": 0, "text": LINKED_KEY_SIZES_RSA_ELSEWHERE_TEXT},
+            "linked-key-sizes-earlier-zero": {
+                "rc": 0, "text": LINKED_KEY_SIZES_EARLIER_ZERO_TEXT},
+            "linked-key-sizes-unrelated-zero": {
+                "rc": 0, "text": LINKED_KEY_SIZES_UNRELATED_ZERO_TEXT},
+            "linked-key-sizes-lookalike": {
+                "rc": 0, "text": LINKED_KEY_SIZES_LOOKALIKE_TEXT},
+            "linked-key-sizes-unrelated-unknown": {
+                "rc": 0, "text": LINKED_KEY_SIZES_UNRELATED_UNKNOWN_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -786,6 +834,71 @@ class JournalGateTests(unittest.TestCase):
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_earlier_zero_then_terminal_positive_fails(self):
+        # Non-vacuity (codex fix1 residual, exact transcript): a
+        # misleading earlier zero ahead of the mixed-cause terminal
+        # positive must not qualify: the gate reads one exact
+        # decoder record, so the duplicate refuses as unprovable.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-earlier-zero",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_positive_terminal_and_unrelated_zero_fails(self):
+        # Non-vacuity (codex fix1 residual, exact transcript): an
+        # unrelated diagnostic carrying raw_malformed=0 past the
+        # mixed-cause terminal positive must not mask it.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-unrelated-zero",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("malformed journal records under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_without_decoder_line_but_lookalike_fields_fails(self):
+        # Non-vacuity (codex fix1 residual, exact transcript): both
+        # tokens on an unrelated diagnostic do not satisfy the
+        # decoder proof when the terminal decoder line is absent.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-lookalike",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_healthy_zero_and_unrelated_unknown_passes(self):
+        # The healthy terminal zero still qualifies when unrelated
+        # text elsewhere names raw_malformed=unknown: only the exact
+        # decoder record counts (codex fix1 residual, exact
+        # transcript).
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-unrelated-unknown",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("# OVERALL: PASS", result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
 
     def test_unknown_object_is_a_harness_error(self):
         result, out = self.run_gate(KERNEL, object_name="detailed")

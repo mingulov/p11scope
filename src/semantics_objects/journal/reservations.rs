@@ -359,6 +359,11 @@ impl<C> ReservationTable<C> {
                 return (true, spent, actual);
             }
             pending.prev = heads[pending.bucket];
+            // The miss above reads the bucket head a second time:
+            // count each load where it occurs so the independent
+            // count diverges from the single debit until the head
+            // is cached.
+            actual += 1;
             assert_ne!(pending.prev, INDEX_NONE, "indexed node linked");
             if spent >= budget {
                 return (false, spent, actual);
@@ -1894,5 +1899,123 @@ mod tests {
             assert_eq!(table.population(Role::H8Open), 0);
             assert_eq!((table.census(), table.bytes()), (0, 0));
         }
+    }
+
+    #[test]
+    fn resource_reservations_key_nonhead_unlink_counts_single_head_read() {
+        // Two colliding key members: unlinking the non-head with
+        // budget 1 must debit exactly the one head load it performs.
+        const BASE: u64 = 500_000;
+        let mut seen = std::collections::HashMap::new();
+        let mut pair = None;
+        for ordinal in 0..20_000u64 {
+            let candidate = RoleKey {
+                namespace: 0,
+                value: BASE + ordinal,
+            };
+            let bucket = ReservationTable::<()>::key_bucket(Role::H8Open, candidate);
+            if let Some(prev) = seen.get(&bucket) {
+                pair = Some((*prev, BASE + ordinal));
+                break;
+            }
+            seen.insert(bucket, BASE + ordinal);
+        }
+        let (first, second) = pair.expect("colliding keys exist");
+        let mut table = ReservationTable::try_new(16).unwrap();
+        let key_first = RoleKey {
+            namespace: 0,
+            value: first,
+        };
+        let key_second = RoleKey {
+            namespace: 0,
+            value: second,
+        };
+        table
+            .insert(Role::H8Open, key_first, None, 10, ())
+            .unwrap();
+        table
+            .insert(Role::H8Open, key_second, None, 10, ())
+            .unwrap();
+        let at_first = table
+            .key_slot_for_test(Role::H8Open, key_first)
+            .unwrap();
+        let at_second = table
+            .key_slot_for_test(Role::H8Open, key_second)
+            .unwrap();
+        let bucket = ReservationTable::<()>::key_bucket(Role::H8Open, key_first);
+        assert_eq!(
+            bucket,
+            ReservationTable::<()>::key_bucket(Role::H8Open, key_second),
+            "the pair collides"
+        );
+        assert_eq!(
+            table.key_heads[bucket],
+            node_code(at_second, 1),
+            "the second insert is the head"
+        );
+        let mut pending = PendingUnlink {
+            plane: KEY_LINKS,
+            bucket,
+            node: node_code(at_first, 1),
+            prev: INDEX_NONE,
+            splice_ready: false,
+        };
+        let (done, spent, actual) = ReservationTable::<()>::chain_unlink_resumable(
+            &mut table.key_heads,
+            &mut table.slots,
+            &mut pending,
+            1,
+        );
+        assert!(!done, "budget 1 cannot finish a non-head splice");
+        assert_eq!(spent, 1, "one debit for the head load");
+        assert_eq!(actual, 1, "exactly one head load occurs");
+    }
+
+    #[test]
+    fn resource_reservations_id_nonhead_unlink_counts_single_head_read() {
+        // Two colliding alias identities: unlinking the non-head alias
+        // with budget 1 must debit exactly the one head load it performs.
+        let mut table = ReservationTable::try_new(256).unwrap();
+        let mut seen = std::collections::HashMap::new();
+        let mut pair = None;
+        for value in 1..=200u64 {
+            let id = table.insert(Role::Raw, key(value), None, 1, ()).unwrap();
+            let bucket = ReservationTable::<()>::id_bucket(id);
+            if let Some(prev) = seen.get(&bucket) {
+                pair = Some((*prev, id));
+                break;
+            }
+            seen.insert(bucket, id);
+        }
+        let (first, second) = pair.expect("sequential identities collide");
+        let at_first = table.id_slot_for_test(first).unwrap();
+        let at_second = table.id_slot_for_test(second).unwrap();
+        let bucket = ReservationTable::<()>::id_bucket(first);
+        assert_eq!(
+            bucket,
+            ReservationTable::<()>::id_bucket(second),
+            "the pair collides"
+        );
+        assert_eq!(
+            table.id_heads[bucket],
+            node_code(at_second, 0),
+            "the second insert is the head"
+        );
+        let mut pending = PendingUnlink {
+            plane: ID_LINKS,
+            bucket,
+            node: node_code(at_first, 0),
+            prev: INDEX_NONE,
+            splice_ready: false,
+        };
+        let (done, spent, actual) = ReservationTable::<()>::chain_unlink_resumable(
+            &mut table.id_heads,
+            &mut table.slots,
+            &mut pending,
+            1,
+        );
+        assert!(!done, "budget 1 cannot finish a non-head splice");
+        assert_eq!(spent, 1, "one debit for the head load");
+        assert_eq!(actual, 1, "exactly one head load occurs");
     }
 }

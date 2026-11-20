@@ -24159,6 +24159,112 @@ fn key_operation_fenced_void_ending_feed_queues_reseed_once() {
     );
 }
 
+/// A failed fresh-evidence take is unknown, not negative: its
+/// delivery retries with staging and Joint mode intact (the next
+/// tick takes again) instead of falling the whole session back.
+#[test]
+fn joint_failed_take_retries_with_staging_intact() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) = guarded.admit_shape(&ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(guarded.registry.feed_staged_len_for_test(joint_id), Some(1));
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.take_failed = true;
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert_eq!(outcome, FailureApplyOutcome::Retried);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "a retry keeps Joint mode"
+    );
+    assert_eq!(
+        guarded.registry.feed_staged_len_for_test(joint_id),
+        Some(1),
+        "a retry keeps staging intact"
+    );
+}
+
+/// An exiting process's Joint rows fold with the rows kept: the
+/// departed fold carries the shared key-use rows and the retained
+/// projection into the observations instead of dropping them with
+/// the feed.
+#[test]
+fn joint_exit_fold_keeps_joint_rows() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    for call in sign_flow().into_iter().take(3) {
+        let (facts, position) = guarded.admit_shape(&call);
+        guarded.observe(&joint_key, position, facts);
+    }
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(outcome, FailureApplyOutcome::FellBack { replayed: 3 }),
+        "the fallback rows the staged calls first"
+    );
+    let taken = guarded
+        .registry
+        .take_instance_for_fold(joint_id)
+        .expect("the live instance folds");
+    guarded.registry.fold_taken_instance(taken, 1_000_000);
+    let observations = guarded.registry.joint_observations(1);
+    assert!(
+        observations
+            .unknown_key_operations
+            .iter()
+            .any(|row| row.category == "sign" && row.completed == 1),
+        "the folded feed's sign row is kept, got {:?}",
+        observations.unknown_key_operations,
+    );
+}
+
 /// v0.7.0 issue 3 (fallback twin): a clean resume clears the
 /// `proof_refused_fallback` latch the same way — the replayed calls
 /// stay counted, the section reads populated. JK-22: the pre-resume

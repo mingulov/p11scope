@@ -2780,6 +2780,16 @@ impl CallerRegistry {
             .map(|record| record.feed.frontier_for_test())
     }
 
+    /// Tests-only staged-depth read: a retried failure must keep
+    /// staging intact.
+    #[cfg(test)]
+    pub(crate) fn feed_staged_len_for_test(&self, id: RegistryInstanceId) -> Option<usize> {
+        self.instance_state
+            .semantics
+            .get(&id)
+            .map(|record| record.feed.staged_len())
+    }
+
     /// Inspect accounting without granting publication authority.
     #[cfg(test)]
     pub(crate) fn keyuse_for_test(&self) -> &crate::semantics_key_use::KeyUseReducer {

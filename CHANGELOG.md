@@ -53,14 +53,18 @@ versioned separately and are opaque, exact dispatch keys.
 - Provider, token and mechanism facts on inventory runs with the new
   `--provider-info` opt-in (section version 8; standalone, off by
   default; needs `--capture auto` or `native` and a FULL build).
-  `--json` gains the additive `provider_observations` section plus
-  per-module `provider_info` records, text gains one concise provider
-  line per module with `-v` token and mechanism lines, and CBOM maps
-  the same facts onto supplier, device and algorithm components.
-  Token serials and labels, session counts, memory sizes and clock
-  readings are never captured; a refused uretprobe-hazard self-probe
-  leaves usage entries only with a named gap. Versions 1–7 stay
-  frozen.
+  Observed content decides the output: modules with completed
+  `C_GetInfo` evidence gain per-module `provider_info` records and
+  one concise provider text line each, `--json` gains the optional
+  top-level `provider_observations` section when token rows,
+  mechanism rows or Task 7 gaps exist, `-v` adds token and
+  mechanism lines for the rows present, and CBOM projects
+  manufacturer and library version onto library components, token
+  rows onto devices and mechanism limits onto algorithms. Token
+  serials and labels, session counts, memory sizes and clock
+  readings are never captured; without a clean uretprobe-hazard
+  safety assessment the run leaves usage entries only with a named
+  gap. Versions 1–7 stay frozen.
 
 ### Changed
 

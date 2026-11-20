@@ -1835,21 +1835,29 @@ Limits that matter in pods:
   capture), and refuses under `--capture scan`; it needs no other
   flag, so info appears in default inventory as well as under
   `--key-operations`, and identically with `--key-sizes` on or off.
-  `--json` gains the additive `provider_observations` section
-  (per-slot token rows, per-mechanism limit rows and named gaps)
-  plus the per-module `provider_info` record, text gains one
-  concise provider line per module, and `-v` adds per-slot token
-  and per-mechanism limit lines; CBOM maps the same facts onto
-  supplier, device and algorithm components. Without the flag,
+  Observation needs the native lane: an `auto` run that stays
+  scan-only acquires no facts. Output follows the observed
+  content: a module renders its concise provider line and
+  per-module `provider_info` record only with completed, usable
+  `C_GetInfo` evidence (token or mechanism facts alone add no
+  provider line), and `--json` gains the optional top-level
+  `provider_observations` section only when token rows, mechanism
+  rows or Task 7 gaps exist; `-v` adds per-slot token and
+  per-mechanism limit lines for the rows present. CBOM projects
+  available manufacturer and library version onto `library`
+  components, token rows onto `device` components and mechanism
+  limits onto `algorithm` components (see the [CBOM
+  export](cbom-export.md#provider-token-and-mechanism-info-task-7-v1-only)
+  mapping); Task 7 gaps have no CBOM projection. Without the flag,
   `provider_observations` stays absent and info functions remain
   plain usage endpoints. Token serials and labels, session counts,
-  memory sizes and clock readings are never captured. Where the
-  uretprobe-hazard self-probe refuses (a confined target or an
-  unproven kernel), info return probes stay detached: the affected
-  endpoints keep usage entries only and count the
-  `info_return_refused_hazard` gap, and the
-  `--allow-uretprobe-on-confined-target` override does not re-enable
-  them.
+  memory sizes and clock readings are never captured. Inventory
+  needs a clean uretprobe-hazard safety assessment: on an affected
+  or unproven kernel, or when the assessment cannot be completed,
+  info return probes stay detached — the affected endpoints keep
+  usage entries only and count the `info_return_refused_hazard`
+  gap. Inventory does not accept the
+  `--allow-uretprobe-on-confined-target` override.
 
   The fixture PID and IDs vary by run. Mapping alone does not prove use;
   `At least N entries observed` counts entries, a lower bound, rather than

@@ -2180,10 +2180,13 @@ impl IngestedJointQuantum {
         // spends here is refunded below: it delivers nothing.
         let before = *remaining;
         // A parked consumer degrades instead of retrying: force the
-        // fallback its feed would take under a fenced void. The streak
-        // is copied out here (the batch borrows the consumer below).
-        let forced_disposition = self.consumers[index]
-            .parked
+        // fallback its feed would take under a fenced void. The flag
+        // only alters retry deliveries: a genuine fallback or
+        // history loss the seal observed after the park keeps its
+        // original route (and its loss invalidation). The streak is
+        // copied out here (the batch borrows the consumer below).
+        let forced_disposition = (self.consumers[index].parked
+            && audited.disposition() == SealFailureDisposition::Retry)
             .then_some(SealFailureDisposition::Fallback);
         let park_streak = self.consumers[index].stuck_streak;
         let mut batch = FailureBatchDelivery {

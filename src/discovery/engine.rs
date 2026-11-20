@@ -42494,6 +42494,10 @@ pub(crate) mod publication_tests;
 pub(crate) mod pressure_native_tests;
 
 #[cfg(test)]
+#[path = "flood_admission_tests.rs"]
+pub(crate) mod flood_admission_tests;
+
+#[cfg(test)]
 mod reexec_diagnostic_evaluation_tests {
     use super::session_fixture::ScriptedSession;
     use super::*;

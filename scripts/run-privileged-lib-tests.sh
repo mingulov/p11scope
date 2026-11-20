@@ -352,6 +352,16 @@ discovery::engine::tests::stamped_legacy_fixture_reports_no_surface_gap
 # children with a default kind-6 twin (cgroup scope, ~25 s). Known-fail on
 # 6.6.157 (pre-existing planner merge divergence, reproduced at lane base).
 discovery::engine::tests::exit_mappings_live_cgroup_split_and_default_twin
+# Flood-admission (v0.7.2 MUST-fix): a short --system profile floods
+# SIGKILL children (256 MiB mappers with a per-minute K signature,
+# SIGKILLed near scan time) plus a zero-call dlopen churn loop
+# against an isolated provider copy, with a zero-call anchor mapped
+# pre-capture and held to the end (~120 s). Every driven call must
+# count exactly with no spurious calls, no event loss, no ambiguity
+# rows, and every slot active; the K signature attributes any stall
+# to its minute. Pre-fix code retires the proven slots mid-capture
+# and late windows go missing.
+discovery::engine::flood_admission_tests::privileged_profile_system_flood_shortlived_exact_per_window
 # T8 twin fullness control: the identical phase-1 arming with an empty
 # request map admits the same head with zero loss, proving the twin's
 # refusal pins the full blocked map rather than the head. Expected
@@ -559,6 +569,18 @@ inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_so
 # the LEDGER exactly. A build without the journal pins the
 # journal_unavailable refusal. Prints MTKEY lines (about a minute).
 inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact
+# v0.7.1 admission/counting regression cells: each spawns the real
+# observer (P11SCOPE_E2E_OBSERVER, else the p11scope sibling), drives a
+# deterministic workload with exact expected counts, and asserts counted
+# == driver with zero unnamed loss (about 3-5 min each): (a) 2-way
+# 1 GiB kill bursts plus an exact poll control, (b) a 2-way newcomer flood
+# with loader churn, (c) a 1/s inventory short-lived stream, (d) flood
+# children alternating two views of one provider file on a private ext4
+# loop mount. Prints R071A/B/C/D lines.
+regress071_privileged_tests::privileged_profile_system_bigchild_kills_exact_lp64
+regress071_privileged_tests::privileged_profile_system_newcomer_flood_exact_lp64
+regress071_privileged_tests::privileged_inventory_system_shortlived_stream_exact_lp64
+regress071_privileged_tests::privileged_profile_system_bind_mount_two_view_exact_lp64
 # Reload-disclosure cells: installed inventory captures over the owned
 # fixture pair. The churn run publishes the disclosure naming the
 # churned identity with exact counts; the clean control omits the key

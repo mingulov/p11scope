@@ -2381,6 +2381,36 @@
       "path": "discovery::identity::tests::btrfs_live_two_subvolumes_merge_per_file",
       "reason": "privileged: btrfs two-subvolume merge lock, staged by the btrfs campaign (root, loop-mounted btrfs)",
       "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/flood_admission_tests.rs",
+      "path": "discovery::engine::flood_admission_tests::privileged_profile_system_flood_shortlived_exact_per_window",
+      "reason": "privileged: flood-admission --system short-lived exact-count cell",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/regress071_privileged_tests.rs",
+      "path": "regress071_privileged_tests::privileged_profile_system_bigchild_kills_exact_lp64",
+      "reason": "privileged: profile --system counts every 1 GiB kill-loop C_Initialize and every holder poll exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/regress071_privileged_tests.rs",
+      "path": "regress071_privileged_tests::privileged_profile_system_newcomer_flood_exact_lp64",
+      "reason": "privileged: profile --system counts a newcomer flood of short-lived callers exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/regress071_privileged_tests.rs",
+      "path": "regress071_privileged_tests::privileged_inventory_system_shortlived_stream_exact_lp64",
+      "reason": "privileged: inventory --system counts a 1/s short-lived stream exactly",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/regress071_privileged_tests.rs",
+      "path": "regress071_privileged_tests::privileged_profile_system_bind_mount_two_view_exact_lp64",
+      "reason": "privileged: profile --system counts two bind-mounted views of one provider exactly",
+      "cell": "privileged"
     }
   ]
 }

@@ -313,27 +313,30 @@ impl<'a> JournalLeaves<'a> {
     }
 
     /// Whether a staged shape attributes to `key` against the image's
-    /// live set as it stands (stop) or a frozen live set (doom).
+    /// live set as it stands (stop) or a frozen live set (doom),
+    /// whose per-claimant lookup is indexed: the probe for a frozen-set
+    /// decision is priced without the image's key list.
     pub(in crate::semantics_objects) fn attributes_to(
         &self,
         key: JournalDomainKey,
         shape: &StagedShape,
-        frozen_live: Option<&[JournalDomainKey]>,
+        frozen_live: Option<&BTreeSet<JournalDomainKey>>,
         _paid: ClaimsPaid,
     ) -> bool {
         if shape.identity.image != key.image() {
             return false;
         }
         self.visit_claims(shape);
-        let built;
-        let live = match frozen_live {
-            Some(live) => live,
+        let attribution = match frozen_live {
+            Some(live) => self
+                .adapter
+                .attribute_call_by(key, shape, |claimant| live.contains(claimant)),
             None => {
-                built = self.adapter.live_keys_for_image(key.image());
-                &built
+                let live = self.adapter.live_keys_for_image(key.image());
+                self.adapter.attribute_call(key, shape, &live)
             }
         };
-        self.adapter.attribute_call(key, shape, live) == CallAttribution::Mine
+        attribution == CallAttribution::Mine
     }
 
     // ---- Classification ------------------------------------------------

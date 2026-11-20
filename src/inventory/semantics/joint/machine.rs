@@ -822,6 +822,14 @@ enum Phase {
         identity: RawQuantumIdentity,
         base: u64,
     },
+    PublishedLossPoll {
+        receipt: BatchReceipt,
+        identity: RawQuantumIdentity,
+        base: u64,
+        final_original: bool,
+        ring_polled: bool,
+        stash_polled: bool,
+    },
 }
 
 /// One paid accumulator for the original collection's H0 reports. Incoming
@@ -2849,7 +2857,8 @@ impl LiveJointMachine {
                 | Phase::Staging { identity, .. }
                 | Phase::Auditing { identity, .. }
                 | Phase::Negative { identity, .. }
-                | Phase::Audited { identity, .. } => Some(*identity),
+                | Phase::Audited { identity, .. }
+                | Phase::PublishedLossPoll { identity, .. } => Some(*identity),
                 _ => None,
             })
     }
@@ -2892,6 +2901,7 @@ impl LiveJointMachine {
             Phase::Auditing { .. } => "Auditing",
             Phase::Negative { .. } => "Negative",
             Phase::Audited { .. } => "Audited",
+            Phase::PublishedLossPoll { .. } => "PublishedLossPoll",
         })
     }
 
@@ -2921,6 +2931,7 @@ impl LiveJointMachine {
             Some(Phase::Auditing { .. }) => ("Auditing", None),
             Some(Phase::Negative { .. }) => ("Negative", None),
             Some(Phase::Audited { .. }) => ("Audited", None),
+            Some(Phase::PublishedLossPoll { .. }) => ("PublishedLossPoll", None),
         };
         let demand = match self.demand {
             None => "None",
@@ -4252,29 +4263,24 @@ impl LiveJointMachine {
                         self.finish_no_progress_polls = 0;
                         self.audit_no_progress_polls = 0;
                         self.finish_no_progress_since = None;
-                        if final_original {
-                            self.finish_receipt = Some(receipt);
-                        }
-                        // Poll the EVENTS ring-loss and length-stash
-                        // counters on every machine publish, mirroring
-                        // the plain commit path: a rise discloses in
-                        // the next publication instead of staying
-                        // silent. The polls run before the demand
-                        // check below can return early, so a publish
-                        // that outruns its demand still discloses.
-                        coordinator.poll_and_disclose_events_ring_loss(lane);
-                        coordinator.poll_and_disclose_length_stash_loss(lane);
-                        if let Some(Demand::Bound {
-                            original,
-                            base_revision,
-                        }) = self.demand
-                        {
-                            if original != identity || base_revision != base {
-                                return (Phase::Idle, Err(SemanticRefusal::Unavailable));
-                            }
-                            self.demand = Some(Demand::Published(receipt));
-                        }
-                        (Phase::Idle, Ok(Step::Published))
+                        // The EVENTS ring-loss and length-stash polls
+                        // move to the post-publish phase: they are
+                        // native counter reads, so each runs only
+                        // against its own budgeted action instead of
+                        // past an exhausted slice. The counters are
+                        // cumulative, so a deferred rise discloses on
+                        // the next budgeted pass, never silently.
+                        (
+                            Phase::PublishedLossPoll {
+                                receipt,
+                                identity,
+                                base,
+                                final_original,
+                                ring_polled: false,
+                                stash_polled: false,
+                            },
+                            Ok(Step::Continue),
+                        )
                     }
                     Ok(Ok(JointCommitProgress::Pending)) => {
                         // Wall-time no-progress bound, finish and
@@ -4400,6 +4406,64 @@ impl LiveJointMachine {
                         Err(reason),
                     ),
                 }
+            }
+            Phase::PublishedLossPoll {
+                receipt,
+                identity,
+                base,
+                final_original,
+                ring_polled,
+                stash_polled,
+            } => {
+                let mut ring_polled = ring_polled;
+                let mut stash_polled = stash_polled;
+                // Each native loss lookup is budgeted before it
+                // runs: an exhausted slice defers the remaining
+                // polls to the next pass instead of reading past
+                // the budget. Both helpers run exactly once per
+                // publication, in the plain commit path's order,
+                // mirroring it: a rise discloses in the next
+                // publication instead of staying silent.
+                if !ring_polled && budget.available() {
+                    budget.spend(1);
+                    coordinator.poll_and_disclose_events_ring_loss(lane);
+                    ring_polled = true;
+                }
+                if !stash_polled && budget.available() {
+                    budget.spend(1);
+                    coordinator.poll_and_disclose_length_stash_loss(lane);
+                    stash_polled = true;
+                }
+                if !ring_polled || !stash_polled {
+                    return (
+                        Phase::PublishedLossPoll {
+                            receipt,
+                            identity,
+                            base,
+                            final_original,
+                            ring_polled,
+                            stash_polled,
+                        },
+                        Ok(Step::Yield),
+                    );
+                }
+                if final_original {
+                    self.finish_receipt = Some(receipt);
+                }
+                // The polls ran before the demand check below can
+                // return early, so a publish that outruns its
+                // demand still discloses.
+                if let Some(Demand::Bound {
+                    original,
+                    base_revision,
+                }) = self.demand
+                {
+                    if original != identity || base_revision != base {
+                        return (Phase::Idle, Err(SemanticRefusal::Unavailable));
+                    }
+                    self.demand = Some(Demand::Published(receipt));
+                }
+                (Phase::Idle, Ok(Step::Published))
             }
         }
     }

@@ -644,14 +644,16 @@ PY
     # line proves nothing. The audit-void split stays for
     # explaining the selected cause; only the raw decoder total
     # proves the invariant, and an absent, duplicate, malformed or
-    # unprovable count refuses.
+    # unprovable count refuses. The candidate count anchors on the
+    # label alone, so a bare label or a record missing the space
+    # after it still counts as a candidate instead of vanishing.
     if [ "$KEY_SIZES" = 1 ] && [ -f "$J_TXT" ]; then
         if ! grep -Eq 'key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+' "$J_TXT"; then
             add_reason "key rows never rendered under --key-sizes"
         elif ! grep -Eq '^  key row [^ ]+ object [^ ]+ sign key .*RSA 2048 \(from signature length\)' "$J_TXT"; then
             add_reason "no classified RSA-2048 size under --key-sizes"
         fi
-        DECODER_LINES=$(grep -c '^p11scope: joint decoder: ' "$J_TXT" || true)
+        DECODER_LINES=$(grep -c '^p11scope: joint decoder:' "$J_TXT" || true)
         if [ "$DECODER_LINES" != 1 ]; then
             add_reason "raw malformed count absent or unprovable under --key-sizes"
         elif grep -Eq '^p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0$' "$J_TXT"; then

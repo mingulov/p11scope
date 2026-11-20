@@ -153,7 +153,8 @@ impl<C> TableSlot<C> {
 
 /// Resumable cursor for the budgeted role sweep (`release_role_step`).
 /// Slots advance in order; chain unlinks resume from their predecessor
-/// when a credit's leaf budget runs out. The table stays
+/// or retained splice position when a credit's leaf budget runs out.
+/// The table stays
 /// lookup-consistent across yields (a removed membership reads absent,
 /// a dangling alias node is skipped), but the caller must not insert,
 /// merge or transfer until the sweep completes.
@@ -171,6 +172,10 @@ struct PendingUnlink {
     bucket: usize,
     node: u16,
     prev: u16,
+    /// True when the splice position is found but its
+    /// target-successor load still owns one leaf unit: the next step
+    /// reads the successor and completes the splice.
+    splice_ready: bool,
 }
 
 impl ReleaseRoleCursor {
@@ -306,19 +311,18 @@ impl<C> ReservationTable<C> {
 
     /// Resumable chain unlink for the budgeted void sweep: at most
     /// `budget` link reads this call (`INDEX_NONE` in `prev` starts at
-    /// the head). Returns whether the splice completed, the units
-    /// spent (head read plus predecessor reads, never above `budget`)
-    /// and the independently counted link reads performed (head plus
-    /// predecessor plus target-successor loads). A yielded unlink
-    /// leaves the chain unchanged, so resuming from the returned
-    /// predecessor is exact.
+    /// the head, `splice_ready` completes a retained splice). Returns
+    /// whether the splice completed, the units spent and the
+    /// independently counted link reads performed (both count the
+    /// head read, predecessor reads and the target-successor load,
+    /// never above `budget`). When the budget ends at the discovered
+    /// splice position, the unlink yields with `splice_ready` set and
+    /// the chain unchanged, so the next step's successor load is
+    /// exact.
     fn chain_unlink_resumable(
         heads: &mut [u16; INDEX_BUCKETS],
         slots: &mut [TableSlot<C>],
-        plane: usize,
-        bucket: usize,
-        node: u16,
-        prev: &mut u16,
+        pending: &mut PendingUnlink,
         budget: usize,
     ) -> (bool, usize, usize) {
         if budget == 0 {
@@ -326,16 +330,37 @@ impl<C> ReservationTable<C> {
         }
         let mut spent = 0;
         let mut actual = 0;
-        if *prev == INDEX_NONE {
+        if pending.splice_ready {
             spent += 1;
             actual += 1;
-            if heads[bucket] == node {
+            let successor =
+                slots[node_slot(pending.node)].next[pending.plane]
+                    [node_lane(pending.node)];
+            if pending.prev == INDEX_NONE {
+                heads[pending.bucket] = successor;
+            } else {
+                slots[node_slot(pending.prev)].next[pending.plane]
+                    [node_lane(pending.prev)] = successor;
+            }
+            pending.splice_ready = false;
+            return (true, spent, actual);
+        }
+        if pending.prev == INDEX_NONE {
+            spent += 1;
+            actual += 1;
+            if heads[pending.bucket] == pending.node {
+                if spent >= budget {
+                    pending.splice_ready = true;
+                    return (false, spent, actual);
+                }
+                spent += 1;
                 actual += 1;
-                heads[bucket] = slots[node_slot(node)].next[plane][node_lane(node)];
+                heads[pending.bucket] = slots[node_slot(pending.node)].next
+                    [pending.plane][node_lane(pending.node)];
                 return (true, spent, actual);
             }
-            *prev = heads[bucket];
-            assert_ne!(*prev, INDEX_NONE, "indexed node linked");
+            pending.prev = heads[pending.bucket];
+            assert_ne!(pending.prev, INDEX_NONE, "indexed node linked");
             if spent >= budget {
                 return (false, spent, actual);
             }
@@ -343,15 +368,22 @@ impl<C> ReservationTable<C> {
         while spent < budget {
             spent += 1;
             actual += 1;
-            let next = slots[node_slot(*prev)].next[plane][node_lane(*prev)];
-            if next == node {
+            let next = slots[node_slot(pending.prev)].next[pending.plane]
+                [node_lane(pending.prev)];
+            if next == pending.node {
+                if spent >= budget {
+                    pending.splice_ready = true;
+                    return (false, spent, actual);
+                }
+                spent += 1;
                 actual += 1;
-                slots[node_slot(*prev)].next[plane][node_lane(*prev)] =
-                    slots[node_slot(node)].next[plane][node_lane(node)];
+                slots[node_slot(pending.prev)].next[pending.plane]
+                    [node_lane(pending.prev)] = slots[node_slot(pending.node)]
+                    .next[pending.plane][node_lane(pending.node)];
                 return (true, spent, actual);
             }
-            *prev = next;
-            assert_ne!(*prev, INDEX_NONE, "indexed node linked");
+            pending.prev = next;
+            assert_ne!(pending.prev, INDEX_NONE, "indexed node linked");
         }
         (false, spent, actual)
     }
@@ -474,7 +506,8 @@ impl<C> ReservationTable<C> {
     }
 
     /// One budgeted sweep step over `role`: at most `budget` leaf units
-    /// (slot visits plus chain-link reads). Returns whether the sweep
+    /// (slot visits plus chain-link reads: bucket-head, predecessor
+    /// and target-successor loads). Returns whether the sweep
     /// completed and the units spent (never above `budget`). The caller
     /// holds `cursor` across steps and must not insert, merge or
     /// transfer until completion.
@@ -495,10 +528,7 @@ impl<C> ReservationTable<C> {
                 let (done, used, actual) = Self::chain_unlink_resumable(
                     &mut self.id_heads,
                     &mut self.slots,
-                    pending.plane,
-                    pending.bucket,
-                    pending.node,
-                    &mut pending.prev,
+                    &mut pending,
                     budget - spent,
                 );
                 spent += used;
@@ -526,6 +556,7 @@ impl<C> ReservationTable<C> {
                             bucket: Self::id_bucket(id),
                             node: node_code(at, lane),
                             prev: INDEX_NONE,
+                            splice_ready: false,
                         });
                         advanced = true;
                         break;
@@ -546,10 +577,7 @@ impl<C> ReservationTable<C> {
                 let (done, used, actual) = Self::chain_unlink_resumable(
                     &mut self.key_heads,
                     &mut self.slots,
-                    pending.plane,
-                    pending.bucket,
-                    pending.node,
-                    &mut pending.prev,
+                    &mut pending,
                     budget - spent,
                 );
                 spent += used;
@@ -600,6 +628,7 @@ impl<C> ReservationTable<C> {
                         bucket,
                         node,
                         prev: INDEX_NONE,
+                        splice_ready: false,
                     });
                     continue;
                 }

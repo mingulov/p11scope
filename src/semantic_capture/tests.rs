@@ -2486,6 +2486,127 @@ fn joint_retained_take_maps_receipt_state_refusals() {
     }
 }
 
+/// A take that races live truth requests a partition refresh for
+/// its key, so the next tick re-observes it and the retried take
+/// validates.
+#[test]
+fn joint_raced_take_requests_partition_refresh() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.receipt_epochs = Some(CompleteEpochs {
+        local: 1,
+        global: 5,
+        fault: 0,
+        sticky: 0,
+        record_flags: 0,
+    });
+    let receipt = &witness.candidate.receipt;
+    let (cookie, exec, file) = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    assert!(
+        !harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file)
+    );
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("a raced take refuses");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file),
+        "a raced take queues its key for refresh"
+    );
+}
+
+/// A refresh requested by a raced take re-observes the key on the
+/// next tick even with no new calls: the scan appends the
+/// continuation the frozen router missed, and the retried take
+/// validates against current truth.
+#[test]
+fn joint_partition_refresh_recovers_raced_take() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    // Global churn with no new call: the router never re-observes,
+    // so live truth runs ahead of the frozen scan.
+    harness.io.global = 1;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    let scans_before = harness.io.attempts.len();
+    let mut raw = harness.collect();
+    let report = harness
+        .capture
+        .tick_collected_with(&mut harness.io, &mut raw)
+        .expect("an empty tick still refreshes");
+    assert!(
+        harness.io.attempts.len() > scans_before,
+        "the refresh re-observes the key"
+    );
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the retried take validates against current truth");
+    assert_eq!(harness.capture.take_drift_tolerated(), 1);
+}
+
+/// Partition refresh interests deduplicate per key and stay
+/// bounded: a repeat request renews, and beyond the pending cap
+/// interests drop silently.
+#[test]
+fn joint_partition_refresh_interests_dedup_and_cap() {
+    let (harness, _, _) = birth_sealed_witness();
+    let image = ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    };
+    harness.capture.request_partition_refresh(image, 0, 1, 100);
+    harness.capture.request_partition_refresh(image, 0, 2, 200);
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        1,
+        "a repeat request renews one key"
+    );
+    assert!(harness.capture.has_refresh_interest_for_test(71, 0, 0));
+    for cookie in 1000..(1000 + 2 * crate::discovery::instances::MAX_PENDING as u64) {
+        harness.capture.request_partition_refresh(
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 0,
+            },
+            0,
+            1,
+            100,
+        );
+    }
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        crate::discovery::instances::MAX_PENDING,
+        "interests stay capped"
+    );
+}
+
 #[test]
 fn joint_absence_birth_requires_prior_negative_and_quiet_sighting() {
     actual_absence_birth_fixture();

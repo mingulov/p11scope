@@ -147,6 +147,7 @@ impl ResumeCursor {
     /// cut-short retries, then demoted members, then examined ones
     /// (ascending pid within each tier). Unknown tasks read
     /// never-attempted: work fails toward retry, never toward stall.
+    #[cfg(test)]
     pub(crate) fn order_members(&self, tasks: &[MemberTask]) -> Vec<u32> {
         let mut never = Vec::new();
         let mut retry = Vec::new();
@@ -348,6 +349,7 @@ impl ScanPassOwner {
     }
 
     /// A Detailed owner with a work ceiling and I/O allowances.
+    #[cfg(test)]
     pub(crate) fn detailed(work_ceiling: u64, io_bytes: u64) -> Self {
         Self::from_limits(ScanLimits {
             per_object_bytes: io_bytes,
@@ -356,6 +358,7 @@ impl ScanPassOwner {
         .with_work_ceiling(work_ceiling)
     }
 
+    #[cfg(test)]
     fn with_work_ceiling(mut self, work_ceiling: u64) -> Self {
         self.work_ceiling = work_ceiling;
         self
@@ -808,6 +811,7 @@ impl ScanPassOwner {
 
     /// Charges an I/O read, naming a terminal stop when the allowance
     /// itself can never admit.
+    #[cfg(test)]
     pub(crate) fn charge_io(&mut self, bytes: u64) -> ChargeOutcome {
         if self.scan_stop_reason.is_some() {
             let reason = self.scan_stop_reason.unwrap_or(IO_CEILING_REASON);

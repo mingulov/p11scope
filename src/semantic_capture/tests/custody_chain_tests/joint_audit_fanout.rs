@@ -13945,10 +13945,12 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
 }
 
 /// The linked-stream void with colliding retained H8 entries is resumable
-/// under the Finish work budget: at most 64 leaf units per credit (INV-2),
-/// holding the fenced void and deferring collection until cleanup
-/// completes. Drives one credit at a time, checks multi-credit progress,
+/// in Running mode: at most 64 leaf units per credit (INV-2), holding
+/// the fenced void and deferring collection until cleanup completes.
+/// Drives one Running credit at a time, checks multi-credit progress,
 /// the loss disclosure, preserved Model siblings and single refunds.
+/// See the Finish twin for the Running-to-Finish handoff with a live
+/// cursor.
 #[test]
 fn joint_machine_idle_void_with_colliding_h8_is_resumable_one_credit_at_a_time() {
     use crate::inventory_semantics::JointServiceProgress;
@@ -14243,6 +14245,297 @@ fn joint_machine_idle_void_with_colliding_h8_is_resumable_one_credit_at_a_time()
         )),
         "the resumable void still discloses its fenced loss: {gaps:?}"
     );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// The Finish twin of the Running bulk void: begins Finish with the
+/// sweep cursor pending, holds the fenced unpublished failure and
+/// unchanged Raw cursor and Q across intermediate polls, then
+/// publishes exactly once with the named gap after the completed
+/// sweep. Covers a second stop refusal after the cursor yields with
+/// its observable loss and single custody outcome.
+#[test]
+fn joint_machine_finish_void_with_colliding_h8_holds_fence_across_handoff() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let prime_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    let prime_charged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .charged_bytes();
+    let prime_h8_bytes = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .h8_bytes_for_test();
+    const BULK: u64 = 512;
+    const H8_BASE: u64 = 500_000;
+    const MODEL_BASE: u64 = 600_000;
+    const H8_BYTES: u64 = 10;
+    const MODEL_BYTES: u64 = 20;
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let ledger = coordinator.joint_capture_mut().ledger_mut();
+        ledger.prepare_capacity().unwrap();
+        for ordinal in 0..BULK {
+            ledger.charge_h8open(H8_BASE + ordinal, H8_BYTES).unwrap();
+        }
+        for token in 0..BULK {
+            ledger
+                .charge_model(MODEL_BASE + token, MODEL_BYTES)
+                .unwrap();
+        }
+    }
+    let bulk_charged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .charged_bytes();
+    assert_eq!(
+        bulk_charged,
+        prime_charged + BULK * H8_BYTES + BULK * MODEL_BYTES,
+        "bulk charges add their exact bytes"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 99);
+    let initial_h8 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test()[1];
+    assert!(initial_h8 >= BULK as usize, "bulk void work pending");
+    let mut saw_partial = false;
+    for _ in 0..8 {
+        fixture
+            .service(1)
+            .expect("partial Running sweep never refuses");
+        let h8 = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[1];
+        if h8 < initial_h8 && h8 > 0 {
+            saw_partial = true;
+            break;
+        }
+    }
+    assert!(saw_partial, "Running leaves its sweep cursor pending");
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .void_cleanup_pending(),
+        "the fenced failure waits unpublished across the handoff"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "nothing publishes before the sweep completes"
+    );
+    assert!(
+        fixture.machine.retained_raw_for_test().is_none(),
+        "Running defers collection while its sweep owns work"
+    );
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().expect("Finish begins with live cursor");
+    assert_eq!(
+        fixture.begin_finish(),
+        Err(crate::inventory_semantics::SemanticRefusal::Unavailable),
+        "a second stop refuses while the cursor stays pending"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .void_cleanup_pending(),
+        "the refused second stop keeps the fenced sweep"
+    );
+    let mut q_addr = None;
+    let mut saw_finish_partial = false;
+    let mut published_receipt = None;
+    for _ in 0..512 {
+        let phase = fixture.machine.diagnostic_snapshot_for_test().0;
+        let is_void = phase == "Voiding" || phase == "VoidingStaged";
+        if is_void {
+            saw_finish_partial = true;
+            if phase == "Voiding" {
+                assert!(
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .void_cleanup_pending(),
+                    "the sweep holds its fenced failure unpublished"
+                );
+                assert!(
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .pending_void_for_test()
+                        .is_none(),
+                    "nothing publishes before the sweep completes"
+                );
+            } else {
+                assert!(
+                    !fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .void_cleanup_pending(),
+                    "the sweep completed before disposal"
+                );
+                assert!(
+                    fixture
+                        .scene
+                        .real
+                        .scene
+                        .coordinator
+                        .joint_capture()
+                        .pending_void_for_test()
+                        .is_some(),
+                    "disposal retains the published fenced failure"
+                );
+                let gaps: Vec<(String, String)> = fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                    .collect();
+                assert!(
+                    !gaps.contains(&(
+                        "Joint key operations unavailable; retained S1".to_string(),
+                        "joint_void_ingest_break_loss_history_loss".to_string()
+                    )),
+                    "the gap discloses after disposal, not during: {gaps:?}"
+                );
+            }
+            assert!(
+                fixture.machine.retained_raw_for_test().is_none(),
+                "Finish defers its Raw collection until cleanup completes"
+            );
+            if let Some(q) = fixture.machine.retained_finish_q_for_test() {
+                let addr = q as *const _ as usize;
+                if let Some(kept) = q_addr {
+                    assert_eq!(kept, addr, "Finish keeps its same observed Q");
+                } else {
+                    q_addr = Some(addr);
+                }
+            }
+        }
+        match fixture.poll_finish(1).unwrap() {
+            JointCommitProgress::Published(receipt) => {
+                published_receipt = Some(receipt);
+                break;
+            }
+            JointCommitProgress::Pending => {}
+        }
+    }
+    assert!(saw_finish_partial, "Finish drives its pending cleanup");
+    let receipt = published_receipt.expect("the Finish publishes once");
+    let _ = receipt;
+    assert!(
+        fixture.scene.real.lane.is_finished(),
+        "the Finish completes its lane"
+    );
+    let done_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(done_roles[1], 0, "Finish removes every bulk member");
+    assert_eq!(
+        done_roles[2],
+        prime_roles[2] + BULK as usize,
+        "Finish preserves every Model sibling"
+    );
+    let done_charged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .charged_bytes();
+    assert_eq!(
+        done_charged,
+        bulk_charged - prime_h8_bytes - BULK * H8_BYTES,
+        "one refund per removed member through Finish"
+    );
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    let void_gaps = gaps
+        .iter()
+        .filter(|(subject, reason)| {
+            subject == "Joint key operations unavailable; retained S1"
+                && reason == "joint_void_ingest_break_loss_history_loss"
+        })
+        .count();
+    assert_eq!(void_gaps, 1, "exactly one fenced loss disclosure: {gaps:?}");
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 

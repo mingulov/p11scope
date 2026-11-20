@@ -254,6 +254,22 @@ const EC_X25519: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6e];
 const EC_X448: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x6f];
 const EC_ED25519: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
 const EC_ED448: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x71];
+// Relaxed-dialect fix1 reviewed encodings: secp256k1 + brainpool
+// P-256/384r1 OIDs plus the two SoftHSM PrintableString Edwards
+// spellings (measured live on SoftHSM 2.6.1 query-back).
+const EC_SECP256K1: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a];
+const EC_BPOOL256: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07,
+];
+const EC_BPOOL384: &[u8] = &[
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0b,
+];
+const EC_ED25519_STR: &[u8] = &[
+    0x13, 0x0c, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x32, 0x35, 0x35, 0x31, 0x39,
+];
+const EC_ED448_STR: &[u8] = &[
+    0x13, 0x0a, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x34, 0x34, 0x38,
+];
 
 use attr_kind as ak;
 use attr_list_flag as alf;
@@ -2140,16 +2156,18 @@ fn object_producer_attributes_full_width_and_no_read() {
         );
     }
     // Accepted neighbors stay unsupported after a full read and recheck.
+    // (Fix1: Class 5, KEA/RC2, ValueLen 8/64 and ModulusBits 512 now
+    // classify; the refused neighbors move to the new set edges.)
     for (selector, bad) in [
-        (SEL_CLASS, 5u64),
+        (SEL_CLASS, 12u64),
         (SEL_CLASS, u64::MAX),
-        (SEL_KEYTYPE, 0x05),
-        (SEL_KEYTYPE, 0x11),
+        (SEL_KEYTYPE, 0x06),
+        (SEL_KEYTYPE, 0x4c),
         (SEL_TOKEN, 2),
-        (SEL_VALUELEN, 8),
-        (SEL_VALUELEN, 64),
-        (SEL_MODBITS, 512),
-        (SEL_MODBITS, 1025),
+        (SEL_VALUELEN, 0),
+        (SEL_VALUELEN, 4097),
+        (SEL_MODBITS, 255),
+        (SEL_MODBITS, 16385),
     ] {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             let w = layout.word_bytes() as u64;
@@ -2182,7 +2200,7 @@ fn object_producer_attributes_full_width_and_no_read() {
         }
     }
 
-    // (c) Curves: exact bytes only, lengths 5/7/10/11, nothing else.
+    // (c) Curves: exact bytes only, lengths 5/7/10/11/12/14, nothing else.
     for (bytes, curve) in [
         (EC_P256, 1u16),
         (EC_P384, 2),
@@ -2192,6 +2210,11 @@ fn object_producer_attributes_full_width_and_no_read() {
         (EC_X448, 5),
         (EC_ED25519, 6),
         (EC_ED448, 7),
+        (EC_SECP256K1, 8),
+        (EC_BPOOL256, 9),
+        (EC_BPOOL384, 10),
+        (EC_ED25519_STR, 6),
+        (EC_ED448_STR, 7),
     ] {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             let w = layout.word_bytes() as u64;
@@ -2249,7 +2272,8 @@ fn object_producer_attributes_full_width_and_no_read() {
         assert_eq!(outcome.cells[0].status, ast::UNSUPPORTED, "len {len}");
         assert_eq!(outcome.cells[0].value, 0);
     }
-    for len in [0u64, 1, 6, 8, 9, 12, 16] {
+    // (Fix1: 12/14 now read; the gaps 13/15 pin the length set shut.)
+    for len in [0u64, 1, 6, 8, 9, 13, 15, 16] {
         let target = fresh_lp64();
         prog_attr(&target, 0x5000, 0, 8, SEL_ECPARAMS, 0x9000, len);
         let (mut read_word, mut read_bytes) = readers(&target);
@@ -3039,12 +3063,15 @@ fn object_producer_attributes_partial_alias_retry() {
         assert_eq!(outcome.cells[0].status, ast::INVALID_LENGTH, "{layout:?}");
 
         // Entry capacity below the exact shape is insufficient capacity.
+        // (Fix1: the scalar floor is 4 on both layouts, so the probe
+        // uses 3; a 7-byte LP64 span is now an invalid length, not a
+        // short buffer.)
         let entry_target = fresh(w);
-        prog_attr(&entry_target, BASE, 0, w, SEL_CLASS, 0x9000, w - 1);
+        prog_attr(&entry_target, BASE, 0, w, SEL_CLASS, 0x9000, 3);
         let mut small = GetEntryState::default();
         capture_get_entry(BASE, 1, layout, &mut small, word_reader(&entry_target));
         let return_target = fresh(w);
-        prog_attr(&return_target, BASE, 0, w, SEL_CLASS, 0x9000, w - 1);
+        prog_attr(&return_target, BASE, 0, w, SEL_CLASS, 0x9000, 3);
         return_target.borrow_mut().set_word(0x9000, 2);
         let (mut read_word, mut read_bytes) = readers(&return_target);
         let outcome = capture_get_return(
@@ -6059,5 +6086,111 @@ fn pqc_parameter_set_seed_canary_alias_get_refuses() {
         }
         assert_no_read_of(&target, SEED_BUF + 0x10);
         assert_no_bytes_reads(&target);
+    }
+}
+
+// Relaxed-dialect fix1: a 4-byte CK_ULONG scalar on LP64 reads exactly
+// 4 bytes (little-endian, zero-extended) and classifies; the bytes
+// past the short span are never touched, and an unclassifiable short
+// word is unsupported after the exact read, never widened.
+#[test]
+fn relaxed_short_word_scalar_reads_exactly_four_bytes() {
+    for (selector, kind, word) in [
+        (SEL_CLASS, ak::CLASS, 2u32),
+        (SEL_KEYTYPE, ak::KEY_TYPE, 0x2b),
+        (SEL_VALUELEN, ak::VALUE_LEN, 20),
+        (SEL_MODBITS, ak::MODULUS_BITS, 1536),
+        (SEL_PARAMETER_SET, ak::PARAMETER_SET, 2),
+    ] {
+        let target = fresh_lp64();
+        prog_attr(&target, 0x5000, 0, 8, selector, 0x9000, 4);
+        target.borrow_mut().set_bytes(0x9000, &word.to_le_bytes());
+        target.borrow_mut().set_bytes(0x9004, &[0xBB; 4]);
+        let (mut read_word, mut read_bytes) = readers(&target);
+        let outcome = inspect_request_template(
+            0x5000,
+            1,
+            None,
+            LinuxLayout::Lp64,
+            &mut read_word,
+            &mut read_bytes,
+        );
+        assert_eq!(
+            outcome.cells[0],
+            AttrCell {
+                kind,
+                status: ast::VALUE,
+                value: word as u16,
+            },
+            "short word {selector:#x}"
+        );
+        assert_no_read_of(&target, 0x9004);
+        let value_entry = target.borrow().log()[3];
+        assert_eq!(value_entry, (READ_BYTES, 0x9000, 4));
+    }
+    // A short word outside the closed set is unsupported, not widened.
+    let target = fresh_lp64();
+    prog_attr(&target, 0x5000, 0, 8, SEL_KEYTYPE, 0x9000, 4);
+    target
+        .borrow_mut()
+        .set_bytes(0x9000, &0x06u32.to_le_bytes());
+    let (mut read_word, mut read_bytes) = readers(&target);
+    let outcome = inspect_request_template(
+        0x5000,
+        1,
+        None,
+        LinuxLayout::Lp64,
+        &mut read_word,
+        &mut read_bytes,
+    );
+    assert_eq!(outcome.cells[0].status, ast::UNSUPPORTED);
+    assert_eq!(outcome.cells[0].value, 0);
+    assert_no_read_of(&target, 0x9004);
+}
+
+// Relaxed-dialect fix1: the attested NSS vendor key type normalizes to
+// standard ML-KEM at the capture cell; neighboring vendor numbers stay
+// unsupported after the full read and recheck.
+#[test]
+fn relaxed_nss_vendor_key_type_normalizes_to_ml_kem() {
+    let target = fresh_lp64();
+    prog_attr(&target, 0x5000, 0, 8, SEL_KEYTYPE, 0x9000, 8);
+    target.borrow_mut().set_word(0x9000, 0xCE53_4356);
+    let (mut read_word, mut read_bytes) = readers(&target);
+    let outcome = inspect_request_template(
+        0x5000,
+        1,
+        None,
+        LinuxLayout::Lp64,
+        &mut read_word,
+        &mut read_bytes,
+    );
+    assert_eq!(
+        outcome.cells[0],
+        AttrCell {
+            kind: ak::KEY_TYPE,
+            status: ast::VALUE,
+            value: 0x49,
+        }
+    );
+    for vendor in [0xCE53_4355u64, 0xCE53_4357, 0x8000_0000] {
+        let target = fresh_lp64();
+        prog_attr(&target, 0x5000, 0, 8, SEL_KEYTYPE, 0x9000, 8);
+        target.borrow_mut().set_word(0x9000, vendor);
+        let (mut read_word, mut read_bytes) = readers(&target);
+        let outcome = inspect_request_template(
+            0x5000,
+            1,
+            None,
+            LinuxLayout::Lp64,
+            &mut read_word,
+            &mut read_bytes,
+        );
+        assert_eq!(
+            outcome.cells[0].status,
+            ast::UNSUPPORTED,
+            "vendor {vendor:#x}"
+        );
+        assert_eq!(outcome.cells[0].value, 0);
     }
 }

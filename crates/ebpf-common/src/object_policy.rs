@@ -31,6 +31,11 @@ pub enum SafeAttributeKind {
 /// (`06 09 2b 06 01 04 01 da 47 0f 01`, X25519) plus the four RFC 8410
 /// 5-byte OIDs (`06 03 2b 65 6e` X25519, `06 03 2b 65 6f` X448,
 /// `06 03 2b 65 70` Ed25519, `06 03 2b 65 71` Ed448).
+/// Relaxed-dialect fix1: secp256k1 plus the two brainpool curves SoftHSM
+/// emits (`06 05 2b 81 04 00 0a`; `06 09 2b 24 03 03 02 08 01 01 07/0b`),
+/// measured live on SoftHSM 2.6.1; the two SoftHSM PrintableString
+/// Edwards forms map to the existing Ed25519/Ed448 variants (same
+/// curve, provider spelling), never to new variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafeCurve {
     Secp256r1,
@@ -40,6 +45,9 @@ pub enum SafeCurve {
     X448,
     Ed25519,
     Ed448,
+    Secp256k1,
+    BrainpoolP256r1,
+    BrainpoolP384r1,
 }
 
 /// Compare the entire target word; excluded/unknown selectors gain no reads.
@@ -59,6 +67,12 @@ pub const fn safe_attribute_kind(raw: u64) -> Option<SafeAttributeKind> {
 
 /// Validate an exact value length against the target ABI, never host width.
 /// This does not establish readable spans, capacity or unchanged headers.
+/// Relaxed-dialect fix1: EC params additionally accept the two SoftHSM
+/// PrintableString Edwards lengths (12/14); every `CK_ULONG` scalar kind
+/// additionally accepts a 4-byte encoding (a 32-bit client word or a
+/// short provider encoding — read as exactly 4 bytes, zero-extended,
+/// never widened in place). `CK_BBOOL` stays exactly 1 byte: 4-byte
+/// booleans are an app bug with divergent provider semantics.
 pub const fn valid_safe_attribute_length(
     kind: SafeAttributeKind,
     len: u64,
@@ -66,8 +80,10 @@ pub const fn valid_safe_attribute_length(
 ) -> bool {
     match kind {
         SafeAttributeKind::Token => len == 1,
-        SafeAttributeKind::EcParams => len == 5 || len == 7 || len == 10 || len == 11,
-        _ => len == layout.word_bytes() as u64,
+        SafeAttributeKind::EcParams => {
+            len == 5 || len == 7 || len == 10 || len == 11 || len == 12 || len == 14
+        }
+        _ => len == layout.word_bytes() as u64 || len == 4,
     }
 }
 
@@ -81,16 +97,33 @@ pub const fn valid_safe_attribute_length(
 /// decided at label time.
 /// R2 new-site: KeyType accepts `CKK_HKDF` (0x42); ValueLen accepts the
 /// measured HKDF/AES schedule sizes 12 and 48.
+/// Relaxed-dialect fix1: Class accepts every assigned `CKO_*` (0..=11 —
+/// domain parameters and trust/validation objects establish their kind
+/// but never form key labels); KeyType accepts every assigned standard
+/// `CKK_*` (`0x00..=0x05 | 0x10..=0x4b` per OASIS PKCS #11 3.2, including
+/// DES/DES3/HMAC/DSA/DH and HSS/XMSS — establishment only, labels stay
+/// with the label arms); the one attested vendor key type
+/// `CKK_NSS_ML_KEM` (`0xCE53_4356`, NSS `lib/util/pkcs11n.h`
+/// `CKK_NSS + 6`, read back from vendor-keygen'd keys on real softoken)
+/// normalizes to its standard meaning `CKK_ML_KEM` (0x49) so vendor-
+/// spelled keys label exactly like standard ones — same de-facto NSS
+/// block reliance the display table already takes, full-width match,
+/// no truncation; ValueLen accepts `1..=4096` (0 stays refused: SoftHSM
+/// reports 0 for unwrapped keys, which is provider-unknown, never a
+/// size); ModulusBits accepts `256..=16384` (512/1536 measured live on
+/// all RSA providers). Non-listed sizes label through the existing
+/// `*_other` arms; unlisted values still refuse with the named reason.
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
-        (SafeAttributeKind::Class, 0..=4)
-        | (
-            SafeAttributeKind::KeyType,
-            0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41 | 0x42 | 0x49..=0x4b,
-        )
+        // The attested vendor spelling normalizes to its standard
+        // meaning first; its number overlaps no standard arm (see the
+        // closed-set test), so order carries no aliasing risk.
+        (SafeAttributeKind::KeyType, 0xCE53_4356) => Some(0x49),
+        (SafeAttributeKind::Class, 0..=11)
+        | (SafeAttributeKind::KeyType, 0x00..=0x05 | 0x10..=0x4b)
         | (SafeAttributeKind::Token, 0 | 1)
-        | (SafeAttributeKind::ValueLen, 12 | 16 | 24 | 32 | 48)
-        | (SafeAttributeKind::ModulusBits, 1024 | 2048 | 3072 | 4096 | 8192)
+        | (SafeAttributeKind::ValueLen, 1..=4096)
+        | (SafeAttributeKind::ModulusBits, 256..=16384)
         | (SafeAttributeKind::ParameterSet, 1..=12) => Some(value as u16),
         _ => None,
     }
@@ -99,7 +132,13 @@ pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> O
 /// Exact complete-byte equality only; no DER parser or prefix fallback.
 /// R2 new-site: the 11-byte draft-josefsson Curve25519 OID (measured in
 /// Firefox ephemeral keypair templates) plus the four RFC 8410 5-byte
-/// OIDs. No printable-string forms: unmeasured, deferred.
+/// OIDs.
+/// Relaxed-dialect fix1: secp256k1 plus brainpool P-256/384r1 (measured
+/// live on SoftHSM 2.6.1, which echoes the OIDs on query-back), and the
+/// two SoftHSM PrintableString Edwards spellings (`13 0c "edwards25519"`,
+/// `13 0a "edwards448"` — same curves as the RFC 8410 OIDs, provider
+/// spelling only). Still no parser: every accepted form is one exact
+/// byte string.
 pub fn classify_ec_params(bytes: &[u8]) -> Option<SafeCurve> {
     match bytes {
         [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07] => Some(SafeCurve::Secp256r1),
@@ -110,6 +149,25 @@ pub fn classify_ec_params(bytes: &[u8]) -> Option<SafeCurve> {
         [0x06, 0x03, 0x2b, 0x65, 0x6f] => Some(SafeCurve::X448),
         [0x06, 0x03, 0x2b, 0x65, 0x70] => Some(SafeCurve::Ed25519),
         [0x06, 0x03, 0x2b, 0x65, 0x71] => Some(SafeCurve::Ed448),
+        // secp256k1 OID 1.3.132.0.10 (SEC 2).
+        [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a] => Some(SafeCurve::Secp256k1),
+        // brainpool P-256r1 OID 1.3.36.3.3.2.8.1.1.7 (RFC 5639).
+        [0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07] => {
+            Some(SafeCurve::BrainpoolP256r1)
+        }
+        // brainpool P-384r1 OID 1.3.36.3.3.2.8.1.1.11 (RFC 5639).
+        [0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0b] => {
+            Some(SafeCurve::BrainpoolP384r1)
+        }
+        // SoftHSM query-back spellings: ASN.1 PrintableString
+        // `13 0c "edwards25519"` (14 bytes) and `13 0a "edwards448"`
+        // (12 bytes). Same curves, provider spelling.
+        [0x13, 0x0c, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x32, 0x35, 0x35, 0x31, 0x39] => {
+            Some(SafeCurve::Ed25519)
+        }
+        [0x13, 0x0a, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x34, 0x34, 0x38] => {
+            Some(SafeCurve::Ed448)
+        }
         _ => None,
     }
 }
@@ -289,6 +347,9 @@ pub fn valid_object_descriptor(function: u32, candidate: &ObjectCaptureDescripto
 /// Keep which accepted mechanism must match the existing return-time evidence.
 /// R2 new-site: HKDF derive/data plus base-and-key concatenation join the
 /// closed set (none belongs to the may-leave-`phKey`-untouched family).
+/// Relaxed-dialect fix1: the two remaining standard concatenation
+/// variants join (same scalar-handle protocol: CKR_OK writes the
+/// derived-key handle, like every accepted derive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarDeriveMechanism {
     DhPkcs,
@@ -298,6 +359,8 @@ pub enum ScalarDeriveMechanism {
     HkdfDerive,
     HkdfData,
     ConcatBaseAndKey,
+    ConcatBaseAndData,
+    ConcatDataAndBase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +382,8 @@ pub const fn derive_result_protocol(mechanism: u64) -> DeriveResultProtocol {
         0x402a => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::HkdfDerive),
         0x402b => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::HkdfData),
         0x360 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::ConcatBaseAndKey),
+        0x362 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::ConcatBaseAndData),
+        0x363 => DeriveResultProtocol::ScalarHandle(ScalarDeriveMechanism::ConcatDataAndBase),
         _ => DeriveResultProtocol::Unavailable,
     }
 }

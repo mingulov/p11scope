@@ -15,25 +15,61 @@ const SELECTORS: &[(u64, SafeAttributeKind)] = &[
     (0x061d, SafeAttributeKind::ParameterSet),
 ];
 
-const SCALARS: &[(SafeAttributeKind, &[u64])] = &[
-    (SafeAttributeKind::Class, &[0, 1, 2, 3, 4]),
+/// A closed scalar set: an exact list or a closed range. Ranges keep
+/// their ends pinned by the closed-set test (every value inside and
+/// outside the range, exhaustively over the u16 span that covers them).
+#[derive(Clone, Copy)]
+enum ScalarSet {
+    Exact(&'static [u64]),
+    Range { lo: u64, hi: u64 },
+}
+
+impl ScalarSet {
+    fn contains(&self, value: u64) -> bool {
+        match self {
+            ScalarSet::Exact(list) => list.contains(&value),
+            ScalarSet::Range { lo, hi } => *lo <= value && value <= *hi,
+        }
+    }
+}
+
+// Relaxed-dialect fix1 reviewed rows: Class gains the remaining assigned
+// CKO_* (5..=11); KeyType gains every assigned standard CKK_*
+// (0x05 KEA plus the contiguous 0x11..=0x4b block: RC2/RC4/DES/DES3,
+// CAST/RC5/IDEA/legacy, AES, Blowfish/Twofish, SecurID/HOTP/ACTI,
+// Camellia/Aria, the HMAC block, SEED, GOST/ChaCha20/Poly1305/AES-XTS,
+// SHA3/BLAKE2 HMACs, Salsa20/X2RATCHET, Edwards/Montgomery, HKDF,
+// SHA512 HMACs, HSS/XMSS, PQC); ValueLen/ModulusBits become closed
+// ranges (0 and absurd sizes stay refused).
+const CLASS_VALUES: &[u64] = &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const KEY_TYPE_VALUES: &[u64] = &[
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19,
+    0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29,
+    0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39,
+    0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x4b,
+];
+
+const SCALARS: &[(SafeAttributeKind, ScalarSet)] = &[
+    (SafeAttributeKind::Class, ScalarSet::Exact(CLASS_VALUES)),
     (
         SafeAttributeKind::KeyType,
-        &[
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x42, 0x49, 0x4a, 0x4b,
-        ],
+        ScalarSet::Exact(KEY_TYPE_VALUES),
     ),
-    (SafeAttributeKind::Token, &[0, 1]),
-    (SafeAttributeKind::ValueLen, &[12, 16, 24, 32, 48]),
+    (SafeAttributeKind::Token, ScalarSet::Exact(&[0, 1])),
+    (
+        SafeAttributeKind::ValueLen,
+        ScalarSet::Range { lo: 1, hi: 4096 },
+    ),
     (
         SafeAttributeKind::ModulusBits,
-        &[1024, 2048, 3072, 4096, 8192],
+        ScalarSet::Range { lo: 256, hi: 16384 },
     ),
-    (SafeAttributeKind::EcParams, &[]),
+    (SafeAttributeKind::EcParams, ScalarSet::Exact(&[])),
     // F16 (7.05 PQC) reviewed row: the CKP_* union 1..=12.
     (
         SafeAttributeKind::ParameterSet,
-        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        ScalarSet::Exact(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
     ),
 ];
 
@@ -62,6 +98,37 @@ const CURVES: &[(&[u8], SafeCurve)] = &[
     (&[0x06, 0x03, 0x2b, 0x65, 0x6f], SafeCurve::X448),
     (&[0x06, 0x03, 0x2b, 0x65, 0x70], SafeCurve::Ed25519),
     (&[0x06, 0x03, 0x2b, 0x65, 0x71], SafeCurve::Ed448),
+    // Relaxed-dialect fix1 reviewed rows: secp256k1 + brainpool
+    // P-256/384r1 OIDs plus the two SoftHSM PrintableString Edwards
+    // spellings (same curves as the RFC 8410 OIDs above).
+    (
+        &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a],
+        SafeCurve::Secp256k1,
+    ),
+    (
+        &[
+            0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07,
+        ],
+        SafeCurve::BrainpoolP256r1,
+    ),
+    (
+        &[
+            0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0b,
+        ],
+        SafeCurve::BrainpoolP384r1,
+    ),
+    (
+        &[
+            0x13, 0x0c, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x32, 0x35, 0x35, 0x31, 0x39,
+        ],
+        SafeCurve::Ed25519,
+    ),
+    (
+        &[
+            0x13, 0x0a, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x34, 0x34, 0x38,
+        ],
+        SafeCurve::Ed448,
+    ),
 ];
 
 const DERIVE: &[(u64, ScalarDeriveMechanism)] = &[
@@ -73,6 +140,10 @@ const DERIVE: &[(u64, ScalarDeriveMechanism)] = &[
     (0x402a, ScalarDeriveMechanism::HkdfDerive),
     (0x402b, ScalarDeriveMechanism::HkdfData),
     (0x360, ScalarDeriveMechanism::ConcatBaseAndKey),
+    // Relaxed-dialect fix1 reviewed rows: the two remaining standard
+    // concatenation variants (0x361 stays refused: unassigned).
+    (0x362, ScalarDeriveMechanism::ConcatBaseAndData),
+    (0x363, ScalarDeriveMechanism::ConcatDataAndBase),
 ];
 
 // Mutation caught: any additional selector or scalar permission, including an
@@ -91,7 +162,7 @@ fn s2s3_safe_attribute_sets_are_closed() {
     }
     for &(kind, accepted) in SCALARS {
         for value in 0..=u16::MAX as u64 {
-            let expected = accepted.contains(&value).then_some(value as u16);
+            let expected = accepted.contains(value).then_some(value as u16);
             assert_eq!(
                 classify_attribute_scalar(kind, value),
                 expected,
@@ -102,26 +173,45 @@ fn s2s3_safe_attribute_sets_are_closed() {
             assert_eq!(classify_attribute_scalar(kind, value), None);
         }
     }
+    // The one attested vendor spelling normalizes to its standard
+    // meaning; its neighbors and the bare vendor base stay refused.
+    assert_eq!(
+        classify_attribute_scalar(SafeAttributeKind::KeyType, 0xCE53_4356),
+        Some(0x49),
+        "CKK_NSS_ML_KEM normalizes to CKK_ML_KEM"
+    );
+    for refused in [
+        0xCE53_4355u64,
+        0xCE53_4357,
+        0x8000_0000,
+        0xCE53_4356 | (1 << 32),
+    ] {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, refused),
+            None,
+            "vendor key type {refused:#x} refused"
+        );
+    }
 }
 
 // Mutation caught: a key-type vocabulary drifting from the OASIS PKCS #11
-// 3.0 numbers, including the pinned pkcs11-types misnumbering that puts
-// Edwards/Montgomery at 0x3a/0x3b (those are BLAKE2b HMAC and stay refused).
+// 3.2 numbers, including the pinned pkcs11-types misnumbering that puts
+// Edwards/Montgomery at 0x3a/0x3b (those are BLAKE2b HMAC per OASIS and
+// classify as themselves; Edwards/Montgomery stay at 0x40/0x41).
 #[test]
 fn s2s3_key_types_pin_oasis_numbers() {
     // F16 (7.05 PQC) reviewed values: CKK_ML_KEM/CKK_ML_DSA/CKK_SLH_DSA
-    // from OASIS PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1.
-    const ACCEPTED: &[u64] = &[
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x42, 0x49, 0x4a, 0x4b,
-    ];
-    for value in ACCEPTED {
+    // from OASIS PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1. Fix1
+    // accepts every assigned standard id; the table is the contract.
+    for value in KEY_TYPE_VALUES {
         assert_eq!(
             classify_attribute_scalar(SafeAttributeKind::KeyType, *value),
             Some(*value as u16),
             "key type {value:#x}"
         );
     }
-    for refused in [0x05u64, 0x11, 0x27, 0x3a, 0x3b] {
+    // Reserved gaps and the first unassigned id stay refused.
+    for refused in [0x06u64, 0x07, 0x0f, 0x4c, 0x4d, 0xff] {
         assert_eq!(
             classify_attribute_scalar(SafeAttributeKind::KeyType, refused),
             None,
@@ -139,8 +229,12 @@ fn s2s3_safe_lengths_follow_target_width() {
             for len in 0..=16 {
                 let expected = match kind {
                     SafeAttributeKind::Token => len == 1,
-                    SafeAttributeKind::EcParams => len == 5 || len == 7 || len == 10 || len == 11,
-                    _ => len == word,
+                    SafeAttributeKind::EcParams => {
+                        len == 5 || len == 7 || len == 10 || len == 11 || len == 12 || len == 14
+                    }
+                    // Fix1: the short 4-byte scalar encoding reads on
+                    // either layout (on ILP32 it is the full word).
+                    _ => len == word || len == 4,
                 };
                 assert_eq!(
                     valid_safe_attribute_length(kind, len, layout),
@@ -164,7 +258,9 @@ fn s2s3_curve_encodings_are_exact() {
         for end in 0..bytes.len() {
             assert_eq!(classify_ec_params(&bytes[..end]), None);
         }
-        let mut buffer = [0u8; 12];
+        // Fix1: the longest accepted form is 14 bytes; the probe
+        // buffer covers one byte past it.
+        let mut buffer = [0u8; 16];
         buffer[..bytes.len()].copy_from_slice(bytes);
         assert_eq!(classify_ec_params(&buffer[..bytes.len() + 1]), None);
         buffer[1..bytes.len() + 1].copy_from_slice(bytes);
@@ -200,16 +296,38 @@ fn s2s3_classification_rejects_high_bits() {
             assert_eq!(safe_attribute_kind(selector), Some(kind));
             assert_eq!(safe_attribute_kind(selector | high), None);
         }
-        for &(kind, values) in SCALARS {
-            for &value in values {
-                assert_eq!(classify_attribute_scalar(kind, value), Some(value as u16));
-                assert_eq!(classify_attribute_scalar(kind, value | high), None);
+        for &(kind, set) in SCALARS {
+            // Ranges pin their ends plus interior samples; lists pin
+            // every member. High-bit variants of all refuse.
+            let mut values = [0u64; 80];
+            let count = match set {
+                ScalarSet::Exact(list) => {
+                    values[..list.len()].copy_from_slice(list);
+                    list.len()
+                }
+                ScalarSet::Range { lo, hi } => {
+                    values[..5].copy_from_slice(&[lo, hi, (lo + hi) / 2, lo + 1, hi - 1]);
+                    5
+                }
+            };
+            for value in values[..count].iter().copied() {
+                assert_eq!(
+                    classify_attribute_scalar(kind, value),
+                    Some(value as u16),
+                    "{kind:?}: {value:#x}"
+                );
+                assert_eq!(
+                    classify_attribute_scalar(kind, value | high),
+                    None,
+                    "{kind:?}: {value:#x} | high"
+                );
             }
             for (layout, word) in [(LinuxLayout::Lp64, 8), (LinuxLayout::Ilp32, 4)] {
                 let lengths: &[u64] = match kind {
                     SafeAttributeKind::Token => &[1],
-                    SafeAttributeKind::EcParams => &[5, 7, 10, 11],
-                    _ => core::slice::from_ref(&word),
+                    SafeAttributeKind::EcParams => &[5, 7, 10, 11, 12, 14],
+                    _ if word == 4 => &[4],
+                    _ => &[8, 4],
                 };
                 for &len in lengths {
                     assert!(valid_safe_attribute_length(kind, len, layout));

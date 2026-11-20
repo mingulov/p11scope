@@ -35,10 +35,10 @@ use crate::object_policy::{
     SafeAttributeKind, SafeCurve, ScalarDeriveMechanism,
 };
 use crate::object_wire::{
-    ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_CONCAT_BASE_AND_KEY,
-    OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1, OBJECT_DERIVE_ECDH1_COFACTOR,
-    OBJECT_DERIVE_HKDF_DATA, OBJECT_DERIVE_HKDF_DERIVE, OBJECT_DERIVE_SHA256,
-    OBJECT_DERIVE_UNAVAILABLE,
+    ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_CONCAT_BASE_AND_DATA,
+    OBJECT_DERIVE_CONCAT_BASE_AND_KEY, OBJECT_DERIVE_CONCAT_DATA_AND_BASE, OBJECT_DERIVE_DH_PKCS,
+    OBJECT_DERIVE_ECDH1, OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_HKDF_DATA,
+    OBJECT_DERIVE_HKDF_DERIVE, OBJECT_DERIVE_SHA256, OBJECT_DERIVE_UNAVAILABLE,
 };
 use crate::{instance, target_word_end, InstanceStamp, LinuxLayout, ARG_NONE};
 
@@ -213,6 +213,12 @@ impl DeriveEntry {
             DeriveEntry::Accepted(ScalarDeriveMechanism::ConcatBaseAndKey) => {
                 OBJECT_DERIVE_CONCAT_BASE_AND_KEY
             }
+            DeriveEntry::Accepted(ScalarDeriveMechanism::ConcatBaseAndData) => {
+                OBJECT_DERIVE_CONCAT_BASE_AND_DATA
+            }
+            DeriveEntry::Accepted(ScalarDeriveMechanism::ConcatDataAndBase) => {
+                OBJECT_DERIVE_CONCAT_DATA_AND_BASE
+            }
             DeriveEntry::Unavailable => OBJECT_DERIVE_UNAVAILABLE,
         }
     }
@@ -228,6 +234,8 @@ pub const fn derive_mechanism_code(mechanism: ScalarDeriveMechanism) -> u64 {
         ScalarDeriveMechanism::HkdfDerive => 0x402a,
         ScalarDeriveMechanism::HkdfData => 0x402b,
         ScalarDeriveMechanism::ConcatBaseAndKey => 0x360,
+        ScalarDeriveMechanism::ConcatBaseAndData => 0x362,
+        ScalarDeriveMechanism::ConcatDataAndBase => 0x363,
     }
 }
 
@@ -477,24 +485,32 @@ fn safe_curve_code(curve: SafeCurve) -> u16 {
         SafeCurve::X448 => 5,
         SafeCurve::Ed25519 => 6,
         SafeCurve::Ed448 => 7,
+        // Relaxed-dialect fix1: additive codes; 1..7 stay frozen.
+        SafeCurve::Secp256k1 => 8,
+        SafeCurve::BrainpoolP256r1 => 9,
+        SafeCurve::BrainpoolP384r1 => 10,
     }
 }
 
 /// Smallest exact length that can carry a value: entry capacities below this
 /// are insufficient regardless of the returned length.
+/// Relaxed-dialect fix1: scalars bottom at 4 (the accepted short-word
+/// encoding), on either layout.
 #[inline(always)]
-fn min_exact_len(kind: SafeAttributeKind, layout: LinuxLayout) -> u64 {
+fn min_exact_len(kind: SafeAttributeKind, _layout: LinuxLayout) -> u64 {
     match kind {
         SafeAttributeKind::Token => 1,
         SafeAttributeKind::EcParams => 5,
-        _ => layout.word_bytes() as u64,
+        _ => 4,
     }
 }
 
 /// Read and classify one established value span. `len` is the exact accepted
-/// length (token 1, EC 5/7/10/11, scalar `W`). Returns the classified code or the
-/// failure status; unreadable means the read failed, unsupported means the
-/// bytes were read but classify to nothing.
+/// length (token 1, EC 5/7/10/11/12/14, scalar `W` or the short 4). Returns
+/// the classified code or the failure status; unreadable means the read
+/// failed, unsupported means the bytes were read but classify to nothing.
+/// A 4-byte scalar on LP64 reads exactly 4 bytes (never a widened word)
+/// and zero-extends; the target is little-endian on every supported host.
 #[inline(always)]
 fn read_classified_value(
     kind: SafeAttributeKind,
@@ -511,17 +527,18 @@ fn read_classified_value(
             classify_attribute_scalar(kind, u64::from(byte[0])).ok_or(attr_status::UNSUPPORTED)
         }
         SafeAttributeKind::EcParams => {
-            if len != 5 && len != 7 && len != 10 && len != 11 {
+            if len != 5 && len != 7 && len != 10 && len != 11 && len != 12 && len != 14 {
                 return Err(attr_status::INVALID_LENGTH);
             }
             // Keep this fixed initialization in the scalar reader's frame:
             // a synthesized memset adds a level to the BPF return chain.
-            let mut storage = core::mem::MaybeUninit::<[u8; 11]>::uninit();
-            // SAFETY: the eleven byte stores initialize every array element
-            // before a reference is formed; this byte array has no padding.
+            let mut storage = core::mem::MaybeUninit::<[u8; 14]>::uninit();
+            // SAFETY: the fourteen byte stores initialize every array
+            // element before a reference is formed; this byte array has
+            // no padding.
             let buf = unsafe {
                 let bytes = storage.as_mut_ptr().cast::<u8>();
-                for index in 0..11 {
+                for index in 0..14 {
                     bytes.add(index).write_volatile(0);
                 }
                 storage.assume_init_mut()
@@ -534,6 +551,16 @@ fn read_classified_value(
             Ok(safe_curve_code(curve))
         }
         _ => {
+            // Short-word scalars on LP64 read exactly their 4 bytes;
+            // the full word path below would overread the accepted
+            // span. (On ILP32 len 4 is the full word and stays on
+            // the word path.)
+            if len == 4 && layout == LinuxLayout::Lp64 {
+                let mut word = [0u8; 4];
+                read_bytes(ptr, &mut word).map_err(|()| attr_status::UNREADABLE)?;
+                let value = u64::from(u32::from_le_bytes(word));
+                return classify_attribute_scalar(kind, value).ok_or(attr_status::UNSUPPORTED);
+            }
             let word = reader
                 .read_word(ptr, layout)
                 .map_err(|()| attr_status::UNREADABLE)?;
@@ -1550,10 +1577,24 @@ pub fn capture_get_return(
             i += 1;
             continue;
         }
-        if len > slot.entry_capacity || !valid_safe_attribute_length(kind, len, layout) {
+        // Validity before capacity: a valid length the short buffer
+        // cannot hold is insufficient capacity (the value exists but
+        // is unreadable), never a malformed length. (Fix1: with 4- and
+        // 8-byte scalars both valid, the old combined check blamed the
+        // length for a short buffer.)
+        if !valid_safe_attribute_length(kind, len, layout) {
             outcome.cells[i as usize] = AttrCell {
                 kind: slot.kind,
                 status: attr_status::INVALID_LENGTH,
+                value: 0,
+            };
+            i += 1;
+            continue;
+        }
+        if len > slot.entry_capacity {
+            outcome.cells[i as usize] = AttrCell {
+                kind: slot.kind,
+                status: attr_status::INSUFFICIENT_CAPACITY,
                 value: 0,
             };
             i += 1;
@@ -2774,8 +2815,15 @@ where
         cell.status = attr_status::INSUFFICIENT_CAPACITY;
         return encode_get_slot_result(GetSlotFlow::Done, 0);
     }
-    if len > slot.entry_capacity || !valid_safe_attribute_length(kind, len, layout) {
+    // Validity before capacity (see the array reference above): a
+    // valid length the short buffer cannot hold is insufficient
+    // capacity, never a malformed length.
+    if !valid_safe_attribute_length(kind, len, layout) {
         cell.status = attr_status::INVALID_LENGTH;
+        return encode_get_slot_result(GetSlotFlow::Done, 0);
+    }
+    if len > slot.entry_capacity {
+        cell.status = attr_status::INSUFFICIENT_CAPACITY;
         return encode_get_slot_result(GetSlotFlow::Done, 0);
     }
     if validate_target_span(ptr, len, layout).is_none() {

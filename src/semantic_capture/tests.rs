@@ -2607,6 +2607,92 @@ fn joint_partition_refresh_interests_dedup_and_cap() {
     );
 }
 
+/// A stale refresh interest drops silently: an attachment slot
+/// that no longer resolves never reaches the scan.
+#[test]
+fn joint_partition_refresh_drops_stale_slot() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        99,
+        receipt.pin.pid(),
+    );
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
+    let scans_before = harness.io.attempts.len();
+    let mut raw = harness.collect();
+    harness
+        .capture
+        .tick_collected_with(&mut harness.io, &mut raw)
+        .expect("an empty tick drains");
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        0,
+        "the drain consumes the interest"
+    );
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before,
+        "a stale slot never scans"
+    );
+}
+
+/// A refresh scan offers no birth: with the retry armed (as after
+/// a reseed re-arm), the refresh continuation carries no birth
+/// cut, and the next real sighting still births.
+#[test]
+fn joint_partition_refresh_offers_no_birth() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.global = 1;
+    assert!(
+        witness
+            .fresh_evidence_with(
+                &mut harness.io,
+                &mut rows,
+                &harness.capture,
+                harness.fixture.attachment(),
+                harness.fixture.binding(),
+            )
+            .is_err(),
+        "live ahead of the scan races the take"
+    );
+    harness.capture.rearm_image_for_reseed(ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    });
+    let mut raw = harness.collect();
+    let mut report = harness
+        .capture
+        .tick_collected_with(&mut harness.io, &mut raw)
+        .expect("an empty tick still refreshes");
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    let receipts = report.take_current();
+    assert!(
+        !receipts.is_empty(),
+        "the refresh scan publishes its receipt"
+    );
+    for receipt in receipts {
+        assert!(
+            receipt.into_birth_candidate().is_err(),
+            "a refresh scan offers no birth"
+        );
+    }
+    harness.io.global = 2;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (mut report, _) = harness.route(&mut raw);
+    let candidate = report
+        .take_current()
+        .pop()
+        .expect("a current receipt for the sighting")
+        .into_birth_candidate();
+    assert!(
+        candidate.is_ok(),
+        "the offer survived the refresh for its real sighting"
+    );
+}
+
 #[test]
 fn joint_absence_birth_requires_prior_negative_and_quiet_sighting() {
     actual_absence_birth_fixture();

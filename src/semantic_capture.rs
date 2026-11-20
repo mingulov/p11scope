@@ -1948,6 +1948,16 @@ impl SemanticCapture {
             .try_lock()
             .map_or(0, |interests| interests.len())
     }
+
+    /// Drain take-requested partition refreshes for the tick's
+    /// joined sweep. Fail-soft: a contended drain waits for the
+    /// next tick.
+    fn take_refresh_interests(&self) -> Vec<((u64, u64, u32), RefreshInterest)> {
+        let Ok(mut interests) = self.refresh_interests.try_lock() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut *interests).into_iter().collect()
+    }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins
     /// assert the positive disclosure from the report and use this only to
@@ -4351,6 +4361,37 @@ impl SemanticCapture {
                 self.jobs.push_back(job);
             }
         }
+        // Take-requested partition refreshes join this same sweep,
+        // so the router follows the current truth a raced take saw
+        // even with no new calls. Resolved fresh; stale interests
+        // drop silently and re-request as needed. A call-driven
+        // interest for the same key wins (its scan re-observes
+        // anyway). Refresh scans carry no birth cut: they re-prove
+        // the partition without offering, and births keep flowing
+        // through re-arm accounting.
+        let mut refresh_keys = BTreeSet::new();
+        for ((cookie, exec, file), interest) in self.take_refresh_interests() {
+            let key = (cookie, exec, file);
+            if joined_interests.contains_key(&key) {
+                continue;
+            }
+            let Some(endpoint) = io.endpoint(interest.attachment_slot) else {
+                continue;
+            };
+            if endpoint.file_slot != file {
+                continue;
+            }
+            joined_interests.insert(
+                key,
+                (
+                    interest.image,
+                    endpoint,
+                    interest.attachment_slot,
+                    interest.pid,
+                ),
+            );
+            refresh_keys.insert(key);
+        }
         // Pending keeps its existing queue, deadlines, and first claim on
         // the shared scan cap. Sweep only this tick's Joined interests in a
         // separate cyclic order; a refusal advances the cursor as well.
@@ -4401,7 +4442,11 @@ impl SemanticCapture {
                 slot,
                 pin,
                 deadline: proof_deadline,
-                birth_cut: birth_cut.clone(),
+                birth_cut: if refresh_keys.contains(&key) {
+                    None
+                } else {
+                    birth_cut.clone()
+                },
             };
             report.scans += 1;
             self.joined_refresh_cursor = Some(key);

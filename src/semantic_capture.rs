@@ -1293,6 +1293,152 @@ struct RefreshInterest {
     pid: u32,
 }
 
+/// Leaf units one cadence credit pays for in a memory or map stride
+/// (runtime contract INV-2): a credit is one native call or at most
+/// this many entries.
+const REFRESH_STRIDE: usize = crate::discovery::engine::GRAPH_STRIDE;
+
+/// Position of a strided static-side walk over the Session's link
+/// registry for one receipt slot: the next link, the next member slot
+/// inside it, and the sides found so far. Meaningful only under the
+/// attachment revision it was taken under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidesWalk {
+    pub(crate) link: usize,
+    pub(crate) offset: usize,
+    pub(crate) entry: bool,
+    pub(crate) ret: bool,
+}
+
+/// One static-side walk stride's verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidesStep {
+    /// Both the entry and the return side cover the slot.
+    Found,
+    /// The registry ended without both sides.
+    Missing,
+    /// The stride ran out of units; resume from the walk.
+    More,
+}
+
+/// A value with a revision that moves on every mutable borrow. The
+/// cadence cursor keeps a scan it already paid for across a service
+/// yield only while the router it was taken against is untouched:
+/// any `&mut` use by a tick, a take or another entry moves the
+/// revision, and the cursor withholds the stale result instead of
+/// committing it. Shared reads leave the revision alone.
+struct Revised<T> {
+    value: T,
+    revision: u64,
+}
+impl<T> Revised<T> {
+    fn new(value: T) -> Self {
+        Self { value, revision: 0 }
+    }
+    fn revision(this: &Self) -> u64 {
+        this.revision
+    }
+}
+impl<T> std::ops::Deref for Revised<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+impl<T> std::ops::DerefMut for Revised<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.revision = self.revision.wrapping_add(1);
+        &mut self.value
+    }
+}
+
+/// Take-refresh cadence telemetry (diagnostic only, counts only):
+/// keys re-scanned, cursor yields that kept work for a later pass,
+/// interests consumed without a scan (a stale key or a full queue),
+/// health moves deferred to the next tick's audit, and paid-for
+/// progress a foreign change discarded (re-earned on a later pass).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TakeRefreshCounts {
+    pub(crate) scans: u64,
+    pub(crate) yields: u64,
+    pub(crate) dropped: u64,
+    pub(crate) deferred: u64,
+    pub(crate) restarts: u64,
+}
+
+/// One take-refresh interest the cadence cursor holds between passes,
+/// with the stage it resumes at. Owned by the cursor (not queued), so
+/// a yield keeps it; a release requeues it.
+struct HeldRefresh {
+    key: (u64, u64, u32),
+    interest: RefreshInterest,
+    endpoint: Endpoint,
+    pin: Arc<PidPin>,
+    /// The retained attachment proved current (descriptor readback and
+    /// both static sides). An unproven attachment still re-observes
+    /// for the router; it only withholds the receipt, as on the tick.
+    attached: bool,
+    stage: RefreshStage,
+}
+
+/// Resumable cadence stages after the pick (which pays for the storage
+/// snapshot). Every stage is one credit unit, debited before its work,
+/// except `Accept`, whose router join walks the pending table and pays
+/// its leaf units up front. Pre-scan progress carries the attachment
+/// revision it was proven under; a scan result carries the router
+/// revision it was taken against as well.
+enum RefreshStage {
+    /// Health read, accepted only as the unchanged steady state.
+    PreAudit,
+    /// DESCRIPTORS readback, one stride per credit.
+    Readback { next: u32, session: u64 },
+    /// Static-side walk, one stride per credit.
+    Sides { walk: SidesWalk, session: u64 },
+    /// Pidfd custody check.
+    Custody { session: u64 },
+    /// One scan window, clamped to the service deadline.
+    Scan { session: u64 },
+    /// Post-scan health read over the obtained result.
+    PostAudit(Box<ScannedRefresh>),
+    /// Retained target and its file-identity check.
+    Target(Box<ScannedRefresh>),
+    /// Router observation and receipt.
+    Accept(Box<ScannedRefresh>),
+}
+
+/// A cadence scan already paid for, with the authority it was taken
+/// under.
+struct ScannedRefresh {
+    job: ScanJob,
+    fence: u64,
+    result: Result<ImageScanProof, ImageQueryRefusal>,
+    watched: Option<RetainedInventoryTarget>,
+    session: u64,
+    router: u64,
+}
+
+/// What one cadence stage left the cursor with.
+enum RefreshFlow {
+    /// The stage completed; the next one runs if credit remains.
+    Continue,
+    /// The interest finished (accepted, refused, consumed or
+    /// released): the cursor is idle again.
+    Done,
+    /// An up-front step needs more credit than remains: keep it.
+    Yield,
+}
+
+/// How [`SemanticCapture::accept_scan_with`] treats the attachment and
+/// the binding: the tick reads the retained attachment itself and may
+/// rebind; the cadence passes a target it already checked and only
+/// refreshes an existing current binding.
+enum AcceptMode {
+    Tick,
+    Refresh {
+        watched: Option<RetainedInventoryTarget>,
+    },
+}
+
 /// Outcome of one joined-sweep key scan, shared by the tick's
 /// joined sweep and the cadence sweep: the guards, scan,
 /// audit and accept run as one behavior on both paths, so a
@@ -1378,6 +1524,50 @@ trait CaptureIo {
     /// legacy continuity rule.
     fn storage_null(&mut self) -> Option<u64> {
         None
+    }
+    /// Pidfd custody of a pinned task (one native call).
+    fn custody(&mut self, pin: &Arc<PidPin>) -> bool {
+        pin.still_the_same()
+    }
+    /// Revision of the attachment's link registry; a strided receipt
+    /// proof resumes only under the revision it started under.
+    /// Fixtures without a registry never move it.
+    fn attachment_revision(&self) -> u64 {
+        0
+    }
+    /// Descriptor entries a complete receipt readback compares.
+    /// Fixtures without a descriptor table compare none.
+    fn attachment_readback_len(&self) -> u32 {
+        0
+    }
+    /// One receipt readback stride (one lookup per entry).
+    fn attachment_readback_stride(
+        &mut self,
+        _start: u32,
+        _len: u32,
+    ) -> Result<(), CurrentReceiptRefusal> {
+        Ok(())
+    }
+    /// One static-side walk stride for a receipt slot. Fixtures
+    /// without a link registry report both sides present.
+    fn attachment_sides_stride(
+        &self,
+        _slot: u32,
+        walk: &mut SidesWalk,
+        _units: usize,
+    ) -> SidesStep {
+        walk.entry = true;
+        walk.ret = true;
+        SidesStep::Found
+    }
+    /// The receipt's retained target after a complete readback and
+    /// side walk (one file-identity check). Fixtures fall back to
+    /// their whole retained attachment.
+    fn attachment_target(
+        &self,
+        slot: u32,
+    ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal> {
+        self.retained_attachment(slot)
     }
 }
 
@@ -1563,6 +1753,29 @@ impl CaptureIo for SessionIo<'_> {
             .map(|counters| counters.storage_null)
             .ok()
     }
+    fn attachment_revision(&self) -> u64 {
+        self.session.attachment_revision()
+    }
+    fn attachment_readback_len(&self) -> u32 {
+        self.session.semantic_receipt_readback_len()
+    }
+    fn attachment_readback_stride(
+        &mut self,
+        start: u32,
+        len: u32,
+    ) -> Result<(), CurrentReceiptRefusal> {
+        self.session.semantic_receipt_readback_stride(start, len)
+    }
+    fn attachment_sides_stride(&self, slot: u32, walk: &mut SidesWalk, units: usize) -> SidesStep {
+        self.session
+            .semantic_receipt_sides_stride(slot, walk, units)
+    }
+    fn attachment_target(
+        &self,
+        slot: u32,
+    ) -> Result<RetainedInventoryTarget, CurrentReceiptRefusal> {
+        self.session.semantic_receipt_target_tail(slot)
+    }
 }
 
 struct Awaiting {
@@ -1603,7 +1816,7 @@ impl TerminalTaskProof {
 
 pub(crate) struct SemanticCapture {
     identity: u64,
-    router: InstanceRouter,
+    router: Revised<InstanceRouter>,
     /// The collected quantum of the tick in progress (`None` outside
     /// a collected tick): a routed call notes it for its key's birth
     /// retry.
@@ -1665,6 +1878,14 @@ pub(crate) struct SemanticCapture {
     /// borrow; the stop disclosure reads this beside the
     /// seal-bootstrap arms.
     take_refresh_scans: u64,
+    /// The cadence cursor's held interest and resume stage (`None`
+    /// when idle). See [`Self::sweep_take_refresh_with`].
+    take_refresh_held: Option<HeldRefresh>,
+    /// A cadence health read saw the fault, sticky or miss-raise state
+    /// move (or fail): the cursor leaves applying it to the next
+    /// tick's audit and does no further I/O until that audit runs.
+    take_refresh_audit_deferred: bool,
+    take_refresh_counts: TakeRefreshCounts,
     /// Last tick's scan count and refusals, for the stuck-transaction
     /// diagnostic only. Test-visible; production behavior never reads it.
     #[cfg(test)]
@@ -1759,7 +1980,7 @@ impl SemanticCapture {
             + 1;
         Ok(Self {
             identity,
-            router: InstanceRouter::new(domain, RouterLimits::default()),
+            router: Revised::new(InstanceRouter::new(domain, RouterLimits::default())),
             tick_quantum: None,
             limits,
             next_token: 1,
@@ -1783,6 +2004,9 @@ impl SemanticCapture {
             take_drift_tolerated: AtomicU64::new(0),
             refresh_interests: Mutex::new(BTreeMap::new()),
             take_refresh_scans: 0,
+            take_refresh_held: None,
+            take_refresh_audit_deferred: false,
+            take_refresh_counts: TakeRefreshCounts::default(),
             #[cfg(test)]
             last_tick_scans_for_test: 0,
             #[cfg(test)]
@@ -1997,18 +2221,23 @@ impl SemanticCapture {
         interests.remove_entry(&key)
     }
 
-    /// Re-queue one unprocessed refresh interest for the next
-    /// eligible step (per-pass bound, cap or deadline yielded).
-    /// Fail-soft: a contended or full queue drops the interest and
-    /// the next raced take re-requests it.
-    fn requeue_refresh_interest(&self, key: (u64, u64, u32), interest: RefreshInterest) {
+    /// Re-queue one unprocessed refresh interest for a later step (a
+    /// service yield, a deferred audit or a withheld stale scan). A
+    /// newer request for the same key already queued wins. False when
+    /// a contended or full queue could not take it (the caller counts
+    /// the drop; the next raced take re-requests it).
+    fn requeue_refresh_interest(&self, key: (u64, u64, u32), interest: RefreshInterest) -> bool {
         let Ok(mut interests) = self.refresh_interests.try_lock() else {
-            return;
+            return false;
         };
-        if !interests.contains_key(&key) && interests.len() >= MAX_PENDING {
-            return;
+        if interests.contains_key(&key) {
+            return true;
+        }
+        if interests.len() >= MAX_PENDING {
+            return false;
         }
         interests.insert(key, interest);
+        true
     }
 
     /// Take-refresh keys re-scanned by cadence sweeps
@@ -2018,22 +2247,31 @@ impl SemanticCapture {
         self.take_refresh_scans
     }
 
-    /// Whether any take-refresh interest waits for re-observation
-    /// (production reach for the cadence sweep): only raced takes
-    /// queue interests, so a queued interest means a take raced
-    /// since the last drain. Fail-soft: a contended check reads
-    /// empty and the next service retries.
+    /// Whether any take-refresh work waits (production reach for the
+    /// cadence sweep): a queued interest (only raced takes queue
+    /// them) or one the cadence cursor holds between passes.
+    /// Fail-soft: a contended queue check reads empty and the next
+    /// service retries.
     pub(crate) fn has_queued_take_refresh(&self) -> bool {
-        self.refresh_interests
-            .try_lock()
-            .is_ok_and(|interests| !interests.is_empty())
+        self.take_refresh_held.is_some()
+            || self
+                .refresh_interests
+                .try_lock()
+                .is_ok_and(|interests| !interests.is_empty())
     }
 
-    /// One bounded no-call take-refresh step through the same
-    /// owned Session: re-observe one take-raced key between seal
-    /// retries (machine cadence). The pin comes from the key's
-    /// own canonical binding, never a global pin list. See the
-    /// budgeted helper below.
+    /// Take-refresh cadence telemetry (diagnostic only).
+    pub(crate) fn take_refresh_counts(&self) -> TakeRefreshCounts {
+        TakeRefreshCounts {
+            scans: self.take_refresh_scans,
+            ..self.take_refresh_counts
+        }
+    }
+
+    /// One bounded no-call take-refresh pass through the same owned
+    /// Session (machine cadence). The pin comes from the key's own
+    /// canonical binding, never a global pin list. See the cursor
+    /// below.
     pub(crate) fn sweep_take_refresh(
         &mut self,
         session: &mut Session,
@@ -2050,18 +2288,30 @@ impl SemanticCapture {
         )
     }
 
-    /// Re-observe one take-raced key between seal retries (machine
-    /// cadence): a single credited step outside any tick, like one
-    /// tick joined-scan but with no collection or routing. The
-    /// caller stashes the report for the next tick merge, so a
-    /// re-observed receipt and resolved outcomes join a batch
-    /// instead of dropping. Debit before work: an exhausted
-    /// credit or a past service deadline preserves every interest
-    /// with zero new I/O. One interest per pass; unprocessed keys
-    /// stay queued for the next eligible step. Stale interests
-    /// drop silently (charged) and re-request on the next raced
-    /// take. Scan windows clamp to the service deadline. Generic
-    /// I/O variant; production wraps the live Session above,
+    /// Re-observe take-raced keys between seal retries (machine
+    /// cadence) through one resumable cursor: like one tick
+    /// joined-scan, but with no collection or routing, and with every
+    /// leaf paid for before it starts. The caller stashes the report
+    /// for the next tick merge, so a re-observed receipt and resolved
+    /// outcomes join a batch instead of dropping.
+    ///
+    /// Each stage is one credit unit, debited first, and runs only
+    /// while credit remains and the service window is open: the
+    /// interest pick plus the storage snapshot, the health read, each
+    /// DESCRIPTORS readback stride and static-side walk stride of at
+    /// most [`REFRESH_STRIDE`] entries, the custody check, the scan,
+    /// the post-scan health read, and the retained target's identity
+    /// check. The router observation pays its pending-table walk and
+    /// resolutions up front. A spent credit or a closed window yields
+    /// with the held interest and its stage kept for the next pass.
+    /// Progress carries the attachment revision it was proven under,
+    /// and a scan result the router revision it was taken against; a
+    /// foreign change withholds the stale part (counted) and the
+    /// interest re-earns it. Health that moved is never applied here:
+    /// the cursor defers it to the next tick's audit, withholds the
+    /// evidence and requeues the interest. At most one interest
+    /// starts per pass; stale interests are consumed and counted.
+    /// Generic I/O variant; production wraps the live Session above,
     /// twins drive it with scripted I/O, and the substituted lane
     /// drives it with held I/O.
     // The I/O seam stays sealed: `CaptureIo` is private, so only
@@ -2075,69 +2325,394 @@ impl SemanticCapture {
         service_deadline: Instant,
     ) -> TickReport {
         let mut report = TickReport::default();
-        if *budget == 0 || io.now() >= service_deadline {
-            return report;
-        }
         if !self.has_queued_take_refresh() {
             return report;
         }
-        if report.scans >= self.limits.scans
-            || self.image_failed
-            || self.exhausted
-            || self.sticky != 0
-        {
+        if self.stopped {
+            self.take_refresh_held = None;
             return report;
         }
-        *budget = budget.saturating_sub(1);
-        // One storage_null snapshot per scan pass for the Q1(b) gate.
-        self.router.note_storage_null(io.storage_null());
-        if !self.audit(io, &mut report) {
-            return report;
-        }
-        let Some((key, interest)) = self.take_one_refresh_interest() else {
-            return report;
-        };
-        let Some(endpoint) = io.endpoint(interest.attachment_slot) else {
-            return report;
-        };
-        if endpoint.file_slot != key.2 {
-            return report;
-        }
-        if report.scans >= self.limits.scans
-            || self.image_failed
-            || self.exhausted
-            || self.sticky != 0
-            || io.now() >= service_deadline
-        {
-            self.requeue_refresh_interest(key, interest);
-            return report;
-        }
-        // The sweep leaves the tick's cyclic cursor alone. Refresh
-        // scans carry no birth cut: they re-prove the partition
-        // without offering.
-        match self.scan_one_joined_key(
-            io,
-            (
-                interest.image,
-                endpoint,
-                interest.attachment_slot,
-                interest.pid,
-            ),
-            None,
-            &mut report,
-            Some(service_deadline),
-            true,
-        ) {
-            JoinedScanOutcome::Scanned => {
-                self.take_refresh_scans = self.take_refresh_scans.saturating_add(1);
+        // At most one interest per pass: a resumed one counts.
+        let mut started = self.take_refresh_held.is_some();
+        loop {
+            // Memory-only gates first: a failed, exhausted, sticky or
+            // incompletely audited capture (or a deferred health move)
+            // does no I/O and keeps the held interest.
+            if self.image_failed
+                || self.exhausted
+                || self.sticky != 0
+                || self.pending_discovery_status != CollectionStatus::Complete
+                || self.take_refresh_audit_deferred
+            {
+                break;
             }
-            JoinedScanOutcome::Skipped => {}
-            JoinedScanOutcome::Break => {
-                self.requeue_refresh_interest(key, interest);
+            if self.take_refresh_held.is_none() && started {
+                break;
+            }
+            if *budget == 0 || io.now() >= service_deadline {
+                self.take_refresh_counts.yields = self.take_refresh_counts.yields.saturating_add(1);
+                break;
+            }
+            let Some(mut held) = self.take_refresh_held.take() else {
+                started = true;
+                let Some((key, interest)) = self.take_one_refresh_interest() else {
+                    break;
+                };
+                // The pick's credit pays the binding lookup and the
+                // storage read; a stale key is consumed on it.
+                *budget -= 1;
+                let Some((endpoint, pin)) = self.refresh_binding(io, key, interest) else {
+                    self.take_refresh_counts.dropped =
+                        self.take_refresh_counts.dropped.saturating_add(1);
+                    break;
+                };
+                // One storage_null snapshot per scan pass for the Q1(b) gate.
+                self.router.note_storage_null(io.storage_null());
+                self.take_refresh_held = Some(HeldRefresh {
+                    key,
+                    interest,
+                    endpoint,
+                    pin,
+                    attached: true,
+                    stage: RefreshStage::PreAudit,
+                });
+                continue;
+            };
+            match self.refresh_stage(io, &mut held, budget, service_deadline, &mut report) {
+                RefreshFlow::Continue => self.take_refresh_held = Some(held),
+                RefreshFlow::Done => {}
+                RefreshFlow::Yield => {
+                    self.take_refresh_held = Some(held);
+                    self.take_refresh_counts.yields =
+                        self.take_refresh_counts.yields.saturating_add(1);
+                    break;
+                }
             }
         }
         self.stamp_disposition(&mut report);
         report
+    }
+
+    /// The key's canonical current binding and endpoint (memory only):
+    /// same domain, current, the exact image, the interest's pid and
+    /// the endpoint's file slot.
+    fn refresh_binding(
+        &self,
+        io: &impl CaptureIo,
+        key: (u64, u64, u32),
+        interest: RefreshInterest,
+    ) -> Option<(Endpoint, Arc<PidPin>)> {
+        let endpoint = io.endpoint(interest.attachment_slot)?;
+        if endpoint.file_slot != key.2 {
+            return None;
+        }
+        let binding = self.bindings.get(&interest.image.task_cookie)?;
+        if binding.domain != self.router.domain()
+            || !binding.current
+            || binding.image != interest.image
+            || binding.pin.pid() != interest.pid
+        {
+            return None;
+        }
+        Some((endpoint, binding.pin.clone()))
+    }
+
+    /// The held interest still names the same canonical binding and
+    /// endpoint (memory only), re-checked before custody and the scan.
+    fn refresh_binding_holds(&self, io: &impl CaptureIo, held: &HeldRefresh) -> bool {
+        self.refresh_binding(io, held.key, held.interest)
+            .is_some_and(|(endpoint, pin)| {
+                endpoint == held.endpoint && Arc::ptr_eq(&pin, &held.pin)
+            })
+    }
+
+    /// Release a held interest back to the queue for a later step; a
+    /// full or contended queue consumes it (counted).
+    fn release_refresh(&mut self, key: (u64, u64, u32), interest: RefreshInterest) {
+        if !self.requeue_refresh_interest(key, interest) {
+            self.take_refresh_counts.dropped = self.take_refresh_counts.dropped.saturating_add(1);
+        }
+    }
+
+    /// One health read accepted only as the unchanged steady state the
+    /// last applied audit left: same fault, no sticky, same miss
+    /// raises. Anything else (or a failed read) is left for the next
+    /// tick's audit to apply; the cursor never invalidates, resolves
+    /// or prunes from here.
+    fn refresh_health_steady(&mut self, io: &mut impl CaptureIo) -> bool {
+        let Ok(health) = io.health() else {
+            return false;
+        };
+        let (_, raises) = io.hook_miss_totals();
+        health.fault == self.fault
+            && health.sticky == 0
+            && self.sticky == 0
+            && raises == self.miss_raises
+    }
+
+    /// Defer a moved or failed health read to the next tick's audit:
+    /// no further cadence I/O until it runs, the interest requeued.
+    fn defer_refresh_audit(&mut self, key: (u64, u64, u32), interest: RefreshInterest) {
+        self.take_refresh_audit_deferred = true;
+        self.take_refresh_counts.deferred = self.take_refresh_counts.deferred.saturating_add(1);
+        self.release_refresh(key, interest);
+    }
+
+    /// Whether a carried scan is still the router's and attachment's
+    /// current truth; otherwise withhold it and requeue (counted).
+    fn refresh_scan_current(
+        &mut self,
+        io: &impl CaptureIo,
+        held: &HeldRefresh,
+        scanned: &ScannedRefresh,
+    ) -> bool {
+        if Revised::revision(&self.router) == scanned.router
+            && io.attachment_revision() == scanned.session
+        {
+            return true;
+        }
+        self.take_refresh_counts.restarts = self.take_refresh_counts.restarts.saturating_add(1);
+        self.release_refresh(held.key, held.interest);
+        false
+    }
+
+    /// Push one cadence scan refusal into the report.
+    fn refuse_refresh_scan(
+        &mut self,
+        job: &ScanJob,
+        refusal: ImageQueryRefusal,
+        report: &mut TickReport,
+    ) {
+        report.scan_refusals.push(refusal);
+        #[cfg(test)]
+        self.last_refusal_by_key_for_test.insert(job.key(), refusal);
+        #[cfg(not(test))]
+        let _ = job;
+    }
+
+    /// Run one resumable cadence stage. The loop above checked credit
+    /// and the service window; every stage debits before its I/O.
+    fn refresh_stage(
+        &mut self,
+        io: &mut impl CaptureIo,
+        held: &mut HeldRefresh,
+        budget: &mut usize,
+        service_deadline: Instant,
+        report: &mut TickReport,
+    ) -> RefreshFlow {
+        // Pre-scan progress restarts at the readback under a moved
+        // attachment revision (memory only, no credit).
+        let session = io.attachment_revision();
+        if let RefreshStage::Readback {
+            session: proven, ..
+        }
+        | RefreshStage::Sides {
+            session: proven, ..
+        }
+        | RefreshStage::Custody {
+            session: proven, ..
+        }
+        | RefreshStage::Scan {
+            session: proven, ..
+        } = &held.stage
+            && *proven != session
+        {
+            self.take_refresh_counts.restarts = self.take_refresh_counts.restarts.saturating_add(1);
+            held.attached = true;
+            held.stage = RefreshStage::Readback { next: 0, session };
+            return RefreshFlow::Continue;
+        }
+        match std::mem::replace(&mut held.stage, RefreshStage::PreAudit) {
+            RefreshStage::PreAudit => {
+                *budget -= 1;
+                if !self.refresh_health_steady(io) {
+                    self.defer_refresh_audit(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
+                held.stage = RefreshStage::Readback { next: 0, session };
+            }
+            RefreshStage::Readback { next, session } => {
+                let total = io.attachment_readback_len();
+                if next >= total {
+                    // Nothing (left) to read back: no lookup, no credit.
+                    held.stage = RefreshStage::Sides {
+                        walk: SidesWalk::default(),
+                        session,
+                    };
+                    return RefreshFlow::Continue;
+                }
+                *budget -= 1;
+                let len = (total - next).min(REFRESH_STRIDE as u32);
+                held.stage = match io.attachment_readback_stride(next, len) {
+                    Ok(()) if next + len >= total => RefreshStage::Sides {
+                        walk: SidesWalk::default(),
+                        session,
+                    },
+                    Ok(()) => RefreshStage::Readback {
+                        next: next + len,
+                        session,
+                    },
+                    Err(_) => {
+                        held.attached = false;
+                        RefreshStage::Custody { session }
+                    }
+                };
+            }
+            RefreshStage::Sides { mut walk, session } => {
+                *budget -= 1;
+                held.stage = match io.attachment_sides_stride(
+                    held.interest.attachment_slot,
+                    &mut walk,
+                    REFRESH_STRIDE,
+                ) {
+                    SidesStep::Found => RefreshStage::Custody { session },
+                    SidesStep::Missing => {
+                        held.attached = false;
+                        RefreshStage::Custody { session }
+                    }
+                    SidesStep::More => RefreshStage::Sides { walk, session },
+                };
+            }
+            RefreshStage::Custody { session } => {
+                if !self.refresh_binding_holds(io, held) {
+                    self.take_refresh_counts.dropped =
+                        self.take_refresh_counts.dropped.saturating_add(1);
+                    return RefreshFlow::Done;
+                }
+                *budget -= 1;
+                if !io.custody(&held.pin) {
+                    self.take_refresh_counts.dropped =
+                        self.take_refresh_counts.dropped.saturating_add(1);
+                    return RefreshFlow::Done;
+                }
+                held.stage = RefreshStage::Scan { session };
+            }
+            RefreshStage::Scan { session } => {
+                if !self.refresh_binding_holds(io, held) {
+                    self.take_refresh_counts.dropped =
+                        self.take_refresh_counts.dropped.saturating_add(1);
+                    return RefreshFlow::Done;
+                }
+                let now = io.now();
+                let (Some(proof_deadline), Some(slice_end)) = (
+                    now.checked_add(self.limits.pending_for),
+                    now.checked_add(self.limits.scan_slice),
+                ) else {
+                    self.exhaust(report);
+                    return RefreshFlow::Done;
+                };
+                *budget -= 1;
+                // Refresh scans carry no birth cut: they re-prove the
+                // partition without offering.
+                let job = ScanJob {
+                    image: held.interest.image,
+                    endpoint: held.endpoint,
+                    slot: held.interest.attachment_slot,
+                    pin: held.pin.clone(),
+                    deadline: proof_deadline,
+                    birth_cut: None,
+                };
+                report.scans += 1;
+                self.take_refresh_scans = self.take_refresh_scans.saturating_add(1);
+                let fence = self.router.fence();
+                let attempt_deadline = slice_end.min(proof_deadline).min(service_deadline);
+                let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
+                // A proven absence breaks continuity from the obtained
+                // result alone, even when the window elapsed mid-scan.
+                if matches!(result, Err(ImageQueryRefusal::Empty)) {
+                    self.router
+                        .note_proven_absence(job.image, job.endpoint.file_slot);
+                }
+                // A scan that ran into its window starts no further
+                // I/O: no post-scan audit, no positive evidence; the
+                // key waits for a later step.
+                if io.now() >= attempt_deadline {
+                    self.refuse_refresh_scan(&job, ImageQueryRefusal::Deadline, report);
+                    self.release_refresh(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
+                held.stage = RefreshStage::PostAudit(Box::new(ScannedRefresh {
+                    job,
+                    fence,
+                    result,
+                    watched: None,
+                    session,
+                    router: Revised::revision(&self.router),
+                }));
+            }
+            RefreshStage::PostAudit(scanned) => {
+                if !self.refresh_scan_current(io, held, &scanned) {
+                    return RefreshFlow::Done;
+                }
+                *budget -= 1;
+                if !self.refresh_health_steady(io) {
+                    self.defer_refresh_audit(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
+                if io.now() >= scanned.job.deadline {
+                    self.refuse_refresh_scan(&scanned.job, ImageQueryRefusal::Deadline, report);
+                    self.release_refresh(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
+                if let Err(refusal) = scanned.result {
+                    self.refuse_refresh_scan(&scanned.job, refusal, report);
+                    return RefreshFlow::Done;
+                }
+                held.stage = if held.attached {
+                    RefreshStage::Target(scanned)
+                } else {
+                    RefreshStage::Accept(scanned)
+                };
+            }
+            RefreshStage::Target(mut scanned) => {
+                if !self.refresh_scan_current(io, held, &scanned) {
+                    return RefreshFlow::Done;
+                }
+                *budget -= 1;
+                scanned.watched = io.attachment_target(scanned.job.slot).ok();
+                held.stage = RefreshStage::Accept(scanned);
+            }
+            RefreshStage::Accept(scanned) => {
+                if !self.refresh_scan_current(io, held, &scanned) {
+                    return RefreshFlow::Done;
+                }
+                if io.now() >= scanned.job.deadline {
+                    self.refuse_refresh_scan(&scanned.job, ImageQueryRefusal::Deadline, report);
+                    self.release_refresh(held.key, held.interest);
+                    return RefreshFlow::Done;
+                }
+                // The observation joins every pending call of the key:
+                // it walks the router's pending table and emits each
+                // resolution, so it pays both up front (bounded by the
+                // pending cap).
+                let units = self.router.pending_len().saturating_mul(2);
+                let cost = 1 + units.div_ceil(REFRESH_STRIDE);
+                if *budget < cost {
+                    held.stage = RefreshStage::Accept(scanned);
+                    return RefreshFlow::Yield;
+                }
+                *budget -= cost;
+                let ScannedRefresh {
+                    job,
+                    fence,
+                    result,
+                    watched,
+                    ..
+                } = *scanned;
+                if let Ok(proof) = result {
+                    self.accept_scan_with(
+                        io,
+                        proof,
+                        &job,
+                        fence,
+                        report,
+                        AcceptMode::Refresh { watched },
+                    );
+                }
+                return RefreshFlow::Done;
+            }
+        }
+        RefreshFlow::Continue
     }
 
     /// Scan one joined-sweep key: the tick's per-key guards, scan,
@@ -2145,10 +2720,7 @@ impl SemanticCapture {
     /// `birth_cut` is the tick's cut for call-driven interests and
     /// `None` for refresh interests (no birth offered). The tick
     /// advances its cyclic cursor on `Scanned`; the cadence sweep
-    /// leaves the cursor alone. The cadence step passes its service
-    /// deadline to clamp the scan window and looks its pin up from
-    /// the key's own canonical binding instead of the tick's
-    /// target slice.
+    /// leaves the cursor alone.
     fn scan_one_joined_key(
         &mut self,
         io: &mut impl CaptureIo,
@@ -2158,40 +2730,21 @@ impl SemanticCapture {
             crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
         )>,
         report: &mut TickReport,
-        service_deadline: Option<Instant>,
-        direct_pin: bool,
     ) -> JoinedScanOutcome {
         let (image, endpoint, slot, pid) = interest;
-        let pin = if direct_pin {
-            let Some(binding) = self.bindings.get(&image.task_cookie) else {
-                return JoinedScanOutcome::Skipped;
-            };
-            if binding.domain != self.router.domain()
-                || !binding.current
-                || binding.image != image
-                || binding.pin.pid() != pid
-            {
-                return JoinedScanOutcome::Skipped;
-            }
-            binding.pin.clone()
-        } else {
-            let Some(pin) = io.target(pid) else {
-                return JoinedScanOutcome::Skipped;
-            };
-            let Some(binding) = self.bindings.get(&image.task_cookie) else {
-                return JoinedScanOutcome::Skipped;
-            };
-            if binding.domain != self.router.domain()
-                || !binding.current
-                || binding.image != image
-                || pin.pid() != pid
-                || !Arc::ptr_eq(&pin, &binding.pin)
-            {
-                return JoinedScanOutcome::Skipped;
-            }
-            pin
+        let Some(pin) = io.target(pid) else {
+            return JoinedScanOutcome::Skipped;
         };
-        if !pin.still_the_same() {
+        let Some(binding) = self.bindings.get(&image.task_cookie) else {
+            return JoinedScanOutcome::Skipped;
+        };
+        if binding.domain != self.router.domain()
+            || !binding.current
+            || binding.image != image
+            || pin.pid() != pid
+            || !Arc::ptr_eq(&pin, &binding.pin)
+            || !pin.still_the_same()
+        {
             return JoinedScanOutcome::Skipped;
         }
         let now = io.now();
@@ -2212,10 +2765,7 @@ impl SemanticCapture {
         };
         report.scans += 1;
         let fence = self.router.fence();
-        let mut attempt_deadline = slice_end.min(proof_deadline);
-        if let Some(service) = service_deadline {
-            attempt_deadline = attempt_deadline.min(service);
-        }
+        let attempt_deadline = slice_end.min(proof_deadline);
         let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
         let healthy = self.audit(io, report);
         // The break is recorded from the already-obtained result
@@ -3947,6 +4497,8 @@ impl SemanticCapture {
         self.jobs.clear();
     }
     fn audit(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) -> bool {
+        // This audit applies whatever a cadence health read deferred.
+        self.take_refresh_audit_deferred = false;
         if self.pending_discovery_status != CollectionStatus::Complete {
             self.fail_coverage(io, report);
             return false;
@@ -4037,11 +4589,10 @@ impl SemanticCapture {
     }
 
     fn refuse_binding(&mut self, image: ImageIdentity, report: &mut TickReport) {
-        let resolved = self.router.refuse_image_pending(
-            self.router.domain(),
-            image,
-            UnknownReason::BindingCapacity,
-        );
+        let domain = self.router.domain();
+        let resolved =
+            self.router
+                .refuse_image_pending(domain, image, UnknownReason::BindingCapacity);
         self.resolve(resolved, report);
         self.prune_jobs();
     }
@@ -4097,6 +4648,25 @@ impl SemanticCapture {
         fence: u64,
         report: &mut TickReport,
     ) {
+        self.accept_scan_with(io, proof, job, fence, report, AcceptMode::Tick);
+    }
+
+    /// The one accept behavior for tick and cadence scans. The tick
+    /// reads the retained attachment here and may bind or rebind the
+    /// task; the cadence passes the target its strided proof already
+    /// identity-checked and refreshes only an existing current binding
+    /// for the same pin. With at most one current binding per pin (the
+    /// only insertion below retires the others first), that refresh
+    /// has no prior image to retire, so it skips the binding walk.
+    fn accept_scan_with(
+        &mut self,
+        io: &mut impl CaptureIo,
+        proof: ImageScanProof,
+        job: &ScanJob,
+        fence: u64,
+        report: &mut TickReport,
+        mode: AcceptMode,
+    ) {
         // Production calls this immediately after the fresh synchronous scan
         // and its postscan audit. No deferred seal queue can roll bindings back.
         if proof.domain() != self.router.domain()
@@ -4130,15 +4700,44 @@ impl SemanticCapture {
                     .insert(job.key(), ImageQueryRefusal::Custody);
                 return;
             }
+        } else if matches!(mode, AcceptMode::Refresh { .. }) {
+            // A refresh never binds a new task: that is the tick's job.
+            report.scan_refusals.push(ImageQueryRefusal::Custody);
+            #[cfg(test)]
+            self.last_refusal_by_key_for_test
+                .insert(job.key(), ImageQueryRefusal::Custody);
+            return;
         } else if self.bindings.len() >= self.limits.bindings {
             self.refuse_binding(job.image, report);
             return;
         }
+        // A refresh refreshes the exact current binding only.
+        let refresh = match mode {
+            AcceptMode::Refresh { watched } => {
+                if self
+                    .bindings
+                    .get(&job.image.task_cookie)
+                    .is_none_or(|existing| existing.image != job.image)
+                {
+                    report.scan_refusals.push(ImageQueryRefusal::Custody);
+                    #[cfg(test)]
+                    self.last_refusal_by_key_for_test
+                        .insert(job.key(), ImageQueryRefusal::Custody);
+                    return;
+                }
+                Some(watched)
+            }
+            AcceptMode::Tick => None,
+        };
         let prior_ids =
             self.router
                 .current_instances(self.router.domain(), job.image, job.endpoint.file_slot);
         let epochs = proof.epochs();
-        let watched = io.retained_attachment(job.slot).ok();
+        let refreshed = refresh.is_some();
+        let (watched, identity_checked) = match refresh {
+            Some(watched) => (watched, true),
+            None => (io.retained_attachment(job.slot).ok(), false),
+        };
         let (outcome, resolved) = self.router.observe(proof);
         let accepted = matches!(
             outcome,
@@ -4189,20 +4788,30 @@ impl SemanticCapture {
             );
         }
         if accepted && !self.exhausted {
-            #[cfg(test)]
-            {
-                self.walk_units_for_test += self.bindings.len();
-            }
-            let prior: Vec<_> = self
-                .bindings
-                .values()
-                .filter(|binding| {
-                    binding.current
-                        && binding.image != job.image
-                        && Arc::ptr_eq(&binding.pin, &job.pin)
-                })
-                .map(|binding| binding.image)
-                .collect();
+            let prior: Vec<_> = if refreshed {
+                #[cfg(test)]
+                debug_assert!(
+                    self.bindings.values().all(|binding| !binding.current
+                        || binding.image == job.image
+                        || !Arc::ptr_eq(&binding.pin, &job.pin)),
+                    "at most one current binding per pin"
+                );
+                Vec::new()
+            } else {
+                #[cfg(test)]
+                {
+                    self.walk_units_for_test += self.bindings.len();
+                }
+                self.bindings
+                    .values()
+                    .filter(|binding| {
+                        binding.current
+                            && binding.image != job.image
+                            && Arc::ptr_eq(&binding.pin, &job.pin)
+                    })
+                    .map(|binding| binding.image)
+                    .collect()
+            };
             for image in prior {
                 self.bindings
                     .get_mut(&image.task_cookie)
@@ -4234,7 +4843,7 @@ impl SemanticCapture {
                 fence,
                 &ids,
             ) && let Some(watched) = watched
-                && watched.check_unchanged() == Ok(true)
+                && (identity_checked || watched.check_unchanged() == Ok(true))
             {
                 // A sighting retry offers this quantum's birth at most
                 // once; a New or AdmittedFirst offer counts as the
@@ -4719,14 +5328,7 @@ impl SemanticCapture {
             } else {
                 birth_cut.clone()
             };
-            match self.scan_one_joined_key(
-                io,
-                joined_interests[&key],
-                birth_cut,
-                &mut report,
-                None,
-                false,
-            ) {
+            match self.scan_one_joined_key(io, joined_interests[&key], birth_cut, &mut report) {
                 JoinedScanOutcome::Scanned => {
                     self.joined_refresh_cursor = Some(key);
                 }
@@ -4797,6 +5399,7 @@ impl SemanticCapture {
             return;
         }
         self.stopped = true;
+        self.take_refresh_held = None;
         self.invalidate(InvalidationScope::Stopped, report);
         let images: Vec<_> = self
             .awaiting

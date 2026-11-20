@@ -22704,6 +22704,267 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn seal_exit_abandoned_sign_disposes_per_call_and_later_sign_binds() {
+        // Fix5: an exit-time unbounded abandonment of a neutral
+        // (effect-free S1) call disposes per-call with a named loss
+        // gap instead of dooming the whole key: the seal succeeds,
+        // the key stays live, and later signs on the same key bind.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function_n("C_Sign", 3);
+        let sign = function_id("C_Sign");
+        scene.ingest(&begin_bytes(1, 1, sign, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene
+            .seal(&bootstrap)
+            .expect("neutral abandonment disposes per-call, key seals");
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key keeps binding after a neutral abandonment"
+        );
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the per-call disposal names its loss gap: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            success
+                .prefix
+                .settled()
+                .iter()
+                .any(|call| call.function == sign),
+            "the healthy sign converts in the same seal"
+        );
+        // A later sign on the same key binds too.
+        scene.ingest(&begin_bytes(1, 3, sign, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later sign binds on the live key");
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live across the later seal"
+        );
+    }
+
+    #[test]
+    fn seal_converted_sign_abandonment_disposes_and_key_continues() {
+        // Fix5 converted twin: an unbounded abandonment staged on an
+        // already-converted neutral call releases its model ticket
+        // per-call (no whole-key doom) while the key keeps sealing.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function_n("C_Sign", 3);
+        let sign = function_id("C_Sign");
+        scene.ingest(&begin_bytes(1, 1, sign, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        let success = scene
+            .seal(&bootstrap)
+            .expect("converted neutral abandonment disposes per-call");
+        assert_eq!(
+            scene.model.project().usage.pending_calls,
+            1,
+            "one ticket released, one converted"
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live after disposing its converted abandonment"
+        );
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the converted disposal names its loss gap: {:?}",
+            success.effects.effects
+        );
+        scene.ingest(&begin_bytes(1, 3, sign, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later sign binds on the live key");
+    }
+
+    #[test]
+    fn seal_exit_abandoned_create_still_dooms_key() {
+        // Fix5 guard: an exit-time unbounded abandonment of a
+        // mutating call still dooms the whole key (fail closed).
+        // Per-call disposal is neutral-only.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("mutating abandonment still dooms");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the mutating abandonment keeps its permanent refusal"
+        );
+    }
+
+    #[test]
+    fn seal_mixed_neutral_and_mutating_abandonment_still_dooms() {
+        // Fix5 guard: one mutating abandonment dominates any number
+        // of neutral ones — the partition dooms the key (fail
+        // closed) instead of disposing around the mutating call.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof_sign = scene.attest_function("C_Sign");
+        let proof_create = scene.attest();
+        assert_eq!(
+            proof_sign.key, proof_create.key,
+            "precondition: one key holds both calls"
+        );
+        let sign = function_id("C_Sign");
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, sign, 0));
+        scene.ingest(&abandon_bytes(
+            1,
+            1,
+            JOURNAL_REASON_EXEC_EXIT,
+            (COOKIE, EXEC),
+        ));
+        scene.ingest(&begin_bytes(1, 2, create, 0));
+        scene.ingest(&abandon_bytes(
+            1,
+            2,
+            JOURNAL_REASON_EXEC_EXIT,
+            (COOKIE, EXEC),
+        ));
+        let bootstrap = scene.bootstrap(proof_sign, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the mutating abandonment still dooms");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof_sign.key)
+                .expect("sealed key")
+                .refused,
+            "the mixed abandonment keeps its permanent refusal"
+        );
+    }
+
+    #[test]
+    fn void_with_staged_sign_abandonment_preserves_key_and_rebirths() {
+        // Fix5 preserve twin: a void wiping a staged neutral
+        // abandonment preserves no doom and taints no image — the
+        // fence suffices for effect-free calls, so the key rebirths
+        // above the fence and later signs bind.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_Sign");
+        let sign = function_id("C_Sign");
+        let outer = begin_bytes(1, 1, sign, 0);
+        scene.ingest(&outer);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("voided key")
+                .refused,
+            "the void preserves no doom for a neutral abandonment"
+        );
+        assert!(
+            !scene.adapter.image_refused((COOKIE, EXEC)),
+            "the void taints no image for a neutral abandonment"
+        );
+        // The key rebirths above the fence and a later sign binds.
+        let fence = scene.adapter.consumed_through;
+        let reproof = scene.attest_function("C_Sign");
+        assert_eq!(reproof, proof);
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        let grant = SessionBirthGrant::scripted(
+            reproof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene
+            .seal_at(&rebirth, 8)
+            .expect("post-void rebirth binds the later sign");
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("rebound key")
+                .refused,
+            "the rebirth keeps the key live"
+        );
+    }
+
+    #[test]
     fn object_journal_conversion_capacity_refusal_propagates_effects() {
         // Carryover 10: a capacity refusal on the production conversion
         // path (model.begin inside the seal) publishes its invalidation

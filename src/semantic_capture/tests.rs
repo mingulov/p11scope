@@ -1249,6 +1249,9 @@ struct ScriptIo {
     /// read is a continuity audit of several reads); each one costs
     /// `health_advance` and counts in the spy.
     health_ops: usize,
+    /// A native storage_null miss landing right after the next scan
+    /// returns (its counter, then its global bump): consumed once.
+    after_scan: Option<(Option<u64>, u32)>,
 }
 
 /// Counts of substituted native leaves (and leaf units) a capture
@@ -1379,6 +1382,7 @@ impl ScriptIo {
             side_walk_units: 130,
             readback_advance: Duration::ZERO,
             health_ops: 1,
+            after_scan: None,
         }
     }
     fn call_image(&mut self, cookie: u64, exec_id: u64, fault: u32) {
@@ -1562,13 +1566,18 @@ impl CaptureIo for ScriptIo {
             ranges.push(MapRange::new(0x4000, 0x5000, 0, false));
         }
         self.current_image = self.output_image.unwrap_or(job.image);
+        let epochs_global = self.global;
+        if let Some((storage, global)) = self.after_scan.take() {
+            self.storage_null = storage;
+            self.global = global;
+        }
         acquire_test_scan(
             self.domain,
             self.output_image.unwrap_or(job.image),
             self.output_file.unwrap_or(job.endpoint.file_slot),
             CompleteEpochs {
                 local: u64::from(self.local),
-                global: u64::from(self.global),
+                global: u64::from(epochs_global),
                 fault: self.last_health.fault,
                 sticky: 0,
                 record_flags: 0,
@@ -3520,9 +3529,9 @@ fn joint_take_refresh_cadence_starts_no_audit_after_the_window() {
         .expect("the later step recovers the take");
 }
 
-/// The storage read belongs to the scan it gates: it runs after the
-/// scan (paid and window-checked like any leaf), and one that overruns
-/// the service window starts no target check and commits nothing.
+/// The storage reads bracket the scan they gate: each is paid and
+/// window-checked like any leaf, and a pre-scan sample that overruns
+/// the service window dispatches no scan and commits nothing.
 #[test]
 fn joint_take_refresh_cadence_yields_after_a_slow_storage_read() {
     let (mut harness, _, _) = raced_refresh_witness();
@@ -3532,13 +3541,9 @@ fn joint_take_refresh_cadence_yields_after_a_slow_storage_read() {
     let report = harness
         .capture
         .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
-    assert_eq!(harness.io.attempts.len(), 1, "the sample follows the scan");
+    assert_eq!(harness.io.spy.custody.get(), 1, "custody precedes it");
     assert_eq!(harness.io.spy.storage.get(), 1);
-    assert_eq!(
-        harness.io.spy.target_checks.get(),
-        0,
-        "no target check after it"
-    );
+    assert!(harness.io.attempts.is_empty(), "no scan after it");
     assert!(report.observations.is_empty(), "nothing commits after it");
     assert!(harness.capture.has_queued_take_refresh(), "the key waits");
 }
@@ -3683,9 +3688,10 @@ fn joint_take_refresh_cadence_restarts_proof_on_moved_attachment() {
 fn joint_take_refresh_cadence_withholds_scan_after_foreign_router_change() {
     let (mut harness, _, _) = raced_refresh_witness();
     let deadline = harness.io.now() + Duration::from_secs(10);
-    // Pick, health, two readback strides, three side strides, custody
-    // and the scan: the post-scan audit waits for the next pass.
-    let mut budget = 9;
+    // Pick, health, two readback strides, three side strides, custody,
+    // the pre-scan storage sample and the scan: the post-scan audit
+    // waits for the next pass.
+    let mut budget = 10;
     let report = harness
         .capture
         .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
@@ -3788,6 +3794,103 @@ fn joint_take_refresh_cadence_splits_on_a_storage_move_after_the_pick() {
         refusal,
         crate::attach::BirthObservationRefusal::WitnessStale
     );
+}
+
+/// A storage_null miss that lands after the scan but before the
+/// post-scan sample cannot be attributed to the scan's epochs: the
+/// bracket withholds that proof (counted), and the re-scan mints from
+/// post-move truth, so no later scan continues an instance minted
+/// from the pre-move proof.
+#[test]
+fn joint_take_refresh_cadence_withholds_a_scan_bracketing_a_storage_move() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let (domain, image, file) = (receipt.domain, receipt.image, receipt.endpoint.file_slot);
+    harness.io.storage_null = Some(5);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    // The cadence scan seals global 2; the miss then counts storage
+    // and globalizes before the post-scan sample.
+    harness.io.after_scan = Some((Some(6), 3));
+    let restarts = harness.capture.take_refresh_counts().restarts;
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::New],
+        "only the post-move re-scan is observed"
+    );
+    assert_eq!(
+        harness.capture.take_refresh_counts().restarts,
+        restarts + 1,
+        "the bracketed proof is a counted withhold"
+    );
+    // A later refresh at the post-move epochs matches the minted entry
+    // itself: nothing continued across the move.
+    harness.capture.request_partition_refresh(
+        image,
+        file,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::Continued]
+    );
+    assert_eq!(
+        harness
+            .capture
+            .router
+            .partition_back_taint(domain, image, file),
+        Some((false, false)),
+        "no global-only continuation from a pre-move proof"
+    );
+}
+
+/// A refresh interest the tick drains but never reaches (its scan
+/// quota went to pending work) stays queued for a later tick, which
+/// re-observes it.
+#[test]
+fn joint_take_refresh_survives_a_saturated_tick() {
+    let (mut harness, witness, _) = raced_refresh_witness();
+    let receipt = &witness.candidate.receipt;
+    let key = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    let scans = harness.capture.limits.scans;
+    harness.capture.limits.scans = 0;
+    let report = harness.capture.tick_with(&mut harness.io).unwrap();
+    assert_eq!(report.scans, 0, "the saturated tick scans nothing");
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(key.0, key.1, key.2),
+        "the unreached interest is kept"
+    );
+    harness.capture.limits.scans = scans;
+    let report = harness.capture.tick_with(&mut harness.io).unwrap();
+    assert_eq!(report.scans, 1, "the next tick re-observes the key");
+    assert!(
+        !harness
+            .capture
+            .has_refresh_interest_for_test(key.0, key.1, key.2),
+        "the attempt consumes the interest"
+    );
+    assert_eq!(harness.capture.take_refresh_counts().dropped, 0);
 }
 
 /// Scan ranges padded past one stride, the call's executable range
@@ -3934,6 +4037,17 @@ fn joint_take_refresh_cadence_hands_an_oversized_join_to_the_tick() {
         .capture
         .sweep_take_refresh_with(&mut harness.io, &mut budget, deadline);
     assert_eq!(cadence_leaves(&harness.io), leaves, "idle until the tick");
+    // A receiving tick whose scan quota is spent keeps the handoff.
+    let scans = harness.capture.limits.scans;
+    harness.capture.limits.scans = 0;
+    harness.capture.tick_with(&mut harness.io).unwrap();
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(key.0, key.1, key.2),
+        "a saturated tick never loses the handed-off interest"
+    );
+    harness.capture.limits.scans = scans;
 }
 
 /// A descriptor readback stride starts no lookup after the service

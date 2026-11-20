@@ -21994,6 +21994,125 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scoped_preserve_dooms_sole_live_key() {
+        // One live key faces its own collision abandonment: the
+        // sole survivor is doomed without consulting claims, and
+        // the attributed image never taints.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let proof = harness.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        assert!(
+            harness.owner.adapter().key_is_live(proof.key),
+            "precondition: the key is live before the void"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert!(
+            harness.owner.adapter().proof_refused_for_test(proof),
+            "the sole key keeps its abandonment refusal"
+        );
+        assert!(
+            !harness.owner.adapter().image_tainted_for_test((COOKIE, EXEC)),
+            "an attributed abandonment never taints its image"
+        );
+    }
+
+    #[test]
+    fn scoped_preserve_taints_unclaimed_shared_abandonment() {
+        // Two live keys share an image, but neither claims the
+        // staged collision abandonment: with no live claimant to
+        // doom, the image taints instead, and neither key is
+        // refused.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let first = harness.attest();
+        let mut other_fixture = AttestationFixture::new(image_default());
+        let other_admitted = other_fixture.admit_session_function(SESSION, "C_CreateObject");
+        let second = harness
+            .owner
+            .adapter_mut()
+            .attest_key(&other_admitted)
+            .expect("sibling key attests");
+        assert_ne!(first.key, second.key, "the twin covers two keys");
+        let begin = begin_bytes(1, 1, create, 0);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        assert!(
+            harness.owner.adapter().key_is_live(first.key)
+                && harness.owner.adapter().key_is_live(second.key),
+            "precondition: both keys are live before the void"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = first.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert!(
+            harness.owner.adapter().image_tainted_for_test((COOKIE, EXEC)),
+            "the unclaimed abandonment taints its image"
+        );
+        assert!(
+            !harness.owner.adapter().proof_refused_for_test(first)
+                && !harness.owner.adapter().proof_refused_for_test(second),
+            "taint precedence refuses neither key"
+        );
+        assert!(
+            harness.owner.adapter().open.is_empty(),
+            "the drained image keeps no opens"
+        );
+    }
+
+    #[test]
     fn seal_barrier_clear_can_consume_its_whole_reserve() {
         // 63 attested opens plus one capacity-refused BEGIN clear
         // with zero units left: the refused phase completes exactly

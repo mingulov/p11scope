@@ -3583,6 +3583,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_capture.adapter().joint_void_diagnosis()
     }
 
+    /// Seal bootstrap telemetry: which bootstrap check refused a
+    /// seal, by arm (bootstrap-arm diagnostics).
+    pub(crate) fn joint_seal_bootstrap_diagnosis(
+        &self,
+    ) -> crate::semantics_objects::journal::SealBootstrapCounts {
+        self.joint_capture.adapter().seal_bootstrap_diagnosis()
+    }
+
     /// Disclose audit voids as counted scope gaps (scope round): one
     /// `joint_void_<subcause>_history_loss` gap per void since the last
     /// drain, like ingest-break voids. Scope-wide (not per process).

@@ -1076,6 +1076,151 @@ pub(crate) struct JointVoidDiagnosis {
     pub(crate) keys_pending: u64,
 }
 
+/// Diagnostic-only seal bootstrap refusal arms: which
+/// bootstrap check refused a seal. Counts only; no identities, paths
+/// or payloads. Disclosed on stderr when verbose text is requested,
+/// never a contract and never part of reports. Instrumentation only:
+/// it changes no Joint decision, seal, fence or gap.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SealBootstrapCounts {
+    /// Fresh-evidence takes that failed, by refusal variant (see
+    /// `take_arm_name` for the slot order).
+    pub(crate) take_failed: [u64; SealBootstrapCounts::TAKE_ARMS],
+    /// Birth re-verifications that failed, by refusal variant (see
+    /// `reverify_arm_name` for the slot order).
+    pub(crate) reverify_failed: [u64; SealBootstrapCounts::REVERIFY_ARMS],
+    /// Seals refused because the birth cut does not cover retained
+    /// staged history for the key.
+    pub(crate) covers_failed: u64,
+    /// Seals refused on a pinned-cut mismatch (rebirth above a
+    /// different cut for the same key-era).
+    pub(crate) pin_failed: u64,
+    /// Seals refused at any other bootstrap-mismatch arm (missing
+    /// key, era mismatch, stream-cut rejection, cut above frontier).
+    pub(crate) other_failed: u64,
+}
+
+impl SealBootstrapCounts {
+    /// Take-failure slots: one per `BirthObservationRefusal`
+    /// variant. A new variant extends this count, the name table and
+    /// the index match together (the index match is exhaustive, so a
+    /// new variant fails to compile until it is placed).
+    pub(crate) const TAKE_ARMS: usize = 16;
+    /// Re-verify-failure slots: one per `BirthRefusal` variant,
+    /// with the same extend-together rule.
+    pub(crate) const REVERIFY_ARMS: usize = 8;
+    /// Take-failure slot names in index order.
+    const TAKE_ARM_NAMES: [&'static str; Self::TAKE_ARMS] = [
+        "CurrentPartition",
+        "StreamCut",
+        "AbsenceHistory",
+        "MarkerNotReady",
+        "LatchTripped",
+        "SpentExhausted",
+        "CustodyLost",
+        "AttachmentMismatch",
+        "MarkerPublished",
+        "RowUnreadable",
+        "BindingMismatch",
+        "GenerationMismatch",
+        "AppearanceForeign",
+        "AppearanceNotAdvanced",
+        "AppearanceRejected",
+        "NegativeFenceMismatch",
+    ];
+    /// Re-verify-failure slot names in index order.
+    const REVERIFY_ARM_NAMES: [&'static str; Self::REVERIFY_ARMS] = [
+        "ImageTainted",
+        "ImageUnknown",
+        "ClosureStale",
+        "NoveltyBroken",
+        "AbsenceUnproven",
+        "EvidenceMismatch",
+        "BelowVoidFence",
+        "AttachHistoryBroken",
+    ];
+
+    /// Slot for one take-failure refusal (exhaustive: a new variant
+    /// must take a slot here and a name above).
+    pub(crate) fn take_index(refusal: crate::attach::BirthObservationRefusal) -> usize {
+        use crate::attach::BirthObservationRefusal::*;
+        match refusal {
+            CurrentPartition => 0,
+            StreamCut => 1,
+            AbsenceHistory => 2,
+            MarkerNotReady => 3,
+            LatchTripped => 4,
+            SpentExhausted => 5,
+            CustodyLost => 6,
+            AttachmentMismatch => 7,
+            MarkerPublished => 8,
+            RowUnreadable => 9,
+            BindingMismatch => 10,
+            GenerationMismatch => 11,
+            AppearanceForeign => 12,
+            AppearanceNotAdvanced => 13,
+            AppearanceRejected => 14,
+            NegativeFenceMismatch => 15,
+        }
+    }
+
+    /// Slot for one re-verify refusal (exhaustive, same rule).
+    pub(crate) fn reverify_index(refusal: BirthRefusal) -> usize {
+        use BirthRefusal::*;
+        match refusal {
+            ImageTainted => 0,
+            ImageUnknown => 1,
+            ClosureStale => 2,
+            NoveltyBroken => 3,
+            AbsenceUnproven => 4,
+            EvidenceMismatch => 5,
+            BelowVoidFence => 6,
+            AttachHistoryBroken => 7,
+        }
+    }
+
+    /// Name of one take-failure slot (`None` past the table: a
+    /// misplaced index prints nothing rather than panicking).
+    pub(crate) fn take_arm_name(index: usize) -> Option<&'static str> {
+        Self::TAKE_ARM_NAMES.get(index).copied()
+    }
+
+    /// Name of one re-verify-failure slot (same fail-soft rule).
+    pub(crate) fn reverify_arm_name(index: usize) -> Option<&'static str> {
+        Self::REVERIFY_ARM_NAMES.get(index).copied()
+    }
+
+    /// Total failed takes across all refusal variants.
+    pub(crate) fn take_failed_total(&self) -> u64 {
+        self.take_failed
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    }
+
+    /// Total failed re-verifications across all refusal variants.
+    pub(crate) fn reverify_failed_total(&self) -> u64 {
+        self.reverify_failed
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    }
+}
+
+/// One seal bootstrap refusal arm (diagnostic-only): counted by
+/// `JournalAdapter::note_bootstrap_arm`, never authority.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SealBootstrapArm {
+    /// The fresh-evidence take failed with this refusal.
+    Take(crate::attach::BirthObservationRefusal),
+    /// Birth re-verification failed with this refusal.
+    Reverify(BirthRefusal),
+    /// The birth cut does not cover retained staged history.
+    Covers,
+    /// A pinned-cut mismatch for the key-era.
+    Pin,
+    /// Any other bootstrap-mismatch arm.
+    Other,
+}
+
 /// Why a seal attempt answered `BoundNotReady` (internal diagnostics
 /// and the frame's future-input decision; never authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1521,6 +1666,10 @@ pub(crate) struct JournalAdapter {
     /// round): one per void however many feeds it ended. Saturating;
     /// instrumentation only, never authority.
     voids_ended_joint_feed: u64,
+    /// Diagnostic-only seal bootstrap refusal arms: which
+    /// bootstrap check refused a seal, by arm. Saturating;
+    /// instrumentation only, never authority.
+    seal_bootstrap: SealBootstrapCounts,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -1699,6 +1848,7 @@ impl JournalAdapter {
             audit_fault_unreadable: 0,
             audit_resource_unavailable: 0,
             voids_ended_joint_feed: 0,
+            seal_bootstrap: SealBootstrapCounts::default(),
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
@@ -2770,6 +2920,52 @@ impl JournalAdapter {
         self.audit_fault_unreadable = carried.audit_fault_unreadable;
         self.audit_resource_unavailable = carried.audit_resource_unavailable;
         self.voids_ended_joint_feed = carried.voids_ended_joint_feed;
+    }
+
+    /// Diagnostic-only (bootstrap arms): count one seal bootstrap refusal arm.
+    /// Saturating; instrumentation only, never authority.
+    fn note_bootstrap_arm(&mut self, arm: SealBootstrapArm) {
+        let counts = &mut self.seal_bootstrap;
+        match arm {
+            SealBootstrapArm::Take(refusal) => {
+                let index = SealBootstrapCounts::take_index(refusal);
+                if let Some(slot) = counts.take_failed.get_mut(index) {
+                    *slot = slot.saturating_add(1);
+                } else {
+                    debug_assert!(false, "take arm index past its table");
+                }
+            }
+            SealBootstrapArm::Reverify(refusal) => {
+                let index = SealBootstrapCounts::reverify_index(refusal);
+                if let Some(slot) = counts.reverify_failed.get_mut(index) {
+                    *slot = slot.saturating_add(1);
+                } else {
+                    debug_assert!(false, "re-verify arm index past its table");
+                }
+            }
+            SealBootstrapArm::Covers => {
+                counts.covers_failed = counts.covers_failed.saturating_add(1);
+            }
+            SealBootstrapArm::Pin => {
+                counts.pin_failed = counts.pin_failed.saturating_add(1);
+            }
+            SealBootstrapArm::Other => {
+                counts.other_failed = counts.other_failed.saturating_add(1);
+            }
+        }
+    }
+
+    /// Diagnostic-only (bootstrap arms): adopt a retired owner's bootstrap-arm
+    /// counters across joint-owner replacement. Instrumentation only,
+    /// never authority.
+    pub(crate) fn carry_seal_bootstrap_counts(&mut self, carried: &SealBootstrapCounts) {
+        self.seal_bootstrap = *carried;
+    }
+
+    /// Diagnostic-only (bootstrap arms): snapshot the seal bootstrap refusal
+    /// arms. Instrumentation only, never authority.
+    pub(crate) fn seal_bootstrap_diagnosis(&self) -> SealBootstrapCounts {
+        self.seal_bootstrap
     }
 
     /// Diagnostic-only (Task 0 plus the scope-round split): snapshot
@@ -6935,6 +7131,9 @@ impl JournalAdapter {
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
         let Some(state) = self.keys.get(&key) else {
+            // Diagnostic-only (bootstrap arms): count the refusing arm. The
+            // refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Other);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         };
         if state.refused || state.tainted {
@@ -6962,6 +7161,9 @@ impl JournalAdapter {
         // once the live one ended (handled below after the ended check can
         // observe it). Anything else is a mismatched bootstrap.
         if bootstrap.proof().era != state.era {
+            // Diagnostic-only (bootstrap arms): count the refusing arm. The
+            // refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Other);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // The receipt's own generation must be live: a birth verified
@@ -6975,13 +7177,22 @@ impl JournalAdapter {
                 ordinal: ConsumptionOrdinal(bootstrap.birth_cut()),
             })
         {
+            // Diagnostic-only (bootstrap arms): count the refusing arm. The
+            // refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Other);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Pull one fresh birth observation: the seal never receives a
         // reusable evidence value. A failed take refuses (the next tick
         // takes again), exactly like moved native evidence.
-        let Ok(fresh) = births.take_birth_evidence() else {
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+        let fresh = match births.take_birth_evidence() {
+            Ok(fresh) => fresh,
+            Err(refusal) => {
+                // Diagnostic-only (bootstrap arms): count which refusal
+                // failed the take. The refusal below is unchanged.
+                self.note_bootstrap_arm(SealBootstrapArm::Take(refusal));
+                return Err(self.failure(JournalGap::BootstrapMismatch));
+            }
         };
         // Re-verify the birth with fresh Session evidence against
         // current retained truth: moved native evidence or a chain break
@@ -6996,6 +7207,9 @@ impl JournalAdapter {
             &fresh,
             self.closure_generation,
         ) {
+            // Diagnostic-only (bootstrap arms): count which refusal failed
+            // re-verification. The refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Reverify(refusal));
             // The receipt generation was checked above, so only taint
             // keeps its own gap here.
             let gap = match refusal {
@@ -7010,6 +7224,9 @@ impl JournalAdapter {
         if let Some(pinned) = state.bootstraps.get(&bootstrap.proof().era)
             && *pinned != bootstrap.birth_cut()
         {
+            // Diagnostic-only (bootstrap arms): count the refusing arm. The
+            // refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Pin);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // The birth covers all retained staged history for the key:
@@ -7019,12 +7236,18 @@ impl JournalAdapter {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
         if !self.birth_covers_staged(key, &live, image, bootstrap.birth_cut()) {
+            // Diagnostic-only (bootstrap arms): count the refusing arm. The
+            // refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Covers);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         if frontier < state.sealed_through {
             return Err(self.failure(JournalGap::FrontierRegression));
         }
         if bootstrap.birth_cut() > frontier {
+            // Diagnostic-only (bootstrap arms): count the refusing arm. The
+            // refusal below is unchanged.
+            self.note_bootstrap_arm(SealBootstrapArm::Other);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Resumption below the void fence refuses: a fresh birth names
@@ -24984,6 +25207,366 @@ pub(crate) mod tests {
         // Nothing voided: a fresh take seals the same staged history.
         let success = scene.seal(&bootstrap).expect("fresh take seals");
         assert_eq!(success.prefix.settled().len(), 1);
+    }
+
+    /// Bootstrap-arm diagnostics: every take-failure refusal variant maps to a
+    /// distinct slot named for itself, and likewise for every
+    /// re-verify refusal. The matches are exhaustive, so a new
+    /// variant fails to compile until it is placed and named.
+    #[test]
+    fn seal_bootstrap_arm_names_cover_every_variant() {
+        use crate::attach::BirthObservationRefusal as Take;
+        let takes = [
+            Take::CurrentPartition,
+            Take::StreamCut,
+            Take::AbsenceHistory,
+            Take::MarkerNotReady,
+            Take::LatchTripped,
+            Take::SpentExhausted,
+            Take::CustodyLost,
+            Take::AttachmentMismatch,
+            Take::MarkerPublished,
+            Take::RowUnreadable,
+            Take::BindingMismatch,
+            Take::GenerationMismatch,
+            Take::AppearanceForeign,
+            Take::AppearanceNotAdvanced,
+            Take::AppearanceRejected,
+            Take::NegativeFenceMismatch,
+        ];
+        assert_eq!(takes.len(), SealBootstrapCounts::TAKE_ARMS);
+        let mut seen = [false; SealBootstrapCounts::TAKE_ARMS];
+        for refusal in takes {
+            let index = SealBootstrapCounts::take_index(refusal);
+            assert!(
+                index < SealBootstrapCounts::TAKE_ARMS,
+                "{refusal:?} past its table"
+            );
+            assert!(!seen[index], "{refusal:?} collides on slot {index}");
+            seen[index] = true;
+            let name = SealBootstrapCounts::take_arm_name(index);
+            match refusal {
+                Take::CurrentPartition => assert_eq!((index, name), (0, Some("CurrentPartition"))),
+                Take::StreamCut => assert_eq!((index, name), (1, Some("StreamCut"))),
+                Take::AbsenceHistory => assert_eq!((index, name), (2, Some("AbsenceHistory"))),
+                Take::MarkerNotReady => assert_eq!((index, name), (3, Some("MarkerNotReady"))),
+                Take::LatchTripped => assert_eq!((index, name), (4, Some("LatchTripped"))),
+                Take::SpentExhausted => assert_eq!((index, name), (5, Some("SpentExhausted"))),
+                Take::CustodyLost => assert_eq!((index, name), (6, Some("CustodyLost"))),
+                Take::AttachmentMismatch => {
+                    assert_eq!((index, name), (7, Some("AttachmentMismatch")))
+                }
+                Take::MarkerPublished => assert_eq!((index, name), (8, Some("MarkerPublished"))),
+                Take::RowUnreadable => assert_eq!((index, name), (9, Some("RowUnreadable"))),
+                Take::BindingMismatch => assert_eq!((index, name), (10, Some("BindingMismatch"))),
+                Take::GenerationMismatch => {
+                    assert_eq!((index, name), (11, Some("GenerationMismatch")))
+                }
+                Take::AppearanceForeign => {
+                    assert_eq!((index, name), (12, Some("AppearanceForeign")))
+                }
+                Take::AppearanceNotAdvanced => {
+                    assert_eq!((index, name), (13, Some("AppearanceNotAdvanced")))
+                }
+                Take::AppearanceRejected => {
+                    assert_eq!((index, name), (14, Some("AppearanceRejected")))
+                }
+                Take::NegativeFenceMismatch => {
+                    assert_eq!((index, name), (15, Some("NegativeFenceMismatch")))
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|used| *used),
+            "every take slot is named by a variant"
+        );
+        let reverifies = [
+            BirthRefusal::ImageTainted,
+            BirthRefusal::ImageUnknown,
+            BirthRefusal::ClosureStale,
+            BirthRefusal::NoveltyBroken,
+            BirthRefusal::AbsenceUnproven,
+            BirthRefusal::EvidenceMismatch,
+            BirthRefusal::BelowVoidFence,
+            BirthRefusal::AttachHistoryBroken,
+        ];
+        assert_eq!(reverifies.len(), SealBootstrapCounts::REVERIFY_ARMS);
+        let mut seen = [false; SealBootstrapCounts::REVERIFY_ARMS];
+        for refusal in reverifies {
+            let index = SealBootstrapCounts::reverify_index(refusal);
+            assert!(
+                index < SealBootstrapCounts::REVERIFY_ARMS,
+                "{refusal:?} past its table"
+            );
+            assert!(!seen[index], "{refusal:?} collides on slot {index}");
+            seen[index] = true;
+            let name = SealBootstrapCounts::reverify_arm_name(index);
+            match refusal {
+                BirthRefusal::ImageTainted => assert_eq!((index, name), (0, Some("ImageTainted"))),
+                BirthRefusal::ImageUnknown => assert_eq!((index, name), (1, Some("ImageUnknown"))),
+                BirthRefusal::ClosureStale => assert_eq!((index, name), (2, Some("ClosureStale"))),
+                BirthRefusal::NoveltyBroken => {
+                    assert_eq!((index, name), (3, Some("NoveltyBroken")))
+                }
+                BirthRefusal::AbsenceUnproven => {
+                    assert_eq!((index, name), (4, Some("AbsenceUnproven")))
+                }
+                BirthRefusal::EvidenceMismatch => {
+                    assert_eq!((index, name), (5, Some("EvidenceMismatch")))
+                }
+                BirthRefusal::BelowVoidFence => {
+                    assert_eq!((index, name), (6, Some("BelowVoidFence")))
+                }
+                BirthRefusal::AttachHistoryBroken => {
+                    assert_eq!((index, name), (7, Some("AttachHistoryBroken")))
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|used| *used),
+            "every re-verify slot is named by a variant"
+        );
+        assert_eq!(SealBootstrapCounts::take_arm_name(999), None);
+        assert_eq!(SealBootstrapCounts::reverify_arm_name(999), None);
+    }
+
+    /// Bootstrap-arm diagnostics: a failed fresh-evidence take counts its own
+    /// refusal slot and nothing else. The seal outcome is unchanged
+    /// (bootstrap mismatch, nothing voided).
+    #[test]
+    fn seal_bootstrap_take_failure_counts_its_refusal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        struct FailingBirthSource(crate::attach::BirthObservationRefusal);
+
+        impl BirthEvidenceSource for FailingBirthSource {
+            fn take_birth_evidence(
+                &mut self,
+            ) -> Result<SessionBirthEvidence, crate::attach::BirthObservationRefusal> {
+                Err(self.0)
+            }
+        }
+
+        for refusal in [
+            crate::attach::BirthObservationRefusal::RowUnreadable,
+            crate::attach::BirthObservationRefusal::BindingMismatch,
+        ] {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            let bootstrap = scene.bootstrap(proof, 0);
+            let frontier = scene.adapter.consumed_frontier();
+            let audit = scene.audit();
+            let cell = ScriptedFaultCell::steady(audit.fault_after);
+            let mut failing = FailingBirthSource(refusal);
+            let failure = scene
+                .adapter
+                .seal(
+                    &mut scene.model,
+                    &audit,
+                    &bootstrap,
+                    frontier,
+                    &mut failing,
+                    &cell,
+                )
+                .expect_err("failed take refuses");
+            assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+            let counts = scene.adapter.seal_bootstrap_diagnosis();
+            let index = SealBootstrapCounts::take_index(refusal);
+            assert_eq!(counts.take_failed[index], 1, "{refusal:?} counts its slot");
+            assert_eq!(counts.take_failed_total(), 1);
+            assert_eq!(counts.reverify_failed_total(), 0);
+            assert_eq!(counts.covers_failed, 0);
+            assert_eq!(counts.pin_failed, 0);
+            assert_eq!(counts.other_failed, 0);
+        }
+    }
+
+    /// Bootstrap-arm diagnostics: a failed birth re-verification counts its
+    /// own refusal slot and nothing else. The seal outcome is
+    /// unchanged (bootstrap mismatch).
+    #[test]
+    fn seal_bootstrap_reverify_failure_counts_its_refusal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Evidence mismatch: fresh evidence names another image.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let foreign =
+            SessionBirthEvidence::scripted((COOKIE + 9, EXEC), 0, 0, scene.closure_generation(), 1);
+        let failure = scene
+            .seal_explicit(&audit, &bootstrap, frontier, foreign)
+            .expect_err("foreign evidence refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        let index = SealBootstrapCounts::reverify_index(BirthRefusal::EvidenceMismatch);
+        assert_eq!(counts.reverify_failed[index], 1);
+        assert_eq!(counts.reverify_failed_total(), 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.covers_failed, 0);
+        assert_eq!(counts.pin_failed, 0);
+        assert_eq!(counts.other_failed, 0);
+
+        // Unknown image: the key attested but nothing ever sighted it.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene.seal(&bootstrap).expect_err("unsighted image refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        let index = SealBootstrapCounts::reverify_index(BirthRefusal::ImageUnknown);
+        assert_eq!(counts.reverify_failed[index], 1);
+        assert_eq!(counts.reverify_failed_total(), 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.covers_failed, 0);
+        assert_eq!(counts.pin_failed, 0);
+        assert_eq!(counts.other_failed, 0);
+    }
+
+    /// Bootstrap-arm diagnostics: the covers, pin and residual bootstrap arms
+    /// count their own buckets and nothing else. The seal outcomes
+    /// are unchanged (bootstrap mismatch throughout).
+    #[test]
+    fn seal_bootstrap_covers_pin_other_count_their_arms() {
+        // Covers: claimed staged history sits at the birth cut, so the
+        // birth would certify history it excludes.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let cut = scene.adapter.consumed_frontier().0;
+        let birth = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AttachObserved,
+            cut,
+            scene.closure_generation(),
+        );
+        let failure = scene.seal(&birth).expect_err("uncovered history refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        assert_eq!(counts.covers_failed, 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.reverify_failed_total(), 0);
+        assert_eq!(counts.pin_failed, 0);
+        assert_eq!(counts.other_failed, 0);
+
+        // Pin: a moved birth for the same key-era refuses on the pin
+        // alone (another image's record lands first, so both cuts
+        // verify as exec-novel).
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let anchor = begin_bytes(1, 1, create, 0);
+        let mut foreign = ordinary_for(&anchor, 0);
+        foreign.slot = 99;
+        foreign.image = ImageIdentity {
+            task_cookie: COOKIE + 3,
+            exec_id: EXEC,
+        };
+        foreign.target_function = function_id("C_GetInfo");
+        scene.ingest_ordinary(foreign);
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let first = scene.bootstrap(proof, 0);
+        scene.seal(&first).expect("first seal pins the birth");
+        let moved = scene.bootstrap(proof, 1);
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &moved,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&moved),
+            )
+            .expect_err("moved birth refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        assert_eq!(counts.pin_failed, 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.reverify_failed_total(), 0);
+        assert_eq!(counts.covers_failed, 0);
+        assert_eq!(counts.other_failed, 0);
+
+        // Other (era): the proof carries a non-live era.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let era_proof = JournalDomainProof {
+            key: proof.key,
+            era: proof.era + 1,
+        };
+        let receipt = BootstrapReceipt::scripted(
+            era_proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
+        let failure = scene.seal(&receipt).expect_err("wrong era refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        assert_eq!(counts.other_failed, 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.reverify_failed_total(), 0);
+        assert_eq!(counts.covers_failed, 0);
+        assert_eq!(counts.pin_failed, 0);
+
+        // Other (missing key): no key attested for the proof.
+        let mut scene = Scene::new(image_default());
+        let missing = JournalDomainKey {
+            domain_tag: 9999,
+            caller: 9999,
+            cookie: COOKIE + 9,
+            exec: EXEC + 9,
+            router: 9999,
+        };
+        let receipt = BootstrapReceipt::scripted(
+            JournalDomainProof {
+                key: missing,
+                era: 0,
+            },
+            BirthKind::AttachObserved,
+            0,
+            scene.closure_generation(),
+        );
+        let failure = scene.seal(&receipt).expect_err("missing key refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        assert_eq!(counts.other_failed, 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.reverify_failed_total(), 0);
+        assert_eq!(counts.covers_failed, 0);
+        assert_eq!(counts.pin_failed, 0);
+
+        // Other (cut above frontier): the birth cut runs past the
+        // seal frontier (one sighting, no staged history).
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let anchor = begin_bytes(1, 1, create, 0);
+        let mut seen = ordinary_for(&anchor, 0);
+        seen.slot = 99;
+        scene.ingest_ordinary(seen);
+        let receipt = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AttachObserved,
+            99,
+            scene.closure_generation(),
+        );
+        let failure = scene.seal(&receipt).expect_err("cut past frontier refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        let counts = scene.adapter.seal_bootstrap_diagnosis();
+        assert_eq!(counts.other_failed, 1);
+        assert_eq!(counts.take_failed_total(), 0);
+        assert_eq!(counts.reverify_failed_total(), 0);
+        assert_eq!(counts.covers_failed, 0);
+        assert_eq!(counts.pin_failed, 0);
     }
 
     #[test]

@@ -1766,9 +1766,15 @@ impl Drop for Ext4Loop {
 /// default-lane `profile --system` with the verdict scoped to the file's
 /// inode, plus loader churn. Tuned on fedora against 2234b514f (RED) and
 /// v0.7.0 (GREEN); see the lane report for the numbers.
-const D_DURATION_S: u64 = 270;
+const D_DURATION_S: u64 = 330;
 const D_K0: u64 = 10;
 const D_HOLD_MS: u64 = 50;
+/// Fixed two-view child count for the acceptance bar: the burst loop
+/// stops here (284 bursts at 3-way), so the proof covers a fixed
+/// count past the old ~720-child stop instead of a timing-variable
+/// one. The loop still fails honestly when the host cannot drive
+/// the count inside the capture window.
+const D_FIXED_CHILDREN: u64 = 852;
 /// 3-way bursts (≈3 GiB concurrent, fine on CI runners and fedora; this
 /// cell stays out of the 4 GiB vng guests): 2-way breaks too close to
 /// the run's end for a reliable margin.
@@ -1894,7 +1900,7 @@ fn cell_d_inner(workload: &R071Workload, observer: &Path) -> Result<()> {
     }
     let mut n = 0u64;
     let mut burst = 0u64;
-    while Instant::now() < loop_end {
+    while n < D_FIXED_CHILDREN && Instant::now() < loop_end {
         if obs.child.try_wait()?.is_some() {
             anyhow::bail!(
                 "{TAG}: the observer exited mid-loop: {}",
@@ -1955,7 +1961,10 @@ fn cell_d_inner(workload: &R071Workload, observer: &Path) -> Result<()> {
         }
     }
     println!("{TAG} bursts={burst} children={n}");
-    ensure!(n > 0, "{TAG}: FIXTURE: the flood ran zero children");
+    ensure!(
+        n >= 800,
+        "{TAG}: FIXTURE: the flood drove {n} children, below the 800 bar"
+    );
     obs.wait_exit(Duration::from_secs(D_DURATION_S + 120), TAG)?;
     churn.kill_and_wait()?;
     anchor.kill_and_wait()?;

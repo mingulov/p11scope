@@ -602,6 +602,9 @@
                   "manifest object unavailable",
                   "prearm object unavailable",
                   "discovery transport unavailable",
+                  "process exited mid-flight",
+                  "scan budget exhausted",
+                  "no unique attached loader context",
                   "process-tree members were still present when the command exited; their calls after the run end are out of scope",
                   "only the started command is observed",
                   "handed-back descendants are unknown",
@@ -831,6 +834,9 @@
         },
         "pid_descendant_gaps": {"type": "integer", "minimum": 0},
         "multi_rebuild_gaps": {"type": "integer", "minimum": 0},
+        "pid_descendant_gaps_admitted": {"type": "integer", "minimum": 0},
+        "member_stop_attached": {"type": "integer", "minimum": 0},
+        "member_stop_unattached": {"type": "integer", "minimum": 0},
         "learned_staged_files": {"type": "integer", "minimum": 0},
         "learned_event_loss": {"type": "integer", "minimum": 0},
         "learned_cap_skipped": {"type": "integer", "minimum": 0},
@@ -1178,7 +1184,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps", "pid_descendant_gaps_admitted", "member_stop_attached", "member_stop_unattached", "learned_staged_files", "learned_event_loss", "learned_cap_skipped"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
@@ -1196,6 +1202,9 @@
                 {"required": ["attach_mechanisms"]},
                 {"required": ["pid_descendant_gaps"]},
                 {"required": ["multi_rebuild_gaps"]},
+                {"required": ["pid_descendant_gaps_admitted"]},
+                {"required": ["member_stop_attached"]},
+                {"required": ["member_stop_unattached"]},
                 {"required": ["learned_staged_files"]},
                 {"required": ["learned_event_loss"]},
                 {"required": ["learned_cap_skipped"]},

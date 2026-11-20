@@ -3859,6 +3859,39 @@ fn joint_take_refresh_cadence_withholds_a_scan_bracketing_a_storage_move() {
     );
 }
 
+/// An unreadable pre-scan sample never hides a counter move the
+/// post-scan sample proves: the readable sample gates the
+/// observation, so it fails closed and mints.
+#[test]
+fn joint_take_refresh_cadence_mints_on_a_move_after_an_unreadable_pre_sample() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.storage_null = Some(5);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    // The pre-scan read fails; the counter reads 6 after the scan.
+    harness.io.storage_null = None;
+    harness.io.after_scan = Some((Some(6), 2));
+    assert_eq!(
+        drain_cadence(&mut harness, 64),
+        vec![ObserveOutcome::New],
+        "the proven move since the last observation mints"
+    );
+}
+
 /// A refresh interest the tick drains but never reaches (its scan
 /// quota went to pending work) stays queued for a later tick, which
 /// re-observes it.

@@ -1378,6 +1378,26 @@ impl InstanceRouter {
         }
     }
 
+    /// Global/miss taint of the newest observation for one key,
+    /// for take-side live-ahead decisions. `None` without an
+    /// observation or for a foreign domain.
+    #[cfg_attr(not(test), allow(dead_code))] // Consulted by take validation with the gate.
+    pub(crate) fn partition_back_taint(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        file: u32,
+    ) -> Option<(bool, bool)> {
+        if domain != self.domain {
+            return None;
+        }
+        let image = ImageKey::from(image);
+        self.observed
+            .get(&(image, file))
+            .and_then(|list| list.back())
+            .map(|back| (back.continued_across_global, back.continued_across_miss))
+    }
+
     /// Registration needs the newest exact accepted observation. Historical
     /// epoch keys remain usable for call history, never for this authority.
     pub(crate) fn current_partition_matches(

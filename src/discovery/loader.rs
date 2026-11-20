@@ -8,6 +8,7 @@ use p11scope_ebpf_common::{
 use p11scope_manifest::elf::SymbolFact;
 use p11scope_manifest::maps::MapEntry;
 
+use crate::attach::monotonic_ns;
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::process::ProcessViewId;
 
@@ -125,6 +126,14 @@ pub(crate) struct LoaderContext {
     state: LoaderContextState,
     pub(crate) was_attached: bool,
     pub(crate) earliest_hit_ns: Option<u64>,
+    /// This incarnation's start (userspace monotonic clock, same
+    /// timebase as record hook clocks), set only when reusing a
+    /// retired slot: the hit boundary rejects records predating it,
+    /// so a retired incarnation's in-flight records can never
+    /// validate against (or corrupt the clock of) the slot's new
+    /// incarnation. First incarnations (`None`) predate no records
+    /// and take every timestamp the other checks admit.
+    pub(crate) incarnation_start_ns: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -145,7 +154,12 @@ pub(crate) struct LoaderRegistry {
     /// through deep `new` chains on small stacks, and every by-value
     /// copy would carry this table.
     contexts: Box<[Option<LoaderContext>; MAX_LOADER_CONTEXTS]>,
-    allocated: usize,
+    /// High-water id mark: fresh arms take `high_water + 1` while it
+    /// stays below the cap, so ids march monotonically in the common
+    /// case; freed slots below it recycle only under pressure (when
+    /// no fresh id remains), which also maximizes the drain interval
+    /// between a retirement and its slot's reuse.
+    high_water: usize,
     discovery_truncated: u64,
     context_failures: u64,
     #[cfg(test)]
@@ -163,7 +177,7 @@ impl Default for LoaderRegistry {
                 .expect("loader slot table holds exactly MAX_LOADER_CONTEXTS entries");
         Self {
             contexts,
-            allocated: 0,
+            high_water: 0,
             discovery_truncated: 0,
             context_failures: 0,
             #[cfg(test)]
@@ -194,10 +208,27 @@ impl LoaderRegistry {
         result
     }
 
+    /// Lowest freed slot (removed or tombstoned-but-unremoved),
+    /// if any. Consulted only under pressure (no fresh id remains);
+    /// only 256 live contexts exhaust the registry.
+    fn free_slot(&self) -> Option<usize> {
+        (0..self.high_water).find(|index| match &self.contexts[*index] {
+            None => true,
+            Some(context) => context.state == LoaderContextState::Tombstoned,
+        })
+    }
+
     fn preflight_checked(&self, spec: LoaderContextSpec) -> Result<PreparedLoaderContext, String> {
-        if self.allocated == MAX_LOADER_CONTEXTS {
-            return Err(LOADER_CAPACITY_EXHAUSTED_REASON.into());
-        }
+        // Fresh ids while any remain (monotonic common case); freed
+        // slots recycle only under pressure.
+        let index = if self.high_water < MAX_LOADER_CONTEXTS {
+            self.high_water
+        } else {
+            match self.free_slot() {
+                Some(index) => index,
+                None => return Err(LOADER_CAPACITY_EXHAUSTED_REASON.into()),
+            }
+        };
         let expected_hook_ip = spec
             .mapping
             .as_ref()
@@ -207,8 +238,24 @@ impl LoaderRegistry {
             .state_address
             .map(|state| signed_delta(state, spec.hook.virtual_address))
             .transpose()?;
-        let id = LoaderContextId((self.allocated + 1) as u16);
+        let id = LoaderContextId((index + 1) as u16);
         let cookie = encode_loader_cookie(id.get(), state_delta)?;
+        // Reusing a retired slot stamps the new incarnation so the hit
+        // boundary can refuse the old life's in-flight records; first
+        // incarnations predate no records. Without a readable clock a
+        // reuse cannot be stamped, so staleness would be unverifiable:
+        // fail closed instead of arming an unprovable slot.
+        let reusing_retired = matches!(
+            &self.contexts[index],
+            Some(context) if context.state == LoaderContextState::Tombstoned
+        );
+        let incarnation_start_ns = if reusing_retired {
+            Some(monotonic_ns().ok_or_else(|| {
+                "monotonic clock read failed; the loader incarnation cannot be stamped".to_string()
+            })?)
+        } else {
+            None
+        };
         Ok(PreparedLoaderContext {
             id,
             context: LoaderContext {
@@ -218,6 +265,7 @@ impl LoaderRegistry {
                 state: LoaderContextState::Prepared,
                 was_attached: false,
                 earliest_hit_ns: None,
+                incarnation_start_ns,
             },
         })
     }
@@ -254,21 +302,22 @@ impl LoaderRegistry {
         &mut self,
         prepared: PreparedLoaderContext,
     ) -> Result<LoaderContextId, String> {
-        let expected = LoaderContextId((self.allocated.saturating_add(1)) as u16);
-        if self.allocated == MAX_LOADER_CONTEXTS
-            || prepared.id != expected
-            || self.contexts[self.allocated].is_some()
-        {
+        let id = prepared.id;
+        let index = usize::from(id.get().saturating_sub(1));
+        let slot_free = self.contexts.get(index).is_some_and(|slot| match slot {
+            None => true,
+            Some(context) => context.state == LoaderContextState::Tombstoned,
+        });
+        if index >= MAX_LOADER_CONTEXTS || !slot_free {
             return Err("preflighted loader context no longer matches registry state".into());
         }
-        let id = prepared.id;
-        self.contexts[self.allocated] = Some(prepared.context);
-        self.allocated += 1;
+        self.contexts[index] = Some(prepared.context);
+        self.high_water = self.high_water.max(index + 1);
         Ok(id)
     }
 
     pub(crate) fn record_preflight_failure(&mut self) {
-        if self.allocated == MAX_LOADER_CONTEXTS {
+        if self.high_water == MAX_LOADER_CONTEXTS && self.free_slot().is_none() {
             self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         }
     }
@@ -424,7 +473,17 @@ impl LoaderRegistry {
         timestamp_ns: u64,
     ) -> Result<&LoaderContext, String> {
         let valid = self.context(id).is_some_and(|context| {
-            context.state == state
+            // Stale-record proof at the hit boundary: on a reused slot,
+            // a record that predates this incarnation belongs to the
+            // slot's retired previous life and can never validate here,
+            // so it can never corrupt the new earliest-hit time.
+            // (Same-nanosecond ties accept; the corruption they could
+            // cause is below clock granularity and therefore
+            // meaningless.) First incarnations take every timestamp.
+            context
+                .incarnation_start_ns
+                .is_none_or(|start| timestamp_ns >= start)
+                && context.state == state
                 && context.spec.view == view
                 && context.spec.loader == loader
                 && context
@@ -462,8 +521,16 @@ impl LoaderRegistry {
 
     /// Committed lifetime contexts: the owned-child reserve gates
     /// member arms against this, never against the 256 hard ceiling.
+    /// Live contexts (prepared or attached): tombstoned and removed
+    /// slots are recyclable pressure relief, not pressure. The
+    /// child-reserve gate refuses churn on this count.
     pub(crate) fn allocated_contexts(&self) -> usize {
-        self.allocated
+        self.contexts
+            .iter()
+            .filter(|slot| {
+                matches!(slot, Some(context) if context.state != LoaderContextState::Tombstoned)
+            })
+            .count()
     }
 
     pub(crate) fn context_failures(&self) -> u64 {
@@ -796,6 +863,17 @@ mod tests {
         registry.prepare(prepared).unwrap()
     }
 
+    /// A hit timestamp inside one incarnation: the context's own start
+    /// plus an offset (first incarnations start at zero).
+    fn hit_ts(registry: &LoaderRegistry, id: LoaderContextId, base: u64) -> u64 {
+        registry
+            .context(id)
+            .unwrap()
+            .incarnation_start_ns
+            .unwrap_or(0)
+            .saturating_add(base)
+    }
+
     fn spec_with_view(view: ProcessViewId) -> LoaderContextSpec {
         LoaderContextSpec {
             view,
@@ -810,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn loader_registry_enforces_monotonic_contexts_and_retirement() {
+    fn loader_registry_reuses_freed_slots_and_retires_contexts() {
         assert_eq!(encode_loader_cookie(1, None).unwrap(), 512);
         assert_eq!(encode_loader_cookie(1, Some(0)).unwrap(), 256);
         assert!(decode_loader_cookie(0).is_err());
@@ -837,7 +915,7 @@ mod tests {
                 PinnedObjectId(9),
                 &mapping(),
                 0x4000_0100,
-                20,
+                hit_ts(&registry, first, 20),
             )
             .unwrap();
         registry
@@ -847,10 +925,13 @@ mod tests {
                 PinnedObjectId(9),
                 &mapping(),
                 0x4000_0100,
-                30,
+                hit_ts(&registry, first, 30),
             )
             .unwrap();
-        assert_eq!(registry.context(first).unwrap().earliest_hit_ns, Some(20));
+        assert_eq!(
+            registry.context(first).unwrap().earliest_hit_ns,
+            Some(hit_ts(&registry, first, 20))
+        );
 
         registry.tombstone(first).unwrap();
         assert!(registry.mark_attached(first).is_err());
@@ -863,11 +944,15 @@ mod tests {
                     PinnedObjectId(9),
                     &mapping(),
                     0x4000_0100,
-                    10,
+                    hit_ts(&registry, first, 10),
                 )
                 .is_err(),
             "a queued record must not resolve after tombstoning"
         );
+        // Fresh ids march monotonically while any remain, even past
+        // freed slots below the high-water mark.
+        let second = prepare(&mut registry, spec(None));
+        assert_eq!(second.get(), 2);
         registry.remove(first).unwrap();
         assert!(registry.context(first).is_none());
         assert!(registry.mark_attached(first).is_err());
@@ -875,29 +960,144 @@ mod tests {
         assert!(registry.remove(first).is_err());
 
         let cancelled = prepare(&mut registry, spec(None));
-        assert_eq!(cancelled.get(), 2);
+        assert_eq!(cancelled.get(), 3);
         registry.cancel_prepared(cancelled).unwrap();
         assert!(!registry.context(cancelled).unwrap().was_attached);
         registry.remove(cancelled).unwrap();
         assert!(registry.context(cancelled).is_none());
 
-        for expected in 3..=MAX_LOADER_CONTEXTS as u16 {
+        // Capacity binds only when every slot is live: fresh ids
+        // fill to the high-water mark, then the two freed slots
+        // recycle under pressure, and only then does the next arm
+        // fail with the named gap and count its truncation.
+        for _ in 0..253 {
+            let id = prepare(&mut registry, spec(None));
+            registry.mark_attached(id).unwrap();
+        }
+        for expected in [1u16, 3u16] {
             let id = prepare(&mut registry, spec(None));
             assert_eq!(id.get(), expected);
             registry.mark_attached(id).unwrap();
-            registry.tombstone(id).unwrap();
-            registry.remove(id).unwrap();
         }
-        let allocated = registry.allocated;
+        assert_eq!(registry.allocated_contexts(), MAX_LOADER_CONTEXTS);
         let truncated = registry.discovery_truncated();
         let error = registry.preflight(spec(None)).unwrap_err();
-        assert_eq!(registry.allocated, allocated);
         assert_eq!(registry.discovery_truncated(), truncated);
-        assert!(registry.ids_for_view(ProcessViewId(7)).is_empty());
         registry.record_preflight_failure();
         assert!(error.contains("capacity 256"), "{error}");
         assert_eq!(registry.discovery_truncated(), 1);
         assert_eq!(registry.context_failures(), 1);
+
+        // Under pressure the lowest freed slot recycles: retire two
+        // (one tombstoned in place, one removed) and the next arms
+        // take them back in id order with fresh incarnations.
+        let fifth = LoaderContextId(5);
+        let seventh = LoaderContextId(7);
+        registry.tombstone(fifth).unwrap();
+        registry.tombstone(seventh).unwrap();
+        registry.remove(seventh).unwrap();
+        let recycled = prepare(&mut registry, spec(None));
+        assert_eq!(recycled.get(), 5);
+        assert!(
+            registry
+                .context(recycled)
+                .unwrap()
+                .earliest_hit_ns
+                .is_none()
+        );
+        assert!(
+            registry
+                .context(recycled)
+                .unwrap()
+                .incarnation_start_ns
+                .is_some()
+        );
+        let recycled = prepare(&mut registry, spec(None));
+        assert_eq!(recycled.get(), 7);
+        assert!(registry.preflight(spec(None)).is_err());
+    }
+
+    /// Owner 3c twin: a stale record from a retired incarnation can
+    /// never validate against the slot's new incarnation, so it can
+    /// never corrupt the new earliest-hit time. Demonstrated through
+    /// the real preflight/prepare/validate seam, not staged.
+    #[test]
+    fn loader_reused_slot_rejects_stale_records_at_the_hit_boundary() {
+        let mut registry = LoaderRegistry::default();
+        for _ in 0..MAX_LOADER_CONTEXTS {
+            let id = prepare(&mut registry, spec(None));
+            registry.mark_attached(id).unwrap();
+        }
+        let first = LoaderContextId(1);
+        let stale_ts = hit_ts(&registry, first, 20);
+        registry
+            .validate_hit(
+                first.case_id(),
+                ProcessViewId(7),
+                PinnedObjectId(9),
+                &mapping(),
+                0x4000_0100,
+                stale_ts,
+            )
+            .unwrap();
+        registry.tombstone(first).unwrap();
+        // Reuse the tombstoned slot under pressure: the new
+        // incarnation stamps wall time, provably after the first
+        // life's small fixture clock.
+        let reused = prepare(&mut registry, spec(None));
+        assert_eq!(reused.get(), first.get());
+        registry.mark_attached(reused).unwrap();
+        // The old incarnation's last record arrives after the reuse:
+        // its clock predates the new incarnation, so it refuses.
+        assert!(
+            registry
+                .validate_hit(
+                    reused.case_id(),
+                    ProcessViewId(7),
+                    PinnedObjectId(9),
+                    &mapping(),
+                    0x4000_0100,
+                    stale_ts,
+                )
+                .is_err(),
+            "a stale record must not validate against the new incarnation"
+        );
+        assert_eq!(registry.context(reused).unwrap().earliest_hit_ns, None);
+        // The new incarnation's own records validate and set its clock.
+        registry
+            .validate_hit(
+                reused.case_id(),
+                ProcessViewId(7),
+                PinnedObjectId(9),
+                &mapping(),
+                0x4000_0100,
+                hit_ts(&registry, reused, 40),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.context(reused).unwrap().earliest_hit_ns,
+            Some(hit_ts(&registry, reused, 40))
+        );
+    }
+
+    /// Owner 3c: the 257th arm succeeds once any slot retires (the
+    /// registry recycles; only 256 live contexts exhaust it).
+    /// Demonstrated through the real seam: 256 attached arms, one
+    /// retirement, then the 257th arm takes the freed slot.
+    #[test]
+    fn loader_257th_arm_succeeds_after_one_retirement() {
+        let mut registry = LoaderRegistry::default();
+        let mut ids = Vec::new();
+        for _ in 0..MAX_LOADER_CONTEXTS {
+            let id = prepare(&mut registry, spec(None));
+            registry.mark_attached(id).unwrap();
+            ids.push(id);
+        }
+        assert!(registry.preflight(spec(None)).is_err());
+        registry.tombstone(ids[0]).unwrap();
+        registry.remove(ids[0]).unwrap();
+        let reused = prepare(&mut registry, spec(None));
+        assert_eq!(reused.get(), 1);
     }
 
     #[test]
@@ -943,7 +1143,14 @@ mod tests {
         ] {
             assert!(
                 registry
-                    .validate_hit(id.case_id(), view, loader, &map, hook_ip, 5)
+                    .validate_hit(
+                        id.case_id(),
+                        view,
+                        loader,
+                        &map,
+                        hook_ip,
+                        hit_ts(&registry, id, 5)
+                    )
                     .is_err()
             );
         }
@@ -957,7 +1164,7 @@ mod tests {
                 PinnedObjectId(9),
                 &mapping(),
                 0x4000_0100,
-                50,
+                hit_ts(&registry, id, 50),
             )
             .unwrap();
         registry
@@ -967,10 +1174,13 @@ mod tests {
                 PinnedObjectId(9),
                 &mapping(),
                 0x4000_0100,
-                40,
+                hit_ts(&registry, id, 40),
             )
             .unwrap();
-        assert_eq!(registry.context(id).unwrap().earliest_hit_ns, Some(40));
+        assert_eq!(
+            registry.context(id).unwrap().earliest_hit_ns,
+            Some(hit_ts(&registry, id, 40))
+        );
     }
 
     #[test]
@@ -988,7 +1198,7 @@ mod tests {
                 PinnedObjectId(9),
                 &mapping(),
                 0x4000_0100,
-                5,
+                hit_ts(&registry, id, 5),
             )
             .unwrap();
         assert!(
@@ -999,7 +1209,7 @@ mod tests {
                     PinnedObjectId(9),
                     &mapping(),
                     0x4000_0101,
-                    6,
+                    hit_ts(&registry, id, 6),
                 )
                 .is_err()
         );
@@ -1146,7 +1356,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(registry.successful_prepare_count(), 2);
-        assert_eq!(registry.allocated, 2);
+        assert_eq!(registry.high_water, 2);
         assert_eq!(registry.attempts().len(), 4);
 
         let first = registry
@@ -1164,7 +1374,7 @@ mod tests {
             "preflighted loader context no longer matches registry state"
         );
         assert_eq!(registry.successful_prepare_count(), 3);
-        assert_eq!(registry.allocated, 3);
+        assert_eq!(registry.high_water, 3);
         assert_eq!(registry.attempts().len(), 8);
         let refused = registry.attempts().last().unwrap().clone();
         assert_eq!(refused.kind, LoaderAttemptKind::Prepare);
@@ -1186,7 +1396,7 @@ mod tests {
         registry.remove_recorded(id, 100, true, 11, 12).unwrap();
         assert_eq!(registry.attempts().len(), 10);
         assert_eq!(registry.successful_prepare_count(), 3);
-        assert_eq!(registry.allocated, 3);
+        assert_eq!(registry.high_water, 3);
         let removed = registry.attempts().last().unwrap().clone();
         assert_eq!(removed.kind, LoaderAttemptKind::Remove);
         assert_eq!(removed.refusal, None);
@@ -1227,14 +1437,14 @@ mod tests {
                 .expect("envelope fill must prepare");
         }
         assert_eq!(registry.successful_prepare_count(), 256);
-        assert_eq!(registry.allocated, 256);
+        assert_eq!(registry.high_water, 256);
         assert_eq!(registry.attempts().len(), 512);
         let refusal = registry
             .preflight_recorded(spec(None), 2000, true, 13, 17)
             .unwrap_err();
         assert_eq!(refusal, "loader context capacity 256 is exhausted");
         assert_eq!(registry.successful_prepare_count(), 256);
-        assert_eq!(registry.allocated, 256);
+        assert_eq!(registry.high_water, 256);
         assert_eq!(registry.attempts().len(), 513);
         let refused = registry.attempts().last().unwrap().clone();
         assert_eq!(refused.ordinal, 513);

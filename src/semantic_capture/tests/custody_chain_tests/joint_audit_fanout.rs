@@ -13689,9 +13689,7 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
     assert!(initial_h8 > 0, "the void has sweep work: {initial_h8}");
     let mut void_started = false;
     for _ in 0..16 {
-        fixture
-            .service(1)
-            .expect("starting the void never refuses");
+        fixture.service(1).expect("starting the void never refuses");
         let capture = fixture.scene.real.scene.coordinator.joint_capture();
         if capture.void_cleanup_pending() || capture.pending_void_for_test().is_some() {
             void_started = true;
@@ -13729,9 +13727,7 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
         if h8 < initial_h8 {
             saw_partial = true;
         }
-        fixture
-            .service(1)
-            .expect("the sweep credit never refuses");
+        fixture.service(1).expect("the sweep credit never refuses");
         sweep_credits += 1;
         let after = fixture
             .scene
@@ -13845,7 +13841,10 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
         first_lookups, 62,
         "two feed visits plus 62 chain visits fill the 64-unit credit"
     );
-    assert_eq!(first_sweep, 0, "no unlink starts before its lookup completes");
+    assert_eq!(
+        first_sweep, 0,
+        "no unlink starts before its lookup completes"
+    );
     assert_eq!(
         feed_state(&fixture, 1).1,
         1,
@@ -14377,7 +14376,9 @@ fn joint_machine_finish_void_with_colliding_h8_holds_fence_across_handoff() {
         "Running defers collection while its sweep owns work"
     );
     fixture.enable_finish_fixture(Vec::new());
-    fixture.begin_finish().expect("Finish begins with live cursor");
+    fixture
+        .begin_finish()
+        .expect("Finish begins with live cursor");
     assert_eq!(
         fixture.begin_finish(),
         Err(crate::inventory_semantics::SemanticRefusal::Unavailable),

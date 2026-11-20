@@ -1930,7 +1930,7 @@ pub(crate) fn joint_voids_line(
 pub(crate) fn joint_bootstraps_line(
     counts: &crate::semantics_objects::journal::SealBootstrapCounts,
     take_drift_tolerated: u64,
-    take_refresh_scans: u64,
+    take_refresh: crate::semantic_capture::TakeRefreshCounts,
 ) -> String {
     use crate::semantics_objects::journal::SealBootstrapCounts;
     fn detail(slots: &[u64], name: fn(usize) -> Option<&'static str>) -> String {
@@ -1952,11 +1952,16 @@ pub(crate) fn joint_bootstraps_line(
     }
     format!(
         "p11scope: joint seal bootstraps: take_failed={} \
-         take_drift_tolerated={} take_refresh_scans={} reverify_failed={} covers_failed={} pin_failed={} \
+         take_drift_tolerated={} take_refresh_scans={} take_refresh_yields={} take_refresh_dropped={} \
+         take_refresh_deferred={} take_refresh_restarts={} reverify_failed={} covers_failed={} pin_failed={} \
          other_failed={} take_detail={} reverify_detail={}",
         counts.take_failed_total(),
         take_drift_tolerated,
-        take_refresh_scans,
+        take_refresh.scans,
+        take_refresh.yields,
+        take_refresh.dropped,
+        take_refresh.deferred,
+        take_refresh.restarts,
         counts.reverify_failed_total(),
         counts.covers_failed,
         counts.pin_failed,
@@ -2408,12 +2413,13 @@ impl AttestedSemanticLane {
             .map_or(0, |live| live.capture.take_drift_tolerated())
     }
 
-    /// Take-refresh keys re-scanned by cadence sweeps
-    /// (diagnostic only; zero without a live lane).
-    pub(crate) fn take_refresh_scans(&self) -> u64 {
+    /// Take-refresh cadence telemetry: keys re-scanned, yields,
+    /// consumed interests, deferred health moves and discarded stale
+    /// progress (diagnostic only; zero without a live lane).
+    pub(crate) fn take_refresh_counts(&self) -> crate::semantic_capture::TakeRefreshCounts {
         self.live
             .as_ref()
-            .map_or(0, |live| live.capture.take_refresh_scans())
+            .map_or_else(Default::default, |live| live.capture.take_refresh_counts())
     }
 
     /// Machine cadence: re-observe one take-raced key while a
@@ -6890,12 +6896,12 @@ mod bootstraps_line_tests {
         let counts = crate::semantics_objects::journal::SealBootstrapCounts::default();
         // Arity follows the additive cadence-sweep field; both
         // assertions below are untouched.
-        let line = joint_bootstraps_line(&counts, 7, 0);
+        let line = joint_bootstraps_line(&counts, 7, Default::default());
         assert!(
             line.contains("take_drift_tolerated=7"),
             "tolerated takes ride the bootstrap line: {line}"
         );
-        let idle = joint_bootstraps_line(&counts, 0, 0);
+        let idle = joint_bootstraps_line(&counts, 0, Default::default());
         assert!(
             idle.contains("take_drift_tolerated=0"),
             "zero stays explicit: {idle}"
@@ -6907,12 +6913,30 @@ mod bootstraps_line_tests {
     #[test]
     fn joint_bootstraps_line_reports_take_refresh_scans() {
         let counts = crate::semantics_objects::journal::SealBootstrapCounts::default();
-        let line = joint_bootstraps_line(&counts, 0, 3);
+        let refresh = crate::semantic_capture::TakeRefreshCounts {
+            scans: 3,
+            yields: 4,
+            dropped: 5,
+            deferred: 6,
+            restarts: 7,
+        };
+        let line = joint_bootstraps_line(&counts, 0, refresh);
         assert!(
             line.contains("take_refresh_scans=3"),
             "swept keys ride the bootstrap line: {line}"
         );
-        let idle = joint_bootstraps_line(&counts, 0, 0);
+        for named in [
+            "take_refresh_yields=4",
+            "take_refresh_dropped=5",
+            "take_refresh_deferred=6",
+            "take_refresh_restarts=7",
+        ] {
+            assert!(
+                line.contains(named),
+                "cadence gaps ride the bootstrap line by name: {line}"
+            );
+        }
+        let idle = joint_bootstraps_line(&counts, 0, Default::default());
         assert!(
             idle.contains("take_refresh_scans=0"),
             "zero stays explicit: {idle}"

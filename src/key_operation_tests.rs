@@ -28745,6 +28745,127 @@ fn keymeta_direct_without_mechanism_names_no_mechanism() {
     }
 }
 
+/// A missing mechanism is a weak, zero-evidence reason: the row key
+/// carries no mechanism, so an unreadable mechanism shares its row with
+/// a later observed one, and the later counted evidence replaces the
+/// absent reason in either arrival order. Recognized family evidence
+/// still pins and clears.
+#[test]
+fn keymeta_absent_mechanism_yields_to_counted_evidence() {
+    const NSS_TLS_PRF_GENERAL_SHA256: u64 = 0xCE53_4365;
+    for absent_first in [true, false] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let (first, second) = if absent_first {
+            (None, Some(NSS_TLS_PRF_GENERAL_SHA256))
+        } else {
+            (Some(NSS_TLS_PRF_GENERAL_SHA256), None)
+        };
+        for (n, mechanism) in [first, second].into_iter().enumerate() {
+            let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+            let ts = 100 + n as u64 * 100;
+            ctx.start("C_SignInit", 7, mechanism, &[receipt], ts);
+            ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), ts + 50, None, None);
+        }
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .expect("the sign row infers");
+        assert_eq!(inferred.family.status, InferredStatus::Unknown);
+        assert_eq!(inferred.family.value, None);
+        assert_eq!(
+            inferred.family.reason,
+            Some(crate::keymeta::REASON_UNLISTED_MECHANISM),
+            "absent_first={absent_first}"
+        );
+        assert_eq!(
+            inferred.family.completions, 1,
+            "absent_first={absent_first}"
+        );
+    }
+    // Recognized family evidence still pins and clears the absent
+    // reason, in either arrival order.
+    for absent_first in [true, false] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let (first, second) = if absent_first {
+            (None, Some(0x0001u64))
+        } else {
+            (Some(0x0001u64), None)
+        };
+        for (n, mechanism) in [first, second].into_iter().enumerate() {
+            let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+            let ts = 100 + n as u64 * 100;
+            ctx.start("C_SignInit", 7, mechanism, &[receipt], ts);
+            ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), ts + 50, None, None);
+        }
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "sign", "key", "unknown")
+            .expect("the sign row infers");
+        assert_eq!(
+            inferred.family.status,
+            InferredStatus::Inferred,
+            "absent_first={absent_first}"
+        );
+        assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+        assert_eq!(inferred.family.reason, None);
+        assert_eq!(inferred.family.completions, 1);
+    }
+}
+
+/// The wrapped-role arm shares the weak-absent contract: a wrap whose
+/// mechanism only types the operation key still counts family evidence
+/// on the wrapped row, so it replaces a missing-mechanism reason there
+/// in either arrival order, while the operation row pins its family.
+#[test]
+fn keymeta_wrapped_absent_mechanism_yields_to_operation_key_evidence() {
+    for absent_first in [true, false] {
+        let ids = KeymetaCtx::object_ids(2);
+        let mut ctx = KeymetaCtx::new();
+        let (first, second) = if absent_first {
+            (None, Some(0x0001u64))
+        } else {
+            (Some(0x0001u64), None)
+        };
+        for (n, mechanism) in [first, second].into_iter().enumerate() {
+            let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+            let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+            let ts = 100 + n as u64 * 100;
+            ctx.direct(
+                "C_WrapKey",
+                7,
+                mechanism,
+                &[wrapping, wrapped],
+                ts,
+                None,
+                None,
+            )
+            .expect("wrap completes");
+        }
+        let inferred = ctx
+            .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+            .expect("the wrapped row infers");
+        assert_eq!(inferred.family.status, InferredStatus::Unknown);
+        assert_eq!(inferred.family.value, None);
+        assert_eq!(
+            inferred.family.reason,
+            Some(crate::keymeta::REASON_OPERATION_KEY_ONLY),
+            "absent_first={absent_first}"
+        );
+        assert_eq!(
+            inferred.family.completions, 1,
+            "absent_first={absent_first}"
+        );
+        // The operation row still pins its recognized family either way.
+        let inferred = ctx
+            .inference(ids[0].as_u64(), "wrap", "wrapping_key", "unknown")
+            .expect("the wrapping row infers");
+        assert_eq!(inferred.family.status, InferredStatus::Inferred);
+        assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+        assert_eq!(inferred.family.reason, None);
+        assert_eq!(inferred.family.completions, 1);
+    }
+}
+
 /// The Firefox key-info shape at the reducer seam: a sign under
 /// `CKM_SHA256_HMAC` on an untyped key infers family `generic_secret`
 /// (HMAC keys are generic secrets) with one supporting completion,

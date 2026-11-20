@@ -1063,6 +1063,17 @@ class PairedPathTwins(unittest.TestCase):
                                     "joint evidence absent"):
             oracle.validate_snapshot(single, "s1only")
 
+    def test_mutation_folded_snapshot_refused_names_live_feed(self):
+        oracle = require_oracle(self)
+        collision, joint, _single = paired(oracle, "poll_msg")
+        joint["status"] = "partial"
+        joint["reason"] = "live_joint_feed_absent"
+        with self.assertRaises(oracle.LedgerError) as raised:
+            oracle.validate_snapshot(joint, "joint")
+        message = str(raised.exception)
+        self.assertIn("live joint feed absent", message)
+        self.assertNotIn("joint evidence absent", message)
+
     def test_mutation_suppressed_snapshot_refused(self):
         oracle = require_oracle(self)
         collision, joint, single = paired(oracle, "poll_msg")

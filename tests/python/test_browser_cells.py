@@ -2201,7 +2201,144 @@ class BrowserFoldedLeg(unittest.TestCase):
     live browser instance survives; these twins pin the three
     folded-leg predicates over synthetic inputs so a softening of any
     of them fails here instead of silently widening the live cell.
+    The full-branch rig twins below drive the real FF-FIRST-BG cell
+    against synthetic reports, so the whole status/reason branch (the
+    valid folded shape, the refused pairs, the guard mutant, and the
+    still-eligible loss reasons) fails here instead of widening it.
     """
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(prefix="g33-folded-leg-"))
+        self.addCleanup(shutil.rmtree, self.work, True)
+
+    @staticmethod
+    def _folded_sign_rows(instances):
+        """One completed sign row per ``instances`` entry."""
+        return [{"category": "sign", "instance": instance, "completed": 1}
+                for instance in instances]
+
+    def _ff_first_bg_report(self, status, reason, rows, live_browser):
+        """Synthetic FF-FIRST-BG inventory report over ``rows``.
+
+        ``live_browser`` selects the live leg (a live browser instance
+        owns the rows) or the folded leg (a background instance only;
+        the browser survives solely as folded departed-use identities).
+        """
+        browser_module = {
+            "id": "m0",
+            "paths": ["/usr/lib64/firefox/libsoftokn3.so"],
+        }
+        if not live_browser:
+            browser_module["departed_use"] = {
+                "identities": [
+                    {"exe": {"path": "/usr/lib64/firefox/firefox"}}],
+            }
+        doc = {
+            "modules": [browser_module,
+                        {"id": "m-bg",
+                         "paths": ["/usr/lib64/pkcs11/libsofthsm2.so"]}],
+            "instances": [{"id": "bg0", "module": "m-bg"}],
+            "object_observations": {
+                "status": status, "reason": reason,
+                "key_operations": rows, "gaps": [],
+            },
+            "observation": {"semantic_capture": {"events_lost": 0}},
+            "gaps": [],
+        }
+        if live_browser:
+            doc["instances"].append({"id": "b0", "module": "m0"})
+        path = self.work / "ff-first-bg-report.json"
+        path.write_text(json.dumps(doc))
+        return path
+
+    def _ff_first_bg_rig(self, status, reason, rows, live_browser):
+        """Run the real FF-FIRST-BG cell against a synthetic report."""
+        report_path = self._ff_first_bg_report(status, reason, rows,
+                                               live_browser)
+        result = cells.CellResult("FF-FIRST-BG", report_path)
+        result.flow["observer_exit"] = 0
+        store = SimpleNamespace(lib=Path("/not-opened/libsofthsm2.so"),
+                                env={})
+        bg_log = self.work / "bg.log"
+        bg_log.write_text("READY\nSTOP n=42\n")
+        bg = SimpleNamespace(stop=lambda: None, log=bg_log)
+        plain = SimpleNamespace(url="https://127.0.0.1:1/",
+                                requests_served=1)
+        cc = SimpleNamespace(url="https://127.0.0.1:2/",
+                             handshakes_ok=1, client_certs_presented=1)
+        plain_ctx = MagicMock()
+        plain_ctx.__enter__.return_value = plain
+        cc_ctx = MagicMock()
+        cc_ctx.__enter__.return_value = cc
+        case = BrowserCells(
+            "test_ff_first_with_background_provider_covers_browser")
+        case.work = self.work
+        case.seed = lambda *a: (
+            store, SimpleNamespace(cert_pem=Path("/not-opened/client.pem")))
+        with patch.object(cells, "preflight", return_value=None), \
+                patch.object(cells, "start_soft_call", return_value=bg), \
+                patch.object(cells, "observe_first_system",
+                             return_value=result), \
+                patch.object(tls_server, "make_server_credential",
+                             return_value=(Path("/not-opened/key"),
+                                           Path("/not-opened/cert"))), \
+                patch.object(tls_server, "FlowServer",
+                             side_effect=[plain_ctx, cc_ctx]):
+            case.test_ff_first_with_background_provider_covers_browser()
+
+    def test_folded_branch_valid_partial_accepted(self):
+        # Guard: the folded shape (partial with retained sign rows and
+        # no live browser instance) passes the real cell.
+        rows = self._folded_sign_rows(["i-folded-1", "i-folded-2"])
+        self._ff_first_bg_rig("partial", "live_joint_feed_absent",
+                              rows, False)
+
+    def test_folded_branch_bootstrap_with_rows_refused(self):
+        # Retained rows must commit partial with the folded reason: the
+        # old unavailable/bootstrap pair beside proved rows is refused.
+        rows = self._folded_sign_rows(["i-folded-1", "i-folded-2"])
+        with self.assertRaisesRegex(AssertionError, "no retained rows"):
+            self._ff_first_bg_rig("unavailable", "bootstrap_unavailable",
+                                  rows, False)
+
+    def test_folded_branch_folded_reason_requires_partial(self):
+        # The folded reason beside retained rows is partial coverage,
+        # never unavailable.
+        rows = self._folded_sign_rows(["i-folded-1", "i-folded-2"])
+        with self.assertRaisesRegex(AssertionError, "must commit partial"):
+            self._ff_first_bg_rig("unavailable", "live_joint_feed_absent",
+                                  rows, False)
+
+    def test_folded_branch_live_instance_with_folded_reason_refused(self):
+        # Mutant twin: live browser instances beside the folded reason
+        # mean no live per-key tracking for retained callers. The rows
+        # sit on the live instance, so dropping the folded reason from
+        # the guard would let this pass the row gates below.
+        rows = self._folded_sign_rows(["b0", "b0"])
+        with self.assertRaisesRegex(AssertionError, "never covered"):
+            self._ff_first_bg_rig("partial", "live_joint_feed_absent",
+                                  rows, True)
+
+    def test_folded_branch_folded_reason_without_rows_refused(self):
+        # The folded reason with zero rows still means never covered.
+        with self.assertRaisesRegex(AssertionError, "never covered"):
+            self._ff_first_bg_rig("partial", "live_joint_feed_absent",
+                                  [], False)
+
+    def test_folded_branch_bootstrap_without_rows_refused(self):
+        # Rowless bootstrap still means never covered.
+        with self.assertRaisesRegex(AssertionError, "never covered"):
+            self._ff_first_bg_rig("unavailable", "bootstrap_unavailable",
+                                  [], False)
+
+    def test_folded_branch_loss_reasons_stay_eligible(self):
+        # Guard: specific loss/fallback reasons keep their existing
+        # gates — the no-live-feed branch must not touch them.
+        for status, reason in [("partial", "proof_refused_fallback"),
+                               ("stale", "authority_lost")]:
+            with self.subTest(reason=reason):
+                rows = self._folded_sign_rows(["i-folded-1", "i-folded-2"])
+                self._ff_first_bg_rig(status, reason, rows, False)
 
     def test_bootstrap_with_live_browser_instances_fails(self):
         # Folded-leg-only allowance: bootstrap with S1 rows is

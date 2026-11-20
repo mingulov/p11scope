@@ -496,6 +496,18 @@ class SnapshotTwins(unittest.TestCase):
                                     ": joint evidence absent"):
             oracle.validate_snapshot(snapshot)
 
+    def test_mutation_folded_snapshot_refused_names_live_feed(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        snapshot = healthy_snapshot([first, second])
+        snapshot["status"] = "partial"
+        snapshot["reason"] = "live_joint_feed_absent"
+        with self.assertRaises(oracle.LedgerError) as raised:
+            oracle.validate_snapshot(snapshot)
+        message = str(raised.exception)
+        self.assertIn("live joint feed absent", message)
+        self.assertNotIn("joint evidence absent", message)
+
     def test_mutation_status_reason_disagree_rejected(self):
         oracle = require_oracle(self)
         _, _, first, second = validated_pair(oracle, "interleave")

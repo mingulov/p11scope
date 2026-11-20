@@ -270,6 +270,31 @@ mod tests {
         }
     }
 
+    /// A configured registry shape for a listed vendor id wins over
+    /// the vendor default (`or_insert`, not `insert`): NSS
+    /// `CKM_NSS_ML_KEM_KEY_PAIR_GEN` (`0xCE534380`) configured as
+    /// `"gcm"` keeps its decoder instead of degrading to `NONE`.
+    #[test]
+    fn approved_mechanisms_preserves_configured_vendor_shape() {
+        let registry = MechanismRegistry::from_parts(
+            HashMap::from([(0xCE53_4380u64, "gcm".to_string())]),
+            HashSet::new(),
+            DiscoveryMode::Transparent,
+            "vendor-shape-control".into(),
+        );
+        let approved = approved_mechanisms(&registry);
+        assert_eq!(
+            approved.get(&0xCE53_4380),
+            Some(&shape::GCM),
+            "the configured registry shape wins for a listed vendor id"
+        );
+        assert_eq!(
+            approved.len(),
+            516,
+            "463 official plus 53 listed vendor ids, deduplicated"
+        );
+    }
+
     #[test]
     fn approvals_are_the_exact_official_and_registered_union() {
         // This count belongs to pkcs11-types 0.2.3 from crates.io (Cargo.toml).

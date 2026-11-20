@@ -2268,6 +2268,7 @@ mod tests {
             0xCE53_437Eu64, // CKM_NSS_KYBER (out of scope)
             0xCE53_4381u64 | (1 << 32),
             0xCE53_4381u64 | (1 << 1), // 0xCE534383: adjacent unlisted id
+            0xCE53_437Fu64 | (1 << 32),
             0xCE53_437Fu64 | (1 << 7), // 0xCE5343FF: unassigned NSS gap
         ] {
             assert_eq!(infer_family(id), None, "id 0x{id:x} infers nothing");

@@ -1232,9 +1232,12 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaises(ORACLE.OracleRefusal):
                 ORACLE.check_section(mutated)
         with self.subTest("duplicate mechanism refused"):
+            # Order-preserving duplicate: [0x17, 0xCE.., 0xCE..] stays
+            # sorted, so only the duplicate check can refuse it (this
+            # pins the duplicate check, not the ordering check).
             mutated = copy.deepcopy(section)
             mutated["unknown_key_operations"][0]["mechanisms"].append(
-                {"mechanism": 0x17, "terminals": 1})
+                {"mechanism": 0xCE534380, "terminals": 1})
             with self.assertRaises(ORACLE.OracleRefusal):
                 ORACLE.check_section(mutated)
         with self.subTest("misordered mechanisms refused"):

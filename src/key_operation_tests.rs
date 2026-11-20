@@ -29845,6 +29845,98 @@ fn keymeta_kem_lengths_name_parameter_sets() {
     );
 }
 
+/// The NSS vendor encapsulate/decapsulate id rows proved end to
+/// end: a receipt-bound `C_DecapsulateKey` with mechanism
+/// `0xCE53_4381` and a 1088-octet length infers ML-KEM-768 on the
+/// proved row (family `ml_kem`, set `ml_kem_768`) and promotes the
+/// section to v7 — the vendor-id twin of the standard-ML-KEM
+/// proved path.
+#[test]
+fn nss_vendor_decapsulate_rows_proved_mlkem768() {
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let receipt = KeymetaCtx::receipt(
+        ids[0],
+        "C_DecapsulateKey",
+        0,
+        KeyRole::DecapsulationKey,
+        None,
+    );
+    ctx.direct(
+        "C_DecapsulateKey",
+        7,
+        Some(0xCE53_4381),
+        &[receipt],
+        100,
+        Some(LengthOutcome::Value(1088)),
+        None,
+    )
+    .expect("decapsulate completes");
+    let inferred = ctx
+        .inference(
+            ids[0].as_u64(),
+            "decapsulate",
+            "decapsulation_key",
+            "unknown",
+        )
+        .expect("the decapsulate row infers");
+    assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        inferred
+            .size
+            .detail
+            .as_ref()
+            .map(|(detail, tag)| (detail.clone(), *tag)),
+        Some((
+            SizeDetail::PqcSet {
+                parameter_set: "ml_kem_768",
+                octets: 1088,
+            },
+            EvidenceTag::DecapsulateInput,
+        ))
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    assert_eq!(committed.key_operations.len(), 1, "one proved row");
+    let row = &committed.key_operations[0];
+    assert_eq!(row.category, "decapsulate");
+    assert_eq!(row.role, "decapsulation_key");
+    let row_inferred = row.inferred.as_ref().expect("the proved row infers");
+    assert_eq!(row_inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        row_inferred
+            .size
+            .detail
+            .as_ref()
+            .map(|(detail, tag)| (detail.clone(), *tag)),
+        Some((
+            SizeDetail::PqcSet {
+                parameter_set: "ml_kem_768",
+                octets: 1088,
+            },
+            EvidenceTag::DecapsulateInput,
+        ))
+    );
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        7,
+        "inferred content promotes its section to v7"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 7);
+    assert_eq!(
+        section["key_operations"][0]["inferred_family"]["value"],
+        "ml_kem"
+    );
+    assert_eq!(
+        section["key_operations"][0]["inferred_size"]["detail"]["parameter_set"],
+        "ml_kem_768"
+    );
+}
+
 /// Derive mechanisms type the base key only; the family joins
 /// without any length evidence.
 #[test]
@@ -33680,6 +33772,89 @@ fn unknown_mechanism_detail_merges_across_preservation() {
             .collect::<Vec<_>>(),
         vec![(0x17, 1), (0xCE53_4380, 1)],
         "both pairs survive, sorted by id"
+    );
+}
+
+/// Past the unknown-mechanism detail budget, merged detail refuses
+/// by full pair terminals: two absorbed pairs carrying 3 terminals
+/// join the named v9 gap while row counters stay exact.
+#[test]
+fn unknown_mechanism_merge_overflow_refuses_with_named_gap() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::MAX_UNKNOWN_MECHANISMS_PER_BUCKET;
+    let mut main = KeymetaCtx::new();
+    for (n, id) in (0x10000u64..)
+        .take(MAX_UNKNOWN_MECHANISMS_PER_BUCKET)
+        .enumerate()
+    {
+        assert!(
+            main.direct(
+                "C_GenerateKeyPair",
+                7,
+                Some(id),
+                &[],
+                100 + n as u64,
+                None,
+                None
+            )
+            .is_some(),
+            "direct {n} emits"
+        );
+    }
+    let mut other = KeymetaCtx::new();
+    for (n, id) in [0x20000u64, 0x20000, 0x20001].into_iter().enumerate() {
+        assert!(
+            other
+                .direct(
+                    "C_GenerateKeyPair",
+                    7,
+                    Some(id),
+                    &[],
+                    200 + n as u64,
+                    None,
+                    None
+                )
+                .is_some(),
+            "absorbed direct {n} emits"
+        );
+    }
+    let preserved = std::mem::replace(&mut other.keyuse, KeyUseReducer::new());
+    main.keyuse.absorb_preserved(preserved);
+    assert_eq!(
+        main.keyuse.key_use_evidence().unknown_mechanism_refused,
+        3,
+        "the absorbed pairs refuse by full terminals, not by pair count"
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &main.keyuse);
+    let keygen = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair" && row.reason == "not_applicable")
+        .expect("the keygen summary");
+    assert_eq!(
+        keygen.completed,
+        MAX_UNKNOWN_MECHANISMS_PER_BUCKET as u64 + 3,
+        "row counters stay exact"
+    );
+    assert_eq!(
+        keygen.mechanisms.len(),
+        MAX_UNKNOWN_MECHANISMS_PER_BUCKET,
+        "detail keeps the first 8 ids"
+    );
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "unknown_mechanism_rows_refused")
+        .expect("the refusal publishes as a named gap");
+    assert_eq!(gap.subject, "key_operation");
+    assert_eq!(gap.repeats, 3);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        9,
+        "a v9-only gap promotes its section to v9"
     );
 }
 

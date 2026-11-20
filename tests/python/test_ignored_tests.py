@@ -1734,7 +1734,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (351 tests)",
+        self.assertIn("verify: curation matches the binary (352 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):

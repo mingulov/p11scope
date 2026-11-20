@@ -8495,6 +8495,14 @@ pub(crate) mod tests {
             }
         }
 
+        /// Readability restored after a transient `/proc` race: processes
+        /// admitted while blind keep their unknown start time.
+        pub(crate) fn unblind(&self, pid: u32) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.readable = true;
+            }
+        }
+
         pub(crate) fn kill(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.alive = false;

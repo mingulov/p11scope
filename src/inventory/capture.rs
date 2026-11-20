@@ -522,6 +522,10 @@ pub(crate) trait LaneHost<Pin> {
     /// Forget a capture coverage that never activated (the auto fallback).
     fn abandon_capture_coverage(&mut self);
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt);
+    /// The lane's initial attach completed: stamp the tick cutover new
+    /// callers are measured against. Default: ignore (test hosts set
+    /// the cutover explicitly when they need it).
+    fn note_attach_ticks(&mut self) {}
     fn note_capture_custody(&mut self, custody: &ScopeCustody);
     fn take_target_delta(&mut self) -> TargetDelta;
     /// Whether the host holds a pending target delta (pre-arm proved
@@ -584,6 +588,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         InventoryCoordinator::note_extend_receipt(self, receipt);
+    }
+
+    fn note_attach_ticks(&mut self) {
+        InventoryCoordinator::note_attach_ticks(self);
     }
 
     fn note_capture_custody(&mut self, custody: &ScopeCustody) {
@@ -848,6 +856,7 @@ impl<L> NativeLane<L> {
             ));
         }
         host.note_extend_receipt(&receipt);
+        host.note_attach_ticks();
         host.note_native_lane();
         if let Some(reason) = lossy {
             let at_ns = receipt

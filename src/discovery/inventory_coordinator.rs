@@ -859,6 +859,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// pre-arm terminal cause reads `Stop` (6.13 maps errors to stop), never
     /// a deadline `ScopeEnd`. Set by `note_scope_gap` on that pinned subject.
     capture_failed: bool,
+    /// Initial-attach cutover in clock ticks since boot (`/proc/uptime`,
+    /// rounded up), stamped by the lane start after the initial attach.
+    /// A caller whose `/proc` start time is strictly later provably
+    /// spawned after the attach, so its first observed call is its seed
+    /// (same rule as the semantic lane's retention cutover). `None`
+    /// (unstamped, or an unreadable clock) disables the seed base,
+    /// keeping base 0.
+    attach_ticks: Option<u64>,
 }
 
 fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscoveryConfig> {
@@ -1398,6 +1406,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             diagnostic_refresh_loss: false,
             diagnostic_native_unavailable: false,
             capture_failed: false,
+            attach_ticks: None,
         })
     }
 
@@ -3749,6 +3758,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scope,
             bound: None,
             attached_at: BTreeMap::new(),
+            attached_ticks: BTreeMap::new(),
             failed: BTreeSet::new(),
             unproven: None,
             original_pid_exit: None,
@@ -3779,6 +3789,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Absorbs one extend receipt: attached endpoints with their instants,
     /// failed endpoints (sticky), and the scope custody.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 forwards receipts.
+    /// Stamp the initial-attach tick cutover once, right after the
+    /// lane's initial attach completes (the lane start calls this once;
+    /// later extends must not move the cutover).
+    pub(crate) fn note_attach_ticks(&mut self) {
+        if self.attach_ticks.is_none() {
+            self.attach_ticks = crate::semantic_capture::current_uptime_ticks();
+        }
+    }
+
     pub(crate) fn note_extend_receipt(&mut self, receipt: &ExtendReceipt) {
         // Exec coverage is the binder's, whatever capture coverage holds.
         if let Some(coverage) = receipt.exec_coverage {
@@ -3787,11 +3806,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
+        // One tick stamp per receipt (not per endpoint): every attach
+        // in the receipt shares it.
+        let receipt_ticks = crate::semantic_capture::current_uptime_ticks();
         for attached in &receipt.attached {
             capture.attached_at.insert(attached.id, attached.at_ns);
+            if let Some(ticks) = receipt_ticks {
+                capture.attached_ticks.insert(attached.id, ticks);
+            }
         }
         for failed in &receipt.failed {
             capture.attached_at.remove(&failed.id);
+            capture.attached_ticks.remove(&failed.id);
             capture.failed.insert(failed.id);
         }
         // The receipt's stamps just landed; feed the pre-arm watches.
@@ -9219,6 +9245,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Whether an on-time row's first sight is the caller's setup seed
+    /// (fetch the function table): the row's witness endpoint — the
+    /// endpoint the pair's first recorded entry passed through — is a
+    /// plan-proven setup hook, the caller provably spawned after the
+    /// initial attach, and that endpoint was already live then, so the
+    /// seed was observed (a seed missed before its endpoint attached
+    /// keeps base 0). Ticks alone never exclude: an ordinary first
+    /// entry at the same timing keeps base 0. All three stamps share
+    /// the boot-time tick basis (suspend-proof). Same-tick births,
+    /// unknown start times, a missing cutover, unattached endpoints
+    /// and unproven endpoints all keep base 0: the seed base applies
+    /// only when every proof holds.
+    fn seeded_first_sight(&self, row: &WitnessRow, caller: CallerId) -> bool {
+        if !self.setup_endpoints.contains(&row.endpoint) {
+            return false;
+        }
+        let Some(attach) = self.attach_ticks else {
+            return false;
+        };
+        let Some(started) = self
+            .adapter
+            .record(caller)
+            .and_then(|record| record.start_time)
+        else {
+            return false;
+        };
+        if started <= attach {
+            return false;
+        }
+        self.capture
+            .as_ref()
+            .and_then(|capture| capture.attached_ticks.get(&row.endpoint))
+            .is_some_and(|live| *live < started)
+    }
+
     fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
         let key = PairKey::of(row);
         let held_first = self
@@ -9252,7 +9313,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // A late-bound row (recorded before its caller's admission)
             // rebases past its first sight instead: the pre-admission
             // subtotal is unattributed, and only post-admission growth
-            // stages.
+            // stages. An on-time row whose first recorded entry passed
+            // through a plan-proven setup endpoint, whose caller
+            // spawned after the initial attach with the endpoint
+            // already live, observed its setup seed first: it bases
+            // past exactly that one call, so only counted calls stage.
             None => {
                 let late = self
                     .adapter
@@ -9261,6 +9326,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let fresh = if late {
                     let sight = row.entry_count;
                     (sight, sight, held_first, held_first)
+                } else if self.seeded_first_sight(row, caller) {
+                    (1, 1, held_first, held_first)
                 } else {
                     (0, 0, 0, held_first)
                 };
@@ -13179,6 +13246,10 @@ struct CaptureCoverage {
     /// The first caller proven to be the scope incarnation.
     bound: Option<CallerId>,
     attached_at: BTreeMap<EndpointId, u64>,
+    /// Per-endpoint attach instant in clock ticks since boot, stamped
+    /// beside `attached_at`: the seed base compares it against caller
+    /// start times on the shared boot-time basis.
+    attached_ticks: BTreeMap<EndpointId, u64>,
     /// Sticky: a failed endpoint is never retried, so its modules never
     /// read watched.
     failed: BTreeSet<EndpointId>,
@@ -25810,6 +25881,361 @@ exit 0
     }
 
     #[test]
+    fn attach_tick_cutover_stamps_once() {
+        // The lane start stamps the cutover; later stamps never move
+        // it. Tests leave it unstamped (None) unless they set it.
+        let (mut native, _) = watched_native();
+        assert_eq!(native.scene.coordinator.attach_ticks, None);
+        native.scene.coordinator.note_attach_ticks();
+        native.scene.coordinator.attach_ticks = Some(123);
+        native.scene.coordinator.note_attach_ticks();
+        assert_eq!(native.scene.coordinator.attach_ticks, Some(123));
+    }
+
+    #[test]
+    fn counts_for_a_setup_first_row_base_past_the_seed() {
+        // Confirmed setup-first: the newcomer's first recorded entry
+        // passed through the C_GetFunctionList setup endpoint, live
+        // since tick 300, and the caller spawned after the initial
+        // attach (start 500 > attach 400): the bind bases past exactly
+        // the setup seed, and refresh to 44 reads 43.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 43);
+        assert_eq!(
+            registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject
+                    == crate::discovery::caller_registry::DEMOTED_COUNT_PLACED)
+                .count(),
+            1,
+            "the rebased seed discloses its window: {:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn counts_for_an_ordinary_first_row_keep_base_zero_at_the_same_timing() {
+        // Same timing as the setup-first row, but the newcomer's first
+        // recorded entry passed through the ordinary C_Initialize
+        // endpoint: a real first entry, never the setup seed. The bind
+        // keeps base 0 and refresh to 44 reads 44.
+        let (mut native, caller, _setup, ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[ordinary].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, ordinary);
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 44);
+    }
+
+    #[test]
+    fn counts_for_a_setup_endpoint_attached_after_the_spawn_keep_base_zero() {
+        // Partial attach: the setup endpoint came live at tick 600,
+        // after the caller spawned (start 500), so the seed may have
+        // been missed. The first recorded entry keeps base 0 and
+        // refresh to 44 reads 44.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 600);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 44);
+    }
+
+    #[test]
+    fn counts_for_a_setup_first_row_with_same_tick_birth_keep_base_zero() {
+        // Equality boundary: the caller spawned exactly at the initial
+        // attach tick (start 500 == attach 500), so the spawn-after
+        // proof fails and the setup-first row keeps base 0: refresh to
+        // 44 reads 44 with no rebase disclosure.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(500);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row.clone()]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        // The bind staged at the drain; publication folds staged into
+        // the base at commit, so the bind base is read here.
+        assert_eq!(pair_base(&native, &row), 0);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 44);
+        assert_eq!(rebase_gaps(&native), 0);
+    }
+
+    #[test]
+    fn counts_for_a_setup_first_row_with_same_tick_activation_keep_base_zero() {
+        // Equality boundary: the setup endpoint came live exactly when
+        // the caller spawned (live 500 == start 500), so the
+        // live-before-spawn proof fails and the row keeps base 0:
+        // refresh to 44 reads 44 with no rebase disclosure.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 500);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row.clone()]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        // The bind staged at the drain; publication folds staged into
+        // the base at commit, so the bind base is read here.
+        assert_eq!(pair_base(&native, &row), 0);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 44);
+        assert_eq!(rebase_gaps(&native), 0);
+    }
+
+    #[test]
+    fn counts_for_a_setup_first_row_with_unknown_start_keep_base_zero() {
+        // Unknown process start: the record never learned when the
+        // caller spawned, so the spawn-after proof fails and the
+        // setup-first row keeps base 0. Without a proven start the
+        // caller wins no edge, so the count is read from the pair
+        // itself: base 0 with the full 44 staged, held (not based
+        // out) through commit, with no rebase disclosure.
+        let (mut native, caller, setup, _ordinary) = watched_native_blind_with_setup();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .start_time,
+            None
+        );
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row.clone()]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        // The bind staged at the drain; publication folds staged into
+        // the base at commit, so the bind base is read here.
+        assert_eq!(pair_base(&native, &row), 0);
+        assert_eq!(pair_staged(&native, &row), Some(44));
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .unwrap()
+                .start_time,
+            None,
+            "the start time stays unknown through the bind"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(pair_base(&native, &row), 44);
+        assert_eq!(rebase_gaps(&native), 0);
+    }
+
+    #[test]
+    fn counts_for_a_setup_first_row_with_delayed_receipt_keep_base_zero() {
+        // Delayed attach receipt: the endpoint activated at tick 300,
+        // before the caller spawned and ran its setup entry at tick
+        // 500 — but the receipt landed at 501, after the spawn, and the
+        // gate reads only the receipt. The row keeps base 0: refresh to
+        // 44 reads 44 with no rebase disclosure. Conservative toward
+        // retaining observed counts: the activation/receipt gap is
+        // unobservable to the gate.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 501);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row.clone()]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        // The bind staged at the drain; publication folds staged into
+        // the base at commit, so the bind base is read here.
+        assert_eq!(pair_base(&native, &row), 0);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 44);
+        assert_eq!(rebase_gaps(&native), 0);
+    }
+
+    #[test]
+    fn counts_for_a_prepared_setup_first_row_base_past_the_seed() {
+        // The setup-first scene through the prepared absorb: the
+        // newcomer's first recorded entry passed through the
+        // C_GetFunctionList setup endpoint (classified from the
+        // prepared commit's own matches, with no provider read at
+        // consumption), live since tick 300, and the caller spawned
+        // after the initial attach (start 500 > attach 400): refresh
+        // to 44 reads 43 with exactly one rebase disclosure.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup_prepared();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, setup);
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 43);
+        assert_eq!(
+            registry
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject
+                    == crate::discovery::caller_registry::DEMOTED_COUNT_PLACED)
+                .count(),
+            1,
+            "the rebased seed discloses its window: {:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn counts_for_a_prepared_ordinary_first_row_keep_base_zero() {
+        // Same timing through the prepared absorb, but the newcomer's
+        // first recorded entry passed through the ordinary
+        // C_Initialize endpoint: a real first entry, never the setup
+        // seed. The bind keeps base 0 and refresh to 44 reads 44.
+        let (mut native, caller, _setup, ordinary) = watched_native_with_setup_prepared();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[ordinary].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, ordinary);
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 44);
+    }
+
+    #[test]
     fn counts_for_an_unbound_row_never_publish() {
         // R-C51-1 and DR-C51-PREADMIT: the row never binds, so its
         // first-sight count, its refreshes, and any later refresh all
@@ -33823,6 +34249,75 @@ int main(void) {
         let (mut native, caller) = watched_native();
         let (setup, ordinary) = extend_with_setup_prepared(&mut native);
         (native, caller, setup, ordinary)
+    }
+
+    /// A watched native scene whose caller was admitted while its
+    /// `/proc` was unreadable, so the record never learned a start
+    /// time — extended with the setup module like
+    /// [`watched_native_with_setup`].
+    fn watched_native_blind_with_setup() -> (NativeScene, CallerId, usize, usize) {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        scene.source.blind(7);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        // Transient race: readable again right after admission, but the
+        // record never learned the start time.
+        scene.source.unblind(7);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let (setup, ordinary) = extend_with_setup(&mut native);
+        (native, caller, setup, ordinary)
+    }
+
+    /// The pair target base for `row`'s pair after publication, across
+    /// all target states: the absolute count accounted so far.
+    fn pair_base(native: &NativeScene, row: &WitnessRow) -> u64 {
+        let key = PairKey::of(row);
+        match native.scene.coordinator.pair_targets.get(&key) {
+            Some(
+                PairTarget::Pending { base, .. }
+                | PairTarget::Bound { base, .. }
+                | PairTarget::Dropped { base, .. }
+                | PairTarget::Suspended { base, .. },
+            ) => *base,
+            None => panic!("the row's pair has a target"),
+        }
+    }
+
+    /// The pair target staged count for `row`'s pair, when its state
+    /// carries one: the absolute count staged so far.
+    fn pair_staged(native: &NativeScene, row: &WitnessRow) -> Option<u64> {
+        let key = PairKey::of(row);
+        match native.scene.coordinator.pair_targets.get(&key) {
+            Some(PairTarget::Pending { staged, .. } | PairTarget::Bound { staged, .. }) => {
+                Some(*staged)
+            }
+            Some(_) => None,
+            None => panic!("the row's pair has a target"),
+        }
+    }
+
+    /// Rebase-disclosure gaps on the scene: the seed base discloses
+    /// its window through exactly one, and a base-0 bind discloses
+    /// none.
+    fn rebase_gaps(native: &NativeScene) -> usize {
+        native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::DEMOTED_COUNT_PLACED)
+            .count()
     }
 
     fn use_before_admission(coverage: &UseCoverage) -> bool {

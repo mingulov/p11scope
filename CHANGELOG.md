@@ -99,6 +99,15 @@ versioned separately and are opaque, exact dispatch keys.
   fires only as the last resort, after the recovery save failed. The
   saved-fallback line names the actual owner (`mode 0600, readable
   only by <user>`; `root-only` only for root-owned files).
+- Inventory newcomer counts exclude the uncounted setup seed exactly
+  where it is proven: an on-time row whose first recorded entry
+  passed through a plan-proven function-table-hook endpoint, whose
+  caller spawned after the initial attach with the endpoint already
+  live, bases past exactly that one call. Every other first-entry
+  shape keeps base 0 (conservative toward retaining observed
+  counts), and each rebased seed discloses its window through one
+  `demoted count placed` gap recording a count of placements on its
+  module.
 
 ## [0.7.1] - 2026-11-17
 

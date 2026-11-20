@@ -2693,6 +2693,150 @@ fn joint_partition_refresh_offers_no_birth() {
     );
 }
 
+/// A retained take accepts live truth ahead of a tainted scan:
+/// the router observed global churn (a tainted continuation) and
+/// live advanced further with the same local words, so the take
+/// validates against live instead of failing the stale scan
+/// forever.
+#[test]
+fn joint_retained_take_accepts_live_ahead_of_tainted_scan() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    let receipt = &witness.candidate.receipt;
+    assert_eq!(
+        harness.capture.router.partition_back_taint(
+            receipt.domain,
+            receipt.image,
+            receipt.endpoint.file_slot
+        ),
+        Some((true, false)),
+        "the continuation taints the scan"
+    );
+    harness.io.global = 2;
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("live ahead of a tainted scan validates");
+    assert_eq!(harness.capture.take_drift_tolerated(), 1);
+}
+
+/// A retained take refuses live ahead of an untainted scan: the
+/// advance is too new for any observation, so the take races
+/// (and queues its refresh) instead of trusting unscanned truth.
+#[test]
+fn joint_retained_take_refuses_live_ahead_of_untainted_scan() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let (cookie, exec, file) = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    assert_eq!(
+        harness
+            .capture
+            .router
+            .partition_back_taint(receipt.domain, receipt.image, file),
+        Some((false, false)),
+        "the mint observation is untainted"
+    );
+    assert_eq!(
+        harness
+            .capture
+            .router
+            .partition_back_taint(NativeDomainId::mint(), receipt.image, file),
+        None,
+        "a foreign domain has no standing"
+    );
+    harness.io.global = 1;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of an untainted scan races");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file),
+        "the first advance queues its refresh"
+    );
+    assert_eq!(harness.capture.take_drift_tolerated(), 0);
+}
+
+/// A retained take refuses live with a moved local word even past
+/// a tainted scan: a local move means this process remapped, so
+/// the take races for the refresh scan to prove it.
+#[test]
+fn joint_retained_take_refuses_live_with_moved_local() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.local = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("a moved local word races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert_eq!(harness.capture.take_drift_tolerated(), 0);
+}
+
+/// The live-ahead gate accepts exactly global advances past
+/// disclosed taint: every other word, direction or taint refuses.
+#[test]
+fn joint_live_ahead_gate_accepts_only_tainted_global_advance() {
+    fn e(local: u64, global: u64, fault: u64, sticky: u64, record_flags: u64) -> CompleteEpochs {
+        CompleteEpochs {
+            local,
+            global,
+            fault,
+            sticky,
+            record_flags,
+        }
+    }
+    let base = e(1, 9, 0, 0, 0);
+    assert!(
+        SemanticCapture::accept_live_ahead(e(1, 20, 0, 0, 0), base, true, false),
+        "the live case accepts"
+    );
+    for (live, global_tainted, miss_tainted, why) in [
+        (e(1, 20, 0, 0, 0), false, false, "untainted"),
+        (e(1, 20, 0, 0, 0), true, true, "miss-tainted"),
+        (e(2, 20, 0, 0, 0), true, false, "local moved"),
+        (e(1, 20, 1, 0, 0), true, false, "fault moved"),
+        (e(1, 20, 0, 1, 0), true, false, "sticky set"),
+        (e(1, 20, 0, 0, 4), true, false, "flags moved"),
+        (e(1, 9, 0, 0, 0), true, false, "equal needs no override"),
+        (e(1, 8, 0, 0, 0), true, false, "backward"),
+    ] {
+        assert!(
+            !SemanticCapture::accept_live_ahead(live, base, global_tainted, miss_tainted),
+            "{why} refuses"
+        );
+    }
+}
+
 #[test]
 fn joint_absence_birth_requires_prior_negative_and_quiet_sighting() {
     actual_absence_birth_fixture();

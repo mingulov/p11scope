@@ -2827,8 +2827,9 @@ fn joint_machine_finish_without_landed_row_publishes() {
         }
     }
     // The quiet finish measured 14 polls before the fresh-pull guard;
-    // the guard adds at most one pull, so 16 keeps one slack.
-    const QUIET_FINISH_POLL_BOUND: usize = 16;
+    // the guard adds at most one pull and the post-publish phase one
+    // budgeted pass per loss poll, so 18 keeps one slack.
+    const QUIET_FINISH_POLL_BOUND: usize = 18;
     eprintln!("finish_quiet polls={polls}");
     assert!(published, "the quiet finish publishes within its bound");
     assert!(

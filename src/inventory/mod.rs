@@ -2155,9 +2155,13 @@ fn run_with_terminal_budget(
         let drift_tolerated = semantic_lane
             .as_ref()
             .map_or(0, |lane| lane.take_drift_tolerated());
+        let refresh_scans = semantic_lane
+            .as_ref()
+            .map_or(0, |lane| lane.take_refresh_scans());
         inventory_diagnostic(&crate::inventory_semantics::joint_bootstraps_line(
             &bootstraps,
             drift_tolerated,
+            refresh_scans,
         ));
     }
     // Output attempts first; only then may an unsettled retirement's drop
@@ -9648,9 +9652,13 @@ fn run_dashboard(
         let drift_tolerated = semantic_lane
             .as_ref()
             .map_or(0, |lane| lane.take_drift_tolerated());
+        let refresh_scans = semantic_lane
+            .as_ref()
+            .map_or(0, |lane| lane.take_refresh_scans());
         display.notice(&crate::inventory_semantics::joint_bootstraps_line(
             &bootstraps,
             drift_tolerated,
+            refresh_scans,
         ));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.

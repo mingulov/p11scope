@@ -4663,6 +4663,13 @@ impl LiveJointMachine {
                             self.audit_no_progress_polls = 0;
                             self.finish_no_progress_since = None;
                         }
+                        // Cadence: a seal retry stall re-observes
+                        // take-raced keys before the next attempt, so
+                        // one refresh scan lands per stall instead of
+                        // starving behind the burst. No queued
+                        // interests means no raced take, and the
+                        // service stays a pure yield.
+                        lane.service_take_refresh_sweep();
                         (
                             Phase::Audited {
                                 frame,

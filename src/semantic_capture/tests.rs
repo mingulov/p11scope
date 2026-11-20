@@ -2840,6 +2840,22 @@ fn joint_take_refresh_sweep_bounded_by_scan_cap() {
     assert_eq!(harness.capture.take_refresh_scans(), 1);
 }
 
+/// The cadence sweep resolves interest pids through the
+/// current binding pins (as the tick resolves its targets): the
+/// accessor carries the witness's own pin, so the sweep's guard
+/// finds it. Without these pins the production scan would
+/// resolve no pid and skip every key.
+#[test]
+fn joint_take_refresh_sweep_targets_current_binding_pins() {
+    let (harness, witness, _) = birth_sealed_witness();
+    let pins = harness.capture.refresh_target_pins();
+    assert!(
+        pins.iter()
+            .any(|pin| Arc::ptr_eq(pin, &witness.candidate.receipt.pin)),
+        "the sweep targets the bound pin"
+    );
+}
+
 /// A cadence sweep with no queued interests scans nothing and
 /// counts nothing: stalled seals that never raced a take keep
 /// their behavior exactly.

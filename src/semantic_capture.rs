@@ -1292,6 +1292,22 @@ struct RefreshInterest {
     attachment_slot: u32,
     pid: u32,
 }
+
+/// Outcome of one joined-sweep key scan, shared by the tick's
+/// joined sweep and the cadence sweep: the guards, scan,
+/// audit and accept run as one behavior on both paths, so a
+/// future guard change cannot silently diverge the tick from
+/// the cadence re-observation.
+enum JoinedScanOutcome {
+    /// The key scanned (attempted): counted, accepted or
+    /// refused into the report.
+    Scanned,
+    /// The key failed its guards: nothing scanned, nothing counted.
+    Skipped,
+    /// The capture exhausted on an impossible clock overflow:
+    /// the caller breaks its sweep.
+    Break,
+}
 impl ScanJob {
     fn key(&self) -> (u64, u64, u32) {
         (
@@ -1996,6 +2012,43 @@ impl SemanticCapture {
         self.take_refresh_scans
     }
 
+    /// Whether any take-refresh interest waits for re-observation
+    /// (production reach for the cadence sweep): only raced takes
+    /// queue interests, so a queued interest means a take raced
+    /// since the last drain. Fail-soft: a contended check reads
+    /// empty and the next service retries.
+    pub(crate) fn has_queued_take_refresh(&self) -> bool {
+        self.refresh_interests
+            .try_lock()
+            .is_ok_and(|interests| !interests.is_empty())
+    }
+
+    /// Pins of all current bindings (production reach for the
+    /// cadence sweep's scan targets): the sweep resolves each
+    /// interest's pid through these, exactly as the tick resolves
+    /// its targets. Cloned Arcs only; bounded by the binding cap.
+    pub(crate) fn refresh_target_pins(&self) -> Vec<Arc<PidPin>> {
+        self.bindings
+            .values()
+            .filter(|binding| binding.current)
+            .map(|binding| binding.pin.clone())
+            .collect()
+    }
+
+    /// One bounded no-call take-refresh sweep through the same
+    /// owned Session: re-observe take-raced keys between seal
+    /// retries (machine cadence). `targets` carries the current
+    /// binding pins (see [`Self::refresh_target_pins`]), as the
+    /// tick's targets do: an empty slice would resolve no pid
+    /// and skip every key. See the shared helper below.
+    pub(crate) fn sweep_take_refresh(
+        &mut self,
+        session: &mut Session,
+        targets: &[Arc<PidPin>],
+    ) -> TickReport {
+        self.sweep_take_refresh_with(&mut SessionIo { session, targets })
+    }
+
     /// Re-observe take-raced keys between seal retries (machine
     /// cadence): drain queued refresh interests and scan them
     /// outside any tick, like the tick's joined sweep but with no
@@ -2003,13 +2056,152 @@ impl SemanticCapture {
     /// the next tick merge, so re-observed receipts and resolved
     /// outcomes join a batch instead of dropping. Bounded by the
     /// shared per-tick scan cap; stale interests drop silently
-    /// and re-request on the next raced take. Test-only I/O
-    /// variant; production wraps the live Session below.
-    #[cfg(test)]
-    fn sweep_take_refresh_with(&mut self, _io: &mut impl CaptureIo) -> TickReport {
-        // Inert until the cadence implementation lands: the sweep
-        // twins pin the recovery RED first.
-        TickReport::default()
+    /// and re-request on the next raced take. Generic I/O
+    /// variant; production wraps the live Session above, twins
+    /// drive it with scripted I/O, and the substituted lane
+    /// drives it with held I/O.
+    // The I/O seam stays sealed: `CaptureIo` is private, so only
+    // in-crate descendants can implement or name it; this bound
+    // merely lets those callers pass their own I/O through.
+    #[allow(private_bounds)]
+    pub(crate) fn sweep_take_refresh_with(&mut self, io: &mut impl CaptureIo) -> TickReport {
+        // One storage_null snapshot per scan pass for the Q1(b) gate.
+        self.router.note_storage_null(io.storage_null());
+        let mut report = TickReport::default();
+        if !self.audit(io, &mut report) {
+            return report;
+        }
+        // Resolve drained interests fresh, as in the tick's joined
+        // sweep: a call-driven interest for the same key would win
+        // there, but the sweep runs with no new calls, so every
+        // resolved interest scans. Stale slots drop silently and
+        // re-request on the next raced take.
+        let mut interests = BTreeMap::new();
+        for ((cookie, exec, file), interest) in self.take_refresh_interests() {
+            let key = (cookie, exec, file);
+            let Some(endpoint) = io.endpoint(interest.attachment_slot) else {
+                continue;
+            };
+            if endpoint.file_slot != file {
+                continue;
+            }
+            interests.insert(
+                key,
+                (
+                    interest.image,
+                    endpoint,
+                    interest.attachment_slot,
+                    interest.pid,
+                ),
+            );
+        }
+        // BTreeMap order is deterministic; the sweep leaves the
+        // tick's cyclic cursor alone. Refresh scans carry no birth
+        // cut: they re-prove the partition without offering.
+        for (_key, interest) in interests {
+            if report.scans >= self.limits.scans
+                || self.image_failed
+                || self.exhausted
+                || self.sticky != 0
+            {
+                break;
+            }
+            match self.scan_one_joined_key(io, interest, None, &mut report) {
+                JoinedScanOutcome::Scanned => {
+                    self.take_refresh_scans = self.take_refresh_scans.saturating_add(1);
+                }
+                JoinedScanOutcome::Skipped => {}
+                JoinedScanOutcome::Break => break,
+            }
+        }
+        self.stamp_disposition(&mut report);
+        report
+    }
+
+    /// Scan one joined-sweep key: the tick's per-key guards, scan,
+    /// post-scan audit and accept, shared with the cadence sweep.
+    /// `birth_cut` is the tick's cut for call-driven interests and
+    /// `None` for refresh interests (no birth offered). The tick
+    /// advances its cyclic cursor on `Scanned`; the cadence sweep
+    /// leaves the cursor alone.
+    fn scan_one_joined_key(
+        &mut self,
+        io: &mut impl CaptureIo,
+        interest: (ImageIdentity, Endpoint, u32, u32),
+        birth_cut: Option<(
+            JournalBirthCut,
+            crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        )>,
+        report: &mut TickReport,
+    ) -> JoinedScanOutcome {
+        let (image, endpoint, slot, pid) = interest;
+        let Some(pin) = io.target(pid) else {
+            return JoinedScanOutcome::Skipped;
+        };
+        let Some(binding) = self.bindings.get(&image.task_cookie) else {
+            return JoinedScanOutcome::Skipped;
+        };
+        if binding.domain != self.router.domain()
+            || !binding.current
+            || binding.image != image
+            || pin.pid() != pid
+            || !Arc::ptr_eq(&pin, &binding.pin)
+            || !pin.still_the_same()
+        {
+            return JoinedScanOutcome::Skipped;
+        }
+        let now = io.now();
+        let (Some(proof_deadline), Some(slice_end)) = (
+            now.checked_add(self.limits.pending_for),
+            now.checked_add(self.limits.scan_slice),
+        ) else {
+            self.exhaust(report);
+            return JoinedScanOutcome::Break;
+        };
+        let job = ScanJob {
+            image,
+            endpoint,
+            slot,
+            pin,
+            deadline: proof_deadline,
+            birth_cut,
+        };
+        report.scans += 1;
+        let fence = self.router.fence();
+        let attempt_deadline = slice_end.min(proof_deadline);
+        let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
+        let healthy = self.audit(io, report);
+        // The break is recorded from the already-obtained result
+        // before the slice check: a scan that proves the module
+        // unmapped breaks continuity even when the slice elapsed
+        // mid-scan.
+        if matches!(result, Err(ImageQueryRefusal::Empty)) {
+            self.router
+                .note_proven_absence(job.image, job.endpoint.file_slot);
+        }
+        if io.now() >= attempt_deadline {
+            report.scan_refusals.push(ImageQueryRefusal::Deadline);
+            #[cfg(test)]
+            self.last_refusal_by_key_for_test
+                .insert(job.key(), ImageQueryRefusal::Deadline);
+        } else if healthy {
+            match result {
+                Ok(proof) => self.accept_scan(io, proof, &job, fence, report),
+                Err(refusal) => {
+                    // A scan that proves the module unmapped breaks
+                    // router continuity for the job's key, so a later
+                    // reload mints instead of reviving the old ID.
+                    if refusal == ImageQueryRefusal::Empty {
+                        self.router
+                            .note_proven_absence(job.image, job.endpoint.file_slot);
+                    }
+                    report.scan_refusals.push(refusal);
+                    #[cfg(test)]
+                    self.last_refusal_by_key_for_test.insert(job.key(), refusal);
+                }
+            }
+        }
+        JoinedScanOutcome::Scanned
     }
 
     /// Test-only drain reach for the live twins: production `accept_scan`
@@ -4479,77 +4671,21 @@ impl SemanticCapture {
             {
                 break;
             }
-            let (image, endpoint, slot, pid) = joined_interests[&key];
-            let Some(pin) = io.target(pid) else {
-                continue;
+            // One shared per-key scan with the cadence sweep; the
+            // cursor advances per scanned key, as before (its move
+            // from before the scan to after is unobservable: the
+            // cursor is only read at the next sweep start).
+            let birth_cut = if refresh_keys.contains(&key) {
+                None
+            } else {
+                birth_cut.clone()
             };
-            let Some(binding) = self.bindings.get(&image.task_cookie) else {
-                continue;
-            };
-            if binding.domain != self.router.domain()
-                || !binding.current
-                || binding.image != image
-                || pin.pid() != pid
-                || !Arc::ptr_eq(&pin, &binding.pin)
-                || !pin.still_the_same()
-            {
-                continue;
-            }
-            let now = io.now();
-            let (Some(proof_deadline), Some(slice_end)) = (
-                now.checked_add(self.limits.pending_for),
-                now.checked_add(self.limits.scan_slice),
-            ) else {
-                self.exhaust(&mut report);
-                break;
-            };
-            let job = ScanJob {
-                image,
-                endpoint,
-                slot,
-                pin,
-                deadline: proof_deadline,
-                birth_cut: if refresh_keys.contains(&key) {
-                    None
-                } else {
-                    birth_cut.clone()
-                },
-            };
-            report.scans += 1;
-            self.joined_refresh_cursor = Some(key);
-            let fence = self.router.fence();
-            let attempt_deadline = slice_end.min(proof_deadline);
-            let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
-            let healthy = self.audit(io, &mut report);
-            // The break is recorded from the already-obtained result
-            // before the slice check: a scan that proves the module
-            // unmapped breaks continuity even when the slice elapsed
-            // mid-scan.
-            if matches!(result, Err(ImageQueryRefusal::Empty)) {
-                self.router
-                    .note_proven_absence(job.image, job.endpoint.file_slot);
-            }
-            if io.now() >= attempt_deadline {
-                report.scan_refusals.push(ImageQueryRefusal::Deadline);
-                #[cfg(test)]
-                self.last_refusal_by_key_for_test
-                    .insert(job.key(), ImageQueryRefusal::Deadline);
-            } else if healthy {
-                match result {
-                    Ok(proof) => self.accept_scan(io, proof, &job, fence, &mut report),
-                    Err(refusal) => {
-                        // A scan that proves the module unmapped breaks
-                        // router continuity for the job's key, so a later
-                        // reload mints instead of reviving the old ID.
-                        if refusal == ImageQueryRefusal::Empty {
-                            self.router
-                                .note_proven_absence(job.image, job.endpoint.file_slot);
-                        }
-                        report.scan_refusals.push(refusal);
-                        #[cfg(test)]
-                        self.last_refusal_by_key_for_test.insert(job.key(), refusal);
-                    }
+            match self.scan_one_joined_key(io, joined_interests[&key], birth_cut, &mut report) {
+                JoinedScanOutcome::Scanned => {
+                    self.joined_refresh_cursor = Some(key);
                 }
+                JoinedScanOutcome::Skipped => {}
+                JoinedScanOutcome::Break => break,
             }
         }
         // Retained images that never bind get a bounded horizon: past it

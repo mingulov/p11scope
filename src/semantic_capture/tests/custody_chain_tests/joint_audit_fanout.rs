@@ -29317,8 +29317,8 @@ fn joint_reread_plus_h3_pending_keeps_pending_and_absorbs_nothing() {
         q1.bind_targets(&ports).unwrap();
         assert_eq!(
             q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
-            Ok(QuantumSealProgress::LocalPending),
-            "the pending frame defers, it never converts"
+            Ok(QuantumSealProgress::AwaitFutureInput),
+            "the pending frame awaits future H0 input, it never converts"
         );
     }
 }

@@ -2778,8 +2778,9 @@ fn joint_retained_take_refuses_live_ahead_of_untainted_scan() {
 }
 
 /// A retained take refuses live with a moved local word even past
-/// a tainted scan: a local move means this process remapped, so
-/// the take races for the refresh scan to prove it.
+/// a tainted scan and an advanced global: a local move means this
+/// process remapped, so the take races for the refresh scan to
+/// prove it.
 #[test]
 fn joint_retained_take_refuses_live_with_moved_local() {
     let (mut harness, witness, mut rows) = birth_sealed_witness();
@@ -2788,6 +2789,7 @@ fn joint_retained_take_refuses_live_with_moved_local() {
     let mut raw = harness.collect();
     let (report, _) = harness.route(&mut raw);
     assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.global = 2;
     harness.io.local = 2;
     let refusal = witness
         .fresh_evidence_with(

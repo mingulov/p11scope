@@ -3334,6 +3334,80 @@ fn joint_birth_witness_refuses_replaced_custody_provider_native_and_fence() {
     );
 }
 
+/// A fault-era move invalidates the retained partition receipt for
+/// good: the recheck names the stale witness, not a contended
+/// attempt, so delivery falls back promptly instead of retrying a
+/// take that can never succeed.
+#[test]
+fn joint_birth_witness_stale_fence_refuses_retained_witness() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (_, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let closure = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    let fence_before = harness.capture.router.fence();
+    harness.capture.audit_health(
+        Health {
+            fault: 1,
+            sticky: 0,
+        },
+        &mut TickReport::default(),
+    );
+    harness.io.last_health.fault = 1;
+    assert_ne!(
+        harness.capture.router.fence(),
+        fence_before,
+        "precondition: the fault-era move advanced the router fence"
+    );
+    assert_eq!(
+        witness.fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding()
+        ),
+        Err(crate::attach::BirthObservationRefusal::RetainedWitnessMismatch),
+        "a stale receipt fence is a definitive negative about the retained witness"
+    );
+}
+
+/// A recheck that misses its bounded window stays a contended
+/// attempt: only the witness comparison is definitive, so deadline
+/// misses keep retrying.
+#[test]
+fn joint_birth_witness_deadline_refuses_current_partition() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (report, admitted) = harness.route(&mut raw);
+    let (_, proof) = harness.ingest(raw, &admitted);
+    let publisher = NativePublisher::build();
+    let closure = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0"], closure);
+    let mut rows = NativeBirthRows { row, control };
+    let witness = harness.birth(report, &admitted, &proof, None, &mut rows);
+    harness.io.receipt_advance = harness.capture.limits.scan_slice + Duration::from_millis(1);
+    assert_eq!(
+        witness.fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding()
+        ),
+        Err(crate::attach::BirthObservationRefusal::CurrentPartition),
+        "a missed window stays a contended attempt"
+    );
+}
+
 #[test]
 fn joint_birth_recheck_measures_the_window_on_the_test_clock() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};

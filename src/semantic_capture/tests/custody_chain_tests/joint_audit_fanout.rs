@@ -1708,6 +1708,36 @@ impl MachineScene {
         )
     }
 
+    fn service_with_budget(
+        &mut self,
+        budget: &mut crate::inventory_semantics::JointWorkBudget,
+    ) -> Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal> {
+        let Self {
+            scene,
+            machine,
+            native,
+            finish,
+            live_discovery,
+        } = self;
+        let mut io = HeldMachineIo {
+            drain: &mut scene.drain,
+            h0: &scene.real.h0,
+            producers: &scene.producers,
+            attached: scene.attached.as_ref().unwrap(),
+            native,
+            finish: finish.as_mut(),
+            live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
+        };
+        machine.service_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+            crate::inventory_semantics::JointServiceMode::Running,
+            budget,
+        )
+    }
+
     fn poll_commit(
         &mut self,
         work: usize,
@@ -18147,6 +18177,315 @@ fn watchdog_park_runs_bounded_and_resumes() {
     );
 }
 
+/// A barrier-free scan that consumes exactly its reserve still leaves
+/// the park a turn: 64 capacity-refused BEGINs on the attested image
+/// clear with zero units left, so the first watchdog tick parks
+/// nothing; the retained clear hands the next tick's reserve to the
+/// park instead of rescanning, and the frame completes past it.
+#[test]
+fn watchdog_barrier_clear_reserve_parks_next_tick() {
+    const ROW: &str = "barrier clear keeps a park turn";
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::JournalGap;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    // BEGIN-only in-flight calls: no terminals finish them, so the
+    // refused staging survives to the watchdog scan.
+    for (index, sequence) in (2..66u64).enumerate() {
+        let name = ["C_SignInit", "C_SignUpdate", "C_SignFinal"][index % 3];
+        let (begin, _) = fixture.scene.encoded(pid, 0, name, sequence);
+        fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    assert!(
+        fixture.machine.begin_commit(true).is_ok(),
+        "{ROW}: the lane accepts the refused calls' commit"
+    );
+    for _ in 0..512 {
+        if fixture.machine.diagnostic_snapshot_for_test().0 == "Ingesting" {
+            break;
+        }
+        fixture.service(1).unwrap_or_else(|reason| {
+            panic!("{ROW}: the refused quantum must reach ingest: {reason:?}")
+        });
+    }
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Ingesting",
+        "{ROW}: the quantum waits at ingest"
+    );
+    // Freeze ledger charges for the ingest step only: the 64 BEGINs
+    // refuse on capacity through the real ingest path. Grants bind
+    // unfrozen above; H9 stages at commit time below.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .ledger_mut()
+        .set_byte_limit(0);
+    for _ in 0..512 {
+        let label = fixture.machine.diagnostic_snapshot_for_test().0;
+        if label != "Ingesting" {
+            break;
+        }
+        fixture.service(1).unwrap_or_else(|reason| {
+            panic!("{ROW}: the refused quantum must ingest past its refusal: {reason:?}")
+        });
+    }
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .ledger_mut()
+        .set_byte_limit(crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT as u64);
+    fixture.reach_phase("Audited");
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .has_seal_barrier(),
+        "{ROW}: attested staging bars nothing (control)"
+    );
+    let mut probe = 64usize;
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut()
+            .has_seal_barrier_bounded(&mut probe),
+        crate::semantics_objects::journal::BarrierCheck::Clear,
+        "{ROW}: precondition: the scan clears"
+    );
+    assert_eq!(
+        probe, 0,
+        "{ROW}: precondition: the clear consumes exactly its reserve"
+    );
+    let target = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .joint_history_targets()
+        .next()
+        .expect("one stuck target")
+        .0;
+    let failure = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .scripted_failure(
+            JournalGap::BoundNotReady,
+            target.bootstrap(),
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+    fixture.machine.pose_frame_failure_for_test(failure);
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    let mut published = false;
+    for _ in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(JointServiceProgress::Pending) => {}
+            Err(_) => break,
+        }
+    }
+    assert!(
+        published,
+        "{ROW}: the frame completes past its parked consumer"
+    );
+    assert_eq!(
+        fixture.machine.audit_no_progress_trip_for_test(),
+        None,
+        "{ROW}: no trip stands"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        0,
+        "{ROW}: no rearm consumed"
+    );
+    assert!(
+        watchdog_scope_gaps(&fixture)
+            .iter()
+            .any(|(subject, _)| subject == "joint stuck consumer parked"),
+        "{ROW}: the park stages its named gap"
+    );
+}
+
+/// An Idle tick that spends its whole budget on scoped recovery must
+/// not collect on the stale pre-recovery allowance: with exactly the
+/// recovery's cost in budget, the tick completes the void, then
+/// yields before I/O with the drain untouched.
+#[test]
+fn idle_recovery_yields_collection_when_budget_spent() {
+    const ROW: &str = "recovery spends before collection";
+    use crate::inventory_semantics::{JointServiceProgress, JointWorkBudget};
+    fn stuck_idle_scene() -> MachineScene {
+        let mut scene = MachineScene::new(1);
+        scene.prime(1);
+        let pid = std::process::id();
+        scene.scene.push(pid, 0, "C_SignInit", 2);
+        scene.scene.push(pid, 0, "C_SignUpdate", 3);
+        scene.scene.push(pid, 0, "C_SignFinal", 4);
+        watchdog_drive_to_applied(&mut scene);
+        scene.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+        assert_eq!(
+            scene.service(1),
+            Err(SemanticRefusal::Unavailable),
+            "the transient refusal latches"
+        );
+        assert_eq!(
+            scene.rearm("semantic_unavailable"),
+            Some(true),
+            "the refused quantum re-arms"
+        );
+        scene
+    }
+    // Measure the Idle-entry cost (absence scan plus scoped
+    // recovery) through the service path on a twin scene: one unit
+    // per service until the break is consumed and no recovery
+    // stands. Each service must spend exactly its unit.
+    let mut measure = stuck_idle_scene();
+    let mut cost = 0usize;
+    for _ in 0..512 {
+        let mut budget = JointWorkBudget {
+            remaining_actions: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+        };
+        measure
+            .service_with_budget(&mut budget)
+            .unwrap_or_else(|reason| {
+                panic!("{ROW}: the measuring services never refuse: {reason:?}")
+            });
+        assert_eq!(
+            budget.remaining_actions, 0,
+            "{ROW}: precondition: each measuring service spends its unit"
+        );
+        cost += 1;
+        let consumed = !measure
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_break_pending();
+        let standing = measure
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_recovery_progress_for_test()
+            .is_some();
+        if consumed && !standing {
+            break;
+        }
+    }
+    assert!(cost > 0, "{ROW}: precondition: the recovery spends");
+    assert!(
+        !measure
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_break_pending(),
+        "{ROW}: precondition: the measured break is consumed"
+    );
+    let mut fixture = stuck_idle_scene();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_break_pending(),
+        "{ROW}: precondition: the scoped break pends"
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Idle",
+        "{ROW}: precondition: the lane idles after re-arm"
+    );
+    let pid = std::process::id();
+    for (index, sequence) in (100..110u64).enumerate() {
+        let name = ["C_SignInit", "C_SignUpdate", "C_SignFinal"][index % 3];
+        fixture.scene.push(pid, 0, name, sequence);
+    }
+    let waiting = fixture.scene.drain.source().remaining();
+    assert!(waiting > 0, "{ROW}: precondition: bait waits in the drain");
+    let mut budget = JointWorkBudget {
+        remaining_actions: cost,
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+    };
+    let outcome = fixture.service_with_budget(&mut budget);
+    assert_eq!(
+        outcome,
+        Ok(JointServiceProgress::Pending),
+        "{ROW}: the spent tick yields"
+    );
+    assert!(
+        !fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_break_pending(),
+        "{ROW}: the recovery consumed its break"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .scoped_recovery_progress_for_test(),
+        None,
+        "{ROW}: the recovery completed within the budget"
+    );
+    assert_eq!(
+        fixture.machine.diagnostic_snapshot_for_test().0,
+        "Idle",
+        "{ROW}: no collection starts on a spent tick"
+    );
+    assert_eq!(
+        fixture.scene.drain.source().remaining(),
+        waiting,
+        "{ROW}: the drain stays untouched"
+    );
+}
+
 /// E9b: a scoped void sheds barrier-causing unbound staging — a stuck
 /// foreign call (in-flight, never attested) bars seals; the trip
 /// re-arms with scoped recovery that sheds the barrier with loss
@@ -25417,6 +25756,26 @@ impl JointBirthEvidenceSource for RefuseOneBirth<'_> {
     }
 }
 
+/// Fail one birth-evidence take with partition contention, then
+/// serve native takes: the transient-take twin's stand-in.
+struct FailTakeOnce<'a> {
+    inner: NativeFrameBirths<'a>,
+    fail: bool,
+}
+impl JointBirthEvidenceSource for FailTakeOnce<'_> {
+    fn take_for(
+        &mut self,
+        target: &JointFeedTarget,
+        binding: &SemanticCallerBinding,
+    ) -> Result<SessionBirthEvidence, BirthObservationRefusal> {
+        if self.fail {
+            self.fail = false;
+            return Err(BirthObservationRefusal::CurrentPartition);
+        }
+        self.inner.take_for(target, binding)
+    }
+}
+
 /// Only the native leaf is substituted. Capture, stash, witnesses and frame
 /// remain the originals from the real collection/admission path above.
 struct HeldCommitNative<'a> {
@@ -26859,6 +27218,174 @@ fn joint_frame_preflight_keeps_targets_and_birth_selection_on_retry() {
             .iter()
             .all(|feed| feed.reduced == 2 && feed.staged == 0 && !feed.fallback && !feed.degraded)
     );
+}
+
+/// A parked retry keeps a genuine later history loss: the frame
+/// retries one contended take with both feeds staged, parks exactly
+/// one consumer, then observes a real fault move. The next seal
+/// records the fault loss and delivery must serve the original loss
+/// route (invalidation plus counted disposal), not the parked
+/// fallback override; the sibling stays pending, then completes.
+#[test]
+fn joint_parked_retry_keeps_genuine_fault_loss() {
+    use crate::semantics_objects::journal::JournalGap;
+    use crate::semantics_objects::journal::joint_audit::ParkProgress;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut takes = FailTakeOnce {
+        inner: NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        },
+        fail: true,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        frame.bind_targets(&ports).unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut takes, &fault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert!(
+            takes.inner.seen.is_empty(),
+            "the failed take reads no birth"
+        );
+        let recorded = frame
+            .failure_for_test()
+            .expect("the failed take records its failure");
+        assert_eq!(recorded.gap, JournalGap::BootstrapMismatch);
+        assert_eq!(
+            recorded.take_failed,
+            Some(BirthObservationRefusal::CurrentPartition),
+            "the first seal fails on the contended take"
+        );
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::LocalPending),
+            "the contended take retries"
+        );
+    }
+    drop(takes);
+    let staged: Vec<usize> = fixture.feeds().iter().map(|feed| feed.staged).collect();
+    assert_eq!(
+        staged,
+        vec![1, 1],
+        "control: the retry keeps both feeds staged"
+    );
+    let disposed_before: Vec<u64> = fixture.feeds().iter().map(|feed| feed.disposed).collect();
+    let mut budget = 64usize;
+    assert_eq!(
+        frame.park_stuck_consumers_bounded(&mut budget),
+        ParkProgress::Done(1),
+        "exactly one stuck consumer parks"
+    );
+    let states = frame.consumer_states_for_test();
+    assert_eq!(states.len(), 2);
+    assert_eq!(
+        states.iter().filter(|state| state.3).count(),
+        1,
+        "exactly one consumer carries the park flag"
+    );
+    let parked_id = states.iter().find(|state| state.3).unwrap().0;
+    let sibling_id = states.iter().find(|state| !state.3).unwrap().0;
+    fault.epoch.set(1);
+    let mut takes = FailTakeOnce {
+        inner: NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        },
+        fail: false,
+    };
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.seal_next(&mut ports, &mut takes, &fault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert!(
+            takes.inner.seen.is_empty(),
+            "the fault re-read fails the seal before any take"
+        );
+        let recorded = frame
+            .failure_for_test()
+            .expect("the fault move records its failure");
+        assert_eq!(
+            recorded.gap,
+            JournalGap::FaultChanged,
+            "the next seal records the genuine fault loss"
+        );
+        assert_eq!(
+            frame
+                .deliver_next(&mut ports)
+                .expect("a parked consumer still delivers genuine loss"),
+            QuantumSealProgress::LocalPending,
+            "the loss delivers while the sibling pends"
+        );
+    }
+    drop(takes);
+    let states = frame.consumer_states_for_test();
+    let parked = states.iter().find(|state| state.0 == parked_id).unwrap();
+    let sibling = states.iter().find(|state| state.0 == sibling_id).unwrap();
+    assert_eq!(parked.1, "LossDelivered");
+    assert_eq!(sibling.1, "Pending");
+    let feeds = fixture.feeds();
+    let parked_feed = feeds.iter().find(|feed| feed.id == parked_id).unwrap();
+    let sibling_feed = feeds.iter().find(|feed| feed.id == sibling_id).unwrap();
+    let parked_before =
+        disposed_before[feeds.iter().position(|feed| feed.id == parked_id).unwrap()];
+    assert_eq!(parked_feed.staged, 0, "the loss consumes the parked feed");
+    assert_eq!(
+        parked_feed.disposed,
+        parked_before + 1,
+        "the loss counts its disposed head"
+    );
+    assert!(parked_feed.degraded, "the loss invalidates the parked feed");
+    assert!(
+        !parked_feed.fallback,
+        "a genuine loss keeps its own route, not fallback"
+    );
+    assert_eq!(
+        sibling_feed.staged, 1,
+        "the sibling keeps its staged head while pending"
+    );
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            frame.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete),
+            "the sibling completes the frame"
+        );
+    }
+    let states = frame.consumer_states_for_test();
+    let sibling = states.iter().find(|state| state.0 == sibling_id).unwrap();
+    assert_eq!(sibling.1, "LossDelivered");
 }
 
 #[test]

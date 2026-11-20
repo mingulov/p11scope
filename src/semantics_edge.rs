@@ -800,8 +800,9 @@ impl EdgeSemantics {
         if descriptor.lifecycle == lifecycle::OPEN_SESSION && call.session == SESSION_NONE {
             return PendingRoute::Unroutable;
         }
-        #[cfg(test)]
-        self.bump_edge_read_for_test();
+        // No test bump here: the budgeted admission cursor charges and
+        // counts this lookup at its own read site; the synchronous
+        // path stays unbumped.
         if self.pending.contains_key(&(call.session, function)) {
             return PendingRoute::Duplicate;
         }
@@ -1200,15 +1201,99 @@ enum EdgeRetirePhase {
     Done,
 }
 
+/// Resumable budgeted pending admission for one staged PENDING head:
+/// routes, captures the origin, inserts, then evicts oldest-first past
+/// [`MAX_EDGE_PENDING`] — every map lookup charged before it reads
+/// through the shared gate, one leaf per visit, with the charged
+/// visit and the eviction best retained across yields. Matches
+/// synchronous queueing + oldest eviction exactly (same inserts, same
+/// evicted record, same Unknown terminals, same counts and evidence).
+pub(crate) struct PendingAdmissionCursor {
+    /// Retained head facts (the head stays staged until the admission
+    /// commits, so the cursor clones what it needs up front).
+    /// Eviction terminals name the evicted call (like sync), never
+    /// this head, so no head origin is retained.
+    call: SemanticCall,
+    phase: PendingAdmissionPhase,
+    /// Retained routing (charged lookup).
+    route: Option<PendingRoute>,
+    /// Operation bits to capture, in `operation_bits` order.
+    bits: Vec<u16>,
+    /// Retained origin bits captured so far.
+    capture: Vec<(u16, Option<u64>)>,
+    /// Pending-scan position (BTree key order) and remaining count
+    /// (snapshotted at insert: nothing mutates the maps mid-scan, so
+    /// no terminal lookup is needed).
+    scan_pending_upto: Option<(u64, u32)>,
+    scan_pending_left: usize,
+    /// Detached-scan position and remaining count.
+    scan_detached_upto: Option<(u64, u32, crate::semantics_objects::AsyncValue)>,
+    scan_detached_left: usize,
+    /// Best (oldest) record so far. Pending wins ties (matches the
+    /// synchronous comparison).
+    best: Option<PendingAdmissionBest>,
+    /// Retained evicted record for the Unknown-end walk.
+    evicted: Option<EvictedRecord>,
+    /// Evicted-origin bits ended so far.
+    evict_done: usize,
+    /// Retained liveness decision (session, bit) whose visit +
+    /// terminal still needs its atomic 2-unit credit: set when the
+    /// liveness read succeeds but the terminal charge refuses, so the
+    /// resume never re-reads the charged visit.
+    evict_end_pending: Option<(u64, u16)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAdmissionPhase {
+    Route,
+    Capture,
+    Insert,
+    EvictScan,
+    EvictEnd,
+    Done,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PendingAdmissionBest {
+    Pending {
+        key: (u64, u32),
+        sequence: u64,
+    },
+    Detached {
+        key: (u64, u32, crate::semantics_objects::AsyncValue),
+        sequence: u64,
+    },
+}
+
+impl PendingAdmissionBest {
+    fn sequence(self) -> u64 {
+        match self {
+            Self::Pending { sequence, .. } | Self::Detached { sequence, .. } => sequence,
+        }
+    }
+}
+
+struct EvictedRecord {
+    session: u64,
+    origin: CallOrigin,
+    effect_origin: EffectOrigin,
+    resource: Option<ResourceLease>,
+}
+
 /// Pure peek result for one staged head (see
 /// [`EdgeSemantics::would_retire_scope`]).
 #[derive(Debug, Clone)]
 pub(crate) enum RetirePeek {
-    /// Zero-leaf observe (downgrade-gate failure, unsealed/COUNT_ONLY,
-    /// PENDING queue): caller pops for 1 unit and runs observe
-    /// synchronously with no pre-charge (0 reads). Lifecycle guard
-    /// misses are Bounded (their synchronous observe may read).
+    /// Zero-leaf observe (downgrade-gate failure, unsealed/COUNT_ONLY):
+    /// caller pops for 1 unit and runs observe synchronously with no
+    /// pre-charge (0 reads). Lifecycle guard misses are Bounded
+    /// (their synchronous observe may read); PENDING queues are
+    /// Pending (their admission + eviction scan is budgeted).
     NoOp,
+    /// Budgeted pending admission + oldest-first eviction (caller uses
+    /// [`Self::start_pending_admission`] and pops without a second
+    /// observe once the cursor completes).
+    Pending,
     /// Bounded observe (Init/Update/Direct/Async, 2-machine
     /// OPERATION_NOT_INITIALIZED, lifecycle guard miss):
     /// caller reserve-checks HEAD_WORST and runs atomically.
@@ -2452,7 +2537,9 @@ impl EdgeSemantics {
     /// Pure retire-scope peek for one staged head during disposal:
     /// returns how the head would retire WITHOUT mutating (no counter
     /// increments, no map changes). `NoOp` means zero-leaf observe
-    /// (caller pops for 1, no pre-charge); `Bounded` means bounded
+    /// (caller pops for 1, no pre-charge); `Pending` means budgeted
+    /// admission + eviction (caller uses
+    /// [`Self::start_pending_admission`]); `Bounded` means bounded
     /// observe (caller reserve-checks HEAD_WORST and runs atomically);
     /// `All` means whole-scope retire (caller uses
     /// [`Self::start_budgeted_invalidation`] with Cancelled);
@@ -2489,9 +2576,6 @@ impl EdgeSemantics {
                 count_reconciliations: true,
             };
         }
-        if call.rv == CkRv::PENDING.0 {
-            return RetirePeek::NoOp;
-        }
         if matches!(
             descriptor.lifecycle,
             x if x == lifecycle::ASYNC_COMPLETE
@@ -2499,6 +2583,9 @@ impl EdgeSemantics {
                 || x == lifecycle::ASYNC_JOIN
         ) {
             return RetirePeek::Bounded;
+        }
+        if call.rv == CkRv::PENDING.0 {
+            return RetirePeek::Pending;
         }
         match descriptor.lifecycle {
             x if x == lifecycle::OPEN_SESSION => {
@@ -3128,6 +3215,340 @@ impl EdgeSemantics {
         }
     }
 
+    /// Start the resumable budgeted admission for one staged PENDING
+    /// head's facts. The caller drives
+    /// [`Self::poll_pending_admission_step`] with the shared
+    /// [`LeafBudget`] until it completes, then pops the head WITHOUT a
+    /// second observe (the cursor already queued it; a second observe
+    /// would double-queue).
+    pub(crate) fn start_pending_admission(&self, call: SemanticCall) -> PendingAdmissionCursor {
+        let _ = self.last_seen_ns;
+        PendingAdmissionCursor {
+            call,
+            phase: PendingAdmissionPhase::Route,
+            route: None,
+            bits: Vec::new(),
+            capture: Vec::new(),
+            scan_pending_upto: None,
+            scan_pending_left: 0,
+            scan_detached_upto: None,
+            scan_detached_left: 0,
+            best: None,
+            evicted: None,
+            evict_done: 0,
+            evict_end_pending: None,
+        }
+    }
+
+    /// Drive one budgeted pending-admission step through the shared
+    /// pre-debit gate. Returns whether the admission completed. On
+    /// exhaustion yields WITHOUT advancing past the refused leaf (no
+    /// read past the credit). Eviction terminals emit through `sink`
+    /// (the disposal tees them into its preserved key-use, queuing
+    /// association releases for the same budget). Matches synchronous
+    /// queueing + oldest eviction exactly.
+    pub(crate) fn poll_pending_admission_step<S: OperationSink>(
+        &mut self,
+        cursor: &mut PendingAdmissionCursor,
+        sink: &mut S,
+        budget: &mut LeafBudget,
+    ) -> bool {
+        loop {
+            match cursor.phase {
+                PendingAdmissionPhase::Route => {
+                    if cursor.route.is_none() {
+                        if !budget.try_charge() {
+                            return false;
+                        }
+                        #[cfg(test)]
+                        self.bump_edge_read_for_test();
+                        cursor.route = Some(self.route_pending(&cursor.call));
+                    }
+                    match cursor.route.expect("route retained") {
+                        PendingRoute::Unroutable => {
+                            self.orphans = self.orphans.saturating_add(1);
+                            cursor.phase = PendingAdmissionPhase::Done;
+                        }
+                        PendingRoute::Duplicate => {
+                            self.evidence.async_duplicates =
+                                self.evidence.async_duplicates.saturating_add(1);
+                            self.orphans = self.orphans.saturating_add(1);
+                            cursor.phase = PendingAdmissionPhase::Done;
+                        }
+                        PendingRoute::Fresh { descriptor, .. } => {
+                            cursor.bits = crate::semantics::operation_bits(descriptor.operations)
+                                .map(|(bit, _)| bit)
+                                .collect();
+                            cursor.phase = PendingAdmissionPhase::Capture;
+                        }
+                    }
+                    continue;
+                }
+                PendingAdmissionPhase::Capture => {
+                    if cursor.capture.len() >= cursor.bits.len() {
+                        cursor.phase = PendingAdmissionPhase::Insert;
+                        continue;
+                    }
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
+                    let bit = cursor.bits[cursor.capture.len()];
+                    let session = cursor.call.session;
+                    let generation = self
+                        .active
+                        .get(&(session, bit))
+                        .map(|machine| machine.generation);
+                    cursor.capture.push((bit, generation));
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                PendingAdmissionPhase::Insert => {
+                    let PendingRoute::Fresh {
+                        function, charge, ..
+                    } = cursor.route.expect("fresh admission inserts")
+                    else {
+                        debug_assert!(false, "only fresh admissions insert");
+                        return false;
+                    };
+                    self.sequence = self.sequence.wrapping_add(1);
+                    let sequence = self.sequence;
+                    let resource = self.take_resource_charge(charge);
+                    let origin = CallOrigin {
+                        bits: std::mem::take(&mut cursor.capture),
+                    };
+                    self.pending.insert(
+                        (cursor.call.session, function),
+                        PendingCall {
+                            call: cursor.call.clone(),
+                            origin,
+                            origin_pos: None,
+                            sequence,
+                            resource,
+                        },
+                    );
+                    cursor.scan_pending_left = self.pending.len();
+                    cursor.scan_detached_left = self.detached.len();
+                    cursor.phase = PendingAdmissionPhase::EvictScan;
+                    continue;
+                }
+                PendingAdmissionPhase::EvictScan => {
+                    if self.pending.len() + self.detached.len() <= MAX_EDGE_PENDING {
+                        cursor.phase = PendingAdmissionPhase::Done;
+                        continue;
+                    }
+                    if cursor.scan_pending_left > 0 {
+                        if !budget.try_charge() {
+                            return false;
+                        }
+                        #[cfg(test)]
+                        self.bump_edge_read_for_test();
+                        let (key, sequence) = self
+                            .scan_next_pending(cursor.scan_pending_upto)
+                            .expect("admission scan retained its record");
+                        cursor.scan_pending_upto = Some(key);
+                        cursor.scan_pending_left -= 1;
+                        let better = cursor.best.is_none_or(|best| sequence < best.sequence());
+                        if better {
+                            cursor.best = Some(PendingAdmissionBest::Pending { key, sequence });
+                        }
+                        if budget.remaining() == 0 {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if cursor.scan_detached_left > 0 {
+                        if !budget.try_charge() {
+                            return false;
+                        }
+                        #[cfg(test)]
+                        self.bump_edge_read_for_test();
+                        let (key, sequence) = self
+                            .scan_next_detached(cursor.scan_detached_upto)
+                            .expect("admission scan retained its record");
+                        cursor.scan_detached_upto = Some(key);
+                        cursor.scan_detached_left -= 1;
+                        // Strictly less keeps pending-wins-ties (matches
+                        // the synchronous comparison).
+                        let better = cursor.best.is_none_or(|best| sequence < best.sequence());
+                        if better {
+                            cursor.best = Some(PendingAdmissionBest::Detached { key, sequence });
+                        }
+                        if budget.remaining() == 0 {
+                            return false;
+                        }
+                        continue;
+                    }
+                    let best = cursor.best.expect("an over-bound scan finds a record");
+                    let (session, call, origin, resource) = match best {
+                        PendingAdmissionBest::Pending { key, .. } => {
+                            let record =
+                                self.pending.remove(&key).expect("scan retained its record");
+                            (key.0, record.call, record.origin, record.resource)
+                        }
+                        PendingAdmissionBest::Detached { key, .. } => {
+                            let id = self
+                                .detached
+                                .remove(&key)
+                                .expect("scan retained its record");
+                            (id.call.session, id.call, id.origin, id.resource)
+                        }
+                    };
+                    let effect_origin = if S::WANTS_EFFECTS {
+                        EffectOrigin::from(&call)
+                    } else {
+                        EffectOrigin::placeholder()
+                    };
+                    drop(call);
+                    cursor.evicted = Some(EvictedRecord {
+                        session,
+                        origin,
+                        effect_origin,
+                        resource,
+                    });
+                    cursor.evict_done = 0;
+                    cursor.phase = PendingAdmissionPhase::EvictEnd;
+                    continue;
+                }
+                PendingAdmissionPhase::EvictEnd => {
+                    let total = cursor
+                        .evicted
+                        .as_ref()
+                        .map_or(0, |evicted| evicted.origin.bits.len());
+                    if cursor.evict_done >= total {
+                        if let Some(evicted) = cursor.evicted.take() {
+                            self.evidence.async_evictions =
+                                self.evidence.async_evictions.saturating_add(1);
+                            drop(evicted.origin);
+                            drop(evicted.resource);
+                        }
+                        cursor.evict_end_pending = None;
+                        cursor.phase = PendingAdmissionPhase::Done;
+                        continue;
+                    }
+                    if let Some((session, bit)) = cursor.evict_end_pending {
+                        if !budget.try_charge_n(2) {
+                            return false;
+                        }
+                        #[cfg(test)]
+                        {
+                            self.bump_edge_read_for_test();
+                            self.bump_edge_read_for_test();
+                        }
+                        let evicted = cursor.evicted.as_ref().expect("evicted retained");
+                        let end_origin = evicted.effect_origin.clone();
+                        self.end_machine(
+                            session,
+                            bit,
+                            Self::category_name(bit),
+                            EndState::Unknown,
+                            &end_origin,
+                            &CompletionEvidence::NONE,
+                            sink,
+                        );
+                        cursor.evict_end_pending = None;
+                        cursor.evict_done += 1;
+                        if budget.remaining() == 0 {
+                            return false;
+                        }
+                        continue;
+                    }
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
+                    let evicted = cursor.evicted.as_ref().expect("evicted retained");
+                    let (session, bound) =
+                        (evicted.session, evicted.origin.bits[cursor.evict_done]);
+                    let (bit, generation) = bound;
+                    let live_matches = generation.is_some()
+                        && self
+                            .active
+                            .get(&(session, bit))
+                            .map(|machine| machine.generation)
+                            == generation;
+                    if !live_matches {
+                        cursor.evict_done += 1;
+                        if budget.remaining() == 0 {
+                            return false;
+                        }
+                        continue;
+                    }
+                    cursor.evict_end_pending = Some((session, bit));
+                    if !budget.try_charge_n(2) {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    {
+                        self.bump_edge_read_for_test();
+                        self.bump_edge_read_for_test();
+                    }
+                    let evicted = cursor.evicted.as_ref().expect("evicted retained");
+                    let end_origin = evicted.effect_origin.clone();
+                    self.end_machine(
+                        session,
+                        bit,
+                        Self::category_name(bit),
+                        EndState::Unknown,
+                        &end_origin,
+                        &CompletionEvidence::NONE,
+                        sink,
+                    );
+                    cursor.evict_end_pending = None;
+                    cursor.evict_done += 1;
+                    if budget.remaining() == 0 {
+                        return false;
+                    }
+                }
+                PendingAdmissionPhase::Done => {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// Next pending record for the oldest scan: key + sequence in
+    /// BTree key order (one charged read at the call site).
+    fn scan_next_pending(&self, upto: Option<(u64, u32)>) -> Option<((u64, u32), u64)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match upto {
+            None => self
+                .pending
+                .iter()
+                .next()
+                .map(|(key, record)| (*key, record.sequence)),
+            Some(done) => self
+                .pending
+                .range((Excluded(done), Unbounded))
+                .next()
+                .map(|(key, record)| (*key, record.sequence)),
+        }
+    }
+
+    /// Next detached record for the oldest scan: key + sequence in
+    /// BTree key order (one charged read at the call site).
+    fn scan_next_detached(
+        &self,
+        upto: Option<(u64, u32, crate::semantics_objects::AsyncValue)>,
+    ) -> Option<((u64, u32, crate::semantics_objects::AsyncValue), u64)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        match upto {
+            None => self
+                .detached
+                .iter()
+                .next()
+                .map(|(key, id)| (*key, id.sequence)),
+            Some(done) => self
+                .detached
+                .range((Excluded(done), Unbounded))
+                .next()
+                .map(|(key, id)| (*key, id.sequence)),
+        }
+    }
+
     /// Same-file double-load detection (F7b/F7c): live operations end
     /// unknown (shared with loss — "right now" is unattributable),
     /// and the detection latch forces the label unknown from this
@@ -3323,10 +3744,11 @@ impl EdgeSemantics {
     /// (F2): one entry per affected operation bit, `None` where no
     /// machine is live.
     fn capture_origin(&self, session: u64, descriptor: &SlotSemantics) -> CallOrigin {
+        // No test bump here: the budgeted admission cursor charges and
+        // counts each capture lookup at its own read site; the
+        // synchronous path stays unbumped.
         let bits = crate::semantics::operation_bits(descriptor.operations)
             .map(|(bit, _)| {
-                #[cfg(test)]
-                self.bump_edge_read_for_test();
                 (
                     bit,
                     self.active
@@ -4424,13 +4846,14 @@ mod tests {
             call("C_SetOperationState", 5, CkRv::OK.0, 10_070),
             call("C_Sign", 6, CkRv::SESSION_CLOSED.0, 10_080),
             call("C_OpenSession", 7, CkRv::OK.0, 10_090),
+            call("C_SignUpdate", 3, CkRv::PENDING.0, 10_100),
         ]
     }
 
     /// Budgeted retire cursors match synchronous observe exactly:
     /// same end maps, counters, evidence and effect order, one leaf
     /// per visit/terminal/drop/unbind, over random seeds and every
-    /// retiring call shape (All, Session, Slot, Selected).
+    /// retiring call shape (All, Session, Slot, Selected, Pending).
     #[test]
     fn budgeted_retire_matches_synchronous_observe() {
         use crate::semantics_objects::journal::LeafBudget;
@@ -4455,6 +4878,27 @@ mod tests {
                             &origin,
                             &mut budgeted_effects,
                         );
+                    }
+                    RetirePeek::Pending => {
+                        let mut cursor = budgeted_edge.start_pending_admission(retiring.clone());
+                        let mut polls = 0;
+                        loop {
+                            let mut gate = LeafBudget::new(3);
+                            if budgeted_edge.poll_pending_admission_step(
+                                &mut cursor,
+                                &mut budgeted_effects,
+                                &mut gate,
+                            ) {
+                                break;
+                            }
+                            assert!(
+                                gate.spent() <= 3,
+                                "seed {seed}: poll spent {} above 3",
+                                gate.spent()
+                            );
+                            polls += 1;
+                            assert!(polls < 100_000, "seed {seed}: admission must complete");
+                        }
                     }
                     RetirePeek::All {
                         count_reconciliations,
@@ -4548,6 +4992,125 @@ mod tests {
                     retiring.function
                 );
             }
+        }
+    }
+
+    /// Budgeted pending admission matches synchronous queueing
+    /// exactly at the 256/257 boundary and on duplicate/unroutable
+    /// inputs: same maps, counters, evidence and effect order, one
+    /// leaf per visit, with the Unknown end's visit + terminal kept
+    /// atomic across yields.
+    #[test]
+    fn budgeted_pending_admission_matches_synchronous_queue() {
+        use crate::semantics_objects::journal::LeafBudget;
+        fn pending(session: u64, ts: u64) -> SemanticCall {
+            SemanticCall {
+                function: "C_SignUpdate".into(),
+                rv: CkRv::PENDING.0,
+                session,
+                ts_ns: ts,
+                ..SemanticCall::default()
+            }
+        }
+        fn snapshot(edge: &EdgeSemantics) -> (usize, usize, usize, usize, u64, u64, u64, u64, u64) {
+            (
+                edge.active.len(),
+                edge.pending.len(),
+                edge.detached.len(),
+                edge.open.len(),
+                edge.completed,
+                edge.cancelled,
+                edge.unknown,
+                edge.orphans,
+                edge.evidence.async_evictions,
+            )
+        }
+        for shape in ["evict", "duplicate", "unroutable"] {
+            let mut sync_edge = EdgeSemantics::default();
+            sync_edge.observe(&init("C_SignInit", 1, RSA_PSS, 100));
+            for session in 1..=256u64 {
+                sync_edge.observe(&pending(session, 100 + session));
+            }
+            let head = match shape {
+                "evict" => pending(257, 400),
+                "duplicate" => pending(1, 400),
+                // Session-less OPEN_SESSION PENDING: gate-passed with a
+                // known descriptor (so the peek routes Pending), but
+                // unroutable at queue time.
+                _ => call("C_OpenSession", SESSION_NONE, CkRv::PENDING.0, 400),
+            };
+            let origin = EffectOrigin {
+                function: head.function.clone(),
+                session: head.session,
+                ts_ns: head.ts_ns,
+            };
+            let mut sync_effects = Vec::new();
+            sync_edge.observe_with_effects(&head, &origin, &mut sync_effects);
+            let mut cursor_edge = EdgeSemantics::default();
+            cursor_edge.observe(&init("C_SignInit", 1, RSA_PSS, 100));
+            for session in 1..=256u64 {
+                cursor_edge.observe(&pending(session, 100 + session));
+            }
+            let mut cursor = cursor_edge.start_pending_admission(head);
+            let mut cursor_effects = Vec::new();
+            cursor_edge.reset_test_edge_reads_for_test();
+            let (mut total_spent, mut total_reads, mut stalls, mut polls) = (0, 0, 0, 0);
+            let mut units = 1usize;
+            loop {
+                cursor_edge.reset_test_edge_reads_for_test();
+                let mut gate = LeafBudget::new(units);
+                let done = cursor_edge.poll_pending_admission_step(
+                    &mut cursor,
+                    &mut cursor_effects,
+                    &mut gate,
+                );
+                assert_eq!(
+                    gate.spent(),
+                    cursor_edge.test_edge_reads_for_test(),
+                    "{shape} poll {polls}: every read debited"
+                );
+                total_spent += gate.spent();
+                total_reads += cursor_edge.test_edge_reads_for_test();
+                if done {
+                    break;
+                }
+                if gate.spent() == 0 {
+                    stalls += 1;
+                    units = 2;
+                } else {
+                    units = 1;
+                }
+                polls += 1;
+                assert!(polls < 100_000, "{shape}: the admission must complete");
+            }
+            if shape == "evict" {
+                assert_eq!(
+                    stalls, 1,
+                    "the atomic Unknown end stalls a 1-unit gate once"
+                );
+                assert_eq!(
+                    (total_spent, total_reads),
+                    (262, 262),
+                    "route + capture + 257-visit scan + liveness + visit + terminal"
+                );
+            } else {
+                assert_eq!(
+                    (total_spent, total_reads),
+                    (1, 1),
+                    "{shape}: one routed lookup"
+                );
+                assert_eq!(stalls, 0, "{shape}: no atomic end stalls");
+            }
+            assert_eq!(cursor_effects, sync_effects, "{shape}: terminals match");
+            assert_eq!(
+                snapshot(&cursor_edge),
+                snapshot(&sync_edge),
+                "{shape}: maps match"
+            );
+            assert_eq!(
+                cursor_edge.evidence, sync_edge.evidence,
+                "{shape}: evidence matches"
+            );
         }
     }
 

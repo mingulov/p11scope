@@ -91,13 +91,15 @@ const HKDF_IDS: &[u64] = &[0x0000402a, 0x0000402b];
 const ML_KEM_IDS: &[u64] = &[0x00000017];
 /// The one attested vendor exception to the §4.2 vendor rule:
 /// `CKM_NSS_ML_KEM` (`0xCE53_4381`, NSS `lib/util/pkcs11n.h`
-/// `CKM_NSS + 49`), exposed by softokn beside standard `CKM_ML_KEM`
-/// and used for TLS KEM operations (`lib/ssl/tls13con.c`). Same
-/// family and length map as the standard id; the vendor keygen id
-/// (`0xCE53_4380`) stays silent under the creation rule, and legacy
-/// Kyber (`0xCE53_437D/0xCE53_437E`) stays silent (Kyber is not
-/// ML-KEM). De-facto NSS block ownership is the same reliance the
-/// display-only vendor table already takes.
+/// `CKM_NSS + 49`), exposed by softokn with encapsulate/decapsulate
+/// flags beside standard `CKM_ML_KEM`. NSS TLS itself currently
+/// operates through the standard id (the vendor id is latent), but
+/// its documented semantics are ML-KEM, so when it is used it must
+/// attribute as ML-KEM. Same family and length map as the standard
+/// id; the vendor keygen id (`0xCE53_4380`) stays silent under the
+/// creation rule, and legacy Kyber (`0xCE53_437D/0xCE53_437E`) stays
+/// silent (Kyber is not ML-KEM). De-facto NSS block ownership is the
+/// same reliance the display-only vendor table already takes.
 const NSS_ML_KEM_IDS: &[u64] = &[0xCE53_4381];
 const ML_DSA_IDS: &[u64] = &[
     0x0000001d, 0x0000001f, 0x00000023, 0x00000024, 0x00000025, 0x00000026, 0x00000027, 0x00000028,
@@ -2219,8 +2221,8 @@ mod tests {
 
     /// The attested NSS ML-KEM operation mechanism infers its
     /// family: `CKM_NSS_ML_KEM` (`0xCE53_4381`, NSS
-    /// `lib/util/pkcs11n.h` `CKM_NSS + 49`, exposed by softokn and
-    /// used beside standard `CKM_ML_KEM` for TLS KEM operations)
+    /// `lib/util/pkcs11n.h` `CKM_NSS + 49`, exposed by softokn with
+    /// encapsulate/decapsulate flags beside standard `CKM_ML_KEM`)
     /// names ML-KEM exactly like the standard id. The vendor keygen
     /// id stays silent under the creation rule, like every
     /// `_KEY_PAIR_GEN` id.

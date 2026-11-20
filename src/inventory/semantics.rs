@@ -773,6 +773,30 @@ pub(crate) trait LaneTestIo {
     fn length_stash_loss_fails(&mut self) -> bool {
         false
     }
+    /// Scripted length-stash insert-failure counter (cumulative).
+    /// None when the scripted lane models no readable counter. The
+    /// machine polls insert and mismatch independently, one native
+    /// lookup per budgeted action.
+    fn length_stash_insert_loss(&mut self) -> Option<u64> {
+        None
+    }
+    /// Scripted insert-counter read failure. False unless the script
+    /// poses one; distinct from `length_stash_insert_loss`
+    /// returning None.
+    fn length_stash_insert_loss_fails(&mut self) -> bool {
+        false
+    }
+    /// Scripted length-stash mismatch counter (cumulative). None
+    /// when the scripted lane models no readable counter.
+    fn length_stash_mismatch_loss(&mut self) -> Option<u64> {
+        None
+    }
+    /// Scripted mismatch-counter read failure. False unless the
+    /// script poses one; distinct from `length_stash_mismatch_loss`
+    /// returning None.
+    fn length_stash_mismatch_loss_fails(&mut self) -> bool {
+        false
+    }
     /// Scripted collection saturation: the scripted tick stopped at
     /// its record quantum with more possibly waiting.
     fn collection_saturated(&self) -> bool {

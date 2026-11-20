@@ -10,11 +10,15 @@ use std::mem::size_of;
 
 const ROLES: usize = 5;
 
-/// Intrusive-index capacity: the production staging table is indexed;
-/// larger tables keep the linear scans. No table today exceeds this.
-const MAX_INDEXED: usize = 1_024;
+/// Intrusive-index capacity: every table whose chain-node codes fit the
+/// `u16` link encoding stays indexed, including the production 4,096-slot
+/// staging table. Only capacities past this correctness bound keep the
+/// linear scans; no table today is one. This bound sizes no memory: the
+/// slot layout, bucket count and prepaid allocation are unchanged.
+const MAX_INDEXED: usize = (u16::MAX as usize - 1) / ROLES;
 /// Chain buckets per index (the key and id indexes share the shape).
-/// At most five memberships per slot over 1,024 slots hash here.
+/// At most five memberships per slot hash here; at staging capacity
+/// the average key chain stays near twenty entries.
 const INDEX_BUCKETS: usize = 1_024;
 /// Empty chain head/link: outside the node-code range.
 const INDEX_NONE: u16 = u16::MAX;
@@ -23,7 +27,7 @@ const KEY_LINKS: usize = 0;
 const ID_LINKS: usize = 1;
 
 /// Chain-node code: `slot * ROLES + lane`. Slots below `MAX_INDEXED`
-/// keep every code below 5,120.
+/// keep every code below `INDEX_NONE` (13,106 slots × 5 lanes).
 fn node_code(slot: usize, lane: usize) -> u16 {
     debug_assert!(slot < MAX_INDEXED && lane < ROLES);
     (slot * ROLES + lane) as u16
@@ -37,9 +41,13 @@ fn node_lane(code: u16) -> usize {
     usize::from(code) % ROLES
 }
 
-/// Deterministic Fx-style hash for the intrusive index. The seed is
-/// fixed, so chain shapes are stable across runs and the lookup bound
-/// is a stable property, not luck.
+/// Deterministic Fx-style hash for the intrusive index. The seed and
+/// finalizer are fixed, so chain shapes are stable across runs and the
+/// lookup bound is a stable property, not luck. The finalizer avalanches
+/// the low bits: bucket selection uses `hash % INDEX_BUCKETS`, and
+/// production keys are sequential tickets, ordinals and reservation IDs,
+/// which the bare Fx rounds cluster into 32 buckets; the finalizer
+/// spreads 4,096 sequential entries over ~1,000 buckets instead.
 fn index_hash(parts: &[u64]) -> u64 {
     const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
     let mut hash = SEED;
@@ -47,6 +55,11 @@ fn index_hash(parts: &[u64]) -> u64 {
         hash = hash.wrapping_add(*part);
         hash = hash.rotate_left(5).wrapping_mul(SEED);
     }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^= hash >> 33;
     hash
 }
 
@@ -146,8 +159,8 @@ pub(super) struct ReservationTable<C> {
     /// the table keeps its exact single prepaid allocation and adds
     /// negligible stack pressure. Chain nodes are (slot, lane) codes;
     /// every membership and alias is linked exactly while present.
-    /// Tables past `MAX_INDEXED` ignore the index and keep the linear
-    /// scans.
+    /// Tables past `MAX_INDEXED` (codes past the `u16` link range)
+    /// ignore the index and keep the linear scans.
     key_heads: [u16; INDEX_BUCKETS],
     id_heads: [u16; INDEX_BUCKETS],
     /// Intrusive free list head: per-slot links live in the slots. A
@@ -980,6 +993,20 @@ mod tests {
     }
 
     #[test]
+    fn resource_reservations_staging_capacity_keeps_one_exact_prepaid_allocation() {
+        // The production staging table keeps its exact single prepaid
+        // allocation: indexing the 4,096 slots adds no heap memory.
+        use crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
+
+        let expected = ReservationTable::<()>::allocation_bytes(MAX_UNSETTLED_STAGED).unwrap();
+        let (table, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+            ReservationTable::<()>::try_new(MAX_UNSETTLED_STAGED).unwrap()
+        });
+        assert_eq!((allocations, bytes), (1, expected));
+        assert_eq!(table.slots.capacity(), MAX_UNSETTLED_STAGED);
+    }
+
+    #[test]
     fn resource_reservations_transfer_retains_old_physical_charge_until_drop() {
         struct Charge<'a> {
             live: &'a std::cell::Cell<usize>,
@@ -1237,13 +1264,19 @@ mod tests {
         }
         fuzz(8, 0x1bd9_1f16_39b1_2c4d, 600);
         fuzz(1_024, 0x9e37_79b9_7f4a_7c15, 200);
+        fuzz(
+            crate::semantics_objects::journal::MAX_UNSETTLED_STAGED,
+            0x2b99_5f3c_8d41_e6a7,
+            60,
+        );
     }
 
     #[test]
     fn resource_reservations_unindexed_capacity_keeps_linear_scans() {
-        // Past MAX_INDEXED the table keeps the old scans: behavior is
-        // identical, only the cost differs. Exercises the fallback.
-        let mut table = ReservationTable::try_new(1_025).unwrap();
+        // Past MAX_INDEXED (codes past the u16 link range) the table
+        // keeps the old scans: behavior is identical, only the cost
+        // differs. Exercises the fallback.
+        let mut table = ReservationTable::try_new(MAX_INDEXED + 1).unwrap();
         assert!(!table.indexed());
         let a = table.insert(Role::Raw, key(1), None, 1, ()).unwrap();
         let b = table.insert(Role::Model, key(2), None, 1, ()).unwrap();

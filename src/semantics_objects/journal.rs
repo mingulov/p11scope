@@ -22040,7 +22040,10 @@ pub(crate) mod tests {
             "the sole key keeps its abandonment refusal"
         );
         assert!(
-            !harness.owner.adapter().image_tainted_for_test((COOKIE, EXEC)),
+            !harness
+                .owner
+                .adapter()
+                .image_tainted_for_test((COOKIE, EXEC)),
             "an attributed abandonment never taints its image"
         );
     }
@@ -22098,7 +22101,10 @@ pub(crate) mod tests {
             "the probe takes the scoped branch"
         );
         assert!(
-            harness.owner.adapter().image_tainted_for_test((COOKIE, EXEC)),
+            harness
+                .owner
+                .adapter()
+                .image_tainted_for_test((COOKIE, EXEC)),
             "the unclaimed abandonment taints its image"
         );
         assert!(

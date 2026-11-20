@@ -2935,6 +2935,228 @@ impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::Lane
     }
 }
 
+/// Scripts both loss counters over a faithful H0 and counts every
+/// substituted counter read: the budget twins observe how many loss
+/// lookups each machine slice performs. Every other seam delegates
+/// to the scene's shared H0 unchanged.
+struct PublishCountedLossStub<I> {
+    inner: I,
+    ring_loss: std::collections::VecDeque<u64>,
+    stash_loss: std::collections::VecDeque<(u64, u64)>,
+    ring_polls: std::rc::Rc<std::cell::Cell<usize>>,
+    stash_polls: std::rc::Rc<std::cell::Cell<usize>>,
+}
+
+impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::LaneTestIo
+    for PublishCountedLossStub<I>
+{
+    fn events_ring_loss(&mut self) -> Option<u64> {
+        self.ring_polls.set(self.ring_polls.get() + 1);
+        self.ring_loss.pop_front()
+    }
+
+    fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
+        self.stash_polls.set(self.stash_polls.get() + 1);
+        self.stash_loss.pop_front()
+    }
+
+    fn stash_pending_floor(&self) -> Option<u64> {
+        self.inner.stash_pending_floor()
+    }
+
+    fn inspect_pending_h3(
+        &self,
+        inspect: &mut dyn FnMut(
+            &crate::semantic_capture::SemanticCapture,
+            &crate::inventory_semantics::RefreshReceiptStash,
+            &crate::attach::SessionDrainProducers,
+        ),
+    ) {
+        self.inner.inspect_pending_h3(inspect)
+    }
+
+    fn semantic_published(&mut self) {
+        self.inner.semantic_published()
+    }
+
+    fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+        self.inner.begin_terminal_cleanup()
+    }
+
+    fn finish_terminal_cleanup(
+        &mut self,
+        second_signal: &dyn Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        self.inner.finish_terminal_cleanup(second_signal, out)
+    }
+
+    fn poll_terminal_detach(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<crate::attach::ProducerDetachProgress> {
+        self.inner.poll_terminal_detach(out)
+    }
+
+    fn tick_targets(&mut self, pins: &[std::sync::Arc<crate::process::PidPin>]) {
+        self.inner.tick_targets(pins)
+    }
+
+    fn service_live_discovery(&mut self) {
+        self.inner.service_live_discovery()
+    }
+
+    fn collection_saturated(&self) -> bool {
+        self.inner.collection_saturated()
+    }
+
+    fn retained_registration_ns(&self, image: p11scope_ebpf_common::ImageIdentity) -> Option<u64> {
+        self.inner.retained_registration_ns(image)
+    }
+
+    fn validate_attachment(
+        &mut self,
+        subset: &crate::inventory_semantics::AttestedSubset,
+    ) -> Result<(), crate::inventory_semantics::SemanticRefusal> {
+        self.inner.validate_attachment(subset)
+    }
+
+    fn take_refresh_receipt(
+        &mut self,
+        pin: &std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+    ) -> Option<crate::semantic_capture::CurrentPartitionReceipt> {
+        self.inner.take_refresh_receipt(pin, slot)
+    }
+
+    fn stash_admission_evidence(
+        &mut self,
+        receipts: Vec<crate::semantic_capture::CurrentPartitionReceipt>,
+        outcomes: Vec<crate::semantic_capture::TickOutcome>,
+    ) {
+        self.inner.stash_admission_evidence(receipts, outcomes)
+    }
+
+    fn physical_gaps(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        gaps: &mut Vec<crate::semantic_capture::PhysicalSemanticGap>,
+    ) -> Option<
+        Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        >,
+    > {
+        self.inner.physical_gaps(domain, gaps)
+    }
+
+    fn validate_collected_preparation(
+        &self,
+        raw: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Result<(), crate::inventory_semantics::SemanticRefusal> {
+        self.inner.validate_collected_preparation(raw)
+    }
+
+    fn physical_gaps_collected(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        gaps: &mut Vec<crate::semantic_capture::PhysicalSemanticGap>,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Option<
+        Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        >,
+    > {
+        self.inner.physical_gaps_collected(domain, gaps, raw)
+    }
+
+    fn validate_current(
+        &mut self,
+        receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+        report: &mut crate::semantic_capture::TickReport,
+    ) -> Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+        self.inner.validate_current(receipt, report)
+    }
+
+    fn tick(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) -> Result<
+        crate::inventory_semantics::SemanticBatch,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner.tick(domain)
+    }
+
+    fn refresh(
+        &mut self,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+    ) -> Result<
+        (
+            Vec<p11scope_ebpf_common::ImageIdentity>,
+            std::sync::Arc<crate::process::PidPin>,
+        ),
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner.refresh(pin, slot)
+    }
+
+    fn refresh_collected(
+        &mut self,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &crate::semantics_objects::journal::JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<
+        (
+            Vec<p11scope_ebpf_common::ImageIdentity>,
+            std::sync::Arc<crate::process::PidPin>,
+        ),
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner
+            .refresh_collected(pin, slot, raw, adapter, producers)
+    }
+
+    fn has_pending_evidence(&self) -> bool {
+        self.inner.has_pending_evidence()
+    }
+
+    fn finish(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) -> crate::inventory_semantics::SemanticBatch {
+        self.inner.finish(domain)
+    }
+
+    fn quiescent(&mut self) -> bool {
+        self.inner.quiescent()
+    }
+
+    fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+        self.inner.positions()
+    }
+
+    fn drain_events_to(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> crate::inventory_semantics::LaneDrainOutcome {
+        self.inner.drain_events_to(stop, quantum)
+    }
+
+    fn drain_discovery_to(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> crate::inventory_semantics::LaneDrainOutcome {
+        self.inner.drain_discovery_to(stop, quantum)
+    }
+}
+
 /// The strict s1only gate stages a mechanism-bearing modeled call whose
 /// native BEGIN is entry-time (MECH_NONE, no mechanism capture) while its S1
 /// admission is return-time (mechanism value): the default producer never
@@ -3191,6 +3413,329 @@ fn joint_machine_publish_discloses_length_stash_loss_rise() {
         .collect();
     assert_eq!(gaps.len(), 1, "the staged gap surfaces: {gaps:?}");
     assert_eq!(gaps[0].1, 1, "a single rise surfaces once: {gaps:?}");
+}
+
+/// A running publication that exhausts its slice must not read the
+/// native loss counters past its budget: the publish slice performs
+/// zero loss lookups, and the budgeted resume polls disclose exactly
+/// once before completion is exposed, without republishing (codex
+/// fix3 residual).
+#[test]
+fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let h0 = scene.scene.real.h0.clone();
+    let ring_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let stash_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    scene
+        .scene
+        .real
+        .lane
+        .install_test_io(Box::new(PublishCountedLossStub {
+            inner: h0,
+            ring_loss: std::collections::VecDeque::from([9, 9, 9]),
+            stash_loss: std::collections::VecDeque::from([(3, 1), (3, 1), (3, 1)]),
+            ring_polls: std::rc::Rc::clone(&ring_polls),
+            stash_polls: std::rc::Rc::clone(&stash_polls),
+        }));
+    let pid = std::process::id();
+    for (seq, name) in (1u64..).zip([
+        "C_CreateObject",
+        "C_SignInit",
+        "C_SignUpdate",
+        "C_SignFinal",
+    ]) {
+        scene.scene.push(pid, 0, name, seq);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    let lookups = || ring_polls.get() + stash_polls.get();
+    let mut publish_call = None;
+    let mut first_lookup_call = None;
+    let mut published = 0;
+    for call in 0..512 {
+        let before = lookups();
+        let progress = scene
+            .service(1)
+            .expect("one-action running slices serve until publish");
+        let after = lookups();
+        assert!(
+            after - before <= 1,
+            "one action buys at most one loss lookup (call {call})"
+        );
+        if phase_of(&scene) == "PublishedLossPoll" && publish_call.is_none() {
+            publish_call = Some(call);
+        }
+        if after != before && first_lookup_call.is_none() {
+            first_lookup_call = Some(call);
+        }
+        if matches!(
+            progress,
+            crate::inventory_semantics::JointServiceProgress::Published
+        ) {
+            published += 1;
+            break;
+        }
+    }
+    assert_eq!(published, 1, "the single demand publishes once");
+    let publish_call = publish_call.expect("the commit publishes through the post-publish phase");
+    let first_lookup_call = first_lookup_call.expect("the resume polls the loss counters");
+    assert!(
+        first_lookup_call > publish_call,
+        "zero loss lookups on the exhausted publish slice"
+    );
+    assert_eq!(
+        (ring_polls.get(), stash_polls.get()),
+        (1, 1),
+        "the resume polls each counter exactly once"
+    );
+    // Each rise stages one named gap at publish; the counts land immediately.
+    let staged: Vec<_> = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| {
+            subject == "native capture events lost" || subject == "key sizes lost some lengths"
+        })
+        .collect();
+    assert_eq!(
+        staged,
+        [
+            (
+                "native capture events lost".to_string(),
+                "the EVENTS ring was full; the kernel refused records \
+                 before the drain could read them \
+                 (kernel reserve failures; exact count in events_lost)"
+                    .to_string(),
+            ),
+            (
+                "key sizes lost some lengths".to_string(),
+                "the length stash dropped retention (a full map or a \
+                 stale row; exact counts in the semantic capture summary)"
+                    .to_string(),
+            ),
+        ],
+        "each rise stages one named gap on the budgeted resume"
+    );
+    let lane = &scene.scene.real.lane;
+    let summary = lane.semantic_summary();
+    assert_eq!(
+        (
+            lane.shed_calls_disclosed(),
+            lane.events_ring_loss_disclosed(),
+            summary.unrouted_returns,
+            summary.events_lost
+        ),
+        (0, 9, 0, 9),
+        "the disclosed ring delta counts exactly once on the resume"
+    );
+    assert_eq!(
+        (
+            lane.length_stash_loss_disclosed(),
+            summary.length_insert_failures,
+            summary.length_stash_mismatches
+        ),
+        ((3, 1), 3, 1),
+        "the disclosed stash delta counts exactly once on the resume"
+    );
+    // A settled publication stays settled: further passes stay
+    // Pending, poll nothing more and disclose nothing twice.
+    for _ in 0..3 {
+        assert!(
+            matches!(
+                scene.service(1).expect("settled passes stay servable"),
+                crate::inventory_semantics::JointServiceProgress::Pending
+            ),
+            "no second publication past completion"
+        );
+    }
+    assert_eq!(
+        (ring_polls.get(), stash_polls.get()),
+        (1, 1),
+        "no lookup repeats past completion"
+    );
+    let staged: Vec<_> = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| {
+            subject == "native capture events lost" || subject == "key sizes lost some lengths"
+        })
+        .collect();
+    assert_eq!(staged.len(), 2, "no gap repeats past completion: {staged:?}");
+}
+
+/// A Finish publication that exhausts its slice defers its loss
+/// polls the same way: zero lookups on the publish slice,
+/// exactly-once disclosure on the budgeted resume, one receipt and
+/// no republish (codex fix3 residual).
+#[test]
+fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let h0 = scene.scene.real.h0.clone();
+    let ring_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let stash_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    scene
+        .scene
+        .real
+        .lane
+        .install_test_io(Box::new(PublishCountedLossStub {
+            inner: h0,
+            ring_loss: std::collections::VecDeque::from([9, 9, 9, 9, 9, 9, 9, 9]),
+            stash_loss: std::collections::VecDeque::from([
+                (3, 1),
+                (3, 1),
+                (3, 1),
+                (3, 1),
+                (3, 1),
+                (3, 1),
+                (3, 1),
+                (3, 1),
+            ]),
+            ring_polls: std::rc::Rc::clone(&ring_polls),
+            stash_polls: std::rc::Rc::clone(&stash_polls),
+        }));
+    let pid = std::process::id();
+    for (seq, name) in (1u64..).zip([
+        "C_CreateObject",
+        "C_SignInit",
+        "C_SignUpdate",
+        "C_SignFinal",
+    ]) {
+        scene.scene.push(pid, 0, name, seq);
+    }
+    scene.enable_finish_fixture(Vec::new());
+    scene.begin_finish().unwrap();
+    let lookups = || ring_polls.get() + stash_polls.get();
+    let mut publish_calls = 0;
+    let mut published = 0;
+    for _ in 0..512 {
+        let before = lookups();
+        let phase_before = phase_of(&scene);
+        let progress = scene
+            .poll_finish(1)
+            .expect("one-action finish slices serve until publish");
+        let after = lookups();
+        assert!(
+            after - before <= 1,
+            "one action buys at most one loss lookup"
+        );
+        if phase_before != "PublishedLossPoll" && phase_of(&scene) == "PublishedLossPoll" {
+            publish_calls += 1;
+            assert_eq!(
+                after, before,
+                "zero loss lookups on the exhausted publish slice"
+            );
+        }
+        if matches!(progress, JointCommitProgress::Published(_)) {
+            published += 1;
+            assert!(
+                scene.scene.real.lane.is_finished(),
+                "the finish receipt finishes the lane"
+            );
+            break;
+        }
+    }
+    assert_eq!(published, 1, "the finish publishes one receipt");
+    assert!(
+        publish_calls >= 1,
+        "the finish commit publishes through the post-publish phase"
+    );
+    assert_eq!(
+        ring_polls.get(),
+        stash_polls.get(),
+        "every publish polls both counters exactly once"
+    );
+    assert!(
+        ring_polls.get() >= 1,
+        "the resume polls the loss counters"
+    );
+    let staged: Vec<_> = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| {
+            subject == "native capture events lost" || subject == "key sizes lost some lengths"
+        })
+        .collect();
+    assert_eq!(
+        staged,
+        [
+            (
+                "native capture events lost".to_string(),
+                "the EVENTS ring was full; the kernel refused records \
+                 before the drain could read them \
+                 (kernel reserve failures; exact count in events_lost)"
+                    .to_string(),
+            ),
+            (
+                "key sizes lost some lengths".to_string(),
+                "the length stash dropped retention (a full map or a \
+                 stale row; exact counts in the semantic capture summary)"
+                    .to_string(),
+            ),
+        ],
+        "each rise stages one named gap on the budgeted resume"
+    );
+    let lane = &scene.scene.real.lane;
+    let summary = lane.semantic_summary();
+    assert_eq!(
+        (
+            lane.shed_calls_disclosed(),
+            lane.events_ring_loss_disclosed(),
+            summary.unrouted_returns,
+            summary.events_lost
+        ),
+        (0, 9, 0, 9),
+        "the disclosed ring delta counts exactly once on the resume"
+    );
+    assert_eq!(
+        (
+            lane.length_stash_loss_disclosed(),
+            summary.length_insert_failures,
+            summary.length_stash_mismatches
+        ),
+        ((3, 1), 3, 1),
+        "the disclosed stash delta counts exactly once on the resume"
+    );
+    // A finished lane refuses further polls: no second receipt, no
+    // further lookups, no repeated gaps.
+    for _ in 0..3 {
+        assert!(
+            scene.poll_finish(1).is_err(),
+            "no second publication past the finish receipt"
+        );
+    }
+    assert_eq!(
+        ring_polls.get(),
+        stash_polls.get(),
+        "no lookup repeats past completion"
+    );
+    let staged: Vec<_> = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| {
+            subject == "native capture events lost" || subject == "key sizes lost some lengths"
+        })
+        .collect();
+    assert_eq!(staged.len(), 2, "no gap repeats past completion: {staged:?}");
 }
 
 /// Plain and machine polls share one ring-loss baseline on one

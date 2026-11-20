@@ -100739,8 +100739,10 @@ fn admission_owner1_rebuild_keeps_peer_and_binds_no_refused_module() {
                 counters: DiscoveryCounters::default(),
             },
         );
-        let mut newcomer_counters = DiscoveryCounters::default();
-        newcomer_counters.object_skips = skips;
+        let newcomer_counters = DiscoveryCounters {
+            object_skips: skips,
+            ..Default::default()
+        };
         engine.scan_inputs.insert(
             newcomer.view,
             ScanInput {
@@ -100794,8 +100796,10 @@ fn admission_owner1_snapshot_binds_no_refused_module() {
                 counters: DiscoveryCounters::default(),
             },
         );
-        let mut newcomer_counters = DiscoveryCounters::default();
-        newcomer_counters.object_skips = skips;
+        let newcomer_counters = DiscoveryCounters {
+            object_skips: skips,
+            ..Default::default()
+        };
         engine.scan_inputs.insert(
             newcomer.view,
             ScanInput {

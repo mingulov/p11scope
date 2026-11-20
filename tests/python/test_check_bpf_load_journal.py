@@ -171,6 +171,37 @@ LINKED_KEY_SIZES_BARE_LABEL_TEXT = LINKED_KEY_SIZES_TEXT + \
 LINKED_KEY_SIZES_NOSPACE_TEXT = LINKED_KEY_SIZES_TEXT + \
     "p11scope: joint decoder:raw_malformed=3 raw_malformed_unprovable=0\n"
 
+#: The healthy transcript whose sole decoder line carries the
+#: canonical zero plus NUL and trailing bytes: without text
+#: matching the `$` anchor matches at the NUL and the gate
+#: qualifies this malformed line as the exact zero record (codex
+#: fix3 residual, exact transcript).
+LINKED_KEY_SIZES_NUL_DECODER_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0\n",
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0\x00trailing-bytes\n")
+
+#: The healthy transcript whose sole decoder line carries the
+#: canonical zero plus a non-NUL control byte and trailing bytes:
+#: any byte outside the exact grammar refuses, not just NUL
+#: (codex fix3 residual).
+LINKED_KEY_SIZES_CONTROL_DECODER_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0\n",
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0\x07trailing-bytes\n")
+
+#: The healthy transcript whose sole decoder line carries the
+#: canonical zero plus printable trailing bytes: the exact record
+#: ends at the newline, so trailing data refuses (codex fix3
+#: residual).
+LINKED_KEY_SIZES_TRAILING_DECODER_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0\n",
+    "p11scope: joint decoder: raw_malformed=0 "
+    "raw_malformed_unprovable=0 trailing-bytes\n")
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -284,6 +315,9 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-unrelated-unknown": key_sizes_rows(),
             "linked-key-sizes-bare-label": key_sizes_rows(),
             "linked-key-sizes-nospace": key_sizes_rows(),
+            "linked-key-sizes-nul-decoder": key_sizes_rows(),
+            "linked-key-sizes-control-decoder": key_sizes_rows(),
+            "linked-key-sizes-trailing-decoder": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -346,6 +380,12 @@ class JournalGateTests(unittest.TestCase):
                 "rc": 0, "text": LINKED_KEY_SIZES_BARE_LABEL_TEXT},
             "linked-key-sizes-nospace": {
                 "rc": 0, "text": LINKED_KEY_SIZES_NOSPACE_TEXT},
+            "linked-key-sizes-nul-decoder": {
+                "rc": 0, "text": LINKED_KEY_SIZES_NUL_DECODER_TEXT},
+            "linked-key-sizes-control-decoder": {
+                "rc": 0, "text": LINKED_KEY_SIZES_CONTROL_DECODER_TEXT},
+            "linked-key-sizes-trailing-decoder": {
+                "rc": 0, "text": LINKED_KEY_SIZES_TRAILING_DECODER_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -945,6 +985,58 @@ class JournalGateTests(unittest.TestCase):
         # record must not vanish from the count.
         budgets = self.owned_key_sizes_budgets()
         result, out = self.run_gate(KERNEL, mode="linked-key-sizes-nospace",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_nul_tailed_decoder_record_fails(self):
+        # Non-vacuity (codex fix3 residual, exact transcript): the
+        # sole decoder line carrying the canonical zero plus NUL
+        # and trailing bytes must refuse as unprovable: without
+        # text matching the `$` anchor matches at the NUL and the
+        # gate qualifies the malformed line as the exact record.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-nul-decoder",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_control_tailed_decoder_record_fails(self):
+        # Non-vacuity (codex fix3 residual): the sole decoder line
+        # carrying the canonical zero plus a non-NUL control byte
+        # and trailing bytes must refuse as unprovable: any byte
+        # outside the exact grammar refuses, not just NUL.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-control-decoder",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("raw malformed count absent or unprovable",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_trailing_decoder_record_fails(self):
+        # Non-vacuity (codex fix3 residual): the sole decoder line
+        # carrying the canonical zero plus printable trailing bytes
+        # must refuse as unprovable: the exact record ends at the
+        # newline.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-trailing-decoder",
                                     budgets=budgets,
                                     object_name="journal-gate1",
                                     key_sizes="1")

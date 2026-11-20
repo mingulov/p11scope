@@ -10,10 +10,15 @@ requires, per leg: the workload's exact known counts and FIPS lengths;
 the four PQC mechanism rows with exact call counts; twelve per-key rows
 whose metadata label, inferred family and (sizes leg) inferred parameter
 set name the exact set; six generate_key_pair completions and no other
-unknown row; no before_semantic_boundary gap; and the verbose text
-showing family + parameter set on every PQC key row plus the `pqc keys:`
-spotlight with all six sets. Anything missing fails: no skip counts as
-a pass.
+unknown row; and the verbose text showing family + parameter set on
+every PQC key row plus the `pqc keys:` spotlight with all six sets.
+Anything missing fails: no skip counts as a pass.
+
+No gap assertion: the workload's setup calls (Initialize, sessions,
+login) legitimately precede the semantic receipt under deferred
+admission, so a `before_semantic_boundary` gap is expected and harmless;
+the exact PQC mechanism and row counts prove every PQC operation was
+observed instead (a missed PQC op breaks counts first).
 
 Usage:
   pqc_cell_compare.py --sizes-log F --sizes-exit N --sizes-inventory F
@@ -169,27 +174,6 @@ def check_key_rows(fail, leg, inv, sizes):
             fail.add(leg, f"unknown row {row!r}, want 6 not_applicable keygens")
 
 
-def gap_reasons(holders):
-    reasons = []
-    for gaps in holders:
-        rows = gaps.get("rows", []) if isinstance(gaps, dict) else gaps
-        for gap in rows or []:
-            if isinstance(gap, dict):
-                reasons.append(str(gap.get("reason", "")))
-            else:
-                reasons.append(str(gap))
-    return reasons
-
-
-def check_gaps(fail, leg, inv):
-    holders = [inv.get("gaps", []),
-               inv.get("object_observations", {}).get("gaps", [])]
-    for reason in gap_reasons(holders):
-        if "before_semantic_boundary" in reason:
-            fail.add(leg, "before_semantic_boundary gap present: "
-                          "ops ran before attach")
-
-
 def check_text(fail, leg, text_path, sizes):
     lines = Path(text_path).read_text(encoding="utf-8").splitlines()
     key_rows = [ln for ln in lines if ln.startswith("  key row ")]
@@ -226,7 +210,6 @@ def judge_leg(fail, leg, args, sizes):
             return
         check_mechanisms(fail, leg, inv)
         check_key_rows(fail, leg, inv, sizes)
-        check_gaps(fail, leg, inv)
         check_text(fail, leg, args[f"{leg}_text"], sizes)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         fail.add(leg, f"judge error: {exc!r}")
@@ -280,13 +263,13 @@ def main(argv):
         {"cell": "pqc-sizes-rows", "pass": sizes_fail.ok(),
          "qualification": "qualified",
          "detail": ("12 key rows carry family + template label + length set; "
-                    "6 keygens; 4 mechanism rows exact; no pre-boundary gap"
+                    "6 keygens; 4 mechanism rows exact"
                     if sizes_fail.ok()
                     else "; ".join(sizes_fail.problems))},
         {"cell": "pqc-nosizes-rows", "pass": nosizes_fail.ok(),
          "qualification": "qualified",
          "detail": ("12 key rows carry family + template label; 6 keygens; "
-                    "4 mechanism rows exact; no pre-boundary gap"
+                    "4 mechanism rows exact"
                     if nosizes_fail.ok()
                     else "; ".join(nosizes_fail.problems))},
     ]

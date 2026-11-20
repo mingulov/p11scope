@@ -262,27 +262,33 @@ int main(int argc, char**argv){
   const char* mldsa_names[4]={NULL,"ML-DSA-44","ML-DSA-65","ML-DSA-87"};
   const char* mlkem_names[4]={NULL,"ML-KEM-512","ML-KEM-768","ML-KEM-1024"};
   for(int set=1;set<=3;set++){
+    /* Every attribute value below lives in its own variable: the
+     * observer refuses template values whose spans alias another
+     * attribute's span (same or peer template), so sharing one
+     * &kt/&btrue across the two halves would leave every row
+     * type-unknown by design. */
     CK_OBJECT_CLASS pub_class=CKO_PUBLIC_KEY, priv_class=CKO_PRIVATE_KEY;
-    CK_KEY_TYPE kt=CKK_ML_DSA;
-    CK_ULONG ps=(CK_ULONG)set;
-    CK_BBOOL btrue=1,bfalse=0;
+    CK_KEY_TYPE kt_pub=CKK_ML_DSA, kt_priv=CKK_ML_DSA;
+    CK_ULONG ps_pub=(CK_ULONG)set, ps_priv=(CK_ULONG)set;
+    CK_BBOOL tok_pub=0, tok_priv=0;
+    CK_BBOOL b_verify=1, b_private=1, b_sensitive=1, b_sign=1;
     char label[64]; snprintf(label,sizeof label,"pqc-mldsa-%d",set);
     struct CK_ATTRIBUTE pubT[]={
       {CKA_CLASS,&pub_class,sizeof pub_class},
-      {CKA_KEY_TYPE,&kt,sizeof kt},
-      {CKA_PARAMETER_SET,&ps,sizeof ps},
-      {CKA_TOKEN,&bfalse,sizeof bfalse},
-      {CKA_VERIFY,&btrue,sizeof btrue},
+      {CKA_KEY_TYPE,&kt_pub,sizeof kt_pub},
+      {CKA_PARAMETER_SET,&ps_pub,sizeof ps_pub},
+      {CKA_TOKEN,&tok_pub,sizeof tok_pub},
+      {CKA_VERIFY,&b_verify,sizeof b_verify},
       {CKA_LABEL,label,strlen(label)},
     };
     struct CK_ATTRIBUTE privT[]={
       {CKA_CLASS,&priv_class,sizeof priv_class},
-      {CKA_KEY_TYPE,&kt,sizeof kt},
-      {CKA_PARAMETER_SET,&ps,sizeof ps},
-      {CKA_TOKEN,&bfalse,sizeof bfalse},
-      {CKA_PRIVATE,&btrue,sizeof btrue},
-      {CKA_SENSITIVE,&btrue,sizeof btrue},
-      {CKA_SIGN,&btrue,sizeof btrue},
+      {CKA_KEY_TYPE,&kt_priv,sizeof kt_priv},
+      {CKA_PARAMETER_SET,&ps_priv,sizeof ps_priv},
+      {CKA_TOKEN,&tok_priv,sizeof tok_priv},
+      {CKA_PRIVATE,&b_private,sizeof b_private},
+      {CKA_SENSITIVE,&b_sensitive,sizeof b_sensitive},
+      {CKA_SIGN,&b_sign,sizeof b_sign},
       {CKA_LABEL,label,strlen(label)},
     };
     struct CK_MECHANISM gen={CKM_ML_DSA_KEY_PAIR_GEN,NULL,0};
@@ -308,27 +314,30 @@ int main(int argc, char**argv){
     for(int i=0;i<pace;i++) sleep(1);
   }
   for(int set=1;set<=3;set++){
+    /* Unshared value variables (see above): aliased template spans
+     * are refused by design. */
     CK_OBJECT_CLASS pub_class=CKO_PUBLIC_KEY, priv_class=CKO_PRIVATE_KEY;
-    CK_KEY_TYPE kt=CKK_ML_KEM;
-    CK_ULONG ps=(CK_ULONG)set;
-    CK_BBOOL btrue=1,bfalse=0;
+    CK_KEY_TYPE kt_pub=CKK_ML_KEM, kt_priv=CKK_ML_KEM;
+    CK_ULONG ps_pub=(CK_ULONG)set, ps_priv=(CK_ULONG)set;
+    CK_BBOOL tok_pub=0, tok_priv=0;
+    CK_BBOOL b_enc=1, b_private=1, b_sensitive=1, b_dec=1;
     char label[64]; snprintf(label,sizeof label,"pqc-mlkem-%d",set);
     struct CK_ATTRIBUTE pubT[]={
       {CKA_CLASS,&pub_class,sizeof pub_class},
-      {CKA_KEY_TYPE,&kt,sizeof kt},
-      {CKA_PARAMETER_SET,&ps,sizeof ps},
-      {CKA_TOKEN,&bfalse,sizeof bfalse},
-      {CKA_ENCAPSULATE,&btrue,sizeof btrue},
+      {CKA_KEY_TYPE,&kt_pub,sizeof kt_pub},
+      {CKA_PARAMETER_SET,&ps_pub,sizeof ps_pub},
+      {CKA_TOKEN,&tok_pub,sizeof tok_pub},
+      {CKA_ENCAPSULATE,&b_enc,sizeof b_enc},
       {CKA_LABEL,label,strlen(label)},
     };
     struct CK_ATTRIBUTE privT[]={
       {CKA_CLASS,&priv_class,sizeof priv_class},
-      {CKA_KEY_TYPE,&kt,sizeof kt},
-      {CKA_PARAMETER_SET,&ps,sizeof ps},
-      {CKA_TOKEN,&bfalse,sizeof bfalse},
-      {CKA_PRIVATE,&btrue,sizeof btrue},
-      {CKA_SENSITIVE,&btrue,sizeof btrue},
-      {CKA_DECAPSULATE,&btrue,sizeof btrue},
+      {CKA_KEY_TYPE,&kt_priv,sizeof kt_priv},
+      {CKA_PARAMETER_SET,&ps_priv,sizeof ps_priv},
+      {CKA_TOKEN,&tok_priv,sizeof tok_priv},
+      {CKA_PRIVATE,&b_private,sizeof b_private},
+      {CKA_SENSITIVE,&b_sensitive,sizeof b_sensitive},
+      {CKA_DECAPSULATE,&b_dec,sizeof b_dec},
       {CKA_LABEL,label,strlen(label)},
     };
     struct CK_MECHANISM gen={CKM_ML_KEM_KEY_PAIR_GEN,NULL,0};
@@ -339,12 +348,13 @@ int main(int argc, char**argv){
     mlkem_gen++;
     struct CK_MECHANISM mech={CKM_ML_KEM,NULL,0};
     CK_OBJECT_CLASS sec_class=CKO_SECRET_KEY; CK_KEY_TYPE sec_kt=CKK_GENERIC_SECRET; CK_ULONG sec_len=32;
+    CK_BBOOL shr_tok=0, shr_sens=0, shr_ext=1;
     struct CK_ATTRIBUTE shrT[]={
       {CKA_CLASS,&sec_class,sizeof sec_class},
       {CKA_KEY_TYPE,&sec_kt,sizeof sec_kt},
-      {CKA_TOKEN,&bfalse,sizeof bfalse},
-      {CKA_SENSITIVE,&bfalse,sizeof bfalse},
-      {CKA_EXTRACTABLE,&btrue,sizeof btrue},
+      {CKA_TOKEN,&shr_tok,sizeof shr_tok},
+      {CKA_SENSITIVE,&shr_sens,sizeof shr_sens},
+      {CKA_EXTRACTABLE,&shr_ext,sizeof shr_ext},
       {CKA_VALUE_LEN,&sec_len,sizeof sec_len},
     };
     CK_BYTE ct[1600]; CK_ULONG ctlen=sizeof ct; CK_OBJECT_HANDLE shr1=0;

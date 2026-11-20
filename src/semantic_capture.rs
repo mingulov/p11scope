@@ -2394,6 +2394,13 @@ impl SemanticCapture {
     /// observation. Every current-truth check stays strict under
     /// tolerance: capture, custody, attachment, health, fence and
     /// the live re-read must all agree with now.
+    ///
+    /// Router standing cannot move mid-validate: this takes only
+    /// `&self`, the router holds no interior mutability, and the
+    /// I/O leaf reaches no router state, so one standing check
+    /// decides. Live moves between takes are caught by the
+    /// before/after re-validation pair around the native read,
+    /// not here.
     fn validate_birth_candidate(
         &self,
         io: &mut impl CaptureIo,
@@ -2449,7 +2456,7 @@ impl SemanticCapture {
         let deadline = io
             .now()
             .checked_add(self.limits.scan_slice)
-            .ok_or(Refusal::CurrentPartition)?;
+            .ok_or(Refusal::TakeDeadline)?;
         let deadline = if retained {
             deadline
         } else {
@@ -2495,21 +2502,6 @@ impl SemanticCapture {
                 return Err(Refusal::EpochDrift);
             }
             tolerated = true;
-        }
-        // Truth must not move under the live re-read: a newer
-        // standing than the validated one races the take (the next
-        // tick re-takes), while a break kills the birth. The strict
-        // path never tolerates, so any move breaks its candidate.
-        let moved = match self.birth_standing(receipt) {
-            BirthPartitionStanding::Current => effective != receipt.epochs,
-            BirthPartitionStanding::Continuous { epochs } if retained => epochs != effective,
-            BirthPartitionStanding::Continuous { .. } => {
-                return Err(Refusal::WitnessStale);
-            }
-            BirthPartitionStanding::Broken => return Err(Refusal::WitnessStale),
-        };
-        if moved {
-            return Err(Refusal::EpochDrift);
         }
         if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint)
             || !Arc::ptr_eq(

@@ -167,7 +167,20 @@ fn inspect_prepared(prepared: &PreparedInventory) -> Result<OwnedIds> {
     anyhow::ensure!(super::super::program_array_id("TAIL_CALLS", tails, 1)?.is_none());
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 15 && ids.programs.len() == 12);
+    // Keymeta Task 7: FULL objects carry the four INFO maps and the
+    // three info programs beside the base census; P0 keeps the
+    // pre-info shape.
+    let expected_maps = if cfg!(feature = "stub-object-attributes") {
+        15
+    } else {
+        19
+    };
+    let expected_programs = if cfg!(feature = "stub-object-attributes") {
+        12
+    } else {
+        15
+    };
+    anyhow::ensure!(ids.maps.len() == expected_maps && ids.programs.len() == expected_programs);
     let guard = prepared.ebpf.map("STACK_GUARD").context("STACK_GUARD")?;
     anyhow::ensure!(super::super::program_array_id("STACK_GUARD", guard, 0)?.is_none());
     ids.assert_no_links()?;
@@ -418,7 +431,20 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
     validate_runtime_inventory_programs(&prepared.ebpf, true)?;
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 22 && ids.programs.len() == 12);
+    // Keymeta Task 7: FULL objects carry the four INFO maps and the
+    // three info programs beside the base census; P0 keeps the
+    // pre-info shape.
+    let expected_maps = if cfg!(feature = "stub-object-attributes") {
+        22
+    } else {
+        26
+    };
+    let expected_programs = if cfg!(feature = "stub-object-attributes") {
+        12
+    } else {
+        15
+    };
+    anyhow::ensure!(ids.maps.len() == expected_maps && ids.programs.len() == expected_programs);
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
     anyhow::ensure!(
         pidfd >= 0,
@@ -523,7 +549,15 @@ fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> R
             |state, step| {
                 ids.observe(state.ebpf()?)?;
                 if step == failed {
-                    anyhow::ensure!(ids.maps.len() == 22 && ids.programs.is_empty());
+                    // Keymeta Task 7: FULL objects carry the four INFO
+                    // maps beside the base census; programs still load
+                    // after this phase.
+                    let expected_maps = if cfg!(feature = "stub-object-attributes") {
+                        22
+                    } else {
+                        26
+                    };
+                    anyhow::ensure!(ids.maps.len() == expected_maps && ids.programs.is_empty());
                     ids.assert_no_links()?;
                     eprintln!(
                         "I2C_CALLER_PREP_IDS phase=held step={failed:?} ids={ids:?} links={{}}"

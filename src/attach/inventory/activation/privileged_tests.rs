@@ -1317,10 +1317,24 @@ impl OwnedIds {
             baseline_unloaded == callers,
             "caller baseline iterator presence differs from the flavor"
         );
-        let expected_maps = if callers { 22 } else { 15 };
+        // Keymeta Task 7: FULL objects carry the four INFO maps and
+        // the three info programs beside the base census; P0 keeps
+        // the pre-info shape.
+        let expected_maps = if cfg!(feature = "stub-object-attributes") {
+            if callers { 22 } else { 15 }
+        } else if callers {
+            26
+        } else {
+            19
+        };
+        let expected_programs = if cfg!(feature = "stub-object-attributes") {
+            12
+        } else {
+            15
+        };
         ensure!(
-            ids.maps.len() == expected_maps && ids.programs.len() == 12,
-            "prepared Inventory census (maps, programs) = ({}, {}), expected ({expected_maps}, 12)",
+            ids.maps.len() == expected_maps && ids.programs.len() == expected_programs,
+            "prepared Inventory census (maps, programs) = ({}, {}), expected ({expected_maps}, {expected_programs})",
             ids.maps.len(),
             ids.programs.len()
         );

@@ -75,38 +75,50 @@ pub(crate) fn demotion_gap_subject() -> String {
 }
 
 /// What the next pass continues: member tiers plus budget-stop
-/// streaks. Never-attempted members scan first, then cut-short
-/// retries, then demoted members past [`BUDGET_STOP_DEMOTE_AFTER`],
-/// then examined members. Streaks key by task generation, so pid
-/// reuse starts fresh; pruning retains enumerated tasks only.
+/// streaks plus per-member own-spend totals. Never-attempted members
+/// scan first, then cut-short retries, then demoted members past
+/// [`BUDGET_STOP_DEMOTE_AFTER`], then examined members; within each
+/// tier the least-spent member scans first, so a refused prefix that
+/// already spent its turns cannot camp at the head ahead of a deferred
+/// tail. Streaks and spend key by task generation, so pid reuse starts
+/// fresh; pruning retains enumerated tasks only.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ResumeCursor {
     examined: BTreeSet<MemberTask>,
     fresh: BTreeSet<MemberTask>,
     streaks: BTreeMap<MemberTask, u32>,
+    own_spend: BTreeMap<MemberTask, u64>,
 }
 
 impl ResumeCursor {
-    /// Records one applied pass's member outcomes and returns the
-    /// tasks newly demoted this pass — the driver files one
-    /// [`demotion_gap_subject`] row per task, never a row per pass.
-    /// Discarded passes record nothing. Noting a task with a proven
-    /// generation supersedes other generations of the same pid, so
-    /// pid reuse never inherits a tier or streak; call
-    /// [`ResumeCursor::prune_to_live`] with the pass enumeration to
-    /// drop departed pids.
+    /// Records one applied pass's member outcomes plus each member's
+    /// own work spent this pass, and returns the tasks newly demoted
+    /// this pass — the driver files one [`demotion_gap_subject`] row per
+    /// task, never a row per pass. Discarded passes record nothing.
+    /// Noting a task with a proven generation supersedes other
+    /// generations of the same pid, so pid reuse never inherits a tier,
+    /// streak or spend total; call [`ResumeCursor::prune_to_live`] with
+    /// the pass enumeration to drop departed pids. Unattempted members
+    /// (deferred before work, never selected, exited) stay
+    /// never-attempted — ahead of retried members — so a deferred tail
+    /// retries before a retried prefix.
     pub(crate) fn note_member_outcomes(
         &mut self,
-        outcomes: &[(MemberTask, MemberOutcome)],
+        outcomes: &[(MemberTask, MemberOutcome, u64)],
     ) -> Vec<MemberTask> {
         let mut newly_demoted = Vec::new();
-        for (task, outcome) in outcomes {
+        for (task, outcome, own_work) in outcomes {
             if task.1.is_some() {
                 let superseded = |held: &MemberTask| held.0 == task.0 && held.1 != task.1;
                 self.examined.retain(|held| !superseded(held));
                 self.fresh.retain(|held| !superseded(held));
                 self.streaks.retain(|held, _| !superseded(held));
+                self.own_spend.retain(|held, _| !superseded(held));
             }
+            self.own_spend
+                .entry(*task)
+                .and_modify(|total| *total = total.saturating_add(*own_work))
+                .or_insert(*own_work);
             match outcome {
                 MemberOutcome::Examined => {
                     self.examined.insert(*task);
@@ -128,7 +140,7 @@ impl ResumeCursor {
                         newly_demoted.push(*task);
                     }
                 }
-                MemberOutcome::CutShortOther | MemberOutcome::Unattempted => {
+                MemberOutcome::CutShortOther => {
                     self.examined.remove(task);
                     if self
                         .streaks
@@ -138,15 +150,22 @@ impl ResumeCursor {
                         self.fresh.insert(*task);
                     }
                 }
+                MemberOutcome::Unattempted => {
+                    // Stays never-attempted: out of every tier, so the
+                    // next pass retries it before any retried member.
+                    self.examined.remove(task);
+                    self.fresh.remove(task);
+                }
             }
         }
         newly_demoted
     }
 
     /// Orders tasks for this pass: never-attempted first, then
-    /// cut-short retries, then demoted members, then examined ones
-    /// (ascending pid within each tier). Unknown tasks read
-    /// never-attempted: work fails toward retry, never toward stall.
+    /// cut-short retries, then demoted members, then examined ones;
+    /// within each tier the least-spent member scans first (pid breaks
+    /// ties), so a refused prefix cannot camp at the head. Unknown tasks
+    /// read never-attempted: work fails toward retry, never toward stall.
     #[cfg(test)]
     pub(crate) fn order_members(&self, tasks: &[MemberTask]) -> Vec<u32> {
         let mut never = Vec::new();
@@ -154,18 +173,19 @@ impl ResumeCursor {
         let mut demoted = Vec::new();
         let mut examined = Vec::new();
         for task in tasks {
+            let spend = self.own_spend.get(task).copied().unwrap_or(0);
             if self.examined.contains(task) {
-                examined.push(task.0);
+                examined.push((spend, task.0));
             } else if self
                 .streaks
                 .get(task)
                 .is_some_and(|streak| *streak >= BUDGET_STOP_DEMOTE_AFTER)
             {
-                demoted.push(task.0);
+                demoted.push((spend, task.0));
             } else if self.fresh.contains(task) || self.streaks.contains_key(task) {
-                retry.push(task.0);
+                retry.push((spend, task.0));
             } else {
-                never.push(task.0);
+                never.push((spend, task.0));
             }
         }
         never.sort_unstable();
@@ -174,9 +194,10 @@ impl ResumeCursor {
         examined.sort_unstable();
         never
             .into_iter()
-            .chain(retry)
-            .chain(demoted)
-            .chain(examined)
+            .map(|(_, pid)| pid)
+            .chain(retry.into_iter().map(|(_, pid)| pid))
+            .chain(demoted.into_iter().map(|(_, pid)| pid))
+            .chain(examined.into_iter().map(|(_, pid)| pid))
             .collect()
     }
 
@@ -192,6 +213,12 @@ impl ResumeCursor {
         self.streaks.clone()
     }
 
+    /// Per-member own-spend totals, for tests.
+    #[cfg(test)]
+    pub(crate) fn own_spend_for_test(&self) -> BTreeMap<MemberTask, u64> {
+        self.own_spend.clone()
+    }
+
     /// Examined tasks held, for memory telemetry.
     pub(crate) fn examined_len(&self) -> usize {
         self.examined.len()
@@ -203,6 +230,7 @@ impl ResumeCursor {
         self.examined.retain(|task| live_pids.contains(&task.0));
         self.fresh.retain(|task| live_pids.contains(&task.0));
         self.streaks.retain(|task, _| live_pids.contains(&task.0));
+        self.own_spend.retain(|task, _| live_pids.contains(&task.0));
     }
 
     /// Projects the tiers to pid sets for selection: recorded tasks
@@ -211,6 +239,8 @@ impl ResumeCursor {
     /// A recycled pid reads fresh, so reuse never inherits the old
     /// incarnation's slot. Never-attempted is the complement (any pid
     /// in no set); unknown work fails toward retry, never toward stall.
+    /// Spend projects alongside the tiers, so under-cap selection orders
+    /// each tier least-spent first.
     pub(crate) fn tiers_for_selection(
         &self,
         live_start_time: impl Fn(u32) -> Option<u64>,
@@ -234,17 +264,27 @@ impl ResumeCursor {
         {
             tiers.demoted.insert(task.0);
         }
+        for (task, spend) in self.own_spend.iter().filter(|(task, _)| live(task)) {
+            tiers
+                .spend
+                .entry(task.0)
+                .and_modify(|total| *total = total.saturating_add(*spend))
+                .or_insert(*spend);
+        }
         tiers
     }
 }
 
 /// The cursor's tiers projected to pids for one selection pass.
-/// Never-attempted members are any pid in no set.
+/// Never-attempted members are any pid in no set. Spend maps pid to
+/// cumulative own work, so under-cap selection orders each tier
+/// least-spent first; pids absent from the map spent nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct MemberTiers {
     pub(crate) examined: BTreeSet<u32>,
     pub(crate) retry: BTreeSet<u32>,
     pub(crate) demoted: BTreeSet<u32>,
+    pub(crate) spend: BTreeMap<u32, u64>,
 }
 
 impl MemberTiers {
@@ -257,21 +297,23 @@ impl MemberTiers {
 
     /// Orders pids for an under-cap pass: never-attempted first,
     /// then cut-short retries, then demoted members, then examined
-    /// ones (ascending pid within each tier).
+    /// ones; within each tier the least-spent member scans first (pid
+    /// breaks ties), so a refused prefix cannot camp at the head.
     pub(crate) fn order_under_cap(&self, pids: &[u32]) -> Vec<u32> {
         let mut never = Vec::new();
         let mut retry = Vec::new();
         let mut demoted = Vec::new();
         let mut examined = Vec::new();
         for pid in pids {
+            let spend = self.spend.get(pid).copied().unwrap_or(0);
             if self.examined.contains(pid) {
-                examined.push(*pid);
+                examined.push((spend, *pid));
             } else if self.demoted.contains(pid) {
-                demoted.push(*pid);
+                demoted.push((spend, *pid));
             } else if self.retry.contains(pid) {
-                retry.push(*pid);
+                retry.push((spend, *pid));
             } else {
-                never.push(*pid);
+                never.push((spend, *pid));
             }
         }
         never.sort_unstable();
@@ -280,9 +322,10 @@ impl MemberTiers {
         examined.sort_unstable();
         never
             .into_iter()
-            .chain(retry)
-            .chain(demoted)
-            .chain(examined)
+            .map(|(_, pid)| pid)
+            .chain(retry.into_iter().map(|(_, pid)| pid))
+            .chain(demoted.into_iter().map(|(_, pid)| pid))
+            .chain(examined.into_iter().map(|(_, pid)| pid))
             .collect()
     }
 }
@@ -629,6 +672,16 @@ impl ScanPassOwner {
                 .map_or(u64::MAX, |window| window.limits.work_units),
             DiscoveryPolicy::DetailedLegacy => self.work_ceiling,
         }
+    }
+
+    /// The pass work allowance for own-spend scheduling: a member whose
+    /// own turn spent this much while tripping a budget stop is the hog
+    /// that actually spent the window, not an inherited-shortage victim.
+    /// No new constant: the existing per-pass bound is the threshold, so
+    /// uniform members (about 1/250 of the window) never accrue on spend
+    /// alone.
+    pub(crate) fn work_allowance_for_scheduling(&self) -> u64 {
+        self.work_allowance()
     }
 
     fn io_allowance(&self) -> u64 {
@@ -1268,10 +1321,10 @@ mod tests {
         );
         assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
         pass.cursor_mut().note_member_outcomes(&[
-            ((1, Some(10)), MemberOutcome::Examined),
-            ((2, Some(20)), MemberOutcome::Examined),
-            ((3, Some(30)), MemberOutcome::CutShortBudgetStop),
-            ((4, Some(40)), MemberOutcome::CutShortBudgetStop),
+            ((1, Some(10)), MemberOutcome::Examined, 0),
+            ((2, Some(20)), MemberOutcome::Examined, 0),
+            ((3, Some(30)), MemberOutcome::CutShortBudgetStop, 0),
+            ((4, Some(40)), MemberOutcome::CutShortBudgetStop, 0),
         ]);
         assert_eq!(pass.end_pass(), Some(WORK_CEILING_REASON));
         assert_eq!(pass.interval_exhaustions(), 1);
@@ -1618,8 +1671,8 @@ mod tests {
     fn owner2_cursor_orders_never_attempted_first() {
         let mut pass = detailed(u64::MAX, u64::MAX);
         pass.cursor_mut().note_member_outcomes(&[
-            ((10, Some(1)), MemberOutcome::Examined),
-            ((20, Some(2)), MemberOutcome::Examined),
+            ((10, Some(1)), MemberOutcome::Examined, 0),
+            ((20, Some(2)), MemberOutcome::Examined, 0),
         ]);
         assert_eq!(
             pass.cursor()
@@ -1645,8 +1698,8 @@ mod tests {
     fn owner2_cursor_keeps_cut_short_members_fresh_for_retry() {
         let mut pass = detailed(u64::MAX, u64::MAX);
         pass.cursor_mut().note_member_outcomes(&[
-            ((11, Some(110)), MemberOutcome::CutShortBudgetStop),
-            ((12, Some(120)), MemberOutcome::Examined),
+            ((11, Some(110)), MemberOutcome::CutShortBudgetStop, 0),
+            ((12, Some(120)), MemberOutcome::Examined, 0),
         ]);
         assert_eq!(
             pass.cursor().examined_for_test(),
@@ -1670,18 +1723,22 @@ mod tests {
         let mut pass = detailed(u64::MAX, u64::MAX);
         let stuck = (11, None);
         for streak in 1..BUDGET_STOP_DEMOTE_AFTER {
-            let demoted = pass
-                .cursor_mut()
-                .note_member_outcomes(&[(stuck, MemberOutcome::CutShortBudgetStop)]);
+            let demoted = pass.cursor_mut().note_member_outcomes(&[(
+                stuck,
+                MemberOutcome::CutShortBudgetStop,
+                0,
+            )]);
             assert!(demoted.is_empty(), "pass {streak} still retries first");
             assert!(
                 !pass.cursor().examined_for_test().contains(&stuck),
                 "pass {streak}: the retrying member still counts as fresh"
             );
         }
-        let demoted = pass
-            .cursor_mut()
-            .note_member_outcomes(&[(stuck, MemberOutcome::CutShortBudgetStop)]);
+        let demoted = pass.cursor_mut().note_member_outcomes(&[(
+            stuck,
+            MemberOutcome::CutShortBudgetStop,
+            0,
+        )]);
         assert_eq!(
             demoted,
             vec![stuck],
@@ -1699,7 +1756,7 @@ mod tests {
         // A gap-free scan completes it: the streak clears and the
         // member joins examined memory genuinely.
         pass.cursor_mut()
-            .note_member_outcomes(&[(stuck, MemberOutcome::Examined)]);
+            .note_member_outcomes(&[(stuck, MemberOutcome::Examined, 0)]);
         assert!(
             pass.cursor().streaks_for_test().is_empty(),
             "completing clears the streak"
@@ -1718,7 +1775,7 @@ mod tests {
         for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
             crossings += pass
                 .cursor_mut()
-                .note_member_outcomes(&[(stuck, MemberOutcome::CutShortBudgetStop)])
+                .note_member_outcomes(&[(stuck, MemberOutcome::CutShortBudgetStop, 0)])
                 .len();
         }
         assert_eq!(crossings, 1, "one named gap for the stuck member");
@@ -1730,7 +1787,7 @@ mod tests {
         for _ in 0..2 {
             crossings += pass
                 .cursor_mut()
-                .note_member_outcomes(&[(stuck, MemberOutcome::CutShortBudgetStop)])
+                .note_member_outcomes(&[(stuck, MemberOutcome::CutShortBudgetStop, 0)])
                 .len();
         }
         assert_eq!(crossings, 1, "no per-pass flood while stuck");
@@ -1743,8 +1800,11 @@ mod tests {
     fn owner2_cursor_streak_restarts_on_pid_reuse() {
         let mut pass = detailed(u64::MAX, u64::MAX);
         for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
-            pass.cursor_mut()
-                .note_member_outcomes(&[((11, Some(100)), MemberOutcome::CutShortBudgetStop)]);
+            pass.cursor_mut().note_member_outcomes(&[(
+                (11, Some(100)),
+                MemberOutcome::CutShortBudgetStop,
+                0,
+            )]);
         }
         assert_eq!(
             pass.cursor().order_members(&[(11, Some(100)), (12, None)]),
@@ -1752,9 +1812,11 @@ mod tests {
             "the old incarnation is demoted"
         );
         // The pid is recycled with a new start-time: fresh streak.
-        let demoted = pass
-            .cursor_mut()
-            .note_member_outcomes(&[((11, Some(200)), MemberOutcome::CutShortBudgetStop)]);
+        let demoted = pass.cursor_mut().note_member_outcomes(&[(
+            (11, Some(200)),
+            MemberOutcome::CutShortBudgetStop,
+            0,
+        )]);
         assert!(demoted.is_empty(), "the new incarnation starts unstuck");
         assert_eq!(
             pass.cursor().streaks_for_test().get(&(11, Some(200))),
@@ -1779,8 +1841,8 @@ mod tests {
         let mut pass = detailed(u64::MAX, u64::MAX);
         for _ in 0..BUDGET_STOP_DEMOTE_AFTER {
             let demoted = pass.cursor_mut().note_member_outcomes(&[
-                ((21, Some(210)), MemberOutcome::CutShortOther),
-                ((22, Some(220)), MemberOutcome::Unattempted),
+                ((21, Some(210)), MemberOutcome::CutShortOther, 0),
+                ((22, Some(220)), MemberOutcome::Unattempted, 0),
             ]);
             assert!(demoted.is_empty(), "non-budget outcomes never accrue");
         }
@@ -1792,8 +1854,11 @@ mod tests {
             "unattempted members stay never-attempted, ahead of retried members"
         );
         // A budget stop does accrue.
-        pass.cursor_mut()
-            .note_member_outcomes(&[((21, Some(210)), MemberOutcome::CutShortBudgetStop)]);
+        pass.cursor_mut().note_member_outcomes(&[(
+            (21, Some(210)),
+            MemberOutcome::CutShortBudgetStop,
+            0,
+        )]);
         assert_eq!(
             pass.cursor().streaks_for_test().get(&(21, Some(210))),
             Some(&1)
@@ -1820,11 +1885,8 @@ mod tests {
             ((500, Some(5000)), MemberOutcome::CutShortOther, 100),
         ]);
         assert_eq!(
-            pass.cursor().order_members(&[
-                (10, Some(100)),
-                (500, Some(5000)),
-                (501, Some(5010))
-            ]),
+            pass.cursor()
+                .order_members(&[(10, Some(100)), (500, Some(5000)), (501, Some(5010))]),
             vec![501, 500, 10],
             "the least-spent retry scans first, regardless of pid"
         );
@@ -1844,22 +1906,31 @@ mod tests {
             pass.cursor().own_spend_for_test().get(&(10, Some(100))),
             Some(&5000)
         );
-        pass.cursor_mut()
-            .note_member_outcomes(&[((10, Some(100)), MemberOutcome::CutShortOther, 3000)]);
+        pass.cursor_mut().note_member_outcomes(&[(
+            (10, Some(100)),
+            MemberOutcome::CutShortOther,
+            3000,
+        )]);
         assert_eq!(
             pass.cursor().own_spend_for_test().get(&(10, Some(100))),
             Some(&8000),
             "spend accumulates across passes"
         );
-        pass.cursor_mut()
-            .note_member_outcomes(&[((10, Some(200)), MemberOutcome::CutShortOther, 50)]);
+        pass.cursor_mut().note_member_outcomes(&[(
+            (10, Some(200)),
+            MemberOutcome::CutShortOther,
+            50,
+        )]);
         assert_eq!(
             pass.cursor().own_spend_for_test().get(&(10, Some(200))),
             Some(&50),
             "a recycled pid starts fresh"
         );
         assert!(
-            !pass.cursor().own_spend_for_test().contains_key(&(10, Some(100))),
+            !pass
+                .cursor()
+                .own_spend_for_test()
+                .contains_key(&(10, Some(100))),
             "the old incarnation's spend never transfers"
         );
     }

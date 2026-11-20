@@ -459,6 +459,10 @@ struct MemberResult {
     view: ProcessViewId,
     status: MemberStatus,
     work_disposition: MemberWorkDisposition,
+    /// Work units this member's own turn spent (after-minus-before
+    /// consumption): fair-share ordering and hog accrual charge the
+    /// spender, never an inherited shortage.
+    own_work: u64,
     generation: Option<MemberGeneration>,
     complete_scan: Option<CompleteMemberScan>,
     /// Completed presentation receipt, separate from physical/absence authority.
@@ -1016,10 +1020,11 @@ fn scan_member_identity(
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
+    let consumption_before = budget.consumption_snapshot();
     // Whether this turn began with the pass's standard allowance: entry
     // consumption equal to the deep-scan loop-start baseline. Read before
     // the view opens; the disposition below compares it once.
-    let full_allowance = budget.consumption_snapshot() == allowance_baseline;
+    let full_allowance = consumption_before == allowance_baseline;
     let opened = ProcessView::open_with_budget(view, pid, budget);
     let view_handle = match opened {
         Ok(view_handle) => view_handle,
@@ -1037,6 +1042,10 @@ fn scan_member_identity(
                 budget.stopped_reason(),
                 full_allowance,
             );
+            let consumption_after = budget.consumption_snapshot();
+            member.own_work = consumption_after
+                .work_units
+                .saturating_sub(consumption_before.work_units);
             return member;
         }
     };
@@ -1061,6 +1070,10 @@ fn scan_member_identity(
         budget.stopped_reason(),
         full_allowance,
     );
+    let consumption_after = budget.consumption_snapshot();
+    member.own_work = consumption_after
+        .work_units
+        .saturating_sub(consumption_before.work_units);
     member
 }
 
@@ -1298,6 +1311,7 @@ fn scan_pinned_member_inner(
         view,
         status,
         work_disposition: MemberWorkDisposition::NoBudgetStop,
+        own_work: 0,
         generation: Some(generation),
         modules,
         examined,
@@ -1360,6 +1374,7 @@ fn member_not_scanned(
         view,
         status,
         work_disposition: MemberWorkDisposition::NoBudgetStop,
+        own_work: 0,
         generation: None,
         modules: Vec::new(),
         examined: Vec::new(),
@@ -1539,6 +1554,9 @@ pub(crate) struct ProcessRecord {
     pub pid: u32,
     pub status: MemberStatus,
     pub work_disposition: MemberWorkDisposition,
+    /// Work units this member's own turn spent: fair-share ordering and
+    /// hog accrual charge the spender.
+    pub own_work: u64,
     pub objects: Vec<usize>,
     /// The generation the member's mappings belong to (deep scans and
     /// maps matches); `None` when no read reached it.
@@ -3044,6 +3062,7 @@ fn assemble(
                 .map_or(MemberWorkDisposition::NoBudgetStop, |member| {
                     member.work_disposition
                 }),
+            own_work: members_by_pid.get(pid).map_or(0, |member| member.own_work),
             pid: *pid,
             status,
             objects,
@@ -6114,6 +6133,7 @@ mod tests {
                         reason: "the process generation could not be pinned: Permission denied (os error 13)".into(),
                     },
                     work_disposition: super::MemberWorkDisposition::NoBudgetStop,
+                    own_work: 0,
                     generation: None,
                     complete_scan: None,
                     application: super::InspectApplicationResult::Unknown(
@@ -7686,6 +7706,7 @@ mod tests {
                 view: ProcessViewId(0),
                 status: MemberStatus::Scanned,
                 work_disposition: MemberWorkDisposition::NoBudgetStop,
+                own_work: 0,
                 generation: None,
                 complete_scan: None,
                 application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
@@ -7714,6 +7735,7 @@ mod tests {
                 pid,
                 status: member.status,
                 work_disposition: member.work_disposition,
+                own_work: member.own_work,
                 objects: vec![0],
                 generation: member.generation,
                 complete_scan: member.complete_scan,
@@ -8299,6 +8321,7 @@ int main(int argc, char **argv) {
                     pid: 100,
                     status: MemberStatus::Scanned,
                     work_disposition: MemberWorkDisposition::NoBudgetStop,
+                    own_work: 0,
                     objects: vec![0],
                     generation: None,
                 },
@@ -8311,6 +8334,7 @@ int main(int argc, char **argv) {
                     pid: 200,
                     status: MemberStatus::Scanned,
                     work_disposition: MemberWorkDisposition::NoBudgetStop,
+                    own_work: 0,
                     objects: if objects.len() > 1 { vec![1] } else { vec![] },
                     generation: None,
                 },
@@ -8531,6 +8555,7 @@ int main(int argc, char **argv) {
                 view: ProcessViewId(view),
                 status: MemberStatus::Scanned,
                 work_disposition: MemberWorkDisposition::NoBudgetStop,
+                own_work: 0,
                 generation: Some(MemberGeneration {
                     start_time: Some(1),
                     exe: Some(exe()),
@@ -9587,6 +9612,7 @@ int main(int argc, char **argv) {
                     reason: detail.to_string(),
                 },
                 work_disposition: MemberWorkDisposition::NoBudgetStop,
+                own_work: 0,
                 generation: None,
                 modules: Vec::new(),
                 examined: Vec::new(),
@@ -10991,6 +11017,7 @@ int main(int argc, char **argv) {
             pid,
             status,
             work_disposition: MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: Vec::new(),
             generation: None,
         };
@@ -12691,6 +12718,7 @@ mod bind_collection_strict_tests {
             view,
             status: MemberStatus::Scanned,
             work_disposition: MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             generation: None,
             complete_scan: Some(CompleteMemberScan::scripted(
                 MemberGeneration {

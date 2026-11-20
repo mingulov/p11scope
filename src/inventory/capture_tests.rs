@@ -1143,6 +1143,7 @@ impl Scene {
                         },
                         work_disposition:
                             crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+                        own_work: 0,
                         objects: vec![0],
                         generation: Some(crate::inspect_system::MemberGeneration {
                             start_time: Some(*start),

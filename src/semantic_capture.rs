@@ -1644,6 +1644,11 @@ pub(crate) struct SemanticCapture {
     /// follows current truth and the retried take validates. Takes
     /// request under shared borrows; the tick drains.
     refresh_interests: Mutex<BTreeMap<(u64, u64, u32), RefreshInterest>>,
+    /// Take-refresh keys re-scanned by cadence sweeps
+    /// (diagnostic only): counted under the exclusive sweep
+    /// borrow; the stop disclosure reads this beside the
+    /// seal-bootstrap arms.
+    take_refresh_scans: u64,
     /// Last tick's scan count and refusals, for the stuck-transaction
     /// diagnostic only. Test-visible; production behavior never reads it.
     #[cfg(test)]
@@ -1756,6 +1761,7 @@ impl SemanticCapture {
             miss_raises: 0,
             take_drift_tolerated: AtomicU64::new(0),
             refresh_interests: Mutex::new(BTreeMap::new()),
+            take_refresh_scans: 0,
             #[cfg(test)]
             last_tick_scans_for_test: 0,
             #[cfg(test)]
@@ -1982,6 +1988,30 @@ impl SemanticCapture {
         };
         std::mem::take(&mut *interests).into_iter().collect()
     }
+
+    /// Take-refresh keys re-scanned by cadence sweeps
+    /// (diagnostic only): the stop disclosure reads this beside
+    /// the seal-bootstrap arms.
+    pub(crate) fn take_refresh_scans(&self) -> u64 {
+        self.take_refresh_scans
+    }
+
+    /// Re-observe take-raced keys between seal retries (machine
+    /// cadence): drain queued refresh interests and scan them
+    /// outside any tick, like the tick's joined sweep but with no
+    /// collection or routing. The caller stashes the report for
+    /// the next tick merge, so re-observed receipts and resolved
+    /// outcomes join a batch instead of dropping. Bounded by the
+    /// shared per-tick scan cap; stale interests drop silently
+    /// and re-request on the next raced take. Test-only I/O
+    /// variant; production wraps the live Session below.
+    #[cfg(test)]
+    fn sweep_take_refresh_with(&mut self, _io: &mut impl CaptureIo) -> TickReport {
+        // Inert until the cadence implementation lands: the sweep
+        // twins pin the recovery RED first.
+        TickReport::default()
+    }
+
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins
     /// assert the positive disclosure from the report and use this only to

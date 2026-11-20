@@ -2693,6 +2693,174 @@ fn joint_partition_refresh_offers_no_birth() {
     );
 }
 
+/// A cadence sweep re-observes a take-raced key without a tick:
+/// the seal stalled in Audited queues the interest, the sweep
+/// scans it, the router follows current truth, and the retried
+/// take validates. The sweep counts its scans beside the
+/// seal-bootstrap arms.
+#[test]
+fn joint_take_refresh_sweep_recovers_raced_take() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    // Global churn with no new call: the router never re-observes,
+    // so live truth runs ahead of the frozen scan.
+    harness.io.global = 1;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races the take");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert_eq!(harness.capture.take_refresh_scans(), 0);
+    let scans_before = harness.io.attempts.len();
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert!(
+        harness.io.attempts.len() > scans_before,
+        "the sweep re-observes the key without a tick"
+    );
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    assert_eq!(
+        harness.capture.take_refresh_scans(),
+        1,
+        "the sweep counts its scans"
+    );
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        0,
+        "the sweep drains the interest"
+    );
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the retried take validates against current truth");
+    assert_eq!(harness.capture.take_drift_tolerated(), 1);
+}
+
+/// A stale cadence-sweep interest drops silently: an attachment
+/// slot that no longer resolves never reaches the scan, and the
+/// drain still consumes the interest.
+#[test]
+fn joint_take_refresh_sweep_drops_stale_slot() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        99,
+        receipt.pin.pid(),
+    );
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 1);
+    let scans_before = harness.io.attempts.len();
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        0,
+        "the drain consumes the interest"
+    );
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before,
+        "a stale slot never scans"
+    );
+    assert_eq!(harness.capture.take_refresh_scans(), 0);
+    assert!(
+        report.observations.is_empty(),
+        "no scan means no observation"
+    );
+}
+
+/// A cadence sweep shares the per-tick scan cap: with the cap at
+/// one and two queued keys, exactly one scans. The drain still
+/// consumes both interests; the unscanned key re-requests on its
+/// next raced take.
+#[test]
+fn joint_take_refresh_sweep_bounded_by_scan_cap() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    // A second scannable key for the same bound image: a distinct
+    // attachment slot whose endpoint names file 1.
+    let sibling = harness
+        .io
+        .endpoints
+        .as_ref()
+        .expect("scripted endpoints")
+        .iter()
+        .find(|(_, endpoint)| endpoint.file_slot == 1)
+        .map(|(slot, _)| *slot);
+    let sibling_slot = match sibling {
+        Some(slot) => slot,
+        None => {
+            let slot = 7;
+            let endpoint = crate::semantic_capture::Endpoint {
+                object: crate::discovery::identity::PinnedObjectId(1),
+                file_slot: 1,
+                offset: 0x1200,
+            };
+            harness
+                .io
+                .endpoints
+                .as_mut()
+                .expect("scripted endpoints")
+                .insert(slot, endpoint);
+            slot
+        }
+    };
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    harness
+        .capture
+        .request_partition_refresh(receipt.image, 1, sibling_slot, receipt.pin.pid());
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 2);
+    harness.capture.limits.scans = 1;
+    let scans_before = harness.io.attempts.len();
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        0,
+        "the drain consumes every interest"
+    );
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before + 1,
+        "the sweep stops at the shared scan cap"
+    );
+    assert_eq!(report.scans, 1);
+    assert_eq!(harness.capture.take_refresh_scans(), 1);
+}
+
+/// A cadence sweep with no queued interests scans nothing and
+/// counts nothing: stalled seals that never raced a take keep
+/// their behavior exactly.
+#[test]
+fn joint_take_refresh_sweep_no_interests_no_scan() {
+    let (mut harness, _, _) = birth_sealed_witness();
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 0);
+    let scans_before = harness.io.attempts.len();
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before,
+        "no interests means no scan"
+    );
+    assert_eq!(harness.capture.take_refresh_scans(), 0);
+    assert!(
+        report.observations.is_empty() && report.scans == 0,
+        "an idle sweep reports nothing"
+    );
+}
+
 /// A retained take accepts live truth ahead of a tainted scan:
 /// the router observed global churn (a tainted continuation) and
 /// live advanced further with the same local words, so the take

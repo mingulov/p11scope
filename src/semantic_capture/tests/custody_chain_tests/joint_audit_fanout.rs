@@ -31101,6 +31101,202 @@ fn with_genuine_prior_terminal(
     }
 }
 
+/// Stage one effect-free (`C_SignUpdate`) unbounded abandonment whose
+/// ordinary return reports `rv`, plus one healthy `C_SignInit` pair, on the
+/// production frame. `converted` stages the abandonment one quantum after
+/// the BEGIN converted (that first frame is sealed here); otherwise BEGIN,
+/// return and abandonment share one quantum. Returns the audited, unsealed
+/// frame carrying the abandonment and the target key's proof.
+fn stage_neutral_abandonment(
+    converted: bool,
+    rv: u64,
+) -> (
+    CanonicalFanoutScene,
+    IngestedJointQuantum,
+    crate::semantics_objects::journal::JournalDomainProof,
+) {
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let proof = target.bootstrap().proof();
+    let (open, ordinary) = fixture
+        .scene
+        .encoded_with_rv(pid, 0, "C_SignUpdate", 2, rv);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_EXEC_EXIT,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    if !converted {
+        source.push_record(abandon.to_vec());
+    }
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    if converted {
+        fixture.seal_replay_head(&mut frame, &BirthFault);
+        fixture
+            .scene
+            .drain
+            .source_mut()
+            .push_record(abandon.to_vec());
+        frame = fixture.audited(0, 0, &BirthFault);
+        assert!(
+            frame.failure_for_test().is_none(),
+            "clean audit: {:?}",
+            frame.failure_for_test()
+        );
+    }
+    (fixture, frame, proof)
+}
+
+/// A per-call (effect-free) abandonment on the production frame: the
+/// disposal's loss gap is owned by an original replay step bound to the
+/// abandoned call, the exact staged head of that call reaches a terminal
+/// disposition, the frame completes with no stranded head or ledger charge,
+/// the key is not refused and a later healthy call on the key still replays.
+#[test]
+fn joint_neutral_abandonment_loss_reaches_terminal_on_frame() {
+    for converted in [false, true] {
+        let (mut fixture, mut frame, proof) = stage_neutral_abandonment(converted, 0);
+        fixture.seal_replay_head(&mut frame, &BirthFault);
+        let seal = frame.active_seal_for_test().unwrap();
+        let lost: Vec<_> = seal
+            .effects
+            .effects
+            .iter()
+            .enumerate()
+            .filter(|(_, effect)| {
+                matches!(
+                    effect,
+                    ObjectEffect::Gap {
+                        reason: ObjectGap::OutcomeLost
+                    }
+                )
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(lost.len(), 1, "exactly one per-call loss gap");
+        let owner = seal
+            .prefix
+            .replay_steps()
+            .iter()
+            .find(|step| step.effect_range().contains(&lost[0]))
+            .expect("an original replay step owns the per-call loss effect");
+        let call = seal
+            .prefix
+            .call_for_step(owner)
+            .expect("the loss step names its abandoned call");
+        assert_eq!(call.function, function_id("C_SignUpdate"));
+        assert!(call.abandoned && call.end_cut.is_none());
+        assert_original_replay_partition(seal);
+        fixture.finish_bounded_batch(frame, false);
+        assert!(
+            !fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .proof_refused_for_test(proof),
+            "a per-call loss never refuses the whole key"
+        );
+        assert!(
+            fixture.feeds().iter().all(|feed| feed.staged == 0),
+            "no stranded staged head"
+        );
+        // A later healthy call on the same key still seals and replays.
+        let (target, pid) = fixture.replay_target();
+        let reduced = |fixture: &CanonicalFanoutScene| {
+            fixture
+                .feeds()
+                .iter()
+                .find(|feed| feed.id == target.id())
+                .unwrap()
+                .reduced
+        };
+        let before = reduced(&fixture);
+        fixture.scene.push(pid, 0, "C_SignInit", 4);
+        let mut frame = fixture.audited(1, 1, &BirthFault);
+        assert!(frame.failure_for_test().is_none());
+        fixture.seal_replay_head(&mut frame, &BirthFault);
+        fixture.finish_bounded_batch(frame, false);
+        assert_eq!(reduced(&fixture), before + 1, "converted={converted}");
+    }
+}
+
+/// The matched negative twin: the same effect-free abandonment whose
+/// admitted ordinary return already proved a lifecycle negative
+/// (invalid session, invalid handle, unseen finalization) is not neutral.
+/// Its disposal would erase that corroborated evidence, so the key fails
+/// closed instead of continuing past it.
+#[test]
+fn joint_abandoned_read_with_corroborated_negative_keeps_key_refusal() {
+    use pkcs11_types::CkRv;
+    for rv in [
+        CkRv::SESSION_HANDLE_INVALID.0,
+        CkRv::KEY_HANDLE_INVALID.0,
+        CkRv::CRYPTOKI_NOT_INITIALIZED.0,
+    ] {
+        for converted in [false, true] {
+            let (mut fixture, mut frame, proof) = stage_neutral_abandonment(converted, rv);
+            let h0 = fixture.scene.real.h0.clone();
+            let mut births = NativeFrameBirths {
+                h0: &h0,
+                attached: &fixture.attached,
+                retained: &mut fixture.births,
+                seen: Vec::new(),
+                unreadable: false,
+            };
+            let mut ports = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_frame_ports(&fixture.scene.producers)
+                .unwrap();
+            frame.bind_targets(&ports).unwrap();
+            let _ = frame.seal_next(&mut ports, &mut births, &BirthFault);
+            drop(ports);
+            assert!(
+                fixture
+                    .scene
+                    .real
+                    .scene
+                    .coordinator
+                    .joint_capture()
+                    .adapter()
+                    .proof_refused_for_test(proof),
+                "rv={rv:#x} converted={converted}: a corroborated negative is not neutral"
+            );
+        }
+    }
+}
+
 #[test]
 fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
     with_genuine_prior_terminal(false, false, |_, _, _, _, _| false);

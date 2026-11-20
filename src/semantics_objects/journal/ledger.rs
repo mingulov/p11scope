@@ -146,6 +146,16 @@ impl StagingLedger {
         })
     }
 
+    /// Test-only sum of retained H8 member bytes, measured before the
+    /// void so the refund check cannot infer it from the post-void
+    /// balance.
+    #[cfg(test)]
+    pub(crate) fn h8_bytes_for_test(&self) -> u64 {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.role_bytes_for_test(Role::H8Open) as u64)
+    }
+
     /// Audit custody uses this ledger's existing pool, never a supplied budget.
     pub(super) fn resource_reserver(&self) -> Option<&SemanticResourceReserver> {
         self.reserver.as_ref()
@@ -724,6 +734,111 @@ mod tests {
             pool.snapshot().charged_bytes,
             charged - 4_096 * (2 + OWNED_ALLOCATION_PADDING)
         );
+        drop(ledger);
+        assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn shared_ledger_resumable_void_keeps_shared_model_and_merged_alias() {
+        // One shared H8+Model operation, one merged H8+Model with two
+        // aliases and one merged H8-only with two aliases (via a Raw
+        // release): the resumable void driven one unit at a time
+        // removes every H8 while preserving the Model siblings and
+        // merged aliases with exact IDs, bytes and pool refund.
+        let pool = SemanticResourcePool::default();
+        let baseline = pool.snapshot().charged_bytes;
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let index = pool.snapshot().charged_bytes;
+        let shared = ledger
+            .charge_role(Role::H8Open, StagingLedger::key(1), None, 10)
+            .unwrap();
+        ledger
+            .charge_role(Role::Model, StagingLedger::key(1), Some(shared), 20)
+            .unwrap();
+        let merged_h8 = ledger
+            .charge_role(Role::H8Open, StagingLedger::key(2), None, 10)
+            .unwrap();
+        let merged_model = ledger
+            .charge_role(Role::Model, StagingLedger::key(3), None, 20)
+            .unwrap();
+        let merged_head = ledger
+            .table
+            .as_mut()
+            .unwrap()
+            .merge(merged_h8, merged_model)
+            .unwrap();
+        assert_eq!(merged_head, merged_h8);
+        let vacating_h8 = ledger
+            .charge_role(Role::H8Open, StagingLedger::key(4), None, 10)
+            .unwrap();
+        let vacating_raw = ledger
+            .charge_role(Role::Raw, StagingLedger::key(5), None, 1)
+            .unwrap();
+        ledger
+            .table
+            .as_mut()
+            .unwrap()
+            .merge(vacating_h8, vacating_raw)
+            .unwrap();
+        ledger.release_role(Role::Raw, StagingLedger::key(5));
+        for key in 100..110u64 {
+            ledger
+                .charge_role(Role::H8Open, StagingLedger::key(key), None, 10)
+                .unwrap();
+        }
+        assert_eq!(ledger.roles_for_test()[1], 13);
+        assert_eq!((ledger.census(), ledger.charged_bytes()), (13, 170));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            index + 170 + 15 * OWNED_ALLOCATION_PADDING
+        );
+        ledger.start_h8_void();
+        assert!(ledger.h8_void_pending());
+        let mut steps = 0;
+        let mut saw_partial = false;
+        loop {
+            let (done, spent) = ledger.poll_h8_void(1);
+            assert!(spent <= 1, "one-unit credit spent {spent}");
+            steps += 1;
+            if done {
+                break;
+            }
+            saw_partial = true;
+            assert!(steps < 20_000, "the void sweep must complete");
+        }
+        assert!(saw_partial, "one-unit credits must need several steps");
+        assert!(!ledger.h8_void_pending());
+        assert_eq!(ledger.roles_for_test()[1], 0);
+        assert_eq!((ledger.census(), ledger.charged_bytes()), (2, 40));
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            index + 40 + 2 * OWNED_ALLOCATION_PADDING,
+            "one exact refund per removed H8 lease"
+        );
+        let table = ledger.table.as_ref().unwrap();
+        assert_eq!(
+            table.reservation(Role::Model, StagingLedger::key(1)),
+            Some(shared)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Model, StagingLedger::key(1)),
+            Some(20)
+        );
+        assert_eq!(table.reservation(Role::H8Open, StagingLedger::key(1)), None);
+        assert_eq!(
+            table.reservation(Role::Model, StagingLedger::key(3)),
+            Some(merged_head)
+        );
+        assert_eq!(
+            table.member_bytes(Role::Model, StagingLedger::key(3)),
+            Some(20)
+        );
+        assert!(!table.reservation_is_released(merged_h8));
+        assert!(!table.reservation_is_released(merged_model));
+        assert!(table.reservation_is_released(vacating_h8));
+        assert!(table.reservation_is_released(vacating_raw));
+        assert_eq!(table.reservation(Role::H8Open, StagingLedger::key(4)), None);
         drop(ledger);
         assert_eq!(pool.snapshot().charged_bytes, baseline);
     }

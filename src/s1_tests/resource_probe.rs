@@ -856,7 +856,10 @@ fn native_semantic_resource_final_types_pinned() {
         Option<crate::discovery::engine::inventory_coordinator::JointAuditSubjectDiagnosis>,
         40
     );
-    pin!(crate::inventory_semantics::SemanticCaptureSummary, 48);
+    // +16 (length-stash loss publication): the inline
+    // `semantic_capture` summary carries the two additive length-stash
+    // counters (two u64; the summary grows 48 -> 64).
+    pin!(crate::inventory_semantics::SemanticCaptureSummary, 64);
     // Task 7 provider/token/mechanism projection: two row Vecs
     // (tokens, mechanisms) plus the eight u64 section gaps
     // (2 x 24 + 8 x 8 = 112 B, niche-filled inline).
@@ -899,9 +902,11 @@ fn native_semantic_resource_final_types_pinned() {
     // +32 (Task 7 run-wide bounds): four more u64 section gaps —
     // run-wide token/mechanism refusals and departed-caller folds
     // (2 x 24 + 8 x 8 = 112).
+    // +16 (length-stash loss publication): the inline
+    // `semantic_capture` summary grows 48 -> 64 (two u64 counters).
     pin!(
         crate::inventory_present::Presentation,
-        1384 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1400 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 5 * size_of::<Vec<u8>>()
             // a2 re-arm rate: joint_audit_subjects
             + size_of::<

@@ -639,6 +639,23 @@ impl LaneTestIo for SharedH0 {
         self.0.borrow_mut().stash.take_for_admission(pin, slot)
     }
 
+    fn service_take_refresh_sweep(&mut self) -> bool {
+        let mut held = self.0.borrow_mut();
+        if !held.capture.has_queued_take_refresh() {
+            return false;
+        }
+        // One deref holds the disjoint borrows below apart.
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *held;
+        let mut report = capture.sweep_take_refresh_with(io);
+        // The substituted path stashes through the same production
+        // merge; it keeps no lane scan-refusal counters (the
+        // capture-level twins pin refusal content in the report).
+        let _ = stash_refresh_report(stash, &mut report);
+        true
+    }
+
     fn stash_admission_evidence(
         &mut self,
         receipts: Vec<CurrentPartitionReceipt>,

@@ -42021,10 +42021,14 @@ int main(void) {
             .record(caller)
             .unwrap()
             .clone();
-        native
-            .scene
-            .coordinator
-            .fold_caller_rendered_state(caller, &caller_record, None, None, None, 200);
+        native.scene.coordinator.fold_caller_rendered_state(
+            caller,
+            &caller_record,
+            None,
+            None,
+            None,
+            200,
+        );
         // The retire queues the fold; one bounded step retires the
         // single row (as `retire_rendered_callers` drives per call).
         assert!(

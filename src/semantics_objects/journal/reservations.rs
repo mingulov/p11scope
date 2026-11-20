@@ -1423,9 +1423,7 @@ impl<C> ReservationTable<C> {
             }
             match cursor.state {
                 MintWalkState::FindingHead { bucket } => {
-                    let Some(current) = self.budgeted_head(KEY_LINKS, bucket, gate) else {
-                        return None;
-                    };
+                    let current = self.budgeted_head(KEY_LINKS, bucket, gate)?;
                     if current == INDEX_NONE {
                         cursor.state = MintWalkState::Miss;
                         return Some(true);
@@ -1441,9 +1439,7 @@ impl<C> ReservationTable<C> {
                     let lane = node_lane(current);
                     let role = cursor.role;
                     let target = cursor.key;
-                    let Some(found) = self.budgeted_match(slot, lane, role, target, gate) else {
-                        return None;
-                    };
+                    let found = self.budgeted_match(slot, lane, role, target, gate)?;
                     if found {
                         cursor.state = MintWalkState::Hit;
                         return Some(false);
@@ -1453,9 +1449,7 @@ impl<C> ReservationTable<C> {
                 MintWalkState::FindingNext { bucket, current } => {
                     let slot = node_slot(current);
                     let lane = node_lane(current);
-                    let Some(next) = self.budgeted_next(slot, KEY_LINKS, lane, gate) else {
-                        return None;
-                    };
+                    let next = self.budgeted_next(slot, KEY_LINKS, lane, gate)?;
                     if next == INDEX_NONE {
                         cursor.state = MintWalkState::Miss;
                         return Some(true);
@@ -1471,9 +1465,7 @@ impl<C> ReservationTable<C> {
                         return Some(true);
                     }
                     let role = cursor.role;
-                    let Some(key) = self.budgeted_slot_key(next_slot, role, gate) else {
-                        return None;
-                    };
+                    let key = self.budgeted_slot_key(next_slot, role, gate)?;
                     if key == Some(cursor.key) {
                         cursor.state = MintWalkState::Hit;
                         return Some(false);

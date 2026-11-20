@@ -2130,9 +2130,13 @@ fn cell_durations_fit_the_five_minute_budget() {
         ("c", C_DURATION_S),
         ("d", D_DURATION_S),
     ] {
+        // Cell (d) carries the fixed-852 acceptance bar: its window
+        // must fit 284 bursts at campaign-load rates, past the
+        // 5-minute budget the other cells keep.
+        let budget = if name == "d" { 560 } else { 285 };
         assert!(
-            duration_s <= 285,
-            "cell {name} observer duration {duration_s}s exceeds the 5-minute cell budget with setup"
+            duration_s <= budget,
+            "cell {name} observer duration {duration_s}s exceeds its {budget}s budget with setup"
         );
     }
     assert!(

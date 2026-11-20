@@ -24,7 +24,8 @@ use p11scope_ebpf_common::{
     ARG_NONE, CounterMode, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
-    EVIDENCE_ABI_REFUSALS, EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
+    EVIDENCE_ABI_REFUSALS, EVIDENCE_LENGTH_INSERT_FAILURES, EVIDENCE_LENGTH_STASH_MISMATCHES,
+    EVIDENCE_RING_LOSS, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, FUNCTION_NAME_MAX_BYTES, FunctionNameKey,
     IMAGE_IDENTITY_TICKET_LIMIT, ImageBankSelect, ImageIdentityControl, LoaderGateControl,
     MAX_DESCRIPTORS, PAIR_CALLS_SECOND_SLOT, PAUSE_ARMED, PRODUCED_DISCOVERY, PRODUCED_EVENTS,
@@ -8667,6 +8668,26 @@ impl Session {
             .iter()
             .copied()
             .fold(0u64, u64::saturating_add))
+    }
+
+    /// Cumulative length-stash losses (all CPUs): `EVIDENCE_START`
+    /// insert failures (the stash map was full, so the call runs
+    /// without retention) and stash mismatches (the return's START
+    /// stamp disagreed with the retained row; deleted and counted,
+    /// never a guessed length). The inventory lane polls these
+    /// beside the ring loss; rises are disclosed, never silent.
+    pub(crate) fn length_stash_loss(&self) -> Result<(u64, u64)> {
+        let evidence: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(self.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+        let sum = |index: &u32| {
+            evidence
+                .get(index, 0)
+                .map(|counts| counts.iter().copied().fold(0u64, u64::saturating_add))
+        };
+        Ok((
+            sum(&EVIDENCE_LENGTH_INSERT_FAILURES)?,
+            sum(&EVIDENCE_LENGTH_STASH_MISMATCHES)?,
+        ))
     }
 
     /// The live fault/sticky generation cells (INSTANCE_GEN fault,

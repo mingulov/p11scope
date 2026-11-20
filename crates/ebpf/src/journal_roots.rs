@@ -416,6 +416,12 @@ pub(super) mod program {
                 unsafe { p11_object_fault() };
                 bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             }
+            // Every return path deletes the stash row (journal
+            // sessions never run aggregate today; this keeps the
+            // branch consistent for the day one does).
+            if Record::LENGTH {
+                length_return_abandon(&key);
+            }
             return 0;
         }
         let mut image = ImageIdentity::default();

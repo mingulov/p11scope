@@ -421,6 +421,11 @@ const INVENTORY: &[ResourceEntry] = &[
         occupancy_source: "START map occupancy; EVIDENCE_START_INSERT_FAILURES",
     },
     ResourceEntry {
+        name: "length_stash_inflight",
+        limit: crate::attach::journal::evidence_start_entries(true) as u64,
+        occupancy_source: "EVIDENCE_START map occupancy; EVIDENCE_LENGTH_INSERT_FAILURES",
+    },
+    ResourceEntry {
         name: "rv_keys",
         limit: RV_ENTRIES as u64,
         occupancy_source: "RV_COUNTS map occupancy; EVIDENCE_RV_UPDATE_FAILURES",

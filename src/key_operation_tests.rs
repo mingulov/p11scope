@@ -33238,6 +33238,330 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
     );
 }
 
+/// Unknown-key rows keep by-number mechanism counts (v9): two
+/// receipt-less NSS vendor-keygen completions plus one standard
+/// decapsulate completion partition with their ids, and the section
+/// promotes to v9 with all 9 unknown-row keys.
+#[test]
+fn unknown_rows_keep_by_number_mechanism_counts() {
+    use crate::key_operation_projection::UnknownMechCount;
+    use crate::key_operation_projection::contract::{UNKNOWN_MECH_ROW_KEYS, UNKNOWN_ROW_KEYS_V9};
+    use crate::key_operation_projection::producer::commit;
+    let mut ctx = KeymetaCtx::new();
+    for ts in [100, 200] {
+        assert!(
+            ctx.direct("C_GenerateKeyPair", 7, Some(0xCE53_4380), &[], ts, None, None)
+                .is_some(),
+            "the vendor keygen emits"
+        );
+    }
+    assert!(
+        ctx.direct("C_DecapsulateKey", 7, Some(0x17), &[], 300, None, None)
+            .is_some(),
+        "the decapsulate emits"
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let keygen = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair" && row.reason == "not_applicable")
+        .expect("the keygen summary");
+    assert_eq!(keygen.completed, 2);
+    assert_eq!(
+        keygen.mechanisms,
+        vec![UnknownMechCount {
+            mechanism: 0xCE53_4380,
+            terminals: 2,
+        }]
+    );
+    let decapsulate = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "decapsulate" && row.reason == "role_unavailable")
+        .expect("the decapsulate summary");
+    assert_eq!(decapsulate.completed, 1);
+    assert_eq!(
+        decapsulate.mechanisms,
+        vec![UnknownMechCount {
+            mechanism: 0x17,
+            terminals: 1,
+        }]
+    );
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        9,
+        "unknown-row mechanism detail promotes its section to v9"
+    );
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], 9);
+    let mut want: Vec<String> = UNKNOWN_ROW_KEYS_V9
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    want.sort();
+    let mut want_mech: Vec<String> = UNKNOWN_MECH_ROW_KEYS
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    want_mech.sort();
+    for rendered in section["unknown_key_operations"].as_array().unwrap() {
+        let mut keys: Vec<String> = rendered
+            .as_object()
+            .expect("row object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, want, "v9 unknown rows carry all 9 keys");
+        for entry in rendered["mechanisms"].as_array().unwrap() {
+            let mut entry_keys: Vec<String> = entry
+                .as_object()
+                .expect("entry object")
+                .keys()
+                .cloned()
+                .collect();
+            entry_keys.sort();
+            assert_eq!(entry_keys, want_mech, "mechanism entries carry 2 keys");
+        }
+    }
+    assert_eq!(
+        section["unknown_key_operations"][0]["mechanisms"][0]["mechanism"],
+        0xCE53_4380u64
+    );
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut row_schema = serde_json::json!({"$ref": "#/$defs/unknown_row"});
+    row_schema["$defs"] = schema_file["$defs"].clone();
+    let validator = jsonschema::options()
+        .build(&row_schema)
+        .expect("v9 unknown-row schema builds");
+    for rendered in section["unknown_key_operations"].as_array().unwrap() {
+        assert!(
+            validator.is_valid(rendered),
+            "unknown rows validate against the v9 unknown-row schema"
+        );
+    }
+}
+
+/// Mechanism-less unknown terminals keep no detail entry and never
+/// promote a section: row counters stay exact with an empty
+/// breakdown.
+#[test]
+fn unknown_rows_without_mechanisms_stay_below_v9() {
+    use crate::key_operation_projection::contract::{UNKNOWN_ROW_KEYS, UNKNOWN_ROW_KEYS_V9};
+    use crate::key_operation_projection::producer::commit;
+    let mut ctx = KeymetaCtx::new();
+    assert!(
+        ctx.direct("C_GenerateKeyPair", 7, None, &[], 100, None, None)
+            .is_some(),
+        "the mechanism-less keygen emits"
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let keygen = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair" && row.reason == "not_applicable")
+        .expect("the keygen summary");
+    assert_eq!(keygen.completed, 1);
+    assert!(
+        keygen.mechanisms.is_empty(),
+        "no id observed, no detail entry"
+    );
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        1,
+        "mechanism-less unknown rows never promote"
+    );
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], 1);
+    let mut want: Vec<String> = UNKNOWN_ROW_KEYS
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    want.sort();
+    assert_eq!(UNKNOWN_ROW_KEYS_V9.len(), 9, "v9 adds exactly one key");
+    for rendered in section["unknown_key_operations"].as_array().unwrap() {
+        let mut keys: Vec<String> = rendered
+            .as_object()
+            .expect("row object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, want, "v1 unknown rows keep the frozen 8 keys");
+    }
+}
+
+/// Past the unknown-mechanism detail budget, refused detail counts
+/// the named v9 gap while row counters stay exact.
+#[test]
+fn unknown_mechanism_overflow_refuses_with_named_gap() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::MAX_UNKNOWN_MECHANISMS;
+    let mut ctx = KeymetaCtx::new();
+    let total = MAX_UNKNOWN_MECHANISMS + 6;
+    for (n, id) in (0x10000u64..).take(total).enumerate() {
+        assert!(
+            ctx.direct("C_GenerateKeyPair", 7, Some(id), &[], 100 + n as u64, None, None)
+                .is_some(),
+            "direct {n} emits"
+        );
+    }
+    assert_eq!(
+        ctx.keyuse.key_use_evidence().unknown_mechanism_refused,
+        6,
+        "the past-cap terminals refuse"
+    );
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+    let keygen = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair" && row.reason == "not_applicable")
+        .expect("the keygen summary");
+    assert_eq!(keygen.completed, total as u64, "row counters stay exact");
+    assert_eq!(
+        keygen.mechanisms.len(),
+        MAX_UNKNOWN_MECHANISMS,
+        "detail keeps the first 1024 pairs"
+    );
+    let gap = committed
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "unknown_mechanism_rows_refused")
+        .expect("the refusal publishes as a named gap");
+    assert_eq!(gap.subject, "key_operation");
+    assert_eq!(gap.repeats, 6);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        9,
+        "a v9-only gap promotes its section to v9"
+    );
+}
+
+/// Preserved unknown detail merges across the loss boundary: the
+/// absorbed reducer's (bucket, id) pairs join the survivor's.
+#[test]
+fn unknown_mechanism_detail_merges_across_preservation() {
+    use crate::key_operation_projection::producer::commit;
+    let mut main = KeymetaCtx::new();
+    let mut other = KeymetaCtx::new();
+    assert!(
+        main.direct("C_GenerateKeyPair", 7, Some(0xCE53_4380), &[], 100, None, None)
+            .is_some()
+    );
+    assert!(
+        other
+            .direct("C_GenerateKeyPair", 7, Some(0x17), &[], 100, None, None)
+            .is_some()
+    );
+    let preserved = std::mem::replace(&mut other.keyuse, KeyUseReducer::new());
+    main.keyuse.absorb_preserved(preserved);
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let committed = commit(1, &[&staging], &scene.model.project(), &main.keyuse);
+    let keygen = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair" && row.reason == "not_applicable")
+        .expect("the keygen summary");
+    assert_eq!(keygen.completed, 2);
+    assert_eq!(
+        keygen
+            .mechanisms
+            .iter()
+            .map(|entry| (entry.mechanism, entry.terminals))
+            .collect::<Vec<_>>(),
+        vec![(0x17, 1), (0xCE53_4380, 1)],
+        "both pairs survive, sorted by id"
+    );
+}
+
+/// The v9 schema pins the unknown-row mechanism keys and adds
+/// exactly one gap reason over v7.
+#[test]
+fn key_operation_schema_v9_pins_unknown_mechanism_keys() {
+    use crate::key_operation_projection::contract::{
+        UNKNOWN_MECH_ROW_KEYS, UNKNOWN_ROW_KEYS, UNKNOWN_ROW_KEYS_V9,
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let load = |name: &str| -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(root.join(name)).unwrap(),
+        )
+        .unwrap()
+    };
+    let schema: serde_json::Value =
+        load("docs/schema/inventory-v1-object-observations-v9.schema.json");
+    let v7: serde_json::Value =
+        load("docs/schema/inventory-v1-object-observations-v7.schema.json");
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let table =
+        |keys: &[&str]| -> Vec<String> { sorted(keys.iter().map(|key| key.to_string()).collect()) };
+    let required = |doc: &serde_json::Value, pointer: &str| -> Vec<String> {
+        sorted(
+            doc.pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    let names = |doc: &serde_json::Value, pointer: &str| -> Vec<String> {
+        sorted(
+            doc.pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 9);
+    assert_eq!(UNKNOWN_ROW_KEYS.len(), 8, "frozen v1-v7 unknown-row keys");
+    assert_eq!(
+        required(&schema, "/$defs/unknown_row/required"),
+        table(&UNKNOWN_ROW_KEYS_V9),
+        "v9 unknown rows require all 9 keys"
+    );
+    assert_eq!(
+        required(&schema, "/$defs/unknown_mechanism/required"),
+        table(&UNKNOWN_MECH_ROW_KEYS),
+        "mechanism entries require both keys"
+    );
+    let v9_gaps = names(&schema, "/$defs/gap_reason/enum");
+    let v7_gaps = names(&v7, "/$defs/gap_reason/enum");
+    let added: Vec<String> = v9_gaps
+        .iter()
+        .filter(|reason| !v7_gaps.contains(reason))
+        .cloned()
+        .collect();
+    assert_eq!(added, vec!["unknown_mechanism_rows_refused".to_string()]);
+    assert_eq!(v9_gaps.len(), v7_gaps.len() + 1);
+}
+
 /// Repeat AES-KW wraps of one proved view count distinct wrapped
 /// sizes exactly past the retention cap: the first two stay pinned
 /// with their evidence tags and repeats never recount.

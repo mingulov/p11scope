@@ -59,6 +59,15 @@ pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// exactly when a row carries non-blank inferred content or a
 /// v7-only gap does; v1–v6 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
+/// Section version 9 (unknown-row mechanism detail): v7 vocabulary
+/// plus the `mechanisms` key on unknown-key rows (by-number
+/// terminal counts per observed mechanism id) and the
+/// `unknown_mechanism_rows_refused` gap. Version 8 is taken by the
+/// separate Task 7 provider section (shared allocator, spec
+/// §10.1). The renderer emits v9 exactly when an unknown row
+/// carries mechanism detail or the v9-only gap does; v1–v7 output
+/// stays byte-stable.
+pub(crate) const OBSERVATIONS_VERSION_V9: u8 = 9;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
 /// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2). The closed
@@ -501,6 +510,24 @@ pub(crate) mod contract {
         "unknown",
         "active",
     ];
+    /// H9 section v9 unknown-key row keys: the frozen 8 plus the
+    /// `mechanisms` by-number detail. v1–v7 rows keep the frozen 8;
+    /// v9 sections carry all 9 on every unknown row.
+    pub(crate) const UNKNOWN_ROW_KEYS_V9: [&str; 9] = [
+        "category",
+        "reason",
+        "unit",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "active",
+        "mechanisms",
+    ];
+    /// The closed unknown-row mechanism entry keys (v9): the numeric
+    /// mechanism id plus its terminal count. No name key exists —
+    /// names ride `-v` text only, never this shape.
+    pub(crate) const UNKNOWN_MECH_ROW_KEYS: [&str; 2] = ["mechanism", "terminals"];
 
     /// Section keys for a v3 section: v1 keys plus `unattributed`
     /// beside the row buckets it counts beside.
@@ -806,6 +833,20 @@ pub(crate) struct UnknownAggRow {
     pub cancelled: u64,
     pub unknown: u64,
     pub active: u64,
+    /// By-number mechanism detail (v9): terminals partitioned here
+    /// per observed mechanism id, sorted by id. Mechanism-less
+    /// terminals (orphan ends, unreadable ids) keep no entry: the
+    /// row counters stay exact while this breakdown covers
+    /// mechanism-bearing terminals only.
+    pub mechanisms: Vec<UnknownMechCount>,
+}
+
+/// One unknown-row mechanism entry: the numeric mechanism id plus
+/// the terminals partitioned into its row with that id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnknownMechCount {
+    pub mechanism: u64,
+    pub terminals: u64,
 }
 
 /// One not-attributed counter: how many calls (or first-observed
@@ -1245,8 +1286,10 @@ fn size_detail_json(
 
 /// Render one unknown-key summary row: the exact frozen keys (no
 /// `started` — starts are never fabricated into the unknown bucket).
-pub(crate) fn unknown_row_json(row: &UnknownAggRow) -> serde_json::Value {
-    serde_json::json!({
+/// The `mechanisms` key renders only at v9+: v1–v7 rows keep the
+/// frozen 8 keys byte-stable.
+pub(crate) fn unknown_row_json(row: &UnknownAggRow, version: u8) -> serde_json::Value {
+    let mut out = serde_json::json!({
         "category": row.category,
         "reason": row.reason,
         "unit": row.unit,
@@ -1255,7 +1298,24 @@ pub(crate) fn unknown_row_json(row: &UnknownAggRow) -> serde_json::Value {
         "cancelled": row.cancelled,
         "unknown": row.unknown,
         "active": row.active,
-    })
+    });
+    if version >= OBSERVATIONS_VERSION_V9
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert(
+            "mechanisms".to_string(),
+            row.mechanisms
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "mechanism": entry.mechanism,
+                        "terminals": entry.terminals,
+                    })
+                })
+                .collect(),
+        );
+    }
+    out
 }
 
 /// Render one gap row: the exact frozen keys.
@@ -1423,7 +1483,27 @@ fn has_v7_gap_content(observations: &ObjectObservations) -> bool {
     })
 }
 
+/// v9 content: an unknown row carrying mechanism detail, or the
+/// v9-only refusal gap (a rowless refusal still promotes its section
+/// to v9, so the named gap never rides a version whose vocabulary
+/// forbids it).
+fn has_v9_content(observations: &ObjectObservations) -> bool {
+    if observations
+        .unknown_key_operations
+        .iter()
+        .any(|row| !row.mechanisms.is_empty())
+    {
+        return true;
+    }
+    observations.gaps.iter().any(|gap| {
+        gap.subject == "key_operation" && gap.reason == "unknown_mechanism_rows_refused"
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if has_v9_content(observations) {
+        return OBSERVATIONS_VERSION_V9;
+    }
     if has_inferred_content(observations) || has_v7_gap_content(observations) {
         return OBSERVATIONS_VERSION_V7;
     }
@@ -1481,7 +1561,7 @@ pub(crate) fn object_observations_json(observations: &ObjectObservations) -> ser
         "sessions": observations.sessions.iter().map(session_row_json).collect::<Vec<_>>(),
         "objects": observations.objects.iter().map(|row| object_row_json(row, version)).collect::<Vec<_>>(),
         "key_operations": observations.key_operations.iter().map(key_row_json).collect::<Vec<_>>(),
-        "unknown_key_operations": observations.unknown_key_operations.iter().map(unknown_row_json).collect::<Vec<_>>(),
+        "unknown_key_operations": observations.unknown_key_operations.iter().map(|row| unknown_row_json(row, version)).collect::<Vec<_>>(),
         "gaps": {
             "rows": observations.gaps.iter().map(gap_row_json).collect::<Vec<_>>(),
             "suppressed": observations.gaps_suppressed,
@@ -1911,6 +1991,7 @@ pub(crate) mod producer {
                 cancelled: counters.cancelled,
                 unknown: counters.unknown,
                 active: counters.active,
+                mechanisms: Vec::new(),
             });
         }
         unknown_rows.sort_by(|a, b| (a.category, a.reason).cmp(&(b.category, b.reason)));

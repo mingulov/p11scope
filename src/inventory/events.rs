@@ -2656,7 +2656,7 @@ fn projection_row_events(
             "revision": observations.revision,
             "version": version,
             "bucket": "unknown",
-            "row": unknown_row_json(row),
+            "row": unknown_row_json(row, version),
         });
         events.push((unknown_event_key(row), "key_operations_observed", payload));
     }

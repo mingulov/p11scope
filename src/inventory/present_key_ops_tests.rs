@@ -88,6 +88,7 @@ fn unknown_row(
         cancelled: 0,
         unknown: 0,
         active,
+        mechanisms: Vec::new(),
     }
 }
 
@@ -602,6 +603,36 @@ fn key_ops_verbose_names_truncated_creation_templates() {
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
         !concise.contains("template truncated"),
+        "concise stays quiet:\n{concise}"
+    );
+}
+
+/// Verbose names unknown-row mechanism detail per row (name and
+/// count); concise stays quiet.
+#[test]
+fn key_ops_verbose_names_unknown_row_mechanisms() {
+    use crate::key_operation_projection::UnknownMechCount;
+    let mut observations = populated(9);
+    let mut row = unknown_row("generate_key_pair", 2, 0, 0, "operations");
+    row.reason = "not_applicable";
+    row.mechanisms = vec![UnknownMechCount {
+        mechanism: 0xCE53_4380,
+        terminals: 2,
+    }];
+    observations.unknown_key_operations.push(row);
+    let presentation = key_ops_presentation(observations);
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert!(
+        block.contains(
+            &"  unknown key row generate_key_pair/not_applicable: CKM_NSS_ML_KEM_KEY_PAIR_GEN ×2"
+        ),
+        "verbose names the unknown-row mechanism:\n{verbose}"
+    );
+    let concise = render_snapshot(&presentation);
+    assert!(
+        !concise.contains("CKM_NSS_ML_KEM_KEY_PAIR_GEN"),
         "concise stays quiet:\n{concise}"
     );
 }

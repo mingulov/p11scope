@@ -1222,6 +1222,7 @@ struct ScriptIo {
     scan_ranges: Option<Vec<MapRange>>,
     fault_cell: Arc<std::sync::atomic::AtomicU64>,
     concurrent_raise: bool,
+    storage_null: Option<u64>,
 }
 impl ScriptIo {
     fn new(domain: NativeDomainId) -> Self {
@@ -1300,6 +1301,7 @@ impl ScriptIo {
             scan_ranges: None,
             fault_cell: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             concurrent_raise: false,
+            storage_null: None,
         }
     }
     fn call_image(&mut self, cookie: u64, exec_id: u64, fault: u32) {
@@ -1522,6 +1524,9 @@ impl CaptureIo for ScriptIo {
             birth_cut: None,
         };
         self.scan(&job, deadline, fence, current)
+    }
+    fn storage_null(&mut self) -> Option<u64> {
+        self.storage_null
     }
 }
 fn capture(io: &ScriptIo) -> SemanticCapture {
@@ -2840,6 +2845,65 @@ fn joint_take_refresh_sweep_bounded_by_scan_cap() {
     assert_eq!(harness.capture.take_refresh_scans(), 1);
 }
 
+/// A cadence sweep preserves its unscanned interest for the next
+/// pass: with the cap at one and two queued keys, exactly one
+/// scans and the other stays queued instead of dropping.
+#[test]
+fn joint_take_refresh_sweep_preserves_unscanned_for_next_pass() {
+    let (mut harness, witness, _) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let sibling = harness
+        .io
+        .endpoints
+        .as_ref()
+        .expect("scripted endpoints")
+        .iter()
+        .find(|(_, endpoint)| endpoint.file_slot == 1)
+        .map(|(slot, _)| *slot);
+    let sibling_slot = match sibling {
+        Some(slot) => slot,
+        None => {
+            let slot = 7;
+            let endpoint = crate::semantic_capture::Endpoint {
+                object: crate::discovery::identity::PinnedObjectId(1),
+                file_slot: 1,
+                offset: 0x1200,
+            };
+            harness
+                .io
+                .endpoints
+                .as_mut()
+                .expect("scripted endpoints")
+                .insert(slot, endpoint);
+            slot
+        }
+    };
+    harness.capture.request_partition_refresh(
+        receipt.image,
+        receipt.endpoint.file_slot,
+        receipt.attachment_slot,
+        receipt.pin.pid(),
+    );
+    harness
+        .capture
+        .request_partition_refresh(receipt.image, 1, sibling_slot, receipt.pin.pid());
+    assert_eq!(harness.capture.refresh_interest_count_for_test(), 2);
+    harness.capture.limits.scans = 1;
+    let scans_before = harness.io.attempts.len();
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        harness.io.attempts.len(),
+        scans_before + 1,
+        "the sweep stops at the shared scan cap"
+    );
+    assert_eq!(report.scans, 1);
+    assert_eq!(
+        harness.capture.refresh_interest_count_for_test(),
+        1,
+        "the unscanned interest stays for the next pass"
+    );
+}
+
 /// The cadence sweep resolves interest pids through the
 /// current binding pins (as the tick resolves its targets): the
 /// accessor carries the witness's own pin, so the sweep's guard
@@ -3021,6 +3085,268 @@ fn joint_live_ahead_gate_accepts_only_tainted_global_advance() {
             "{why} refuses"
         );
     }
+}
+
+/// A retained take refuses live ahead across a recorded absence:
+/// the tainted scan plus a proven unmapped window mints on
+/// re-observation, so the pre-scan take races and the old witness
+/// stays stale after the mint.
+#[test]
+fn joint_retained_take_refuses_live_ahead_with_recorded_absence() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let old_ids = receipt.ids.clone();
+    let (cookie, exec, file) = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    let (domain, image) = (receipt.domain, receipt.image);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    assert_eq!(
+        harness.capture.router.partition_back_taint(domain, image, file),
+        Some((true, false)),
+        "the continuation taints the scan"
+    );
+    harness.capture.router.note_proven_absence(image, file);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead across a recorded absence races");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file),
+        "the raced take queues its refresh"
+    );
+    assert_eq!(harness.capture.take_drift_tolerated(), 0);
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        report.observations,
+        vec![ObserveOutcome::New],
+        "the refresh mints past the absence"
+    );
+    let new_ids = harness
+        .capture
+        .router
+        .current_instances(domain, image, file);
+    assert_ne!(old_ids, new_ids, "the mint moves to a different ID");
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("the old witness is stale after the mint");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::WitnessStale
+    );
+}
+
+/// A retained take refuses live ahead across a proven storage_null
+/// move: the counter proves an unattributed hook event between the
+/// tainted scan and live, so the take races and the refresh mints.
+#[test]
+fn joint_retained_take_refuses_live_ahead_with_moved_storage_null() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let old_ids = receipt.ids.clone();
+    let (cookie, exec, file) = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    let (domain, image) = (receipt.domain, receipt.image);
+    harness.io.storage_null = Some(5);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    assert_eq!(
+        harness.capture.router.partition_back_taint(domain, image, file),
+        Some((true, false)),
+        "the continuation taints the scan"
+    );
+    harness.io.storage_null = Some(6);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead across a storage move races");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file),
+        "the raced take queues its refresh"
+    );
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        report.observations,
+        vec![ObserveOutcome::New],
+        "the refresh mints past the storage move"
+    );
+    let new_ids = harness
+        .capture
+        .router
+        .current_instances(domain, image, file);
+    assert_ne!(old_ids, new_ids, "the mint moves to a different ID");
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("the old witness is stale after the mint");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::WitnessStale
+    );
+}
+
+/// A retained take refuses live ahead when the mapping changed
+/// under the advance: the take carries no ranges, so it cannot
+/// rule out a remap and races for the refresh scan to prove it.
+#[test]
+fn joint_retained_take_refuses_live_ahead_with_changed_ranges() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let old_ids = receipt.ids.clone();
+    let (cookie, exec, file) = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    let (domain, image) = (receipt.domain, receipt.image);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.scan_ranges = Some(vec![MapRange::new(0x8000_0000, 0x8000_6000, 0, true)]);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead across a remap races");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file),
+        "the raced take queues its refresh"
+    );
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        report.observations,
+        vec![ObserveOutcome::New],
+        "the refresh mints past the remap"
+    );
+    let new_ids = harness
+        .capture
+        .router
+        .current_instances(domain, image, file);
+    assert_ne!(old_ids, new_ids, "the mint moves to a different ID");
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("the old witness is stale after the mint");
+    assert_eq!(
+        refusal,
+        crate::attach::BirthObservationRefusal::WitnessStale
+    );
+}
+
+/// Healthy global churn still recovers through refresh: the
+/// pre-scan take races (live ahead of the tainted scan), the
+/// sweep re-proves the same instance, and the retried take
+/// validates against current truth.
+#[test]
+fn joint_retained_take_refresh_recovers_healthy_global_churn() {
+    let (mut harness, witness, mut rows) = birth_sealed_witness();
+    let receipt = &witness.candidate.receipt;
+    let old_ids = receipt.ids.clone();
+    let (cookie, exec, file) = (
+        receipt.image.task_cookie,
+        receipt.image.exec_id,
+        receipt.endpoint.file_slot,
+    );
+    let (domain, image) = (receipt.domain, receipt.image);
+    harness.io.global = 1;
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (report, _) = harness.route(&mut raw);
+    assert_eq!(report.observations, vec![ObserveOutcome::Continued]);
+    harness.io.global = 2;
+    let refusal = witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect_err("live ahead of the scan races for refresh");
+    assert_eq!(refusal, crate::attach::BirthObservationRefusal::EpochDrift);
+    assert!(
+        harness
+            .capture
+            .has_refresh_interest_for_test(cookie, exec, file),
+        "the raced take queues its refresh"
+    );
+    let report = harness.capture.sweep_take_refresh_with(&mut harness.io);
+    assert_eq!(
+        report.observations,
+        vec![ObserveOutcome::Continued],
+        "the refresh re-proves the same instance"
+    );
+    let new_ids = harness
+        .capture
+        .router
+        .current_instances(domain, image, file);
+    assert_eq!(old_ids, new_ids, "healthy churn keeps the same ID");
+    witness
+        .fresh_evidence_with(
+            &mut harness.io,
+            &mut rows,
+            &harness.capture,
+            harness.fixture.attachment(),
+            harness.fixture.binding(),
+        )
+        .expect("the retried take validates against current truth");
+    assert_eq!(harness.capture.take_drift_tolerated(), 1);
 }
 
 #[test]

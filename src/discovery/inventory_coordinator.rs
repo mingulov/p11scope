@@ -3720,6 +3720,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// for the verbose tails once the seated lane no longer reads.
     pub(crate) fn joint_decoder_diagnosis(&self) -> Option<u64> {
         self.retained_decoder_malformed
+    /// Seal bootstrap telemetry: which bootstrap check refused a
+    /// seal, by arm (bootstrap-arm diagnostics).
+    pub(crate) fn joint_seal_bootstrap_diagnosis(
+        &self,
+    ) -> crate::semantics_objects::journal::SealBootstrapCounts {
+        self.joint_capture.adapter().seal_bootstrap_diagnosis()
     }
 
     /// Disclose audit voids as counted scope gaps (scope round): one

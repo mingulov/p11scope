@@ -1989,6 +1989,48 @@ pub(crate) fn joint_decoder_line(raw_malformed: Option<u64>) -> String {
              raw_malformed_unprovable=1"
             .to_string(),
     }
+/// One stderr line for the diagnostic seal-bootstrap summary:
+/// which bootstrap check refused a seal, by arm. Counts only; no
+/// identities, paths or payloads. Diagnostic-only: printed beside
+/// the Joint-void summary only when verbose text is requested, never
+/// a contract. Variant detail lists nonzero slots only (`-` when the
+/// bucket is empty).
+pub(crate) fn joint_bootstraps_line(
+    counts: &crate::semantics_objects::journal::SealBootstrapCounts,
+) -> String {
+    use crate::semantics_objects::journal::SealBootstrapCounts;
+    fn detail(slots: &[u64], name: fn(usize) -> Option<&'static str>) -> String {
+        let mut parts = Vec::new();
+        for (index, count) in slots.iter().enumerate() {
+            if *count == 0 {
+                continue;
+            }
+            match name(index) {
+                Some(label) => parts.push(format!("{label}:{count}")),
+                None => parts.push(format!("slot{index}:{count}")),
+            }
+        }
+        if parts.is_empty() {
+            "-".to_string()
+        } else {
+            parts.join(",")
+        }
+    }
+    format!(
+        "p11scope: joint seal bootstraps: take_failed={} \
+         reverify_failed={} covers_failed={} pin_failed={} other_failed={} \
+         take_detail={} reverify_detail={}",
+        counts.take_failed_total(),
+        counts.reverify_failed_total(),
+        counts.covers_failed,
+        counts.pin_failed,
+        counts.other_failed,
+        detail(&counts.take_failed, SealBootstrapCounts::take_arm_name),
+        detail(
+            &counts.reverify_failed,
+            SealBootstrapCounts::reverify_arm_name
+        ),
+    )
 }
 
 /// One stderr line for the diagnostic audit-subject summary:

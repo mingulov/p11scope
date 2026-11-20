@@ -2167,6 +2167,10 @@ fn run_with_terminal_budget(
             subjects.refusals_before_first_rearm,
             subjects.refusals_after_first_rearm,
         ));
+        let bootstraps = coordinator.joint_seal_bootstrap_diagnosis();
+        inventory_diagnostic(&crate::inventory_semantics::joint_bootstraps_line(
+            &bootstraps,
+        ));
     }
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
@@ -9669,6 +9673,10 @@ fn run_dashboard(
             subjects.audits,
             subjects.refusals_before_first_rearm,
             subjects.refusals_after_first_rearm,
+        ));
+        let bootstraps = coordinator.joint_seal_bootstrap_diagnosis();
+        display.notice(&crate::inventory_semantics::joint_bootstraps_line(
+            &bootstraps,
         ));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.

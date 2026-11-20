@@ -3179,6 +3179,12 @@ impl CallerRegistry {
                 cursor.done_upto = Some(id);
                 continue;
             }
+            if !gate.try_charge() {
+                self.staged_disposal = Some(cursor);
+                let spent = gate.spent();
+                debug_assert!(spent <= budget);
+                return (false, spent);
+            }
             #[cfg(test)]
             self.test_disposal_reads
                 .set(self.test_disposal_reads.get() + 1);
@@ -3198,12 +3204,6 @@ impl CallerRegistry {
                 debug_assert!(spent <= budget);
                 return (true, spent);
             };
-            if !gate.try_charge() {
-                self.staged_disposal = Some(cursor);
-                let spent = gate.spent();
-                debug_assert!(spent <= budget);
-                return (false, spent);
-            }
             let Some(record) = self.instance_state.semantics.get_mut(&next_id) else {
                 cursor.done_upto = Some(next_id);
                 continue;

@@ -1190,6 +1190,46 @@ pub(crate) struct EdgeRetireCursor {
     open_insert_pending: Option<(u64, u64)>,
     /// Whether Selected unknown-flags counting ran (first poll).
     selected_counted: bool,
+    /// Retained active visit (charged next lookup + decision): held
+    /// across yields so a refused terminal charge never re-reads.
+    pending_active: Option<ActiveVisit>,
+    /// Retained pending visit: key + decision (`None` while the
+    /// decision read is still owed).
+    pending_pending: Option<((u64, u32), Option<bool>)>,
+    /// Retained detached visit (charged next lookup + staged value /
+    /// open decision).
+    pending_detached: Option<DetachedVisit>,
+}
+
+/// One scanned active machine with its end/skip decision (`None`
+/// while a Slot decision read is still owed).
+#[derive(Debug, Clone, Copy)]
+struct ActiveVisit {
+    next: (u64, u16),
+    decision: Option<RetireActiveDecision>,
+}
+
+/// One scanned detached id with its staged decision.
+#[derive(Debug, Clone, Copy)]
+struct DetachedVisit {
+    next: (u64, u32, crate::semantics_objects::AsyncValue),
+    stage: DetachedVisitStage,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DetachedVisitStage {
+    /// Value unread: charge, read, resolve or retain the owner.
+    NeedValue,
+    /// Owned id under a Slot scope: charge, read the owner's open.
+    NeedOpen { owner: u64 },
+    /// Resolved: float, drop, or keep.
+    Ready { action: RetireDetachedAction },
+}
+
+/// Preliminary detached decision from a retained value read.
+enum DetachedPreliminaryAction {
+    Done(RetireDetachedAction),
+    NeedOpen { owner: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1751,12 +1791,13 @@ impl EdgeSemantics {
     }
 
     /// Whether one login/logout call retires its slot's operations,
-    /// shared by the synchronous reducer ([`Self::apply_auth`]) and the
-    /// feed peek ([`Self::would_retire_scope`]) so the two cannot drift:
+    /// shared by the synchronous reducer ([`Self::apply_auth`]), the
+    /// feed peek ([`Self::would_retire_scope`]) and the feed's
+    /// charge-then-classify helper so the three cannot drift:
     /// context-specific `C_Login` with `OK` is exempt, and only
     /// `OK`/`PIN_LOCKED` proceed (both prove the token answered with
     /// changed auth state).
-    fn auth_retires_slot(call: &SemanticCall) -> bool {
+    pub(crate) fn auth_retires_slot(call: &SemanticCall) -> bool {
         if call.function == "C_Login" && call.user_type == 2 && call.rv == CkRv::OK.0 {
             return false;
         }
@@ -2550,8 +2591,9 @@ impl EdgeSemantics {
     /// downgrade-cause counting differs, which the peek correctly
     /// omits). LOGIN/LOGOUT share the synchronous auth scope predicate
     /// ([`Self::auth_retires_slot`]) and resolve their slot from the
-    /// live open map (like sync); exempt and slot-less logins observe
-    /// Bounded.
+    /// live open map (like sync); the caller pre-charges that one
+    /// lookup before calling (see the feed's charge-then-classify
+    /// helper). Exempt and slot-less logins observe Bounded.
     pub(crate) fn would_retire_scope(&self, call: &SemanticCall) -> RetirePeek {
         if !call.attributable || !call.authorized || !call.unambiguous || call.count_only {
             return RetirePeek::NoOp;
@@ -2698,6 +2740,9 @@ impl EdgeSemantics {
             session_had_open: None,
             open_insert_pending: None,
             selected_counted: false,
+            pending_active: None,
+            pending_pending: None,
+            pending_detached: None,
         }
     }
 
@@ -2726,36 +2771,63 @@ impl EdgeSemantics {
         loop {
             match cursor.phase {
                 EdgeRetirePhase::Active => {
-                    let Some(next) = self.retire_next_active(cursor) else {
-                        if matches!(cursor.scope, EdgeRetireScope::SessionMachines { .. }) {
-                            self.evidence.operation_state_imports =
-                                self.evidence.operation_state_imports.saturating_add(1);
-                            cursor.phase = EdgeRetirePhase::Done;
-                            continue;
+                    if cursor.pending_active.is_none() {
+                        if !budget.try_charge() {
+                            return false;
                         }
-                        if matches!(
-                            cursor.scope,
-                            EdgeRetireScope::Slot {
-                                close_all: true,
-                                ..
+                        let Some(next) = self.retire_next_active(cursor) else {
+                            if matches!(cursor.scope, EdgeRetireScope::SessionMachines { .. }) {
+                                self.evidence.operation_state_imports =
+                                    self.evidence.operation_state_imports.saturating_add(1);
+                                cursor.phase = EdgeRetirePhase::Done;
+                                continue;
                             }
-                        ) && !cursor.slot_unproven_pass
-                        {
-                            cursor.slot_unproven_pass = true;
-                            cursor.active_done_upto = None;
+                            if matches!(
+                                cursor.scope,
+                                EdgeRetireScope::Slot {
+                                    close_all: true,
+                                    ..
+                                }
+                            ) && !cursor.slot_unproven_pass
+                            {
+                                cursor.slot_unproven_pass = true;
+                                cursor.active_done_upto = None;
+                                continue;
+                            }
+                            cursor.phase = EdgeRetirePhase::Pending;
                             continue;
+                        };
+                        cursor.pending_active = Some(ActiveVisit {
+                            next,
+                            decision: None,
+                        });
+                    }
+                    let next = cursor.pending_active.expect("visit retained").next;
+                    let decision = match cursor.pending_active.expect("visit retained").decision {
+                        Some(decision) => decision,
+                        None => {
+                            // Slot decisions read the open map
+                            // (charged); all others are pure.
+                            if matches!(cursor.scope, EdgeRetireScope::Slot { .. }) {
+                                if !budget.try_charge() {
+                                    return false;
+                                }
+                            }
+                            let (session, bit) = next;
+                            let decision = self.retire_active_decision(cursor, session, bit);
+                            cursor
+                                .pending_active
+                                .as_mut()
+                                .expect("visit retained")
+                                .decision = Some(decision);
+                            decision
                         }
-                        cursor.phase = EdgeRetirePhase::Pending;
-                        continue;
                     };
                     let (session, bit) = next;
-                    let decision = self.retire_active_decision(cursor, session, bit);
                     match decision {
                         RetireActiveDecision::Skip => {
-                            if !budget.try_charge() {
-                                return false;
-                            }
                             cursor.active_done_upto = Some(next);
+                            cursor.pending_active = None;
                             if budget.remaining() == 0 {
                                 return false;
                             }
@@ -2765,6 +2837,7 @@ impl EdgeSemantics {
                                 return false;
                             }
                             cursor.active_done_upto = Some(next);
+                            cursor.pending_active = None;
                             cursor.changed = true;
                             #[cfg(test)]
                             {
@@ -2808,24 +2881,53 @@ impl EdgeSemantics {
                     }
                 }
                 EdgeRetirePhase::Pending => {
-                    let Some(next) = self.retire_next_pending(cursor) else {
-                        cursor.phase = EdgeRetirePhase::Detached;
-                        continue;
-                    };
-                    if !budget.try_charge() {
-                        return false;
+                    if cursor.pending_pending.is_none() {
+                        if matches!(cursor.scope, EdgeRetireScope::SessionMachines { .. }) {
+                            cursor.phase = EdgeRetirePhase::Detached;
+                            continue;
+                        }
+                        if !budget.try_charge() {
+                            return false;
+                        }
+                        let Some(next) = self.retire_next_pending(cursor) else {
+                            cursor.phase = EdgeRetirePhase::Detached;
+                            continue;
+                        };
+                        // Session decisions are pure (always doomed);
+                        // Slot/Selected decisions read below.
+                        let doomed = if matches!(cursor.scope, EdgeRetireScope::Session { .. }) {
+                            Some(true)
+                        } else {
+                            None
+                        };
+                        cursor.pending_pending = Some((next, doomed));
                     }
-                    cursor.pending_done_upto = Some(next);
-                    if self.retire_pending_doomed(cursor, &next) {
+                    let (next, doomed) = cursor.pending_pending.expect("visit retained");
+                    let doomed = match doomed {
+                        Some(doomed) => doomed,
+                        None => {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            let doomed = self.retire_pending_doomed(cursor, &next);
+                            cursor.pending_pending = Some((next, Some(doomed)));
+                            doomed
+                        }
+                    };
+                    if doomed {
                         self.pending.remove(&next);
                         cursor.changed = true;
                     }
+                    cursor.pending_done_upto = Some(next);
+                    cursor.pending_pending = None;
                     if budget.remaining() == 0 {
                         return false;
                     }
                 }
                 EdgeRetirePhase::Detached => {
-                    if self.detached.is_empty() {
+                    if self.detached.is_empty()
+                        || matches!(cursor.scope, EdgeRetireScope::SessionMachines { .. })
+                    {
                         if matches!(
                             cursor.scope,
                             EdgeRetireScope::Slot {
@@ -2843,43 +2945,96 @@ impl EdgeSemantics {
                         }
                         continue;
                     }
-                    let Some(next) = self.retire_next_detached(cursor) else {
-                        if matches!(
-                            cursor.scope,
-                            EdgeRetireScope::Slot {
-                                close_all: false,
-                                ..
-                            }
-                        ) {
-                            if cursor.changed {
-                                self.evidence.auth_state_ambiguities =
-                                    self.evidence.auth_state_ambiguities.saturating_add(1);
-                            }
-                            cursor.phase = EdgeRetirePhase::Done;
-                        } else {
-                            cursor.phase = EdgeRetirePhase::Open;
+                    if cursor.pending_detached.is_none() {
+                        if !budget.try_charge() {
+                            return false;
                         }
-                        continue;
-                    };
-                    if !budget.try_charge() {
-                        return false;
+                        let Some(next) = self.retire_next_detached(cursor) else {
+                            if matches!(
+                                cursor.scope,
+                                EdgeRetireScope::Slot {
+                                    close_all: false,
+                                    ..
+                                }
+                            ) {
+                                if cursor.changed {
+                                    self.evidence.auth_state_ambiguities =
+                                        self.evidence.auth_state_ambiguities.saturating_add(1);
+                                }
+                                cursor.phase = EdgeRetirePhase::Done;
+                            } else {
+                                cursor.phase = EdgeRetirePhase::Open;
+                            }
+                            continue;
+                        };
+                        cursor.pending_detached = Some(DetachedVisit {
+                            next,
+                            stage: DetachedVisitStage::NeedValue,
+                        });
                     }
-                    cursor.detached_done_upto = Some(next);
-                    match self.retire_detached_action(cursor, &next) {
-                        RetireDetachedAction::Float => {
-                            if let Some(id) = self.detached.get_mut(&next) {
-                                id.owner = None;
-                                cursor.changed = true;
+                    let visit = cursor.pending_detached.expect("visit retained");
+                    match visit.stage {
+                        DetachedVisitStage::NeedValue => {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            #[cfg(test)]
+                            self.bump_edge_read_for_test();
+                            let id = self
+                                .detached
+                                .get(&visit.next)
+                                .expect("retire scan retained");
+                            let owner = id.owner;
+                            let function = id.call.function.clone();
+                            match Self::detached_preliminary_action(&cursor.scope, owner, &function)
+                            {
+                                DetachedPreliminaryAction::Done(action) => {
+                                    cursor.pending_detached = Some(DetachedVisit {
+                                        next: visit.next,
+                                        stage: DetachedVisitStage::Ready { action },
+                                    });
+                                }
+                                DetachedPreliminaryAction::NeedOpen { owner } => {
+                                    cursor.pending_detached = Some(DetachedVisit {
+                                        next: visit.next,
+                                        stage: DetachedVisitStage::NeedOpen { owner },
+                                    });
+                                }
                             }
                         }
-                        RetireDetachedAction::Drop => {
-                            self.detached.remove(&next);
-                            cursor.changed = true;
+                        DetachedVisitStage::NeedOpen { owner } => {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            #[cfg(test)]
+                            self.bump_edge_read_for_test();
+                            let open = self.open.get(&owner).copied();
+                            let action = Self::detached_slot_action(&cursor.scope, open);
+                            cursor.pending_detached = Some(DetachedVisit {
+                                next: visit.next,
+                                stage: DetachedVisitStage::Ready { action },
+                            });
                         }
-                        RetireDetachedAction::Keep => {}
-                    }
-                    if budget.remaining() == 0 {
-                        return false;
+                        DetachedVisitStage::Ready { action } => {
+                            match action {
+                                RetireDetachedAction::Float => {
+                                    if let Some(id) = self.detached.get_mut(&visit.next) {
+                                        id.owner = None;
+                                        cursor.changed = true;
+                                    }
+                                }
+                                RetireDetachedAction::Drop => {
+                                    self.detached.remove(&visit.next);
+                                    cursor.changed = true;
+                                }
+                                RetireDetachedAction::Keep => {}
+                            }
+                            cursor.detached_done_upto = Some(visit.next);
+                            cursor.pending_detached = None;
+                            if budget.remaining() == 0 {
+                                return false;
+                            }
+                        }
                     }
                 }
                 EdgeRetirePhase::Open => match cursor.scope.clone() {
@@ -2907,13 +3062,44 @@ impl EdgeSemantics {
                             }
                             #[cfg(test)]
                             self.bump_edge_read_for_test();
-                            if !self.open.contains_key(&ins_session)
-                                && self.open.len() >= MAX_EDGE_SESSIONS
-                            {
-                                self.dropped = self.dropped.saturating_add(1);
-                            } else {
-                                self.retain_resource_charge(resources::OPEN_BINDING_CHARGE);
-                                self.open.insert(ins_session, ins_slot);
+                            // One entry lookup (charged above) covers
+                            // the occupancy check and the insert; the
+                            // length pre-read is free metadata. Each arm
+                            // retains exactly like
+                            // `retain_resource_charge` (split + absorb
+                            // through disjoint field borrows, since the
+                            // entry holds the map).
+                            let full = self.open.len() >= MAX_EDGE_SESSIONS;
+                            use std::collections::btree_map::Entry;
+                            match self.open.entry(ins_session) {
+                                Entry::Occupied(mut slot) => {
+                                    if let Some(prepared) = self.resource_transition.as_mut() {
+                                        let lease = prepared
+                                            .reservation
+                                            .split(resources::OPEN_BINDING_CHARGE);
+                                        self.resource_owner
+                                            .as_mut()
+                                            .expect("admitted owner")
+                                            .absorb(lease);
+                                    }
+                                    slot.insert(ins_slot);
+                                }
+                                Entry::Vacant(slot) => {
+                                    if full {
+                                        self.dropped = self.dropped.saturating_add(1);
+                                    } else {
+                                        if let Some(prepared) = self.resource_transition.as_mut() {
+                                            let lease = prepared
+                                                .reservation
+                                                .split(resources::OPEN_BINDING_CHARGE);
+                                            self.resource_owner
+                                                .as_mut()
+                                                .expect("admitted owner")
+                                                .absorb(lease);
+                                        }
+                                        slot.insert(ins_slot);
+                                    }
+                                }
                             }
                             cursor.open_insert_pending = None;
                         }
@@ -2954,18 +3140,16 @@ impl EdgeSemantics {
                             cursor.phase = EdgeRetirePhase::Done;
                             continue;
                         }
-                        let Some(next) = self.retire_next_open(cursor) else {
-                            cursor.phase = EdgeRetirePhase::Done;
-                            continue;
-                        };
                         if !budget.try_charge() {
                             return false;
                         }
-                        cursor.open_done_upto = Some(next);
-                        #[cfg(test)]
-                        self.bump_edge_read_for_test();
-                        if self.open.get(&next) == Some(&slot) {
-                            self.open.remove(&next);
+                        let Some((session, owner)) = self.retire_next_open(cursor) else {
+                            cursor.phase = EdgeRetirePhase::Done;
+                            continue;
+                        };
+                        cursor.open_done_upto = Some(session);
+                        if owner == slot {
+                            self.open.remove(&session);
                             self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
                             cursor.changed = true;
                         }
@@ -3151,67 +3335,79 @@ impl EdgeSemantics {
         }
     }
 
-    /// Float, drop, or keep the scanned detached id.
-    fn retire_detached_action(
-        &self,
-        cursor: &EdgeRetireCursor,
-        next: &(u64, u32, crate::semantics_objects::AsyncValue),
-    ) -> RetireDetachedAction {
-        #[cfg(test)]
-        self.bump_edge_read_for_test();
-        let id = self.detached.get(next).expect("retire scan retained");
-        match &cursor.scope {
+    /// Preliminary detached action from a retained value read (no
+    /// map access): `Done` resolves immediately; `NeedOpen` needs the
+    /// owner's open row (Slot scope with an owned id only). Mirrors
+    /// the synchronous float/drop/keep exactly.
+    fn detached_preliminary_action(
+        scope: &EdgeRetireScope,
+        owner: Option<u64>,
+        function: &str,
+    ) -> DetachedPreliminaryAction {
+        match scope {
             EdgeRetireScope::Session { session, .. } => {
-                if id.owner == Some(*session) {
-                    RetireDetachedAction::Float
+                if owner == Some(*session) {
+                    DetachedPreliminaryAction::Done(RetireDetachedAction::Float)
                 } else {
-                    RetireDetachedAction::Keep
+                    DetachedPreliminaryAction::Done(RetireDetachedAction::Keep)
                 }
             }
-            EdgeRetireScope::SessionMachines { .. } => RetireDetachedAction::Keep,
-            EdgeRetireScope::Slot { slot, close_all } => match id.owner {
-                Some(owner) => {
-                    #[cfg(test)]
-                    self.bump_edge_read_for_test();
-                    match self.open.get(&owner) {
-                        Some(candidate) if candidate == slot => RetireDetachedAction::Float,
-                        Some(_) => RetireDetachedAction::Keep,
-                        None if *close_all => RetireDetachedAction::Float,
-                        None => RetireDetachedAction::Keep,
-                    }
-                }
-                None => RetireDetachedAction::Keep,
+            EdgeRetireScope::SessionMachines { .. } => {
+                DetachedPreliminaryAction::Done(RetireDetachedAction::Keep)
+            }
+            EdgeRetireScope::Slot { .. } => match owner {
+                Some(owner) => DetachedPreliminaryAction::NeedOpen { owner },
+                None => DetachedPreliminaryAction::Done(RetireDetachedAction::Keep),
             },
             EdgeRetireScope::Selected { session, flags, .. } => {
-                if id.owner != Some(*session) {
-                    return RetireDetachedAction::Keep;
+                if owner != Some(*session) {
+                    return DetachedPreliminaryAction::Done(RetireDetachedAction::Keep);
                 }
-                let descriptor = crate::kinds::descriptor(&id.call.function)
-                    .unwrap_or(SlotSemantics::COUNT_ONLY);
+                let descriptor =
+                    crate::kinds::descriptor(function).unwrap_or(SlotSemantics::COUNT_ONLY);
                 let mask = cancel_operation_mask(*flags);
                 if descriptor.operations & mask == 0
                     && direct_cancel_flag(descriptor.direct) & flags == 0
                 {
-                    RetireDetachedAction::Keep
+                    DetachedPreliminaryAction::Done(RetireDetachedAction::Keep)
                 } else {
-                    RetireDetachedAction::Drop
+                    DetachedPreliminaryAction::Done(RetireDetachedAction::Drop)
                 }
             }
         }
     }
 
+    /// Slot detached action from a retained open read (Slot scope
+    /// only): float owned (or close-all orphaned) ids, keep the rest.
+    /// Mirrors the synchronous arm exactly.
+    fn detached_slot_action(scope: &EdgeRetireScope, open: Option<u64>) -> RetireDetachedAction {
+        let EdgeRetireScope::Slot { slot, close_all } = scope else {
+            debug_assert!(false, "only Slot scopes read the owner's open");
+            return RetireDetachedAction::Keep;
+        };
+        match open {
+            Some(candidate) if candidate == *slot => RetireDetachedAction::Float,
+            Some(_) => RetireDetachedAction::Keep,
+            None if *close_all => RetireDetachedAction::Float,
+            None => RetireDetachedAction::Keep,
+        }
+    }
+
     /// Next open key for slot-scope scans.
-    fn retire_next_open(&self, cursor: &EdgeRetireCursor) -> Option<u64> {
+    /// Next open entry for the retire scan: session + slot in one
+    /// charged lookup (the caller compares the retained slot, never
+    /// re-reading).
+    fn retire_next_open(&self, cursor: &EdgeRetireCursor) -> Option<(u64, u64)> {
         #[cfg(test)]
         self.bump_edge_read_for_test();
         use std::ops::Bound::{Excluded, Unbounded};
         match cursor.open_done_upto {
-            None => self.open.keys().next().copied(),
+            None => self.open.iter().next().map(|(key, slot)| (*key, *slot)),
             Some(done) => self
                 .open
                 .range((Excluded(done), Unbounded))
                 .next()
-                .map(|(key, _)| *key),
+                .map(|(key, slot)| (*key, *slot)),
         }
     }
 

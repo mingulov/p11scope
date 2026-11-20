@@ -618,10 +618,9 @@ impl StagingLedger {
         LedgerReleaseCursor { inner }
     }
 
-    /// Drive one budgeted release (staged or association) for at most
-    /// `budget` leaf units through the single pre-debit gate. Returns
-    /// whether the release completed, the units spent (never above
-    /// `budget`) and, on completion, the removed bytes and charge when
+    /// Drive one budgeted release (staged or association) through
+    /// the shared pre-debit `gate`. Returns whether the release
+    /// completed and, on completion, the removed bytes and charge when
     /// a membership was found. The caller RETAINS the returned charge
     /// until its payload drops (drop-then-refund): dropping it at
     /// unlink completion would refund the pool while the staged
@@ -629,32 +628,22 @@ impl StagingLedger {
     pub(crate) fn release_step(
         &mut self,
         cursor: &mut LedgerReleaseCursor,
-        budget: usize,
-    ) -> (bool, usize, Option<(usize, Option<ResourceLease>)>) {
+        gate: &mut LeafBudget,
+    ) -> (bool, Option<(usize, Option<ResourceLease>)>) {
         let Some(inner) = cursor.inner.as_mut() else {
-            return (true, 0, None);
+            return (true, None);
         };
         let Some(table) = self.table.as_mut() else {
             cursor.inner = None;
-            return (true, 0, None);
+            return (true, None);
         };
-        let (done, spent, actual, result) = table.release_single_step(inner, budget);
-        #[cfg(not(test))]
-        let _ = actual;
-        #[cfg(test)]
-        debug_assert_eq!(
-            spent, actual,
-            "budgeted release must debit every leaf unit it performs"
-        );
+        let (done, result) = table.release_single_step(inner, gate);
         if done {
             cursor.inner = None;
-        }
-        debug_assert!(spent <= budget);
-        if done {
-            (done, spent, result)
+            (true, result)
         } else {
             debug_assert!(result.is_none());
-            (done, spent, None)
+            (false, None)
         }
     }
 

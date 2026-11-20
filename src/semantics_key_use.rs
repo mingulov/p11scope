@@ -359,6 +359,29 @@ pub(crate) struct JointStaging {
     test_feed_reads: std::cell::Cell<usize>,
 }
 
+/// One charged staged-queue peek: `Yield` (no credit: retry with
+/// fresh credit, nothing read), `Empty` (empty queue, unit consumed),
+/// or the retained head facts (cloned: the head stays staged).
+pub(crate) enum StagedPeek {
+    Yield,
+    Empty,
+    Head {
+        position: u64,
+        native: Option<crate::attach::capture::NativeDomainId>,
+        facts: SemanticCall,
+        origin: EffectOrigin,
+    },
+}
+
+/// One charged staged-queue pop: the head's facts, origin and
+/// position (the release cursor was built from the peeked native
+/// domain handle at selection).
+pub(crate) struct PoppedHead {
+    facts: SemanticCall,
+    origin: EffectOrigin,
+    position: u64,
+}
+
 impl std::fmt::Debug for JointStaging {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JointStaging")
@@ -834,6 +857,57 @@ impl JointStaging {
     #[cfg(test)]
     pub(crate) fn reset_test_feed_reads_for_test(&self) {
         self.test_feed_reads.set(0);
+    }
+
+    /// Charge-then-peek the staged head for budgeted disposal: grants
+    /// one unit before reading. `Yield` returns WITHOUT reading when
+    /// the credit is exhausted (caller yields); `Empty` reports an
+    /// empty queue (the lookup still consumed its unit); `Head`
+    /// retains the head's facts for classification (cloned: the head
+    /// stays staged until its work commits).
+    pub(crate) fn peek_head_charged(
+        &self,
+        gate: &mut crate::semantics_objects::journal::LeafBudget,
+    ) -> StagedPeek {
+        if !gate.try_charge() {
+            return StagedPeek::Yield;
+        }
+        #[cfg(test)]
+        self.bump_feed_read_for_test();
+        match self.staged.front() {
+            None => StagedPeek::Empty,
+            Some(head) => StagedPeek::Head {
+                position: head.position,
+                native: head.resource_native,
+                facts: head.facts.clone(),
+                origin: head.origin.clone(),
+            },
+        }
+    }
+
+    /// Charge-then-pop the staged head for budgeted disposal: grants
+    /// one unit before reading. Returns `None` WITHOUT popping when
+    /// the credit is exhausted (caller yields with the head retained).
+    pub(crate) fn pop_head_charged(
+        &mut self,
+        expected: u64,
+        gate: &mut crate::semantics_objects::journal::LeafBudget,
+    ) -> Option<PoppedHead> {
+        if !gate.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.bump_feed_read_for_test();
+        let head = self.staged.pop_front().expect("pending head retained");
+        assert_eq!(
+            head.position, expected,
+            "the disposal holds its head across credits"
+        );
+        Some(PoppedHead {
+            facts: head.facts,
+            origin: head.origin,
+            position: head.position,
+        })
     }
 
     /// Read the original retained membership, without copying its payload or
@@ -4273,6 +4347,52 @@ impl OperationSink for CaptureSink {
     }
 }
 
+/// One staged head retained across its budgeted disposal: the
+/// peeked position plus whether the head observes Bounded (`false`
+/// pops for 1 unit; retiring and PENDING heads run their cursors
+/// first and pop without observing). Retained once at selection, so
+/// the classification never re-reads on short credit.
+struct PendingHead {
+    position: u64,
+    bounded: bool,
+}
+
+/// One peeked staged head awaiting classification: the charged peek
+/// retains its facts here, so a refused classify grant resumes
+/// without re-peeking (re-peeking would livelock 1-unit polls: the
+/// peek spends the unit the classify needs).
+struct PeekedHead {
+    position: u64,
+    native: Option<crate::attach::capture::NativeDomainId>,
+    facts: SemanticCall,
+    origin: EffectOrigin,
+}
+
+/// Charge-then-classify one staged head: grants the classify lookup
+/// before the peek reads it (login/logout slot resolution reads the
+/// open map once; every other shape classifies pure). Returns `None`
+/// WITHOUT classifying when the grant refuses (caller yields with
+/// the head retained; nothing read).
+fn classify_head_charged(
+    throwaway: &EdgeSemantics,
+    facts: &SemanticCall,
+    gate: &mut crate::semantics_objects::journal::LeafBudget,
+) -> Option<crate::semantics_edge::RetirePeek> {
+    let descriptor = crate::kinds::descriptor(&facts.function)
+        .unwrap_or(p11scope_ebpf_common::SlotSemantics::COUNT_ONLY);
+    if matches!(
+        descriptor.lifecycle,
+        x if x == p11scope_ebpf_common::lifecycle::LOGIN
+            || x == p11scope_ebpf_common::lifecycle::LOGOUT
+    ) && crate::semantics_edge::EdgeSemantics::auth_retires_slot(facts)
+    {
+        if !gate.try_charge() {
+            return None;
+        }
+    }
+    Some(throwaway.would_retire_scope(facts))
+}
+
 /// One captured `Started` effect awaiting its budgeted mint: the
 /// admission (duplicate check, resolution, budget check) already ran
 /// synchronously; the mint cursor walks and commits through the
@@ -4319,6 +4439,10 @@ struct PendingStartDrain {
 /// and PENDING heads use resumable cursors (exact per-leaf, no
 /// bound).
 const HEAD_WORST: usize = 56;
+/// Bounded atomic region minus its pop: the pop charges 1 at its own
+/// read, so the reserve covers the remaining 55 (same 56 total, with
+/// every read charged where it happens).
+const HEAD_OBSERVE_RESERVE: usize = HEAD_WORST - 1;
 
 pub(crate) struct FeedDisposalCursor {
     instance: RegistryInstanceId,
@@ -4326,7 +4450,8 @@ pub(crate) struct FeedDisposalCursor {
     throwaway: Option<EdgeSemantics>,
     preserved: Option<KeyUseReducer>,
     pending_release: Option<crate::semantics_objects::journal::LedgerReleaseCursor>,
-    pending_position: Option<u64>,
+    pending_head: Option<PendingHead>,
+    pending_peek: Option<PeekedHead>,
     /// Retained H9 charge from a completed unlink whose payload has
     /// not yet dropped: held across yields (including the pop-credit
     /// boundary) and refunded once after the drop. `None` when no
@@ -4375,7 +4500,8 @@ impl FeedDisposalCursor {
             throwaway: is_joint.then(EdgeSemantics::default),
             preserved: is_joint.then(KeyUseReducer::new),
             pending_release: None,
-            pending_position: None,
+            pending_head: None,
+            pending_peek: None,
             pending_lease: None,
             invalidate: None,
             head_retire_all: None,
@@ -4445,12 +4571,7 @@ impl FeedDisposalCursor {
                     debug_assert!(false, "queued assoc release needs its ledger");
                     return false;
                 };
-                let remaining = gate.remaining();
-                let (done, used, result) = fallback_ledger.release_step(release, remaining);
-                for _ in 0..used {
-                    let charged = gate.try_charge();
-                    debug_assert!(charged);
-                }
+                let (done, result) = fallback_ledger.release_step(release, gate);
                 if !done {
                     return false;
                 }
@@ -4469,12 +4590,7 @@ impl FeedDisposalCursor {
                 continue;
             }
             if let Some(release) = self.pending_release.as_mut() {
-                let remaining = gate.remaining();
-                let (done, used, result) = ledger.release_step(release, remaining);
-                for _ in 0..used {
-                    let charged = gate.try_charge();
-                    debug_assert!(charged);
-                }
+                let (done, result) = ledger.release_step(release, gate);
                 if !done {
                     return false;
                 }
@@ -4572,113 +4688,49 @@ impl FeedDisposalCursor {
                 self.head_retired = true;
                 continue;
             }
-            if let Some(expected) = self.pending_position {
+            if self.pending_head.is_some() {
                 if self.head_retired {
-                    if !gate.try_charge() {
+                    let expected = self.pending_head.as_ref().expect("head retained").position;
+                    let Some(popped) = feed.pop_head_charged(expected, gate) else {
                         return false;
-                    }
-                    #[cfg(test)]
-                    feed.bump_feed_read_for_test();
-                    let head = feed.staged.pop_front().expect("pending head retained");
-                    assert_eq!(
-                        head.position, expected,
-                        "the disposal holds its head across credits"
-                    );
-                    let (position, _native) = (head.position, head.resource_native);
-                    drop(head);
-                    feed.frontier = feed.frontier.max(position);
+                    };
+                    feed.frontier = feed.frontier.max(popped.position);
                     feed.history_disposed = feed.history_disposed.saturating_add(1);
-                    self.pending_position = None;
+                    self.pending_head = None;
                     self.head_retired = false;
                     drop(self.pending_lease.take());
                     continue;
                 }
                 if !self.is_joint {
-                    if !gate.try_charge() {
+                    let expected = self.pending_head.as_ref().expect("head retained").position;
+                    let Some(popped) = feed.pop_head_charged(expected, gate) else {
                         return false;
-                    }
-                    #[cfg(test)]
-                    feed.bump_feed_read_for_test();
-                    let head = feed.staged.pop_front().expect("pending head retained");
-                    assert_eq!(
-                        head.position, expected,
-                        "the disposal holds its head across credits"
-                    );
-                    let (position, _native) = (head.position, head.resource_native);
-                    drop(head);
-                    feed.frontier = feed.frontier.max(position);
+                    };
+                    feed.frontier = feed.frontier.max(popped.position);
                     feed.history_disposed = feed.history_disposed.saturating_add(1);
-                    self.pending_position = None;
+                    self.pending_head = None;
                     drop(self.pending_lease.take());
                     continue;
                 }
-                #[cfg(test)]
-                feed.bump_feed_read_for_test();
-                let front = feed.staged.front().expect("pending head retained");
-                assert_eq!(
-                    front.position, expected,
-                    "the disposal holds its head across credits"
-                );
-                let peek = {
-                    let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
-                    throwaway.would_retire_scope(&front.facts)
-                };
-                match peek {
-                    crate::semantics_edge::RetirePeek::All {
-                        count_reconciliations,
-                    } => {
-                        let origin = front.origin.clone();
-                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
-                        self.head_retire_all = Some(throwaway.start_budgeted_invalidation(
-                            false,
-                            Some(&origin),
-                            count_reconciliations,
-                        ));
-                        continue;
-                    }
-                    crate::semantics_edge::RetirePeek::Subset(scope) => {
-                        let origin = front.origin.clone();
-                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
-                        self.head_retire = Some(throwaway.start_budgeted_retire(scope, &origin));
-                        continue;
-                    }
-                    crate::semantics_edge::RetirePeek::Pending => {
-                        let facts = front.facts.clone();
-                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
-                        self.head_pending = Some(throwaway.start_pending_admission(facts));
-                        continue;
-                    }
-                    crate::semantics_edge::RetirePeek::NoOp => {
-                        if !gate.try_charge() {
-                            return false;
-                        }
-                    }
-                    crate::semantics_edge::RetirePeek::Bounded => {
-                        if !gate.try_charge_n(HEAD_WORST) {
-                            return false;
-                        }
-                    }
+                let pending = self.pending_head.as_ref().expect("head retained");
+                let (expected, bounded) = (pending.position, pending.bounded);
+                if bounded && !gate.try_charge_n(HEAD_OBSERVE_RESERVE) {
+                    return false;
                 }
-                #[cfg(test)]
-                feed.bump_feed_read_for_test();
-                let head = feed.staged.pop_front().expect("pending head retained");
-                assert_eq!(
-                    head.position, expected,
-                    "the disposal holds its head across credits"
-                );
+                let Some(popped) = feed.pop_head_charged(expected, gate) else {
+                    return false;
+                };
                 {
                     let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
                     let mut capture = CaptureSink {
                         effects: Vec::new(),
                     };
-                    throwaway.observe_with_effects(&head.facts, &head.origin, &mut capture);
+                    throwaway.observe_with_effects(&popped.facts, &popped.origin, &mut capture);
                     self.pending_effects.extend(capture.effects);
                 }
-                let (position, _native) = (head.position, head.resource_native);
-                drop(head);
-                feed.frontier = feed.frontier.max(position);
+                feed.frontier = feed.frontier.max(popped.position);
                 feed.history_disposed = feed.history_disposed.saturating_add(1);
-                self.pending_position = None;
+                self.pending_head = None;
                 drop(self.pending_lease.take());
                 continue;
             }
@@ -4697,49 +4749,112 @@ impl FeedDisposalCursor {
                 }
                 continue;
             }
-            #[cfg(test)]
-            feed.bump_feed_read_for_test();
-            let Some(front) = feed.staged.front() else {
-                if self.finalized {
-                    return true;
-                }
-                if !self.is_joint {
-                    self.finalized = true;
-                    return true;
-                }
-                if !self.finalize_started {
-                    if self.throwaway.is_none() || self.preserved.is_none() {
-                        debug_assert!(false, "joint finalizes once with live reducers");
-                        return false;
+            if self.pending_peek.is_none() {
+                match feed.peek_head_charged(gate) {
+                    StagedPeek::Yield => return false,
+                    StagedPeek::Empty => {
+                        if self.finalized {
+                            return true;
+                        }
+                        if !self.is_joint {
+                            self.finalized = true;
+                            return true;
+                        }
+                        if !self.finalize_started {
+                            if self.throwaway.is_none() || self.preserved.is_none() {
+                                debug_assert!(false, "joint finalizes once with live reducers");
+                                return false;
+                            }
+                            let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                            self.invalidate =
+                                Some(throwaway.start_budgeted_invalidation(true, None, false));
+                            self.finalize_started = true;
+                            continue;
+                        }
+                        debug_assert!(self.invalidate.is_none());
+                        debug_assert!(self.assoc_queue.is_empty());
+                        debug_assert!(self.assoc_release.is_none());
+                        debug_assert!(self.pending_head.is_none());
+                        debug_assert!(self.pending_start.is_none());
+                        debug_assert!(self.pending_effects.is_empty());
+                        let preserved = self.preserved.take().expect("joint finalizes once");
+                        // The throwaway stays (resourceless, drained: drop timing
+                        // is unobservable) so post-finalize read accounting keeps
+                        // its counter; the cursor drop frees it with the void.
+                        assert!(self.throwaway.is_some(), "joint finalizes once");
+                        keyuse.absorb_preserved(preserved);
+                        self.finalized = true;
+                        return true;
                     }
-                    let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
-                    self.invalidate =
-                        Some(throwaway.start_budgeted_invalidation(true, None, false));
-                    self.finalize_started = true;
-                    continue;
+                    StagedPeek::Head {
+                        position,
+                        native,
+                        facts,
+                        origin,
+                    } => {
+                        self.pending_peek = Some(PeekedHead {
+                            position,
+                            native,
+                            facts,
+                            origin,
+                        });
+                    }
                 }
-                debug_assert!(self.invalidate.is_none());
-                debug_assert!(self.assoc_queue.is_empty());
-                debug_assert!(self.assoc_release.is_none());
-                let preserved = self.preserved.take().expect("joint finalizes once");
-                // The throwaway stays (resourceless, drained: drop timing
-                // is unobservable) so post-finalize read accounting keeps
-                // its counter; the cursor drop frees it with the void.
-                assert!(self.throwaway.is_some(), "joint finalizes once");
-                keyuse.absorb_preserved(preserved);
-                self.finalized = true;
-                return true;
-            };
+            }
             if self.pending_lease.is_some() {
                 debug_assert!(false, "a retained lease always pairs with its head");
                 return false;
             }
-            let (position, native) = (front.position, front.resource_native);
+            // Classify once (charged) and start retiring and admission
+            // cursors now; their arms run after the unlink drains (loop
+            // order), so the unlink-then-work order stands. NoOp/Bounded
+            // retain their marker for the pop arm. Pure feeds pop
+            // directly. A refused classify grant yields with the peek
+            // retained (no re-peek, no re-read).
+            let (position, native, bounded) = if !self.is_joint {
+                let peeked = self.pending_peek.take().expect("peek retained");
+                (peeked.position, peeked.native, false)
+            } else {
+                let retained = self.pending_peek.as_ref().expect("peek retained");
+                let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                let Some(peek) = classify_head_charged(throwaway, &retained.facts, gate) else {
+                    return false;
+                };
+                let peeked = self.pending_peek.take().expect("peek retained");
+                let (position, native) = (peeked.position, peeked.native);
+                let bounded = match peek {
+                    crate::semantics_edge::RetirePeek::All {
+                        count_reconciliations,
+                    } => {
+                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                        self.head_retire_all = Some(throwaway.start_budgeted_invalidation(
+                            false,
+                            Some(&peeked.origin),
+                            count_reconciliations,
+                        ));
+                        false
+                    }
+                    crate::semantics_edge::RetirePeek::Subset(scope) => {
+                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                        self.head_retire =
+                            Some(throwaway.start_budgeted_retire(scope, &peeked.origin));
+                        false
+                    }
+                    crate::semantics_edge::RetirePeek::Pending => {
+                        let throwaway = self.throwaway.as_ref().expect("joint keeps reducers");
+                        self.head_pending = Some(throwaway.start_pending_admission(peeked.facts));
+                        false
+                    }
+                    crate::semantics_edge::RetirePeek::NoOp => false,
+                    crate::semantics_edge::RetirePeek::Bounded => true,
+                };
+                (position, native, bounded)
+            };
             let cursor = match native {
                 Some(native) => ledger.release_cursor_collected(native, position),
                 None => ledger.release_cursor(position),
             };
-            self.pending_position = Some(position);
+            self.pending_head = Some(PendingHead { position, bounded });
             self.pending_release = Some(cursor);
             continue;
         }
@@ -5195,7 +5310,8 @@ mod disposal_tests {
                     while let Some(ticket) = queue.pop_front() {
                         let mut cursor = fallback.release_assoc_cursor(ticket);
                         loop {
-                            let (done, _, result) = fallback.release_step(&mut cursor, 64);
+                            let mut gate = LeafBudget::new(64);
+                            let (done, result) = fallback.release_step(&mut cursor, &mut gate);
                             if done {
                                 drop(result);
                                 break;
@@ -5941,9 +6057,10 @@ mod disposal_tests {
     }
 
     /// One-unit polls never read past their grant: every 1-unit poll
-    /// over a retiring feed debits exactly what it reads, refused
-    /// leaves resume with state and custody intact, and the retire
-    /// completes with its exact terminal.
+    /// over a cursor-driven feed (retire + admission heads only;
+    /// Bounded heads need a 56-unit reserve by design) debits exactly
+    /// what it reads, refused leaves resume with state and custody
+    /// intact, and the disposal completes with nothing lost.
     #[test]
     fn feed_disposal_one_unit_polls_never_read_past_grant() {
         use pkcs11_types::CkRv;
@@ -5958,8 +6075,16 @@ mod disposal_tests {
             crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(33);
         let heads = [
             call("C_OpenSession", 7, CkRv::OK.0, 100),
-            init_call("C_SignInit", 7, 0x000d, 110),
-            call("C_CloseSession", 7, CkRv::OK.0, 120),
+            pending_call(7, 110),
+            SemanticCall {
+                function: "C_Login".into(),
+                session: 7,
+                user_type: 1,
+                rv: CkRv::OK.0,
+                ts_ns: 120,
+                ..SemanticCall::default()
+            },
+            call("C_CloseSession", 7, CkRv::OK.0, 130),
         ];
         for (index, head) in heads.iter().enumerate() {
             let head_origin = EffectOrigin {
@@ -5982,13 +6107,13 @@ mod disposal_tests {
             tag,
         );
         assert_eq!(feed.staged_len(), 0, "{tag}");
-        assert_eq!(feed.history_disposed(), 3, "{tag}");
+        assert_eq!(feed.history_disposed(), 4, "{tag}");
         assert_eq!(
             unknown_sums(&keyuse),
-            [0, 0, 1, 0],
-            "{tag}: the close retires the open as Cancelled"
+            [0, 0, 0, 0],
+            "{tag}: retires without machines emit no terminals"
         );
         assert_eq!(ledger.staged(), 0, "{tag}: every H9 released");
-        assert_eq!(fallback.census(), 0, "{tag}: the assoc released");
+        assert_eq!(fallback.census(), 0, "{tag}: nothing minted");
     }
 }

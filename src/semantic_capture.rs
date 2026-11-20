@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -376,6 +377,35 @@ impl RetainedBirthWitness {
         Ok(())
     }
 
+    /// Ask the next tick to re-observe this witness's key after
+    /// live truth raced its take, so the router follows current
+    /// truth and the retried take validates. Fail-soft.
+    fn request_refresh(&self, capture: &SemanticCapture) {
+        let receipt = &self.candidate.receipt;
+        capture.request_partition_refresh(
+            receipt.image,
+            receipt.endpoint.file_slot,
+            receipt.attachment_slot,
+            receipt.pin.pid(),
+        );
+    }
+
+    /// One retained re-validation that requests a partition refresh
+    /// when live truth races it.
+    fn revalidate_for_take(
+        &self,
+        capture: &SemanticCapture,
+        io: &mut impl CaptureIo,
+    ) -> Result<bool, crate::attach::BirthObservationRefusal> {
+        match capture.validate_birth_candidate(io, &self.candidate, true) {
+            Err(crate::attach::BirthObservationRefusal::EpochDrift) => {
+                self.request_refresh(capture);
+                Err(crate::attach::BirthObservationRefusal::EpochDrift)
+            }
+            outcome => outcome,
+        }
+    }
+
     pub(crate) fn fresh_evidence(
         &self,
         session: &mut Session,
@@ -390,13 +420,12 @@ impl RetainedBirthWitness {
         let deadline = Instant::now()
             .checked_add(capture.limits.scan_slice)
             .ok_or(crate::attach::BirthObservationRefusal::TakeDeadline)?;
-        let before = capture.validate_birth_candidate(
+        let before = self.revalidate_for_take(
+            capture,
             &mut SessionIo {
                 session,
                 targets: &[],
             },
-            &self.candidate,
-            true,
         )?;
         let evidence = {
             let maps = session.instance_maps();
@@ -409,13 +438,12 @@ impl RetainedBirthWitness {
                 self.receipt.birth(),
             )?
         };
-        let after = capture.validate_birth_candidate(
+        let after = self.revalidate_for_take(
+            capture,
             &mut SessionIo {
                 session,
                 targets: &[],
             },
-            &self.candidate,
-            true,
         )?;
         if Instant::now() >= deadline {
             return Err(crate::attach::BirthObservationRefusal::TakeDeadline);
@@ -447,7 +475,7 @@ impl RetainedBirthWitness {
             .now()
             .checked_add(capture.limits.scan_slice)
             .ok_or(crate::attach::BirthObservationRefusal::TakeDeadline)?;
-        let before = capture.validate_birth_candidate(io, &self.candidate, true)?;
+        let before = self.revalidate_for_take(capture, io)?;
         let evidence = crate::attach::observe_retained_birth(
             rows,
             binding,
@@ -455,7 +483,7 @@ impl RetainedBirthWitness {
             &self.admission,
             self.receipt.birth(),
         )?;
-        let after = capture.validate_birth_candidate(io, &self.candidate, true)?;
+        let after = self.revalidate_for_take(capture, io)?;
         if io.now() >= deadline {
             return Err(crate::attach::BirthObservationRefusal::TakeDeadline);
         }
@@ -1252,6 +1280,18 @@ struct ScanJob {
         crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
     )>,
 }
+
+/// One take-requested partition refresh: re-observe this image and
+/// file so the router follows current truth. The tick resolves the
+/// endpoint fresh from the attachment slot and drops stale
+/// interests silently; the sweep's binding checks and the accept
+/// path re-validate everything a take cannot prove.
+#[derive(Clone, Copy)]
+struct RefreshInterest {
+    image: ImageIdentity,
+    attachment_slot: u32,
+    pid: u32,
+}
 impl ScanJob {
     fn key(&self) -> (u64, u64, u32) {
         (
@@ -1598,6 +1638,12 @@ pub(crate) struct SemanticCapture {
     /// receipt was stale but current truth still names its
     /// instance): diagnostic only, counted under shared borrows.
     take_drift_tolerated: AtomicU64,
+    /// Partition refreshes a raced take requested, by
+    /// (task cookie, exec id, file slot): the next tick re-observes
+    /// these keys through the normal joined sweep, so the router
+    /// follows current truth and the retried take validates. Takes
+    /// request under shared borrows; the tick drains.
+    refresh_interests: Mutex<BTreeMap<(u64, u64, u32), RefreshInterest>>,
     /// Last tick's scan count and refusals, for the stuck-transaction
     /// diagnostic only. Test-visible; production behavior never reads it.
     #[cfg(test)]
@@ -1709,6 +1755,7 @@ impl SemanticCapture {
             hook_misses: 0,
             miss_raises: 0,
             take_drift_tolerated: AtomicU64::new(0),
+            refresh_interests: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             last_tick_scans_for_test: 0,
             #[cfg(test)]
@@ -1845,6 +1892,61 @@ impl SemanticCapture {
     /// drift (diagnostic only).
     fn note_take_drift_tolerated(&self) {
         self.take_drift_tolerated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Request a partition refresh for a key whose take raced live
+    /// truth: the next tick re-observes it through the normal
+    /// joined sweep, so the router follows current truth and the
+    /// retried take validates. One interest per key (a repeat
+    /// request renews it); beyond the pending cap interests drop
+    /// silently and re-request as needed. Fail-soft throughout: a
+    /// dropped request only delays the refresh to the next raced
+    /// take, never fails it.
+    pub(crate) fn request_partition_refresh(
+        &self,
+        image: ImageIdentity,
+        file_slot: u32,
+        attachment_slot: u32,
+        pid: u32,
+    ) {
+        let Ok(mut interests) = self.refresh_interests.try_lock() else {
+            return;
+        };
+        let key = (image.task_cookie, image.exec_id, file_slot);
+        if !interests.contains_key(&key) && interests.len() >= MAX_PENDING {
+            return;
+        }
+        interests.insert(
+            key,
+            RefreshInterest {
+                image,
+                attachment_slot,
+                pid,
+            },
+        );
+    }
+
+    /// Whether a partition refresh is queued for one key
+    /// (test-only drain reach for the refresh twins).
+    #[cfg(test)]
+    pub(crate) fn has_refresh_interest_for_test(
+        &self,
+        cookie: u64,
+        exec: u64,
+        file_slot: u32,
+    ) -> bool {
+        self.refresh_interests
+            .try_lock()
+            .is_ok_and(|interests| interests.contains_key(&(cookie, exec, file_slot)))
+    }
+
+    /// Queued partition refreshes (test-only drain reach for the
+    /// refresh twins).
+    #[cfg(test)]
+    pub(crate) fn refresh_interest_count_for_test(&self) -> usize {
+        self.refresh_interests
+            .try_lock()
+            .map_or(0, |interests| interests.len())
     }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins

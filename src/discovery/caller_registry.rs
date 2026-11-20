@@ -4588,6 +4588,13 @@ impl CallerRegistry {
         self.modules_by_key.get(key).copied()
     }
 
+    /// Latch the sizes-unavailable mode on the Joint key-use
+    /// reducer: the flag was on but the sizes lane failed to start,
+    /// so lengths drop with `key_sizes_unavailable`.
+    pub(crate) fn set_joint_key_sizes_unavailable(&mut self) {
+        self.joint_keyuse.set_key_sizes_unavailable();
+    }
+
     /// Tests-only reference wiring (N1): bind one module key to one
     /// caller edge, retained exactly as a mapped admission would
     /// leave it. Skips admission verdicts: the guarded-path tests

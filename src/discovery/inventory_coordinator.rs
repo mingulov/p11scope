@@ -1796,6 +1796,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.attach_set.set_info_capture(capture);
     }
 
+    /// Latch the sizes-unavailable mode after the sizes-off journal
+    /// retry seated: the flag was on but the sizes lane failed to
+    /// start, so the Joint key-use reducer drops lengths with
+    /// `key_sizes_unavailable`, never the needs-flag reason.
+    pub(crate) fn note_key_sizes_unavailable(&mut self) {
+        self.registry.set_joint_key_sizes_unavailable();
+    }
+
     /// Retains an already-validated `--prearm-module` pinning for the run's
     /// lifetime (F5). The pins hold their FDs until the coordinator drops.
     /// Their object/byte usage is also the manifest-side prior (packet 6.13
@@ -15131,6 +15139,26 @@ pub(crate) mod tests {
         );
         coordinator.set_key_sizes_requested(true);
         assert!(coordinator.registry().keyuse_for_test().key_sizes_enabled());
+    }
+
+    /// The sizes-unavailable latch reaches the Joint key-use
+    /// reducer: admission stops and the unavailable reason governs.
+    #[test]
+    fn key_sizes_unavailable_reaches_joint_keyuse_reducer() {
+        let mut coordinator = coordinator();
+        coordinator.set_key_sizes_requested(true);
+        coordinator.note_key_sizes_unavailable();
+        assert!(
+            !coordinator.registry().keyuse_for_test().key_sizes_enabled(),
+            "unavailable stops admission like off-mode"
+        );
+        assert!(
+            coordinator
+                .registry()
+                .keyuse_for_test()
+                .key_sizes_unavailable(),
+            "the unavailable latch reaches the reducer"
+        );
     }
 
     #[test]

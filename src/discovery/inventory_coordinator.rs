@@ -20051,6 +20051,25 @@ pub(crate) mod tests {
         file.set_len(dynstr_off + dynstr_bytes).unwrap();
     }
 
+    /// Build a shared object carrying `bytes` of initialized file-backed
+    /// data (a haskoki-class memory footprint: megabytes of data mappings,
+    /// tiny tables) as `out` under `dir`. It exports one hook symbol so
+    /// the scan treats it as a provider file and actually snapshots and
+    /// decodes its data; a hook-less file's data is never examined.
+    fn gcc_big_data_fixture(dir: &std::path::Path, out: &str, bytes: usize) -> PathBuf {
+        let source = dir.join(format!("{out}.c"));
+        std::fs::write(
+            &source,
+            format!(
+                "/* {bytes} bytes of file-backed data. */\n\
+                 __attribute__((used)) static const unsigned char fixture_blob[{bytes}] = {{1}};\n\
+                 unsigned long C_GetFunctionList(void *list) {{ (void)list; return 0; }}\n"
+            ),
+        )
+        .unwrap();
+        gcc(dir, out, &source, &["-shared", "-fPIC"], &[])
+    }
+
     /// Spawn one owned large-table driver over `mapped` (and optionally a
     /// real provider), stopped after its readiness handshake.
     fn spawn_table_driver(
@@ -20060,6 +20079,19 @@ pub(crate) mod tests {
         mapped: &[std::path::PathBuf],
         provider: Option<&std::path::Path>,
     ) -> crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild {
+        let providers: Vec<&std::path::Path> = provider.into_iter().collect();
+        spawn_table_driver_multi(dir, driver, ready_name, mapped, &providers)
+    }
+
+    /// Spawn one owned driver over `mapped` plus every `providers` entry
+    /// (dlopened in order), stopped after its readiness handshake.
+    fn spawn_table_driver_multi(
+        dir: &std::path::Path,
+        driver: &std::path::Path,
+        ready_name: &str,
+        mapped: &[std::path::PathBuf],
+        providers: &[&std::path::Path],
+    ) -> crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild {
         use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
         let ready = dir.join(ready_name);
         let mut command = std::process::Command::new(driver);
@@ -20067,7 +20099,7 @@ pub(crate) mod tests {
         for path in mapped {
             command.arg("--map").arg(path);
         }
-        if let Some(provider) = provider {
+        for provider in providers {
             command.arg("--provider").arg(provider);
         }
         command
@@ -20088,12 +20120,13 @@ pub(crate) mod tests {
         })
     }
 
-    /// One scene pass before the fold: deep-scan gaps, module paths and
-    /// attempted file I/O.
+    /// One scene pass before the fold: deep-scan gaps, module paths,
+    /// attempted file I/O and shared pass work spent.
     struct CgroupTablePass {
         gaps: Vec<(u32, String, String)>,
         modules: Vec<String>,
         attempted_io: Option<u64>,
+        used_work: usize,
     }
 
     /// One cgroup transaction over an owned child that maps large-table
@@ -20112,6 +20145,15 @@ pub(crate) mod tests {
             mapped: &[std::path::PathBuf],
             provider: Option<&std::path::Path>,
         ) -> Self {
+            let providers: Vec<&std::path::Path> = provider.into_iter().collect();
+            Self::new_with_providers(dir, mapped, &providers)
+        }
+
+        fn new_with_providers(
+            dir: tempfile::TempDir,
+            mapped: &[std::path::PathBuf],
+            providers: &[&std::path::Path],
+        ) -> Self {
             let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let driver = gcc(
                 dir.path(),
@@ -20120,8 +20162,13 @@ pub(crate) mod tests {
                 &["-O2", "-Wall", "-Wextra", "-Werror"],
                 &["-ldl"],
             );
-            let child =
-                spawn_table_driver(dir.path(), &driver, "large-table-ready", mapped, provider);
+            let child = spawn_table_driver_multi(
+                dir.path(),
+                &driver,
+                "large-table-ready",
+                mapped,
+                providers,
+            );
             std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
             let mut coordinator = Box::new(
                 InventoryCoordinator::new(
@@ -20180,6 +20227,7 @@ pub(crate) mod tests {
                 gaps: collection.member_gaps_for_test(),
                 modules: collection.module_paths_for_test(),
                 attempted_io: collection.attempted_io_bytes_for_test(),
+                used_work: collection.used_work(),
             };
             self.coordinator
                 .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
@@ -20300,6 +20348,71 @@ pub(crate) mod tests {
                 .any(|path| path.contains("scoped-provider")),
             "pass 2 must find the provider placed after the large objects: {:?}",
             second.modules
+        );
+    }
+
+    /// The haskoki twin: one member maps two 6 MiB-data objects ahead of
+    /// a real provider. Each large object costs ~1M pass work units
+    /// (192K snapshot-record units plus 786K decode words, both charged
+    /// to the shared pass allowance and the scan window), so the first
+    /// pass must still reach the provider placed after them: the
+    /// production pass work allowance fits a haskoki-class member.
+    #[test]
+    fn cgroup_pass_scans_haskoki_sized_data_and_reaches_its_provider() {
+        const BIG_DATA_BYTES: usize = 6 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let roles = inode_ordered_role_paths(
+            dir.path(),
+            &["big-data-a.so", "big-data-b.so", "scoped-provider.so"],
+            |roles| {
+                let first = gcc_big_data_fixture(dir.path(), "big-data-a-build.so", BIG_DATA_BYTES);
+                std::fs::copy(&first, &roles[0]).unwrap();
+                let second =
+                    gcc_big_data_fixture(dir.path(), "big-data-b-build.so", BIG_DATA_BYTES);
+                std::fs::copy(&second, &roles[1]).unwrap();
+                let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                let compiled = gcc(
+                    dir.path(),
+                    "scoped-provider-build.so",
+                    &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+                    &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+                    &[],
+                );
+                std::fs::copy(&compiled, &roles[2]).unwrap();
+            },
+        );
+        let mut scene = CgroupTableScene::new_with_providers(
+            dir,
+            &[],
+            &[roles[0].as_path(), roles[1].as_path(), roles[2].as_path()],
+        );
+
+        let first = scene.pass();
+        let stopped: Vec<_> = first
+            .gaps
+            .iter()
+            .filter(|(_, _, reason)| {
+                reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+            })
+            .collect();
+        assert!(
+            stopped.is_empty(),
+            "the first pass must fit a haskoki-class member in its work allowance: {stopped:?}"
+        );
+        assert!(
+            first
+                .modules
+                .iter()
+                .any(|path| path.contains("scoped-provider")),
+            "the first pass must reach the provider placed after the large-data objects: {:?}",
+            first.modules
+        );
+        assert!(
+            first.used_work > (1 << 20),
+            "the pass must actually spend haskoki-class work (past the old 1M ceiling), \
+             not skip the large data: used {} units",
+            first.used_work
         );
     }
 

@@ -3137,37 +3137,20 @@ impl JournalAdapter {
                     JournalContradiction::TerminalBeforeBegin,
                 );
             }
-            // On a clean image only an effect-neutral terminal with a
-            // clean return is excused: a state-changing call that
-            // outlived its release (a void wipe, a shed-taint drop
-            // plus lift) is unattributed state change, never the
-            // release working as intended — excusing it could let a
-            // later bind of a reused handle name a destroyed key. The
-            // return classes mirror the unclaimable-original disposal
-            // (Ok, Partial and plain Failed alone); the END passed
-            // wire validation, so malformed reads false exactly as
-            // there. The excuse is consumed either way: a second
-            // terminal for one key still promotes. The function check
-            // below duplicates the record-time void filter and the lift
-            // purge as a second layer: even a wrongly recorded
-            // non-neutral absence is still rejected here. ABANDON has
-            // no such layer (it consumes blindly), so its safety rests
-            // on the filter and purge alone.
-            let excused = self
-                .take_derived_absence(image, key)
-                .is_some_and(|function| {
-                    disposes_unclaimable_original(function)
-                        && matches!(
-                            super::state::return_class(
-                                function,
-                                end.payload_base().event.rv,
-                                false
-                            ),
-                            super::state::Outcome::Ok
-                                | super::state::Outcome::Partial
-                                | super::state::Outcome::Failed
-                        )
-                });
+            // On a clean image a terminal with a recorded release
+            // (a void wipe, a shed-taint drop) disposes: the release
+            // already disclosed the loss, so the terminal is expected
+            // fallout, never new taint evidence — regardless of
+            // function or return. The disposed call never proves; a
+            // later bind of a reused handle still refuses at the
+            // claim layer where the collision materializes. The
+            // absence is consumed either way: a second terminal for
+            // one key still promotes. Terminals with no recorded
+            // release taint below. The lift purge keeps removing
+            // state-changing absences before an image goes clean, so
+            // a destroy that outlived a shed-taint plus lift still
+            // taints there instead of riding the lift.
+            let excused = self.take_derived_absence(image, key).is_some();
             if excused {
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
@@ -6263,7 +6246,10 @@ impl JournalAdapter {
         if !self.keys.contains_key(&key)
             && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
             && siblings.iter().any(|sibling| {
-                sibling != &key && self.key_is_live(*sibling) && self.keys[sibling].model_registered
+                sibling != &key
+                    && self.key_is_live(*sibling)
+                    && self.keys[sibling].model_registered
+                    && self.sibling_blocks_rebirth(*sibling)
             })
         {
             return Err(AttestationRefusal::ImageSealed);
@@ -6280,7 +6266,10 @@ impl JournalAdapter {
     /// era. Re-attestation after a fault-void returns the live key; a
     /// tainted image or a full key table refuses. A second live key for
     /// an image whose key already converted refuses: sole-key
-    /// attributions cannot be re-examined.
+    /// attributions cannot be re-examined — unless the sibling's
+    /// conversion is entirely fenced, in which case the void wiped
+    /// every staged claim and a post-void rebirth binds above the
+    /// fence.
     /// Birth and closure are verified on top of this binding by
     /// [`BootstrapReceipt::attest`].
     pub(crate) fn bind_admitted_key(
@@ -6737,6 +6726,17 @@ impl JournalAdapter {
             .get(&key)
             .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
             && !self.is_tainted((key.cookie, key.exec))
+    }
+
+    /// Whether a converted sibling still blocks a new key for its
+    /// image: its conversion extends past its void fence (actively
+    /// converting). A sibling whose conversion is entirely fenced (a
+    /// void wiped every staged claim) holds nothing left to
+    /// re-examine, so a post-void rebirth binds above the fence.
+    fn sibling_blocks_rebirth(&self, sibling: JournalDomainKey) -> bool {
+        self.keys
+            .get(&sibling)
+            .is_none_or(|state| state.void_fence == 0 || state.sealed_through > state.void_fence)
     }
 
     /// Live keys bound for one image: the attribution set a seal
@@ -7386,7 +7386,11 @@ impl JournalAdapter {
             self.closure_generation,
             &seal_epoch,
         ) {
-            return Err(self.reject_audit(model, audit, gap, seal_epoch));
+            // An absorbed post-collection fault returns Ok with the
+            // baseline already pinned; only real voids propagate. The
+            // pin below must not overwrite an absorb's re-baseline.
+            self.reject_audit(model, audit, gap, seal_epoch)?;
+            return Ok(());
         }
         // The audit passed: pin the cumulative baseline. Past the first
         // seal this is a no-op (the chain rule already equated them).
@@ -7400,23 +7404,29 @@ impl JournalAdapter {
         audit: &JournalAuditReceipt,
         gap: JournalGap,
         seal_epoch: Result<u64, FaultReadError>,
-    ) -> SealFailure {
+    ) -> Result<(), SealFailure> {
         // Any audit failure breaks absence-appearance chains: the clean
-        // coverage the witness requires is gone from this ordinal on.
-        // Voids fence the loss explicitly before dropping staged
-        // truth, so later proof resumes above a fenced interval
-        // instead of silently skipping it; the fencing effects are
-        // reported with the refusal. Every O(1) refusal (stop,
-        // counters, cuts, the fence) publishes here; the per-row work
-        // (preserve, fence, refuse, wipe, the all-key scope) is one
-        // deferred rejection the frame drives through its budget and
-        // fills into this failure before delivering it.
+        // coverage the witness requires is gone from this ordinal on,
+        // even when the failure keeps staged inputs. Voids fence the
+        // loss explicitly before dropping staged truth, so later proof
+        // resumes above a fenced interval instead of silently skipping
+        // it; the fencing effects are reported with the refusal. A
+        // post-collection fault absorb (below) trips the chain the
+        // same way on its first observation, without voiding: the
+        // collected interval stays proved. A repeat observation of an
+        // already-absorbed era restores the chain mark instead.
+        // Every O(1) refusal (stop, counters, cuts, the fence)
+        // publishes here; the per-row work (preserve, fence, refuse,
+        // wipe, the all-key scope) is one deferred rejection the
+        // frame drives through its budget and fills into this
+        // failure before delivering it.
         let deferred = !matches!(gap, JournalGap::H3Pending | JournalGap::ClosureStale);
         let scope = if deferred {
             SealFailure::deferred_scope()
         } else {
             SealFailureScope::Unqualified
         };
+        let was_audit_failure = self.last_audit_failure;
         self.last_audit_failure = Some(self.consumed_through);
         let effects = ObjectEffects::default();
         let mut h3_voided = None;
@@ -7440,6 +7450,36 @@ impl JournalAdapter {
             | JournalGap::ResourceUnavailable
             | JournalGap::Discarded
             | JournalGap::H3Loss => {
+                if gap == JournalGap::FaultChanged
+                    && audit.fault_error.is_none()
+                    && audit.fault_before == audit.fault_after
+                    && let Ok(epoch) = seal_epoch
+                    && epoch >= audit.fault_after
+                    && self.last_fault.is_none_or(|last| epoch >= last)
+                {
+                    // Post-collection fault: the move landed outside
+                    // every collected interval (between collections or
+                    // after the drain closed), so the bracket proves
+                    // this quantum and the seal absorbs the move
+                    // instead of voiding it. Every BPF fault arm
+                    // discards its call's terminal rather than emitting
+                    // a faulted journal record, so no hidden record
+                    // rides the quantum: dangling begins hold
+                    // per-call, refused joins abandon per-incarnation,
+                    // and H0 invalidates its own era. The first
+                    // observation of the era trips the absence chain
+                    // and pins the baseline; repeats absorb silently.
+                    // Absorbs count no void bucket: the quantum
+                    // sealed, nothing voided. An in-bracket move or a
+                    // regressed cell still voids below.
+                    let freshest = audit.fault_after.max(epoch);
+                    if self.last_fault.is_none_or(|last| freshest > last) {
+                        self.last_fault = Some(freshest);
+                    } else {
+                        self.last_audit_failure = was_audit_failure;
+                    }
+                    return Ok(());
+                }
                 // Irreversible refusals first: the deferred void
                 // preserves staged unbounded abandonments as permanent
                 // refusals BEFORE staged custody is dropped, so a void
@@ -7543,7 +7583,7 @@ impl JournalAdapter {
             let ticket = self.issue_rejection(mode, true, None);
             self.settle_inline(model, ticket, &mut failure);
         }
-        failure
+        Err(failure)
     }
 
     #[cfg(test)]
@@ -7604,7 +7644,9 @@ impl JournalAdapter {
                 Ok(_) => None,
             };
             if let Some(gap) = gap {
-                return Err(self.reject_audit(model, audit, gap, reading));
+                // An absorbed post-collection fault returns Ok and the
+                // seal below proceeds; only real voids propagate.
+                self.reject_audit(model, audit, gap, reading)?;
             }
             self.seal_domain_inner(model, audit, bootstrap, frontier, births, Some(replay))
         })();
@@ -8443,15 +8485,18 @@ impl JournalAdapter {
         debug_assert!(self.void_wiped.len() <= self.limits.open_calls);
         // The wiped BEGINs' terminals will arrive unmatched: the void
         // deliberately released them, so they are expected-absent, never
-        // new taint evidence — but only effect-neutral calls that the
-        // live entry would accept a terminal for. A state-changing
-        // call that outlived its wipe is unattributed state change
-        // (excusing it could name a destroyed key), and a terminal
-        // the live entry would reject as a contradiction (staged
-        // END/ABANDON, NO_END, corroborated return) stays rejected:
-        // those stay out, so their terminals still promote.
-        // Recorded before the table clears, under the same open-table
-        // cap (past it, terminals promote).
+        // new taint evidence — for every wiped call the live entry
+        // would accept a terminal for, regardless of function. The
+        // void's fence and named gap already disclose the loss, so a
+        // state-changing terminal that outlived its wipe disposes
+        // (never proves) instead of tainting the whole image: the
+        // disposed call stays unproven, and a later handle-reuse
+        // collision still refuses at the claim layer where it
+        // materializes. A terminal the live entry would reject as a
+        // contradiction (staged END/ABANDON, NO_END, corroborated
+        // return) stays rejected: those stay out, so their terminals
+        // still promote. Recorded before the table clears, under the
+        // same open-table cap (past it, terminals promote).
         let wiped: Vec<((u64, u64), JournalNativeKey, u32)> = self
             .open
             .iter()
@@ -8460,7 +8505,6 @@ impl JournalAdapter {
                     && entry.abandon.is_none()
                     && !entry.begin.no_end()
                     && entry.corroborated_return.is_none()
-                    && disposes_unclaimable_original(entry.function)
             })
             .map(|(key, entry)| (entry.image, *key, entry.function))
             .collect();

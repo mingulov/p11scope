@@ -50,6 +50,17 @@ versioned separately and are opaque, exact dispatch keys.
   gap. Text gains parenthetical tallies plus `-v` per-row
   lines, CBOM qualification counts inferred use without reading
   inferred facts, and versions 1–6 stay frozen and byte-stable.
+- Provider, token and mechanism facts on inventory runs with the new
+  `--provider-info` opt-in (section version 8; standalone, off by
+  default; needs `--capture auto` or `native` and a FULL build).
+  `--json` gains the additive `provider_observations` section plus
+  per-module `provider_info` records, text gains one concise provider
+  line per module with `-v` token and mechanism lines, and CBOM maps
+  the same facts onto supplier, device and algorithm components.
+  Token serials and labels, session counts, memory sizes and clock
+  readings are never captured; a refused uretprobe-hazard self-probe
+  leaves usage entries only with a named gap. Versions 1–7 stay
+  frozen.
 
 ### Changed
 

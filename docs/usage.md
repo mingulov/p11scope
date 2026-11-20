@@ -1828,6 +1828,29 @@ Limits that matter in pods:
   `object_observations` section of the JSON report; `--json` has the
   full rows.
 
+  `--provider-info` (standalone, off by default) additionally captures
+  provider, token and mechanism facts from observed application
+  `C_GetInfo`, `C_GetTokenInfo` and `C_GetMechanismInfo` calls. It
+  needs `--capture auto` or `native` and a FULL build (P0 omits info
+  capture), and refuses under `--capture scan`; it needs no other
+  flag, so info appears in default inventory as well as under
+  `--key-operations`, and identically with `--key-sizes` on or off.
+  `--json` gains the additive `provider_observations` section
+  (per-slot token rows, per-mechanism limit rows and named gaps)
+  plus the per-module `provider_info` record, text gains one
+  concise provider line per module, and `-v` adds per-slot token
+  and per-mechanism limit lines; CBOM maps the same facts onto
+  supplier, device and algorithm components. Without the flag,
+  `provider_observations` stays absent and info functions remain
+  plain usage endpoints. Token serials and labels, session counts,
+  memory sizes and clock readings are never captured. Where the
+  uretprobe-hazard self-probe refuses (a confined target or an
+  unproven kernel), info return probes stay detached: the affected
+  endpoints keep usage entries only and count the
+  `info_return_refused_hazard` gap, and the
+  `--allow-uretprobe-on-confined-target` override does not re-enable
+  them.
+
   The fixture PID and IDs vary by run. Mapping alone does not prove use;
   `At least N entries observed` counts entries, a lower bound, rather than
   completed operations. Capture loss, unknown counts and no-use intervals

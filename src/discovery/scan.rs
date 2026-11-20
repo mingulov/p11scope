@@ -1176,6 +1176,16 @@ impl RetainedFileFacts {
                 .count(),
         )
     }
+
+    /// Test-only: every carried decode cursor with its key, so twins can
+    /// assert frontiers, cached rows and completeness pass by pass.
+    #[cfg(test)]
+    pub(crate) fn decode_cursors_for_test(&self) -> Vec<(DecodeCursorKey, DecodeCursor)> {
+        self.decode_cursors
+            .iter()
+            .map(|(key, cursor)| (key.clone(), cursor.clone()))
+            .collect()
+    }
 }
 
 /// Accounted bytes of the carried decode-cursor map. Kept separate from
@@ -8532,6 +8542,8 @@ pub(crate) fn final_maps_refusal_for_test(
 
 #[cfg(test)]
 mod tests {
+    mod resume_matrix;
+
     use super::super::scan_pass::{
         MappingFingerprintEntry, SCAN_IN_PROGRESS_SUBJECT, SweepFrontier, decode_cursor_bytes,
         scan_in_progress_reason,
@@ -9125,6 +9137,10 @@ mod tests {
             crate::discovery::identity::FileIdentity,
             crate::discovery::identity::FileIdentity,
         )>,
+        /// Scripted `/proc/<pid>/exe` target; `None` reads the live link.
+        /// Models an exec between passes (same pid and start time, new
+        /// image): decode cursors must miss across it.
+        exe_override: Option<PathBuf>,
     }
 
     struct BracketMemory {
@@ -9238,6 +9254,12 @@ mod tests {
             } else {
                 view.run_while_same(|| ())
             }
+        }
+        fn exe_target(&mut self, view: &ProcessView) -> std::io::Result<PathBuf> {
+            if let Some(scripted) = &self.exe_override {
+                return Ok(scripted.clone());
+            }
+            std::fs::read_link(format!("/proc/{}/exe", view.pid()))
         }
     }
 
@@ -9407,6 +9429,7 @@ mod tests {
                 fail_clock_at_b: false,
                 final_generation_spend: 0,
                 mapped: None,
+                exe_override: None,
             }
         }
 
@@ -21840,6 +21863,653 @@ int main(int argc, char **argv) {
             selected,
             vec![2001, 1001],
             "a missing member fills a free slot oldest-first"
+        );
+    }
+
+    /// Drive one scan pass with an armed budget: `limits` plus the carried
+    /// bundle (empty for pass one). Returns the outcome and the bundle the
+    /// pass takes back, so twins can thread real resume state across passes.
+    fn armed_scan_pass(
+        fixture: &mut BracketFixture,
+        limits: ScanLimits,
+        carried: RetainedFileFacts,
+    ) -> (Result<ScanOutcome, String>, RetainedFileFacts) {
+        let mut budget = CaptureWorkBudget::new(limits).with_retained_file_facts(carried);
+        let outcome = fixture.run(&mut budget);
+        let carried = budget.take_retained_file_facts();
+        (outcome, carried)
+    }
+
+    /// Whether the fixture's memory log shows a re-read at or after
+    /// `offset` (a resumed pass re-acquiring bytes, never a replay).
+    fn log_reread_at_or_after(fixture: &BracketFixture, offset: u64) -> bool {
+        fixture.log.borrow().iter().any(|event| {
+            event
+                .strip_prefix("memory ")
+                .and_then(|rest| rest.split_once(' '))
+                .and_then(|(at, _)| u64::from_str_radix(at, 16).ok())
+                .is_some_and(|at| at >= offset)
+        })
+    }
+
+    /// A truncated mapping snapshot is a resume point, never a completed
+    /// decode: the per-object leg covers the first data mapping fully but
+    /// stops 0x80 bytes into the second, before its interface triple. Pass
+    /// one must stay unfinished; pass two (fresh per-object budget) must
+    /// re-read the second mapping and find the triple.
+    #[test]
+    fn truncated_mapping_snapshot_resumes_and_never_completes() {
+        let mut fixture = BracketFixture::new(8, true);
+        let limits = ScanLimits {
+            per_object_bytes: 0x2000 + 0x80,
+            total_bytes: u64::MAX,
+        };
+        let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        let first = first.unwrap();
+        assert_eq!(first.modules().len(), 1);
+        assert_eq!(
+            first.modules()[0].tables.len(),
+            1,
+            "the first mapping decoded fully"
+        );
+        assert!(
+            first.modules()[0].interfaces.is_empty(),
+            "the triple past the truncation is not yet examined"
+        );
+        assert!(
+            !first.modules()[0].tables_scan_finished,
+            "a truncated snapshot grants no finished-scan evidence"
+        );
+        assert_eq!(
+            carried.cursor_counts(),
+            (1, 1),
+            "the truncated object carries an unfinished cursor, never a completed decode"
+        );
+        fixture.log.borrow_mut().clear();
+        let (second, carried) = armed_scan_pass(&mut fixture, limits, carried);
+        let second = second.unwrap();
+        assert!(
+            log_reread_at_or_after(&fixture, 0x7000),
+            "pass two must re-read the truncated mapping, not replay it: {:?}",
+            fixture.log.borrow()
+        );
+        assert_eq!(
+            second.modules()[0].interfaces.len(),
+            1,
+            "pass two finds the triple past the truncation: {:?}",
+            second.modules()[0].interfaces
+        );
+        assert_eq!(
+            carried.cursor_counts().1,
+            0,
+            "fully acquired passes converge"
+        );
+    }
+
+    /// One provider with a single 12 MiB data mapping holding a table at
+    /// offset 0 and a rival table at 9 MiB, scanned under the production
+    /// 8 MiB per-object leg: pass one acquires the first 8 MiB only, so
+    /// the rival table waits for pass two's bounded continuation read.
+    struct BigMappingFixture {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        view: ProcessView,
+        maps: String,
+        mem: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    struct BigMappingMemory {
+        file: File,
+        log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    }
+
+    impl ScanMemory for BigMappingMemory {
+        fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.log
+                .borrow_mut()
+                .push(format!("memory {offset:x} {}", bytes.len()));
+            use std::os::unix::fs::FileExt as _;
+            self.file.read_at(bytes, offset)
+        }
+    }
+
+    impl ScanIo for BigMappingFixture {
+        type Memory = BigMappingMemory;
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            self.log.borrow_mut().push("maps".into());
+            Ok(Box::new(std::io::Cursor::new(
+                self.maps.as_bytes().to_vec(),
+            )))
+        }
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<BigMappingMemory> {
+            Ok(BigMappingMemory {
+                file: self.mem.try_clone()?,
+                log: self.log.clone(),
+            })
+        }
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    impl BigMappingFixture {
+        const DATA_BASE: u64 = 0x100_0000;
+        const DATA_LEN: u64 = 12 << 20;
+        const RIVAL_AT: u64 = 9 << 20;
+        const DEP_BASE: u64 = 0x9000;
+
+        fn write_table(mem: &File, at: u64) {
+            let mut table = vec![0u8; 69 * 8];
+            table[..2].copy_from_slice(&[2, 40]);
+            for slot in 0..68 {
+                let pointer: u64 = match slot {
+                    0 => 0x1100,
+                    1 => 0,
+                    _ => Self::DEP_BASE + 0x100,
+                };
+                table[(slot + 1) * 8..(slot + 2) * 8].copy_from_slice(&pointer.to_le_bytes());
+            }
+            use std::os::unix::fs::FileExt as _;
+            mem.write_all_at(&table, at).unwrap();
+        }
+
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let view = ProcessView::open(ProcessViewId(72), std::process::id()).unwrap();
+            let path = dir.path().join("big-provider.so");
+            std::fs::write(&path, BracketFixture::minimal_provider_elf(8)).unwrap();
+            let file = File::open(&path).unwrap();
+            let key = crate::discovery::identity::retained_object_key(
+                &view,
+                &file,
+                &mut CaptureWorkBudget::default(),
+            )
+            .unwrap();
+            let identity = format!(
+                "{:x}:{:x} {} {}",
+                key.device.major,
+                key.device.minor,
+                key.inode,
+                path.display()
+            );
+            let maps = format!(
+                "1000-2000 r-xp 00000000 {identity}\n\
+                 9000-a000 r-xp 00000000 08:01 999 /dependency.so\n\
+                 {:x}-{:x} rw-p 00002000 {identity}\n",
+                Self::DATA_BASE,
+                Self::DATA_BASE + Self::DATA_LEN,
+            );
+            let mem = tempfile::tempfile().unwrap();
+            mem.set_len(Self::DATA_BASE + Self::DATA_LEN).unwrap();
+            Self::write_table(&mem, Self::DATA_BASE);
+            Self::write_table(&mem, Self::DATA_BASE + Self::RIVAL_AT);
+            Self {
+                _dir: dir,
+                path,
+                view,
+                maps,
+                mem,
+                log: Default::default(),
+            }
+        }
+
+        fn run(&mut self, budget: &mut CaptureWorkBudget) -> Result<ScanOutcome, String> {
+            let view = ProcessView::open(self.view.id(), self.view.pid()).unwrap();
+            let hooks = HookRegistry::builtin();
+            let hints = [self.path.clone()];
+            scan_process_view_with_io(
+                &ScanRequest {
+                    pid: view.pid(),
+                    hints: &hints,
+                    hooks: &hooks,
+                },
+                &view,
+                budget,
+                self,
+            )
+        }
+    }
+
+    /// A rival table 9 MiB into a 12 MiB mapping is never examined by an
+    /// 8 MiB per-object read, so pass one stays unfinished and grants no
+    /// finished-scan evidence; pass two continues from the byte frontier
+    /// and decodes both tables (a truncated snapshot cached as complete
+    /// would hide the rival and wrongly authorize sole-table semantics).
+    #[test]
+    fn rival_table_beyond_the_per_object_leg_is_found_on_the_next_pass() {
+        let mut fixture = BigMappingFixture::new();
+        let limits = ScanLimits {
+            per_object_bytes: 8 << 20,
+            total_bytes: u64::MAX,
+        };
+        let mut first =
+            CaptureWorkBudget::new(limits).with_retained_file_facts(RetainedFileFacts::default());
+        let outcome = fixture.run(&mut first).unwrap();
+        let addresses: Vec<u64> = outcome.modules()[0]
+            .tables
+            .iter()
+            .map(|table| table.address)
+            .collect();
+        assert_eq!(
+            addresses,
+            vec![BigMappingFixture::DATA_BASE],
+            "pass one decodes only the table inside the first 8 MiB"
+        );
+        assert!(
+            !outcome.modules()[0].tables_scan_finished,
+            "the truncated 8 MiB prefix grants no finished-scan evidence"
+        );
+        let carried = first.take_retained_file_facts();
+        assert_eq!(
+            carried.cursor_counts(),
+            (1, 1),
+            "the 4 MiB of unread bytes keep the object unfinished"
+        );
+        let mut second = CaptureWorkBudget::new(limits).with_retained_file_facts(carried);
+        let outcome = fixture.run(&mut second).unwrap();
+        let mut addresses: Vec<u64> = outcome.modules()[0]
+            .tables
+            .iter()
+            .map(|table| table.address)
+            .collect();
+        addresses.sort_unstable();
+        assert_eq!(
+            addresses,
+            vec![
+                BigMappingFixture::DATA_BASE,
+                BigMappingFixture::DATA_BASE + BigMappingFixture::RIVAL_AT
+            ],
+            "pass two continues from the byte frontier and decodes the rival table"
+        );
+        assert!(
+            outcome.modules()[0].tables_scan_finished,
+            "complete acquisition restores finished-scan evidence"
+        );
+        assert_eq!(
+            second.take_retained_file_facts().cursor_counts().1,
+            0,
+            "fully acquired passes converge"
+        );
+    }
+
+    /// One directly decodable legacy table (version 2.40, slot 0 in the
+    /// provider's own text, slot 1 NULL, the rest in /dependency.so),
+    /// mirroring `BracketFixture::populate_provider_memory` at any address.
+    fn write_legacy_table_at(mem: &File, at: u64) {
+        let mut table = vec![0u8; 69 * 8];
+        table[..2].copy_from_slice(&[2, 40]);
+        for slot in 0..68 {
+            let pointer: u64 = match slot {
+                0 => 0x1100,
+                1 => 0,
+                _ => 0x9100,
+            };
+            table[(slot + 1) * 8..(slot + 2) * 8].copy_from_slice(&pointer.to_le_bytes());
+        }
+        use std::os::unix::fs::FileExt as _;
+        mem.write_all_at(&table, at).unwrap();
+    }
+
+    /// One `CK_INTERFACE` triple (`name`, `function list`, `flags`).
+    fn write_interface_triple_at(mem: &File, at: u64, name: u64, table: u64, flags: u64) {
+        use std::os::unix::fs::FileExt as _;
+        for (slot, value) in [name, table, flags].into_iter().enumerate() {
+            mem.write_all_at(&value.to_le_bytes(), at + (slot * 8) as u64)
+                .unwrap();
+        }
+    }
+
+    /// Drive one Inventory-policy scan pass with an armed budget: `limits`
+    /// plus the carried bundle, with the pass window and scan begun like
+    /// the collectors begin them. Returns the outcome and the bundle.
+    fn armed_inventory_scan_pass(
+        fixture: &mut BracketFixture,
+        limits: InventoryDiscoveryLimits,
+        carried: RetainedFileFacts,
+    ) -> (Result<ScanOutcome, String>, RetainedFileFacts) {
+        let mut budget = CaptureWorkBudget::for_inventory(limits).with_retained_file_facts(carried);
+        let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(window.clone()).unwrap();
+        let outcome = fixture.run(&mut budget);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(window).unwrap();
+        let carried = budget.take_retained_file_facts();
+        (outcome, carried)
+    }
+
+    /// An interface refused by the retained-key ceiling is retried, not
+    /// lost: pass one admits the first triple and holds at the refused
+    /// second; pass two (fresh keys) admits it and converges with both
+    /// names. A sweep that finished past the refusal would replay the
+    /// first triple forever and never decode the second.
+    #[test]
+    fn refused_interface_is_retried_on_the_next_pass() {
+        let mut fixture = BracketFixture::new(8, true);
+        write_interface_triple_at(&fixture.mem, 0x5000, 0xb100, 0x4800, 0);
+        write_interface_triple_at(&fixture.mem, 0x5100, 0xb200, 0x4800, 0);
+        {
+            use std::os::unix::fs::FileExt as _;
+            fixture
+                .mem
+                .write_all_at(b"B-UNIQUE-NAME\0", 0xb200)
+                .unwrap();
+        }
+        let limits = inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 1);
+        let mut carried = RetainedFileFacts::default();
+        let mut names = Vec::new();
+        let mut finished = false;
+        for _ in 0..3 {
+            let (outcome, next) = armed_inventory_scan_pass(&mut fixture, limits, carried);
+            carried = next;
+            let outcome = outcome.unwrap();
+            names = outcome.modules()[0]
+                .interfaces
+                .iter()
+                .filter_map(|interface| interface.name_lossy.clone())
+                .collect();
+            names.sort();
+            finished = outcome.modules()[0].tables_scan_finished;
+            if carried.cursor_counts().1 == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            names,
+            vec!["B-UNIQUE-NAME".to_string(), "PKCS 11".to_string()],
+            "the refused triple is retried with fresh keys, not dropped"
+        );
+        assert!(
+            finished,
+            "complete decoding restores finished-scan evidence"
+        );
+    }
+
+    /// A table refused by the retained-key ceiling holds the table
+    /// frontier and converges across passes (three tables under a 1-key
+    /// ceiling need three passes). Guards the refusal-hold path while the
+    /// truncation and replay paths change around it.
+    #[test]
+    fn refused_table_holds_its_frontier_and_converges_across_passes() {
+        let mut fixture = BracketFixture::new(8, true);
+        write_legacy_table_at(&fixture.mem, 0x5800);
+        write_legacy_table_at(&fixture.mem, 0x7500);
+        let limits = inventory_limits(8 << 20, 1 << 20, 4096, 32768, 4096, 1);
+        let mut carried = RetainedFileFacts::default();
+        let mut addresses = Vec::new();
+        let mut finished = false;
+        for _ in 0..4 {
+            let (outcome, next) = armed_inventory_scan_pass(&mut fixture, limits, carried);
+            carried = next;
+            let outcome = outcome.unwrap();
+            addresses = outcome.modules()[0]
+                .tables
+                .iter()
+                .map(|table| table.address)
+                .collect();
+            addresses.sort_unstable();
+            finished = outcome.modules()[0].tables_scan_finished;
+            if carried.cursor_counts().1 == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            addresses,
+            vec![0x4800, 0x5800, 0x7500],
+            "each refused table is retried until all three decode"
+        );
+        assert!(
+            finished,
+            "complete decoding restores finished-scan evidence"
+        );
+    }
+
+    /// A table the bracket refused for a changed external target must not
+    /// replay past that change: when the target change persists into pass
+    /// two, the cached decode misses its mapping dependencies and pass two
+    /// re-reads and re-decodes from the current mappings instead.
+    #[test]
+    fn changed_external_target_is_not_replayed_without_validation() {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.maps_b = fixture.maps_b.replace(
+            "9000-a000 r-xp 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 999 /replacement.so",
+        );
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        let first = first.unwrap();
+        assert!(
+            first
+                .modules()
+                .iter()
+                .all(|module| module.tables.is_empty()),
+            "pass one refuses the table whose target moved: {:?}",
+            first.modules()
+        );
+        // The target change persists: both of pass two's snapshots carry it.
+        fixture.maps_a.clone_from(&fixture.maps_b);
+        fixture.maps_reads = 0;
+        fixture.log.borrow_mut().clear();
+        let (second, _) = armed_scan_pass(&mut fixture, limits, carried);
+        let second = second.unwrap();
+        assert!(
+            log_reread_at_or_after(&fixture, 0x4000),
+            "pass two must re-read the provider, not replay the refused decode: {:?}",
+            fixture.log.borrow()
+        );
+        assert_eq!(
+            second.modules()[0].tables.len(),
+            1,
+            "the re-decoded table validates against the current mappings"
+        );
+        assert!(
+            second.modules()[0].tables_scan_finished,
+            "a validated fresh decode restores finished-scan evidence"
+        );
+    }
+
+    /// The replay path re-validates external targets every pass: a table
+    /// decoded and cached on pass one is refused again when its target
+    /// moves during pass two, exactly like a fresh decode. Replaying the
+    /// cached rows past the move would publish an unvalidated table with
+    /// finished-scan evidence.
+    #[test]
+    fn target_changed_during_the_replay_pass_refuses_the_table() {
+        let mut fixture = BracketFixture::new(8, true);
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        assert_eq!(first.unwrap().modules()[0].tables.len(), 1);
+        assert_eq!(carried.cursor_counts(), (1, 0));
+        fixture.maps_b = fixture.maps_a.replace(
+            "9000-a000 r-xp 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 999 /replacement.so",
+        );
+        fixture.maps_reads = 0;
+        let (second, carried) = armed_scan_pass(&mut fixture, limits, carried);
+        let second = second.unwrap();
+        assert!(
+            second
+                .modules()
+                .iter()
+                .all(|module| module.tables.is_empty()),
+            "the replayed table is refused when its target moves: {:?}",
+            second.modules()
+        );
+        assert!(
+            second
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason.contains("mapping changed during acquisition")),
+            "the refusal names the mapping change: {:?}",
+            second.skipped()
+        );
+        assert!(
+            carried.decode_cursors_for_test().is_empty(),
+            "a proven mapping change discards the cached decode"
+        );
+    }
+
+    /// An exec between passes (same pid and start time, new image) misses
+    /// the decode cursor: pass two re-reads the provider instead of
+    /// replaying rows decoded from the pre-exec address space.
+    #[test]
+    fn exec_between_passes_misses_the_decode_cursor() {
+        let mut fixture = BracketFixture::new(8, true);
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        assert_eq!(first.unwrap().modules()[0].tables.len(), 1);
+        fixture.exe_override = Some(PathBuf::from("/other/binary"));
+        fixture.maps_reads = 0;
+        fixture.log.borrow_mut().clear();
+        let (second, _) = armed_scan_pass(&mut fixture, limits, carried);
+        let second = second.unwrap();
+        assert!(
+            log_reread_at_or_after(&fixture, 0x4000),
+            "pass two must re-read after an exec, not replay: {:?}",
+            fixture.log.borrow()
+        );
+        assert_eq!(
+            second.modules()[0].tables.len(),
+            1,
+            "the post-exec address space re-decodes under the same layout"
+        );
+    }
+
+    /// A module the bracket refused leaves no publishable cursor: neither
+    /// a completed decode nor cached rows survive a proven mapping change
+    /// (a transient validation failure, below, keeps a rowless frontier).
+    #[test]
+    fn bracket_rejected_module_leaves_no_publishable_cursor() {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.maps_b = fixture.maps_b.replace(
+            "9000-a000 r-xp 00000000 08:01 999 /dependency.so",
+            "9000-a000 r-xp 00000000 08:01 999 /replacement.so",
+        );
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (outcome, carried) =
+            armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        assert!(
+            outcome
+                .unwrap()
+                .modules()
+                .iter()
+                .all(|module| module.tables.is_empty()),
+            "the refused table does not publish"
+        );
+        assert!(
+            carried.decode_cursors_for_test().is_empty(),
+            "a proven mapping change discards the candidate decode"
+        );
+    }
+
+    /// A transient bracket failure (maps B unreadable, generation
+    /// unproven either way) publishes nothing and caches nothing: bytes
+    /// the scan could not validate prove nothing, so no frontier, rows or
+    /// completed decode ride on the unvalidated pass (budget-starved
+    /// brackets, which keep their rows count-only, are the separate
+    /// availability path).
+    #[test]
+    fn transient_bracket_failure_discards_the_unvalidated_decode() {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.fail_open_b = true;
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (outcome, carried) =
+            armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        assert!(
+            outcome
+                .unwrap()
+                .modules()
+                .iter()
+                .all(|module| module.tables.is_empty()),
+            "the unvalidated table does not publish"
+        );
+        assert!(
+            carried.decode_cursors_for_test().is_empty(),
+            "no frontier or rows ride an unvalidated pass"
+        );
+    }
+
+    /// A proven generation loss retires the pid's decode cursors at the
+    /// scan's own lifecycle boundary: the next pass re-scans fresh instead
+    /// of replaying rows from a dead generation.
+    #[test]
+    fn proven_generation_loss_retires_the_pid_cursors() {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.fail_generation = true;
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (outcome, carried) =
+            armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        assert!(
+            outcome
+                .unwrap()
+                .modules()
+                .iter()
+                .all(|module| module.tables.is_empty()),
+            "the generation-lost table does not publish"
+        );
+        assert!(
+            carried.decode_cursors_for_test().is_empty(),
+            "a proven generation loss retires the pid's cursors"
+        );
+    }
+
+    /// An object absent from the current mappings retires its decode
+    /// cursor: the fresh maps prove it unmapped, so the stale cursor must
+    /// not linger in progress totals or replay later.
+    #[test]
+    fn unmapped_object_retires_its_decode_cursor() {
+        let mut fixture = BracketFixture::new(8, true);
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        assert_eq!(first.unwrap().modules()[0].tables.len(), 1);
+        assert_eq!(carried.cursor_counts(), (1, 0));
+        let stripped: String = fixture
+            .maps_a
+            .lines()
+            .filter(|line| !line.contains("provider.so"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fixture.maps_a = stripped.clone();
+        fixture.maps_b = stripped;
+        fixture.maps_reads = 0;
+        let (_, carried) = armed_scan_pass(&mut fixture, limits, carried);
+        assert!(
+            carried.decode_cursors_for_test().is_empty(),
+            "the unmapped object's cursor retires on the proved maps"
         );
     }
 

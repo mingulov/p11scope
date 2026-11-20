@@ -808,6 +808,24 @@ impl CgroupCollection {
             .flat_map(|member| member.modules.iter().map(|module| module.path.clone()))
             .collect()
     }
+    /// Test-only: `(path, decoded tables)` per deep-scanned module, so a
+    /// multi-pass test can tell a visited module from a decoded provider.
+    #[cfg(test)]
+    pub(crate) fn module_tables_for_test(&self) -> Vec<(String, usize)> {
+        let Some(collection) = &self.collection else {
+            return Vec::new();
+        };
+        collection
+            .members
+            .iter()
+            .flat_map(|member| {
+                member
+                    .modules
+                    .iter()
+                    .map(|module| (module.path.clone(), module.tables.len()))
+            })
+            .collect()
+    }
     #[cfg(test)]
     pub(crate) fn original_weak(&self, pid: u32) -> Option<std::sync::Weak<ProcessView>> {
         self.originals

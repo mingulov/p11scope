@@ -22242,6 +22242,150 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scoped_preserve_taint_takes_precedence_over_competing_doom() {
+        // Codex fix4-review finding 2 (folded in fix6): one
+        // collision abandonment named by the stuck key competes with
+        // an unclaimed collision abandonment on the same shared
+        // image. Taint takes precedence: the image taints and
+        // neither key is refused — the stuck key's doom decision
+        // must not land on a tainted image. Mutating calls only:
+        // neutral abandonments skip preservation since fix5, so the
+        // unclaimed shape uses a second mutating function no claim
+        // names.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let destroy = function_id("C_DestroyObject");
+        let stuck_first = harness.attest();
+        let stuck_proof = harness.attest();
+        assert_eq!(
+            stuck_first.key, stuck_proof.key,
+            "the twin pairs two claims on one stuck key"
+        );
+        let mut sibling_fixture = AttestationFixture::new(image_default());
+        let sibling_admitted = sibling_fixture.admit_session_function(SESSION, "C_CreateObject");
+        let sibling_proof = harness
+            .owner
+            .adapter_mut()
+            .attest_key(&sibling_admitted)
+            .expect("sibling key attests");
+        assert_ne!(
+            stuck_proof.key, sibling_proof.key,
+            "the twin covers two distinct keys"
+        );
+        // The claimed shape: a session create the stuck key names.
+        let mut begin = begin_bytes(1, 1, create, 0);
+        put_u64(&mut begin, 80, SESSION);
+        assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            harness.ingest(&abandon_bytes(
+                1,
+                1,
+                JOURNAL_REASON_ENTRY_COLLISION,
+                (COOKIE, EXEC)
+            )),
+            JournalDisposition::AbandonStaged,
+            "the claimed collision abandonment stages"
+        );
+        // The unclaimed shape: a destroy no claim names (neither
+        // key attested it, and every claim names a create).
+        let unclaimed = begin_bytes(1, 2, destroy, 0);
+        assert_eq!(
+            harness.ingest(&unclaimed),
+            JournalDisposition::BeginAdmitted
+        );
+        assert_eq!(
+            harness.ingest(&abandon_bytes(
+                1,
+                2,
+                JOURNAL_REASON_ENTRY_COLLISION,
+                (COOKIE, EXEC)
+            )),
+            JournalDisposition::AbandonStaged,
+            "the unclaimed collision abandonment stages"
+        );
+        harness.prepare_claims();
+        let image = (COOKIE, EXEC);
+        assert!(
+            harness.owner.adapter().key_is_live(stuck_proof.key),
+            "precondition: the stuck key is live before the void"
+        );
+        assert!(
+            harness.owner.adapter().key_is_live(sibling_proof.key),
+            "precondition: the sibling key is live before the void"
+        );
+        let live = harness.owner.adapter().live_keys_for_image(image);
+        assert_eq!(live.len(), 2, "precondition: both keys share liveness");
+        let abandoned: Vec<StagedShape> = harness
+            .owner
+            .adapter()
+            .open
+            .values()
+            .filter(|entry| entry.abandon.is_some())
+            .map(shape_of_entry)
+            .collect();
+        assert_eq!(abandoned.len(), 2, "precondition: two abandonments stage");
+        let mut namings: Vec<Vec<JournalDomainKey>> = abandoned
+            .iter()
+            .map(|shape| {
+                harness
+                    .owner
+                    .adapter()
+                    .claimants_naming(shape)
+                    .map(|m| {
+                        m.iter()
+                            .filter(|(key, ordinals)| !ordinals.is_empty() && live.contains(key))
+                            .map(|(key, _)| *key)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        namings.sort();
+        assert_eq!(
+            namings,
+            vec![vec![], vec![stuck_proof.key]],
+            "precondition: one shape names only the stuck key, the other names nobody"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = stuck_proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert!(
+            harness.owner.adapter().image_tainted_for_test(image),
+            "the unclaimed abandonment taints its image"
+        );
+        assert!(
+            !harness.owner.adapter().proof_refused_for_test(stuck_proof),
+            "taint precedence refuses not even the named stuck key"
+        );
+        assert!(
+            !harness
+                .owner
+                .adapter()
+                .proof_refused_for_test(sibling_proof),
+            "the unclaimed sibling stays unrefused"
+        );
+    }
+
+    #[test]
     fn seal_barrier_clear_can_consume_its_whole_reserve() {
         // 63 attested opens plus one capacity-refused BEGIN clear
         // with zero units left: the refused phase completes exactly
@@ -22709,13 +22853,18 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_unbounded_abandonment_releases_model_calls() {
-        // I3: unbounded abandonment disposes model call storage (the
-        // shared pending budget is refunded) while the incarnation
-        // refusal sticks: proof for the abandoned frame never recovers.
+        // I3 (fix6 controller ruling on the fix5 pins: ACCEPTED): a
+        // neutral (effect-free S1) unbounded abandonment such as
+        // ENTRY_COLLISION on C_Sign disposes per-call with the named
+        // outcome_lost gap while the key keeps sealing (owner rules:
+        // partial never stop, data always). The disposed call's
+        // storage is released, the converted call stays held, and no
+        // refusal sticks. Whole-key doom is now mutating-only (see
+        // the converted-mutating twin below).
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
 
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest_function_n("C_Sign", 2);
+        let proof = scene.attest_function_n("C_Sign", 3);
         let sign = function_id("C_Sign");
         // One call converts (model holds its ticket); a second, never
         // converted, is then abandoned unboundedly.
@@ -22726,37 +22875,77 @@ pub(crate) mod tests {
         scene.ingest(&begin_bytes(1, 2, sign, 0));
         let abandon = abandon_bytes(1, 2, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
         assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
-        let failure = scene
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        let success = scene
             .seal(&bootstrap)
-            .expect_err("unbounded abandonment refuses");
-        assert_eq!(failure.gap, JournalGap::DomainTainted);
-        // Storage released, refusal retained.
-        assert_eq!(scene.model.project().usage.pending_calls, 0);
+            .expect("neutral abandonment disposes per-call, key seals");
         assert!(
-            scene
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the per-call disposal names its loss gap: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            success.prefix.settled().is_empty(),
+            "the disposed call settles nothing"
+        );
+        // The converted call stays held; the disposed call releases
+        // its staging without touching the held ticket.
+        assert_eq!(success.prefix.open_keys().len(), 1);
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one disposed call names one loss gap"
+        );
+        assert!(
+            !scene
                 .adapter
                 .keys
                 .get(&proof.key)
                 .expect("sealed key")
-                .refused
+                .refused,
+            "the key stays live after a neutral abandonment"
         );
-        let retry = scene
+        // The key keeps sealing: a later sign on the same key binds
+        // (a vacuous reseal at an unchanged frontier waits per seal
+        // semantics, so liveness is proved with new history).
+        scene.ingest(&begin_bytes(1, 3, sign, 0));
+        scene
             .seal(&bootstrap)
-            .expect_err("incarnation never recovers");
-        assert_eq!(retry.gap, JournalGap::DomainTainted);
+            .expect("later sign binds on the live key");
+        assert_eq!(scene.model.project().usage.pending_calls, 2);
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "no refusal sticks for a neutral abandonment"
+        );
     }
 
     #[test]
-    fn object_journal_converted_abandonment_refuses_and_disposes() {
-        // Carryover 9 + N2: an unbounded abandonment staged on an
-        // already-CONVERTED call refuses permanently and disposes its
-        // model storage exactly like one on a converting call —
-        // conversion never outruns abandonment authority, and settle
-        // never succeeds across it.
+    fn object_journal_converted_neutral_abandonment_disposes_per_call() {
+        // Carryover 9 + N2 (fix6 controller ruling on the fix5 pins:
+        // ACCEPTED — renamed from
+        // object_journal_converted_abandonment_refuses_and_disposes):
+        // an unbounded abandonment staged on an already-CONVERTED
+        // neutral call releases its model ticket per-call with the
+        // named outcome_lost gap while the key keeps sealing (owner
+        // rules: partial never stop, data always). Conversion never
+        // outruns abandonment authority — the ticket releases — but
+        // no refusal sticks for effect-free calls. Whole-key doom is
+        // now mutating-only (see the converted-mutating twin below).
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
 
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest_function("C_Sign");
+        let proof = scene.attest_function_n("C_Sign", 2);
         let sign = function_id("C_Sign");
         scene.ingest(&begin_bytes(1, 1, sign, 0));
         let bootstrap = scene.bootstrap(proof, 0);
@@ -22764,9 +22953,81 @@ pub(crate) mod tests {
         assert_eq!(scene.model.project().usage.pending_calls, 1);
         let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
         assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        let success = scene
+            .seal(&bootstrap)
+            .expect("converted neutral abandonment disposes per-call");
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the converted disposal names its loss gap: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            success.prefix.settled().is_empty(),
+            "the disposed ticket settles nothing"
+        );
+        assert!(
+            success.prefix.open_keys().is_empty(),
+            "the disposed ticket stays released"
+        );
+        assert_eq!(scene.model.project().usage.pending_calls, 0);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one disposed ticket names one loss gap"
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live after disposing its converted abandonment"
+        );
+        // The key keeps sealing: a later sign on the same key binds.
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        scene
+            .seal(&bootstrap)
+            .expect("later sign binds on the live key");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key stays live across the later seal"
+        );
+    }
+
+    #[test]
+    fn object_journal_converted_mutating_abandonment_still_dooms() {
+        // Fix6 twin of the converted-neutral disposal pin above (same
+        // ENTRY_COLLISION reason, same converted shape): a mutating
+        // call's abandonment still dooms the whole key (fail closed).
+        // Per-call disposal is neutral-only per the fix6 controller
+        // ruling.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
         let failure = scene
             .seal(&bootstrap)
-            .expect_err("converted abandonment refuses");
+            .expect_err("converted mutating abandonment still dooms");
         assert_eq!(failure.gap, JournalGap::DomainTainted);
         assert_eq!(scene.model.project().usage.pending_calls, 0);
         assert!(
@@ -22775,7 +23036,8 @@ pub(crate) mod tests {
                 .keys
                 .get(&proof.key)
                 .expect("sealed key")
-                .refused
+                .refused,
+            "the mutating abandonment keeps its permanent refusal"
         );
     }
 

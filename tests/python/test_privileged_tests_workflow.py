@@ -530,7 +530,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("journal exact-list mismatch", self.yml)
         campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
         second = campaign["second_flavor"]
-        self.assertEqual(len(second["cells"]), 7)
+        self.assertEqual(len(second["cells"]), 9)
         self.assertIn("inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
                       second["cells"])
         self.assertIn("attach::tests::sealed_session_drain_linkage_is_behavioral", second["cells"])

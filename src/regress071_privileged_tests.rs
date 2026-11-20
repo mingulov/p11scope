@@ -1766,7 +1766,7 @@ impl Drop for Ext4Loop {
 /// default-lane `profile --system` with the verdict scoped to the file's
 /// inode, plus loader churn. Tuned on fedora against 2234b514f (RED) and
 /// v0.7.0 (GREEN); see the lane report for the numbers.
-const D_DURATION_S: u64 = 330;
+const D_DURATION_S: u64 = 360;
 const D_K0: u64 = 10;
 const D_HOLD_MS: u64 = 50;
 /// Fixed two-view child count for the acceptance bar: the burst loop

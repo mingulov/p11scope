@@ -10001,6 +10001,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     && (recovery.epoch.is_none() || recovery.epoch_pending && continuing)
                     && recovery.ordinary_checkpoint != 0
                     && recovery.ordinary_checkpoint == ownership.sequence);
+            // Copied before the mutable diagnostic call below: the
+            // same-carrier resume arm re-baselines to it.
+            let current_sequence = ownership.sequence;
             self.diagnostic_ownership(
                 key,
                 &mut recovery,
@@ -10196,6 +10199,165 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.diagnostic_recovery_selection(key, &mut recovery, false);
                 self.recoveries.insert(key, recovery);
                 continue;
+            }
+            // Same-carrier resolution with withheld growth no fence can
+            // select: transient revisions churned the epoch scan (stale
+            // checkpoint) but the carrier never changed and the caller
+            // is live. Historical reads split by anchor order (post-scan
+            // stages, predating discloses); the held cumulative read
+            // stages on mapping-stability alone. Either way the window
+            // resumes instead of gap-flushing whole, then the recovery
+            // re-baselines so ordinary growth continues. Selectable
+            // tags keep the fenced migration path (it owns reads it can
+            // prove); genuine changes (other carriers, dead callers,
+            // refused reads) keep the stock path below. A live fence
+            // keeps it too, and so does a settled binder proof:
+            // Proven stages this pass and Rejected cancels. Only a
+            // pending proof resumes here.
+            // Fail-closed incarnation proof (unreadable sides veto);
+            // liveness, reuse (held pin), exec successors and capture
+            // loss are already guarded by live/canceled.
+            let live_generation = live.as_ref().is_some_and(|record| {
+                scan_generation_proves_caller(
+                    record.start_time,
+                    record.exe.as_ref(),
+                    scan.generation(),
+                )
+            });
+            let fence_idle = recovery
+                .fence
+                .is_none_or(|fence| fence.count <= recovery.watermark);
+            // Mirror take_read exactly: when it could select a tag for
+            // this scan, the fenced migration owns the reads.
+            let fenceable = recovery
+                .pending_reads
+                .iter()
+                .flatten()
+                .any(|tag| tag.scan.equivalent(&scan));
+            // The binder proof is pending (or no sighting exists yet):
+            // Proven means the stock path stages this pass and
+            // Rejected means it cancels; only a pending proof wedges
+            // while the carrier and incarnation stay live.
+            let proof_pending = recovery.sighting.as_ref().is_none_or(|sighting| {
+                matches!(
+                    self.binder.check_current_binding(sighting),
+                    CurrentBindingCheck::Pending
+                )
+            });
+            let resumable = live_generation
+                && !recovery.receipt_refused
+                && fence_idle
+                && !fenceable
+                && proof_pending
+                && self.registry.module_id_for(&module) == Some(recovery.carrier);
+            if resumable {
+                let base_since = match self.pair_targets.get(&key) {
+                    Some(
+                        PairTarget::Bound { base_since, .. }
+                        | PairTarget::Pending { base_since, .. }
+                        | PairTarget::Suspended { base_since, .. },
+                    ) => *base_since,
+                    // Live targets only reach here; settled pairs
+                    // continue above.
+                    _ => 0,
+                };
+                let tags: Vec<PairCount> = recovery
+                    .pending_reads
+                    .iter()
+                    .flatten()
+                    .map(|tag| tag.read)
+                    .collect();
+                let (split_base, split_since, split_top) = split_withheld_growth(
+                    recovery.watermark,
+                    base_since,
+                    &tags,
+                    held,
+                    scan.finished_ns(),
+                );
+                if split_top.is_some_and(|top| top.count > split_base) && budget.spend(12) {
+                    let top = split_top.expect("eligible growth");
+                    let caller = recovery.caller;
+                    let watermark = recovery.watermark;
+                    self.diagnostic_withheld(
+                        key,
+                        &recovery,
+                        watermark,
+                        split_base,
+                        DiagnosticReason::SoleOwner,
+                        None,
+                    );
+                    self.registry
+                        .note_retirement_count_gap(caller, watermark, split_base);
+                    // Re-baseline to ordinary-pending BEFORE staging so
+                    // the resumed window stages under an Ordinary origin:
+                    // no binding proof is needed for same-carrier,
+                    // live-caller, anchor-ordered growth.
+                    recovery.ordinary_checkpoint = current_sequence;
+                    recovery.deferred_count = false;
+                    recovery.blocked = false;
+                    recovery.epoch = None;
+                    recovery.epoch_pending = false;
+                    recovery.sighting = None;
+                    // The fence (if any) stays: a consumed fence is
+                    // inert evidence of the disclosed prefix, and a
+                    // live one belongs to the migration that set it
+                    // (live fences never reach here). Either way the
+                    // staged window re-roots past it via the
+                    // watermark, never by rewriting it. Consumed
+                    // tags clear (their counts are staged or disclosed);
+                    // the fence and the discarded bound stay untouched.
+                    for slot in &mut recovery.pending_reads {
+                        *slot = None;
+                    }
+                    recovery.watermark = split_base;
+                    recovery.withheld_through = split_base;
+                    self.bump_placement_generation(key);
+                    // Only rebind when staging actually queued; on refusal
+                    // the held read retries next pass. Either way the
+                    // staged absolute advances past the resumed window so
+                    // the ordinary arms cannot re-stage it whole (that
+                    // would borrow the disclosed predating prefix); a
+                    // refused rebind that skipped this would silently
+                    // lose growth the staged absolute claims as covered.
+                    // Suspended targets carry no staged absolute and have
+                    // no restage path; the arm retries them via held.
+                    if self.stage_pending_count(
+                        key,
+                        caller,
+                        std::slice::from_ref(&module),
+                        top,
+                        split_since,
+                        split_base,
+                    ) {
+                        self.pair_targets.insert(
+                            key,
+                            PairTarget::Pending {
+                                caller,
+                                modules: vec![module.clone()],
+                                staged: top.count,
+                                staged_ns: top.anchor_ns,
+                                endpoint: recovery.endpoint,
+                                base: split_base,
+                                base_since: split_since,
+                            },
+                        );
+                    } else if let Some(target) = self.pair_targets.get_mut(&key) {
+                        match target {
+                            PairTarget::Bound {
+                                staged, staged_ns, ..
+                            }
+                            | PairTarget::Pending {
+                                staged, staged_ns, ..
+                            } => {
+                                *staged = (*staged).max(top.count);
+                                *staged_ns = top.anchor_ns;
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.recoveries.insert(key, recovery);
+                    continue;
+                }
             }
             if recovery.epoch_pending {
                 self.bump_placement_generation(key);
@@ -12994,6 +13156,183 @@ enum PendingCountOrigin {
 }
 
 /// Fixed-size recovery state per exact pair with successfully placed history.
+/// Split withheld coverage at a same-carrier resolution: historical
+/// reads order by anchor against the resolving scan's finish
+/// (post-scan eligible, predating set the disclosed base). The held
+/// cumulative read joins on mapping-stability alone (no anchor
+/// check): it is current evidence (latest batch, complete when
+/// usable), and the carrier guard already confined this path to the
+/// unchanged mapping, so its attribution is timing-independent.
+/// Returns the disclosed base, its anchor, and the top eligible read
+/// if any growth resumes.
+fn split_withheld_growth(
+    watermark: u64,
+    base_since: u64,
+    tags: &[PairCount],
+    held: Option<PairCount>,
+    finished_ns: u64,
+) -> (u64, u64, Option<PairCount>) {
+    let mut split_base = watermark;
+    let mut split_since = base_since;
+    let mut split_top: Option<PairCount> = None;
+    for read in tags.iter().copied() {
+        if read.count <= watermark || !read.retirement_usable {
+            continue;
+        }
+        if read.anchor_ns > finished_ns {
+            if read.count > split_top.map_or(0, |top| top.count) {
+                split_top = Some(read);
+            }
+        } else if read.count > split_base {
+            split_base = read.count;
+            split_since = read.anchor_ns;
+        }
+    }
+    if let Some(held_read) = held {
+        if held_read.count > watermark
+            && held_read.retirement_usable
+            && held_read.count > split_top.map_or(split_base, |top| top.count)
+        {
+            split_top = Some(held_read);
+        }
+    }
+    (split_base, split_since, split_top)
+}
+
+#[cfg(test)]
+mod split_withheld_growth_tests {
+    use super::*;
+
+    fn read(count: u64, anchor_ns: u64, usable: bool) -> PairCount {
+        PairCount {
+            count,
+            first_ns: anchor_ns,
+            anchor_ns,
+            last_ns: anchor_ns,
+            retirement_usable: usable,
+            diagnostic_observation: 0,
+            diagnostic_transition: 0,
+        }
+    }
+
+    /// Post-scan reads stage past a base the predating reads disclose.
+    #[test]
+    fn split_orders_historical_reads_by_anchor() {
+        let tags = [read(7, 500, true), read(12, 3000, true)];
+        let (base, since, top) = split_withheld_growth(1, 100, &tags, None, 2001);
+        assert_eq!((base, since), (7, 500));
+        assert_eq!(top.map(|top| top.count), Some(12));
+    }
+
+    /// Unusable reads never stage; predating ones still disclose.
+    #[test]
+    fn split_skips_unusable_reads() {
+        let tags = [read(12, 3000, false)];
+        let (base, since, top) =
+            split_withheld_growth(1, 100, &tags, Some(read(12, 3000, false)), 2001);
+        assert_eq!((base, since), (1, 100));
+        assert!(top.is_none());
+    }
+
+    /// The held cumulative read stages on mapping-stability even when
+    /// its anchor predates the resolving scan: it is current evidence
+    /// (latest batch), and the carrier guard already confined this
+    /// path to the unchanged mapping.
+    #[test]
+    fn split_stages_stale_held_on_mapping_stability() {
+        let (base, since, top) =
+            split_withheld_growth(23, 900, &[], Some(read(44, 1000, true)), 2001);
+        assert_eq!((base, since), (23, 900));
+        assert_eq!(top.map(|top| top.count), Some(44));
+    }
+}
+
+/// Incarnation agreement between a live caller record and a scan's
+/// generation, fail-closed on unreadable sides: unknown (`None`)
+/// proves nothing, so only two readable sides that agree resume
+/// (L3-1). A transiently unreadable start time or exe keeps the
+/// recovery wedged (gap-flushed) rather than staging growth for a
+/// caller the scan never proved.
+fn scan_generation_proves_caller(
+    record_start: Option<u64>,
+    record_exe: Option<&ExeIdentity>,
+    scan: &crate::inspect_system::MemberGeneration,
+) -> bool {
+    record_start.is_some()
+        && record_start == scan.start_time
+        && record_exe.is_some()
+        && record_exe == scan.exe.as_ref()
+}
+
+#[cfg(test)]
+mod scan_generation_proof_tests {
+    use super::*;
+
+    fn generation(
+        start_time: Option<u64>,
+        exe: Option<ExeIdentity>,
+    ) -> crate::inspect_system::MemberGeneration {
+        crate::inspect_system::MemberGeneration { start_time, exe }
+    }
+
+    fn exe(ino: u64) -> ExeIdentity {
+        ExeIdentity {
+            dev: 7,
+            ino,
+            mtime_secs: 9,
+            mtime_nanos: 0,
+            path: None,
+        }
+    }
+
+    /// Matching readable generations agree and only those resume: a
+    /// proven mismatch on either field vetoes, and an unreadable side
+    /// (`None`) fails closed — unknown never proves the incarnation.
+    #[test]
+    fn scan_generation_proof_matrix() {
+        let present = generation(Some(500), Some(exe(11)));
+        assert!(scan_generation_proves_caller(
+            Some(500),
+            Some(&exe(11)),
+            &present
+        ));
+        // Proven mismatches veto.
+        assert!(!scan_generation_proves_caller(
+            Some(501),
+            Some(&exe(11)),
+            &present
+        ));
+        assert!(!scan_generation_proves_caller(
+            Some(500),
+            Some(&exe(12)),
+            &present
+        ));
+        // Unreadable sides fail closed (transient read gaps wedge
+        // rather than resume for an unproven caller).
+        assert!(!scan_generation_proves_caller(
+            None,
+            Some(&exe(11)),
+            &present
+        ));
+        assert!(!scan_generation_proves_caller(Some(500), None, &present));
+        assert!(!scan_generation_proves_caller(
+            Some(500),
+            Some(&exe(11)),
+            &generation(None, Some(exe(11)))
+        ));
+        assert!(!scan_generation_proves_caller(
+            Some(500),
+            Some(&exe(11)),
+            &generation(Some(500), None)
+        ));
+        assert!(!scan_generation_proves_caller(
+            None,
+            None,
+            &generation(None, None)
+        ));
+    }
+}
+
 struct PairRecovery {
     caller: CallerId,
     endpoint: EndpointId,
@@ -13126,6 +13465,12 @@ impl PairRecovery {
             // Independently justified old H remains until predecessor settlement.
             self.discarded_through = self.watermark;
         }
+        // Retention needs a pre-existing vacancy: keeping an occupied
+        // slot never frees room, so retaining into a full set would
+        // force a fourth-identity refusal that the base drop avoids.
+        // With room, same-epoch reads stay without changing refusal
+        // dynamics; without it they drop exactly as before.
+        let may_retain = self.pending_reads.iter().any(|slot| slot.is_none());
         let mut retained = 0;
         for slot in &mut self.pending_reads {
             work.visit();
@@ -13162,7 +13507,19 @@ impl PairRecovery {
                 *slot = None;
                 continue;
             }
-            if disposition == ReceiptDisposition::Obsolete || tag.read.count <= self.watermark {
+            // Reads tagged under the recovery's own epoch stay eligible
+            // even when churn evicted their receipt: the revision and
+            // generation pin the epoch without needing an assigned
+            // comparison id, so a resolving scan can still fence them
+            // by anchor order. Anything else obsolete drops as before.
+            let epoch_same = may_retain
+                && self
+                    .scan
+                    .as_ref()
+                    .is_some_and(|scan| tag.scan.same_epoch(scan));
+            if tag.read.count <= self.watermark
+                || (disposition == ReceiptDisposition::Obsolete && !epoch_same)
+            {
                 work.visit();
                 if !continuing && tag.read.count > self.watermark {
                     self.discarded_through = self.discarded_through.max(tag.read.count);

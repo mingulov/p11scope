@@ -70,8 +70,16 @@ impl OwnershipScan {
         let comparison = self.comparison.load(Ordering::Relaxed);
         comparison != 0
             && comparison == other.comparison.load(Ordering::Relaxed)
-            && self.revision == other.revision
-            && self.generation() == other.generation()
+            && self.same_epoch(other)
+    }
+
+    /// Same mapping epoch without requiring an assigned comparison id:
+    /// the bounded comparisons may never run under backlog, but the
+    /// revision and generation already pin the epoch. Reads tagged
+    /// under a churned receipt stay fence-eligible for their own
+    /// epoch's scan by this predicate when full equivalence starves.
+    pub(super) fn same_epoch(&self, other: &Self) -> bool {
+        self.revision == other.revision && self.generation() == other.generation()
     }
 }
 

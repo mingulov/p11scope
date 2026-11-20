@@ -14510,7 +14510,10 @@ mod tests {
         });
         let error = open_view_object(&view, path, &mut budget)
             .expect_err("the real identity caller must return no key from an incomplete table");
-        assert!(error.contains("mountinfo byte ceiling"), "{error}");
+        // The mount table is per-scan overhead bounded by the window, not
+        // the per-object leg: a budget too small to prove the complete
+        // table refuses at the attempted-I/O ceiling, never with a key.
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
 
         let (opened, key) = open_view_object(&view, path, &mut CaptureWorkBudget::default())
             .expect("the same caller accepts the EOF-proven complete table");

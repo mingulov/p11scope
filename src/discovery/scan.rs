@@ -22,7 +22,9 @@ use crate::discovery::overlay_witness::{
     witness_unavailable_refusal,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
-use crate::discovery::scan_pass::{DecodeCursor, DecodeCursorKey};
+use crate::discovery::scan_pass::{
+    DecodeCursor, DecodeCursorKey, MappingFingerprintEntry, SweepFrontier,
+};
 use crate::discovery::sweep_attribution::is_caller_range;
 use crate::process::leader_exit::LeaderExitReadBudget;
 use crate::process::{
@@ -410,10 +412,16 @@ pub(crate) fn read_mountinfo_with<R: Read>(
     chunk_size: usize,
     mut deadline: impl FnMut(&mut CaptureWorkBudget) -> Option<&'static str>,
 ) -> Result<String, String> {
-    let table_cap = budget.limits().per_object_bytes.min(MAX_MOUNTINFO_BYTES);
-    if table_cap == 0 {
+    // The mount table is per-scan overhead (read once, cached, window-charged):
+    // gating it on the per-object leg would make small-but-legitimate legs
+    // unusable on mount-heavy hosts, so only the absolute byte cap and the
+    // entry cap below bound the read. Production per-object legs always
+    // exceed any realistic mount table, so this changes no release behavior.
+    // A zero per-object leg still refuses: a degenerate leg admits nothing.
+    if budget.limits().per_object_bytes == 0 {
         return Err(MOUNTINFO_CEILING_REASON.into());
     }
+    let table_cap = MAX_MOUNTINFO_BYTES;
 
     let mut table = Vec::new();
     let mut observed_lines = 0usize;
@@ -1275,6 +1283,11 @@ pub struct CaptureWorkBudget {
     table_candidates: usize,
     decoded_table_entries: usize,
     admitted_tables: BTreeSet<TableIdentity>,
+    /// Earlier passes' cached tables recognized as already admitted: the
+    /// resumed sweep re-examines the read overlap, and a cached row
+    /// re-decoded there is a repeat, not a new record. A side set, never
+    /// capacity-counted.
+    resumed_tables: BTreeSet<TableIdentity>,
     admitted_runtime_tables: BTreeSet<RuntimeTableIdentity>,
     // One current fingerprint per admitted runtime table position. This
     // map is bounded by admitted_runtime_tables, including invalid words
@@ -1318,6 +1331,9 @@ pub struct CaptureWorkBudget {
     eviction_scans: u64,
     interface_records: usize,
     admitted_interfaces: BTreeSet<InterfaceIdentity>,
+    /// Earlier passes' cached interfaces recognized as already admitted,
+    /// like [`Self::resumed_tables`].
+    resumed_interfaces: BTreeSet<InterfaceIdentity>,
     /// New distinct candidates refused by the cardinality ceilings. Sticky
     /// and never reset: the engine snapshots the pair around each scan, and
     /// a delta proves that scan refused something new (bounded/incomplete)
@@ -1553,6 +1569,7 @@ impl CaptureWorkBudget {
             table_candidates: 0,
             decoded_table_entries: 0,
             admitted_tables: BTreeSet::new(),
+            resumed_tables: BTreeSet::new(),
             admitted_runtime_tables: BTreeSet::new(),
             runtime_table_contents: BTreeMap::new(),
             inspected_files: BTreeMap::new(),
@@ -1568,6 +1585,7 @@ impl CaptureWorkBudget {
             eviction_scans: 0,
             interface_records: 0,
             admitted_interfaces: BTreeSet::new(),
+            resumed_interfaces: BTreeSet::new(),
             table_refusals: 0,
             interface_refusals: 0,
             table_exhaustion_reported: false,
@@ -1946,7 +1964,7 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn table_already_admitted(&self, id: &TableIdentity) -> bool {
-        self.admitted_tables.contains(id)
+        self.admitted_tables.contains(id) || self.resumed_tables.contains(id)
     }
 
     pub(crate) fn note_table_admitted(&mut self, id: TableIdentity) -> bool {
@@ -1965,6 +1983,32 @@ impl CaptureWorkBudget {
             return false;
         }
         self.admitted_tables.insert(id)
+    }
+
+    /// Recognize one earlier pass's cached table as already admitted:
+    /// the resumed sweep re-examines the read overlap, and a cached row
+    /// re-decoded there is a repeat, not a new record. Records into the
+    /// side set the repeat check consults, never into the
+    /// capacity-counted admitted set: cached rows must neither consume
+    /// retained admission nor be refused by it (either way would starve
+    /// genuinely new rows behind them). The re-decode work itself still
+    /// charges the window through the normal admit path, so a window
+    /// smaller than the overlap's re-decodes plus one new decode stalls
+    /// (the same stall floor as an undersized pass allowance).
+    pub(crate) fn note_resumed_table_admitted(&mut self, id: TableIdentity) {
+        if !self.may_mutate_retained_state() {
+            return;
+        }
+        self.resumed_tables.insert(id);
+    }
+
+    /// Recognize one earlier pass's cached interface as already
+    /// admitted, like [`Self::note_resumed_table_admitted`].
+    pub(crate) fn note_resumed_interface_admitted(&mut self, id: InterfaceIdentity) {
+        if !self.may_mutate_retained_state() {
+            return;
+        }
+        self.resumed_interfaces.insert(id);
     }
 
     pub(crate) fn runtime_table_already_admitted(&self, id: &RuntimeTableIdentity) -> bool {
@@ -2348,6 +2392,132 @@ impl CaptureWorkBudget {
             .reserve_unfinished_selection(selected, eligible, cap)
     }
 
+    /// Whether this pass records decode cursors (see
+    /// [`super::scan_pass::ScanPassOwner::resume_armed`]).
+    pub(crate) fn resume_armed(&self) -> bool {
+        self.pass.resume_armed()
+    }
+
+    /// Next decode-cursor sequence number (see
+    /// [`super::scan_pass::ScanPassOwner::decode_cursors_seq_next`]).
+    pub(crate) fn decode_cursors_seq_next(&self) -> u64 {
+        self.pass.decode_cursors_seq_next()
+    }
+
+    /// Drop every cursor for `pid` through the pass owner, joining the
+    /// budget's shared retained-byte accounting (see
+    /// [`super::scan_pass::ScanPassOwner::drop_decode_cursors_for_pid`]).
+    pub(crate) fn drop_decode_cursors_for_pid(&mut self, pid: u32) {
+        let pass = &mut self.pass;
+        let retained = &mut self.retained_cache_bytes;
+        pass.drop_decode_cursors_for_pid(pid, retained)
+    }
+
+    /// Drop `pid`'s superseded cursors (see
+    /// [`super::scan_pass::ScanPassOwner::drop_superseded_decode_cursors`]).
+    pub(crate) fn drop_superseded_decode_cursors(&mut self, pid: u32, start_time: u64) {
+        let pass = &mut self.pass;
+        let retained = &mut self.retained_cache_bytes;
+        pass.drop_superseded_decode_cursors(pid, start_time, retained)
+    }
+
+    /// Drop `pid`'s unmapped cursors (see
+    /// [`super::scan_pass::ScanPassOwner::drop_unmapped_decode_cursors`]).
+    pub(crate) fn drop_unmapped_decode_cursors(
+        &mut self,
+        pid: u32,
+        start_time: u64,
+        mapped: &BTreeSet<(Device, u64)>,
+    ) {
+        let pass = &mut self.pass;
+        let retained = &mut self.retained_cache_bytes;
+        pass.drop_unmapped_decode_cursors(pid, start_time, mapped, retained)
+    }
+
+    /// Drop `pid`'s stale object cursors (see
+    /// [`super::scan_pass::ScanPassOwner::drop_stale_decode_cursors`]).
+    pub(crate) fn drop_stale_decode_cursors(&mut self, pid: u32, device: Device, inode: u64) {
+        let pass = &mut self.pass;
+        let retained = &mut self.retained_cache_bytes;
+        pass.drop_stale_decode_cursors(pid, device, inode, retained)
+    }
+
+    /// Arm the next table-sweep call to resume (see
+    /// [`super::scan_pass::ScanPassOwner::set_table_resume`]).
+    pub(crate) fn set_table_resume(
+        &mut self,
+        start_word: u64,
+        anchors: Option<BTreeMap<u64, Vec<usize>>>,
+    ) {
+        self.pass.set_table_resume(start_word, anchors)
+    }
+
+    /// Take the armed table resume (see
+    /// [`super::scan_pass::ScanPassOwner::take_table_resume`]).
+    pub(crate) fn take_table_resume(&mut self) -> (u64, Option<BTreeMap<u64, Vec<usize>>>) {
+        self.pass.take_table_resume()
+    }
+
+    /// Report words swept by the table call now returning (see
+    /// [`super::scan_pass::ScanPassOwner::note_table_swept`]).
+    pub(crate) fn note_table_swept(&mut self, words: u64, completed: bool) {
+        self.pass.note_table_swept(words, completed)
+    }
+
+    /// Words the last table-sweep call swept plus whether it finished
+    /// (see [`super::scan_pass::ScanPassOwner::take_table_swept`]).
+    pub(crate) fn take_table_swept(&mut self) -> (u64, bool) {
+        self.pass.take_table_swept()
+    }
+
+    /// Publish the anchor map the table prologue just computed (see
+    /// [`super::scan_pass::ScanPassOwner::note_table_anchors`]).
+    pub(crate) fn note_table_anchors(&mut self, anchors: BTreeMap<u64, Vec<usize>>) {
+        self.pass.note_table_anchors(anchors)
+    }
+
+    /// Take the last table prologue's anchor map, if it ran (see
+    /// [`super::scan_pass::ScanPassOwner::take_table_anchors_out`]).
+    pub(crate) fn take_table_anchors_out(&mut self) -> Option<BTreeMap<u64, Vec<usize>>> {
+        self.pass.take_table_anchors_out()
+    }
+
+    /// Arm the next interface-sweep call to resume (see
+    /// [`super::scan_pass::ScanPassOwner::set_iface_resume`]).
+    pub(crate) fn set_iface_resume(&mut self, start_word: u64) {
+        self.pass.set_iface_resume(start_word)
+    }
+
+    /// Take the armed interface resume (see
+    /// [`super::scan_pass::ScanPassOwner::take_iface_resume`]).
+    pub(crate) fn take_iface_resume(&mut self) -> u64 {
+        self.pass.take_iface_resume()
+    }
+
+    /// Report words swept by the interface call now returning (see
+    /// [`super::scan_pass::ScanPassOwner::note_iface_swept`]).
+    pub(crate) fn note_iface_swept(&mut self, words: u64, completed: bool) {
+        self.pass.note_iface_swept(words, completed)
+    }
+
+    /// Words the last interface-sweep call swept plus whether it
+    /// finished (see [`super::scan_pass::ScanPassOwner::take_iface_swept`]).
+    pub(crate) fn take_iface_swept(&mut self) -> (u64, bool) {
+        self.pass.take_iface_swept()
+    }
+
+    /// Note one examined-while-unknown interface-triple address (see
+    /// [`super::scan_pass::ScanPassOwner::note_unlinked_triple`]).
+    pub(crate) fn note_unlinked_triple(&mut self, address: u64, target_mapped: bool) {
+        self.pass.note_unlinked_triple(address, target_mapped)
+    }
+
+    /// Drain this object's recorded unlinked triples (see
+    /// [`super::scan_pass::ScanPassOwner::take_unlinked_triples`]).
+    pub(crate) fn take_unlinked_triples(&mut self) -> Vec<u64> {
+        self.pass.take_unlinked_triples()
+    }
+
     #[cfg(test)]
     pub(crate) fn table_candidates_count(&self) -> usize {
         self.table_candidates
@@ -2458,7 +2628,7 @@ impl CaptureWorkBudget {
     }
 
     pub(crate) fn interface_already_admitted(&self, id: &InterfaceIdentity) -> bool {
-        self.admitted_interfaces.contains(id)
+        self.admitted_interfaces.contains(id) || self.resumed_interfaces.contains(id)
     }
 
     pub(crate) fn note_interface_admitted(&mut self, id: InterfaceIdentity) -> bool {
@@ -3148,6 +3318,74 @@ fn span_bytes(layout: LinuxLayout, spans: &[TableSpan]) -> Option<usize> {
     table_bytes(layout, spans.iter().map(|span| span.fields().len()).sum()).ok()
 }
 
+/// Re-read one cached table's full declared extent from current
+/// memory (charged): `None` on any short read, refusal or stop.
+fn reread_table_extent(
+    layout: LinuxLayout,
+    table: &ScannedTable,
+    mem: &impl ScanMemory,
+    budget: &mut CaptureWorkBudget,
+) -> Option<Vec<u8>> {
+    let version_word = u64::from(table.version.0) | (u64::from(table.version.1) << 8);
+    let (_, spans, _) = spans_for(version_word)?;
+    let len = span_bytes(layout, spans)?;
+    budget.spend(1).ok()?;
+    let mut extent = vec![0u8; len];
+    match mem.read_memory_at(&mut extent, table.address) {
+        Ok(read) if read == len => {}
+        _ => return None,
+    }
+    budget.record_io(len);
+    Some(extent)
+}
+
+/// Whether re-decoding `extent` (re-read from current memory) under the
+/// sweep's rules yields exactly `table`.
+fn table_extent_matches(
+    layout: LinuxLayout,
+    table: &ScannedTable,
+    extent: &[u8],
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> bool {
+    match decode_candidate(
+        layout,
+        extent,
+        0,
+        table.address,
+        maps,
+        budget,
+        DecodeContext {
+            runtime_view: None,
+            strict_tail: true,
+        },
+    ) {
+        Ok(Some((fresh, _))) => fresh == *table,
+        _ => false,
+    }
+}
+
+/// Re-prove one cached table against current memory for complete
+/// replay: the table's full declared extent is re-read (charged) and
+/// re-decoded under the sweep's rules, and must equal the cached row.
+/// Identity alone cannot see a same-path exec or a writable-byte
+/// mutation under an unchanged layout, so any short read, decode
+/// mismatch, refusal or stop fails the whole replay into a fresh
+/// rescan. Anchor-recovered rows, which the direct decoder rejects by
+/// design, conservatively rescan.
+fn verify_cached_table(
+    layout: LinuxLayout,
+    table: &ScannedTable,
+    mem: &impl ScanMemory,
+    maps: &MapIndex<'_>,
+    budget: &mut CaptureWorkBudget,
+) -> bool {
+    let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
+        return false;
+    };
+    table_extent_matches(layout, table, &extent, maps, budget)
+}
+
 pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
     let word = read_word_le(header, layout, 0).ok()?;
     let (_, spans, _) = spans_for(word)?;
@@ -3785,6 +4023,84 @@ fn anchor_kept_dominates(
             || (kept_len == candidate_len && kept_start < candidate))
 }
 
+/// Reconcile split-pass table decodes exactly like one roomy pass's
+/// overlap elimination: exact duplicates collapse to their first
+/// occurrence; validated shapes outrank export-anchored recovery;
+/// within one evidence class the longest nonoverlapping match wins;
+/// same-start pairs coexist (an anchored extension retains additional
+/// targets alongside the stronger prefix proof). Returns the kept
+/// tables in address order plus, per input position, the kept index
+/// or `None` when dropped, so interfaces re-link onto the final list.
+fn reconcile_resumed_tables(
+    cached: Vec<ScannedTable>,
+    new: Vec<ScannedTable>,
+    layout: LinuxLayout,
+) -> (Vec<ScannedTable>, Vec<Option<usize>>) {
+    let width = layout.word_bytes();
+    let extent = |table: &ScannedTable| {
+        table_bytes(layout, table.decoded_slot_count()).unwrap_or(
+            table
+                .decoded_slot_count()
+                .saturating_add(1)
+                .saturating_mul(width),
+        )
+    };
+    let total = cached.len().saturating_add(new.len());
+    let mut unique: Vec<(usize, ScannedTable)> = Vec::new();
+    for (position, table) in cached.into_iter().chain(new).enumerate() {
+        if !unique.iter().any(|(_, kept)| kept == &table) {
+            unique.push((position, table));
+        }
+    }
+    // Roomy order: validated desc, length desc, address asc (input
+    // position breaks the rest deterministically).
+    unique.sort_by(|a, b| {
+        let rank = |table: &ScannedTable| (table.walk != "known_prefix", extent(table));
+        rank(&b.1)
+            .cmp(&rank(&a.1))
+            .then(a.1.address.cmp(&b.1.address))
+            .then(a.0.cmp(&b.0))
+    });
+    let mut kept: Vec<(usize, usize, ScannedTable)> = Vec::new();
+    for (position, table) in unique {
+        let len = extent(&table);
+        let overlaps = kept.iter().any(|(_, kept_len, kept)| {
+            table.address != kept.address
+                && table.address < kept.address.saturating_add(*kept_len as u64)
+                && kept.address < table.address.saturating_add(len as u64)
+        });
+        if !overlaps {
+            kept.push((position, len, table));
+        }
+    }
+    kept.sort_by_key(|(_, _, table)| table.address);
+    let mut index_map: Vec<Option<usize>> = vec![None; total];
+    let mut tables = Vec::with_capacity(kept.len());
+    for (kept_index, (position, _, table)) in kept.into_iter().enumerate() {
+        index_map[position] = Some(kept_index);
+        tables.push(table);
+    }
+    (tables, index_map)
+}
+
+/// Merge split-pass table decodes and re-link interfaces onto the
+/// reconciled list: a dropped table's interfaces keep their triple
+/// evidence with no table link.
+fn merge_resumed_module_tables(
+    cached_tables: Vec<ScannedTable>,
+    new_tables: Vec<ScannedTable>,
+    interfaces: &mut [ScannedInterface],
+    layout: LinuxLayout,
+) -> Vec<ScannedTable> {
+    let (tables, index_map) = reconcile_resumed_tables(cached_tables, new_tables, layout);
+    for interface in interfaces.iter_mut() {
+        interface.table = interface
+            .table
+            .and_then(|index| index_map.get(index).copied().flatten());
+    }
+    tables
+}
+
 #[allow(clippy::too_many_arguments)]
 fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
@@ -3796,50 +4112,65 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     excluded_anchor_ranges: &[(u64, u64)],
     mut now: F,
 ) -> (Vec<ScannedTable>, Vec<String>) {
+    // Resumed sweep: start where the earlier pass stopped (call entry
+    // consumes the resume, so a sweep that never runs cannot leak it
+    // into the next object).
+    let (resume_word, resume_anchors) = budget.take_table_resume();
     let mut skipped = Vec::new();
     let mut found: Vec<(usize, usize, bool, ScannedTable)> = Vec::new();
     let mut anchors: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     if let Some(exports) = export_evidence {
-        if let Err(reason) = budget.spend(maps.entries().len() as u64) {
-            return (Vec::new(), vec![reason.to_string()]);
-        }
-        let executable: Vec<_> = maps
-            .entries()
-            .iter()
-            .filter(|mapping| {
-                mapping.device == exports.object.device
-                    && mapping.inode == exports.object.inode
-                    && mapping.permissions[2] == b'x'
-            })
-            .collect();
-        for (name, file_offset) in exports.symbols {
-            if let Some(reason) = budget.check_deadline(now()) {
+        if let Some(cached) = resume_anchors {
+            // The prologue already ran on an earlier pass (mappings
+            // fingerprinted unchanged since): reuse its anchors with no
+            // charges, so every pass spends its budget on new words.
+            anchors = cached;
+        } else {
+            if let Err(reason) = budget.spend(maps.entries().len() as u64) {
                 return (Vec::new(), vec![reason.to_string()]);
             }
-            if let Err(reason) = budget.spend(1) {
-                return (Vec::new(), vec![reason.to_string()]);
-            }
-            let Some(ordinal) = standard_ordinal(name).map(usize::from) else {
-                continue;
-            };
-            for mapping in &executable {
+            let executable: Vec<_> = maps
+                .entries()
+                .iter()
+                .filter(|mapping| {
+                    mapping.device == exports.object.device
+                        && mapping.inode == exports.object.inode
+                        && mapping.permissions[2] == b'x'
+                })
+                .collect();
+            for (name, file_offset) in exports.symbols {
                 if let Some(reason) = budget.check_deadline(now()) {
                     return (Vec::new(), vec![reason.to_string()]);
                 }
                 if let Err(reason) = budget.spend(1) {
                     return (Vec::new(), vec![reason.to_string()]);
                 }
-                if let Some(address) = file_offset
-                    .checked_sub(mapping.file_offset)
-                    .and_then(|delta| mapping.start.checked_add(delta))
-                    .filter(|address| *address < mapping.end)
-                {
-                    let ordinals = anchors.entry(address).or_default();
-                    if !ordinals.contains(&ordinal) {
-                        ordinals.push(ordinal);
+                let Some(ordinal) = standard_ordinal(name).map(usize::from) else {
+                    continue;
+                };
+                for mapping in &executable {
+                    if let Some(reason) = budget.check_deadline(now()) {
+                        return (Vec::new(), vec![reason.to_string()]);
+                    }
+                    if let Err(reason) = budget.spend(1) {
+                        return (Vec::new(), vec![reason.to_string()]);
+                    }
+                    if let Some(address) = file_offset
+                        .checked_sub(mapping.file_offset)
+                        .and_then(|delta| mapping.start.checked_add(delta))
+                        .filter(|address| *address < mapping.end)
+                    {
+                        let ordinals = anchors.entry(address).or_default();
+                        if !ordinals.contains(&ordinal) {
+                            ordinals.push(ordinal);
+                        }
                     }
                 }
             }
+            // A completed prologue publishes its anchors for the frontier
+            // cursor; a prologue that stops early publishes nothing, so the
+            // next pass re-runs it whole.
+            budget.note_table_anchors(anchors.clone());
         }
     }
     // Anchor addresses span the provider's executable mappings: a
@@ -3852,8 +4183,29 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
     // At most one current width for each accepted offset; decoded-table
     // budgets bound both this map and the existing result collection.
     let mut seen = BTreeMap::<usize, usize>::new();
-    let mut offset = 0usize;
     let width = layout.word_bytes();
+    // Resumed sweeps start where the earlier pass stopped; words before
+    // the resume point were examined then and cost nothing now. The
+    // frontier never exceeds the snapshot: frontiers are recorded from
+    // sweeps of these same fingerprinted bytes.
+    let resume_start = usize::try_from(resume_word)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(width);
+    debug_assert!(resume_start <= snapshot.len());
+    // Bounded header lookback for newly visited anchors: an earlier
+    // pass can visit a header (direct decode rejects it) and stop
+    // before the export anchor that would recover it. One max-table
+    // span back covers every in-lookback header; older candidates were
+    // examined and anchor-tried on earlier passes.
+    let anchor_lookback = table_bytes(layout, 104).unwrap_or(width.saturating_mul(105));
+    let mut offset = resume_start.min(snapshot.len());
+    // Fully examined words this call (every early break excludes its
+    // current word, so a resume re-examines exactly what no pass
+    // finished). Completion is loop exit: every break clears it first
+    // (a break falls through to the single report below, so reporting
+    // at the break site would be overwritten).
+    let mut swept = 0u64;
+    let mut completed = true;
     'scan: while offset + width <= snapshot.len() {
         if (offset / width).is_multiple_of(4096)
             && budget.has_deadline()
@@ -3862,6 +4214,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             if let Some(reason) = budget.take_scan_stop_reason() {
                 skipped.push(reason.into());
             }
+            completed = false;
             break;
         }
         // No cardinality pre-check: only the repeat-aware decode below can
@@ -3872,6 +4225,7 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
             if let Some(reason) = budget.take_scan_stop_reason() {
                 skipped.push(reason.into());
             }
+            completed = false;
             break;
         }
         let value = read_word_le(snapshot, layout, offset).expect("one complete word");
@@ -3898,9 +4252,11 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                     if let Some(reason) = budget.take_scan_stop_reason() {
                         skipped.push(reason.into());
                     }
+                    completed = false;
                     break;
                 }
                 offset += width * (run + 1);
+                swept += (run as u64) + 1;
                 continue;
             }
         }
@@ -3954,6 +4310,10 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                 } else if let Some(reason) = budget.table_exhaustion_reason() {
                     skipped.push(reason);
                 }
+                // The current word is re-examined on resume: a stop may
+                // have refused its admission (fresh budget next pass), and
+                // a cardinality refusal clears with the fresh pass budget.
+                completed = false;
                 break;
             }
         }
@@ -3984,11 +4344,22 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                     if let Some(reason) = budget.take_scan_stop_reason() {
                         skipped.push(reason.into());
                     }
+                    // The current word is re-examined on resume: its
+                    // remaining anchor ordinals were never attempted.
+                    completed = false;
                     break 'scan;
                 }
                 let Some(candidate) = offset.checked_sub(width * (ordinal + 1)) else {
                     continue;
                 };
+                // A resumed sweep re-examines words at or after its
+                // resume point, plus headers within the anchor lookback
+                // behind it (visited-but-rejected earlier, anchor never
+                // tried). Older candidates were examined and
+                // anchor-tried on earlier passes.
+                if candidate < resume_start && resume_start - candidate > anchor_lookback {
+                    continue;
+                }
                 if seen.get(&candidate).is_some_and(|count| *count > ordinal) {
                     continue;
                 }
@@ -4051,13 +4422,16 @@ fn detect_tables_with_clock<F: FnMut() -> Option<u64>>(
                         } else if let Some(reason) = budget.table_exhaustion_reason() {
                             skipped.push(reason);
                         }
+                        completed = false;
                         break 'scan;
                     }
                 }
             }
         }
         offset += width;
+        swept += 1;
     }
+    budget.note_table_swept(swept, completed);
     // Fully validated shapes outrank weaker export-anchored recovery. Within
     // one evidence class keep the longest nonoverlapping match.
     found.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)).then(a.0.cmp(&b.0)));
@@ -4096,6 +4470,7 @@ fn scan_interfaces(
     scan_interfaces_for_layout(
         LinuxLayout::Lp64,
         snapshot,
+        0,
         mem,
         tables,
         maps,
@@ -4110,6 +4485,7 @@ fn scan_interfaces(
 fn scan_interfaces_for_layout(
     layout: LinuxLayout,
     snapshot: &[u8],
+    base_address: u64,
     mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
@@ -4121,6 +4497,7 @@ fn scan_interfaces_for_layout(
     scan_interfaces_with_clock(
         layout,
         snapshot,
+        base_address,
         mem,
         tables,
         maps,
@@ -4132,10 +4509,241 @@ fn scan_interfaces_for_layout(
     )
 }
 
+/// One interface triple's admission: name read plus identity and
+/// cardinality checks plus the row build. Shared by the sweep (triples
+/// found in its snapshot) and the carried-triple link step (hints a
+/// previous pass recorded against a partial table set): both admit
+/// through this one rule. Returns the row (if admitted), exhaustion
+/// reasons to surface, and the refused / I/O-exhausted signals.
+#[allow(clippy::too_many_arguments)]
+fn admit_interface_triple(
+    name_ptr: u64,
+    table: usize,
+    flags: u64,
+    tables: &[ScannedTable],
+    maps: &MapIndex<'_>,
+    key: ObjectKey,
+    mem: &impl ScanMemory,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+    runtime_view: Option<ProcessViewId>,
+) -> (Option<ScannedInterface>, Vec<String>, bool, bool) {
+    let mut skipped = Vec::new();
+    // Privacy boundary: a triple is accepted on `table_ptr` alone, so the name
+    // pointer of a look-alike structure could aim anywhere. Only this object's
+    // own readable pages — where a provider keeps its interface names — are
+    // ever dereferenced; anything else is recorded without being read.
+    let mapping_end = maps
+        .containing(name_ptr)
+        .filter(|entry| {
+            entry.permissions[0] == b'r'
+                && ObjectKey {
+                    device: entry.device,
+                    inode: entry.inode,
+                } == key
+                && entry
+                    .raw_path
+                    .as_deref()
+                    .is_some_and(|path| path.starts_with(b"/"))
+        })
+        .map(|entry| entry.end);
+    let mut io_exhausted = false;
+    let (name_class, name_lossy, name_private) = match name_ptr {
+        0 => ("null", None, None),
+        _ if mapping_end.is_none() => ("unreadable", None, None),
+        _ => match read_name(mem, name_ptr, mapping_end.unwrap(), budget, operation_bytes) {
+            Ok(Some(raw)) if raw == STANDARD_INTERFACE_NAME => (
+                "exact_standard",
+                Some(String::from_utf8_lossy(&raw).into_owned()),
+                Some(raw),
+            ),
+            Ok(Some(raw)) => (
+                "other",
+                Some(String::from_utf8_lossy(&raw).into_owned()),
+                Some(raw),
+            ),
+            Ok(None) => ("unreadable", None, None),
+            Err(()) => {
+                io_exhausted = true;
+                ("unreadable", None, None)
+            }
+        },
+    };
+    // Repeat recognition under the cap: the name read above already
+    // charged attempted I/O whether or not this triple is new, and
+    // only a new distinct interface consumes a lifetime record. A
+    // refused triple is skipped — not fatal — so later repeats still
+    // decode; the refusal counter keeps the scan incomplete.
+    let identity = observed_interface_identity(
+        &tables[table],
+        name_class,
+        &name_private,
+        flags,
+        maps,
+        runtime_view,
+        budget,
+    );
+    let repeat = identity
+        .as_ref()
+        .is_some_and(|id| budget.interface_already_admitted(id));
+    if !budget.admit_decoded_interface() {
+        if let Some(reason) = budget.interface_exhaustion_reason() {
+            skipped.push(reason);
+        }
+        return (None, skipped, true, io_exhausted);
+    }
+    if !repeat {
+        if !budget.admit_interface() {
+            if let Some(reason) = budget.interface_exhaustion_reason() {
+                skipped.push(reason);
+            }
+            return (None, skipped, true, io_exhausted);
+        }
+        if let Some(id) = identity
+            && !budget.note_interface_admitted(id)
+        {
+            if let Some(reason) = budget.interface_exhaustion_reason() {
+                skipped.push(reason);
+            }
+            return (None, skipped, true, io_exhausted);
+        }
+    }
+    (
+        Some(ScannedInterface {
+            index: 0,
+            name_class,
+            name_lossy,
+            name_private,
+            flags,
+            table: Some(table),
+        }),
+        skipped,
+        false,
+        io_exhausted,
+    )
+}
+
+/// Link carried interface-triple hints against this pass's final
+/// tables: each address is re-read from current memory (charged) and
+/// admitted through the one shared rule, so links are proven from
+/// current bytes, never replayed. Triples whose target is still
+/// unknown, whose read fails transiently, or whose admission refuses
+/// stay carried for a later pass; triples the fresh sweep already
+/// decoded are skipped as repeats. Returns the still-unlinked
+/// addresses plus whether name reads hit I/O exhaustion.
+#[allow(clippy::too_many_arguments)]
+fn link_carried_triples(
+    layout: LinuxLayout,
+    mem: &impl ScanMemory,
+    tables: &[ScannedTable],
+    interfaces: &mut Vec<ScannedInterface>,
+    maps: &MapIndex<'_>,
+    key: ObjectKey,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+    runtime_view: Option<ProcessViewId>,
+    candidates: Vec<u64>,
+    skipped: &mut Vec<Skipped>,
+    module_path: &str,
+) -> (Vec<u64>, bool) {
+    if candidates.is_empty() {
+        return (Vec::new(), false);
+    }
+    let width = layout.word_bytes();
+    let interface = layout.interface();
+    let by_address: HashMap<u64, usize> =
+        tables
+            .iter()
+            .enumerate()
+            .fold(HashMap::new(), |mut by_address, (index, table)| {
+                by_address.entry(table.address).or_insert(index);
+                by_address
+            });
+    let mut remaining = Vec::new();
+    let mut rest = candidates.as_slice();
+    let mut io_exhausted = false;
+    while let Some((address, tail)) = rest.split_first() {
+        let address = *address;
+        rest = tail;
+        if budget.scan_stopped() {
+            remaining.push(address);
+            remaining.extend_from_slice(rest);
+            break;
+        }
+        if budget.spend(1).is_err() {
+            remaining.push(address);
+            remaining.extend_from_slice(rest);
+            break;
+        }
+        let mut raw = vec![0u8; width * 3];
+        match mem.read_memory_at(&mut raw, address) {
+            Ok(read) if read == raw.len() => {}
+            _ => {
+                // Unproven bytes are not a failed triple: retry next pass.
+                remaining.push(address);
+                continue;
+            }
+        }
+        let word_at = |byte_offset: usize| read_word_le(&raw, layout, byte_offset).ok();
+        let (Some(name_ptr), Some(table_ptr), Some(flags)) = (
+            word_at(interface.name_offset),
+            word_at(interface.function_list_offset),
+            word_at(interface.flags_offset),
+        ) else {
+            remaining.push(address);
+            continue;
+        };
+        let Some(table) = by_address.get(&table_ptr).copied() else {
+            remaining.push(address);
+            continue;
+        };
+        let (admitted, reasons, triple_refused, triple_io) = admit_interface_triple(
+            name_ptr,
+            table,
+            flags,
+            tables,
+            maps,
+            key,
+            mem,
+            budget,
+            operation_bytes,
+            runtime_view,
+        );
+        for reason in reasons {
+            skipped.push(scan_skip(module_path, reason));
+        }
+        if triple_io {
+            skipped.push(scan_skip(
+                module_path,
+                budget
+                    .take_scan_stop_reason()
+                    .unwrap_or(IO_CEILING_REASON)
+                    .into(),
+            ));
+            io_exhausted = true;
+            remaining.push(address);
+            remaining.extend_from_slice(rest);
+            break;
+        }
+        match admitted {
+            Some(row) if !interfaces.iter().any(|known| same_interface(known, &row)) => {
+                interfaces.push(row);
+            }
+            Some(_) => {}
+            None => {
+                debug_assert!(triple_refused, "unadmitted triples always refuse");
+                remaining.push(address);
+            }
+        }
+    }
+    (remaining, io_exhausted)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
     layout: LinuxLayout,
     snapshot: &[u8],
+    base_address: u64,
     mem: &impl ScanMemory,
     tables: &[ScannedTable],
     maps: &MapIndex<'_>,
@@ -4158,7 +4766,19 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                 by_address.entry(table.address).or_insert(index);
                 by_address
             });
-    let mut offset = 0usize;
+    // Resumed sweep: start where the earlier pass stopped (call entry
+    // consumes the resume).
+    let resume_word = budget.take_iface_resume();
+    let resume_start = usize::try_from(resume_word)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(layout.word_bytes());
+    debug_assert!(resume_start <= snapshot.len());
+    let mut offset = resume_start.min(snapshot.len());
+    // Fully examined words this call (every early break excludes its
+    // current word). Completion is loop exit: every break clears it
+    // first (a break falls through to the single report below).
+    let mut swept = 0u64;
+    let mut completed = true;
     while offset + interface.stride <= snapshot.len() {
         if (offset / layout.word_bytes()).is_multiple_of(4096)
             && budget.has_deadline()
@@ -4167,6 +4787,7 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             if let Some(reason) = budget.take_scan_stop_reason() {
                 skipped.push(reason.into());
             }
+            completed = false;
             break;
         }
         // A zero function-list word anchors no triple (a decoded
@@ -4189,9 +4810,11 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                 if let Some(reason) = budget.take_scan_stop_reason() {
                     skipped.push(reason.into());
                 }
+                completed = false;
                 break;
             }
             offset += run * layout.word_bytes();
+            swept += run as u64;
             continue;
         }
         // No cardinality pre-check: only the repeat-aware admission below
@@ -4202,107 +4825,62 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
             if let Some(reason) = budget.take_scan_stop_reason() {
                 skipped.push(reason.into());
             }
+            completed = false;
             break;
         }
+        // A refused triple is unproven bytes: set by the admission
+        // checks below, read after the triple resolves.
+        let mut refused = false;
         let scanned = (|| {
             let name_ptr = word_at(offset + interface.name_offset)?;
             let table_ptr = word_at(offset + interface.function_list_offset)?;
             let flags = word_at(offset + interface.flags_offset)?;
             // The function-list pointer is the anchor: without it a triple of words
             // is just data. Requiring a decoded table also keeps the byte budget —
-            // only the provider's own mappings are ever read.
-            let table = by_address.get(&table_ptr).copied()?;
-            // Privacy boundary: a triple is accepted on `table_ptr` alone, so the name
-            // pointer of a look-alike structure could aim anywhere. Only this object's
-            // own readable pages — where a provider keeps its interface names — are
-            // ever dereferenced; anything else is recorded without being read.
-            let mapping_end = maps
-                .containing(name_ptr)
-                .filter(|entry| {
-                    entry.permissions[0] == b'r'
-                        && ObjectKey {
-                            device: entry.device,
-                            inode: entry.inode,
-                        } == key
-                        && entry
-                            .raw_path
-                            .as_deref()
-                            .is_some_and(|path| path.starts_with(b"/"))
-                })
-                .map(|entry| entry.end);
-            let (name_class, name_lossy, name_private) = match name_ptr {
-                0 => ("null", None, None),
-                _ if mapping_end.is_none() => ("unreadable", None, None),
-                _ => {
-                    match read_name(mem, name_ptr, mapping_end.unwrap(), budget, operation_bytes) {
-                        Ok(Some(raw)) if raw == STANDARD_INTERFACE_NAME => (
-                            "exact_standard",
-                            Some(String::from_utf8_lossy(&raw).into_owned()),
-                            Some(raw),
-                        ),
-                        Ok(Some(raw)) => (
-                            "other",
-                            Some(String::from_utf8_lossy(&raw).into_owned()),
-                            Some(raw),
-                        ),
-                        Ok(None) => ("unreadable", None, None),
-                        Err(()) => {
-                            io_exhausted = true;
-                            ("unreadable", None, None)
-                        }
-                    }
-                }
-            };
-            // Repeat recognition under the cap: the name read above already
-            // charged attempted I/O whether or not this triple is new, and
-            // only a new distinct interface consumes a lifetime record. A
-            // refused triple is skipped — not fatal — so later repeats still
-            // decode; the refusal counter keeps the scan incomplete.
-            let identity = observed_interface_identity(
-                &tables[table],
-                name_class,
-                &name_private,
-                flags,
-                maps,
-                runtime_view,
-                budget,
-            );
-            let repeat = identity
-                .as_ref()
-                .is_some_and(|id| budget.interface_already_admitted(id));
-            if !budget.admit_decoded_interface() {
-                if let Some(reason) = budget.interface_exhaustion_reason() {
-                    skipped.push(reason);
+            // only the provider's own mappings are ever read. A triple whose
+            // table is still unknown is recorded as an unlinked hint (not
+            // dropped): a later pass re-reads it from current memory once
+            // the table set is final.
+            let Some(table) = by_address.get(&table_ptr).copied() else {
+                if let Some(address) = base_address.checked_add(offset as u64) {
+                    let target_mapped = maps.containing(table_ptr).is_some();
+                    budget.note_unlinked_triple(address, target_mapped);
                 }
                 return None;
-            }
-            if !repeat {
-                if !budget.admit_interface() {
-                    if let Some(reason) = budget.interface_exhaustion_reason() {
-                        skipped.push(reason);
-                    }
-                    return None;
-                }
-                if let Some(id) = identity
-                    && !budget.note_interface_admitted(id)
-                {
-                    if let Some(reason) = budget.interface_exhaustion_reason() {
-                        skipped.push(reason);
-                    }
-                    return None;
-                }
-            }
-            Some(ScannedInterface {
-                index: 0,
-                name_class,
-                name_lossy,
-                name_private,
+            };
+            // Name read plus admission through the one shared rule.
+            let (admitted, reasons, triple_refused, triple_io) = admit_interface_triple(
+                name_ptr,
+                table,
                 flags,
-                table: Some(table),
-            })
+                tables,
+                maps,
+                key,
+                mem,
+                budget,
+                operation_bytes,
+                runtime_view,
+            );
+            skipped.extend(reasons);
+            refused = triple_refused;
+            if triple_io {
+                io_exhausted = true;
+            }
+            admitted
         })();
         if let Some(scanned) = scanned {
             found.push(scanned);
+        }
+        if refused {
+            // The refused triple holds the frontier for a retry with
+            // fresh admission: a resumed pass breaks at the refused
+            // word (breaks exclude it, so the next pass re-examines
+            // exactly it), while a single-shot pass keeps examining
+            // later triples, whose repeats decode free.
+            completed = false;
+            if budget.resume_armed() {
+                break;
+            }
         }
         if io_exhausted {
             skipped.push(
@@ -4311,10 +4889,13 @@ fn scan_interfaces_with_clock<F: FnMut() -> Option<u64>>(
                     .unwrap_or(IO_CEILING_REASON)
                     .into(),
             );
+            completed = false;
             break;
         }
         offset += layout.word_bytes();
+        swept += 1;
     }
+    budget.note_iface_swept(swept, completed);
     (found, skipped)
 }
 
@@ -4442,16 +5023,36 @@ fn zero_read_names_exit_with(
 /// advances and retries; only a failed or zero-length read ends the mapping, keeping
 /// what was read so far. The second return says why it stopped short — everything past
 /// that point went unscanned, and the caller must record that rather than imply it was
-/// examined and found empty.
+/// examined and found empty. Test-only: production always reads through
+/// [`read_mapping_from`], even from offset zero.
+#[cfg(test)]
 fn read_mapping(
     mem: &impl ScanMemory,
     entry: &MapEntry,
     budget: &mut CaptureWorkBudget,
     operation_bytes: &mut u64,
 ) -> (Vec<u8>, Option<String>, bool) {
-    let Some(len) = entry.end.checked_sub(entry.start).map(|len| len as usize) else {
+    read_mapping_from(mem, entry, 0, budget, operation_bytes)
+}
+
+/// `entry.start + start_offset..entry.end` from the target: a resumed
+/// pass continues the mapping from its byte frontier instead of
+/// re-acquiring bytes it already swept, so a mapping larger than one
+/// pass's per-object leg still converges. Byte counts in the short
+/// reason stay mapping-relative, so the gap names the whole unexamined
+/// tail exactly like a from-zero read.
+fn read_mapping_from(
+    mem: &impl ScanMemory,
+    entry: &MapEntry,
+    start_offset: usize,
+    budget: &mut CaptureWorkBudget,
+    operation_bytes: &mut u64,
+) -> (Vec<u8>, Option<String>, bool) {
+    let Some(mapping_len) = entry.end.checked_sub(entry.start).map(|len| len as usize) else {
         return (Vec::new(), None, false);
     };
+    let start_offset = start_offset.min(mapping_len);
+    let len = mapping_len - start_offset;
     let mut bytes = Vec::with_capacity(len.min(READ_CHUNK));
     let mut done = 0usize;
     let mut short = None;
@@ -4469,7 +5070,11 @@ fn read_mapping(
             exhausted = true;
             break;
         }
-        let Some(at) = entry.start.checked_add(done as u64) else {
+        let Some(at) = entry
+            .start
+            .checked_add(start_offset as u64)
+            .and_then(|base| base.checked_add(done as u64))
+        else {
             short = Some("address arithmetic overflowed".to_string());
             break;
         };
@@ -4490,7 +5095,15 @@ fn read_mapping(
             }
             Ok(read) => {
                 bytes.truncate(done + read);
-                budget.record_io(read);
+                // Window-only debit: snapshot bytes bound the per-pass I/O
+                // window, never the progress budget. Charging re-reads as
+                // collection work would let the redo exceed the allowance
+                // and stall every pass before any decode; decode words
+                // (charged through `spend`) are the progress the per-pass
+                // work budget bounds. No-op for DetailedLegacy budgets
+                // (no collection leg); the I/O and per-operation legs
+                // above still fence every read.
+                budget.record_window_io(read);
                 *operation_bytes = (*operation_bytes).saturating_add(read as u64);
                 done += read;
             }
@@ -4500,10 +5113,35 @@ fn read_mapping(
         if exhausted {
             cause
         } else {
-            format!("partial snapshot of one data mapping: read {done} of {len} bytes: {cause}")
+            format!(
+                "partial snapshot of one data mapping: read {} of {mapping_len} bytes: {cause}",
+                start_offset.saturating_add(done),
+            )
         }
     });
     (bytes, short, exhausted)
+}
+
+/// One acquired data snapshot: the mapping bytes read this pass, the
+/// address they were read from, whether the read stopped short of the
+/// mapping end (a truncation the sweeps must not call finished), and
+/// the mapping-relative byte offset the read started at (a resumed pass
+/// continues from its byte frontier minus the candidate overlap instead
+/// of re-acquiring swept bytes).
+struct DataSnapshot {
+    index: usize,
+    base: u64,
+    bytes: Vec<u8>,
+    truncated: bool,
+    read_start: usize,
+}
+
+/// Whether an unfinished snapshot defers the rest of the module to
+/// the next pass: resumed passes break (the held frontier retries
+/// with fresh budget and admission), while single-shot passes keep
+/// the historical traversal and sweep on.
+fn snapshot_defers_to_next_pass(finished: bool, budget: &CaptureWorkBudget) -> bool {
+    !finished && budget.resume_armed()
 }
 
 /// File-backed mappings grouped by object, keeping groups that carry code.
@@ -5688,6 +6326,198 @@ pub(crate) fn witness_join_with_copyup(
         return Err(with_lower_skips(&held, &skips));
     }
     Err(witness_refusal(&outcome).expect("a non-join verdict refuses"))
+}
+
+/// The decode-cursor file key for one opened file under its current
+/// pin: `None` when the pin cannot be read or the filesystem cannot name
+/// one file (the same cacheability rule as the export facts) — the
+/// object then scans fresh every pass, never worse than no cursor. A pin
+/// read here that races the facts read simply misses next pass (a
+/// changed file is re-read, never trusted stale).
+fn cursor_file_key_for(file: &File, key: ObjectKey) -> Option<InspectedFileKey> {
+    if !file_inodes_are_unique(file) {
+        return None;
+    }
+    let pin = pin_of(file).ok()?;
+    InspectedFileKey::for_open_file(file, key.device, key.inode, pin).ok()
+}
+
+/// Whether two decoded interfaces are the same triple, ignoring the
+/// per-pass row index (the shared re-index loop assigns final indices
+/// after cached and new interfaces merge): a resumed frontier word is
+/// re-examined, so resume dedup keeps each interface once.
+fn same_interface(a: &ScannedInterface, b: &ScannedInterface) -> bool {
+    a.name_class == b.name_class
+        && a.name_lossy == b.name_lossy
+        && a.name_private == b.name_private
+        && a.flags == b.flags
+        && a.table == b.table
+}
+
+/// One module's decode-cursor write waiting on the bracket: the scan
+/// stages its frontier, rows and completeness here and records them
+/// only after the mapping and generation validation accepts the
+/// module, so a rejected decode never rides the bundle into the next
+/// pass (its frontier is not a resume point for unvalidated bytes).
+struct PendingCursor {
+    key: Option<DecodeCursorKey>,
+    module_key: ObjectKey,
+    fingerprint: Vec<MappingFingerprintEntry>,
+    tables: SweepFrontier,
+    ifaces: SweepFrontier,
+    anchors: Option<BTreeMap<u64, Vec<usize>>>,
+    decoded_tables: Vec<ScannedTable>,
+    decoded_ifaces: Vec<ScannedInterface>,
+    targets: Vec<MapEntry>,
+    swept_tables: u64,
+    swept_ifaces: u64,
+    data_len: usize,
+    complete: bool,
+    /// Unlinked triple addresses still awaiting their table: carried
+    /// hints the link step could not resolve this pass.
+    unlinked: Vec<u64>,
+}
+
+/// Whether every mapping the cached decode depended on still
+/// resolves to the identical mapping: dependency ranges revalidate on
+/// use (the same whole-entry equality the bracket applies), so a
+/// table whose external target moved never replays past the move.
+fn cursor_targets_match(targets: &[MapEntry], maps: &MapIndex<'_>) -> bool {
+    targets.iter().all(|target| {
+        maps.containing(target.start)
+            .is_some_and(|current| current == target)
+    })
+}
+
+/// Record the staged cursor for one bracket-accepted module, if the
+/// module staged one (modules that never swept stage nothing).
+fn record_pending_cursor(
+    budget: &mut CaptureWorkBudget,
+    pending: &[PendingCursor],
+    module_key: &ObjectKey,
+) {
+    if let Some(staged) = pending
+        .iter()
+        .find(|staged| staged.module_key == *module_key)
+    {
+        record_module_cursor(
+            budget,
+            staged.key.clone(),
+            &staged.fingerprint,
+            staged.tables,
+            staged.ifaces,
+            &staged.anchors,
+            &staged.decoded_tables,
+            &staged.decoded_ifaces,
+            &staged.targets,
+            staged.swept_tables,
+            staged.swept_ifaces,
+            staged.data_len,
+            staged.complete,
+            &staged.unlinked,
+            true,
+        );
+    }
+}
+
+/// Record the staged cursor for one budget-starved-bracket module whose
+/// rows ride for count-only resume but never complete: the unproven
+/// generation withholds completion either way, and `validated` records
+/// whether the bracket proved the mappings before starving (`Some(true)`
+/// verdict) or never ran (`None`: the next use re-proves bytes and
+/// re-collects targets instead of replaying).
+fn record_pending_cursor_uncompleted(
+    budget: &mut CaptureWorkBudget,
+    pending: &[PendingCursor],
+    module_key: &ObjectKey,
+    validated: bool,
+) {
+    if let Some(staged) = pending
+        .iter()
+        .find(|staged| staged.module_key == *module_key)
+    {
+        record_module_cursor(
+            budget,
+            staged.key.clone(),
+            &staged.fingerprint,
+            staged.tables,
+            staged.ifaces,
+            &staged.anchors,
+            &staged.decoded_tables,
+            &staged.decoded_ifaces,
+            &staged.targets,
+            staged.swept_tables,
+            staged.swept_ifaces,
+            staged.data_len,
+            false,
+            &staged.unlinked,
+            validated,
+        );
+    }
+}
+
+/// Record one module's decode cursor after its sweeps (when armed and
+/// keyed): progress (or a fully acquired, decoded and validated object)
+/// records; a pass that swept nothing new keeps the older cursor.
+/// Called both when the scan stops mid-module (the stop is exactly what
+/// the next pass resumes from, never complete) and on the normal path
+/// (complete only when the finished-scan gate below proved the whole
+/// acquisition, decoding and validation).
+#[allow(clippy::too_many_arguments)]
+fn record_module_cursor(
+    budget: &mut CaptureWorkBudget,
+    cursor_key: Option<DecodeCursorKey>,
+    fingerprint: &[MappingFingerprintEntry],
+    frontier_tables: SweepFrontier,
+    frontier_ifaces: SweepFrontier,
+    anchors: &Option<BTreeMap<u64, Vec<usize>>>,
+    tables: &[ScannedTable],
+    interfaces: &[ScannedInterface],
+    targets: &[MapEntry],
+    swept_tables: u64,
+    swept_ifaces: u64,
+    data_len: usize,
+    complete: bool,
+    unlinked: &[u64],
+    validated: bool,
+) {
+    let tables_at_end = frontier_tables.snapshot >= data_len;
+    let ifaces_at_end = frontier_ifaces.snapshot >= data_len;
+    if !budget.resume_armed()
+        || cursor_key.is_none()
+        || !(swept_tables > 0 || swept_ifaces > 0 || (tables_at_end && ifaces_at_end))
+    {
+        return;
+    }
+    let key = cursor_key.expect("cursor key checked");
+    // Creation order survives advances: progress must not move a valid
+    // cursor to the tail, or oldest-first resume order churns every
+    // pass. Only genuinely new cursors take the next sequence.
+    let seq = budget
+        .decode_cursor(&key)
+        .map_or_else(|| budget.decode_cursors_seq_next(), |cursor| cursor.seq);
+    budget.record_decode_cursor(
+        key,
+        DecodeCursor {
+            fingerprint: fingerprint.to_vec(),
+            tables: frontier_tables,
+            interfaces: frontier_ifaces,
+            anchors: anchors.clone(),
+            cached_tables: tables.to_vec(),
+            cached_interfaces: interfaces.to_vec(),
+            // Completed tables never match a carried hint, so a
+            // completed object drops its unlinked list.
+            unlinked: if complete {
+                Vec::new()
+            } else {
+                unlinked.to_vec()
+            },
+            targets: targets.to_vec(),
+            complete,
+            validated: validated || complete,
+            seq,
+        },
+    );
 }
 
 /// Read (or reuse the cached) ELF export facts for one opened file
@@ -7740,7 +8570,36 @@ fn scan_view_examined_mode(
     let groups = candidate_groups(&maps);
     // One mount-table read serves every object this scan opens (H-3).
     let mut mounts = crate::process::MountTableCache::default();
-    for (key, group) in groups {
+    // Oldest-unfinished-first: objects an earlier pass left unfinished
+    // scan before new ones (stable otherwise), so small new objects
+    // cannot starve them. Without unfinished cursors this keeps B-tree
+    // order exactly.
+    let ordered = budget.order_groups_for_resume(pid, view.start_time(), groups);
+    // Staged decode-cursor writes, recorded after the bracket accepts
+    // their modules (rejected decodes never ride the bundle).
+    let mut pending_cursors: Vec<PendingCursor> = Vec::new();
+    // The view's executable image, read once for cursor keys (an exec
+    // keeps pid and start time, so the image disambiguates it). One
+    // classification readlink per scanned view, like the existing
+    // stat/exe classification reads; single-shot scans skip it.
+    let mut view_exec: Option<Option<Vec<u8>>> = None;
+    // Retire provably ineligible cursors at this scan's own lifecycle
+    // boundaries (no new process I/O: the fresh maps and the view's
+    // pinned generation prove all three): a reused pid drops its older
+    // generations, and objects the maps no longer cover drop theirs.
+    // Pids this scan never touches keep theirs until cap pressure or a
+    // later scan retires them.
+    if budget.resume_armed()
+        && let Some(start_time) = view.start_time()
+    {
+        budget.drop_superseded_decode_cursors(pid, start_time);
+        let mapped: BTreeSet<(Device, u64)> = maps
+            .iter()
+            .map(|entry| (entry.device, entry.inode))
+            .collect();
+        budget.drop_unmapped_decode_cursors(pid, start_time, &mapped);
+    }
+    for (key, group) in ordered {
         if budget.scan_stopped() {
             break;
         }
@@ -7992,6 +8851,10 @@ fn scan_view_examined_mode(
                 continue;
             }
         };
+        // The decode-cursor file key for the winning file (re-pointed at
+        // the proven lower file after a copy-up join below): `None`
+        // scans fresh every pass, never worse than no cursor.
+        let mut cursor_file_key = cursor_file_key_for(&file, key);
         substage::add(3, sub_facts);
         let mut hook_exports: Vec<String> = facts
             .exports
@@ -8085,6 +8948,9 @@ fn scan_view_examined_mode(
                                 continue;
                             }
                         };
+                    // The joined lower file is the object this module now
+                    // describes: the cursor follows it too.
+                    cursor_file_key = cursor_file_key_for(&proof.file, lower_key);
                     let lower_hooks: Vec<String> = lower_facts
                         .exports
                         .iter()
@@ -8203,17 +9069,287 @@ fn scan_view_examined_mode(
             .filter(|entry| entry.permissions[0] == b'r' && entry.permissions[2] != b'x')
             .copied()
             .collect();
+        // Resume: this object's installed decode cursor, validated
+        // against the current process image, file pin, mapping layout
+        // and dependency ranges. A miss scans fresh (and supersedes
+        // older state for this object); a validated complete cursor
+        // re-emits its decode at ~zero work; a validated partial
+        // cursor resumes its sweeps from their frontiers.
+        let cursor_key = match (view.start_time(), cursor_file_key) {
+            (Some(start_time), Some(file)) => {
+                // The executable image disambiguates an in-place exec
+                // (same pid and start time, new address space); read
+                // once per view, only for scans that resume.
+                let exec = if budget.resume_armed() {
+                    view_exec
+                        .get_or_insert_with(|| {
+                            view.run_while_same(|| io.exe_target(view))
+                                .ok()
+                                .and_then(|result| result.ok())
+                                .map(|target| target.as_os_str().as_bytes().to_vec())
+                        })
+                        .clone()
+                } else {
+                    None
+                };
+                Some(DecodeCursorKey {
+                    pid,
+                    start_time,
+                    file,
+                    exec,
+                })
+            }
+            _ => None,
+        };
+        let fingerprint: Vec<MappingFingerprintEntry> = data
+            .iter()
+            .map(|entry| MappingFingerprintEntry {
+                start: entry.start,
+                end: entry.end,
+                file_offset: entry.file_offset,
+                permissions: entry.permissions,
+            })
+            .collect();
+        let mut resumed = cursor_key.clone().and_then(|key| {
+            budget
+                .decode_cursor(&key)
+                .filter(|cursor| {
+                    // Unvalidated rows (staged after a bracket that never
+                    // ran) carry a possibly partial target map: matching it
+                    // would bless omitted targets, so admission compares the
+                    // fingerprint only and the use-time proof below
+                    // re-collects targets from re-proven bytes.
+                    cursor.fingerprint == fingerprint
+                        && (!cursor.validated || cursor_targets_match(&cursor.targets, &map_index))
+                })
+                .cloned()
+        });
+        if cursor_key.is_some() && resumed.is_none() && budget.resume_armed() {
+            // Reached and missed: the fresh scan below supersedes any
+            // older state for this object (reused pid, rewritten file,
+            // remapped layout, moved dependency, new image).
+            budget.drop_stale_decode_cursors(pid, key.device, key.inode);
+        }
+        if let Some(cursor) = resumed.as_ref().filter(|cursor| cursor.validated) {
+            // Replayed rows rejoin the bracket: re-retain their
+            // dependency targets' current resolutions (proven identical
+            // above), so the closing validation re-proves them against
+            // its own snapshot exactly like freshly decoded rows.
+            for target in &cursor.targets {
+                if let Some(current) = map_index.containing(target.start) {
+                    dependency.targets.insert(current.start, current);
+                }
+            }
+        }
+        if resumed.as_ref().is_some_and(|cursor| !cursor.validated) {
+            // Use-time proof for unvalidated rows: re-read every cached
+            // table's extent from current memory, re-decode and compare,
+            // and re-collect targets from the re-proven bytes. A mid-pass
+            // flap the unrun bracket cannot see fails here into a fresh
+            // rescan instead of poisoning the resume.
+            let mut proven = true;
+            let mut recollected = ScanDependencies {
+                inventory: dependency.inventory.clone(),
+                ..ScanDependencies::default()
+            };
+            if let Some(cursor) = &resumed {
+                for table in &cursor.cached_tables {
+                    let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
+                        proven = false;
+                        break;
+                    };
+                    if !table_extent_matches(layout, table, &extent, &map_index, budget) {
+                        proven = false;
+                        break;
+                    }
+                    recollected.retain_tables(
+                        std::slice::from_ref(table),
+                        &extent,
+                        table.address,
+                        layout,
+                        &map_index,
+                        budget,
+                    );
+                }
+            }
+            if proven && recollected.invalid_span {
+                proven = false;
+            }
+            if proven {
+                dependency.targets = std::mem::take(&mut recollected.targets);
+            } else {
+                budget.drop_stale_decode_cursors(pid, key.device, key.inode);
+                dependency.targets.clear();
+                resumed = None;
+            }
+        }
+        if let Some(cursor) = resumed.as_ref().filter(|cursor| cursor.complete) {
+            // Validated complete: re-emit the cached decode after
+            // proving its bytes still decode the same tables. Identity
+            // (pin, fingerprint, dependencies, process generation)
+            // cannot see a same-path exec or a writable-byte mutation
+            // under an unchanged layout, so every cached table's full
+            // declared extent is re-read from current memory and
+            // re-decoded; any short read, decode mismatch, refusal or
+            // stop discards the cursor and rescans fresh. The
+            // fingerprint proves the own layout frozen and the use
+            // check above re-proved every dependency range; the
+            // bracket below still re-validates the re-retained
+            // targets and the generation before this re-emit can
+            // publish.
+            //
+            // Residual (documented): a completed object with no tables
+            // replays its absence on identity alone — there are no
+            // rows to re-prove — and brand-new runtime-built tables
+            // beside verified rows are not re-swept here. Both close
+            // with read-only/writable acquisition split (writable
+            // ranges re-acquired every pass); read-only bytes are
+            // pin-proven throughout.
+            for table in &cursor.cached_tables {
+                if let Some(file_offset) = table.file_offset {
+                    budget.note_resumed_table_admitted(TableIdentity {
+                        device: key.device,
+                        inode: key.inode,
+                        file_offset,
+                        version_word: u64::from(table.version.0)
+                            | (u64::from(table.version.1) << 8),
+                        usable: table.decoded_slot_count(),
+                    });
+                }
+            }
+            let mut replay_verified = true;
+            for table in &cursor.cached_tables {
+                if !verify_cached_table(layout, table, mem, &map_index, budget) {
+                    replay_verified = false;
+                    break;
+                }
+            }
+            if !replay_verified {
+                // Stale bytes under a matching identity (same-path
+                // exec, runtime mutation): the cursor is discarded and
+                // the fresh scan below supersedes it. Stale re-retained
+                // targets are cleared so they cannot poison the fresh
+                // bracket.
+                budget.drop_stale_decode_cursors(pid, key.device, key.inode);
+                dependency.targets.clear();
+                resumed = None;
+            }
+        }
+        if let Some(cursor) = resumed.as_ref().filter(|cursor| cursor.complete) {
+            module.tables = cursor.cached_tables.clone();
+            module.interfaces = cursor.cached_interfaces.clone();
+            for (index, interface) in module.interfaces.iter_mut().enumerate() {
+                interface.index = index;
+            }
+            if module.tables.is_empty() && !(getter_object && !hinted) {
+                // Proven empty on an earlier pass (validated unchanged
+                // since): the absence row stands, like a fresh complete
+                // scan's.
+                skipped.push(Skipped {
+                    subject: module.path.clone(),
+                    reason: no_table_found_reason(&module.path, hinted),
+                });
+            }
+            // Fully decoded (validated), regardless of pass stops: the
+            // re-emit is complete even when the pass stopped elsewhere.
+            // An unproven witness still withholds finished-ness.
+            module.tables_scan_finished = !witness_unproven;
+            modules.push(module);
+            continue;
+        }
+        // Decode frontiers: resume partial progress, else start fresh.
+        let mut frontier_tables = SweepFrontier {
+            snapshot: 0,
+            word: 0,
+        };
+        let mut frontier_ifaces = SweepFrontier {
+            snapshot: 0,
+            word: 0,
+        };
+        let mut resume_anchors = None;
+        let mut cached_tables = Vec::new();
+        let mut cached_ifaces = Vec::new();
+        if let Some(cursor) = &resumed {
+            frontier_tables = cursor.tables;
+            frontier_ifaces = cursor.interfaces;
+            resume_anchors = cursor.anchors.clone();
+            cached_tables = cursor.cached_tables.clone();
+            cached_ifaces = cursor.cached_interfaces.clone();
+        }
+        // Cross-pass repeat recognition: the resumed sweeps re-examine
+        // the read overlap, so cached rows re-decode there. Admit their
+        // identities up front (bypassing the retained ceilings exactly
+        // like in-pass repeats), so re-decoded cached rows stay free
+        // and cannot starve genuinely new rows behind them. Rows
+        // without a file identity skip this and re-admit normally.
+        for table in &cached_tables {
+            if let Some(file_offset) = table.file_offset {
+                budget.note_resumed_table_admitted(TableIdentity {
+                    device: key.device,
+                    inode: key.inode,
+                    file_offset,
+                    version_word: u64::from(table.version.0) | (u64::from(table.version.1) << 8),
+                    usable: table.decoded_slot_count(),
+                });
+            }
+        }
+        for interface in &cached_ifaces {
+            let table = interface.table.and_then(|index| cached_tables.get(index));
+            if let Some(table) = table
+                && let Some(id) = observed_interface_identity(
+                    table,
+                    interface.name_class,
+                    &interface.name_private,
+                    interface.flags,
+                    &map_index,
+                    Some(view.id()),
+                    budget,
+                )
+            {
+                budget.note_resumed_interface_admitted(id);
+            }
+        }
         // v0.8.0: no whole-size gate on the data range. The chunked
         // mapping reads below enforce the allowances incrementally, so a
         // large data range degrades through the I/O ceiling's named gap
         // (one object still never aborts the scan).
         let sub_tables = Instant::now();
-        let mut snapshots = Vec::with_capacity(data.len());
+        // Snapshots fully swept by both sweeps are not re-read: their
+        // tables are cached and their bytes were examined. The resumed
+        // snapshot itself re-reads from the byte frontier minus one
+        // max-table overlap, so candidates spanning the previous read's
+        // end still decode; later snapshots read whole.
+        let width = layout.word_bytes();
+        // Word-aligned (rounded up): the continuation read and the sweep
+        // below both step whole words from it.
+        let resume_overlap = table_bytes(layout, 104)
+            .unwrap_or(width.saturating_mul(105))
+            .div_ceil(width)
+            .saturating_mul(width);
+        let read_from = frontier_tables.snapshot.min(frontier_ifaces.snapshot);
+        let frontier_byte = |frontier: SweepFrontier, data_idx: usize| {
+            (frontier.snapshot == data_idx).then(|| (frontier.word as usize).saturating_mul(width))
+        };
+        let mut snapshots: Vec<DataSnapshot> = Vec::with_capacity(data.len());
         let mut operation_bytes = 0u64;
         let mut io_exhausted = false;
         let mut data_stopped_short = false;
-        for entry in &data {
-            let (bytes, short, exhausted) = read_mapping(mem, entry, budget, &mut operation_bytes);
+        for (data_idx, entry) in data.iter().enumerate() {
+            if data_idx < read_from {
+                continue;
+            }
+            let read_start = if data_idx == read_from {
+                frontier_byte(frontier_tables, data_idx)
+                    .into_iter()
+                    .chain(frontier_byte(frontier_ifaces, data_idx))
+                    .min()
+                    .unwrap_or(0)
+                    .saturating_sub(resume_overlap)
+            } else {
+                0
+            };
+            let (bytes, short, exhausted) =
+                read_mapping_from(mem, entry, read_start, budget, &mut operation_bytes);
             // A zero-length read against a provably exited group names
             // the exit exactly: the mapping vanished with its process.
             // The byte counts stay — they say how much went
@@ -8233,13 +9369,24 @@ fn scan_view_examined_mode(
             };
             // Bytes past a failed read were never examined; saying nothing here would
             // present a partial decode as a complete one.
-            if short.is_some() {
+            let short_here = short.is_some();
+            if short_here {
                 data_stopped_short = true;
             }
             if let Some(reason) = short {
                 skipped.push(scan_skip(&module.path, reason));
             }
-            snapshots.push((entry.start, bytes));
+            // A stop already reported elsewhere still truncates this
+            // snapshot: only bytes actually read were examined.
+            let truncated = short_here || exhausted;
+            let base = entry.start.saturating_add(read_start as u64);
+            snapshots.push(DataSnapshot {
+                index: data_idx,
+                base,
+                bytes,
+                truncated,
+                read_start,
+            });
             if exhausted {
                 io_exhausted = true;
                 break;
@@ -8247,35 +9394,125 @@ fn scan_view_examined_mode(
         }
         substage::add(4, sub_tables);
         let sub_tables = Instant::now();
-        for (base, snapshot) in &snapshots {
+        let mut new_tables = Vec::new();
+        let mut swept_tables = 0u64;
+        for shot in &snapshots {
+            // Fully table-swept on earlier passes (read for the
+            // interface sweep): skip without charges.
+            if shot.index < frontier_tables.snapshot {
+                continue;
+            }
             let evidence = ObjectExports {
                 object: key,
                 symbols: &exports,
                 getter_present,
                 witness_fault,
             };
+            let start_word = if shot.index == frontier_tables.snapshot {
+                let (resume, start) = super::scan_pass::sweep_resume_words(
+                    frontier_tables.word,
+                    shot.read_start,
+                    width,
+                    (resume_overlap / width) as u64,
+                );
+                budget.set_table_resume(resume, resume_anchors.clone());
+                start
+            } else {
+                0
+            };
             let (tables, exhausted) = detect_tables_with_clock(
                 layout,
-                snapshot,
-                *base,
+                &shot.bytes,
+                shot.base,
                 &map_index,
                 budget,
                 Some(&evidence),
                 &excluded_anchor_ranges,
                 crate::attach::monotonic_ns,
             );
-            dependency.retain_tables(&tables, snapshot, *base, layout, &map_index, budget);
-            module.tables.extend(tables);
+            let (swept, finished) = budget.take_table_swept();
+            swept_tables += swept;
+            if let Some(anchors) = budget.take_table_anchors_out() {
+                resume_anchors = Some(anchors);
+            }
+            // Advance the frontier over fully examined words; a snapshot
+            // left incomplete (a stop, a cardinality break, or a read
+            // that stopped short of the mapping end) holds the frontier
+            // at the first unread word. A resumed pass defers later
+            // snapshots to the next pass, when the budget (and the
+            // per-pass admission caps) are fresh; a single-shot pass
+            // keeps the historical traversal and sweeps on without
+            // moving the held frontier (its frontiers are unrecorded).
+            let finished = finished && !shot.truncated;
+            if shot.index == frontier_tables.snapshot {
+                if finished {
+                    frontier_tables.snapshot += 1;
+                    frontier_tables.word = 0;
+                } else {
+                    frontier_tables.word = start_word.saturating_add(swept);
+                }
+            }
+            dependency.retain_tables(&tables, &shot.bytes, shot.base, layout, &map_index, budget);
+            // A resumed frontier word is re-examined (breaks exclude
+            // it), so a repeat of a cached table decodes again: dedup
+            // keeps each table once.
+            for table in tables {
+                if !cached_tables.contains(&table) && !new_tables.contains(&table) {
+                    new_tables.push(table);
+                }
+            }
             skipped.extend(
                 exhausted
                     .into_iter()
                     .map(|reason| scan_skip(&module.path, reason)),
             );
+            if snapshot_defers_to_next_pass(finished, budget) {
+                break;
+            }
             if budget.scan_stopped() {
                 break;
             }
         }
+        module.interfaces = std::mem::take(&mut cached_ifaces);
+        module.tables = merge_resumed_module_tables(
+            std::mem::take(&mut cached_tables),
+            new_tables,
+            &mut module.interfaces,
+            layout,
+        );
         if budget.scan_stopped() {
+            // Stage before leaving: the stop is exactly what the next
+            // pass resumes from (no new interfaces: their sweep never
+            // ran, but earlier passes' cached ones still re-emit above).
+            // A stopped module is never complete. The bracket below
+            // decides whether this staging records.
+            // The interface sweep never ran here: carried hints ride
+            // through unstaged-linking, plus anything recorded so far.
+            let mut stopped_unlinked = resumed
+                .as_ref()
+                .map(|cursor| cursor.unlinked.clone())
+                .unwrap_or_default();
+            for address in budget.take_unlinked_triples() {
+                if !stopped_unlinked.contains(&address) {
+                    stopped_unlinked.push(address);
+                }
+            }
+            pending_cursors.push(PendingCursor {
+                key: cursor_key,
+                module_key: key,
+                fingerprint,
+                tables: frontier_tables,
+                ifaces: frontier_ifaces,
+                anchors: resume_anchors.clone(),
+                decoded_tables: module.tables.clone(),
+                decoded_ifaces: module.interfaces.clone(),
+                targets: dependency.targets.values().copied().cloned().collect(),
+                swept_tables,
+                swept_ifaces: 0,
+                data_len: data.len(),
+                complete: false,
+                unlinked: stopped_unlinked,
+            });
             if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
                 undecoded_ceiling_files += 1;
                 skipped.push(Skipped {
@@ -8286,10 +9523,30 @@ fn scan_view_examined_mode(
             modules.push(module);
             break;
         }
-        for (_, snapshot) in &snapshots {
+        let mut new_ifaces = Vec::new();
+        let mut swept_ifaces = 0u64;
+        for shot in &snapshots {
+            // Fully interface-swept on earlier passes: skip without
+            // charges (the snapshot was read for the table sweep).
+            if shot.index < frontier_ifaces.snapshot {
+                continue;
+            }
+            let start_word = if shot.index == frontier_ifaces.snapshot {
+                let (resume, start) = super::scan_pass::sweep_resume_words(
+                    frontier_ifaces.word,
+                    shot.read_start,
+                    width,
+                    (resume_overlap / width) as u64,
+                );
+                budget.set_iface_resume(resume);
+                start
+            } else {
+                0
+            };
             let (interfaces, exhausted) = scan_interfaces_for_layout(
                 layout,
-                snapshot,
+                &shot.bytes,
+                shot.base,
                 mem,
                 &module.tables,
                 &map_index,
@@ -8298,13 +9555,47 @@ fn scan_view_examined_mode(
                 &mut operation_bytes,
                 Some(view.id()),
             );
-            module.interfaces.extend(interfaces);
+            let (swept, finished) = budget.take_iface_swept();
+            swept_ifaces += swept;
+            // Like the table sweep: a truncated snapshot holds the
+            // frontier at its first unread word; resumed passes defer
+            // the rest, single-shot passes sweep on detached.
+            let finished = finished && !shot.truncated;
+            if shot.index == frontier_ifaces.snapshot {
+                if finished {
+                    frontier_ifaces.snapshot += 1;
+                    frontier_ifaces.word = 0;
+                } else {
+                    frontier_ifaces.word = start_word.saturating_add(swept);
+                }
+            }
+            // A resumed frontier word is re-examined, so a repeat of a
+            // cached interface decodes again: dedup (index-blind; the
+            // shared loop below re-indexes) keeps each interface once.
+            // The cached rows already moved into `module.interfaces`
+            // above, so that is the dedup baseline (the taken
+            // `cached_ifaces` binding is empty from here on).
+            for interface in interfaces {
+                if !module
+                    .interfaces
+                    .iter()
+                    .any(|known| same_interface(known, &interface))
+                    && !new_ifaces
+                        .iter()
+                        .any(|known| same_interface(known, &interface))
+                {
+                    new_ifaces.push(interface);
+                }
+            }
             let interface_io_exhausted = exhausted.iter().any(|reason| reason == IO_CEILING_REASON);
             skipped.extend(
                 exhausted
                     .into_iter()
                     .map(|reason| scan_skip(&module.path, reason)),
             );
+            if snapshot_defers_to_next_pass(finished, budget) {
+                break;
+            }
             if interface_io_exhausted {
                 io_exhausted = true;
                 break;
@@ -8312,6 +9603,37 @@ fn scan_view_examined_mode(
             if budget.scan_stopped() {
                 break;
             }
+        }
+        module.interfaces.extend(new_ifaces);
+        // Link carried triple hints against this pass's final tables:
+        // triples an earlier pass examined before their table decoded
+        // re-read from current memory and link now (or stay carried).
+        // The sweep above and this step share the one admission rule.
+        let mut triple_candidates = resumed
+            .as_ref()
+            .map(|cursor| cursor.unlinked.clone())
+            .unwrap_or_default();
+        for address in budget.take_unlinked_triples() {
+            if !triple_candidates.contains(&address) {
+                triple_candidates.push(address);
+            }
+        }
+        let (unlinked_remaining, link_io_exhausted) = link_carried_triples(
+            layout,
+            mem,
+            &module.tables,
+            &mut module.interfaces,
+            &map_index,
+            key,
+            budget,
+            &mut operation_bytes,
+            Some(view.id()),
+            triple_candidates,
+            &mut skipped,
+            &module.path,
+        );
+        if link_io_exhausted {
+            io_exhausted = true;
         }
         substage::add(5, sub_tables);
         for (index, interface) in module.interfaces.iter_mut().enumerate() {
@@ -8335,7 +9657,7 @@ fn scan_view_examined_mode(
         // absence from a truncated snapshot. A module with no data
         // mappings at all keeps its row — all zero bytes of its
         // file-backed data were examined.
-        let snapshot_bytes: usize = snapshots.iter().map(|(_, bytes)| bytes.len()).sum();
+        let snapshot_bytes: usize = snapshots.iter().map(|shot| shot.bytes.len()).sum();
         if module.tables.is_empty() {
             if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
                 skipped.push(Skipped {
@@ -8370,6 +9692,27 @@ fn scan_view_examined_mode(
             && budget.refusal_counts() == refusals_before_module
             && stop_before_module.is_none()
             && budget.stopped_reason().is_none();
+        // Stage this object's decode cursor: the next pass resumes from
+        // these frontiers instead of restarting. Completeness is the
+        // finished-scan gate just proved — full acquisition, decoding
+        // and validation — never bare frontier arithmetic. The bracket
+        // below decides whether this staging records.
+        pending_cursors.push(PendingCursor {
+            key: cursor_key,
+            module_key: key,
+            fingerprint,
+            tables: frontier_tables,
+            ifaces: frontier_ifaces,
+            anchors: resume_anchors.clone(),
+            decoded_tables: module.tables.clone(),
+            decoded_ifaces: module.interfaces.clone(),
+            targets: dependency.targets.values().copied().cloned().collect(),
+            swept_tables,
+            swept_ifaces,
+            data_len: data.len(),
+            complete: module.tables_scan_finished,
+            unlinked: unlinked_remaining,
+        });
         if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {
             undecoded_ceiling_files += 1;
         }
@@ -8436,9 +9779,15 @@ fn scan_view_examined_mode(
                 .zip(accepted)
                 .filter_map(|(module, accepted)| {
                     if accepted {
+                        // Validated: the staged frontier and rows record.
+                        record_pending_cursor(budget, &pending_cursors, &module.key);
                         Some(module)
                     } else {
+                        // Proven mapping change: the candidate decode is
+                        // discarded (rows and frontier alike), never
+                        // carried as a resume point for shifted bytes.
                         skipped.push(scan_skip(&module.path, MAPPING_CHANGED_REASON.into()));
+                        budget.drop_stale_decode_cursors(pid, module.key.device, module.key.inode);
                         None
                     }
                 })
@@ -8490,22 +9839,84 @@ fn scan_view_examined_mode(
                 // mapping-changed row, like the healthy arm; only passed
                 // and never-validated modules keep. Kept modules never
                 // claim a finished tables scan: the sole-complete-table
-                // grant needs the full check.
+                // grant needs the full check. Staging follows the
+                // verdict: proved mappings ride validated for count-only
+                // resume, while a module the check never validated rides
+                // unvalidated — its rows and frontiers accumulate across
+                // starved passes (a restart would livelock under tight
+                // recurring budgets), and the next use re-proves their
+                // bytes and re-collects their targets instead of
+                // replaying, so a mid-pass flap the unrun check cannot
+                // see cannot poison the resume.
                 let mut kept = Vec::with_capacity(modules.len());
                 for (mut module, verdict) in modules.into_iter().zip(bracket_verdicts) {
                     if verdict == Some(false) {
                         skipped.push(scan_skip(&module.path, MAPPING_CHANGED_REASON.into()));
+                        budget.drop_stale_decode_cursors(pid, module.key.device, module.key.inode);
                     } else {
                         module.tables_scan_finished = false;
+                        record_pending_cursor_uncompleted(
+                            budget,
+                            &pending_cursors,
+                            &module.key,
+                            verdict == Some(true),
+                        );
                         kept.push(module);
                     }
                 }
                 modules = kept;
             } else {
+                // A work-starved bracket over a live view clears its
+                // publication (flood contract) but still stages its
+                // frontiers and rows unvalidated: without the staging,
+                // an object larger than one pass would restart every
+                // pass and never converge. Staging follows the verdict
+                // like the keep arm. Anything else clears with no
+                // staging (unproven bytes are not a resume point); a
+                // proven generation loss or death additionally retires
+                // the pid's carried cursors at this proved lifecycle
+                // boundary.
+                let budget_starved = validation
+                    .as_ref()
+                    .err()
+                    .is_none_or(|reason| bracket_budget_exhaustion(reason))
+                    && generation
+                        .as_ref()
+                        .err()
+                        .is_none_or(|reason| bracket_budget_exhaustion(reason));
+                if budget_starved && view.still_the_same() {
+                    for (index, module) in modules.iter().enumerate() {
+                        let verdict = bracket_verdicts.get(index).copied().flatten();
+                        record_pending_cursor_uncompleted(
+                            budget,
+                            &pending_cursors,
+                            &module.key,
+                            verdict == Some(true),
+                        );
+                    }
+                }
                 modules.clear();
+                let generation_proven_lost =
+                    matches!(&generation, Err(reason) if !bracket_budget_exhaustion(reason));
+                if budget.resume_armed() && (generation_proven_lost || !view.still_the_same()) {
+                    budget.drop_decode_cursors_for_pid(pid);
+                }
             }
             examined.clear();
         }
+    }
+
+    // Resume view state: while this view holds unfinished cursors, name
+    // the in-progress gap once (done/total) and drop the raw pass-budget
+    // stops it continues. Every sticky-stop reader (take sites, spend
+    // failures, bracket compositions) would otherwise republish the
+    // exhausted wording; a pass budget reached mid-pass is a
+    // continuation, never an exhausted final. Views without unfinished
+    // cursors keep every gap verbatim, so a stall stays loud.
+    if let Some((subject, reason)) =
+        continued_view_gap(&mut skipped, budget, pid, view.start_time())
+    {
+        skipped.push(Skipped { subject, reason });
     }
 
     let outcome = match unavailable {
@@ -8545,8 +9956,7 @@ mod tests {
     mod resume_matrix;
 
     use super::super::scan_pass::{
-        MappingFingerprintEntry, SCAN_IN_PROGRESS_SUBJECT, SweepFrontier, decode_cursor_bytes,
-        scan_in_progress_reason,
+        SCAN_IN_PROGRESS_SUBJECT, decode_cursor_bytes, scan_in_progress_reason,
     };
     use super::*;
 
@@ -18183,7 +19593,11 @@ int main(int argc, char **argv) {
     }
 
     #[test]
-    fn mountinfo_reader_proves_eof_at_the_exact_byte_cap_and_refuses_excess() {
+    fn mountinfo_reader_ignores_small_per_object_legs_and_refuses_past_the_absolute_cap() {
+        // Small per-object legs still read small tables: the mount table
+        // is per-scan overhead (read once, cached, window-charged), so
+        // gating it on the per-object leg would make small-but-legitimate
+        // legs unusable on mount-heavy hosts.
         let mut exact =
             RecordingReader::new([ReaderStep::Bytes(b"abc\n".to_vec()), ReaderStep::Eof]);
         let mut budget = CaptureWorkBudget::new(ScanLimits {
@@ -18197,17 +19611,28 @@ int main(int argc, char **argv) {
         assert_eq!(exact.requests, [5, 1], "the final request is EOF lookahead");
         assert_eq!(budget.attempted_io_bytes(), 4);
 
-        let mut excess = RecordingReader::new([ReaderStep::Bytes(b"abc\nx".to_vec())]);
+        // Past the absolute byte cap, the read refuses with the excess
+        // byte charged. Eight full 8 MiB reads fill the cap; the ninth
+        // single byte trips it.
+        let mut steps = Vec::new();
+        for _ in 0..8 {
+            steps.push(ReaderStep::Bytes(vec![b'x'; 8 << 20]));
+        }
+        steps.push(ReaderStep::Bytes(vec![b'x'; 1]));
+        let mut excess = RecordingReader::new(steps);
         let mut budget = CaptureWorkBudget::new(ScanLimits {
             per_object_bytes: 4,
-            total_bytes: 5,
+            total_bytes: u64::MAX,
         });
         assert_eq!(
-            read_mountinfo_with(&mut excess, &mut budget, 8, |_| None).unwrap_err(),
+            read_mountinfo_with(&mut excess, &mut budget, 8 << 20, |_| None).unwrap_err(),
             MOUNTINFO_CEILING_REASON
         );
-        assert_eq!(excess.requests, [5]);
-        assert_eq!(budget.attempted_io_bytes(), 5, "the excess byte is charged");
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            MAX_MOUNTINFO_BYTES + 1,
+            "the excess byte is charged"
+        );
     }
 
     #[test]
@@ -19082,6 +20507,7 @@ int main(int argc, char **argv) {
             let (interfaces, skipped) = scan_interfaces_for_layout(
                 LinuxLayout::Lp64,
                 &snapshot,
+                0,
                 &mem,
                 tables,
                 &map_index,
@@ -22510,6 +23936,359 @@ int main(int argc, char **argv) {
         assert!(
             carried.decode_cursors_for_test().is_empty(),
             "the unmapped object's cursor retires on the proved maps"
+        );
+    }
+
+    /// A refused interface triple is unproven bytes: the sweep must report
+    /// unfinished so the frontier holds and a later pass retries it with
+    /// fresh admission. A sweep that reaches loop exit past the refusal
+    /// would advance the frontier over the triple and lose it forever.
+    #[test]
+    fn interface_cardinality_refusal_leaves_the_sweep_unfinished() {
+        let maps = parse_maps(
+            b"4000-6000 rw-p 00002000 08:01 7 /lib/provider.so\nb000-c000 r--p 00005000 08:01 7 /lib/provider.so\n",
+        )
+        .unwrap();
+        let index = MapIndex::new(&maps).unwrap();
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+        };
+        let tables = [ScannedTable {
+            version: (2, 40),
+            walk: "full",
+            entries: Vec::new(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x4800,
+            file_offset: Some(0x800),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        }];
+        let mut snapshot = vec![0u8; 48];
+        for (triple, name) in [(0usize, 0xb100u64), (24usize, 0xb200u64)] {
+            snapshot[triple..triple + 8].copy_from_slice(&name.to_le_bytes());
+            snapshot[triple + 8..triple + 16].copy_from_slice(&0x4800u64.to_le_bytes());
+        }
+        let mem = tempfile::tempfile().unwrap();
+        mem.set_len(0xc000).unwrap();
+        {
+            use std::os::unix::fs::FileExt as _;
+            mem.write_all_at(b"PKCS 11\0", 0xb100).unwrap();
+            mem.write_all_at(b"B-UNIQUE\0", 0xb200).unwrap();
+        }
+        let memory = BracketMemory {
+            file: mem,
+            log: Default::default(),
+        };
+        let limits = || inventory_limits(1 << 20, 1 << 20, 4096, 32768, 4096, 1);
+        // Armed: the refusal breaks the sweep at the refused word, so the
+        // next pass re-examines exactly what no pass finished.
+        let mut armed = CaptureWorkBudget::for_inventory(limits())
+            .with_retained_file_facts(RetainedFileFacts::default());
+        let window = armed.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = armed.checkpoint(window.clone()).unwrap();
+        let mut operation_bytes = 0u64;
+        let (found, _) = scan_interfaces_for_layout(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0,
+            &memory,
+            &tables,
+            &index,
+            key,
+            &mut armed,
+            &mut operation_bytes,
+            None,
+        );
+        assert_eq!(found.len(), 1, "one triple admitted under a 1-key ceiling");
+        assert_eq!(
+            armed.take_iface_swept(),
+            (3, false),
+            "the refused triple holds the frontier for the next pass"
+        );
+        armed.finish_scan(scan).unwrap();
+        armed.finish_window(window).unwrap();
+        // Disarmed (single shot, no next pass): the sweep still examines
+        // every triple but reports unfinished, never a clean loop exit.
+        let mut bare = CaptureWorkBudget::for_inventory(limits());
+        let window = bare.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = bare.checkpoint(window.clone()).unwrap();
+        let mut operation_bytes = 0u64;
+        let (found, _) = scan_interfaces_for_layout(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0,
+            &memory,
+            &tables,
+            &index,
+            key,
+            &mut bare,
+            &mut operation_bytes,
+            None,
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            bare.take_iface_swept(),
+            (4, false),
+            "a disarmed sweep examines past the refusal but stays unfinished"
+        );
+        bare.finish_scan(scan).unwrap();
+        bare.finish_window(window).unwrap();
+    }
+
+    /// An anchor-only table split across a pass boundary decodes exactly
+    /// like a roomy pass: pass one visits the header (direct decode
+    /// rejects it) and stops before the export anchor; pass two visits
+    /// the anchor and recovers the header through a bounded lookback
+    /// instead of skipping it as already examined.
+    #[test]
+    fn anchor_only_table_split_across_passes_decodes_like_a_roomy_pass() {
+        let maps = mislabelled_fixture_maps();
+        let index = MapIndex::new(&maps).unwrap();
+        let mut snapshot = vec![0u8; 105 * 8];
+        snapshot[..8].copy_from_slice(&0xa5a5_0000_0000_e707u64.to_le_bytes());
+        // Nonzero filler in words 1..50 defeats the zero-run skip so the
+        // work ceiling can stop between header and anchor; words 51..103
+        // stay zero so the anchor decode keeps its proven slot shape.
+        for word in snapshot[8..50 * 8].as_chunks_mut::<8>().0 {
+            word.copy_from_slice(&0x1500u64.to_le_bytes());
+        }
+        snapshot[104 * 8..105 * 8].copy_from_slice(&0x1500u64.to_le_bytes());
+        let symbols = [(function_name(103).unwrap().to_string(), 0x500)];
+        let exports = ObjectExports {
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 7,
+            },
+            symbols: &symbols,
+            getter_present: false,
+            witness_fault: false,
+        };
+        let anchors: BTreeMap<u64, Vec<usize>> = BTreeMap::from([(0x1500u64, vec![103usize])]);
+        // Pass one: the prologue's anchors are already cached (zero cost);
+        // the ceiling stops the sweep after 26 words (header visited at
+        // word 0, anchor at word 104 unvisited). Each filler word costs
+        // two charges (sweep plus its anchor attempt, which underflows and
+        // is skipped), so 1 + 25 * 2 charges sweep words 0..25.
+        let mut first = CaptureWorkBudget::default();
+        first.set_work_ceiling_for_test(51);
+        first.set_table_resume(0, Some(anchors.clone()));
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut first,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(
+            tables.is_empty(),
+            "the header alone decodes nothing (anchor unvisited)"
+        );
+        assert!(
+            skipped
+                .iter()
+                .any(|reason| reason.contains(WORK_CEILING_REASON)),
+            "pass one stops on its work ceiling: {skipped:?}"
+        );
+        assert_eq!(
+            first.take_table_swept(),
+            (26, false),
+            "pass one sweeps the header but not the anchor"
+        );
+        // Pass two resumes at word 26 with the cached anchors.
+        let mut second = CaptureWorkBudget::default();
+        second.set_table_resume(26, Some(anchors));
+        let (tables, skipped) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut second,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        assert!(skipped.is_empty(), "no evidence invented: {skipped:?}");
+        let split = tables
+            .iter()
+            .find(|table| table.address == 0x7000)
+            .expect("pass two recovers the header through the visited anchor");
+        // The roomy control decodes the same table in one pass.
+        let mut roomy = CaptureWorkBudget::default();
+        let (tables, _) = detect_tables_with_clock(
+            LinuxLayout::Lp64,
+            &snapshot,
+            0x7000,
+            &index,
+            &mut roomy,
+            Some(&exports),
+            &[],
+            || Some(0),
+        );
+        let whole = tables
+            .iter()
+            .find(|table| table.address == 0x7000)
+            .expect("the roomy pass decodes the anchor-only table");
+        assert_eq!(
+            split, whole,
+            "the split decode reconciles exactly with the roomy decode"
+        );
+    }
+
+    /// Split-pass table reconciliation mirrors one roomy pass's overlap
+    /// elimination: exact duplicates collapse, a validated shape
+    /// outranks an overlapping anchored recovery, same-start pairs
+    /// coexist (the extension retains additional targets), and
+    /// interfaces re-link onto the final list (a dropped table's
+    /// interfaces keep their triple evidence with no table link).
+    #[test]
+    fn resumed_table_merge_reconciles_like_a_roomy_pass() {
+        let table = |address: u64, walk: &'static str, slots: usize| ScannedTable {
+            version: (2, 40),
+            walk,
+            entries: Vec::new(),
+            null_entries: vec!["C_Finalize"; 104][..slots].to_vec(),
+            unpinned: Vec::new(),
+            address,
+            file_offset: Some(address),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        };
+        let validated = table(0x4800, "full", 68);
+        let overlapped = table(0x4808, "known_prefix", 104);
+        let prefix = table(0x5000, "full", 68);
+        let extension = table(0x5000, "known_prefix", 104);
+        let (tables, index_map) = reconcile_resumed_tables(
+            vec![validated.clone(), overlapped, prefix.clone()],
+            vec![validated.clone(), extension.clone()],
+            LinuxLayout::Lp64,
+        );
+        let addresses: Vec<u64> = tables.iter().map(|table| table.address).collect();
+        assert_eq!(
+            addresses,
+            vec![0x4800, 0x5000, 0x5000],
+            "the validated shape wins its overlap; same-start pairs coexist"
+        );
+        assert_eq!(tables[1], prefix, "the same-start validated prefix is kept");
+        assert_eq!(
+            tables[2], extension,
+            "the same-start anchored extension is kept alongside it"
+        );
+        assert_eq!(
+            index_map,
+            vec![Some(0), None, Some(1), None, Some(2)],
+            "kept positions re-link; dropped positions read None"
+        );
+        let interface = |table: Option<usize>| ScannedInterface {
+            index: 0,
+            name_class: "other",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table,
+        };
+        let mut interfaces = vec![interface(Some(1)), interface(Some(0)), interface(Some(9))];
+        let merged = merge_resumed_module_tables(
+            vec![validated.clone()],
+            vec![validated],
+            &mut interfaces,
+            LinuxLayout::Lp64,
+        );
+        assert_eq!(merged.len(), 1, "exact duplicates collapse to one table");
+        assert_eq!(
+            interfaces
+                .iter()
+                .map(|interface| interface.table)
+                .collect::<Vec<_>>(),
+            vec![None, Some(0), None],
+            "interfaces re-link onto the reconciled list"
+        );
+    }
+
+    /// An unfinished snapshot defers the rest of the module to the next
+    /// pass only when resume is armed; single-shot passes keep the
+    /// historical traversal and sweep on.
+    #[test]
+    fn unfinished_snapshot_defers_only_when_resume_is_armed() {
+        let armed =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let bare = CaptureWorkBudget::default();
+        assert!(!snapshot_defers_to_next_pass(true, &armed));
+        assert!(!snapshot_defers_to_next_pass(true, &bare));
+        assert!(snapshot_defers_to_next_pass(false, &armed));
+        assert!(
+            !snapshot_defers_to_next_pass(false, &bare),
+            "single-shot passes keep the historical traversal"
+        );
+    }
+
+    /// Advancing a cursor keeps its creation order: progress never moves
+    /// an object to the tail, so oldest-first resume order survives
+    /// repeated advances across passes.
+    #[test]
+    fn advancing_a_cursor_keeps_its_creation_order() {
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key_a, _) = decode_cursor_for_test(7, 9, 100, false, 0);
+        let (key_b, _) = decode_cursor_for_test(7, 9, 101, false, 0);
+        let no_tables: Vec<ScannedTable> = Vec::new();
+        let no_ifaces: Vec<ScannedInterface> = Vec::new();
+        let advance = |budget: &mut CaptureWorkBudget, key: Option<DecodeCursorKey>, word: u64| {
+            record_module_cursor(
+                budget,
+                key,
+                &[],
+                SweepFrontier { snapshot: 0, word },
+                SweepFrontier {
+                    snapshot: 0,
+                    word: 0,
+                },
+                &None,
+                &no_tables,
+                &no_ifaces,
+                &[],
+                5,
+                0,
+                2,
+                false,
+                &[],
+                true,
+            );
+        };
+        advance(&mut budget, Some(key_a.clone()), 5);
+        advance(&mut budget, Some(key_b.clone()), 3);
+        advance(&mut budget, Some(key_b.clone()), 8);
+        advance(&mut budget, Some(key_a.clone()), 10);
+        assert_eq!(
+            budget.decode_cursor(&key_a).map(|cursor| cursor.seq),
+            Some(0),
+            "advancing never re-sequences a valid cursor"
+        );
+        assert_eq!(
+            budget.decode_cursor(&key_b).map(|cursor| cursor.seq),
+            Some(1),
+            "advancing never re-sequences a valid cursor"
+        );
+        let maps = parse_maps(
+            b"1000-2000 r-xp 00000000 08:01 100 /lib/a.so\n3000-4000 r--p 00000000 08:01 100 /lib/a.so\n5000-6000 r-xp 00000000 08:01 101 /lib/b.so\n7000-8000 r--p 00000000 08:01 101 /lib/b.so\n",
+        )
+        .unwrap();
+        let groups = candidate_groups(&maps);
+        let ordered: Vec<u64> = budget
+            .order_groups_for_resume(7, Some(9), groups)
+            .iter()
+            .map(|(key, _)| key.inode)
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![100, 101],
+            "oldest-first order survives repeated advances"
         );
     }
 

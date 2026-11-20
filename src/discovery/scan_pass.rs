@@ -128,9 +128,6 @@ pub(crate) struct DecodeCursorKey {
 /// the documented staleness bound (same class as the long-standing
 /// cross-pass export-fact cache; runtime-built tables outside file-backed
 /// data were already out of the memory scan's reach).
-// The E4 decode kernel reads these fields; the store only carries them.
-// Remove when that kernel lands (B3).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MappingFingerprintEntry {
     pub(crate) start: u64,
@@ -142,9 +139,6 @@ pub(crate) struct MappingFingerprintEntry {
 /// One sweep's frontier within an object: snapshots before `snapshot`
 /// are fully swept, snapshot `snapshot` is swept up to `word` (in words,
 /// not bytes).
-// The E4 decode kernel reads these fields; the store only carries them.
-// Remove when that kernel lands (B3).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SweepFrontier {
     pub(crate) snapshot: usize,
@@ -156,9 +150,6 @@ pub(crate) struct SweepFrontier {
 /// (re-emitted while the object validates unchanged), and the export
 /// anchor map the table sweep's prologue already paid for (so a resumed
 /// sweep skips the prologue's charges).
-// The E4 decode kernel reads the frontier/validation fields; the store
-// reads the rest. Remove when that kernel lands (B3).
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct DecodeCursor {
     /// Data mappings fingerprinted when progress was recorded, in scan
@@ -271,6 +262,29 @@ pub(crate) fn decode_cursor_bytes(key: &DecodeCursorKey, cursor: &DecodeCursor) 
     .unwrap_or(u64::MAX)
 }
 
+/// Sweep start words for a resumed snapshot: the word to arm the
+/// sweep at (snapshot-relative) plus the mapping-relative word the
+/// swept count accumulates from. The sweep restarts at the proven
+/// boundary — the frontier minus one maximum-table span — clamped
+/// into the re-read bytes: candidates the earlier pass never proved
+/// (a header at word zero after a saturated overlap, a split anchor
+/// tail) are re-examined, while long-proven words are never
+/// re-swept, so tight recurring budgets still advance instead of
+/// re-walking the prefix every pass. The re-swept span costs at most
+/// one maximum-table overlap of charges per resumed snapshot.
+pub(crate) fn sweep_resume_words(
+    frontier_word: u64,
+    read_start: usize,
+    width: usize,
+    overlap_words: u64,
+) -> (u64, u64) {
+    let read_word = (read_start / width) as u64;
+    let proven = frontier_word.saturating_sub(overlap_words);
+    let start = read_word.max(proven);
+    let resume = start.saturating_sub(read_word);
+    (resume, start)
+}
+
 /// Whether `device`/`inode` is the file half of `key` (ordering-only
 /// match: ordering is advisory, use re-validates the full key plus the
 /// pin and fingerprint).
@@ -301,6 +315,30 @@ pub(crate) struct DecodeResume {
     /// Whether this pass records decode cursors (armed by installing a
     /// carried bundle: multi-pass inventory collectors only).
     resume_armed: bool,
+    table_resume: SweepResume,
+    iface_resume: SweepResume,
+    /// Interface-triple addresses the sweep examined while their target
+    /// table was still unknown: hints the link step re-reads from
+    /// current memory once tables are final. Drained into staging per
+    /// object; only armed scans record.
+    unlinked_triples: Vec<u64>,
+}
+
+/// Transient per-call sweep resume: the word to start at plus the cached
+/// export anchors (table sweep only), taken at call entry; the words
+/// swept plus whether the sweep finished, reported at every exit. Fully
+/// examined words only: every early break excludes its current word, so
+/// a resume re-examines exactly the words no pass finished. Completion
+/// is loop exit, never word arithmetic: the interface sweep examines
+/// triple starts (stride 3), so its swept words never equal the snapshot
+/// length even when finished.
+#[derive(Debug, Clone, Default)]
+struct SweepResume {
+    start_word: u64,
+    swept_words: u64,
+    swept_completed: bool,
+    anchors: Option<BTreeMap<u64, Vec<usize>>>,
+    anchors_out: Option<BTreeMap<u64, Vec<usize>>>,
 }
 
 /// What the next pass continues: member tiers plus budget-stop
@@ -905,6 +943,223 @@ impl ScanPassOwner {
             .saturating_add(bytes);
         self.decode.cursors.insert(key, cursor);
         true
+    }
+
+    /// Whether this pass records decode cursors (armed by installing a
+    /// carried bundle: multi-pass inventory collectors only).
+    pub(crate) fn resume_armed(&self) -> bool {
+        self.decode.resume_armed
+    }
+
+    /// Next decode-cursor sequence number: one past the installed
+    /// maximum, monotonic across passes (creation order is the
+    /// oldest-first scan order).
+    pub(crate) fn decode_cursors_seq_next(&self) -> u64 {
+        self.decode
+            .cursors
+            .values()
+            .map(|cursor| cursor.seq)
+            .max()
+            .map_or(0, |max| max.saturating_add(1))
+    }
+
+    /// Drop every cursor for `pid` whatever generation or object it
+    /// names: a proven generation loss or death retires the whole
+    /// pid, so the next pass re-scans fresh instead of replaying a
+    /// dead generation. `retained` is the budget's shared counter.
+    pub(crate) fn drop_decode_cursors_for_pid(&mut self, pid: u32, retained: &mut u64) {
+        let stale: Vec<DecodeCursorKey> = self
+            .decode
+            .cursors
+            .keys()
+            .filter(|key| key.pid == pid)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(old) = self.decode.cursors.remove(&key) {
+                *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
+            }
+        }
+    }
+
+    /// Drop `pid`'s cursors for older generations: the view's pinned
+    /// start time proves the pid was reused, so only the live
+    /// generation's cursors may resume.
+    pub(crate) fn drop_superseded_decode_cursors(
+        &mut self,
+        pid: u32,
+        start_time: u64,
+        retained: &mut u64,
+    ) {
+        let stale: Vec<DecodeCursorKey> = self
+            .decode
+            .cursors
+            .keys()
+            .filter(|key| key.pid == pid && key.start_time != start_time)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(old) = self.decode.cursors.remove(&key) {
+                *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
+            }
+        }
+    }
+
+    /// Drop `pid`+`start_time` cursors whose object no mapping covers
+    /// anymore: the fresh maps prove it unmapped, so the stale cursor
+    /// must not linger in progress totals or replay later.
+    pub(crate) fn drop_unmapped_decode_cursors(
+        &mut self,
+        pid: u32,
+        start_time: u64,
+        mapped: &BTreeSet<(Device, u64)>,
+        retained: &mut u64,
+    ) {
+        let stale: Vec<DecodeCursorKey> = self
+            .decode
+            .cursors
+            .keys()
+            .filter(|key| {
+                key.pid == pid
+                    && key.start_time == start_time
+                    && !mapped.contains(&(key.file.device, key.file.inode))
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(old) = self.decode.cursors.remove(&key) {
+                *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
+            }
+        }
+    }
+
+    /// Drop every cursor for `pid`'s object `(device, inode)` whatever
+    /// generation or pin it names: the fresh scan of that object
+    /// supersedes them (a reused pid, a rewritten file, a remapped
+    /// layout). Only called when the object was actually reached and
+    /// missed, never speculatively.
+    pub(crate) fn drop_stale_decode_cursors(
+        &mut self,
+        pid: u32,
+        device: Device,
+        inode: u64,
+        retained: &mut u64,
+    ) {
+        let stale: Vec<DecodeCursorKey> = self
+            .decode
+            .cursors
+            .keys()
+            .filter(|key| key.pid == pid && key.file.device == device && key.file.inode == inode)
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(old) = self.decode.cursors.remove(&key) {
+                *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
+            }
+        }
+    }
+
+    /// Arm the next table-sweep call to resume at `start_word` with the
+    /// cached export anchors (skipping the prologue's charges).
+    pub(crate) fn set_table_resume(
+        &mut self,
+        start_word: u64,
+        anchors: Option<BTreeMap<u64, Vec<usize>>>,
+    ) {
+        self.decode.table_resume.start_word = start_word;
+        self.decode.table_resume.swept_words = 0;
+        self.decode.table_resume.anchors = anchors;
+        self.decode.table_resume.anchors_out = None;
+    }
+
+    /// Take the armed table resume (call entry consumes it, so a sweep
+    /// that never runs cannot leak resume state into the next object).
+    pub(crate) fn take_table_resume(&mut self) -> (u64, Option<BTreeMap<u64, Vec<usize>>>) {
+        self.decode.table_resume.swept_words = 0;
+        self.decode.table_resume.swept_completed = false;
+        self.decode.table_resume.anchors_out = None;
+        (
+            std::mem::replace(&mut self.decode.table_resume.start_word, 0),
+            self.decode.table_resume.anchors.take(),
+        )
+    }
+
+    /// Report words swept by the table call now returning (fully examined
+    /// words only; every early break excludes its current word) and
+    /// whether the sweep finished (loop exit, not a break).
+    pub(crate) fn note_table_swept(&mut self, words: u64, completed: bool) {
+        self.decode.table_resume.swept_words = words;
+        self.decode.table_resume.swept_completed = completed;
+    }
+
+    /// Words the last table-sweep call swept plus whether it finished;
+    /// resets both.
+    pub(crate) fn take_table_swept(&mut self) -> (u64, bool) {
+        (
+            std::mem::replace(&mut self.decode.table_resume.swept_words, 0),
+            std::mem::replace(&mut self.decode.table_resume.swept_completed, false),
+        )
+    }
+
+    /// Publish the anchor map the table prologue just computed (cached
+    /// into the frontier cursor when the sweep stops early).
+    pub(crate) fn note_table_anchors(&mut self, anchors: BTreeMap<u64, Vec<usize>>) {
+        self.decode.table_resume.anchors_out = Some(anchors);
+    }
+
+    /// Take the last table prologue's anchor map, if it ran.
+    pub(crate) fn take_table_anchors_out(&mut self) -> Option<BTreeMap<u64, Vec<usize>>> {
+        self.decode.table_resume.anchors_out.take()
+    }
+
+    /// Arm the next interface-sweep call to resume at `start_word`.
+    pub(crate) fn set_iface_resume(&mut self, start_word: u64) {
+        self.decode.iface_resume.start_word = start_word;
+        self.decode.iface_resume.swept_words = 0;
+    }
+
+    /// Take the armed interface resume (call entry consumes it).
+    pub(crate) fn take_iface_resume(&mut self) -> u64 {
+        self.decode.iface_resume.swept_words = 0;
+        self.decode.iface_resume.swept_completed = false;
+        std::mem::replace(&mut self.decode.iface_resume.start_word, 0)
+    }
+
+    /// Report words swept by the interface call now returning, and
+    /// whether the sweep finished (loop exit, not a break).
+    pub(crate) fn note_iface_swept(&mut self, words: u64, completed: bool) {
+        self.decode.iface_resume.swept_words = words;
+        self.decode.iface_resume.swept_completed = completed;
+    }
+
+    /// Words the last interface-sweep call swept plus whether it
+    /// finished; resets both.
+    pub(crate) fn take_iface_swept(&mut self) -> (u64, bool) {
+        (
+            std::mem::replace(&mut self.decode.iface_resume.swept_words, 0),
+            std::mem::replace(&mut self.decode.iface_resume.swept_completed, false),
+        )
+    }
+
+    /// Note one interface-triple address the sweep examined while its
+    /// target table was still unknown: a hint the link step re-reads
+    /// from current memory once tables are final. Only armed scans
+    /// record (single-shot scans have no next pass), only mapped
+    /// targets qualify (unmapped look-alikes are data), and each
+    /// address records once.
+    pub(crate) fn note_unlinked_triple(&mut self, address: u64, target_mapped: bool) {
+        if !self.decode.resume_armed
+            || !target_mapped
+            || self.decode.unlinked_triples.contains(&address)
+        {
+            return;
+        }
+        self.decode.unlinked_triples.push(address);
+    }
+
+    /// Drain this object's recorded unlinked triples into its staging.
+    pub(crate) fn take_unlinked_triples(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.decode.unlinked_triples)
     }
 
     /// `(done, total, tables)` for one view's cursors: completed objects,

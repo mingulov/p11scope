@@ -3002,10 +3002,12 @@ guards against crafted files — 64 MiB for an inventory pass, 512 MiB
 for a `profile`/`trace` capture. Under `--cgroup`, one inventory pass
 shares that single 64 MiB attempted-read window across every member and
 every file it examines. One pass also shares a single 16M-unit
-discovery work allowance across every member it scans (each snapshot
-byte costs 1/32 unit, each decoded table word one unit); an allowance
-reached mid-pass names its gap and the next pass continues with a
-renewed allowance. Each pass carries its file-derived inspection,
+discovery work allowance across every member it scans (each decoded
+table word costs one unit; snapshot bytes ride the I/O window, never
+the work allowance, so re-reads cannot stall a pass before any
+decode); an allowance reached mid-pass names its gap and the next
+pass continues with a renewed allowance. Each pass carries its
+file-derived inspection,
 export, loader and table-refusal facts into the next pass, keyed and
 pinned by file identity, size and change time. An unchanged object is read
 once rather than on every pass while its facts fit the retained-fact

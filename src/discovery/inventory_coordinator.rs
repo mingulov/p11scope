@@ -20354,11 +20354,11 @@ pub(crate) mod tests {
     }
 
     /// The haskoki twin: one member maps two 6 MiB-data objects ahead of
-    /// a real provider. Each large object costs ~1M pass work units
-    /// (192K snapshot-record units plus 786K decode words, both charged
-    /// to the shared pass allowance and the scan window), so the first
-    /// pass must still reach the provider placed after them: the
-    /// production pass work allowance fits a haskoki-class member.
+    /// a real provider. Each large object costs ~786K pass work units
+    /// of decode words (snapshot bytes ride the I/O window, never the
+    /// work allowance), so the first pass must still reach the provider
+    /// placed after them: the production pass work allowance fits a
+    /// haskoki-class member.
     #[test]
     fn cgroup_pass_scans_haskoki_sized_data_and_reaches_its_provider() {
         const BIG_DATA_BYTES: usize = 6 << 20;

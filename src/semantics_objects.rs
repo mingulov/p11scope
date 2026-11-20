@@ -1470,6 +1470,19 @@ impl ObjectSemantics {
         self.state.abandon_domain(domain, ledger)
     }
 
+    /// Sealed production input: per-call disposal for one abandoned
+    /// neutral call (converted ticket or `None` when never
+    /// converted). Returns `None` for a non-neutral ticket (fail
+    /// closed) so the caller keeps whole-key refusal for it. Only
+    /// the journal's per-call disposal path calls this.
+    pub(crate) fn dispose_abandoned_neutral(
+        &mut self,
+        token: Option<CallToken>,
+        ledger: &mut journal::StagingLedger,
+    ) -> Option<ObjectEffects> {
+        self.state.dispose_abandoned_neutral(token, ledger)
+    }
+
     pub(crate) fn project(&self) -> ObjectProjection {
         self.state.project()
     }

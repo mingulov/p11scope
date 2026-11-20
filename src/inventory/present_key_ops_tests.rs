@@ -359,6 +359,94 @@ fn key_ops_line_unavailable_names_reason() {
     );
 }
 
+/// Ruled contract: folded Joint rows render in text like JSON —
+/// the rows stay beside a one-line coverage note naming why live
+/// per-key tracking is unavailable (owner "data always" + "partial,
+/// never stop"). The "no key can be named yet" sentence appears only
+/// when there are truly no rows, never beside retained rows.
+#[test]
+fn key_ops_line_folded_rows_render_with_coverage_note() {
+    let mut observations = populated(9);
+    observations.status = ObsStatus::Partial;
+    observations.reason = "live_joint_feed_absent";
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 4, 0, 0, "operations"));
+    let presentation = key_ops_presentation(observations);
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 0 keys on 1 provider; rev 9 partial; 0 sessions",
+            "  live per-key tracking unavailable; retained rows continue",
+            "  unidentified provider: sign 4 completed, 0 returned errors, 0 active operations",
+        ],
+        "folded rows render beside the coverage note:\n{concise}"
+    );
+    assert!(
+        !concise.contains("no key can be named yet"),
+        "rows exist, so no such sentence:\n{concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains(
+            "  live per-key tracking unavailable; retained rows continue \
+             (reason: live_joint_feed_absent)"
+        ),
+        "verbose pairs the machine reason:\n{verbose}"
+    );
+    // Positive control: JSON carries the same rows beside the same
+    // status and reason.
+    let document =
+        serde_json::to_value(object_observations_json(&presentation.object_observations)).unwrap();
+    assert_eq!(
+        document.get("status").and_then(|value| value.as_str()),
+        Some("partial")
+    );
+    assert_eq!(
+        document.get("reason").and_then(|value| value.as_str()),
+        Some("live_joint_feed_absent")
+    );
+    assert_eq!(
+        document
+            .get("key_operations")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "JSON keeps the folded row"
+    );
+}
+
+/// Ruled contract, no-rows leg: a partial section with retained
+/// counts but no key rows names plain counts in its coverage note —
+/// still never the "no key can be named yet" sentence, which is
+/// reserved for the truly rowless unavailable section.
+#[test]
+fn key_ops_line_folded_without_rows_names_plain_counts() {
+    let mut observations = populated(9);
+    observations.status = ObsStatus::Partial;
+    observations.reason = "live_joint_feed_absent";
+    observations.add_unattributed("started_before_attach", 2);
+    let presentation = key_ops_presentation(observations);
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 0 keys on 0 providers; rev 9 partial; 0 sessions",
+            "  live per-key tracking unavailable; plain counts only",
+            "  no key operations observed",
+            "  not attributed: started_before_attach 2",
+        ],
+        "counts render beside the coverage note:\n{concise}"
+    );
+    assert!(
+        !concise.contains("no key can be named yet"),
+        "counts exist, so no such sentence:\n{concise}"
+    );
+}
+
 #[test]
 fn key_ops_line_counts_not_attributed_beside_exact_rows() {
     let mut observations = populated(9);

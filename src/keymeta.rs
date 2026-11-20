@@ -3064,6 +3064,10 @@ mod tests {
     fn reason_displays() {
         for (reason, display) in [
             (REASON_UNLISTED_MECHANISM, "unlisted mechanism"),
+            // Ruled contract: a mechanism-less completion names its
+            // family unknown with no_mechanism (literal: the const
+            // lands with the implementation).
+            ("no_mechanism", "no mechanism"),
             (
                 REASON_OPERATION_KEY_ONLY,
                 "mechanism types the operation key",

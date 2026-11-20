@@ -3752,9 +3752,12 @@ fn key_operation_message_unbound_context_rows_message_contexts() {
         &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
         true,
     );
+    // Ruled contract: retained rows with no live Joint feed report
+    // partial with the named live_joint_feed_absent reason, never
+    // unavailable (owner "data always" + "partial, never stop").
     assert_eq!(
         (twin.status, twin.reason),
-        (ObsStatus::Unavailable, "bootstrap_unavailable")
+        (ObsStatus::Partial, "live_joint_feed_absent")
     );
     let row = twin
         .unknown_key_operations
@@ -3867,9 +3870,12 @@ fn key_operation_message_all_categories_count_contexts_direct() {
         &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
         true,
     );
+    // Ruled contract: retained rows with no live Joint feed report
+    // partial with the named live_joint_feed_absent reason, never
+    // unavailable (owner "data always" + "partial, never stop").
     assert_eq!(
         (committed.status, committed.reason),
-        (ObsStatus::Unavailable, "bootstrap_unavailable")
+        (ObsStatus::Partial, "live_joint_feed_absent")
     );
     for (_, _, _, _, category) in &matrix {
         let row = committed
@@ -9585,7 +9591,10 @@ fn key_operation_schema_contract() {
                 "bootstrap_unavailable",
                 "proof_refused_fallback",
                 "authority_lost",
-                "row_budget_exhausted"
+                "row_budget_exhausted",
+                // Ruled contract: the producer names retained evidence
+                // with no live Joint feed live_joint_feed_absent.
+                "live_joint_feed_absent",
             ]
             .contains(&reason),
             "producer-only reason: {reason}"
@@ -14453,8 +14462,11 @@ fn key_operation_pqc_matrix_negative() {
     assert!(keyuse.aggregates().is_empty(), "no KEM proved bucket");
     let s1only = JointStaging::select_s1_only();
     let committed = commit(1, &[&s1only], &scene.model.project(), &keyuse);
-    assert_eq!(committed.status, ObsStatus::Unavailable);
-    assert_eq!(committed.reason, "bootstrap_unavailable");
+    // Ruled contract: retained rows with no live Joint feed report
+    // partial with the named live_joint_feed_absent reason, never
+    // unavailable (owner "data always" + "partial, never stop").
+    assert_eq!(committed.status, ObsStatus::Partial);
+    assert_eq!(committed.reason, "live_joint_feed_absent");
     assert!(committed.key_operations.is_empty(), "no KEM proved rows");
     assert!(committed.objects.is_empty(), "no KEM object read invented");
     let mut reasons: Vec<_> = committed
@@ -14954,8 +14966,11 @@ fn key_operation_rsa_ledger_reference() {
     let s1only = JointStaging::select_s1_only();
     let model = JointScene::new().model.project();
     let committed = commit(1, &[&s1only], &model, &keyuse);
-    assert_eq!(committed.status, ObsStatus::Unavailable);
-    assert_eq!(committed.reason, "bootstrap_unavailable");
+    // Ruled contract: retained rows with no live Joint feed report
+    // partial with the named live_joint_feed_absent reason, never
+    // unavailable (owner "data always" + "partial, never stop").
+    assert_eq!(committed.status, ObsStatus::Partial);
+    assert_eq!(committed.reason, "live_joint_feed_absent");
     assert!(committed.key_operations.is_empty(), "S1Only proves no rows");
     assert!(committed.objects.is_empty() && committed.sessions.is_empty());
     let mut summaries: Vec<_> = committed
@@ -20313,6 +20328,13 @@ fn reason_enum_pins_journal_unavailable() {
         crate::key_operation_projection::REASON_LABELS.contains(&"bootstrap_unavailable"),
         "bootstrap_unavailable keeps its 0.6.0 meaning"
     );
+    // Ruled contract: retained evidence with no live Joint feed is
+    // partial with the named live_joint_feed_absent reason, carried
+    // by the Rust table and the frozen schema enum together.
+    assert!(
+        crate::key_operation_projection::REASON_LABELS.contains(&"live_joint_feed_absent"),
+        "REASON_LABELS must carry live_joint_feed_absent"
+    );
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let schema: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(
@@ -20334,6 +20356,10 @@ fn reason_enum_pins_journal_unavailable() {
     assert!(
         reasons.contains(&"bootstrap_unavailable"),
         "frozen schema enum keeps bootstrap_unavailable"
+    );
+    assert!(
+        reasons.contains(&"live_joint_feed_absent"),
+        "frozen schema enum must carry live_joint_feed_absent"
     );
 }
 
@@ -20373,6 +20399,64 @@ fn producer_commit_without_linked_journal_reports_journal_unavailable() {
     assert_eq!(
         linked.reason, "bootstrap_unavailable",
         "linked without births keeps its 0.6.0 meaning"
+    );
+}
+
+/// Ruled contract: a folded Joint feed (proved rows and objects
+/// retained, the live feed gone from the census) commits partial
+/// with the named live_joint_feed_absent reason, never unavailable
+/// (owner "data always" + "partial, never stop"). The rows and
+/// objects stay intact beside the reason.
+#[test]
+fn producer_commit_folded_joint_rows_report_partial_live_feed_absent() {
+    use crate::key_operation_projection::producer::commit_with_journal_linked;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for call in [
+        ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    ] {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut edge,
+            &mut keyuse,
+            &mut sink,
+            &call,
+        );
+    }
+    assert!(!keyuse.aggregates().is_empty(), "the seal proved rows");
+    // The Joint feed folds out of the census (short-lived process
+    // exit): only a clean S1Only feed remains beside the retained
+    // reducer and model evidence. No fold record is latched (the
+    // retained reducer/model evidence, not a clean folded history,
+    // drives the partial below).
+    let s1only = JointStaging::select_s1_only();
+    let folded = commit_with_journal_linked(
+        2,
+        &[&s1only],
+        &scene.model.project(),
+        &keyuse,
+        &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
+        true,
+    );
+    assert_eq!(
+        (folded.status, folded.reason),
+        (ObsStatus::Partial, "live_joint_feed_absent"),
+        "retained folded-Joint evidence is partial, never unavailable"
+    );
+    assert!(
+        !folded.key_operations.is_empty(),
+        "the proved rows stay beside the reason"
+    );
+    assert!(
+        !folded.objects.is_empty(),
+        "the retained objects stay beside the reason"
     );
 }
 
@@ -21655,8 +21739,11 @@ fn key_operation_lifecycle_close_all_finalize_commit_link() {
         .expect("failed finalize keeps the live use");
     assert_eq!((row.started, row.active, row.key_join_lost), (1, 1, 0));
     assert_eq!(committed.objects[0].lifetime, "live");
-    // Stage 5: the same populated model through an unlinked lane
-    // reports journal_unavailable — rows in memory are not delivery.
+    // Stage 5, ruled contract: the same populated model through a
+    // lane with no live Joint feed reports partial with the named
+    // live_joint_feed_absent reason — retained rows publish as
+    // partial history, never unavailable (owner "data always" +
+    // "partial, never stop").
     let s1only = JointStaging::select_s1_only();
     let unlinked = commit_with_journal_linked(
         5,
@@ -21666,9 +21753,9 @@ fn key_operation_lifecycle_close_all_finalize_commit_link() {
         &crate::discovery::caller_registry::instance_input::FoldedJointEvidence::default(),
         false,
     );
-    assert_eq!(unlinked.status, ObsStatus::Unavailable);
-    assert_eq!(unlinked.reason, "journal_unavailable");
-    assert_eq!(unlinked.objects.len(), 1, "rows stay while status refuses");
+    assert_eq!(unlinked.status, ObsStatus::Partial);
+    assert_eq!(unlinked.reason, "live_joint_feed_absent");
+    assert_eq!(unlinked.objects.len(), 1, "rows stay beside partial");
 }
 
 /// Object handle reuse retires the old view and mints the new one,
@@ -28587,7 +28674,10 @@ fn keymeta_established_compat() {
 }
 
 /// Unlisted mechanisms infer nothing with the named reason; a call
-/// without any mechanism leaves no inference at all.
+/// without any mechanism names its family unknown with the ruled
+/// no_mechanism reason (a zero-completion reason, like the size
+/// side's absent-evidence reasons — owner "data always: name what
+/// is unknown"), never a bare none.
 #[test]
 fn keymeta_unlisted_and_missing_mechanism() {
     let ids = KeymetaCtx::object_ids(1);
@@ -28605,19 +28695,47 @@ fn keymeta_unlisted_and_missing_mechanism() {
         Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
     );
     assert_eq!(inferred.family.completions, 1);
-    // No mechanism at all: no family evidence, no inference entry.
+    // No mechanism at all: no family evidence, so the row names its
+    // unknown with no_mechanism and counts no family completion.
     let ids = KeymetaCtx::object_ids(1);
     let mut ctx = KeymetaCtx::new();
     let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
     ctx.start("C_SignInit", 7, None, &[receipt], 100);
     ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
-    assert!(
-        ctx.inference(ids[0].as_u64(), "sign", "key", "unknown")
-            .is_none_or(|inferred| {
-                inferred.family.value.is_none() && inferred.family.completions == 0
-            }),
-        "a mechanism-less completion attributes no family"
-    );
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the mechanism-less row names its unknown");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.family.value, None);
+    assert_eq!(inferred.family.reason, Some("no_mechanism"));
+    assert_eq!(inferred.family.completions, 0);
+}
+
+/// Ruled contract, direct-call sites: a mechanism-less wrap names
+/// family unknown with no_mechanism on both the wrapping-key row
+/// (the operation role) and the wrapped row (which gains nothing
+/// from the absent mechanism either), with no family completion
+/// counted on either.
+#[test]
+fn keymeta_direct_without_mechanism_names_no_mechanism() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    ctx.direct("C_WrapKey", 7, None, &[wrapping, wrapped], 100, None, None)
+        .expect("wrap completes");
+    for (object, role) in [
+        (ids[0].as_u64(), "wrapping_key"),
+        (ids[1].as_u64(), "wrapped_object"),
+    ] {
+        let inferred = ctx
+            .inference(object, "wrap", role, "unknown")
+            .unwrap_or_else(|| panic!("the mechanism-less {role} row names its unknown"));
+        assert_eq!(inferred.family.status, InferredStatus::Unknown, "{role}");
+        assert_eq!(inferred.family.value, None, "{role}");
+        assert_eq!(inferred.family.reason, Some("no_mechanism"), "{role}");
+        assert_eq!(inferred.family.completions, 0, "{role}");
+    }
 }
 
 /// The Firefox key-info shape at the reducer seam: a sign under

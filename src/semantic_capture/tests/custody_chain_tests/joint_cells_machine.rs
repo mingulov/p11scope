@@ -2724,6 +2724,217 @@ impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::Lane
     }
 }
 
+/// Scripts the length-stash counters over a faithful H0: every
+/// other seam delegates to the scene's shared H0 unchanged.
+struct PublishStashLossStub<I> {
+    inner: I,
+    stash_loss: std::collections::VecDeque<(u64, u64)>,
+}
+
+impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::LaneTestIo
+    for PublishStashLossStub<I>
+{
+    fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
+        self.stash_loss.pop_front()
+    }
+
+    fn stash_pending_floor(&self) -> Option<u64> {
+        self.inner.stash_pending_floor()
+    }
+
+    fn inspect_pending_h3(
+        &self,
+        inspect: &mut dyn FnMut(
+            &crate::semantic_capture::SemanticCapture,
+            &crate::inventory_semantics::RefreshReceiptStash,
+            &crate::attach::SessionDrainProducers,
+        ),
+    ) {
+        self.inner.inspect_pending_h3(inspect)
+    }
+
+    fn semantic_published(&mut self) {
+        self.inner.semantic_published()
+    }
+
+    fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+        self.inner.begin_terminal_cleanup()
+    }
+
+    fn finish_terminal_cleanup(
+        &mut self,
+        second_signal: &dyn Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        self.inner.finish_terminal_cleanup(second_signal, out)
+    }
+
+    fn poll_terminal_detach(
+        &mut self,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<crate::attach::ProducerDetachProgress> {
+        self.inner.poll_terminal_detach(out)
+    }
+
+    fn tick_targets(&mut self, pins: &[std::sync::Arc<crate::process::PidPin>]) {
+        self.inner.tick_targets(pins)
+    }
+
+    fn service_live_discovery(&mut self) {
+        self.inner.service_live_discovery()
+    }
+
+    fn collection_saturated(&self) -> bool {
+        self.inner.collection_saturated()
+    }
+
+    fn retained_registration_ns(&self, image: p11scope_ebpf_common::ImageIdentity) -> Option<u64> {
+        self.inner.retained_registration_ns(image)
+    }
+
+    fn validate_attachment(
+        &mut self,
+        subset: &crate::inventory_semantics::AttestedSubset,
+    ) -> Result<(), crate::inventory_semantics::SemanticRefusal> {
+        self.inner.validate_attachment(subset)
+    }
+
+    fn take_refresh_receipt(
+        &mut self,
+        pin: &std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+    ) -> Option<crate::semantic_capture::CurrentPartitionReceipt> {
+        self.inner.take_refresh_receipt(pin, slot)
+    }
+
+    fn stash_admission_evidence(
+        &mut self,
+        receipts: Vec<crate::semantic_capture::CurrentPartitionReceipt>,
+        outcomes: Vec<crate::semantic_capture::TickOutcome>,
+    ) {
+        self.inner.stash_admission_evidence(receipts, outcomes)
+    }
+
+    fn physical_gaps(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        gaps: &mut Vec<crate::semantic_capture::PhysicalSemanticGap>,
+    ) -> Option<
+        Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        >,
+    > {
+        self.inner.physical_gaps(domain, gaps)
+    }
+
+    fn validate_collected_preparation(
+        &self,
+        raw: &crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Result<(), crate::inventory_semantics::SemanticRefusal> {
+        self.inner.validate_collected_preparation(raw)
+    }
+
+    fn physical_gaps_collected(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        gaps: &mut Vec<crate::semantic_capture::PhysicalSemanticGap>,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> Option<
+        Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        >,
+    > {
+        self.inner.physical_gaps_collected(domain, gaps, raw)
+    }
+
+    fn validate_current(
+        &mut self,
+        receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+        report: &mut crate::semantic_capture::TickReport,
+    ) -> Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+        self.inner.validate_current(receipt, report)
+    }
+
+    fn tick(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) -> Result<
+        crate::inventory_semantics::SemanticBatch,
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner.tick(domain)
+    }
+
+    fn refresh(
+        &mut self,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+    ) -> Result<
+        (
+            Vec<p11scope_ebpf_common::ImageIdentity>,
+            std::sync::Arc<crate::process::PidPin>,
+        ),
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner.refresh(pin, slot)
+    }
+
+    fn refresh_collected(
+        &mut self,
+        pin: std::sync::Arc<crate::process::PidPin>,
+        slot: u32,
+        raw: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        adapter: &crate::semantics_objects::journal::JournalAdapter,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Result<
+        (
+            Vec<p11scope_ebpf_common::ImageIdentity>,
+            std::sync::Arc<crate::process::PidPin>,
+        ),
+        crate::inventory_semantics::SemanticRefusal,
+    > {
+        self.inner
+            .refresh_collected(pin, slot, raw, adapter, producers)
+    }
+
+    fn has_pending_evidence(&self) -> bool {
+        self.inner.has_pending_evidence()
+    }
+
+    fn finish(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) -> crate::inventory_semantics::SemanticBatch {
+        self.inner.finish(domain)
+    }
+
+    fn quiescent(&mut self) -> bool {
+        self.inner.quiescent()
+    }
+
+    fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+        self.inner.positions()
+    }
+
+    fn drain_events_to(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> crate::inventory_semantics::LaneDrainOutcome {
+        self.inner.drain_events_to(stop, quantum)
+    }
+
+    fn drain_discovery_to(
+        &mut self,
+        stop: usize,
+        quantum: usize,
+    ) -> crate::inventory_semantics::LaneDrainOutcome {
+        self.inner.drain_discovery_to(stop, quantum)
+    }
+}
+
 /// The strict s1only gate stages a mechanism-bearing modeled call whose
 /// native BEGIN is entry-time (MECH_NONE, no mechanism capture) while its S1
 /// admission is return-time (mechanism value): the default producer never
@@ -2897,6 +3108,85 @@ fn joint_machine_publish_discloses_events_ring_loss_rise() {
         .iter()
         .zip(coordinator.registry().gap_repeats().iter())
         .filter(|(gap, _)| gap.subject == "native capture events lost")
+        .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
+        .collect();
+    assert_eq!(gaps.len(), 1, "the staged gap surfaces: {gaps:?}");
+    assert_eq!(gaps[0].1, 1, "a single rise surfaces once: {gaps:?}");
+}
+
+/// The machine publish path polls the length-stash counters beside
+/// the EVENTS ring loss: a stash rise discloses at publish instead
+/// of waiting for the next tick, stop or plain commit.
+#[test]
+fn joint_machine_publish_discloses_length_stash_loss_rise() {
+    let mut scene = MachineScene::new(1);
+    scene.native.fail_births = true;
+    let h0 = scene.scene.real.h0.clone();
+    scene
+        .scene
+        .real
+        .lane
+        .install_test_io(Box::new(PublishStashLossStub {
+            inner: h0,
+            stash_loss: std::collections::VecDeque::from([(3, 1), (3, 1), (3, 1)]),
+        }));
+    let pid = std::process::id();
+    for (seq, name) in (1u64..).zip([
+        "C_CreateObject",
+        "C_SignInit",
+        "C_SignUpdate",
+        "C_SignFinal",
+    ]) {
+        scene.scene.push(pid, 0, name, seq);
+    }
+    scene.machine.begin_commit(true).unwrap();
+    scene.published_labeled("m1-stash-loss", None);
+    // The stash rise stages one named gap at publish; the counts land immediately.
+    let staged: Vec<_> = scene
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == "key sizes lost some lengths")
+        .collect();
+    assert_eq!(
+        staged,
+        [(
+            "key sizes lost some lengths".to_string(),
+            "the length stash dropped retention (a full map or a \
+             stale row; exact counts in the semantic capture summary)"
+                .to_string(),
+        )],
+        "a stash rise stages one named gap at machine publish"
+    );
+    let lane = &scene.scene.real.lane;
+    let summary = lane.semantic_summary();
+    assert_eq!(
+        (
+            lane.length_stash_loss_disclosed(),
+            summary.length_insert_failures,
+            summary.length_stash_mismatches
+        ),
+        ((3, 1), 3, 1),
+        "the disclosed stash delta counts exactly once at publish"
+    );
+    // And it surfaces through the production final commit, never stuck staged.
+    let real = &mut scene.scene.real;
+    let (lane, scene) = (&mut real.lane, &mut real.scene);
+    scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(lane))
+        .expect("the production final commit publishes the staged gap");
+    let coordinator = &scene.coordinator;
+    let gaps: Vec<_> = coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .zip(coordinator.registry().gap_repeats().iter())
+        .filter(|(gap, _)| gap.subject == "key sizes lost some lengths")
         .map(|(gap, repeats)| (gap.reason.clone(), *repeats))
         .collect();
     assert_eq!(gaps.len(), 1, "the staged gap surfaces: {gaps:?}");

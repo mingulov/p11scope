@@ -3,7 +3,9 @@
 //! Capture resource reservations backed by the registry's existing pool.
 
 use super::MAX_UNSETTLED_STAGED;
-use super::reservations::{Refusal, ReservationId, ReservationTable, Role, RoleKey};
+use super::reservations::{
+    Refusal, ReleaseRoleCursor, ReservationId, ReservationTable, Role, RoleKey,
+};
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SEMANTIC_RESOURCE_LIMIT, SemanticResourceReserver,
 };
@@ -64,6 +66,10 @@ pub(crate) struct StagingLedger {
     next_raw: u64,
     generation: Option<LedgerGeneration>,
     byte_limit: u64,
+    // Resumable H8 void sweep: `Some` while a budgeted void still owns
+    // slot/link work. No insert, merge or transfer may run until the
+    // sweep completes (the machine defers collection meanwhile).
+    h8_void: Option<ReleaseRoleCursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +120,7 @@ impl StagingLedger {
                 .ok()
                 .map(|last| LedgerGeneration(last + 1)),
             byte_limit: SEMANTIC_RESOURCE_LIMIT as u64,
+            h8_void: None,
         }
     }
 
@@ -437,6 +444,40 @@ impl StagingLedger {
         if let Some(table) = self.table.as_mut() {
             table.release_role(Role::H8Open);
         }
+    }
+
+    /// Start the resumable H8 void sweep. Empty ledgers (no table or no
+    /// H8 population) hold no sweep: `poll_h8_void` then completes at
+    /// once with no work.
+    pub(crate) fn start_h8_void(&mut self) {
+        let needs = self
+            .table
+            .as_ref()
+            .is_some_and(|table| table.population(Role::H8Open) > 0);
+        self.h8_void = needs.then(ReleaseRoleCursor::new);
+    }
+
+    /// Drive the H8 void sweep for at most `units` leaf units (slot
+    /// visits plus chain-link reads). Returns whether the sweep
+    /// completed and the units spent (never above `units`).
+    pub(crate) fn poll_h8_void(&mut self, units: usize) -> (bool, usize) {
+        let Some(cursor) = self.h8_void.as_mut() else {
+            return (true, 0);
+        };
+        let Some(table) = self.table.as_mut() else {
+            self.h8_void = None;
+            return (true, 0);
+        };
+        let (done, spent) = table.release_role_step(Role::H8Open, cursor, units);
+        if done {
+            self.h8_void = None;
+        }
+        (done, spent)
+    }
+
+    /// Whether a budgeted H8 void sweep still owns work.
+    pub(crate) fn h8_void_pending(&self) -> bool {
+        self.h8_void.is_some()
     }
 
     pub(crate) fn charge_model(&mut self, token: u64, bytes: u64) -> Result<(), LedgerRefusal> {

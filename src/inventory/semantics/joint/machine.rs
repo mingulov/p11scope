@@ -766,6 +766,12 @@ struct FinishControl {
 #[allow(clippy::large_enum_variant)] // The complete bounded original stays inline in the paid machine.
 enum Phase {
     Idle,
+    /// A started ingest-break void whose reservation sweep still owns
+    /// work. Holds the machine here, deferring collection and
+    /// publication, while the owner's fenced failure and prepaid lease
+    /// wait unpublished until the sweep completes (at most 64 leaf
+    /// units per credit, INV-2).
+    Voiding,
     Collecting(Collected),
     Binding(Collected),
     AwaitH0(Collected),
@@ -2873,6 +2879,7 @@ impl LiveJointMachine {
         }
         Some(match self.phase.as_ref()? {
             Phase::Idle => "Idle",
+            Phase::Voiding => "Voiding",
             Phase::Collecting(_) => "Collecting",
             Phase::Binding(_) => "Binding",
             Phase::AwaitH0(_) => "AwaitH0",
@@ -2902,6 +2909,7 @@ impl LiveJointMachine {
         let (phase, original) = match self.phase.as_ref() {
             None => ("NoPhase", None),
             Some(Phase::Idle) => ("Idle", None),
+            Some(Phase::Voiding) => ("Voiding", None),
             Some(Phase::Collecting(value)) => ("Collecting", Some(value)),
             Some(Phase::Binding(value)) => ("Binding", Some(value)),
             Some(Phase::AwaitH0(value)) => ("AwaitH0", Some(value)),
@@ -3337,11 +3345,20 @@ impl LiveJointMachine {
                 // the void takes the named disposition path as before. A
                 // finish keeps the refusal, so a stop never waits on the
                 // pool.
+                //
+                // A started void with reservation sweep work holds the
+                // machine in Phase::Voiding (at most 64 leaf units per
+                // credit, INV-2), deferring the drop, gap disclosure and
+                // collection below until the sweep completes. Small voids
+                // finish inside the start and take the immediate path.
+                if coordinator.joint_capture().void_cleanup_pending() {
+                    return (Phase::Voiding, Ok(Step::Continue));
+                }
                 if self.producers.journal_linked() {
-                    let voided = match coordinator.joint_capture_mut().void_ingest_break() {
-                        Ok(voided) => {
+                    let started = match coordinator.joint_capture_mut().start_void_ingest_break() {
+                        Ok(started) => {
                             self.unpaid_void_yields = 0;
-                            voided
+                            started
                         }
                         Err(RawQuantumRefusal::Resource(_))
                             if q.is_none() && self.unpaid_void_yields < MAX_UNPAID_VOID_YIELDS =>
@@ -3351,7 +3368,11 @@ impl LiveJointMachine {
                         }
                         Err(_) => return (Phase::Idle, Err(SemanticRefusal::Unavailable)),
                     };
-                    if voided {
+                    if started && coordinator.joint_capture().void_cleanup_pending() {
+                        budget.spend(1);
+                        return (Phase::Voiding, Ok(Step::Continue));
+                    }
+                    if started {
                         // An idle void strands staged-but-unreduced
                         // calls: a Joint feed's seal can wait
                         // (BoundNotReady) behind a long call from the
@@ -3427,6 +3448,35 @@ impl LiveJointMachine {
                     }),
                     Ok(Step::Continue),
                 )
+            }
+            Phase::Voiding => {
+                // One resumable void credit: at most 64 leaf units of
+                // slot/link sweep, debiting one action. Collection and
+                // publication stay deferred until the sweep completes and
+                // the owner publishes the fenced void. Shared by running
+                // and Finish (both arrive here from Idle).
+                if !budget.available() {
+                    return (Phase::Voiding, Ok(Step::Yield));
+                }
+                let (done, _spent) = coordinator.joint_capture_mut().poll_void_cleanup(64);
+                budget.spend(1);
+                if !done {
+                    return (Phase::Voiding, Ok(Step::Continue));
+                }
+                // Sweep complete: the owner published the fenced void.
+                // Same post-void disposal and disclosure as Idle's
+                // immediate path, then back to Idle to collect above
+                // the fence.
+                coordinator.drop_abandoned_joint_staged();
+                coordinator.note_scope_gap(
+                    crate::inventory_present::JOINT_RETAINED_S1_SUBJECT.to_string(),
+                    format!(
+                        "joint_void_{}_history_loss",
+                        crate::semantics_objects::journal::joint_driver::INGEST_BREAK_VOID_GAP
+                            .label()
+                    ),
+                );
+                (Phase::Idle, Ok(Step::Continue))
             }
             Phase::Collecting(mut original) => {
                 // The H0 leaf accepts at most MAX_PENDING ordinary records.

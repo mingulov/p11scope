@@ -148,6 +148,41 @@ impl<C> TableSlot<C> {
     }
 }
 
+/// Resumable cursor for the budgeted role sweep (`release_role_step`).
+/// Slots advance in order; chain unlinks resume from their predecessor
+/// when a credit's leaf budget runs out. The table stays
+/// lookup-consistent across yields (a removed membership reads absent,
+/// a dangling alias node is skipped), but the caller must not insert,
+/// merge or transfer until the sweep completes.
+pub(super) struct ReleaseRoleCursor {
+    next_slot: usize,
+    pending_key: Option<PendingUnlink>,
+    pending_alias_slot: Option<usize>,
+    pending_alias_lane: usize,
+    pending_alias_unlink: Option<PendingUnlink>,
+    pending_alias_ids: [Option<ReservationId>; ROLES],
+}
+
+struct PendingUnlink {
+    plane: usize,
+    bucket: usize,
+    node: u16,
+    prev: u16,
+}
+
+impl ReleaseRoleCursor {
+    pub(super) fn new() -> Self {
+        Self {
+            next_slot: 0,
+            pending_key: None,
+            pending_alias_slot: None,
+            pending_alias_lane: 0,
+            pending_alias_unlink: None,
+            pending_alias_ids: [None; ROLES],
+        }
+    }
+}
+
 pub(super) struct ReservationTable<C> {
     slots: Vec<TableSlot<C>>,
     next: u64,
@@ -258,6 +293,51 @@ impl<C> ReservationTable<C> {
         }
     }
 
+    /// Resumable chain unlink for the budgeted void sweep: at most
+    /// `budget` link reads this call (`INDEX_NONE` in `prev` starts at
+    /// the head). Returns whether the splice completed and the units
+    /// spent (head read plus predecessor reads, never above `budget`).
+    /// A yielded unlink leaves the chain unchanged, so resuming from
+    /// the returned predecessor is exact.
+    fn chain_unlink_resumable(
+        heads: &mut [u16; INDEX_BUCKETS],
+        slots: &mut [TableSlot<C>],
+        plane: usize,
+        bucket: usize,
+        node: u16,
+        prev: &mut u16,
+        budget: usize,
+    ) -> (bool, usize) {
+        if budget == 0 {
+            return (false, 0);
+        }
+        let mut spent = 0;
+        if *prev == INDEX_NONE {
+            spent += 1;
+            if heads[bucket] == node {
+                heads[bucket] = slots[node_slot(node)].next[plane][node_lane(node)];
+                return (true, spent);
+            }
+            *prev = heads[bucket];
+            assert_ne!(*prev, INDEX_NONE, "indexed node linked");
+            if spent >= budget {
+                return (false, spent);
+            }
+        }
+        while spent < budget {
+            spent += 1;
+            let next = slots[node_slot(*prev)].next[plane][node_lane(*prev)];
+            if next == node {
+                slots[node_slot(*prev)].next[plane][node_lane(*prev)] =
+                    slots[node_slot(node)].next[plane][node_lane(node)];
+                return (true, spent);
+            }
+            *prev = next;
+            assert_ne!(*prev, INDEX_NONE, "indexed node linked");
+        }
+        (false, spent)
+    }
+
     /// Pop the first vacant slot from the intrusive free list.
     fn free_pop(head: &mut u16, slots: &mut [TableSlot<C>]) -> Option<usize> {
         let at = *head;
@@ -357,50 +437,164 @@ impl<C> ReservationTable<C> {
     }
 
     pub(super) fn release_role(&mut self, role: Role) {
+        // Synchronous callers drain the same budgeted sweep without
+        // yielding: each internal step still honors the leaf budget.
+        let mut cursor = ReleaseRoleCursor::new();
+        while !self.release_role_step(role, &mut cursor, 64).0 {}
+    }
+
+    /// One budgeted sweep step over `role`: at most `budget` leaf units
+    /// (slot visits plus chain-link reads). Returns whether the sweep
+    /// completed and the units spent (never above `budget`). The caller
+    /// holds `cursor` across steps and must not insert, merge or
+    /// transfer until completion.
+    pub(super) fn release_role_step(
+        &mut self,
+        role: Role,
+        cursor: &mut ReleaseRoleCursor,
+        budget: usize,
+    ) -> (bool, usize) {
+        let mut spent = 0;
         let indexed = self.indexed();
-        for at in 0..self.slots.len() {
-            let taken = self.slots[at]
-                .operation
-                .as_mut()
-                .and_then(|operation| operation.roles[role.index()].take());
-            if let Some(member) = taken {
-                if indexed {
-                    Self::chain_unlink(
-                        &mut self.key_heads,
-                        &mut self.slots,
-                        KEY_LINKS,
-                        Self::key_bucket(role, member.key),
-                        node_code(at, role.index()),
-                    );
+        loop {
+            if spent >= budget {
+                debug_assert!(spent <= budget);
+                return (false, spent);
+            }
+            if let Some(mut pending) = cursor.pending_alias_unlink.take() {
+                let (done, used) = Self::chain_unlink_resumable(
+                    &mut self.id_heads,
+                    &mut self.slots,
+                    pending.plane,
+                    pending.bucket,
+                    pending.node,
+                    &mut pending.prev,
+                    budget - spent,
+                );
+                spent += used;
+                if !done {
+                    cursor.pending_alias_unlink = Some(pending);
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
                 }
+                cursor.pending_alias_lane += 1;
+                continue;
+            }
+            if let Some(at) = cursor.pending_alias_slot {
+                // The slot was cleared at vacate time; its aliases live in
+                // the cursor snapshot until the free push. Unlink the next
+                // present lane, or finish the slot when none remain.
+                let mut advanced = false;
+                while cursor.pending_alias_lane < ROLES {
+                    let lane = cursor.pending_alias_lane;
+                    if let Some(id) = cursor.pending_alias_ids[lane] {
+                        cursor.pending_alias_unlink = Some(PendingUnlink {
+                            plane: ID_LINKS,
+                            bucket: Self::id_bucket(id),
+                            node: node_code(at, lane),
+                            prev: INDEX_NONE,
+                        });
+                        advanced = true;
+                        break;
+                    }
+                    cursor.pending_alias_lane += 1;
+                }
+                if !advanced {
+                    if indexed {
+                        Self::free_push(&mut self.free_head, &mut self.slots, at);
+                    }
+                    cursor.pending_alias_slot = None;
+                    cursor.pending_alias_ids = [None; ROLES];
+                    cursor.next_slot = at + 1;
+                }
+                continue;
+            }
+            if let Some(mut pending) = cursor.pending_key.take() {
+                let (done, used) = Self::chain_unlink_resumable(
+                    &mut self.key_heads,
+                    &mut self.slots,
+                    pending.plane,
+                    pending.bucket,
+                    pending.node,
+                    &mut pending.prev,
+                    budget - spent,
+                );
+                spent += used;
+                if !done {
+                    cursor.pending_key = Some(pending);
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
+                }
+                let at = cursor.next_slot;
+                if self.slot_is_vacant(at) {
+                    self.clear_vacated_slot(at, cursor);
+                } else {
+                    cursor.next_slot = at + 1;
+                }
+                continue;
+            }
+            if cursor.next_slot >= self.slots.len() {
+                debug_assert!(spent <= budget);
+                return (true, spent);
+            }
+            let at = cursor.next_slot;
+            spent += 1;
+            let key = self.slots[at]
+                .operation
+                .as_ref()
+                .and_then(|operation| operation.roles[role.index()].as_ref())
+                .map(|member| member.key);
+            if let Some(key) = key {
+                let bucket = Self::key_bucket(role, key);
+                let node = node_code(at, role.index());
+                let member = self.slots[at]
+                    .operation
+                    .as_mut()
+                    .and_then(|operation| operation.roles[role.index()].take())
+                    .expect("swept membership retained");
                 self.populations[role.index()] -= 1;
                 self.bytes -= member.bytes;
                 drop(member);
-            }
-            let vacant = self.slots[at]
-                .operation
-                .as_ref()
-                .is_some_and(|operation| operation.roles.iter().all(Option::is_none));
-            if vacant {
-                let aliases = self.slots[at].operation.as_ref().unwrap().aliases;
-                self.slots[at].operation = None;
-                self.live -= 1;
                 if indexed {
-                    for (lane, alias) in aliases.iter().enumerate() {
-                        if let Some(id) = alias {
-                            Self::chain_unlink(
-                                &mut self.id_heads,
-                                &mut self.slots,
-                                ID_LINKS,
-                                Self::id_bucket(*id),
-                                node_code(at, lane),
-                            );
-                        }
-                    }
-                    Self::free_push(&mut self.free_head, &mut self.slots, at);
+                    cursor.pending_key = Some(PendingUnlink {
+                        plane: KEY_LINKS,
+                        bucket,
+                        node,
+                        prev: INDEX_NONE,
+                    });
+                    continue;
                 }
             }
+            if self.slot_is_vacant(at) {
+                self.clear_vacated_slot(at, cursor);
+            } else {
+                cursor.next_slot = at + 1;
+            }
         }
+    }
+
+    fn slot_is_vacant(&self, at: usize) -> bool {
+        self.slots[at]
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.roles.iter().all(Option::is_none))
+    }
+
+    /// Clear a vacated slot and queue its alias unlinks in the cursor.
+    /// The slot's chain links stay (dangling but linked) until each alias
+    /// splice completes; lookups skip the cleared operation meanwhile.
+    /// Unindexed tables never linked aliases, so they finish immediately.
+    fn clear_vacated_slot(&mut self, at: usize, cursor: &mut ReleaseRoleCursor) {
+        let aliases = self.slots[at].operation.as_ref().unwrap().aliases;
+        self.slots[at].operation = None;
+        self.live -= 1;
+        if !self.indexed() {
+            cursor.next_slot = at + 1;
+            return;
+        }
+        cursor.pending_alias_slot = Some(at);
+        cursor.pending_alias_lane = 0;
+        cursor.pending_alias_ids = aliases;
     }
 
     fn key_slot(&self, role: Role, key: RoleKey) -> Option<usize> {

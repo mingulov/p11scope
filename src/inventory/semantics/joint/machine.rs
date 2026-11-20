@@ -4664,12 +4664,20 @@ impl LiveJointMachine {
                             self.finish_no_progress_since = None;
                         }
                         // Cadence: a seal retry stall re-observes
-                        // take-raced keys before the next attempt, so
-                        // one refresh scan lands per stall instead of
-                        // starving behind the burst. No queued
-                        // interests means no raced take, and the
-                        // service stays a pure yield.
-                        lane.service_take_refresh_sweep();
+                        // one take-raced key before the next attempt,
+                        // so one refresh scan lands per stall instead
+                        // of starving behind the burst. Debit before
+                        // work: an exhausted credit or a past service
+                        // deadline preserves every interest with zero
+                        // new I/O for the next eligible step. No
+                        // queued interests means no raced take, and
+                        // the service stays a pure yield.
+                        if budget.available() {
+                            lane.service_take_refresh_sweep(
+                                &mut budget.remaining_actions,
+                                budget.deadline,
+                            );
+                        }
                         (
                             Phase::Audited {
                                 frame,

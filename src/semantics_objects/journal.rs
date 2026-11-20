@@ -1105,7 +1105,7 @@ impl SealBootstrapCounts {
     /// variant. A new variant extends this count, the name table and
     /// the index match together (the index match is exhaustive, so a
     /// new variant fails to compile until it is placed).
-    pub(crate) const TAKE_ARMS: usize = 16;
+    pub(crate) const TAKE_ARMS: usize = 17;
     /// Re-verify-failure slots: one per `BirthRefusal` variant,
     /// with the same extend-together rule.
     pub(crate) const REVERIFY_ARMS: usize = 8;
@@ -1127,6 +1127,7 @@ impl SealBootstrapCounts {
         "AppearanceNotAdvanced",
         "AppearanceRejected",
         "NegativeFenceMismatch",
+        "RetainedWitnessMismatch",
     ];
     /// Re-verify-failure slot names in index order.
     const REVERIFY_ARM_NAMES: [&'static str; Self::REVERIFY_ARMS] = [
@@ -1161,6 +1162,7 @@ impl SealBootstrapCounts {
             AppearanceNotAdvanced => 13,
             AppearanceRejected => 14,
             NegativeFenceMismatch => 15,
+            RetainedWitnessMismatch => 16,
         }
     }
 
@@ -21591,6 +21593,244 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn scoped_preserve_keeps_unclaimed_sibling_on_shared_image() {
+        // Two collision abandonments name only the stuck key on a
+        // shared image; a live sibling key claims neither shape.
+        // Preservation must doom exactly the stuck key against the
+        // original liveness basis: the second abandonment must not
+        // see the first doom's refusal and retire the healthy
+        // sibling as a sole survivor, nor taint the shared image.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let stuck_first = harness.attest();
+        let stuck_proof = harness.attest();
+        assert_eq!(
+            stuck_first.key, stuck_proof.key,
+            "the twin pairs two claims on one stuck key"
+        );
+        let mut sibling_fixture = AttestationFixture::new(image_default());
+        let sibling_admitted = sibling_fixture.admit_session_function(SESSION, "C_CreateObject");
+        let sibling_proof = harness
+            .owner
+            .adapter_mut()
+            .attest_key(&sibling_admitted)
+            .expect("sibling key attests");
+        assert_ne!(
+            stuck_proof.key, sibling_proof.key,
+            "the twin covers two distinct keys"
+        );
+        for sequence in [1u64, 2] {
+            let mut begin = begin_bytes(1, sequence, create, 0);
+            put_u64(&mut begin, 80, SESSION);
+            assert_eq!(harness.ingest(&begin), JournalDisposition::BeginAdmitted);
+            let abandon =
+                abandon_bytes(1, sequence, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+            assert_eq!(
+                harness.ingest(&abandon),
+                JournalDisposition::AbandonStaged,
+                "the collision abandonment stages"
+            );
+        }
+        harness.prepare_claims();
+        let image = (COOKIE, EXEC);
+        assert!(
+            harness.owner.adapter().key_is_live(stuck_proof.key),
+            "precondition: the stuck key is live before the void"
+        );
+        assert!(
+            harness.owner.adapter().key_is_live(sibling_proof.key),
+            "precondition: the sibling key is live before the void"
+        );
+        let live = harness.owner.adapter().live_keys_for_image(image);
+        assert_eq!(live.len(), 2, "precondition: both keys share liveness");
+        let abandoned: Vec<StagedShape> = harness
+            .owner
+            .adapter()
+            .open
+            .values()
+            .filter(|entry| entry.abandon.is_some())
+            .map(shape_of_entry)
+            .collect();
+        assert_eq!(abandoned.len(), 2, "precondition: two abandonments stage");
+        for shape in &abandoned {
+            let naming: Vec<JournalDomainKey> = harness
+                .owner
+                .adapter()
+                .claimants_naming(shape)
+                .map(|m| {
+                    m.iter()
+                        .filter(|(key, ordinals)| !ordinals.is_empty() && live.contains(key))
+                        .map(|(key, _)| *key)
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert_eq!(
+                naming,
+                vec![stuck_proof.key],
+                "precondition: the abandoned shape names only the stuck key"
+            );
+        }
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = stuck_proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert!(
+            harness.owner.adapter().proof_refused_for_test(stuck_proof),
+            "the stuck key keeps its abandonment refusal"
+        );
+        assert!(
+            !harness
+                .owner
+                .adapter()
+                .proof_refused_for_test(sibling_proof),
+            "the unclaimed sibling stays unrefused"
+        );
+        assert!(
+            !harness.owner.adapter().image_tainted_for_test(image),
+            "attributed abandonments never taint their shared image"
+        );
+    }
+
+    #[test]
+    fn seal_barrier_clear_can_consume_its_whole_reserve() {
+        // 63 attested opens plus one capacity-refused BEGIN clear
+        // with zero units left: the refused phase completes exactly
+        // at its last member instead of yielding. One fewer open
+        // leaves one unit. The watchdog must give the park phase
+        // its own turn past such a scan instead of rescanning.
+        for (opens, remainder) in [(63usize, 0usize), (62usize, 1usize)] {
+            let mut scene = Scene::new_with_limits(
+                image_default(),
+                JournalLimits {
+                    open_calls: opens,
+                    thread_floors: 512,
+                    refused_begins: 8,
+                    domain_keys: 8,
+                    image_sightings: 8,
+                },
+            );
+            let create = function_id("C_CreateObject");
+            scene.attest();
+            for thread in 1..=opens as u64 {
+                let begin = begin_bytes(thread, 1, create, 0);
+                assert_eq!(
+                    scene.ingest(&begin),
+                    JournalDisposition::BeginAdmitted,
+                    "{opens} opens: begin {thread} admits"
+                );
+            }
+            let capped = begin_bytes(opens as u64 + 1, 1, create, 0);
+            assert_eq!(
+                scene.ingest(&capped),
+                JournalDisposition::BeginRefusedCapacity,
+                "{opens} opens: one more begin refuses on capacity"
+            );
+            assert!(
+                !scene.adapter.has_seal_barrier(),
+                "{opens} opens: attested staging bars nothing (control)"
+            );
+            let mut budget = SCOPED_RECOVERY_SLICE;
+            assert_eq!(budget, 64, "the watchdog reserve is one slice");
+            let check = scene.adapter.has_seal_barrier_bounded(&mut budget);
+            assert_eq!(check, BarrierCheck::Clear, "{opens} opens: the scan clears");
+            assert_eq!(
+                budget, remainder,
+                "{opens} opens: the clear leaves exactly its remainder"
+            );
+        }
+    }
+
+    #[test]
+    fn scoped_taint_removal_charges_each_entry_once() {
+        // 75 charged opens on one unbound image, one with a staged
+        // collision abandonment. Every one-unit recovery slice drops
+        // at most one open: no single unit may shed the whole
+        // census. At completion every dropped open recorded its
+        // absence, every H8 charge refunded, and the image tainted.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::RecoveryProgress;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let image = (COOKIE + 9, EXEC);
+        for thread in 1..=75u64 {
+            let begin = begin_bytes_image(thread, 1, create, 0, image);
+            assert_eq!(
+                harness.ingest(&begin),
+                JournalDisposition::BeginAdmitted,
+                "open {thread} admits"
+            );
+        }
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, image);
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        assert_eq!(harness.owner.adapter().open.len(), 75);
+        harness.owner.adapter_mut().stream_broken = false;
+        harness.owner.break_scoped_after_running_abandon(&[]);
+        let mut calls = 0u64;
+        let voided = loop {
+            let before = harness.owner.adapter().open.len();
+            let mut budget = 1usize;
+            let progress = harness
+                .owner
+                .void_ingest_break_bounded(&mut budget)
+                .expect("the bounded void never refuses its own budget");
+            calls += 1;
+            let after = harness.owner.adapter().open.len();
+            assert!(
+                before - after <= 1,
+                "one recovery unit drops at most one open ({before} -> {after})"
+            );
+            assert!(calls < 10_000, "the bounded void always terminates");
+            match progress {
+                RecoveryProgress::Done(voided) => break voided,
+                RecoveryProgress::Yielded => {}
+            }
+        };
+        assert!(voided, "the scoped void applies");
+        assert!(
+            harness.owner.adapter().open.is_empty(),
+            "every affected open is removed"
+        );
+        assert_eq!(
+            harness.owner.adapter().derived_absent.len(),
+            75,
+            "every dropped open records its absence"
+        );
+        assert_eq!(
+            harness.owner.adapter().ledger().charged_bytes(),
+            0,
+            "every H8 charge refunds"
+        );
+        assert!(
+            harness.owner.adapter().image_tainted_for_test(image),
+            "the unaccounted abandonment taints its image"
+        );
+    }
+
+    #[test]
     fn scoped_void_runs_bounded_and_resumes_across_yields() {
         // A scoped void over 75 unbound opens advances in bounded
         // slices through the budget: tiny budgets yield with partial
@@ -25282,6 +25522,7 @@ pub(crate) mod tests {
             Take::AppearanceNotAdvanced,
             Take::AppearanceRejected,
             Take::NegativeFenceMismatch,
+            Take::RetainedWitnessMismatch,
         ];
         assert_eq!(takes.len(), SealBootstrapCounts::TAKE_ARMS);
         let mut seen = [false; SealBootstrapCounts::TAKE_ARMS];
@@ -25322,6 +25563,9 @@ pub(crate) mod tests {
                 }
                 Take::NegativeFenceMismatch => {
                     assert_eq!((index, name), (15, Some("NegativeFenceMismatch")))
+                }
+                Take::RetainedWitnessMismatch => {
+                    assert_eq!((index, name), (16, Some("RetainedWitnessMismatch")))
                 }
             }
         }
@@ -25719,6 +25963,48 @@ pub(crate) mod tests {
         assert_eq!(
             failure(JournalGap::H3Loss, None).delivery_disposition(),
             SealFailureDisposition::HistoryLoss,
+        );
+    }
+
+    /// Delivery disposition keeps the prompt fallback for a take
+    /// that failed on a definitively stale retained witness: the
+    /// seal reuses the same witness every retry, so the mismatch
+    /// can never heal by retrying. Only contention/deadline takes
+    /// retry; the gap stays bootstrap mismatch either way.
+    #[test]
+    fn seal_failure_delivery_disposition_falls_back_stale_witness() {
+        use crate::attach::BirthObservationRefusal as Refusal;
+        use crate::semantics_key_use::SealFailureDisposition;
+        fn failure(
+            gap: JournalGap,
+            take_failed: Option<crate::attach::BirthObservationRefusal>,
+        ) -> SealFailure {
+            SealFailure {
+                scope: SealFailureScope::Unqualified,
+                gap,
+                effects: ObjectEffects::default(),
+                h3_voided: None,
+                fence: None,
+                take_failed,
+            }
+        }
+        assert_eq!(
+            failure(
+                JournalGap::BootstrapMismatch,
+                Some(Refusal::RetainedWitnessMismatch)
+            )
+            .delivery_disposition(),
+            SealFailureDisposition::Fallback,
+            "a stale retained witness keeps the prompt fallback"
+        );
+        assert_eq!(
+            failure(
+                JournalGap::BootstrapMismatch,
+                Some(Refusal::CurrentPartition)
+            )
+            .delivery_disposition(),
+            SealFailureDisposition::Retry,
+            "a contended take still retries"
         );
     }
 

@@ -1464,6 +1464,13 @@ pub(crate) enum BirthObservationRefusal {
     /// negative's. An absence witness must not bridge a gap that
     /// invalidated its authority; the positive stays withheld.
     NegativeFenceMismatch,
+    /// The retained partition receipt no longer matches current
+    /// partition truth (its fence is stale, its epochs moved, or its
+    /// partitions changed). A seal reuses the same retained witness
+    /// on every retry, so this is a definitive negative about that
+    /// witness, not a contended attempt: delivery falls back
+    /// promptly instead of retrying through the watchdog delay.
+    RetainedWitnessMismatch,
 }
 
 /// Only a genuine H3 admission can construct this retained association.

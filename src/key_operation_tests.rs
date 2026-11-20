@@ -26808,6 +26808,179 @@ fn key_operation_schema_v6_pins_newsite_metadata_contract() {
     }
 }
 
+/// Relaxed-dialect fix1: the v9 schema pins the widened template
+/// contract — the metadata_label enum extended by exactly the three
+/// secp256k1/brainpool labels, the class enum extended by exactly
+/// 5..=11, the key-type enum extended by exactly the newly accepted
+/// standard ids, value_len/modulus_bits as closed ranges (1..=4096,
+/// 256..=16384), and the curve enum extended by exactly the three
+/// new names. Every new `KeyLabel` renders its label, and the v9
+/// trigger agrees with the table on all 50 labels.
+#[test]
+fn key_operation_schema_v9_pins_relaxed_metadata_contract() {
+    use crate::key_operation_projection::contract::{
+        CURVE_LABELS_V6, CURVE_LABELS_V9, METADATA_LABELS_V6, METADATA_LABELS_V9,
+    };
+    use crate::key_operation_projection::{is_relaxed_curve_name, is_relaxed_metadata_label};
+    use crate::semantics_key_use::metadata_label;
+    use crate::semantics_objects::KeyLabel;
+    use p11scope_ebpf_common::object_policy::SafeCurve;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    let numbers = |pointer: &str| -> Vec<u64> {
+        schema
+            .pointer(pointer)
+            .expect("pointer present")
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|value| value.as_u64())
+            .collect()
+    };
+    let names = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 9);
+    assert_eq!(
+        required("/$defs/metadata_label/enum"),
+        sorted(
+            METADATA_LABELS_V9
+                .iter()
+                .map(|label| label.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(
+        numbers("/$defs/metadata_field_class/properties/value/enum"),
+        vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "class enum gains exactly 5..=11"
+    );
+    let mut key_types: Vec<u64> = vec![0, 1, 2, 3, 4, 5];
+    key_types.extend(0x10..=0x4b);
+    assert_eq!(
+        numbers("/$defs/metadata_field_key_type/properties/value/enum"),
+        key_types,
+        "key-type enum gains exactly the newly accepted standard ids"
+    );
+    for (def, lo, hi) in [
+        ("metadata_field_value_len", 1, 4096),
+        ("metadata_field_modulus_bits", 256, 16384),
+    ] {
+        let value = schema
+            .pointer(&format!("/$defs/{def}/properties/value"))
+            .expect("pointer present");
+        assert_eq!(
+            value.pointer("/type"),
+            Some(&serde_json::json!(["integer", "null"])),
+            "{def}: ranged value shape"
+        );
+        assert_eq!(
+            value
+                .pointer("/minimum")
+                .and_then(serde_json::Value::as_u64),
+            Some(lo),
+            "{def}: range floor"
+        );
+        assert_eq!(
+            value
+                .pointer("/maximum")
+                .and_then(serde_json::Value::as_u64),
+            Some(hi),
+            "{def}: range ceiling"
+        );
+    }
+    assert_eq!(
+        names("/$defs/metadata_field_curve/properties/value/enum"),
+        sorted(
+            CURVE_LABELS_V9
+                .iter()
+                .map(|name| name.to_string())
+                .collect()
+        )
+    );
+    // The v9 tables extend their frozen parents by exactly the
+    // relaxed rows.
+    assert_eq!(METADATA_LABELS_V9.len(), METADATA_LABELS_V6.len() + 3);
+    assert_eq!(
+        METADATA_LABELS_V9[..47].to_vec(),
+        METADATA_LABELS_V6.to_vec()
+    );
+    assert_eq!(CURVE_LABELS_V9.len(), CURVE_LABELS_V6.len() + 3);
+    assert_eq!(CURVE_LABELS_V9[..7].to_vec(), CURVE_LABELS_V6.to_vec());
+    // Every new label renders; the trigger agrees with the table.
+    let labels: [(KeyLabel, &str); 3] = [
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::Secp256k1,
+            },
+            "ec_secp256k1",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::BrainpoolP256r1,
+            },
+            "ec_brainpoolp256r1",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: SafeCurve::BrainpoolP384r1,
+            },
+            "ec_brainpoolp384r1",
+        ),
+    ];
+    for (label, expected) in labels {
+        assert_eq!(metadata_label(label), expected);
+        assert!(METADATA_LABELS_V9.contains(&expected));
+        assert!(is_relaxed_metadata_label(expected));
+    }
+    for label in METADATA_LABELS_V9 {
+        assert_eq!(
+            is_relaxed_metadata_label(label),
+            !METADATA_LABELS_V6.contains(&label),
+            "{label}"
+        );
+    }
+    for name in CURVE_LABELS_V9 {
+        assert_eq!(
+            is_relaxed_curve_name(name),
+            !CURVE_LABELS_V6.contains(&name),
+            "{name}"
+        );
+    }
+}
+
 /// R2 new-site: the section version follows the content. A scene
 /// whose HKDF key is created in-window (complete finite template, no
 /// query) renders v7 (promotion plus inference) with the HKDF label
@@ -27407,8 +27580,10 @@ fn key_operation_newsite_truncated_template_marks_seen_unsupported_value() {
     use crate::semantics_key_use::KeyUseReducer;
     const TRUNCATED: &str = "template truncated (first 8 attributes captured)";
     const UNSUPPORTED: &str = "template value outside approved finite set";
+    // Fix1: the non-finite probe moves from 100, now an accepted
+    // size, to above the 4096 ceiling.
     for (status, value, case) in [
-        (1u8, 100u16, "non-finite scalar"),
+        (1u8, 5000u16, "non-finite scalar"),
         (2u8, 0u16, "explicit unsupported"),
         (3u8, 0u16, "unavailable"),
         (4u8, 0u16, "size-only"),
@@ -27720,6 +27895,8 @@ fn key_operation_newsite_query_only_edwards_carries_no_curve_reason() {
 /// carries no curve reason — `CKA_EC_PARAMS` lives in the public
 /// template, so its absence from the private half's own template
 /// says nothing about usability. The public half still labels.
+/// Relaxed-dialect fix1 (R9): the private half now inherits the
+/// mate's curve and labels too — still with no curve reason.
 #[test]
 fn key_operation_newsite_generate_pair_private_carries_no_curve_reason() {
     use crate::key_operation_projection::object_observations_json;
@@ -27770,7 +27947,11 @@ fn key_operation_newsite_generate_pair_private_carries_no_curve_reason() {
         Some("creation_success"),
         "the private half's own template promoted"
     );
-    assert_eq!(private.label, None, "no curve on the private half");
+    assert_eq!(
+        private.label,
+        Some("x25519"),
+        "the private half inherits the mate's curve (R9)"
+    );
     assert_eq!(private.requested.ec_params.reason, None);
     assert_eq!(
         private.established.ec_params.reason, None,
@@ -28084,8 +28265,10 @@ fn key_operation_newsite_unsupported_value_alone_triggers_v6() {
         &mut joint,
         &mut keyuse,
         &mut sink,
+        // Fix1: the probe moves from 100, now an accepted size,
+        // to above the 4096 ceiling so the cell stays refused.
         &ShapedS1 {
-            request_cells: vec![(4u8, 1u8, 100u16)],
+            request_cells: vec![(4u8, 1u8, 5000u16)],
             ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
         },
     );

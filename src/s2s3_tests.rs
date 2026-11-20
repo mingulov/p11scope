@@ -66,6 +66,22 @@ const CKA_VALUE: u64 = 0x0011;
 const CKA_SEED: u64 = 0x0637;
 const CKA_PARAMETER_SET: u64 = 0x061d;
 const SECP256R1: [u8; 10] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+// Relaxed-dialect fix1 curve spellings (measured live on SoftHSM 2.6.1
+// query-back; the PrintableString forms are SoftHSM's Edwards output).
+const SECP256K1: [u8; 7] = [0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a];
+const BPOOL256R1: [u8; 11] = [
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x07,
+];
+const BPOOL384R1: [u8; 11] = [
+    0x06, 0x09, 0x2b, 0x24, 0x03, 0x03, 0x02, 0x08, 0x01, 0x01, 0x0b,
+];
+const ED25519_RFC8410: [u8; 5] = [0x06, 0x03, 0x2b, 0x65, 0x70];
+const ED25519_SOFTHSM_STR: [u8; 14] = [
+    0x13, 0x0c, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x32, 0x35, 0x35, 0x31, 0x39,
+];
+const ED448_SOFTHSM_STR: [u8; 12] = [
+    0x13, 0x0a, 0x65, 0x64, 0x77, 0x61, 0x72, 0x64, 0x73, 0x34, 0x34, 0x38,
+];
 
 fn sess(raw: u64) -> SessionHandle {
     SessionHandle::new(raw).expect("nonzero session handle")
@@ -2781,9 +2797,10 @@ fn s2s3_metadata_provenance_classifiers_reject_unsupported_values() {
         AttrObservation::scalar(CKA_CLASS, 4, 4, i).status(),
         QueryStatus::Established
     );
+    // Fix1: the short 4-byte scalar spelling establishes on LP64.
     assert_eq!(
         AttrObservation::scalar(CKA_CLASS, 4, 4, l).status(),
-        QueryStatus::Malformed
+        QueryStatus::Established
     );
     assert_eq!(
         AttrObservation::scalar(CKA_CLASS, 8, 0x8000_0000, l).status(),
@@ -5031,14 +5048,16 @@ fn newsite_derived_hkdf_key_establishes_and_labels() {
     );
 }
 
-// Keymeta §6 generic unlisted-type twin: a creation template carrying
-// an unlisted key type (`CKK_CHACHA20`, 0x33) promotes only the
-// value-length fact — the key type stays unknown and the view never
-// labels. The key is then used under `CKM_CHACHA20`: the use counts
-// (`key_uses` 1) without labeling and without establishing any
-// mechanism-derived fact; the positive use-side family inference is
-// Task 3's §4 engine (a reducer-seam twin beside the source twins in
-// `key_operation_tests.rs`, since `ObjectView` carries no family).
+// Keymeta §6 generic listed-but-unlabeled-type twin (relaxed-dialect
+// fix1: `CKK_CHACHA20`/0x33 is now an accepted standard key type): a
+// creation template carrying it promotes both the key-type and the
+// value-length facts, but the view still never labels (no ChaCha20
+// label arm — establishment only). The key is then used under
+// `CKM_CHACHA20`: the use counts (`key_uses` 1) without labeling and
+// without establishing any mechanism-derived fact; the positive
+// use-side family inference is Task 3's §4 engine (a reducer-seam
+// twin beside the source twins in `key_operation_tests.rs`, since
+// `ObjectView` carries no family).
 #[test]
 fn newsite_created_chacha20_key_promotes_value_len_without_label() {
     let mut h = Hist::qualified();
@@ -5061,8 +5080,8 @@ fn newsite_created_chacha20_key_promotes_value_len_without_label() {
     let v = view(&p, id);
     assert_eq!(
         v.established.field(SafeAttributeKind::KeyType),
-        FieldState::Unknown,
-        "the unlisted key type promotes nothing"
+        scalar_field(0x33),
+        "the listed key type establishes"
     );
     assert_eq!(
         v.established.field(SafeAttributeKind::ValueLen),
@@ -5070,7 +5089,10 @@ fn newsite_created_chacha20_key_promotes_value_len_without_label() {
         "the finite value length still promotes"
     );
     assert_eq!(v.key_uses, 1, "the use under CKM_CHACHA20 still counts");
-    assert_eq!(v.label, None, "a size alone never labels");
+    assert_eq!(
+        v.label, None,
+        "type plus size without a label arm never labels"
+    );
 }
 
 // Keymeta §6 gap re-proof (R2-doc §7.3): a `C_DeriveKey` HKDF result
@@ -5123,9 +5145,10 @@ fn newsite_derived_hkdf_via_derive_key_promotes() {
     );
 }
 
-// Keymeta §6 generic unlisted-type twin (`CKK_POLY1305`, 0x34),
-// through the generate family: same rule — the value length
-// promotes, the type stays unknown, the view stays unlabeled.
+// Keymeta §6 generic listed-but-unlabeled-type twin (`CKK_POLY1305`,
+// 0x34), through the generate family (relaxed-dialect fix1: now an
+// accepted standard key type): same rule — the value length and the
+// type both promote, the view stays unlabeled (no label arm).
 #[test]
 fn newsite_created_poly1305_key_promotes_value_len_without_label() {
     let mut h = Hist::qualified();
@@ -5147,15 +5170,18 @@ fn newsite_created_poly1305_key_promotes_value_len_without_label() {
     let v = view(&p, id);
     assert_eq!(
         v.established.field(SafeAttributeKind::KeyType),
-        FieldState::Unknown,
-        "the unlisted key type promotes nothing"
+        scalar_field(0x34),
+        "the listed key type establishes"
     );
     assert_eq!(
         v.established.field(SafeAttributeKind::ValueLen),
         scalar_field(16),
         "the finite value length still promotes"
     );
-    assert_eq!(v.label, None, "a size alone never labels");
+    assert_eq!(
+        v.label, None,
+        "type plus size without a label arm never labels"
+    );
 }
 
 // Keymeta §6 Edwards/Montgomery join (controller KEYMETA-T1 rulings
@@ -5452,22 +5478,23 @@ fn newsite_created_nine_slot_template_tail_size_stays_unknown() {
 }
 
 // Fix round 3: per-kind presence in the retained window is recorded
-// even for unclassifiable values. A nine-slot template with
-// CKA_VALUE_LEN 100 in-window records the kind as seen (so
+// even for unclassifiable values. A nine-slot template with an
+// above-range CKA_VALUE_LEN in-window records the kind as seen (so
 // projection names the unsupported reason, never the truncation);
 // a complete template with the same cell records seen without
-// truncation.
+// truncation. (Fix1: the probe moves from 100, now an accepted
+// size, to above the 4096 ceiling.)
 #[test]
 fn newsite_created_template_records_seen_kinds_despite_values() {
     use crate::semantics_objects::field_index;
     use p11scope_ebpf_common::object_policy::SafeAttributeKind;
-    // Truncated: ValueLen 100 in-window, modulus in the tail.
+    // Truncated: above-range ValueLen in-window, modulus in the tail.
     let mut h = Hist::qualified();
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     let template = attrs(&[
         scalar(CKA_CLASS, 4),
         scalar(CKA_KEY_TYPE, 0x1f),
-        scalar(CKA_VALUE_LEN, 100),
+        scalar(CKA_VALUE_LEN, 5000),
         scalar(CKA_TOKEN, 1),
         AttrObservation::curve(CKA_EC_PARAMS, &SECP256R1, LinuxLayout::Lp64),
         scalar(CKA_PARAMETER_SET, 1),
@@ -5503,7 +5530,7 @@ fn newsite_created_template_records_seen_kinds_despite_values() {
     let template = attrs(&[
         scalar(CKA_CLASS, 4),
         scalar(CKA_KEY_TYPE, 0x1f),
-        scalar(CKA_VALUE_LEN, 100),
+        scalar(CKA_VALUE_LEN, 5000),
     ]);
     let x = h.run(3, create(SA).request(0, template), 4, ok().result(0, H1));
     let e = h.settle(4);
@@ -5777,4 +5804,514 @@ fn newsite_created_data_object_stays_unlabeled() {
         );
         assert_eq!(v.label, None, "{case}: a data object never labels");
     }
+}
+
+// Relaxed-dialect fix1 table: the same keys under several provider
+// spellings. Every row creates one key from a complete finite
+// template and asserts the established class/type plus the joined
+// label — twins differ only in the dialect (size, curve encoding,
+// standard vs vendor key type) and land on the same label. The
+// BPF/exact-byte halves of these dialects are pinned in
+// `p11scope-ebpf-common` (short words, PrintableString lengths,
+// vendor normalization); these twins pin the model joins.
+#[test]
+fn relaxed_dialect_table_same_keys_many_spellings() {
+    struct Case {
+        name: &'static str,
+        observations: Vec<AttrObservation>,
+        class: u16,
+        key_type: u16,
+        label: KeyLabel,
+    }
+    let curve = |bytes: &[u8]| AttrObservation::curve(CKA_EC_PARAMS, bytes, LinuxLayout::Lp64);
+    let cases = vec![
+        Case {
+            name: "rsa-1536 (all providers)",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0),
+                scalar(CKA_MODULUS_BITS, 1536),
+            ],
+            class: 3,
+            key_type: 0,
+            label: KeyLabel::Rsa { modulus_bits: 1536 },
+        },
+        Case {
+            name: "rsa-512 (softhsm/nss)",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0),
+                scalar(CKA_MODULUS_BITS, 512),
+            ],
+            class: 3,
+            key_type: 0,
+            label: KeyLabel::Rsa { modulus_bits: 512 },
+        },
+        Case {
+            name: "rsa-2048 control",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0),
+                scalar(CKA_MODULUS_BITS, 2048),
+            ],
+            class: 3,
+            key_type: 0,
+            label: KeyLabel::Rsa { modulus_bits: 2048 },
+        },
+        Case {
+            name: "aes-128 control",
+            observations: vec![
+                scalar(CKA_CLASS, 4),
+                scalar(CKA_KEY_TYPE, 0x1f),
+                scalar(CKA_VALUE_LEN, 16),
+            ],
+            class: 4,
+            key_type: 0x1f,
+            label: KeyLabel::Aes { value_len: 16 },
+        },
+        Case {
+            name: "generic-20 (hmac-sha1 size)",
+            observations: vec![
+                scalar(CKA_CLASS, 4),
+                scalar(CKA_KEY_TYPE, 0x10),
+                scalar(CKA_VALUE_LEN, 20),
+            ],
+            class: 4,
+            key_type: 0x10,
+            label: KeyLabel::GenericSecret { value_len: 20 },
+        },
+        Case {
+            name: "generic-64",
+            observations: vec![
+                scalar(CKA_CLASS, 4),
+                scalar(CKA_KEY_TYPE, 0x10),
+                scalar(CKA_VALUE_LEN, 64),
+            ],
+            class: 4,
+            key_type: 0x10,
+            label: KeyLabel::GenericSecret { value_len: 64 },
+        },
+        Case {
+            name: "hmac-sha256 joins like a generic secret",
+            observations: vec![
+                scalar(CKA_CLASS, 4),
+                scalar(CKA_KEY_TYPE, 0x2b),
+                scalar(CKA_VALUE_LEN, 32),
+            ],
+            class: 4,
+            key_type: 0x2b,
+            label: KeyLabel::GenericSecret { value_len: 32 },
+        },
+        Case {
+            name: "hmac-sha512 joins like a generic secret",
+            observations: vec![
+                scalar(CKA_CLASS, 4),
+                scalar(CKA_KEY_TYPE, 0x2d),
+                scalar(CKA_VALUE_LEN, 64),
+            ],
+            class: 4,
+            key_type: 0x2d,
+            label: KeyLabel::GenericSecret { value_len: 64 },
+        },
+        Case {
+            name: "ec p-256 control",
+            observations: vec![
+                scalar(CKA_CLASS, 2),
+                scalar(CKA_KEY_TYPE, 3),
+                curve(&SECP256R1),
+            ],
+            class: 2,
+            key_type: 3,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::Secp256r1,
+            },
+        },
+        Case {
+            name: "ec secp256k1 (softhsm)",
+            observations: vec![
+                scalar(CKA_CLASS, 2),
+                scalar(CKA_KEY_TYPE, 3),
+                curve(&SECP256K1),
+            ],
+            class: 2,
+            key_type: 3,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::Secp256k1,
+            },
+        },
+        Case {
+            name: "ec brainpool p-256r1 (softhsm)",
+            observations: vec![
+                scalar(CKA_CLASS, 2),
+                scalar(CKA_KEY_TYPE, 3),
+                curve(&BPOOL256R1),
+            ],
+            class: 2,
+            key_type: 3,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::BrainpoolP256r1,
+            },
+        },
+        Case {
+            name: "ec brainpool p-384r1 (softhsm)",
+            observations: vec![
+                scalar(CKA_CLASS, 2),
+                scalar(CKA_KEY_TYPE, 3),
+                curve(&BPOOL384R1),
+            ],
+            class: 2,
+            key_type: 3,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::BrainpoolP384r1,
+            },
+        },
+        Case {
+            name: "ed25519 rfc8410 spelling",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0x40),
+                curve(&ED25519_RFC8410),
+            ],
+            class: 3,
+            key_type: 0x40,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::Ed25519,
+            },
+        },
+        Case {
+            name: "ed25519 softhsm string spelling (same key)",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0x40),
+                curve(&ED25519_SOFTHSM_STR),
+            ],
+            class: 3,
+            key_type: 0x40,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::Ed25519,
+            },
+        },
+        Case {
+            name: "ed448 softhsm string spelling",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0x40),
+                curve(&ED448_SOFTHSM_STR),
+            ],
+            class: 3,
+            key_type: 0x40,
+            label: KeyLabel::Ec {
+                curve: SafeCurve::Ed448,
+            },
+        },
+        Case {
+            name: "ml-kem-768 standard spelling",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0x49),
+                scalar(CKA_PARAMETER_SET, 2),
+            ],
+            class: 3,
+            key_type: 0x49,
+            label: KeyLabel::Pqc(PqcCode::MlKem768),
+        },
+        Case {
+            name: "ml-kem-768 nss vendor spelling (same key)",
+            observations: vec![
+                scalar(CKA_CLASS, 3),
+                scalar(CKA_KEY_TYPE, 0xCE53_4356),
+                scalar(CKA_PARAMETER_SET, 2),
+            ],
+            class: 3,
+            key_type: 0x49,
+            label: KeyLabel::Pqc(PqcCode::MlKem768),
+        },
+    ];
+    for case in cases {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        let x = h.run(
+            3,
+            create(SA).request(0, attrs(&case.observations)),
+            4,
+            ok().result(0, H1),
+        );
+        let e = h.settle(4);
+        let id = created(&e, x, 0).unwrap();
+        let p = h.project();
+        let v = view(&p, id);
+        assert_eq!(
+            v.established.field(SafeAttributeKind::Class),
+            scalar_field(case.class),
+            "{}: creation establishes the class",
+            case.name,
+        );
+        assert_eq!(
+            v.established.field(SafeAttributeKind::KeyType),
+            scalar_field(case.key_type),
+            "{}: creation establishes the key type",
+            case.name,
+        );
+        assert_eq!(v.label, Some(case.label), "{}: labels", case.name);
+    }
+}
+
+// Relaxed-dialect fix1 table: listed-but-unlabeled establishment.
+// These key types establish their exact numeric (visible in the
+// objects block, usable for family checks) but form no combined
+// label — the view stays honestly unlabeled instead of refusing
+// the known value.
+#[test]
+fn relaxed_dialect_table_listed_without_label() {
+    struct Case {
+        name: &'static str,
+        observations: Vec<AttrObservation>,
+        class: u16,
+        key_type: Option<u16>,
+    }
+    let cases = vec![
+        Case {
+            name: "des (no value_len attr)",
+            observations: vec![scalar(CKA_CLASS, 4), scalar(CKA_KEY_TYPE, 0x13)],
+            class: 4,
+            key_type: Some(0x13),
+        },
+        Case {
+            name: "des3 (no value_len attr)",
+            observations: vec![scalar(CKA_CLASS, 4), scalar(CKA_KEY_TYPE, 0x15)],
+            class: 4,
+            key_type: Some(0x15),
+        },
+        Case {
+            name: "dsa",
+            observations: vec![scalar(CKA_CLASS, 3), scalar(CKA_KEY_TYPE, 0x01)],
+            class: 3,
+            key_type: Some(0x01),
+        },
+        Case {
+            name: "dh",
+            observations: vec![scalar(CKA_CLASS, 3), scalar(CKA_KEY_TYPE, 0x02)],
+            class: 3,
+            key_type: Some(0x02),
+        },
+        Case {
+            name: "domain parameters class",
+            observations: vec![scalar(CKA_CLASS, 6)],
+            class: 6,
+            key_type: None,
+        },
+    ];
+    for case in cases {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        let x = h.run(
+            3,
+            create(SA).request(0, attrs(&case.observations)),
+            4,
+            ok().result(0, H1),
+        );
+        let e = h.settle(4);
+        let id = created(&e, x, 0).unwrap();
+        let p = h.project();
+        let v = view(&p, id);
+        assert_eq!(
+            v.established.field(SafeAttributeKind::Class),
+            scalar_field(case.class),
+            "{}: creation establishes the class",
+            case.name,
+        );
+        match case.key_type {
+            Some(key_type) => assert_eq!(
+                v.established.field(SafeAttributeKind::KeyType),
+                scalar_field(key_type),
+                "{}: creation establishes the key type",
+                case.name,
+            ),
+            None => assert_eq!(
+                v.established.field(SafeAttributeKind::KeyType),
+                FieldState::Unknown,
+                "{}: absent key type stays unknown",
+                case.name,
+            ),
+        }
+        assert_eq!(v.label, None, "{}: stays unlabeled", case.name);
+    }
+}
+
+// Relaxed-dialect fix1: one refusal degrades one field, never the
+// key. A 4-byte `CK_ULONG` spelling establishes exactly like the
+// 8-byte one; a zero value length (SoftHSM's unwrapped-key
+// provider-unknown) and a reserved key type refuse with the field
+// staying unknown while the known facts stand and the key keeps
+// its row.
+#[test]
+fn relaxed_dialect_refusal_is_per_field() {
+    // 4-byte key-type spelling establishes.
+    let short = AttrObservation::scalar(CKA_KEY_TYPE, 4, 0x2b, LinuxLayout::Lp64);
+    assert_eq!(short.status(), QueryStatus::Established);
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        create(SA).request(
+            0,
+            attrs(&[scalar(CKA_CLASS, 4), short, scalar(CKA_VALUE_LEN, 32)]),
+        ),
+        4,
+        ok().result(0, H1),
+    );
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x2b),
+        "the short-word key type establishes"
+    );
+    assert_eq!(
+        v.label,
+        Some(KeyLabel::GenericSecret { value_len: 32 }),
+        "the short-word key labels"
+    );
+    // Zero value length refuses; the type fact stands, no label.
+    let zero = AttrObservation::scalar(CKA_VALUE_LEN, 8, 0, LinuxLayout::Lp64);
+    assert_eq!(zero.status(), QueryStatus::Unsupported);
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        create(SA).request(
+            0,
+            attrs(&[scalar(CKA_CLASS, 4), scalar(CKA_KEY_TYPE, 0x1f), zero]),
+        ),
+        4,
+        ok().result(0, H1),
+    );
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        scalar_field(0x1f),
+        "the refused length keeps the known type"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::ValueLen),
+        FieldState::Unknown,
+        "the zero length stays unknown"
+    );
+    assert_eq!(v.label, None, "no size, no label — but the key stands");
+    // Reserved key type refuses; the class fact stands.
+    let reserved = AttrObservation::scalar(CKA_KEY_TYPE, 8, 0x06, LinuxLayout::Lp64);
+    assert_eq!(reserved.status(), QueryStatus::Unsupported);
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        create(SA).request(0, attrs(&[scalar(CKA_CLASS, 4), reserved])),
+        4,
+        ok().result(0, H1),
+    );
+    let e = h.settle(4);
+    let id = created(&e, x, 0).unwrap();
+    let p = h.project();
+    let v = view(&p, id);
+    assert_eq!(
+        v.established.field(SafeAttributeKind::Class),
+        scalar_field(4),
+        "the refused type keeps the known class"
+    );
+    assert_eq!(
+        v.established.field(SafeAttributeKind::KeyType),
+        FieldState::Unknown,
+        "the reserved type stays unknown"
+    );
+    assert_eq!(v.label, None, "no type, no label — but the key stands");
+}
+
+// Relaxed-dialect fix1 (R9): an EC-family private half inherits the
+// pair-mate public half's established curve — `CKA_EC_PARAMS` lives
+// in the public template. Same no-new-read argument as RSA. A
+// mismatched Edwards/Montgomery pair still never labels.
+#[test]
+fn relaxed_dialect_ec_private_inherits_public_curve() {
+    for (key_type, params, curve, case) in [
+        (3u64, SECP256R1.as_slice(), SafeCurve::Secp256r1, "p-256"),
+        (
+            3u64,
+            SECP256K1.as_slice(),
+            SafeCurve::Secp256k1,
+            "secp256k1",
+        ),
+        (
+            0x40u64,
+            ED25519_SOFTHSM_STR.as_slice(),
+            SafeCurve::Ed25519,
+            "edwards string spelling",
+        ),
+    ] {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        let x = h.run(
+            3,
+            call("C_GenerateKeyPair").on(SA),
+            4,
+            ok().result(0, H1).result(1, H2),
+        );
+        let public = attrs(&[
+            scalar(CKA_CLASS, 2),
+            scalar(CKA_KEY_TYPE, key_type),
+            AttrObservation::curve(CKA_EC_PARAMS, params, LinuxLayout::Lp64),
+        ]);
+        h.run(5, get_attrs(SA, H1), 6, ok().attrs(public));
+        let private = attrs(&[
+            scalar(CKA_CLASS, 3),
+            scalar(CKA_KEY_TYPE, key_type),
+            AttrObservation::unavailable(CKA_EC_PARAMS),
+        ]);
+        h.run(7, get_attrs(SA, H2), 8, ok().attrs(private));
+        let e = h.settle(8);
+        created(&e, x, 0).expect("the public mate is created");
+        let private_id = created(&e, x, 1).expect("the private mate is created");
+        assert_eq!(
+            view(&h.project(), private_id).label,
+            Some(KeyLabel::Ec { curve }),
+            "{case}: the private half inherits the curve"
+        );
+    }
+    // Mismatch: an Edwards private half with a Montgomery-mated
+    // curve never labels through inheritance.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let public = attrs(&[
+        scalar(CKA_CLASS, 2),
+        scalar(CKA_KEY_TYPE, 0x41),
+        AttrObservation::curve(
+            CKA_EC_PARAMS,
+            &[0x06, 0x03, 0x2b, 0x65, 0x6e],
+            LinuxLayout::Lp64,
+        ),
+    ]);
+    h.run(5, get_attrs(SA, H1), 6, ok().attrs(public));
+    let private = attrs(&[
+        scalar(CKA_CLASS, 3),
+        scalar(CKA_KEY_TYPE, 0x40),
+        AttrObservation::unavailable(CKA_EC_PARAMS),
+    ]);
+    h.run(7, get_attrs(SA, H2), 8, ok().attrs(private));
+    let e = h.settle(8);
+    let private_id = created(&e, x, 1).expect("the private mate is created");
+    assert_eq!(
+        view(&h.project(), private_id).label,
+        None,
+        "mismatched inheritance never labels"
+    );
 }

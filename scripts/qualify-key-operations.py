@@ -71,6 +71,7 @@ OBSERVATIONS_VERSION_V4 = 4
 OBSERVATIONS_VERSION_V5 = 5
 OBSERVATIONS_VERSION_V6 = 6
 OBSERVATIONS_VERSION_V7 = 7
+OBSERVATIONS_VERSION_V9 = 9
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -117,9 +118,22 @@ METADATA_FIELD_VALUES_V6 = {
     "key_type": METADATA_FIELD_VALUES_V5["key_type"] + (66,),
     "value_len": METADATA_FIELD_VALUES_V5["value_len"] + (12, 48),
 }
+# H9 section v9 (relaxed dialects): assigned CKO_* 0..=11, every
+# assigned standard CKK_* (0x00..=0x05|0x10..=0x4b), and closed
+# ranges for the two sizes (range membership is exact, like the
+# tuples: 1..=4096 bytes, 256..=16384 bits). v1-v7 tables frozen.
+METADATA_FIELD_VALUES_V9 = {
+    **METADATA_FIELD_VALUES_V6,
+    "class": tuple(range(0, 12)),
+    "key_type": tuple([0, 1, 2, 3, 4, 5] + list(range(0x10, 0x4c))),
+    "value_len": range(1, 4097),
+    "modulus_bits": range(256, 16385),
+}
 CURVE_LABELS = ("secp256r1", "secp384r1", "secp521r1")
 # H9 section v6 (R2 new-site): the Montgomery/Edwards curve names.
 CURVE_LABELS_V6 = CURVE_LABELS + ("x25519", "x448", "ed25519", "ed448")
+# H9 section v9 (relaxed dialects): secp256k1 + brainpool names.
+CURVE_LABELS_V9 = CURVE_LABELS_V6 + ("secp256k1", "brainpoolp256r1", "brainpoolp384r1")
 QUERY_STATUSES = ("not_queried", "established", "unavailable", "size_only", "unsupported",
                   "malformed", "excluded")
 METADATA_LABELS = ("rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
@@ -160,6 +174,13 @@ NEWSITE_METADATA_LABELS = ("x25519", "x448", "ed25519", "ed448",
                            "generic_256", "generic_384", "generic_other")
 METADATA_LABELS_V6 = METADATA_LABELS_V5 + NEWSITE_METADATA_LABELS
 OBJECT_LABELS_V6 = OBJECT_LABELS_V5 + NEWSITE_METADATA_LABELS
+# H9 section v9 (relaxed dialects): the three secp256k1/brainpool EC
+# labels. Key rows accept the v6/v7 labels plus all three; object
+# views accept the established labels plus PQC plus new-site plus the
+# three (`unknown` stays row-level only).
+RELAXED_METADATA_LABELS = ("ec_secp256k1", "ec_brainpoolp256r1", "ec_brainpoolp384r1")
+METADATA_LABELS_V9 = METADATA_LABELS_V6 + RELAXED_METADATA_LABELS
+OBJECT_LABELS_V9 = OBJECT_LABELS_V6 + RELAXED_METADATA_LABELS
 CATEGORIES = ("digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt", "message_sign",
               "message_verify", "generate_key", "generate_key_pair", "wrap", "unwrap",
@@ -820,17 +841,24 @@ def check_section(section):
     _keys(section, SECTION_KEYS_V3
           if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
                          OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
-                         OBSERVATIONS_VERSION_V7)
+                         OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
                              OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
                              OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
-                             OBSERVATIONS_VERSION_V7),
+                             OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
-    if version >= OBSERVATIONS_VERSION_V6:
+    if version >= OBSERVATIONS_VERSION_V9:
+        labels = METADATA_LABELS_V9
+        obj_labels = OBJECT_LABELS_V9
+        keys = METADATA_KEYS_V5
+        values = METADATA_FIELD_VALUES_V9
+        curves = CURVE_LABELS_V9
+        fields = FIELD_KEYS_V6
+    elif version >= OBSERVATIONS_VERSION_V6:
         labels = METADATA_LABELS_V6
         obj_labels = OBJECT_LABELS_V6
         keys = METADATA_KEYS_V5
@@ -893,8 +921,13 @@ def check_section(section):
     _check_budgets(section["budgets"], len(order), len(objects), len(unknown))
     if version == OBSERVATIONS_VERSION_V6:
         _require_v6_content(section, keys)
-    if version >= OBSERVATIONS_VERSION_V7:
+    # v9 carries v7 shapes (checked above) but earns its version from
+    # relaxed values, not inferred content — so the v7 content demand
+    # is v7-only.
+    if version == OBSERVATIONS_VERSION_V7:
         _require_v7_content(section)
+    if version == OBSERVATIONS_VERSION_V9:
+        _require_v9_content(section)
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
             "unknown": unknown, "gaps": gaps, "unattributed": unattributed}
 
@@ -914,6 +947,38 @@ def _require_v7_content(section):
         if row["subject"] == "key_operation" and row["reason"] in V7_ONLY_GAPS:
             return
     _require(False, "v7 section without inferred content")
+
+
+def _require_v9_content(section):
+    """A v9 section carries a relaxed value outside the v7 enums: a
+    relaxed label or curve name, class 5..=11, a newly accepted key
+    type, or a size outside the v7 lists."""
+    v7_key_types = frozenset((0, 1, 2, 3, 4, 16, 31, 64, 65, 66, 73, 74, 75))
+    v7_value_lens = frozenset((12, 16, 24, 32, 48))
+    v7_modulus = frozenset((1024, 2048, 3072, 4096, 8192))
+    for row in section["key_operations"]:
+        if row["metadata_at_use"] in RELAXED_METADATA_LABELS:
+            return
+    for row in section["objects"]:
+        if row["label"] in RELAXED_METADATA_LABELS:
+            return
+        for block in (row["requested"], row["established"]):
+            cls = block["class"]["value"]
+            if cls is not None and cls > 4:
+                return
+            key_type = block["key_type"]["value"]
+            if key_type is not None and key_type not in v7_key_types:
+                return
+            value_len = block["value_len"]["value"]
+            if value_len is not None and value_len not in v7_value_lens:
+                return
+            modulus = block["modulus_bits"]["value"]
+            if modulus is not None and modulus not in v7_modulus:
+                return
+            if block["ec_params"]["value"] in ("secp256k1", "brainpoolp256r1",
+                                               "brainpoolp384r1"):
+                return
+    _require(False, "v9 section without relaxed content")
 
 
 def _require_v6_content(section, keys):

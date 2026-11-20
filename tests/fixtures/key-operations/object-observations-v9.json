@@ -1,0 +1,373 @@
+{
+  "version": 9,
+  "revision": 9,
+  "status": "populated",
+  "reason": "none",
+  "sessions": [
+    {"session": 1, "origin": "opened", "status": "live"},
+    {"session": 2, "origin": "first_observed", "status": "closed"}
+  ],
+  "objects": [
+    {
+      "object": 11,
+      "session": 1,
+      "origin": "created",
+      "creation": "create",
+      "birth": {"start_ns": 1000, "end_ns": 2000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 4, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 66, "source": null, "reason": null},
+        "token": {"status": "value", "value": 0, "source": null, "reason": null},
+        "value_len": {"status": "value", "value": 48, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 4, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 66, "source": "creation_success", "reason": null},
+        "token": {"status": "value", "value": 0, "source": "query", "reason": null},
+        "value_len": {"status": "value", "value": 48, "source": "creation_success", "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "established",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": "hkdf_384",
+      "successful_references": 15,
+      "successful_key_references": 15,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 12,
+      "session": 1,
+      "origin": "created",
+      "creation": "create",
+      "birth": {"start_ns": 3000, "end_ns": 4000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 3, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 64, "source": null, "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "value", "value": "x25519", "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 3, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 64, "source": "creation_success", "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "value", "value": "x25519", "source": "creation_success", "reason": "curve unusable for key type"},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": null,
+      "successful_references": 4,
+      "successful_key_references": 0,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 13,
+      "session": 1,
+      "origin": "created",
+      "creation": "generate_pair",
+      "birth": {"start_ns": 5000, "end_ns": 6000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 3, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 0, "source": null, "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"},
+        "modulus_bits": {"status": "value", "value": 1536, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"}
+      },
+      "established": {
+        "class": {"status": "value", "value": 3, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 0, "source": "creation_success", "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"},
+        "modulus_bits": {"status": "value", "value": 1536, "source": "creation_success", "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": "template truncated (first 8 attributes captured)"}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": "rsa_other",
+      "successful_references": 9,
+      "successful_key_references": 9,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 14,
+      "session": 1,
+      "origin": "created",
+      "creation": "create",
+      "birth": {"start_ns": 7000, "end_ns": 8000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 3, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 65, "source": null, "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": "template value outside approved finite set"},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"}
+      },
+      "established": {
+        "class": {"status": "value", "value": 3, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 65, "source": "creation_success", "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": "template value outside approved finite set"},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": "template partly read"}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": null,
+      "successful_references": 3,
+      "successful_key_references": 0,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 15,
+      "session": 2,
+      "origin": "first_observed",
+      "creation": null,
+      "birth": null,
+      "lifetime": "retired",
+      "lifetime_reason": "session_closed",
+      "attribution": "downgraded",
+      "attribution_reason": "session_closed",
+      "requested": {
+        "class": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "key_type": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 4, "source": "query", "reason": null},
+        "key_type": {"status": "value", "value": 31, "source": "query", "reason": null},
+        "token": {"status": "value", "value": 1, "source": "query", "reason": null},
+        "value_len": {"status": "value", "value": 32, "source": "query", "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "queries": {
+        "class": "established",
+        "key_type": "established",
+        "token": "established",
+        "value_len": "established",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": "aes_256",
+      "successful_references": 2,
+      "successful_key_references": 1,
+      "accessing_sessions": 0
+    },
+    {
+      "object": 16,
+      "session": 1,
+      "origin": "created",
+      "creation": "generate",
+      "birth": {"start_ns": 9000, "end_ns": 10000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 4, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 19, "source": null, "reason": null},
+        "token": {"status": "value", "value": 0, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 4, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 19, "source": "creation_success", "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": null,
+      "successful_references": 2,
+      "successful_key_references": 2,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 17,
+      "session": 1,
+      "origin": "created",
+      "creation": "generate",
+      "birth": {"start_ns": 11000, "end_ns": 12000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 4, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 43, "source": null, "reason": null},
+        "token": {"status": "value", "value": 0, "source": null, "reason": null},
+        "value_len": {"status": "value", "value": 32, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 4, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 43, "source": "creation_success", "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "value_len": {"status": "value", "value": 32, "source": "creation_success", "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": "generic_256",
+      "successful_references": 5,
+      "successful_key_references": 5,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 18,
+      "session": 1,
+      "origin": "created",
+      "creation": "generate_pair",
+      "birth": {"start_ns": 13000, "end_ns": 14000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 2, "source": null, "reason": null},
+        "key_type": {"status": "value", "value": 3, "source": null, "reason": null},
+        "token": {"status": "value", "value": 0, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "value", "value": "secp256k1", "source": null, "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 2, "source": "creation_success", "reason": null},
+        "key_type": {"status": "value", "value": 3, "source": "creation_success", "reason": null},
+        "token": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "value_len": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "modulus_bits": {"status": "unknown", "value": null, "source": null, "reason": null},
+        "ec_params": {"status": "value", "value": "secp256k1", "source": "creation_success", "reason": null},
+        "parameter_set": {"status": "unknown", "value": null, "source": null, "reason": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "not_queried",
+        "ec_params": "not_queried",
+        "parameter_set": "not_queried"
+      },
+      "label": "ec_secp256k1",
+      "successful_references": 4,
+      "successful_key_references": 4,
+      "accessing_sessions": 1
+    }
+  ],
+  "key_operations": [
+    {"instance": "i3", "object": 11, "category": "sign", "role": "key", "metadata_at_use": "hkdf_384", "unit": "operations", "started": 12, "completed": 12, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0, "inferred_family": {"status": "inferred", "value": "hkdf", "completions": 12}, "inferred_size": {"status": "unknown", "detail": null, "completions": 0}},
+    {"instance": "i3", "object": 13, "category": "verify", "role": "key", "metadata_at_use": "rsa_other", "unit": "operations", "started": 3, "completed": 2, "failed": 1, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0, "inferred_family": {"status": "inferred", "value": "rsa", "completions": 3}, "inferred_size": {"status": "inferred", "detail": {"kind": "rsa_nonstandard", "modulus_bytes": 192, "evidence": "verify_input"}, "completions": 2}},
+    {"instance": "i3", "object": 17, "category": "sign", "role": "key", "metadata_at_use": "generic_256", "unit": "operations", "started": 5, "completed": 5, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0, "inferred_family": {"status": "inferred", "value": "generic_secret", "completions": 5}, "inferred_size": {"status": "unknown", "detail": null, "completions": 0}},
+    {"instance": "i3", "object": 18, "category": "verify", "role": "key", "metadata_at_use": "ec_secp256k1", "unit": "operations", "started": 4, "completed": 4, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0, "inferred_family": {"status": "inferred", "value": "ec", "completions": 4}, "inferred_size": {"status": "inferred", "detail": {"kind": "ec", "curve": "p256", "octets": 64, "evidence": "verify_input"}, "completions": 4}}
+  ],
+  "unknown_key_operations": [
+    {"category": "sign", "reason": "metadata_unknown", "unit": "operations", "completed": 1, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0},
+    {"category": "verify", "reason": "key_join_lost", "unit": "operations", "completed": 1, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0}
+  ],
+  "unattributed": [],
+  "gaps": {
+    "rows": [
+      {"subject": "model", "reason": "session_closed", "repeats": 4}
+    ],
+    "suppressed": 0
+  },
+  "budgets": {
+    "key_rows": {"limit": 65536, "occupied": 4, "refused": 0},
+    "object_rows": {"limit": 65536, "occupied": 8, "refused": 0},
+    "unknown_rows": {"occupied": 2},
+    "encoded_bytes": 9114,
+    "allocation_refused": false,
+    "refusal_reason": "none"
+  }
+}

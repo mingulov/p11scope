@@ -59,6 +59,16 @@ pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// exactly when a row carries non-blank inferred content or a
 /// v7-only gap does; v1–v6 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
+/// Section version 9 (relaxed provider dialects): v7 vocabulary plus
+/// the widened template value sets — assigned `CKO_*` 5..=11, every
+/// assigned standard `CKK_*`, `CKA_VALUE_LEN` 1..=4096,
+/// `CKA_MODULUS_BITS` 256..=16384, secp256k1/brainpool curves — and
+/// the three new EC metadata labels. (Version 8 is the Task 7
+/// provider section under the shared allocator, so this claims 9.)
+/// The renderer emits v9 exactly when a row or block carries a value
+/// outside the v7 enums; v1–v7 output stays byte-stable. Like v7, v9
+/// sections carry the inferred keys on every proved row.
+pub(crate) const OBSERVATIONS_VERSION_V9: u8 = 9;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
 /// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2). The closed
@@ -242,6 +252,20 @@ pub(crate) mod contract {
         "ed25519",
         "ed448",
     ];
+    /// H9 section v9 curve vocabulary (relaxed dialects): the v6
+    /// names plus secp256k1 and the two brainpool names.
+    pub(crate) const CURVE_LABELS_V9: [&str; 10] = [
+        "secp256r1",
+        "secp384r1",
+        "secp521r1",
+        "x25519",
+        "x448",
+        "ed25519",
+        "ed448",
+        "secp256k1",
+        "brainpoolp256r1",
+        "brainpoolp384r1",
+    ];
 
     /// Frozen metadata-at-use labels: established RSA modulus bits, AES
     /// value length in bits, EC finite curve. (R2 new-site: complete
@@ -369,6 +393,61 @@ pub(crate) mod contract {
         "generic_256",
         "generic_384",
         "generic_other",
+    ];
+
+    /// H9 section v9 metadata vocabulary (relaxed dialects): the v6/v7
+    /// labels plus the three secp256k1/brainpool EC labels.
+    pub(crate) const METADATA_LABELS_V9: [&str; 50] = [
+        "rsa_1024",
+        "rsa_2048",
+        "rsa_3072",
+        "rsa_4096",
+        "rsa_other",
+        "aes_128",
+        "aes_192",
+        "aes_256",
+        "aes_other",
+        "ec_p256",
+        "ec_p384",
+        "ec_p521",
+        "unknown",
+        "ml_dsa_44",
+        "ml_dsa_65",
+        "ml_dsa_87",
+        "ml_kem_512",
+        "ml_kem_768",
+        "ml_kem_1024",
+        "slh_dsa_sha2_128s",
+        "slh_dsa_shake_128s",
+        "slh_dsa_sha2_128f",
+        "slh_dsa_shake_128f",
+        "slh_dsa_sha2_192s",
+        "slh_dsa_shake_192s",
+        "slh_dsa_sha2_192f",
+        "slh_dsa_shake_192f",
+        "slh_dsa_sha2_256s",
+        "slh_dsa_shake_256s",
+        "slh_dsa_sha2_256f",
+        "slh_dsa_shake_256f",
+        "x25519",
+        "x448",
+        "ed25519",
+        "ed448",
+        "hkdf_96",
+        "hkdf_128",
+        "hkdf_192",
+        "hkdf_256",
+        "hkdf_384",
+        "hkdf_other",
+        "generic_96",
+        "generic_128",
+        "generic_192",
+        "generic_256",
+        "generic_384",
+        "generic_other",
+        "ec_secp256k1",
+        "ec_brainpoolp256r1",
+        "ec_brainpoolp384r1",
     ];
 
     /// Frozen operation categories: 11 machine operations, 9 direct
@@ -719,6 +798,24 @@ pub(crate) fn is_newsite_metadata_label(label: &str) -> bool {
 /// new-site names. Part of the version trigger behind v6 sections.
 pub(crate) fn is_newsite_curve_name(name: &str) -> bool {
     matches!(name, "x25519" | "x448" | "ed25519" | "ed448")
+}
+
+/// Whether a `metadata_at_use`/object label is one of the three
+/// relaxed-dialect EC labels. Part of the version trigger behind v9
+/// sections; the contract test pins agreement with
+/// `contract::METADATA_LABELS_V9`.
+pub(crate) fn is_relaxed_metadata_label(label: &str) -> bool {
+    matches!(
+        label,
+        "ec_secp256k1" | "ec_brainpoolp256r1" | "ec_brainpoolp384r1"
+    )
+}
+
+/// Whether an `ec_params` block curve name is one of the three
+/// relaxed-dialect names. Part of the version trigger behind v9
+/// sections.
+pub(crate) fn is_relaxed_curve_name(name: &str) -> bool {
+    matches!(name, "secp256k1" | "brainpoolp256r1" | "brainpoolp384r1")
 }
 
 /// One session row: public id, origin, status. No instance: the
@@ -1376,6 +1473,44 @@ fn block_has_named_reason(block: &MetadataBlock) -> bool {
     })
 }
 
+/// Relaxed-dialect content: a relaxed label or curve name in any
+/// row or block, or any established scalar outside the v7 enums
+/// (class 5..=11, a newly accepted key type, a value length outside
+/// 12/16/24/32/48, or modulus bits outside the five listed sizes).
+/// Such a value never rides a version whose vocabulary forbids it.
+fn has_relaxed_content(observations: &ObjectObservations) -> bool {
+    /// The v7 key-type enum (frozen): anything else accepted is v9.
+    const V7_KEY_TYPES: [u16; 13] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x42, 0x49, 0x4a, 0x4b,
+    ];
+    if observations
+        .key_operations
+        .iter()
+        .any(|row| is_relaxed_metadata_label(row.metadata_at_use))
+    {
+        return true;
+    }
+    observations.objects.iter().any(|row| {
+        row.label.is_some_and(is_relaxed_metadata_label)
+            || [row.requested, row.established].iter().any(|block| {
+                block.class.scalar.is_some_and(|scalar| scalar > 4)
+                    || block
+                        .key_type
+                        .scalar
+                        .is_some_and(|scalar| !V7_KEY_TYPES.contains(&scalar))
+                    || block
+                        .value_len
+                        .scalar
+                        .is_some_and(|scalar| !matches!(scalar, 12 | 16 | 24 | 32 | 48))
+                    || block
+                        .modulus_bits
+                        .scalar
+                        .is_some_and(|scalar| !matches!(scalar, 1024 | 2048 | 3072 | 4096 | 8192))
+                    || block.ec_params.curve.is_some_and(is_relaxed_curve_name)
+            })
+    })
+}
+
 /// Whether any field of one established block was proven by a
 /// successful creation return rather than a query.
 fn block_has_creation_source(block: &MetadataBlock) -> bool {
@@ -1422,6 +1557,9 @@ fn has_v7_gap_content(observations: &ObjectObservations) -> bool {
 }
 
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if has_relaxed_content(observations) {
+        return OBSERVATIONS_VERSION_V9;
+    }
     if has_inferred_content(observations) || has_v7_gap_content(observations) {
         return OBSERVATIONS_VERSION_V7;
     }
@@ -1934,16 +2072,18 @@ pub(crate) mod producer {
         // v7 keeps the inferred keys on every proved row, whether a
         // row carries non-blank content or a v7-only gap does, so a
         // gap-driven v7 section still renders all 15 keys per row.
-        // Below v7 every row drops its keys (uniform fill above,
-        // frozen 13 below). Model gaps (collected after this) never
-        // trigger v7, and the at-most-three key-side gaps sort
-        // before them under the 256-cap, so this decision equals the
-        // final one.
+        // v9 keeps them the same way (v9 is v7 shapes plus wider
+        // values). Below v7 every row drops its keys (uniform fill
+        // above, frozen 13 below). Model gaps (collected after this)
+        // never trigger v7 or v9, and the at-most-three key-side gaps
+        // sort before them under the 256-cap, so this decision equals
+        // the final one.
         let v7 = observations.key_operations.iter().any(|row| {
             row.inferred
                 .as_ref()
                 .is_some_and(|keys| keys.is_v7_content())
-        }) || has_v7_gap_content(observations);
+        }) || has_v7_gap_content(observations)
+            || has_relaxed_content(observations);
         if !v7 {
             for row in &mut observations.key_operations {
                 row.inferred = None;
@@ -2242,6 +2382,10 @@ pub(crate) mod producer {
             SafeCurve::X448 => "x448",
             SafeCurve::Ed25519 => "ed25519",
             SafeCurve::Ed448 => "ed448",
+            // Relaxed-dialect fix1 (v9): secp256k1 + brainpool.
+            SafeCurve::Secp256k1 => "secp256k1",
+            SafeCurve::BrainpoolP256r1 => "brainpoolp256r1",
+            SafeCurve::BrainpoolP384r1 => "brainpoolp384r1",
         }
     }
 

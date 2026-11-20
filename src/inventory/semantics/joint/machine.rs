@@ -828,7 +828,10 @@ enum Phase {
         base: u64,
         final_original: bool,
         ring_polled: bool,
-        stash_polled: bool,
+        stash_insert_polled: bool,
+        stash_mismatch_polled: bool,
+        stash_insert_delta: Option<u64>,
+        stash_mismatch_delta: Option<u64>,
     },
 }
 
@@ -4277,7 +4280,10 @@ impl LiveJointMachine {
                                 base,
                                 final_original,
                                 ring_polled: false,
-                                stash_polled: false,
+                                stash_insert_polled: false,
+                                stash_mismatch_polled: false,
+                                stash_insert_delta: None,
+                                stash_mismatch_delta: None,
                             },
                             Ok(Step::Continue),
                         )
@@ -4413,28 +4419,40 @@ impl LiveJointMachine {
                 base,
                 final_original,
                 ring_polled,
-                stash_polled,
+                stash_insert_polled,
+                stash_mismatch_polled,
+                stash_insert_delta,
+                stash_mismatch_delta,
             } => {
                 let mut ring_polled = ring_polled;
-                let mut stash_polled = stash_polled;
+                let mut stash_insert_polled = stash_insert_polled;
+                let mut stash_mismatch_polled = stash_mismatch_polled;
+                let mut stash_insert_delta = stash_insert_delta;
+                let mut stash_mismatch_delta = stash_mismatch_delta;
                 // Each native loss lookup is budgeted before it
                 // runs: an exhausted slice defers the remaining
                 // polls to the next pass instead of reading past
-                // the budget. Both helpers run exactly once per
-                // publication, in the plain commit path's order,
-                // mirroring it: a rise discloses in the next
-                // publication instead of staying silent.
+                // the budget or deadline. The two stash lookups run
+                // separately, in the plain commit path's order; the
+                // insert delta is retained with the pending receipt
+                // when a slice ends between them, and both disclose
+                // together once the mismatch lookup lands.
                 if !ring_polled && budget.available() {
                     budget.spend(1);
                     coordinator.poll_and_disclose_events_ring_loss(lane);
                     ring_polled = true;
                 }
-                if !stash_polled && budget.available() {
+                if !stash_insert_polled && budget.available() {
                     budget.spend(1);
-                    coordinator.poll_and_disclose_length_stash_loss(lane);
-                    stash_polled = true;
+                    stash_insert_delta = lane.poll_length_stash_insert_loss();
+                    stash_insert_polled = true;
                 }
-                if !ring_polled || !stash_polled {
+                if !stash_mismatch_polled && budget.available() {
+                    budget.spend(1);
+                    stash_mismatch_delta = lane.poll_length_stash_mismatch_loss();
+                    stash_mismatch_polled = true;
+                }
+                if !ring_polled || !stash_insert_polled || !stash_mismatch_polled {
                     return (
                         Phase::PublishedLossPoll {
                             receipt,
@@ -4442,11 +4460,19 @@ impl LiveJointMachine {
                             base,
                             final_original,
                             ring_polled,
-                            stash_polled,
+                            stash_insert_polled,
+                            stash_mismatch_polled,
+                            stash_insert_delta,
+                            stash_mismatch_delta,
                         },
                         Ok(Step::Yield),
                     );
                 }
+                coordinator.disclose_retained_length_stash_loss(
+                    lane,
+                    stash_insert_delta,
+                    stash_mismatch_delta,
+                );
                 if final_original {
                     self.finish_receipt = Some(receipt);
                 }

@@ -3237,6 +3237,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
     ) {
         let (insert, mismatch) = lane.poll_length_stash_loss();
+        self.disclose_retained_length_stash_loss(lane, insert, mismatch);
+    }
+
+    /// Disclose retained stash deltas polled one native lookup at a
+    /// time: a rise stages the named loss gap with exact counts; the
+    /// first failed read stages one "loss unknown" gap. The machine
+    /// retains the insert delta across slices and discloses both
+    /// together once the mismatch lookup lands, so one publication
+    /// stages at most one named gap plus one unknown gap.
+    pub(crate) fn disclose_retained_length_stash_loss(
+        &mut self,
+        lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+        insert: Option<u64>,
+        mismatch: Option<u64>,
+    ) {
         if insert.is_some() || mismatch.is_some() {
             self.disclose_length_stash_loss(lane, insert.unwrap_or(0), mismatch.unwrap_or(0));
         }

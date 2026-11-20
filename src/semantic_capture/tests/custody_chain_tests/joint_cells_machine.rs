@@ -3468,9 +3468,7 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
         scene.scene.push(pid, 0, name, seq);
     }
     scene.machine.begin_commit(true).unwrap();
-    let lookups = || {
-        ring_polls.get() + stash_insert_polls.get() + stash_mismatch_polls.get()
-    };
+    let lookups = || ring_polls.get() + stash_insert_polls.get() + stash_mismatch_polls.get();
     let mut publish_call = None;
     let mut first_lookup_call = None;
     let mut published = 0;
@@ -3642,9 +3640,7 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
     }
     scene.enable_finish_fixture(Vec::new());
     scene.begin_finish().unwrap();
-    let lookups = || {
-        ring_polls.get() + stash_insert_polls.get() + stash_mismatch_polls.get()
-    };
+    let lookups = || ring_polls.get() + stash_insert_polls.get() + stash_mismatch_polls.get();
     let mut publish_calls = 0;
     let mut published = 0;
     for _ in 0..512 {

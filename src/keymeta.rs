@@ -52,9 +52,24 @@ const RSA_IDS: &[u64] = &[
     0x00000063, 0x00000064, 0x00000065, 0x00000066, 0x00000067, 0x00001054, 0x00004001, 0x00004002,
 ];
 const EC_IDS: &[u64] = &[
-    0x00001041, 0x00001042, 0x00001043, 0x00001044, 0x00001045, 0x00001046, 0x00001047, 0x00001048,
-    0x00001049, 0x0000104a, 0x00001050, 0x00001051, 0x00001052, 0x00001053, 0x00004038, 0x00004039,
-    NSS_ECDHE_KEY_PAIR_GEN_ID,
+    0x00001041,
+    0x00001042,
+    0x00001043,
+    0x00001044,
+    0x00001045,
+    0x00001046,
+    0x00001047,
+    0x00001048,
+    0x00001049,
+    0x0000104a,
+    0x00001050,
+    0x00001051,
+    0x00001052,
+    0x00001053,
+    0x00004038,
+    0x00004039,
+    // NSS CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN (§4.2 exception).
+    0xCE53_437F,
 ];
 const EDDSA_IDS: &[u64] = &[0x00001057];
 const XEDDSA_IDS: &[u64] = &[0x00004029];
@@ -89,12 +104,15 @@ const GENERIC_SECRET_IDS: &[u64] = &[
     0x0000401c, 0x0000401d,
 ];
 const HKDF_IDS: &[u64] = &[0x0000402a, 0x0000402b];
-const ML_KEM_IDS: &[u64] = &[
-    0x00000017,
-    NSS_KYBER_KEY_PAIR_GEN_ID,
-    NSS_ML_KEM_KEY_PAIR_GEN_ID,
-    NSS_ML_KEM_ID,
-];
+/// The ML-KEM family plus the NSS vendor PQC key-exchange ids
+/// (NSS `lib/util/pkcs11n.h`, `CKM_NSS` = `0xCE534350`): the
+/// deliberate §4.2 exception (owner direction 2026-11-20 — Firefox
+/// post-quantum key exchange is the demo), so every other vendor id
+/// still infers nothing. The legacy Kyber keygen id carries its own
+/// named note: pre-standardization Kyber (system NSS 3.120-era,
+/// gone from NSS 3.129+) infers the ML-KEM family, Kyber's direct
+/// successor, family-only like every keygen id.
+const ML_KEM_IDS: &[u64] = &[0x00000017, 0xCE53_437D, 0xCE53_4380, 0xCE53_4381];
 const ML_DSA_IDS: &[u64] = &[
     0x0000001d, 0x0000001f, 0x00000023, 0x00000024, 0x00000025, 0x00000026, 0x00000027, 0x00000028,
     0x00000029, 0x0000002a, 0x0000002b, 0x0000002c,
@@ -136,35 +154,21 @@ const ECDH1_FAMILY_IDS: &[u64] = &[
     0x00001050, 0x00001051, 0x00001052, 0x00001053, 0x00004038, 0x00004039,
 ];
 /// §4.5 ECDH1 qualifier (Montgomery compatibility): ECMQV excluded.
+/// The trailing id is the NSS ECDHE keygen id (NSS generates X25519
+/// through it — `lib/ssl/ssl3ecc.c` `ssl_CreateECDHEPrivateKey`).
 const ECDH1_QUALIFIED_IDS: &[u64] = &[
     0x00001050,
     0x00001051,
     0x00001053,
     0x00004038,
     0x00004039,
-    NSS_ECDHE_KEY_PAIR_GEN_ID,
+    0xCE53_437F,
 ];
-/// NSS vendor PQC key-exchange ids (NSS `lib/util/pkcs11n.h`,
-/// `CKM_NSS` = `0xCE534350`): the deliberate §4.2 exception (owner
-/// direction 2026-11-20 — Firefox post-quantum key exchange is the
-/// demo), so every other vendor id still infers nothing.
-const NSS_KYBER_KEY_PAIR_GEN_ID: u64 = 0xCE53_437D;
-const NSS_ECDHE_KEY_PAIR_GEN_ID: u64 = 0xCE53_437F;
-const NSS_ML_KEM_KEY_PAIR_GEN_ID: u64 = 0xCE53_4380;
-const NSS_ML_KEM_ID: u64 = 0xCE53_4381;
-/// §5.2 NSS vendor keygen subset (family-only): the ML-KEM keygen
-/// id, the ECDHE keygen id (every curve including X25519 —
-/// `lib/ssl/ssl3ecc.c` `ssl_CreateECDHEPrivateKey`), and the legacy
-/// Kyber keygen id under its own named note (pre-standardization
-/// Kyber, system NSS 3.120-era, gone from NSS 3.129+: it infers the
-/// ML-KEM family, Kyber's direct successor, family-only like every
-/// keygen id). Keygen carries no §5.1 length position, so these
-/// never size.
-const NSS_VENDOR_KEYGEN_FAMILY_ONLY_IDS: &[u64] = &[
-    NSS_KYBER_KEY_PAIR_GEN_ID,
-    NSS_ECDHE_KEY_PAIR_GEN_ID,
-    NSS_ML_KEM_KEY_PAIR_GEN_ID,
-];
+/// §5.2 NSS vendor keygen subset (family-only): the legacy Kyber
+/// keygen id (its own named note on [`ML_KEM_IDS`]), the ECDHE
+/// keygen id, and the ML-KEM keygen id. Keygen carries no §5.1
+/// length position, so these never size.
+const NSS_VENDOR_KEYGEN_FAMILY_ONLY_IDS: &[u64] = &[0xCE53_437D, 0xCE53_437F, 0xCE53_4380];
 const RSA_AES_KEY_WRAP_ID: u64 = 0x00001054;
 const AES_XTS_ID: u64 = 0x00001071;
 pub(crate) const AES_KW_ID: u64 = 0x00002109;
@@ -2268,7 +2272,7 @@ mod tests {
             (0xCE53_4380u64, MlKem), // CKM_NSS_ML_KEM_KEY_PAIR_GEN
             (0xCE53_4381u64, MlKem), // CKM_NSS_ML_KEM
             (0xCE53_437Du64, MlKem), // CKM_NSS_KYBER_KEY_PAIR_GEN (legacy Kyber)
-            (0xCE53_437Fu64, Ec), // CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN
+            (0xCE53_437Fu64, Ec),    // CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN
         ] {
             assert_eq!(infer_family(id), Some(family), "id 0x{id:08x}");
         }

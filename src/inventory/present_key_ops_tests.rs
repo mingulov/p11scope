@@ -621,8 +621,7 @@ fn key_ops_verbose_names_unknown_row_mechanisms() {
     }];
     observations.unknown_key_operations.push(row);
     let presentation = key_ops_presentation(observations);
-    let verbose =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let block = key_ops_block(&verbose);
     assert!(
         block.contains(

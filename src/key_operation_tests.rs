@@ -33063,8 +33063,7 @@ fn keymeta_proved_park_refusal_promotes_to_v7() {
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     for (n, view) in [ids[1], ids[2]].into_iter().enumerate() {
-        let receipt =
-            KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
+        let receipt = KeymetaCtx::receipt(ids[0], "C_UnwrapKey", 0, KeyRole::UnwrappingKey, None);
         let mut c = call("C_UnwrapKey", 7, CkRv::OK.0, 100 + n as u64 * 100);
         c.mechanism = 0x2109;
         c.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NONE;
@@ -33341,8 +33340,16 @@ fn unknown_rows_keep_by_number_mechanism_counts() {
     let mut ctx = KeymetaCtx::new();
     for ts in [100, 200] {
         assert!(
-            ctx.direct("C_GenerateKeyPair", 7, Some(0xCE53_4380), &[], ts, None, None)
-                .is_some(),
+            ctx.direct(
+                "C_GenerateKeyPair",
+                7,
+                Some(0xCE53_4380),
+                &[],
+                ts,
+                None,
+                None
+            )
+            .is_some(),
             "the vendor keygen emits"
         );
     }
@@ -33462,8 +33469,16 @@ fn mechanism_only_v9_keeps_proved_row_inferred_keys() {
     ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 50);
     // Unknown detail without any inferred content.
     assert!(
-        ctx.direct("C_GenerateKeyPair", 7, Some(0xCE53_4380), &[], 100, None, None)
-            .is_some(),
+        ctx.direct(
+            "C_GenerateKeyPair",
+            7,
+            Some(0xCE53_4380),
+            &[],
+            100,
+            None,
+            None
+        )
+        .is_some(),
         "the vendor keygen emits"
     );
     let scene = JointScene::new();
@@ -33549,10 +33564,7 @@ fn unknown_rows_without_mechanisms_stay_below_v9() {
     );
     let section = crate::key_operation_projection::object_observations_json(&committed);
     assert_eq!(section["version"], 1);
-    let mut want: Vec<String> = UNKNOWN_ROW_KEYS
-        .iter()
-        .map(|key| key.to_string())
-        .collect();
+    let mut want: Vec<String> = UNKNOWN_ROW_KEYS.iter().map(|key| key.to_string()).collect();
     want.sort();
     assert_eq!(UNKNOWN_ROW_KEYS_V9.len(), 9, "v9 adds exactly one key");
     for rendered in section["unknown_key_operations"].as_array().unwrap() {
@@ -33577,8 +33589,16 @@ fn unknown_mechanism_overflow_refuses_with_named_gap() {
     let total = MAX_UNKNOWN_MECHANISMS_PER_BUCKET + 6;
     for (n, id) in (0x10000u64..).take(total).enumerate() {
         assert!(
-            ctx.direct("C_GenerateKeyPair", 7, Some(id), &[], 100 + n as u64, None, None)
-                .is_some(),
+            ctx.direct(
+                "C_GenerateKeyPair",
+                7,
+                Some(id),
+                &[],
+                100 + n as u64,
+                None,
+                None
+            )
+            .is_some(),
             "direct {n} emits"
         );
     }
@@ -33624,8 +33644,16 @@ fn unknown_mechanism_detail_merges_across_preservation() {
     let mut main = KeymetaCtx::new();
     let mut other = KeymetaCtx::new();
     assert!(
-        main.direct("C_GenerateKeyPair", 7, Some(0xCE53_4380), &[], 100, None, None)
-            .is_some()
+        main.direct(
+            "C_GenerateKeyPair",
+            7,
+            Some(0xCE53_4380),
+            &[],
+            100,
+            None,
+            None
+        )
+        .is_some()
     );
     assert!(
         other
@@ -33664,15 +33692,11 @@ fn key_operation_schema_v9_pins_unknown_mechanism_keys() {
     };
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let load = |name: &str| -> serde_json::Value {
-        serde_json::from_str(
-            &std::fs::read_to_string(root.join(name)).unwrap(),
-        )
-        .unwrap()
+        serde_json::from_str(&std::fs::read_to_string(root.join(name)).unwrap()).unwrap()
     };
     let schema: serde_json::Value =
         load("docs/schema/inventory-v1-object-observations-v9.schema.json");
-    let v7: serde_json::Value =
-        load("docs/schema/inventory-v1-object-observations-v7.schema.json");
+    let v7: serde_json::Value = load("docs/schema/inventory-v1-object-observations-v7.schema.json");
     let sorted = |values: Vec<String>| -> Vec<String> {
         let mut owned = values;
         owned.sort();
@@ -33715,8 +33739,7 @@ fn key_operation_schema_v9_pins_unknown_mechanism_keys() {
         "mechanism entries require both keys"
     );
     assert_eq!(
-        schema["$defs"]["unknown_row"]["properties"]["mechanisms"]["maxItems"],
-        8,
+        schema["$defs"]["unknown_row"]["properties"]["mechanisms"]["maxItems"], 8,
         "at most 8 detail entries per unknown row"
     );
     let v9_gaps = names(&schema, "/$defs/gap_reason/enum");

@@ -4902,7 +4902,10 @@ fn render_snapshot_inner(
                 if unknown_hidden == 1 {
                     let _ = writeln!(out, "  and 1 more unknown key row (not shown)");
                 } else if unknown_hidden > 1 {
-                    let _ = writeln!(out, "  and {unknown_hidden} more unknown key rows (not shown)");
+                    let _ = writeln!(
+                        out,
+                        "  and {unknown_hidden} more unknown key rows (not shown)"
+                    );
                 }
             }
             // F16 (7.05 PQC): the PQC spotlight names proved uses per

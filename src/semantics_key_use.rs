@@ -2995,22 +2995,15 @@ impl KeyUseReducer {
     /// [`MAX_UNKNOWN_MECHANISMS_PER_BUCKET`] refuses into
     /// [`KeyUseEvidence::unknown_mechanism_refused`] while the row
     /// counters stay exact. Allocation-free.
-    fn unknown_add(
-        &mut self,
-        index: usize,
-        outcome: OperationOutcome,
-        mechanism: Option<u64>,
-    ) {
+    fn unknown_add(&mut self, index: usize, outcome: OperationOutcome, mechanism: Option<u64>) {
         self.unknown_ever_live[index] = true;
         self.unknown[index].add(outcome);
         let Some(id) = mechanism else {
             return;
         };
         if !self.unknown[index].keep_mechanism(id) {
-            self.evidence.unknown_mechanism_refused = self
-                .evidence
-                .unknown_mechanism_refused
-                .saturating_add(1);
+            self.evidence.unknown_mechanism_refused =
+                self.evidence.unknown_mechanism_refused.saturating_add(1);
         }
     }
 
@@ -3752,7 +3745,11 @@ impl KeyUseReducer {
                 // A retired primary's S1 terminal routes once to the
                 // unknown-key summary; its proved bucket already
                 // closed `key_join_lost` above.
-                self.unknown_add(unknown_index(open.category, "key_join_lost"), outcome, open.mechanism);
+                self.unknown_add(
+                    unknown_index(open.category, "key_join_lost"),
+                    outcome,
+                    open.mechanism,
+                );
             }
         }
         if !saw_primary {

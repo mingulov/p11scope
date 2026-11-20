@@ -1495,9 +1495,10 @@ fn has_v9_content(observations: &ObjectObservations) -> bool {
     {
         return true;
     }
-    observations.gaps.iter().any(|gap| {
-        gap.subject == "key_operation" && gap.reason == "unknown_mechanism_rows_refused"
-    })
+    observations
+        .gaps
+        .iter()
+        .any(|gap| gap.subject == "key_operation" && gap.reason == "unknown_mechanism_rows_refused")
 }
 
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {

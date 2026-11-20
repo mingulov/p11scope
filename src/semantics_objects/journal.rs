@@ -7563,7 +7563,24 @@ impl JournalAdapter {
                 {
                     // Independent loss/pending/exhaustion/closure denies
                     // the absorb: refuse with its named disposition below.
-                    gap = other;
+                    if other == JournalGap::H3Pending {
+                        // A verified forward bracket rides fenceless
+                        // pending: carry the audited close into the pin
+                        // so the exact continuation (pin == fault_after,
+                        // live H0 owner, floor) can qualify. No absorb
+                        // counts, no proof conversion, no fence. A stale
+                        // bracket behind the pin keeps its FaultChanged
+                        // void below (never regress, never hide a broken
+                        // reader as pending).
+                        if self.last_fault.is_none_or(|last| audit.fault_after >= last) {
+                            gap = other;
+                            if self.last_fault.is_none_or(|last| audit.fault_after > last) {
+                                self.last_fault = Some(audit.fault_after);
+                            }
+                        }
+                    } else {
+                        gap = other;
+                    }
                 } else {
                     // Post-collection fault: the move landed outside
                     // every collected interval (between collections or
@@ -17423,6 +17440,89 @@ pub(crate) mod tests {
                 SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect("kept inputs seal at the carried epoch");
+    }
+
+    #[test]
+    fn seal_chain_h3_loss_then_pending_carries_baseline() {
+        // Loss-then-pending at the new epoch: a chain collection at 8/8
+        // refused for real H3 loss voids with H3Loss (fence, ack, pin
+        // stays 7); the next genuinely pending collection at 8/8 must
+        // not stick on the stale pin. It refuses with H3Pending and
+        // carries 8, so the continuation can qualify without waiting
+        // for the watchdog.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        assert_eq!(scene.adapter.last_fault, Some(7));
+        // First quantum at the new epoch: real H3 loss.
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut loss_audit = scene.audit();
+        loss_audit.fault_before = 8;
+        loss_audit.fault_after = 8;
+        loss_audit.h0_below = 8;
+        loss_audit.h3 = H3DispositionEvidence::scripted_loss(7);
+        let loss = scene
+            .seal_explicit(
+                &loss_audit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("chain plus H3 loss must void");
+        assert_eq!(loss.gap, JournalGap::H3Loss);
+        assert!(loss.fence.is_some(), "the loss void fences");
+        assert_eq!(loss.h3_voided, Some(8));
+        assert_eq!(
+            scene.adapter.last_fault,
+            Some(7),
+            "the loss void leaves the native pin for the pending carry"
+        );
+        // Second quantum at the same epoch: genuinely pending H3 with
+        // a retained floor below the watermark.
+        scene.attest();
+        let again = begin_bytes(1, 3, create, 0);
+        scene.ingest(&again);
+        scene.ingest(&end_bytes(&again, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        scene.prepare_claims();
+        let frontier2 = scene.adapter.consumed_frontier();
+        let mut pending_audit = scene.audit();
+        pending_audit.fault_before = 8;
+        pending_audit.fault_after = 8;
+        pending_audit.h0_below = 8;
+        pending_audit.h3 = H3DispositionEvidence::scripted_clean_pending(7, Some(4));
+        let pending = scene
+            .seal_explicit(
+                &pending_audit,
+                &bootstrap,
+                frontier2,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("chain plus H3 pending must not absorb");
+        assert_eq!(pending.gap, JournalGap::H3Pending);
+        assert_eq!(pending.fence, None, "pending fences nothing");
+        assert_eq!(
+            scene.adapter.last_fault,
+            Some(8),
+            "the pending refusal carries the verified chain close"
+        );
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.audit_h3_loss, 1);
+        assert_eq!(after.audit_fault_absorbed_chain, 0);
+        assert_eq!(after.audit_fault_absorbed_reread, 0);
     }
 
     #[test]

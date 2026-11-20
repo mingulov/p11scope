@@ -4650,13 +4650,13 @@ fn joint_machine_first_call_after_unadmitted_sighting_still_births_joint() {
     );
 }
 
-/// Machine cadence: a seal stalled in Audited re-observes
-/// take-raced keys before its next attempt. The wedged commit
-/// pends without progress; the hook drains the queued interest
-/// through the take-refresh sweep (a stale slot drops without
-/// scanning) while the service still yields Pending. Scanning
-/// and stash content ride the capture-level sweep twins; this
-/// twin pins the Audited wiring only.
+/// Machine cadence: a seal stalled in Audited re-observes one
+/// take-raced key before its next attempt. The wedged commit
+/// pends without progress; the credited step drains the queued
+/// interest (a stale slot drops without scanning) while the
+/// service still yields Pending. Scanning and stash content ride
+/// the capture-level step twins; this twin pins the Audited
+/// wiring only.
 #[test]
 fn joint_audited_retry_sweeps_queued_take_refresh() {
     let mut scene = primed_scene(1);
@@ -4680,7 +4680,7 @@ fn joint_audited_retry_sweeps_queued_take_refresh() {
     );
     scene.machine.pose_no_progress_poll_for_test(true);
     // A stale take-refresh interest: slot 99 resolves nowhere, so
-    // the sweep drains it without scanning.
+    // the credited step drains it without scanning.
     {
         let held = scene.scene.real.h0.0.borrow();
         held.capture.request_partition_refresh(
@@ -4700,7 +4700,7 @@ fn joint_audited_retry_sweeps_queued_take_refresh() {
     }
     for _ in 0..4 {
         let outcome = scene
-            .service(1)
+            .service(10)
             .expect("a wedged Audited poll yields Pending");
         assert!(
             matches!(
@@ -4780,14 +4780,7 @@ fn joint_audited_retry_preserves_refresh_on_exhausted_credit() {
             "precondition: the raced take queued its key"
         );
     }
-    let scans_before = scene
-        .scene
-        .real
-        .h0
-        .0
-        .borrow()
-        .capture
-        .take_refresh_scans();
+    let scans_before = scene.scene.real.h0.0.borrow().capture.take_refresh_scans();
     let io_before = scene.scene.real.h0.0.borrow().io.scan_results.len();
     for _ in 0..2 {
         let outcome = scene
@@ -4820,9 +4813,7 @@ fn joint_audited_retry_preserves_refresh_on_exhausted_credit() {
         );
     }
     assert_eq!(phase_of(&scene), "Audited");
-    let outcome = scene
-        .service(10)
-        .expect("the next credited step runs");
+    let outcome = scene.service(10).expect("the next credited step runs");
     assert!(
         matches!(
             outcome,
@@ -4902,14 +4893,7 @@ fn joint_audited_retry_preserves_refresh_on_past_deadline() {
             "precondition: the raced take queued its key"
         );
     }
-    let scans_before = scene
-        .scene
-        .real
-        .h0
-        .0
-        .borrow()
-        .capture
-        .take_refresh_scans();
+    let scans_before = scene.scene.real.h0.0.borrow().capture.take_refresh_scans();
     let io_before = scene.scene.real.h0.0.borrow().io.scan_results.len();
     let past = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
@@ -4945,9 +4929,7 @@ fn joint_audited_retry_preserves_refresh_on_past_deadline() {
         );
     }
     assert_eq!(phase_of(&scene), "Audited");
-    let outcome = scene
-        .service(10)
-        .expect("the next live-deadline step runs");
+    let outcome = scene.service(10).expect("the next live-deadline step runs");
     assert!(
         matches!(
             outcome,

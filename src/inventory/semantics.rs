@@ -782,11 +782,15 @@ pub(crate) trait LaneTestIo {
     ) -> Option<CurrentPartitionReceipt> {
         None
     }
-    /// Machine cadence: re-observe take-raced keys while a seal
-    /// retry stalls. Test owners without a substituted H0 stay a
-    /// pure no-op; owners with one run the real sweep through
-    /// their substituted I/O and stash.
-    fn service_take_refresh_sweep(&mut self) -> bool {
+    /// Machine cadence: re-observe one take-raced key while a
+    /// seal retry stalls. Test owners without a substituted H0
+    /// stay a pure no-op; owners with one run the real budgeted
+    /// step through their substituted I/O and stash.
+    fn service_take_refresh_sweep(
+        &mut self,
+        _budget: &mut usize,
+        _service_deadline: Instant,
+    ) -> bool {
         false
     }
     fn stash_admission_evidence(
@@ -2412,17 +2416,26 @@ impl AttestedSemanticLane {
             .map_or(0, |live| live.capture.take_refresh_scans())
     }
 
-    /// Machine cadence: re-observe take-raced keys while a seal
-    /// retry stalls, so the next attempt validates against
-    /// current truth. The sweep report stashes for the next tick
+    /// Machine cadence: re-observe one take-raced key while a
+    /// seal retry stalls, so the next attempt validates against
+    /// current truth. The step report stashes for the next tick
     /// merge (receipts, outcomes and disclosures ride the batch);
-    /// scan refusals count beside the tick's. True when a sweep
-    /// ran. No queued interests means no raced take, and the
-    /// service stays a pure no-op.
-    pub(crate) fn service_take_refresh_sweep(&mut self) -> bool {
+    /// scan refusals count beside the tick's. True when a step
+    /// ran. Debit before work: an exhausted credit or a past
+    /// service deadline preserves every interest with zero new
+    /// I/O. No queued interests means no raced take, and the
+    /// service stays a pure no-op without spending.
+    pub(crate) fn service_take_refresh_sweep(
+        &mut self,
+        budget: &mut usize,
+        service_deadline: Instant,
+    ) -> bool {
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
-            return test.service_take_refresh_sweep();
+            return test.service_take_refresh_sweep(budget, service_deadline);
+        }
+        if *budget == 0 || Instant::now() >= service_deadline {
+            return false;
         }
         let Some(live) = self.live.as_deref_mut() else {
             return false;
@@ -2430,8 +2443,9 @@ impl AttestedSemanticLane {
         if !live.capture.has_queued_take_refresh() {
             return false;
         }
-        let pins = live.capture.refresh_target_pins();
-        let mut report = live.capture.sweep_take_refresh(&mut live.session, &pins);
+        let mut report =
+            live.capture
+                .sweep_take_refresh(&mut live.session, budget, service_deadline);
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);

@@ -13536,6 +13536,414 @@ fn joint_machine_idle_void_drops_call_held_behind_running_call() {
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
+/// The stranded staged disposal with a long surviving bucket is
+/// resumable under the void work budget: at most 64 leaf units per
+/// credit, holding the fenced void and deferring collection and gap
+/// disclosure until disposal completes. One held head plus 65
+/// colliding survivors force multi-credit disposal at 64 units.
+#[test]
+fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_key_use::FeedMode;
+    use crate::semantics_objects::journal::StagingLedger;
+    let mut fixture = MachineScene::new(2);
+    fixture.prime(2);
+    let prime_staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .staged_keys_for_test();
+    let prime_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    let pid = std::process::id();
+    let (begin_a, _end_a) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let (begin_b, end_b) = fixture.scene.encoded(pid, 1, "C_SignInit", 4);
+    for bytes in [begin_a.to_vec(), begin_b.to_vec(), end_b.to_vec()] {
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    fixture.reach_phase("Audited");
+    let progress = fixture.service(1);
+    assert_eq!(
+        fixture.machine.retained_consumer_progress_for_test(),
+        Some((1, 1, 1)),
+        "the seal waits behind the running call"
+    );
+    assert_eq!(progress, Ok(JointServiceProgress::Pending));
+    fixture.published_labeled("held-behind-running-call", None);
+    let feed_state = |fixture: &MachineScene, file: usize| {
+        let registry = fixture.scene.real.scene.coordinator.registry();
+        let module = registry
+            .modules()
+            .find(|module| module.key == fixture.scene.real.modules[file].0)
+            .unwrap()
+            .id;
+        let edges: Vec<_> = registry
+            .instance_semantic_edges()
+            .filter(|record| record.module == module)
+            .collect();
+        assert_eq!(edges.len(), 1, "one incarnation per provider");
+        let feed = &edges[0].feed;
+        (
+            feed.mode(),
+            feed.staged_len(),
+            feed.reduced(),
+            feed.fallback_replayed(),
+            feed.fell_back(),
+            feed.degraded_loss(),
+            feed.history_disposed(),
+            feed.segment_fence_for_test(),
+        )
+    };
+    let premise = feed_state(&fixture, 1);
+    assert_eq!(premise.0, FeedMode::Joint, "held feed stays joint");
+    assert_eq!(premise.1, 1, "one held head staged");
+    let held_staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .staged_keys_for_test();
+    let mut new_keys = Vec::new();
+    for key in &held_staged {
+        if !prime_staged.contains(key) {
+            new_keys.push(*key);
+        }
+    }
+    assert_eq!(
+        new_keys.len(),
+        1,
+        "one held head staged: prime={prime_staged:?} held={held_staged:?}"
+    );
+    let (held_ns, held_val) = new_keys[0];
+    let held_bucket = StagingLedger::staged_bucket_for_test(held_ns, held_val);
+    const SURVIVORS: usize = 65;
+    const MODEL_BASE: u64 = 800_000;
+    const MODEL_BYTES: u64 = 20;
+    let mut colliding = Vec::new();
+    for token in MODEL_BASE..(MODEL_BASE + 200_000) {
+        if StagingLedger::model_bucket_for_test(token) == held_bucket {
+            colliding.push(token);
+            if colliding.len() >= SURVIVORS {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        colliding.len(),
+        SURVIVORS,
+        "65 colliding survivors exist around bucket {held_bucket}"
+    );
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let ledger = coordinator.joint_capture_mut().ledger_mut();
+        for token in &colliding {
+            ledger.charge_model(*token, MODEL_BYTES).unwrap();
+        }
+    }
+    let with_survivors = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(
+        with_survivors[2],
+        prime_roles[2] + SURVIVORS,
+        "the 65 survivors are retained models"
+    );
+    assert_eq!(
+        with_survivors[3],
+        prime_roles[3] + 1,
+        "the held head is the one new staged member"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(pid, 1, "C_SignInit", 5);
+    let initial_h8 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test()[1];
+    assert!(initial_h8 > 0, "the void has sweep work: {initial_h8}");
+    let mut void_started = false;
+    for _ in 0..16 {
+        fixture
+            .service(1)
+            .expect("starting the void never refuses");
+        let capture = fixture.scene.real.scene.coordinator.joint_capture();
+        if capture.void_cleanup_pending() || capture.pending_void_for_test().is_some() {
+            void_started = true;
+            break;
+        }
+    }
+    assert!(void_started, "the broken stream starts its void");
+    assert_eq!(
+        feed_state(&fixture, 1).1,
+        1,
+        "starting the sweep stages nothing and disposes nothing"
+    );
+    let mut sweep_credits = 0;
+    let mut saw_partial = false;
+    for _ in 0..256 {
+        let h8 = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[1];
+        let published = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some();
+        if h8 == 0 && published {
+            break;
+        }
+        if h8 < initial_h8 {
+            saw_partial = true;
+        }
+        fixture
+            .service(1)
+            .expect("the sweep credit never refuses");
+        sweep_credits += 1;
+        let after = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[1];
+        if after < initial_h8 && after > 0 {
+            saw_partial = true;
+        }
+    }
+    let swept_h8 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test()[1];
+    assert_eq!(swept_h8, 0, "the sweep empties its members");
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the completed sweep publishes its fenced failure"
+    );
+    assert!(
+        saw_partial || sweep_credits > 1,
+        "the 4,096-slot sweep progresses over multiple credits"
+    );
+    assert_eq!(
+        feed_state(&fixture, 1).1,
+        1,
+        "the sweep completion must not dispose the held head synchronously"
+    );
+    let swept_staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .staged_keys_for_test();
+    assert!(
+        swept_staged.contains(&(held_ns, held_val)),
+        "the held staged member survives the sweep: {swept_staged:?}"
+    );
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        !gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_void_ingest_break_loss_history_loss".to_string()
+        )),
+        "the gap discloses after disposal, not with the sweep: {gaps:?}"
+    );
+    let disposed_before = fixture.disposed_total();
+    let unknown_before = fixture.unknown_terminals();
+    let held_reduced_before = feed_state(&fixture, 1).2;
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .reset_test_slot_visits_for_test();
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .reset_test_sweep_visits_for_test();
+    fixture
+        .service(1)
+        .expect("the first disposal credit never refuses");
+    let first_lookups = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .test_slot_visits_for_test();
+    let first_sweep = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .test_sweep_visits_for_test();
+    assert_eq!(
+        first_lookups, 62,
+        "two feed visits plus 62 chain visits fill the 64-unit credit"
+    );
+    assert_eq!(first_sweep, 0, "no unlink starts before its lookup completes");
+    assert_eq!(
+        feed_state(&fixture, 1).1,
+        1,
+        "a full disposal credit preserves the held head"
+    );
+    let partial_staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .staged_keys_for_test();
+    assert!(
+        partial_staged.contains(&(held_ns, held_val)),
+        "the held member survives a partial disposal credit"
+    );
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the resumable disposal must not refuse: {reason:?}"),
+        }
+    }
+    assert!(published, "the post-disposal frame publishes");
+    assert_eq!(
+        fixture.disposed_total(),
+        disposed_before + 1,
+        "the disposal counts the held call once"
+    );
+    assert_eq!(
+        fixture.unknown_terminals(),
+        [
+            unknown_before[0],
+            unknown_before[1],
+            unknown_before[2],
+            unknown_before[3] + 1
+        ],
+        "the held call's truncated open stands as an unknown-key row"
+    );
+    let held = feed_state(&fixture, 1);
+    assert_eq!(held.0, FeedMode::S1Only, "the void ends the held segment");
+    assert_eq!(held.1, 0, "nothing staged after disposal");
+    assert_eq!(
+        held.2,
+        held_reduced_before + 1,
+        "the post-void call replays instead of disposing"
+    );
+    let done_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(
+        done_roles[2],
+        prime_roles[2] + SURVIVORS,
+        "the 65 survivors stay live through disposal"
+    );
+    {
+        let coordinator = &mut fixture.scene.real.scene.coordinator;
+        let ledger = coordinator.joint_capture_mut().ledger_mut();
+        assert!(
+            ledger.charge_model(colliding[0], MODEL_BYTES).is_err(),
+            "a surviving model is still present"
+        );
+        assert!(
+            ledger.charge_model(900_000, MODEL_BYTES).is_ok(),
+            "the table has room: the refusal above is presence, not Full"
+        );
+        ledger.release_model(900_000);
+    }
+    let done_gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        done_gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_void_ingest_break_loss_history_loss".to_string()
+        )),
+        "the disposal still discloses its fenced loss: {done_gaps:?}"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
 /// The linked-stream void with colliding retained H8 entries is resumable
 /// under the Finish work budget: at most 64 leaf units per credit (INV-2),
 /// holding the fenced void and deferring collection until cleanup

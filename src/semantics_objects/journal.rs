@@ -17526,6 +17526,117 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn seal_chain_h3_pending_distinguishes_later_reread_from_stale_bracket() {
+        // Later-reread vs stale-bracket twins for the pending carry: the
+        // seal-time cell reads 9 while the audited bracket is 8/8. A
+        // forward bracket from pin 7 carries 8 into the pending refusal
+        // (H3Pending, no fence, no ack, no absorbs); a stale bracket
+        // behind pin 9 keeps its FaultChanged void (fence, one void, pin
+        // stays 9). The steady-cell twins above cannot tell these apart.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        for (pin, gap, carried) in [
+            (7, JournalGap::H3Pending, 8),
+            (9, JournalGap::FaultChanged, 9),
+        ] {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            let bootstrap = scene.bootstrap(proof, 0);
+            scene
+                .seal(&bootstrap)
+                .expect("clean seal pins the baseline");
+            assert_eq!(scene.adapter.last_fault, Some(7));
+            if pin == 9 {
+                // Advance the pin past the bracket under test: a clean
+                // 9/9 collection absorbs the post-collection move.
+                scene.attest();
+                let advance = begin_bytes(1, 2, create, 0);
+                scene.ingest(&advance);
+                scene.ingest(&end_bytes(&advance, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+                scene
+                    .seal_at(&bootstrap, 9)
+                    .expect("clean 9/9 absorbs to pin 9");
+                assert_eq!(scene.adapter.last_fault, Some(9));
+            }
+            scene.attest();
+            let next = begin_bytes(1, 3, create, 0);
+            scene.ingest(&next);
+            scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+            scene.prepare_claims();
+            let frontier = scene.adapter.consumed_frontier();
+            let mut reaudit = scene.audit();
+            reaudit.fault_before = 8;
+            reaudit.fault_after = 8;
+            reaudit.h0_below = 8;
+            reaudit.h3 = H3DispositionEvidence::scripted_clean_pending(3, Some(4));
+            let before = scene.adapter.joint_void_diagnosis();
+            // The seal-time reread lands after the audited close: only
+            // the audited bracket decides forward vs stale.
+            let cell = ScriptedFaultCell::steady(9);
+            let failure = scene
+                .adapter
+                .seal(
+                    &mut scene.model,
+                    &reaudit,
+                    &bootstrap,
+                    frontier,
+                    &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                        &bootstrap,
+                    )),
+                    &cell,
+                )
+                .expect_err("chain plus pending with a later reread must refuse");
+            assert_eq!(failure.gap, gap, "pin {pin} with seal reread 9");
+            assert_eq!(failure.h3_voided, None, "neither arm acknowledges H3");
+            assert_eq!(
+                scene.adapter.last_fault,
+                Some(carried),
+                "pin {pin} carries its own close"
+            );
+            let after = scene.adapter.joint_void_diagnosis();
+            if pin == 7 {
+                assert_eq!(failure.fence, None, "forward pending fences nothing");
+                assert_eq!(after.void_audit, before.void_audit, "pending voids nothing");
+                assert_eq!(
+                    after.audit_fault_absorbed_chain, before.audit_fault_absorbed_chain,
+                    "the carry absorbs nothing"
+                );
+                assert_eq!(
+                    after.audit_fault_absorbed_reread, before.audit_fault_absorbed_reread,
+                    "the carry absorbs nothing"
+                );
+            } else {
+                assert!(
+                    failure.fence.is_some(),
+                    "the stale bracket keeps its void fence"
+                );
+                assert_eq!(
+                    after.void_audit,
+                    before.void_audit + 1,
+                    "the stale bracket voids once"
+                );
+                assert_eq!(
+                    after.audit_fault_changed_chain,
+                    before.audit_fault_changed_chain + 1,
+                    "the stale bracket counts its chain site"
+                );
+                assert_eq!(
+                    after.audit_fault_absorbed_chain, before.audit_fault_absorbed_chain,
+                    "the stale void absorbs nothing"
+                );
+                assert_eq!(
+                    after.audit_fault_absorbed_reread, before.audit_fault_absorbed_reread,
+                    "the stale void absorbs nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn void_wiped_wrong_descriptor_end_taints() {
         // Mismatched late END after a global void wipe: the release
         // excuses the missing BEGIN (loss of model continuity), never a

@@ -29437,6 +29437,544 @@ fn joint_chain_plus_h3_pending_carries_baseline_and_defers() {
 }
 
 #[test]
+fn joint_h3_loss_then_pending_carries_baseline_through_coordinator() {
+    // Real loss-then-pending carry across one coordinator, with no
+    // posed era: a route-waiting original sheds when the native era
+    // moves (the health tick emits a positioned FaultEra invalidation
+    // and the router audit sheds the waiter), the staged shed voids
+    // the first frame as H3Loss with a named fence and exactly-once
+    // acknowledgement, and an H0-owned original at the new era then
+    // produces a pending second frame that carries the verified chain
+    // close instead of sticking on the pin the loss left behind. The
+    // second frame cannot defer yet (the loss ended every Joint feed,
+    // so its claimed call never took the feed-staged H9 charge the
+    // continuation requires): defer/finish/disposal after a loss
+    // needs feed clean-point recovery first, which is follow-up work.
+    struct ChangedFault;
+    impl crate::semantics_objects::journal::FaultEpoch for ChangedFault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(1)
+        }
+    }
+    let mut fixture = CanonicalFanoutScene::prior_sealed_with_providers(1);
+    let h3_f0 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .reference_h3_audit_state();
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(0),
+        "the prior publication pins the native baseline"
+    );
+    let a = std::process::id();
+    let child_c = OwnedStoppedChild::new();
+    let c = child_c.id();
+    let c_image = ImageIdentity {
+        task_cookie: 73,
+        exec_id: 0,
+    };
+    let _c_caller = fixture.scene.real.bind(c, c_image, 0);
+    fixture.scene.push(c, 0, "C_SignInit", 1);
+    // First frame's collection at the old era: C waits for its scan
+    // and nothing joins, so the staged era-move batch carries only
+    // the invalidation and the shed waiter.
+    let mut raw = fixture.scene.collect_with_fault(&BirthFault);
+    let first = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(c_image.task_cookie);
+        let first = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(first.calls().count(), 0);
+        first
+    };
+    assert!(first.calls().next().is_none());
+    let c_floor = first.awaiting_floor().expect("C waits for its scan");
+    assert_eq!(c_floor, 3);
+    let alloc_before_era_move = first.allocated_below();
+    let shed_report = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *h0;
+        io.script.fail_cookie = None;
+        // The real health transition into the new era: production
+        // allocates and emits a positioned FaultEra invalidation and
+        // the router audit sheds the route-waiting original.
+        io.script.last_health.fault = 1;
+        let completed = capture.tick_collected_with(io, &mut raw).unwrap();
+        assert_eq!(completed.calls().count(), 1);
+        let shed = completed.calls().next().unwrap();
+        assert_eq!(shed.position(), Some(c_floor));
+        assert_eq!(
+            shed.route(),
+            crate::discovery::instances::Route::Unknown(
+                crate::discovery::instances::UnknownReason::FaultEra
+            )
+        );
+        let invalidation = completed
+            .outcomes()
+            .iter()
+            .find_map(|outcome| match outcome {
+                TickOutcome::Invalidation(invalidation) => Some(invalidation),
+                _ => None,
+            })
+            .expect("the era move emits its invalidation");
+        assert!(matches!(invalidation.scope(), InvalidationScope::FaultEra));
+        assert_eq!(
+            invalidation.position(),
+            Some(alloc_before_era_move),
+            "the invalidation takes the next position"
+        );
+        assert_eq!(completed.allocated_below(), alloc_before_era_move + 1);
+        assert_eq!(completed.awaiting_floor(), None);
+        assert!(stash.min_outcome_position().is_none());
+        completed
+    };
+    let batch1 = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        shed_report,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    let prior_objects = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .objects;
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch1);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    assert_eq!(
+        coordinator
+            .prepared_semantic_batch()
+            .unwrap()
+            .admissions()
+            .count(),
+        0,
+        "the shed waiter admits nothing"
+    );
+    let ingested = raw
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("shed quantum ingests: {reason:?}"));
+    assert!(
+        coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!coordinator.stage_next_prepared_admission(false, true));
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    // The seal reads the live new era over the old-era collection: a
+    // reread FaultChanged denied by staged H3 loss.
+    let mut q1 = acquire(
+        &mut fixture.scene,
+        ingested,
+        &fixture.attached,
+        &ChangedFault,
+    );
+    let loss = q1
+        .failure_for_test()
+        .expect("the shed era-move voids as H3 loss");
+    assert_eq!(
+        loss.gap,
+        crate::semantics_objects::journal::JournalGap::H3Loss
+    );
+    assert!(
+        matches!(
+            q1.audit_for_test().h3_for_test(),
+            H3DispositionEvidence::StagedLoss { barrier } if *barrier == c_floor
+        ),
+        "the shed waiter is the loss barrier"
+    );
+    let voided = loss
+        .h3_voided
+        .expect("the loss barrier needs acknowledgement");
+    assert!(loss.fence.is_some(), "the loss void names its fence");
+    for object in &prior_objects {
+        assert!(loss.effects.effects.iter().any(|effect| matches!(effect, ObjectEffect::Retired { object: id, reason: ObjectGap::OutcomeLost } if *id == object.id)));
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(0),
+        "the loss void leaves the pin for the pending carry"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 1);
+    assert_eq!(diagnosis.audit_h3_loss, 1);
+    assert_eq!(diagnosis.audit_fault_absorbed_chain, 0);
+    assert_eq!(diagnosis.audit_fault_absorbed_reread, 0);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0,
+        "no acknowledgement before actual fanout/disposal"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (h3_f0.0 + 1, false)
+    );
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q1.seal_next(&mut ports, &mut NoFrameBirths, &ChangedFault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            q1.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::LocalPending)
+        );
+        q1 = match q1.finish_frame(&mut ports) {
+            Err((original, reason)) => {
+                assert_eq!(reason, RawQuantumRefusal::DispositionMismatch);
+                original
+            }
+            Ok(_) => panic!("one consumer cannot acknowledge a collection-wide void"),
+        };
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0,
+        "delivery is not acknowledgement"
+    );
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        assert_eq!(
+            q1.seal_next(&mut ports, &mut NoFrameBirths, &ChangedFault),
+            Ok(QuantumSealProgress::DeliveryReady)
+        );
+        assert_eq!(
+            q1.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+        assert_eq!(
+            q1.deliver_next(&mut ports),
+            Ok(QuantumSealProgress::Complete)
+        );
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("both loss deliveries complete: {reason:?}"));
+    }
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        voided,
+        "the loss acknowledges exactly once"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (h3_f0.0 + 1, false)
+    );
+    // Second frame: a fresh H0-owned original at the new era. Its
+    // pending refusal must carry the verified chain close, not stick
+    // on the pin the loss void left behind.
+    let child_e = OwnedStoppedChild::new();
+    let e = child_e.id();
+    let e_image = ImageIdentity {
+        task_cookie: 75,
+        exec_id: 0,
+    };
+    let _e_caller = fixture.scene.real.bind(e, e_image, 0);
+    fixture.scene.push(a, 0, "C_SignInit", 2);
+    fixture.scene.push(e, 0, "C_SignInit", 1);
+    let mut raw2 = fixture.scene.collect_with_fault(&ChangedFault);
+    let first2 = {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 { capture, io, .. } = &mut *h0;
+        io.script.fail_cookie = Some(e_image.task_cookie);
+        let first2 = capture.tick_collected_with(io, &mut raw2).unwrap();
+        assert_eq!(first2.calls().count(), 1);
+        first2
+    };
+    let a_ord = first2.calls().next().unwrap().token().unwrap();
+    assert_eq!(a_ord, 5);
+    let e_floor = first2.awaiting_floor().expect("E waits for its scan");
+    assert_eq!(e_floor, 6);
+    let batch2 = SemanticBatch::from_tick_report(
+        fixture.scene.real.lane.domain(),
+        first2,
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    {
+        let mut h0 = fixture.scene.real.h0.0.borrow_mut();
+        let HeldH0 {
+            capture, io, stash, ..
+        } = &mut *h0;
+        io.script.fail_cookie = None;
+        let mut completed = capture.tick_collected_with(io, &mut raw2).unwrap();
+        assert_eq!(completed.calls().count(), 1);
+        assert_eq!(completed.calls().next().unwrap().position(), Some(e_floor));
+        assert_eq!(completed.awaiting_floor(), None);
+        assert_eq!(stash_refresh_report(stash, &mut completed).1, 0);
+        assert_eq!(stash.min_outcome_position(), Some(e_floor));
+    }
+    let coordinator = &mut fixture.scene.real.scene.coordinator;
+    coordinator.stage_semantic_batch(batch2);
+    coordinator
+        .prepare_staged_semantic_batch(&mut fixture.scene.real.lane, None)
+        .unwrap();
+    let admitted2: Vec<u64> = coordinator
+        .prepared_semantic_batch()
+        .unwrap()
+        .admissions()
+        .map(|input| input.h0_ordinal())
+        .collect();
+    assert_eq!(admitted2, [a_ord]);
+    let ingested2 = raw2
+        .ingest(
+            coordinator.joint_capture_mut().adapter_mut(),
+            &fixture.scene.producers,
+            &fixture.grant,
+        )
+        .unwrap_or_else(|(_, reason)| {
+            panic!("the genuine same raw is now H0 disposed: {reason:?}")
+        });
+    let claim2 = coordinator
+        .claim_next_prepared_admission(&fixture.scene.producers, &ingested2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim2.0, a_ord);
+    assert!(claim2.1.is_ok());
+    assert!(
+        coordinator
+            .claim_next_prepared_admission(&fixture.scene.producers, &ingested2)
+            .unwrap()
+            .is_none()
+    );
+    let mut staged = 0;
+    while coordinator.stage_next_prepared_admission(false, true) {
+        staged += 1;
+    }
+    assert_eq!(staged, 1);
+    assert!(coordinator.finish_prepared_semantic_batch(&fixture.scene.real.lane));
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
+        .unwrap();
+    let mut q2 = acquire(
+        &mut fixture.scene,
+        ingested2,
+        &fixture.attached,
+        &ChangedFault,
+    );
+    let pending = q2
+        .failure_for_test()
+        .expect("new-era pending must refuse, never absorb");
+    assert_eq!(
+        pending.gap,
+        crate::semantics_objects::journal::JournalGap::H3Pending
+    );
+    assert!(
+        matches!(
+            q2.audit_for_test().h3_for_test(),
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor
+            } if *staged_max == a_ord && *pending_floor == Some(e_floor)
+        ),
+        "the new-era original owns the pending floor"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(1),
+        "the pending refusal carries the verified chain close"
+    );
+    assert_eq!(pending.fence, None, "pending fences nothing");
+    assert_eq!(pending.h3_voided, None, "pending acknowledges nothing");
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(diagnosis.void_audit, 1, "no second void");
+    assert_eq!(diagnosis.audit_h3_loss, 1, "the loss counted exactly once");
+    assert_eq!(diagnosis.audit_fault_absorbed_chain, 0);
+    assert_eq!(diagnosis.audit_fault_absorbed_reread, 0);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        voided,
+        "no second acknowledgement"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (h3_f0.0 + 2, false)
+    );
+    let claims2 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    assert_eq!(claims2.0, 1, "the loss claimed nothing");
+    assert_eq!(
+        claims2.1.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
+        [a_ord]
+    );
+    // The pending refusal carries, but the frame cannot defer yet:
+    // the loss ended every Joint feed, so the claimed call never took
+    // the feed-staged H9 charge the continuation requires and the
+    // ledger check fail-closes (fail-closed, not stuck: a feed that
+    // re-selects above the fence resumes Joint at its next clean
+    // point). Defer/finish/disposal after a loss needs that
+    // feed-recovery middle, which is follow-up work, not this fold.
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the loss ended every Joint feed"
+    );
+    {
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q2.bind_targets(&ports).unwrap();
+        assert_eq!(
+            q2.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
+            Ok(QuantumSealProgress::LocalPending),
+            "no feed-staged H9 charge, no continuation: LocalPending until feed recovery"
+        );
+    }
+}
+
+#[test]
 fn joint_first_pending_h3_pins_native_baseline_before_next_fault() {
     // This owner has never acquired a healthy audit or sealed a model call.
     // A's genuine New still registers one Joint consumer before its first

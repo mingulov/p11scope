@@ -27,7 +27,7 @@ use crate::discovery::identity::{
     pin_scanned_view_objects, reconcile_scanned_modules,
 };
 use crate::discovery::loader::LoaderContextSpec;
-use crate::discovery::refresh_queue::RefreshRequest;
+use crate::discovery::refresh_queue::{RefreshRequest, RetirementProof};
 use crate::discovery::scan::{
     IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScanOutcome, ScannedEntry,
     ScannedTable, WORK_CEILING_REASON, order_tables_by_evidence,
@@ -1733,7 +1733,7 @@ fn generational_stale_retirement_keeps_carried_coverage() {
         // Except-carry shape: resolvable, claimless.
         candidate
             .pinned
-            .remove_view_except(view, &BTreeSet::from([object]));
+            .retire_view_only_if_proven_gone(view, RetirementProof::Exited);
         assert!(
             candidate.pinned.view_claims(view).is_none(),
             "the fixture stages carried coverage ({scope:?})"
@@ -2246,7 +2246,7 @@ fn retire_prunes_vanished_owners_and_retires_orphaned_dependency_slots() {
         .unwrap()
         .clone();
     assert_eq!(sole.module_ids.len(), 1, "only B claims 0x2000");
-    pins.remove_view(raw_b.view);
+    pins.retire_view_only_if_proven_gone(raw_b.view, RetirementProof::Exited);
     assert!(pins.summary(modules[1].object).is_none());
     assert!(pins.summary(shared.object).is_some());
     let retired = plan.retire_unpinned_targets(&pins, plan.slots.len());
@@ -21786,7 +21786,10 @@ fn loader_readiness_refuses_retiring_gone_or_unowned_views() {
     engine.retirement_intents.clear();
     assert_eq!(engine.active_loader_hook_count(&session), 1);
     let pin = engine.pinned.clone();
-    engine.pinned.remove_view(view).unwrap();
+    engine
+        .pinned
+        .retire_view_only_if_proven_gone(view, RetirementProof::Exited)
+        .unwrap();
     assert_eq!(engine.active_loader_hook_count(&session), 0);
     engine.pinned = pin;
     let owner = engine.views.pop().unwrap();
@@ -23409,7 +23412,10 @@ fn learned_tables_survive_proving_view_retirement() {
         "baseline: the learned module binds before retirement"
     );
     assert!(
-        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        engine
+            .pinned
+            .retire_view_only_if_proven_gone(ProcessViewId(9), RetirementProof::Exited)
+            .is_some(),
         "the proving view owned pins to retire"
     );
     assert_eq!(
@@ -23434,7 +23440,7 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
     assert!(
         engine
             .pinned
-            .remove_view(Engine::RUN_LEARNED_VIEW_ID)
+            .retire_view_only_if_proven_gone(Engine::RUN_LEARNED_VIEW_ID, RetirementProof::Exited)
             .is_some(),
         "the fixture harvest filed reserved aliases to strip"
     );
@@ -23467,7 +23473,10 @@ fn run_learned_harvest_aliases_survive_candidate_commit() {
     engine.pinned = candidate_pins;
     // Churn gap: the proving view retires with no successor.
     assert!(
-        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        engine
+            .pinned
+            .retire_view_only_if_proven_gone(ProcessViewId(9), RetirementProof::Exited)
+            .is_some(),
         "the proving view owned pins to retire"
     );
     assert_eq!(
@@ -23500,7 +23509,10 @@ fn learned_tables_survive_proving_view_reuse_and_retirement() {
     record_scan_ownership(&mut pins, ProcessViewId(9), other_key, &other_path);
     let _ = engine.pinned.absorb(pins);
     assert!(
-        engine.pinned.remove_view(ProcessViewId(9)).is_some(),
+        engine
+            .pinned
+            .retire_view_only_if_proven_gone(ProcessViewId(9), RetirementProof::Exited)
+            .is_some(),
         "the reused view owned pins to retire"
     );
     assert_eq!(
@@ -23524,9 +23536,12 @@ fn learned_tables_survive_proving_view_refresh() {
         1,
         "baseline: the learned module binds before the refresh"
     );
-    let _ = engine
-        .pinned
-        .replace_view_pins(ProcessViewId(9), PinnedObjects::empty(), &[]);
+    let _ = engine.pinned.replace_view_pins_proven(
+        ProcessViewId(9),
+        PinnedObjects::empty(),
+        &[],
+        RetirementProof::IdentityChanged,
+    );
     assert_eq!(
         learned_candidate_module_count(&mut engine),
         1,
@@ -39648,7 +39663,9 @@ fn exact_loader_pin_survives_cross_overlay_canonicalization() {
     assert_eq!(evidence.modules.len(), 1);
 
     let mut retired = candidate.pinned;
-    let claims = retired.remove_view(loader_module.view).unwrap();
+    let claims = retired
+        .retire_view_only_if_proven_gone(loader_module.view, RetirementProof::Exited)
+        .unwrap();
     assert!(claims.pins.contains(&loader));
     assert!(retired.summary(loader).is_none());
     assert_eq!(
@@ -41809,7 +41826,12 @@ fn post_session_rebuild_preserves_canonical_ids() {
     let mut preserved = engine.pinned.clone();
     assert!(
         preserved
-            .replace_view_pins(modules[0].view, PinnedObjects::empty(), &[original])
+            .replace_view_pins_proven(
+                modules[0].view,
+                PinnedObjects::empty(),
+                &[original],
+                RetirementProof::IdentityChanged
+            )
             .is_empty()
     );
     assert_eq!(

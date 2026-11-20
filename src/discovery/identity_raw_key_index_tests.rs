@@ -146,7 +146,10 @@ fn raw_key_queries_match_the_scan_after_every_mutation() {
     assert_agrees(&pins, "manifest re-keyed");
 
     // Retire one view: its raw goes, other views stay.
-    assert!(pins.remove_view(ProcessViewId(2)).is_some());
+    assert!(
+        pins.retire_view_only_if_proven_gone(ProcessViewId(2), RetirementProof::Exited)
+            .is_some()
+    );
     assert_agrees(&pins, "view retired");
 
     // A probe key edited on the entry alone (no raw-map change).
@@ -172,7 +175,8 @@ fn raw_key_queries_match_the_scan_after_every_mutation() {
 
     // Retire every remaining view.
     for minor in 1..=4 {
-        let _ = pins.remove_view(ProcessViewId(minor as u32));
+        let _ = pins
+            .retire_view_only_if_proven_gone(ProcessViewId(minor as u32), RetirementProof::Exited);
     }
     assert_agrees(&pins, "all views retired");
 }
@@ -193,7 +197,10 @@ fn raw_key_queries_stay_per_copy_across_clone() {
     assert_agrees(&source, "warm source");
     let mut copy = source.clone();
     assert_agrees(&copy, "warm copy");
-    assert!(copy.remove_view(ProcessViewId(3)).is_some());
+    assert!(
+        copy.retire_view_only_if_proven_gone(ProcessViewId(3), RetirementProof::Exited)
+            .is_some()
+    );
     assert_agrees(&copy, "copy view retired");
     assert_agrees(&source, "source after copy retirement");
     assert!(copy.absorb(manifest_pin(overlay(41), SHA, 1)).is_empty());
@@ -243,7 +250,7 @@ fn raw_key_queries_track_split_aliases_of_one_object() {
     let probe = FakeSelfMappingProbe::new(true, Some(maps_key));
     pins.refile_split_manifest_alias(maps_key, PATH, &mut budget, &probe);
     assert_agrees(&pins, "manifest alias refiled");
-    let _ = pins.remove_view(ProcessViewId(21));
+    let _ = pins.retire_view_only_if_proven_gone(ProcessViewId(21), RetirementProof::Exited);
     assert_agrees(&pins, "scan view retired");
 }
 
@@ -269,7 +276,7 @@ fn summary_matches_the_linear_pinned_find_for_every_id() {
         record_scan_ownership(&mut pins, ProcessViewId(minor as u32), overlay(minor), PATH);
     }
     assert!(pins.absorb(manifest_pin(overlay(41), SHA, 1)).is_empty());
-    let _ = pins.remove_view(ProcessViewId(2));
+    let _ = pins.retire_view_only_if_proven_gone(ProcessViewId(2), RetirementProof::Exited);
     for id in query_ids(&pins) {
         assert_eq!(
             pins.summary(id).map(fields),
@@ -333,10 +340,15 @@ fn prune_view_pins_to_modules_preserve_survives_global_purge() {
     record_scan_ownership(&mut pins, ProcessViewId(1), entries[0].0, PATH);
     record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
     // View 1 retires carried: resolvable, claimless.
-    pins.remove_view_except(ProcessViewId(1), &BTreeSet::from([kept]));
+    pins.retire_view_only_if_proven_gone(ProcessViewId(1), RetirementProof::Exited);
     assert!(pins.summary(kept).is_some(), "carried stays resolvable");
     assert!(pins.summary(dropped).is_some(), "fixture pins resolve");
-    pins.prune_view_pins_to_modules(ProcessViewId(2), &[], &[kept]);
+    pins.prune_view_pins_to_modules_proven(
+        ProcessViewId(2),
+        &[],
+        &[kept],
+        RetirementProof::Exited,
+    );
     assert!(
         pins.summary(kept).is_some(),
         "the purge spares carried coverage"
@@ -361,14 +373,19 @@ fn global_purge_spares_resolvable_but_claimless_ids() {
     record_scan_ownership(&mut pins, ProcessViewId(2), entries[1].0, PATH);
     record_scan_ownership(&mut pins, ProcessViewId(3), entries[2].0, PATH);
     // View 1 retires carried: resolvable, claimless.
-    pins.remove_view_except(ProcessViewId(1), &BTreeSet::from([kept]));
+    pins.retire_view_only_if_proven_gone(ProcessViewId(1), RetirementProof::Exited);
     assert!(pins.summary(kept).is_some(), "carried stays resolvable");
     assert!(
         pins.view_claims(ProcessViewId(1)).is_none(),
         "carried drops its claims"
     );
     // An unrelated view's empty replace globally purges.
-    pins.replace_view_pins(ProcessViewId(3), PinnedObjects::empty(), &[]);
+    pins.replace_view_pins_proven(
+        ProcessViewId(3),
+        PinnedObjects::empty(),
+        &[],
+        RetirementProof::Exited,
+    );
     assert!(
         pins.summary(kept).is_some(),
         "the purge spares carried coverage"

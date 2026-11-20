@@ -235,6 +235,30 @@ mod tests {
         );
     }
 
+    /// Every listed vendor mechanism id (NSS, CloudHSM, Luna,
+    /// Yubico — `crate::vendor_mechanisms::VENDOR_MECHANISMS`) is
+    /// approved with no decoder shape, so the journal lane publishes
+    /// vendor key-creation ids (e.g. NSS `CKM_NSS_ML_KEM_KEY_PAIR_GEN`
+    /// `0xCE534380`, which Firefox uses for TLS ML-KEM ephemeral
+    /// keypairs) by number instead of withholding them.
+    #[test]
+    fn approved_mechanisms_includes_every_listed_vendor_id() {
+        let registry = MechanismRegistry::load(None).expect("load embedded registry");
+        let approved = approved_mechanisms(&registry);
+        assert_eq!(
+            crate::vendor_mechanisms::VENDOR_MECHANISMS.len(),
+            53,
+            "pinned vendor catalog size"
+        );
+        for (id, name) in crate::vendor_mechanisms::VENDOR_MECHANISMS {
+            assert_eq!(
+                approved.get(id),
+                Some(&shape::NONE),
+                "listed vendor id 0x{id:08x} ({name}) is approved with no decoder shape"
+            );
+        }
+    }
+
     #[test]
     fn approvals_are_the_exact_official_and_registered_union() {
         // This count belongs to pkcs11-types 0.2.3 from crates.io (Cargo.toml).

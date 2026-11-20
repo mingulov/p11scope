@@ -23225,6 +23225,114 @@ mod tests {
     }
 
     #[test]
+    fn complete_final_joint_lane_refused_take_keeps_the_old_decoder_total() {
+        // A refused take stores nothing: the coordinator keeps its
+        // older snapshot while the posed readable total waits on
+        // the held lane, and the retry stores the new total only
+        // after the transfer hands the session away (codex fix3
+        // residual).
+        let mut coordinator = coordinator();
+        coordinator.note_joint_decoder_malformed(Some(7));
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_test_joint_frame(false);
+        lane.set_scripted_decoder_malformed_for_test(Some(1));
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(lane);
+        driver.complete_final_joint_lane();
+        let held = driver
+            .semantic
+            .as_ref()
+            .expect("the refused lane stays seated");
+        assert_eq!(
+            held.joint_decoder_malformed(),
+            Some(1),
+            "the posed total stays readable on the held lane"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(7),
+            "the refused take keeps the older snapshot"
+        );
+        {
+            let lane = driver
+                .semantic
+                .as_mut()
+                .expect("the refused lane stays seated");
+            let wound = lane.poll_wound_down(&mut *driver.coordinator, &mut std::io::sink());
+            assert!(
+                matches!(wound, Ok(true)),
+                "the completing detach joins on retry"
+            );
+        }
+        driver.complete_final_joint_lane();
+        assert!(
+            driver.semantic.is_none(),
+            "the retry hands the session off and releases the lane"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(1),
+            "the retry stores the new total only after transfer"
+        );
+    }
+
+    #[test]
+    fn complete_final_joint_lane_not_ready_take_keeps_the_old_decoder_total() {
+        // A not-ready take (framed lane) stores nothing either: the
+        // older snapshot stands until the frame clears and the
+        // retry transfers (codex fix3 residual).
+        let mut coordinator = coordinator();
+        coordinator.note_joint_decoder_malformed(Some(7));
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        assert!(
+            matches!(
+                lane.poll_wound_down(&mut coordinator, &mut std::io::sink()),
+                Ok(true)
+            ),
+            "the completing detach joins"
+        );
+        lane.set_scripted_decoder_malformed_for_test(Some(2));
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(lane);
+        driver.complete_final_joint_lane();
+        let held = driver
+            .semantic
+            .as_ref()
+            .expect("the framed lane stays seated");
+        assert!(
+            held.has_joint_frame(),
+            "the take leaves the framed lane finishable"
+        );
+        assert_eq!(
+            held.joint_decoder_malformed(),
+            Some(2),
+            "the posed total stays readable on the held lane"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(7),
+            "the not-ready take keeps the older snapshot"
+        );
+        driver
+            .semantic
+            .as_mut()
+            .expect("the framed lane stays seated")
+            .set_test_joint_frame(false);
+        driver.complete_final_joint_lane();
+        assert!(
+            driver.semantic.is_none(),
+            "the retry hands the session off and releases the lane"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(2),
+            "the retry stores the new total only after transfer"
+        );
+    }
+
+    #[test]
     fn hold_joint_lane_for_exit_retains_the_decoder_total_for_the_tail() {
         // Every abandon/disposition path funnels through the exit
         // hold, which consumes the lane: the hold snapshots the
@@ -29506,6 +29614,101 @@ mod promotion_driver_tests {
             driver.coordinator.joint_decoder_diagnosis(),
             Some(0),
             "retirement keeps the joined total for the tails"
+        );
+    }
+
+    #[test]
+    fn promotion_not_ready_join_keeps_the_old_decoder_total() {
+        // A promotion lane whose take is not ready (framed lane)
+        // joins nothing and stores nothing: the older snapshot
+        // stands while the posed readable total waits on the held
+        // lane. The retry transfers and stores the new total only
+        // after the take, and the joined shell reads unknown (the
+        // take carried the posed total away, pinning the seam
+        // separately from the Drop guard) (codex fix3 residual).
+        let mut coordinator = coordinator();
+        coordinator.note_joint_decoder_malformed(Some(7));
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let mut lane = joint_lane(WindDownIo::completing(), true);
+        lane.set_scripted_decoder_malformed_for_test(Some(5));
+        driver.semantic = Some(lane);
+        let domain = install_promotion_for_wind_down(&mut driver);
+        quiesce_domain_for_retire(&mut *driver.coordinator, domain);
+        let (source, polls, _) = CountingSource::scripted(None);
+        driver.completion_source = Some(Box::new(source));
+        driver.wind_down_installed_promotion(PromotionEnd::Cancelled);
+        // The frame stays set: the first tick reaches the take but
+        // the framed lane reports not-ready, so no join arms.
+        driver.on_tick();
+        {
+            let winding = driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding");
+            assert!(!winding.joined, "the not-ready take arms no join");
+            let lane = winding.lane.as_ref().expect("the lane stays held");
+            assert!(lane.is_finished(), "the lane stays finished");
+            assert!(lane.has_joint_frame(), "the frame still holds the take");
+            assert_eq!(
+                lane.joint_decoder_malformed(),
+                Some(5),
+                "the posed total stays readable on the held lane"
+            );
+        }
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the first tick reaches the take and its completion poll"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(7),
+            "the not-ready join keeps the older snapshot"
+        );
+        driver
+            .retiring
+            .as_mut()
+            .expect("retiring")
+            .winding
+            .as_mut()
+            .expect("winding")
+            .lane
+            .as_mut()
+            .expect("lane")
+            .set_test_joint_frame(false);
+        driver.on_tick();
+        {
+            let winding = driver
+                .retiring
+                .as_ref()
+                .expect("retiring")
+                .winding
+                .as_ref()
+                .expect("winding");
+            assert!(winding.joined, "the retry transfers the session");
+            assert_eq!(
+                winding
+                    .lane
+                    .as_ref()
+                    .expect("the joined shell stays")
+                    .joint_decoder_malformed(),
+                None,
+                "the joined shell reads unknown past the take"
+            );
+        }
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            2,
+            "the retry runs the take path again"
+        );
+        assert_eq!(
+            driver.coordinator.joint_decoder_diagnosis(),
+            Some(5),
+            "the retry stores the new total only after transfer"
         );
     }
 

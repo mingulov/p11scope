@@ -2139,6 +2139,8 @@ fn run_with_terminal_budget(
             voids.audit_counter_unprovable,
             voids.audit_fault_unreadable,
             voids.audit_resource_unavailable,
+            voids.audit_fault_absorbed_chain,
+            voids.audit_fault_absorbed_reread,
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
@@ -9626,6 +9628,8 @@ fn run_dashboard(
             voids.audit_counter_unprovable,
             voids.audit_fault_unreadable,
             voids.audit_resource_unavailable,
+            voids.audit_fault_absorbed_chain,
+            voids.audit_fault_absorbed_reread,
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
@@ -28164,6 +28168,8 @@ mod promotion_driver_tests {
             audit_counter_unprovable: 0,
             audit_fault_unreadable: 0,
             audit_resource_unavailable: 0,
+            audit_fault_absorbed_chain: 0,
+            audit_fault_absorbed_reread: 0,
             voids_ended_joint_feed: 0,
         };
         coordinator

@@ -1090,6 +1090,11 @@ pub(crate) struct JointVoidCounts {
     pub(crate) audit_counter_unprovable: u64,
     pub(crate) audit_fault_unreadable: u64,
     pub(crate) audit_resource_unavailable: u64,
+    /// Absorbed post-collection faults by site (chain check vs seal-time
+    /// re-read): counted and named beside the void buckets, outside the
+    /// eight-bucket sum (absorbs void nothing).
+    pub(crate) audit_fault_absorbed_chain: u64,
+    pub(crate) audit_fault_absorbed_reread: u64,
     /// Voids that ended at least one Joint feed (scope round): counted
     /// once per void no matter how many feeds it ended.
     pub(crate) voids_ended_joint_feed: u64,
@@ -1132,6 +1137,11 @@ pub(crate) struct JointVoidDiagnosis {
     pub(crate) audit_counter_unprovable: u64,
     pub(crate) audit_fault_unreadable: u64,
     pub(crate) audit_resource_unavailable: u64,
+    /// Absorbed post-collection faults by site (chain check vs seal-time
+    /// re-read): counted and named beside the void buckets, outside the
+    /// eight-bucket sum (absorbs void nothing).
+    pub(crate) audit_fault_absorbed_chain: u64,
+    pub(crate) audit_fault_absorbed_reread: u64,
     /// Voids that ended at least one Joint feed (scope round): counted
     /// once per void no matter how many feeds it ended.
     pub(crate) voids_ended_joint_feed: u64,
@@ -2067,6 +2077,12 @@ pub(crate) struct JournalAdapter {
     audit_counter_unprovable: u64,
     audit_fault_unreadable: u64,
     audit_resource_unavailable: u64,
+    /// Diagnostic-only absorbed post-collection faults: `FaultChanged`
+    /// audits the seal absorbed instead of voiding, split by site (chain
+    /// check vs seal-time re-read) like the void split. Outside the void
+    /// sum (absorbs void nothing); saturating, instrumentation only.
+    audit_fault_absorbed_chain: u64,
+    audit_fault_absorbed_reread: u64,
     /// Diagnostic-only voids that ended at least one Joint feed (scope
     /// round): one per void however many feeds it ended. Saturating;
     /// instrumentation only, never authority.
@@ -2211,8 +2227,9 @@ pub(crate) struct JournalAdapter {
     void_wiped: BTreeSet<JournalNativeKey>,
     /// Last sealed checked-fault epoch: the cumulative chain. Each
     /// seal's collection must open at this epoch and the seal-time
-    /// re-read must still show the audited one; a move anywhere in
-    /// the chain voids and re-baselines.
+    /// re-read must still show the audited one; a post-collection move
+    /// absorbs and re-baselines without voiding, while an in-bracket
+    /// move or a regressed cell still voids.
     last_fault: Option<u64>,
     /// The Session drains this adapter serves, one EVENTS-map identity
     /// per attested native domain, bound exclusively by Session
@@ -2275,6 +2292,8 @@ impl JournalAdapter {
             audit_counter_unprovable: 0,
             audit_fault_unreadable: 0,
             audit_resource_unavailable: 0,
+            audit_fault_absorbed_chain: 0,
+            audit_fault_absorbed_reread: 0,
             voids_ended_joint_feed: 0,
             seal_bootstrap: SealBootstrapCounts::default(),
             open: BTreeMap::new(),
@@ -3141,15 +3160,16 @@ impl JournalAdapter {
             // (a void wipe, a shed-taint drop) disposes: the release
             // already disclosed the loss, so the terminal is expected
             // fallout, never new taint evidence — regardless of
-            // function or return. The disposed call never proves; a
-            // later bind of a reused handle still refuses at the
-            // claim layer where the collision materializes. The
-            // absence is consumed either way: a second terminal for
-            // one key still promotes. Terminals with no recorded
-            // release taint below. The lift purge keeps removing
-            // state-changing absences before an image goes clean, so
-            // a destroy that outlived a shed-taint plus lift still
-            // taints there instead of riding the lift.
+            // function or return. The disposed call never proves, and
+            // the void retired the domain's live views, cleared its
+            // bindings and bumped its generation, so a later create
+            // reusing the handle mints a new object instead of naming
+            // the destroyed key. The absence is consumed either way:
+            // a second terminal for one key still promotes. Terminals
+            // with no recorded release taint below. The lift purge
+            // keeps removing state-changing absences before an image
+            // goes clean, so a destroy that outlived a shed-taint plus
+            // lift still taints there instead of riding the lift.
             let excused = self.take_derived_absence(image, key).is_some();
             if excused {
                 self.contradictions.note(TaintCause::Contradiction(
@@ -3219,9 +3239,11 @@ impl JournalAdapter {
                 // The journal deliberately released this call's BEGIN:
                 // keep the disposition and telemetry, but do not
                 // promote to a permanent taint for it. (Abandons carry
-                // no return, so function safety rests on the
-                // record-time filter and the lift purge, which leave
-                // only neutral absences on a clean image.)
+                // no return; like END, the void's fence and named gap
+                // already disclose the loss and the disposed call never
+                // proves, so the arrival consumes blindly. The lift
+                // purge keeps stripping state-changing shed absences
+                // before an image goes clean.)
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -3412,6 +3434,8 @@ impl JournalAdapter {
         self.audit_counter_unprovable = carried.audit_counter_unprovable;
         self.audit_fault_unreadable = carried.audit_fault_unreadable;
         self.audit_resource_unavailable = carried.audit_resource_unavailable;
+        self.audit_fault_absorbed_chain = carried.audit_fault_absorbed_chain;
+        self.audit_fault_absorbed_reread = carried.audit_fault_absorbed_reread;
         self.voids_ended_joint_feed = carried.voids_ended_joint_feed;
     }
 
@@ -3480,6 +3504,8 @@ impl JournalAdapter {
             audit_counter_unprovable: self.audit_counter_unprovable,
             audit_fault_unreadable: self.audit_fault_unreadable,
             audit_resource_unavailable: self.audit_resource_unavailable,
+            audit_fault_absorbed_chain: self.audit_fault_absorbed_chain,
+            audit_fault_absorbed_reread: self.audit_fault_absorbed_reread,
             voids_ended_joint_feed: self.voids_ended_joint_feed,
         }
     }
@@ -3518,6 +3544,8 @@ impl JournalAdapter {
             audit_counter_unprovable: counts.audit_counter_unprovable,
             audit_fault_unreadable: counts.audit_fault_unreadable,
             audit_resource_unavailable: counts.audit_resource_unavailable,
+            audit_fault_absorbed_chain: counts.audit_fault_absorbed_chain,
+            audit_fault_absorbed_reread: counts.audit_fault_absorbed_reread,
             voids_ended_joint_feed: counts.voids_ended_joint_feed,
             keys_total: self.keys.len() as u64,
             keys_refused: refused,
@@ -3636,7 +3664,8 @@ impl JournalAdapter {
     /// because the journal deliberately released its BEGIN (a taint
     /// refusal/drop, an unclaimable-original disposal, or a void
     /// wipe), with the released call's function ordinal for the lift
-    /// purge and the arrival gate. Capped at the open-table bound;
+    /// purge (the arrival gate consumes blindly; only the lift purge
+    /// still keys on function). Capped at the open-table bound;
     /// past the cap the key is not recorded and its terminal
     /// promotes (fail closed).
     fn note_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey, function: u32) {
@@ -5126,8 +5155,9 @@ impl JournalAuditReceipt {
             return Err(JournalGap::FaultChanged);
         }
         // Cumulative chain: this collection must open where the last
-        // seal closed. A move between collections voids like a move
-        // within one.
+        // seal closed. A move between collections absorbs when the
+        // bracket is clean and the cell is sane (re-baselining without
+        // voiding); a move within one still voids.
         if last_fault.is_some_and(|last| self.fault_before != last) {
             return Err(JournalGap::FaultChanged);
         }
@@ -5143,9 +5173,15 @@ impl JournalAuditReceipt {
             return Err(JournalGap::Discarded);
         }
         // Seal-time native re-read: the cell must still show the
-        // audited epoch when the seal runs.
+        // audited epoch when the seal runs. A reading above the u32
+        // domain is a broken reader (production maps it to Saturated),
+        // never a post-collection move for the absorb: reject it here
+        // like the domain leg does, so both choke points agree.
         match seal_epoch {
             Ok(epoch) if *epoch == self.fault_after => {}
+            Ok(epoch) if *epoch > u64::from(u32::MAX) => {
+                return Err(JournalGap::FaultSaturated);
+            }
             Ok(_) => return Err(JournalGap::FaultChanged),
             Err(FaultReadError::Unreadable) => return Err(JournalGap::FaultUnreadable),
             Err(FaultReadError::Saturated) => return Err(JournalGap::FaultSaturated),
@@ -6267,9 +6303,9 @@ impl JournalAdapter {
     /// tainted image or a full key table refuses. A second live key for
     /// an image whose key already converted refuses: sole-key
     /// attributions cannot be re-examined — unless the sibling's
-    /// conversion is entirely fenced, in which case the void wiped
-    /// every staged claim and a post-void rebirth binds above the
-    /// fence.
+    /// conversion is entirely fenced by a global void, in which case
+    /// the void wiped every staged claim and a post-void rebirth binds
+    /// above the fence. Scoped fences never exempt.
     /// Birth and closure are verified on top of this binding by
     /// [`BootstrapReceipt::attest`].
     pub(crate) fn bind_admitted_key(
@@ -6730,13 +6766,18 @@ impl JournalAdapter {
 
     /// Whether a converted sibling still blocks a new key for its
     /// image: its conversion extends past its void fence (actively
-    /// converting). A sibling whose conversion is entirely fenced (a
-    /// void wiped every staged claim) holds nothing left to
-    /// re-examine, so a post-void rebirth binds above the fence.
+    /// converting), or no global void fenced it. A sibling whose
+    /// conversion is entirely fenced by a global void (staged claims
+    /// wiped, global cut advanced past the conversion) holds nothing
+    /// left to re-examine, so a post-void rebirth binds above the
+    /// fence. Scoped fences never exempt: a watchdog scoped void wipes
+    /// only its slice while the global cut stays put.
     fn sibling_blocks_rebirth(&self, sibling: JournalDomainKey) -> bool {
-        self.keys
-            .get(&sibling)
-            .is_none_or(|state| state.void_fence == 0 || state.sealed_through > state.void_fence)
+        self.keys.get(&sibling).is_none_or(|state| {
+            state.void_fence == 0
+                || state.sealed_through > state.void_fence
+                || state.sealed_through > self.voided_through
+        })
     }
 
     /// Live keys bound for one image: the attribution set a seal
@@ -7469,9 +7510,22 @@ impl JournalAdapter {
                     // and H0 invalidates its own era. The first
                     // observation of the era trips the absence chain
                     // and pins the baseline; repeats absorb silently.
-                    // Absorbs count no void bucket: the quantum
-                    // sealed, nothing voided. An in-bracket move or a
-                    // regressed cell still voids below.
+                    // Absorbs count no void bucket (the quantum sealed,
+                    // nothing voided) but count their own diagnostic
+                    // bucket by site, like the void split below: absorbed
+                    // faults stay counted and named. An in-bracket move
+                    // or a regressed cell still voids below.
+                    if audit.fault_before != audit.fault_after
+                        || self
+                            .last_fault
+                            .is_some_and(|last| audit.fault_before != last)
+                    {
+                        self.audit_fault_absorbed_chain =
+                            self.audit_fault_absorbed_chain.saturating_add(1);
+                    } else {
+                        self.audit_fault_absorbed_reread =
+                            self.audit_fault_absorbed_reread.saturating_add(1);
+                    }
                     let freshest = audit.fault_after.max(epoch);
                     if self.last_fault.is_none_or(|last| freshest > last) {
                         self.last_fault = Some(freshest);
@@ -8490,9 +8544,10 @@ impl JournalAdapter {
         // void's fence and named gap already disclose the loss, so a
         // state-changing terminal that outlived its wipe disposes
         // (never proves) instead of tainting the whole image: the
-        // disposed call stays unproven, and a later handle-reuse
-        // collision still refuses at the claim layer where it
-        // materializes. A terminal the live entry would reject as a
+        // void retires the domain's live views, clears its bindings
+        // and bumps its generation, so a later create reusing the
+        // handle mints a new object instead of naming the destroyed
+        // key. A terminal the live entry would reject as a
         // contradiction (staged END/ABANDON, NO_END, corroborated
         // return) stays rejected: those stay out, so their terminals
         // still promote. Recorded before the table clears, under the
@@ -16338,6 +16393,193 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn seal_post_collection_absorb_counts_reread() {
+        // Reread absorb counting: a seal-time fault move outside a clean
+        // collection bracket absorbs and counts the reread absorb bucket
+        // (diagnostic-only, outside the void sum); void buckets stay 0.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let reaudit = scene.audit();
+        let moved = ScriptedFaultCell::steady(9);
+        scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect("post-collection reread absorbs");
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "absorb voids nothing");
+        assert_eq!(
+            after.audit_fault_changed_reread, 0,
+            "absorbs count no void bucket"
+        );
+        assert_eq!(
+            after.audit_fault_absorbed_reread, 1,
+            "the reread absorb counts"
+        );
+        assert_eq!(
+            after.audit_fault_absorbed_chain, 0,
+            "no chain absorb happened"
+        );
+    }
+
+    #[test]
+    fn seal_between_collection_absorb_counts_chain() {
+        // Chain absorb counting: a fault that landed between two
+        // collections absorbs and counts the chain absorb bucket;
+        // the reread bucket stays 0.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let mut reaudit = scene.audit();
+        reaudit.fault_before = 8;
+        reaudit.fault_after = 8;
+        scene
+            .seal_explicit(
+                &reaudit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect("between-collection fault absorbs");
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "absorb voids nothing");
+        assert_eq!(
+            after.audit_fault_changed_chain, 0,
+            "absorbs count no void bucket"
+        );
+        assert_eq!(
+            after.audit_fault_absorbed_chain, 1,
+            "the chain absorb counts"
+        );
+        assert_eq!(
+            after.audit_fault_absorbed_reread, 0,
+            "no reread absorb happened"
+        );
+    }
+
+    #[test]
+    fn repeat_fault_observation_absorb_counts_again() {
+        // Repeat absorbs count every observation: a second seal observing
+        // an already-absorbed fault era absorbs silently (no void, no
+        // re-trip) and still counts its own absorb bucket. The repeat
+        // observes a stale bracket against the pinned baseline, so it
+        // counts the chain site like the void split does.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("clean seal pins the baseline");
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let reaudit = scene.audit();
+        let moved = ScriptedFaultCell::steady(9);
+        scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &reaudit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &moved,
+            )
+            .expect("first observation absorbs");
+        assert_eq!(
+            scene
+                .adapter
+                .joint_void_diagnosis()
+                .audit_fault_absorbed_reread,
+            1,
+            "the first absorb counts"
+        );
+        let tripped = scene.adapter.last_audit_failure;
+        scene.attest();
+        let again = begin_bytes(1, 3, create, 0);
+        scene.ingest(&again);
+        scene.ingest(&end_bytes(&again, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        scene.prepare_claims();
+        let frontier = scene.adapter.consumed_frontier();
+        let stale = scene.audit();
+        let steady = ScriptedFaultCell::steady(9);
+        scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &stale,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &steady,
+            )
+            .expect("repeat observation absorbs");
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(after.void_audit, 0, "absorbs void nothing");
+        assert_eq!(
+            after.audit_fault_absorbed_reread, 1,
+            "the first absorb stays counted"
+        );
+        assert_eq!(
+            after.audit_fault_absorbed_chain, 1,
+            "the stale-bracket repeat counts the chain site"
+        );
+        assert_eq!(scene.adapter.last_audit_failure, tripped);
+    }
+
+    #[test]
     fn post_absorb_absence_birth_refuses_until_void() {
         // Absorb/rebirth interplay pin (fail-closed): an absorb trips the
         // absence chain without fencing, so an AbsenceAppearance birth for
@@ -16431,6 +16673,14 @@ pub(crate) mod tests {
             scene.adapter.joint_void_diagnosis().void_audit,
             1,
             "the absorb voids nothing itself"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .joint_void_diagnosis()
+                .audit_fault_absorbed_chain,
+            1,
+            "the vetoing absorb counts its site"
         );
         assert_eq!(
             scene.adapter.voided_through_for_test(),
@@ -16640,9 +16890,10 @@ pub(crate) mod tests {
     #[test]
     fn object_journal_void_carry_adopts_all_counters() {
         // Retirement carry: adopting a counter snapshot moves all event
-        // counters (Task 0 five plus the scope-round audit split and the
-        // feed-ended count); the per-key gauges recompute from this
-        // owner's own (empty) retained state instead of being carried.
+        // counters (Task 0 five plus the scope-round audit split, the
+        // absorb split and the feed-ended count); the per-key gauges
+        // recompute from this owner's own (empty) retained state instead
+        // of being carried.
         let mut scene = Scene::new(image_default());
         let carried = JointVoidCounts {
             break_dispose: 3,
@@ -16658,6 +16909,8 @@ pub(crate) mod tests {
             audit_counter_unprovable: 37,
             audit_fault_unreadable: 41,
             audit_resource_unavailable: 43,
+            audit_fault_absorbed_chain: 53,
+            audit_fault_absorbed_reread: 59,
             voids_ended_joint_feed: 47,
         };
         scene.adapter.carry_joint_void_counts(&carried);
@@ -16683,9 +16936,11 @@ pub(crate) mod tests {
                 after.audit_counter_unprovable,
                 after.audit_fault_unreadable,
                 after.audit_resource_unavailable,
+                after.audit_fault_absorbed_chain,
+                after.audit_fault_absorbed_reread,
                 after.voids_ended_joint_feed,
             ),
-            (17, 19, 23, 29, 31, 37, 41, 43, 47),
+            (17, 19, 23, 29, 31, 37, 41, 43, 53, 59, 47),
             "the carry adopts every scope-round event counter"
         );
         assert_eq!(

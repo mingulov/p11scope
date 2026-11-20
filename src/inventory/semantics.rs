@@ -1884,6 +1884,8 @@ pub(crate) fn joint_voids_line(
     audit_counter_unprovable: u64,
     audit_fault_unreadable: u64,
     audit_resource_unavailable: u64,
+    audit_fault_absorbed_chain: u64,
+    audit_fault_absorbed_reread: u64,
     skip_eras: u64,
     voids_ended_joint_feed: u64,
 ) -> String {
@@ -1900,6 +1902,8 @@ pub(crate) fn joint_voids_line(
          audit_counter_unprovable={audit_counter_unprovable} \
          audit_fault_unreadable={audit_fault_unreadable} \
          audit_resource_unavailable={audit_resource_unavailable} \
+         audit_fault_absorbed_chain={audit_fault_absorbed_chain} \
+         audit_fault_absorbed_reread={audit_fault_absorbed_reread} \
          skip_eras={skip_eras} voids_ended_joint_feed={voids_ended_joint_feed}"
     )
 }

@@ -561,16 +561,23 @@ range). No map entry renders a bit range anywhere (owner 07:52,
   neither key, so every length classifies `unknown` with reason
   `hybrid_wrap_format`.
 - ECDSA subset (the `CKM_ECDSA*` sign/verify ids) × `sign_output` /
-  `verify_input`, raw r||s: 64 → "EC P-256", 96 → "EC P-384",
-  132 → "EC P-521" (2× field size), each with "(from \<evidence\>
-  length)" and JSON `curve` + `octets` (§10.2). Curves sharing a
-  field size (secp256k1/brainpoolP256r1 with P-256) alias to the
-  same display; the `length` source marks it inferred, never
-  established. Any other length → `unknown` with reason
-  `variable_length_encoding` (DER and other curves; N6: the PKCS#11
-  result representation is what was measured, not the TLS wire
-  encoding — SoftHSM/pkcs11-tool produce raw 64-byte results,
-  rv2 §6; NSS/browser format is measured in Task 5, never assumed).
+  `verify_input`, raw r||s: 64 → "EC 256-bit class", 96 → "EC
+  384-bit class", 132 → "EC 521-bit class" (2× field size), each
+  with "(from \<evidence\> length)" and JSON `ec_class` + `octets`
+  (§10.2). A length alone never names a curve: 64 octets are P-256,
+  secp256k1 or brainpoolP256r1 (96 likewise P-384/brainpoolP384r1),
+  so the curve fills only beside an established NIST curve the
+  length agrees with (JSON `ec` + `curve` + `octets`;
+  `src/keymeta.rs: with_established_curve`, schema v7). Any other
+  length → `unknown` with reason `variable_length_encoding` (DER
+  and other curves; N6: the PKCS#11 result representation is what
+  was measured, not the TLS wire encoding — SoftHSM/pkcs11-tool
+  produce raw 64-byte results, rv2 §6; NSS/browser format is
+  measured in Task 5, never assumed). (Superseded 2026-11-20,
+  v0.7.2 I-5: the earlier 64/96/132 → P-256/P-384/P-521 mapping
+  with a `length` source is withdrawn; see
+  `docs/known-limitations.md` "ECDSA signature lengths publish the
+  size class".)
 - ECDH1-family subset (`CKM_ECDH1_DERIVE`,
   `CKM_ECDH1_COFACTOR_DERIVE`, `CKM_ECMQV_DERIVE`, the three
   `ECDH_*_AES_KEY_WRAP` ids): family-only (family `ec`, no size;
@@ -1309,6 +1316,7 @@ On every `key_operations[]` row (absent below v7):
   "detail": null | { "kind": "rsa", "size_class": 2048, "modulus_bytes": 256, "evidence": "sign_output | verify_input | encrypt_output | decrypt_input | wrap_output | unwrap_input" }
                   | { "kind": "rsa_nonstandard", "modulus_bytes": 257, "evidence": "sign_output | verify_input | encrypt_output | decrypt_input | wrap_output | unwrap_input" }
                   | { "kind": "ec", "curve": "p256 | p384 | p521", "octets": 64, "evidence": "sign_output | verify_input" }
+                  | { "kind": "ec_class", "octets": 64, "evidence": "sign_output | verify_input" }
                   | { "kind": "eddsa", "curve": "ed25519 | ed448", "octets": 64, "evidence": "sign_output | verify_input" }
                   | { "kind": "dsa_class", "label": "dsa_1024 | dsa_2048_224 | dsa_2048_256_or_3072", "octets": 40, "evidence": "sign_output | verify_input" }
                   | { "kind": "pqc_set", "parameter_set": "ml_kem_512 | ml_kem_768 | ml_kem_1024 | ml_dsa_44 | ml_dsa_65 | ml_dsa_87 | slh_dsa_128s | slh_dsa_128f | slh_dsa_192s | slh_dsa_192f | slh_dsa_256s | slh_dsa_256f", "octets": 1088, "evidence": "encapsulate_output | decapsulate_input | sign_output | verify_input" }
@@ -1319,6 +1327,9 @@ On every `key_operations[]` row (absent below v7):
 }
 ```
 
+`ec` carries the curve only when an established NIST curve agrees
+with the length (§5.2 ECDSA); a length alone publishes `ec_class`
+with `octets` only, never a curve name.
 `unknown`: no evidence or evidence outside every map (§5.3, with the
 named reason in `-v` text, not in this closed shape).
 With `--key-sizes` off, `inferred_size` is always `unknown` with
@@ -1366,7 +1377,7 @@ as a parenthetical where they add information (rows whose
 `metadata_at_use` is `unknown`). With `--key-sizes` on:
 
 - `sign: 12 operations (probably RSA 2048: 10; unknown: 2)`
-- `verify: 10 operations (probably EC P-256: 10)`
+- `verify: 10 operations (probably EC 256-bit class: 10)`
 - Non-standard RSA tallies as `probably RSA (non-standard length)`;
   `-v`/JSON carry the masked class + byte count.
 
@@ -1384,9 +1395,11 @@ exactly as today (byte-stable when v7 is absent).
   / `probably XEdDSA (from mechanism)` / `probably secret-key
   (from mechanism)` (the `secret` superclass)
 - `RSA 2048 (from signature length)` /
-  `EC P-256 (from signature length)` /
+  `EC 256-bit class (from signature length)` /
   `ML-KEM-768 (from ciphertext length)` /
   `wrapped material 24 bytes (from 32-byte wrap output, about wrapped key)`
+  (established EC rows read `EC P-256 (from signature length)` when
+  the established curve agrees, §5.2)
 - Non-standard RSA: `RSA, 2,0xx-bit class (from signature length)`
   (§5.2 masking rule; the byte count rides JSON `modulus_bytes`).
 - The `\<evidence\>` noun follows the evidence tag: sign/verify →
@@ -1552,7 +1565,8 @@ New section body (normative):
 > never transported; return value in the trailer. Standard RSA octet lengths
 > (128/256/384/512) name the standard size with the `length` source;
 > other admitted octets show a masked class with the byte count;
-> ECDSA raw lengths name P-256/P-384/P-521 with the `length` source;
+> ECDSA raw lengths name 256/384/521-bit classes with the `length`
+> source (the curve fills only beside an established curve, §5.2);
 > PQC lengths name the parameter set; no bit range is rendered
 > anywhere (owner 07:52). Wrapped-material lengths size the wrapped
 > key, never the wrapping key. Family inference uses
@@ -1602,7 +1616,8 @@ Per §5.2 triple: RSA-subset 256→`size_class` 2048 +
 2041-bit control), RSA 257→masked `2,0xx-bit class` +
 `modulus_bytes` only (no `size_class`), RSA 192→`1,5xx-bit
 class`, RSA_AES_KEY_WRAP 296→family `rsa`, size unknown
-`hybrid_wrap_format`; ECDSA 64/96/132 → P-256/P-384/P-521,
+`hybrid_wrap_format`; ECDSA 64/96/132 → 256/384/521-bit class
+(+ established-fill agreement twins),
 70-byte ECDSA → unknown `variable_length_encoding`, ECDH1-family
 mechanisms → family-only; EdDSA 64/114; XEDDSA 64 → family
 `xeddsa`, size unknown (no Ed25519 alias); KEM 768/1088/1568,
@@ -1889,7 +1904,8 @@ task depends on the postponed Task 8 (§18).
   admitted octet
   length shows a masked class ("RSA, 2,0xx-bit class (from signature
   length)") with the byte count. Same rule for the other families:
-  ECDSA raw lengths → P-256/P-384/P-521, ML-KEM/ML-DSA lengths →
+  ECDSA raw lengths → 256/384/521-bit class (curve only when
+  established, §5.2), ML-KEM/ML-DSA lengths →
   parameter sets. The evidence tag keeps it honest; no range text
   is rendered anywhere. The 64..=2048 admission bound stays as
   anti-aliasing (real odd sizes like 192-byte/1536-bit stay

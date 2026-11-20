@@ -1928,6 +1928,35 @@ pub(crate) fn joint_voids_line(
     )
 }
 
+/// One stderr line for the terminal retained-decoder count: the
+/// single EVENTS drain's malformed-record total (`unknown` without a
+/// drain), plus whether that count is unprovable (absent or
+/// saturated). Counts only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the Joint-void summary only when
+/// verbose text is requested, never a contract and never in reports.
+/// The audit-void split above explains the selected cause; this line
+/// proves the decoder invariant (zero malformed records).
+pub(crate) fn joint_decoder_line(raw_malformed: Option<u64>) -> String {
+    match raw_malformed {
+        Some(total) if total != u64::MAX => {
+            format!(
+                "p11scope: joint decoder: raw_malformed={total} \
+                 raw_malformed_unprovable=0"
+            )
+        }
+        Some(_) => {
+            format!(
+                "p11scope: joint decoder: raw_malformed={} \
+                 raw_malformed_unprovable=1",
+                u64::MAX
+            )
+        }
+        None => "p11scope: joint decoder: raw_malformed=unknown \
+             raw_malformed_unprovable=1"
+            .to_string(),
+    }
+}
+
 /// One stderr line for the diagnostic audit-subject summary:
 /// staging marks committed, ingested-quantum audits run, and audit
 /// refusals split by whether a running re-arm had happened yet.
@@ -2856,6 +2885,16 @@ impl AttestedSemanticLane {
         self.live
             .as_ref()
             .map_or(0, |live| live.capture.router().counters().skip_eras)
+    }
+
+    /// The retained EVENTS decoder's terminal malformed total, for the
+    /// Joint-decoder line. `None` without a live lane or drain:
+    /// unknown, never zero. Read-only; substituted test lanes carry
+    /// no retained drain and read unknown.
+    pub(crate) fn joint_decoder_malformed(&self) -> Option<u64> {
+        self.live
+            .as_ref()
+            .and_then(|live| live.session.events_decoder_malformed())
     }
 
     /// Lifetime per-reason scan-refusal counts (zeros without a live

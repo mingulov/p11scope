@@ -2126,6 +2126,10 @@ fn run_with_terminal_budget(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
+        let decoder = semantic_lane
+            .as_ref()
+            .and_then(|lane| lane.joint_decoder_malformed());
+        inventory_diagnostic(&crate::inventory_semantics::joint_decoder_line(decoder));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         inventory_diagnostic(&crate::inventory_semantics::joint_audit_subjects_line(
             subjects.marks,
@@ -6160,16 +6164,20 @@ fn start_semantic_lane(
                         RetryWithoutSizes::Refused(retry_refusal) => {
                             // The sizes failure keeps its own named
                             // gap beside the key-operations gap below.
+                            // Both journal attempts refused, so the
+                            // sizes-off retry is named as refused: key
+                            // operations do not continue behind it.
+                            let retry_reason = key_operations_refusal_reason(&retry_refusal);
                             coordinator.note_scope_gap(
                                 "key sizes unavailable".into(),
                                 format!(
-                                    "{sizes_reason}; key operations continue without \
-                                     operation-length sizes"
+                                    "{sizes_reason}; sizes-off retry also refused \
+                                     ({retry_reason})"
                                 ),
                             );
                             inventory_diagnostic(&format!(
-                                "p11scope: key sizes unavailable: {sizes_reason}; key operations \
-                                 continue without operation-length sizes"
+                                "p11scope: key sizes unavailable: {sizes_reason}; sizes-off \
+                                 retry also refused ({retry_reason})"
                             ));
                             refusal = retry_refusal;
                         }
@@ -9419,6 +9427,10 @@ fn run_dashboard(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
+        let decoder = semantic_lane
+            .as_ref()
+            .and_then(|lane| lane.joint_decoder_malformed());
+        display.notice(&crate::inventory_semantics::joint_decoder_line(decoder));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         display.notice(&crate::inventory_semantics::joint_audit_subjects_line(
             subjects.marks,
@@ -31875,9 +31887,7 @@ mod seal_readiness_tests {
             sizes_gaps[0].1
         );
         assert!(
-            !sizes_gaps[0]
-                .1
-                .contains("key operations continue without"),
+            !sizes_gaps[0].1.contains("key operations continue without"),
             "the double-refusal must not promise continued key operations: {}",
             sizes_gaps[0].1
         );

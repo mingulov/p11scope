@@ -4255,14 +4255,15 @@ impl LiveJointMachine {
                         if final_original {
                             self.finish_receipt = Some(receipt);
                         }
-                        // Poll the EVENTS ring-loss counter on every
-                        // machine publish, mirroring the plain commit
-                        // path: a rise discloses in the next
-                        // publication instead of staying silent. The
-                        // poll runs before the demand check below can
-                        // return early, so a publish that outruns its
-                        // demand still discloses.
+                        // Poll the EVENTS ring-loss and length-stash
+                        // counters on every machine publish, mirroring
+                        // the plain commit path: a rise discloses in
+                        // the next publication instead of staying
+                        // silent. The polls run before the demand
+                        // check below can return early, so a publish
+                        // that outruns its demand still discloses.
                         coordinator.poll_and_disclose_events_ring_loss(lane);
+                        coordinator.poll_and_disclose_length_stash_loss(lane);
                         if let Some(Demand::Bound {
                             original,
                             base_revision,

@@ -250,6 +250,39 @@ impl LeafBudget {
     }
 }
 
+/// Resumable cursor for one budgeted mint-preflight walk: proves a
+/// fresh key absent (miss) or finds it taken (hit) one leaf per unit
+/// through the shared pre-debit gate (bucket-head load, candidate
+/// inspection, next-link load, linear slot visit). Read-only: the
+/// caller inserts after a miss. The caller must not insert, merge or
+/// transfer until the walk completes (a hit restarts with a fresh
+/// key, since fresh tickets cannot collide without interleave).
+pub(super) struct MintWalkCursor {
+    role: Role,
+    key: RoleKey,
+    state: MintWalkState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MintWalkState {
+    FindingHead { bucket: usize },
+    FindingInspect { bucket: usize, current: u16 },
+    FindingNext { bucket: usize, current: u16 },
+    FindingLinear { next_slot: usize },
+    Miss,
+    Hit,
+}
+
+/// Budgeted free-slot pop outcome: `Yield` (no credit: retry with
+/// fresh credit, nothing popped), `Full` (no vacant slot: refuse),
+/// or the popped slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FreePopOutcome {
+    Yield,
+    Full,
+    Slot(usize),
+}
+
 /// Resumable cursor for one budgeted membership release: the
 /// stranded-staged disposal walks a held head's chain without
 /// exceeding its credit. Each chain-dependent read (bucket-head
@@ -1169,7 +1202,6 @@ impl<C> ReservationTable<C> {
         let at = match existing {
             Some(id) => self.id_slot(id).expect("preflight retained the operation"),
             None => {
-                let id = ReservationId(self.next + 1);
                 let at = if self.indexed() {
                     #[cfg(test)]
                     self.test_preflight_reads
@@ -1189,26 +1221,50 @@ impl<C> ReservationTable<C> {
                         })
                         .expect("preflight retained a slot")
                 };
-                let mut aliases = [None; ROLES];
-                aliases[0] = Some(id);
-                self.slots[at].operation = Some(Operation {
-                    aliases,
-                    roles: std::array::from_fn(|_| None),
-                });
-                self.next = id.0;
-                self.live += 1;
-                if self.indexed() {
-                    Self::chain_link(
-                        &mut self.id_heads,
-                        &mut self.slots,
-                        ID_LINKS,
-                        Self::id_bucket(id),
-                        node_code(at, 0),
-                    );
-                }
+                self.init_fresh_operation(at);
                 at
             }
         };
+        Ok(self.attach_role_member(role, key, bytes, charge, at))
+    }
+
+    /// Initialize a fresh operation in a popped slot: mint its never
+    /// recycled id, link its id node, count it live. Shared by the
+    /// synchronous insert and the budgeted mint commit so the two
+    /// cannot drift.
+    pub(super) fn init_fresh_operation(&mut self, at: usize) {
+        let id = ReservationId(self.next + 1);
+        let mut aliases = [None; ROLES];
+        aliases[0] = Some(id);
+        self.slots[at].operation = Some(Operation {
+            aliases,
+            roles: std::array::from_fn(|_| None),
+        });
+        self.next = id.0;
+        self.live += 1;
+        if self.indexed() {
+            Self::chain_link(
+                &mut self.id_heads,
+                &mut self.slots,
+                ID_LINKS,
+                Self::id_bucket(id),
+                node_code(at, 0),
+            );
+        }
+    }
+
+    /// Attach one role membership to its retained slot: store the
+    /// member, count population and bytes, link its key node, and
+    /// return the operation's head id. Shared by the synchronous
+    /// insert and the budgeted mint commit.
+    pub(super) fn attach_role_member(
+        &mut self,
+        role: Role,
+        key: RoleKey,
+        bytes: usize,
+        charge: C,
+        at: usize,
+    ) -> ReservationId {
         let operation = self.slots[at].operation.as_mut().unwrap();
         operation.roles[role.index()] = Some(Membership { key, bytes, charge });
         self.populations[role.index()] += 1;
@@ -1223,7 +1279,7 @@ impl<C> ReservationTable<C> {
                 node_code(at, role.index()),
             );
         }
-        Ok(head)
+        head
     }
 
     pub(super) fn release(&mut self, role: Role, key: RoleKey) -> Option<(usize, C)> {
@@ -1279,6 +1335,129 @@ impl<C> ReservationTable<C> {
                 key,
                 state: SingleReleaseState::FindingLinear { next_slot: 0 },
             }
+        }
+    }
+
+    /// Initial cursor for one budgeted mint-preflight walk.
+    pub(super) fn mint_walk_cursor(&self, role: Role, key: RoleKey) -> MintWalkCursor {
+        if self.indexed() {
+            MintWalkCursor {
+                role,
+                key,
+                state: MintWalkState::FindingHead {
+                    bucket: Self::key_bucket(role, key),
+                },
+            }
+        } else {
+            MintWalkCursor {
+                role,
+                key,
+                state: MintWalkState::FindingLinear { next_slot: 0 },
+            }
+        }
+    }
+
+    /// One budgeted mint-preflight step through the shared pre-debit
+    /// `gate` (bucket-head load, candidate inspection, next-link
+    /// load, linear slot visit — one unit each, never beyond
+    /// exhaustion). Returns whether the walk finished and, when it
+    /// did, whether the key missed (true) or hit (false). The caller
+    /// holds `cursor` across steps and must not insert, merge or
+    /// transfer until completion.
+    pub(super) fn mint_walk_step(
+        &self,
+        cursor: &mut MintWalkCursor,
+        gate: &mut LeafBudget,
+    ) -> Option<bool> {
+        loop {
+            if gate.remaining() == 0 {
+                return None;
+            }
+            match cursor.state {
+                MintWalkState::FindingHead { bucket } => {
+                    let Some(current) = self.budgeted_head(KEY_LINKS, bucket, gate) else {
+                        return None;
+                    };
+                    if current == INDEX_NONE {
+                        cursor.state = MintWalkState::Miss;
+                        return Some(true);
+                    }
+                    cursor.state = MintWalkState::FindingInspect { bucket, current };
+                }
+                MintWalkState::FindingInspect { bucket, current } => {
+                    if current == INDEX_NONE {
+                        cursor.state = MintWalkState::Miss;
+                        return Some(true);
+                    }
+                    let slot = node_slot(current);
+                    let lane = node_lane(current);
+                    let role = cursor.role;
+                    let target = cursor.key;
+                    let Some(found) = self.budgeted_match(slot, lane, role, target, gate) else {
+                        return None;
+                    };
+                    if found {
+                        cursor.state = MintWalkState::Hit;
+                        return Some(false);
+                    }
+                    cursor.state = MintWalkState::FindingNext { bucket, current };
+                }
+                MintWalkState::FindingNext { bucket, current } => {
+                    let slot = node_slot(current);
+                    let lane = node_lane(current);
+                    let Some(next) = self.budgeted_next(slot, KEY_LINKS, lane, gate) else {
+                        return None;
+                    };
+                    if next == INDEX_NONE {
+                        cursor.state = MintWalkState::Miss;
+                        return Some(true);
+                    }
+                    cursor.state = MintWalkState::FindingInspect {
+                        bucket,
+                        current: next,
+                    };
+                }
+                MintWalkState::FindingLinear { next_slot } => {
+                    if next_slot >= self.slots.len() {
+                        cursor.state = MintWalkState::Miss;
+                        return Some(true);
+                    }
+                    let role = cursor.role;
+                    let Some(key) = self.budgeted_slot_key(next_slot, role, gate) else {
+                        return None;
+                    };
+                    if key == Some(cursor.key) {
+                        cursor.state = MintWalkState::Hit;
+                        return Some(false);
+                    }
+                    cursor.state = MintWalkState::FindingLinear {
+                        next_slot: next_slot + 1,
+                    };
+                }
+                MintWalkState::Miss => {
+                    return Some(true);
+                }
+                MintWalkState::Hit => {
+                    return Some(false);
+                }
+            }
+        }
+    }
+
+    /// Budgeted free-slot pop through the single pre-debit gate: one
+    /// leaf for the free-list pop (head + link as one alloc-read,
+    /// matching the sync-walk count). `Yield` returns WITHOUT popping
+    /// when the credit is exhausted (caller yields); `Full` reports
+    /// no vacant slot (caller refuses).
+    pub(super) fn budgeted_free_pop(&mut self, gate: &mut LeafBudget) -> FreePopOutcome {
+        if !gate.try_charge() {
+            return FreePopOutcome::Yield;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        match Self::free_pop(&mut self.free_head, &mut self.slots) {
+            Some(at) => FreePopOutcome::Slot(at),
+            None => FreePopOutcome::Full,
         }
     }
 

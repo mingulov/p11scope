@@ -3348,6 +3348,125 @@ impl KeyUseReducer {
         self.unknown_add(unknown_index("unknown", "unbound"), *outcome);
     }
 
+    /// Admit one captured `Started` effect for the budgeted drain,
+    /// mirroring [`Self::observe_effect_from_stage`]'s Started arm
+    /// through the mint point: exact duplicates and
+    /// budget-exceeded resolutions refuse synchronously (no mint);
+    /// an admittable open starts its budgeted mint cursor
+    /// (pure-check refusals, including a missing ledger, refuse
+    /// synchronously too). Returns the retained drain on the mint
+    /// path, `None` when the effect already resolved. The mint
+    /// always targets the fallback ledger (disposal mints
+    /// fallback-only, like the synchronous disposal path).
+    fn drain_started_pre(
+        &mut self,
+        instance: RegistryInstanceId,
+        id: OperationId,
+        category: &'static str,
+        mechanism: Option<u64>,
+        key_receipt: Option<KeyReceipt>,
+        started_ts_ns: u64,
+        fallback: Option<&crate::semantics_objects::journal::StagingLedger>,
+    ) -> Option<PendingStartDrain> {
+        let key = (instance, id);
+        if self.open.contains_key(&key) || self.refused.contains_key(&key) {
+            // Exact duplicate delivery: the retained custody
+            // stands untouched — a duplicate never overwrites,
+            // and totals never shrink, so no slot is freed.
+            self.evidence.duplicate_starts = self.evidence.duplicate_starts.saturating_add(1);
+            return None;
+        }
+        let receipts = Self::bound_slice(category, key_receipt.as_slice(), &mut self.evidence);
+        let (slots, len) = Self::resolve(instance, category, receipts);
+        let resolved = &slots[..len];
+        if !self.admits(resolved) {
+            self.refuse(key, instance, category, started_ts_ns);
+            return None;
+        }
+        let assoc_bytes =
+            size_of::<OpenKeyUse>() as u64 + (resolved.len() * size_of::<OpenAssoc>()) as u64;
+        let Some(ledger) = fallback else {
+            debug_assert!(false, "keyassoc mint needs a ledger");
+            self.refuse(key, instance, category, started_ts_ns);
+            return None;
+        };
+        let mint = match ledger.start_keyassoc_mint(assoc_bytes) {
+            Ok(mint) => mint,
+            Err(_) => {
+                self.refuse(key, instance, category, started_ts_ns);
+                return None;
+            }
+        };
+        Some(PendingStartDrain {
+            key,
+            instance,
+            category,
+            mechanism,
+            started_ts_ns,
+            slots,
+            slots_len: len,
+            receipts: receipts.to_vec(),
+            mint,
+        })
+    }
+
+    /// Finish one drained `Started` effect after its mint commits,
+    /// mirroring the synchronous Started arm's post-mint block exactly
+    /// (fallback-only ticket).
+    fn drain_started_post(&mut self, start: PendingStartDrain, ticket: u64) {
+        let resolved = &start.slots[..start.slots_len];
+        self.open_buckets(resolved);
+        let associations: Vec<OpenAssoc> = resolved
+            .iter()
+            .zip(start.receipts.iter())
+            .map(|(slot, receipt)| {
+                let established = receipt.label.map(crate::keymeta::established_kind);
+                // The combined label governs when present (the
+                // base behavior, including legacy CKK_EC plus
+                // curve shapes); the raw type only fills in
+                // when no label exists.
+                let established_type = established.or_else(|| {
+                    receipt
+                        .key_type
+                        .and_then(crate::keymeta::established_type_kind)
+                });
+                OpenAssoc {
+                    bucket: slot.bucket,
+                    key: receipt.key,
+                    lost: false,
+                    primary: slot.primary,
+                    established,
+                    established_type,
+                }
+            })
+            .collect();
+        if start.receipts.is_empty() {
+            // A receipt-less open is live unknown-key S1:
+            // active now, outcome at close.
+            let slot = unknown_index(start.category, unbound_reason_for(start.category));
+            self.unknown_activate(slot);
+        }
+        // Touched proved buckets forward-fill their parks.
+        for assoc in associations.iter() {
+            if let AssocBucket::Proved(bucket) = assoc.bucket {
+                self.forward_fill(bucket, assoc.established);
+            }
+        }
+        self.open.insert(
+            start.key,
+            OpenKeyUse {
+                instance: start.instance,
+                category: start.category,
+                mechanism: start.mechanism,
+                started_ts_ns: start.started_ts_ns,
+                associations,
+                bound: !start.receipts.is_empty(),
+                ticket,
+                ticket_shared: false,
+            },
+        );
+    }
+
     /// Attribute one successful Init-based completion (§4.3/§9):
     /// the terminal length evidence (when admitted) and the
     /// Init-bound mechanism join the open's proved associations; a
@@ -4081,22 +4200,22 @@ impl<S: OperationSink> OperationSink for KeyUseTee<'_, S> {
 pub(crate) struct DisposalTee<'a> {
     keyuse: &'a mut KeyUseReducer,
     instance: RegistryInstanceId,
-    fallback_for_mint: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
     assoc_queue: &'a mut VecDeque<u64>,
+    captured: &'a mut VecDeque<OperationEffect>,
 }
 
 impl<'a> DisposalTee<'a> {
     pub(crate) fn new(
         keyuse: &'a mut KeyUseReducer,
         instance: RegistryInstanceId,
-        fallback_for_mint: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
         assoc_queue: &'a mut VecDeque<u64>,
+        captured: &'a mut VecDeque<OperationEffect>,
     ) -> Self {
         Self {
             keyuse,
             instance,
-            fallback_for_mint,
             assoc_queue,
+            captured,
         }
     }
 }
@@ -4122,17 +4241,53 @@ impl OperationSink for DisposalTee<'_> {
                     self.assoc_queue,
                 );
             }
+            // Retire and invalidation cursors emit only `Ended`; a
+            // `Started` (today unreachable here) captures FIFO for the
+            // budgeted mint drain instead of minting synchronously, so
+            // no disposal path can walk a mint unbudgeted.
+            OperationEffect::Started { .. } => {
+                self.captured.push_back(effect);
+            }
             _ => {
-                self.keyuse.observe_effect_from_stage(
-                    self.instance,
-                    &effect,
-                    None,
-                    self.fallback_for_mint.as_deref_mut(),
-                    None,
-                );
+                self.keyuse
+                    .observe_effect_from_stage(self.instance, &effect, None, None, None);
             }
         }
     }
+}
+
+/// Capturing sink for one head's synchronous observe: the effects
+/// queue FIFO into the drain instead of minting synchronously, so a
+/// fallback mint never walks unbounded inside the atomic region.
+/// Bounded by the head's own effects (a Bounded head touches O(1)
+/// machines, so at most a few effects).
+struct CaptureSink {
+    effects: Vec<OperationEffect>,
+}
+
+impl OperationSink for CaptureSink {
+    const WANTS_EFFECTS: bool = true;
+
+    fn emit(&mut self, effect: OperationEffect) {
+        self.effects.push(effect);
+    }
+}
+
+/// One captured `Started` effect awaiting its budgeted mint: the
+/// admission (duplicate check, resolution, budget check) already ran
+/// synchronously; the mint cursor walks and commits through the
+/// shared gate; the open lands on commit, the refused row on refusal
+/// (mirroring the synchronous Started arm on both paths).
+struct PendingStartDrain {
+    key: (RegistryInstanceId, OperationId),
+    instance: RegistryInstanceId,
+    category: &'static str,
+    mechanism: Option<u64>,
+    started_ts_ns: u64,
+    slots: [ResolvedAssoc; 2],
+    slots_len: usize,
+    receipts: Vec<KeyReceipt>,
+    mint: crate::semantics_objects::journal::LedgerMintCursor,
 }
 
 /// Resumable cursor for one feed's stranded staged disposal: holds
@@ -4141,22 +4296,28 @@ impl OperationSink for DisposalTee<'_> {
 /// per head/next/inspect read); its removed pool charge is RETAINED
 /// until the payload drops (drop-then-refund, never an early refund
 /// while the payload lives). The head then pops, reduces (Joint)
-/// and counts. Finalization drains the throwaway via a resumable
-/// budgeted invalidation (one leaf per machine pop + terminal,
-/// pending/detached drop, or open unbind) with fallback association
-/// releases queued FIFO and drained through the same gate (one leaf
-/// per chain read), preserving terminal reasons and effect order
-/// until the per-feed results merge once. At most one leaf per unit.
+/// and counts, with its effects captured FIFO and drained in emission
+/// order: `Started` mints walk and commit through the shared gate one
+/// leaf per unit (the unfinished mint and the H9 payload lease wait
+/// together until insert or refusal commits), `Ended` closes queue
+/// their releases, directs reduce synchronously. Finalization drains
+/// the throwaway via a resumable budgeted invalidation (one leaf per
+/// machine pop + terminal, pending/detached drop, or open unbind)
+/// with fallback association releases queued FIFO and drained through
+/// the same gate (one leaf per chain read), preserving terminal
+/// reasons and effect order until the per-feed results merge once.
+/// At most one leaf per unit.
 /// Worst-case leaves for one non-retiring staged head's atomic
-/// reduction (pop + edge + key-use + fallback mint walks): 1 pop, 2
-/// machines × 2 (visit + terminal), 2 mints × 25 (single-preflight
-/// miss walk for the measured max chain 12: 1 head + 12 inspects + 12
-/// nexts). Totals 55, rounded to 56. The caller reserve-checks
+/// reduction (pop + synchronous edge observe + effect capture +
+/// key-use admit): 1 pop plus a blanket margin for the O(1)
+/// uninstrumented sync reads (edge gets, key-use admits), rounded to
+/// 56. Association mint walks are NOT inside this reserve: they drain
+/// per-leaf through the same gate after the pop (a long-bucket walk
+/// spans credits instead of exceeding one). The caller reserve-checks
 /// (`try_charge_n`) before starting a head and yields without
-/// starting when fewer remain (retry with a fresh credit); the
-/// property test pins the max chain and per-head reads so the bound
-/// never silently goes stale. Retiring heads use resumable cursors
-/// (exact per-leaf, no bound).
+/// starting when fewer remain (retry with a fresh credit). Retiring
+/// and PENDING heads use resumable cursors (exact per-leaf, no
+/// bound).
 const HEAD_WORST: usize = 56;
 
 pub(crate) struct FeedDisposalCursor {
@@ -4191,6 +4352,12 @@ pub(crate) struct FeedDisposalCursor {
     /// commits, then the head pops WITHOUT a second observe (a second
     /// observe would double-queue).
     head_pending: Option<crate::semantics_edge::PendingAdmissionCursor>,
+    /// Captured head effects awaiting the FIFO drain, in emission
+    /// order: the drain empties this before the next head is selected
+    /// or the feed finalizes, so preservation completes per head.
+    pending_effects: VecDeque<OperationEffect>,
+    /// Captured `Started` effect awaiting its budgeted mint commit.
+    pending_start: Option<PendingStartDrain>,
     /// Set once the head's retire cursor completes (All or subset):
     /// the pending head pops without observe on re-entry.
     head_retired: bool,
@@ -4214,6 +4381,8 @@ impl FeedDisposalCursor {
             head_retire_all: None,
             head_retire: None,
             head_pending: None,
+            pending_effects: VecDeque::new(),
+            pending_start: None,
             head_retired: false,
             assoc_queue: VecDeque::with_capacity(crate::semantics_edge::MAX_EDGE_ACTIVE_OPS),
             assoc_release: None,
@@ -4260,6 +4429,13 @@ impl FeedDisposalCursor {
         keyuse: &mut KeyUseReducer,
         gate: &mut crate::semantics_objects::journal::LeafBudget,
     ) -> bool {
+        // First use prepares the fallback table once, outside the head
+        // poll and its leaf budget (one-time bounded work, like
+        // staging's own prepare): budgeted mints below assume it
+        // prepared and refuse Full when its pool charge refused.
+        if let Some(fallback_ledger) = fallback.as_deref_mut() {
+            let _ = fallback_ledger.prepare_capacity();
+        }
         loop {
             if gate.remaining() == 0 {
                 return false;
@@ -4320,8 +4496,8 @@ impl FeedDisposalCursor {
                 let mut tee = DisposalTee::new(
                     preserved,
                     self.instance,
-                    fallback.as_deref_mut(),
                     &mut self.assoc_queue,
+                    &mut self.pending_effects,
                 );
                 let done = throwaway.poll_invalidation_step(invalidate, &mut tee, gate);
                 if !done {
@@ -4341,8 +4517,8 @@ impl FeedDisposalCursor {
                 let mut tee = DisposalTee::new(
                     preserved,
                     self.instance,
-                    fallback.as_deref_mut(),
                     &mut self.assoc_queue,
+                    &mut self.pending_effects,
                 );
                 let done = throwaway.poll_invalidation_step(retire, &mut tee, gate);
                 if !done {
@@ -4363,8 +4539,8 @@ impl FeedDisposalCursor {
                 let mut tee = DisposalTee::new(
                     preserved,
                     self.instance,
-                    fallback.as_deref_mut(),
                     &mut self.assoc_queue,
+                    &mut self.pending_effects,
                 );
                 let done = throwaway.poll_retire_step(retire, &mut tee, gate);
                 if !done {
@@ -4385,8 +4561,8 @@ impl FeedDisposalCursor {
                 let mut tee = DisposalTee::new(
                     preserved,
                     self.instance,
-                    fallback.as_deref_mut(),
                     &mut self.assoc_queue,
+                    &mut self.pending_effects,
                 );
                 let done = throwaway.poll_pending_admission_step(pending, &mut tee, gate);
                 if !done {
@@ -4492,14 +4668,11 @@ impl FeedDisposalCursor {
                 );
                 {
                     let throwaway = self.throwaway.as_mut().expect("joint keeps reducers");
-                    let preserved = self.preserved.as_mut().expect("joint keeps reducers");
-                    let mut tee = DisposalTee::new(
-                        preserved,
-                        self.instance,
-                        fallback.as_deref_mut(),
-                        &mut self.assoc_queue,
-                    );
-                    throwaway.observe_with_effects(&head.facts, &head.origin, &mut tee);
+                    let mut capture = CaptureSink {
+                        effects: Vec::new(),
+                    };
+                    throwaway.observe_with_effects(&head.facts, &head.origin, &mut capture);
+                    self.pending_effects.extend(capture.effects);
                 }
                 let (position, _native) = (head.position, head.resource_native);
                 drop(head);
@@ -4507,6 +4680,21 @@ impl FeedDisposalCursor {
                 feed.history_disposed = feed.history_disposed.saturating_add(1);
                 self.pending_position = None;
                 drop(self.pending_lease.take());
+                continue;
+            }
+            // Drain captured effects FIFO before selecting the next
+            // head or finalizing: preservation completes per head, in
+            // emission order (a retained mint and its H9 payload lease
+            // wait here together, never past the finalize absorb).
+            if self.pending_start.is_some() || !self.pending_effects.is_empty() {
+                if !self.is_joint {
+                    self.pending_start = None;
+                    self.pending_effects.clear();
+                    continue;
+                }
+                if !self.poll_effect_drain(fallback.as_deref_mut(), gate) {
+                    return false;
+                }
                 continue;
             }
             #[cfg(test)]
@@ -4554,6 +4742,98 @@ impl FeedDisposalCursor {
             self.pending_position = Some(position);
             self.pending_release = Some(cursor);
             continue;
+        }
+    }
+
+    /// Drain captured head effects FIFO through the shared pre-debit
+    /// `gate`: `Started` mints walk and commit through the gate one
+    /// leaf per unit (the unfinished mint waits here until insert or
+    /// refusal commits), `Ended` closes queue their releases, directs
+    /// reduce synchronously (no ledger). Returns whether the queue
+    /// drained; false yields with the retained mint/effects resuming
+    /// on fresh credit. Preserves the synchronous Started arm's rows,
+    /// evidence, refusals and custody on every path.
+    fn poll_effect_drain(
+        &mut self,
+        mut fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        gate: &mut crate::semantics_objects::journal::LeafBudget,
+    ) -> bool {
+        use crate::semantics_objects::journal::MintStepOutcome;
+        loop {
+            if gate.remaining() == 0 {
+                return false;
+            }
+            if self.pending_start.is_some() {
+                let Some(fallback_ledger) = fallback.as_deref_mut() else {
+                    debug_assert!(false, "a started drain needs its ledger");
+                    return false;
+                };
+                let start = self.pending_start.as_mut().expect("started drain retained");
+                match fallback_ledger.mint_step(&mut start.mint, gate) {
+                    MintStepOutcome::Yield => return false,
+                    MintStepOutcome::Done(result) => {
+                        let start = self.pending_start.take().expect("started drain retained");
+                        let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                        match result {
+                            Ok(ticket) => preserved.drain_started_post(start, ticket),
+                            Err(_) => preserved.refuse(
+                                start.key,
+                                start.instance,
+                                start.category,
+                                start.started_ts_ns,
+                            ),
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(effect) = self.pending_effects.pop_front() else {
+                return true;
+            };
+            match effect {
+                OperationEffect::Started {
+                    id,
+                    category,
+                    mechanism,
+                    key_receipt,
+                    origin,
+                } => {
+                    let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                    let started = preserved.drain_started_pre(
+                        self.instance,
+                        id,
+                        category,
+                        mechanism,
+                        key_receipt,
+                        origin.ts_ns,
+                        fallback.as_deref(),
+                    );
+                    if let Some(started) = started {
+                        self.pending_start = Some(started);
+                    }
+                }
+                OperationEffect::Ended {
+                    id,
+                    outcome,
+                    length,
+                    corroboration,
+                    ..
+                } => {
+                    let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                    preserved.observe_ended_queued_for_disposal(
+                        self.instance,
+                        &id,
+                        &outcome,
+                        &length,
+                        &corroboration,
+                        &mut self.assoc_queue,
+                    );
+                }
+                effect => {
+                    let preserved = self.preserved.as_mut().expect("joint keeps reducers");
+                    preserved.observe_effect_from_stage(self.instance, &effect, None, None, None);
+                }
+            }
         }
     }
 }
@@ -5477,15 +5757,19 @@ mod disposal_tests {
 
     /// A pool-full fallback mint refuses the open without consuming
     /// a ticket: the refused row closes Unknown at finalize with
-    /// explicit evidence, inside every poll's debit.
+    /// explicit evidence, inside every poll's debit. The fallback
+    /// ledger holds a dedicated exact-fit pool (a shared pool would
+    /// regain room from the head's own H9 refund before the mint).
     #[test]
     fn feed_disposal_pool_refusal_refuses_open_without_ticket() {
         let tag = "mint-pool-refusal";
         let pool = SemanticResourcePool::default();
         let mut ledger = StagingLedger::with_resources(pool.reserver());
         ledger.prepare_capacity().unwrap();
-        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        let mint_pool = SemanticResourcePool::default();
+        let mut fallback = StagingLedger::with_resources(mint_pool.reserver());
         fallback.prepare_capacity().unwrap();
+        mint_pool.reference_set_limit(mint_pool.snapshot().charged_bytes);
         let mut feed = joint_feed();
         let instance =
             crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(31);
@@ -5496,7 +5780,6 @@ mod disposal_tests {
             &mut ledger,
         )
         .unwrap();
-        pool.reference_set_limit(pool.snapshot().charged_bytes);
         let mut cursor = FeedDisposalCursor::new(instance, true);
         let mut keyuse = KeyUseReducer::new();
         let (_, sync) = drive_disposal_reservation_checked(
@@ -5520,10 +5803,141 @@ mod disposal_tests {
             "{tag}: exactly one refused row"
         );
         assert_eq!(fallback.census(), 0, "{tag}: no assoc minted");
-        pool.reference_set_limit(usize::MAX);
+        mint_pool.reference_set_limit(usize::MAX);
         let ticket = fallback.mint_keyassoc(16).unwrap();
         assert_eq!(ticket, 1, "{tag}: the refusal consumed no ticket");
         fallback.release_keyassoc(ticket);
+    }
+
+    /// Budgeted Started drain matches the synchronous Started arm
+    /// exactly (same rows, unknowns, evidence, refusals, custody):
+    /// random starts incl. duplicates, pool-full mints and churned
+    /// buckets, sync vs capture + 1-unit budgeted drain, over 50
+    /// seeds. Guards the duplicated Started arm against drift. The
+    /// disposal only ever drains receipt-less starts (its throwaway
+    /// observes without receipts); the drain mirrors the full arm.
+    #[test]
+    fn started_drain_matches_synchronous_observe() {
+        use crate::semantics_edge::OperationId;
+        use crate::semantics_objects::journal::MintStepOutcome;
+        for seed in 0..50u64 {
+            let mut snapshots = Vec::new();
+            for path in 0..2 {
+                let mut state = seed.wrapping_add(0x51ed_1eed_51ed_1eed);
+                let mut next = || {
+                    state ^= state >> 12;
+                    state ^= state << 25;
+                    state ^= state >> 27;
+                    state = state.wrapping_mul(0x2545_f491_4f6c_dd1d);
+                    state
+                };
+                let pool = SemanticResourcePool::default();
+                let mut fallback = StagingLedger::with_resources(pool.reserver());
+                fallback.prepare_capacity().unwrap();
+                let bytes = size_of::<OpenKeyUse>() as u64;
+                for _ in 0..(next() % 24) {
+                    let ticket = fallback.mint_keyassoc(bytes).unwrap();
+                    if next().is_multiple_of(3) {
+                        fallback.release_keyassoc(ticket);
+                    }
+                }
+                match next() % 3 {
+                    0 => pool.reference_set_limit(pool.snapshot().charged_bytes),
+                    1 => {
+                        let room = 2
+                            * (bytes as usize
+                                + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING);
+                        pool.reference_set_limit(pool.snapshot().charged_bytes + room);
+                    }
+                    _ => {}
+                }
+                let instance =
+                    crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(
+                        (200 + seed) as u32,
+                    );
+                let mut keyuse = KeyUseReducer::new();
+                let starts = 1 + (next() % 12);
+                for ordinal in 0..starts {
+                    let id = OperationId::from_ordinal_for_test(1 + (next() % 8));
+                    let category = match next() % 4 {
+                        0 => "sign",
+                        1 => "generate_key",
+                        2 => "digest",
+                        _ => "encrypt",
+                    };
+                    let effect = OperationEffect::Started {
+                        id,
+                        category,
+                        mechanism: (next().is_multiple_of(2)).then_some(0x000d),
+                        key_receipt: None,
+                        origin: origin("C_SignInit", 1, 100 + ordinal),
+                    };
+                    if path == 0 {
+                        keyuse.observe_effect(instance, &effect, None, Some(&mut fallback));
+                    } else {
+                        let OperationEffect::Started {
+                            id,
+                            category,
+                            mechanism,
+                            key_receipt,
+                            origin,
+                        } = effect
+                        else {
+                            unreachable!("constructed Started");
+                        };
+                        let started = keyuse.drain_started_pre(
+                            instance,
+                            id,
+                            category,
+                            mechanism,
+                            key_receipt,
+                            origin.ts_ns,
+                            Some(&fallback),
+                        );
+                        let Some(mut started) = started else {
+                            continue;
+                        };
+                        let mut iters = 0;
+                        loop {
+                            let mut gate = LeafBudget::new(1);
+                            match fallback.mint_step(&mut started.mint, &mut gate) {
+                                MintStepOutcome::Yield => {
+                                    iters += 1;
+                                    assert!(iters < 100_000, "seed {seed}: the mint must commit");
+                                }
+                                MintStepOutcome::Done(Ok(ticket)) => {
+                                    keyuse.drain_started_post(started, ticket);
+                                    break;
+                                }
+                                MintStepOutcome::Done(Err(_)) => {
+                                    keyuse.refuse(
+                                        started.key,
+                                        started.instance,
+                                        started.category,
+                                        started.started_ts_ns,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                snapshots.push((
+                    unknown_sums(&keyuse),
+                    fallback.census(),
+                    fallback.charged_bytes(),
+                    keyuse.evidence(),
+                    keyuse.open().len(),
+                    keyuse.refused_opens().len(),
+                    keyuse.aggregates().len(),
+                    pool.snapshot().charged_bytes,
+                ));
+            }
+            assert_eq!(
+                snapshots[1], snapshots[0],
+                "seed {seed}: budgeted drain matches sync"
+            );
+        }
     }
 
     /// One-unit polls never read past their grant: every 1-unit poll

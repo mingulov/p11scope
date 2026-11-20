@@ -4,7 +4,8 @@
 
 use super::MAX_UNSETTLED_STAGED;
 use super::reservations::{
-    Refusal, ReleaseRoleCursor, ReservationId, ReservationTable, Role, RoleKey, SingleReleaseCursor,
+    FreePopOutcome, LeafBudget, MintWalkCursor, Refusal, ReleaseRoleCursor, ReservationId,
+    ReservationTable, Role, RoleKey, SingleReleaseCursor,
 };
 use crate::semantics_edge::resources::{
     OWNED_ALLOCATION_PADDING, ResourceLease, SEMANTIC_RESOURCE_LIMIT, SemanticResourceReserver,
@@ -76,6 +77,36 @@ pub(crate) struct StagingLedger {
 /// it across credits until its head's chain unlink finishes.
 pub(crate) struct LedgerReleaseCursor {
     inner: Option<SingleReleaseCursor<Option<ResourceLease>>>,
+}
+
+/// Resumable budgeted fallback-association mint: the preflight walk
+/// debits head/inspect/next reads through the shared gate one leaf
+/// per unit; the commit validates the walked ticket, rechecks the
+/// byte limit, reserves the pool charge, pops a free slot and
+/// inserts through the shared write path. The caller retains the
+/// cursor (and its payload lease) until insert or refusal commits.
+/// Refusals match the synchronous mint exactly; tickets never
+/// recycle and refusals never consume one.
+pub(crate) struct LedgerMintCursor {
+    bytes: u64,
+    bytes_usize: usize,
+    ticket: u64,
+    walk: MintWalkCursor,
+    phase: LedgerMintPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LedgerMintPhase {
+    Walk,
+    Commit,
+}
+
+/// One budgeted mint step's outcome: `Yield` (call again with fresh
+/// credit; nothing committed) or `Done` with the minted ticket or
+/// the refusal.
+pub(crate) enum MintStepOutcome {
+    Yield,
+    Done(Result<u64, LedgerRefusal>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,6 +655,151 @@ impl StagingLedger {
         } else {
             debug_assert!(result.is_none());
             (done, spent, None)
+        }
+    }
+
+    /// Start one budgeted association mint for `bytes`: pure admission
+    /// checks (byte limit, table fullness, ticket exhaustion, following
+    /// the synchronous mint's order) and the preflight walk cursor for
+    /// the next ticket. A missing table refuses Full (its prepare
+    /// refused earlier — like the synchronous mint, which prepares
+    /// inside charge and refuses when that fails).
+    pub(crate) fn start_keyassoc_mint(
+        &self,
+        bytes: u64,
+    ) -> Result<LedgerMintCursor, LedgerRefusal> {
+        let total = self
+            .charged_bytes()
+            .checked_add(bytes)
+            .ok_or(LedgerRefusal::Full)?;
+        if total > self.byte_limit {
+            return Err(LedgerRefusal::Full);
+        }
+        let bytes_usize = usize::try_from(bytes).map_err(|_| LedgerRefusal::Full)?;
+        let Some(table) = self.table.as_ref() else {
+            return Err(LedgerRefusal::Full);
+        };
+        if table.census() >= MAX_UNSETTLED_STAGED {
+            return Err(LedgerRefusal::Full);
+        }
+        let ticket = self
+            .next_keyassoc
+            .checked_add(1)
+            .ok_or(LedgerRefusal::Full)?;
+        let walk = table.mint_walk_cursor(Role::Association, Self::key(ticket));
+        Ok(LedgerMintCursor {
+            bytes,
+            bytes_usize,
+            ticket,
+            walk,
+            phase: LedgerMintPhase::Walk,
+        })
+    }
+
+    /// Restart a mint's walk with a fresh ticket after an interleaved
+    /// mint took the walked one (fresh tickets cannot collide without
+    /// interleave, so a hit restarts instead of refusing: the mint
+    /// linearizes after the interleaved one, like a later synchronous
+    /// mint). Re-runs the admission checks; their refusal ends the
+    /// mint without consuming a ticket.
+    fn restart_keyassoc_mint(&self, cursor: &mut LedgerMintCursor) -> Result<(), LedgerRefusal> {
+        let fresh = self.start_keyassoc_mint(cursor.bytes)?;
+        cursor.ticket = fresh.ticket;
+        cursor.walk = fresh.walk;
+        cursor.phase = LedgerMintPhase::Walk;
+        Ok(())
+    }
+
+    /// Drive one budgeted mint step through the shared pre-debit
+    /// `gate`: the walk first (one leaf per head/inspect/next read),
+    /// then the commit (ticket validation, byte-limit recheck, pool
+    /// reserve, free pop, insert). Yields without advancing past a
+    /// refused leaf; the caller retains the cursor (and its payload
+    /// lease) until `Done`. A refused free-pop charge yields with the
+    /// walk-miss retained (no re-walk).
+    pub(crate) fn mint_step(
+        &mut self,
+        cursor: &mut LedgerMintCursor,
+        gate: &mut LeafBudget,
+    ) -> MintStepOutcome {
+        loop {
+            match cursor.phase {
+                LedgerMintPhase::Walk => {
+                    let Some(table) = self.table.as_ref() else {
+                        return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                    };
+                    match table.mint_walk_step(&mut cursor.walk, gate) {
+                        None => return MintStepOutcome::Yield,
+                        Some(true) => {
+                            cursor.phase = LedgerMintPhase::Commit;
+                        }
+                        Some(false) => {
+                            if self.restart_keyassoc_mint(cursor).is_err() {
+                                return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                            }
+                        }
+                    }
+                }
+                LedgerMintPhase::Commit => {
+                    if self.next_keyassoc.checked_add(1) != Some(cursor.ticket) {
+                        if self.restart_keyassoc_mint(cursor).is_err() {
+                            return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                        }
+                        continue;
+                    }
+                    if self
+                        .charged_bytes()
+                        .checked_add(cursor.bytes)
+                        .is_none_or(|total| total > self.byte_limit)
+                    {
+                        return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                    }
+                    let Some(table) = self.table.as_mut() else {
+                        return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                    };
+                    if table.census() >= MAX_UNSETTLED_STAGED {
+                        return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                    }
+                    let slot = match table.budgeted_free_pop(gate) {
+                        FreePopOutcome::Yield => return MintStepOutcome::Yield,
+                        FreePopOutcome::Full => {
+                            return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                        }
+                        FreePopOutcome::Slot(at) => at,
+                    };
+                    let lease_bytes = cursor
+                        .bytes_usize
+                        .checked_add(OWNED_ALLOCATION_PADDING)
+                        .ok_or(LedgerRefusal::Full);
+                    let Ok(lease_bytes) = lease_bytes else {
+                        return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                    };
+                    let charge = match &self.reserver {
+                        Some(reserver) => match reserver.reserve(lease_bytes) {
+                            Ok(lease) => Some(lease),
+                            Err(_) => return MintStepOutcome::Done(Err(LedgerRefusal::Full)),
+                        },
+                        None => None,
+                    };
+                    // The slot stays popped across the reserve above:
+                    // nothing else runs between, so the pop cannot go
+                    // stale. (A `Full` pop returned before reserving.)
+                    let Some(table) = self.table.as_mut() else {
+                        drop(charge);
+                        return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                    };
+                    table.init_fresh_operation(slot);
+                    table.attach_role_member(
+                        Role::Association,
+                        Self::key(cursor.ticket),
+                        cursor.bytes_usize,
+                        charge,
+                        slot,
+                    );
+                    self.next_keyassoc = cursor.ticket;
+                    return MintStepOutcome::Done(Ok(cursor.ticket));
+                }
+            }
         }
     }
 

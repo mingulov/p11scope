@@ -9947,7 +9947,7 @@ fn discover_plan(
                     } else {
                         MemberOutcome::Examined
                     };
-                    member_outcomes.push((task, outcome));
+                    member_outcomes.push((task, outcome, 0));
                 }
                 // Only a complete scan that proved every member of its
                 // own shape examined covers it: incomplete scans,
@@ -10019,6 +10019,7 @@ fn discover_plan(
                     member_outcomes.push((
                         (*pid, view.start_time()),
                         crate::discovery::scan_pass::MemberOutcome::CutShortOther,
+                        0,
                     ));
                 }
             }

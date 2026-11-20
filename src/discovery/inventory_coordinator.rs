@@ -13163,13 +13163,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // live task this pass missed over-reports as unknown at the
         // stop — the safe direction, like the overflow sweep below.
         retain_current_tasks(&mut self.ever_enumerated, &current);
-        // Feed the pass cursor one typed outcome per enumerated member.
-        // A deep scan a truncating gap cut short examined nothing to
-        // completion: it stays fresh so the next pass retries it first
-        // instead of stranding it behind the same prefix. Only a budget
-        // stop on a proven generation accrues toward demotion, and only
-        // a completed scan or a maps match clears the streak.
+        // Feed the pass cursor one typed outcome plus own spend per
+        // enumerated member. A deep scan a truncating gap cut short
+        // examined nothing to completion: budget stops on proven
+        // own-exhaustion accrue toward demotion, other truncations stay
+        // fresh for retry, and unattempted members stay never-attempted
+        // ahead of retries; only a completed scan or a maps match clears
+        // the streak. Own spend accumulates for fair-share ordering.
         let cut_short = Self::truncated_member_pids(catalog);
+        let hog_threshold = self
+            .engine
+            .budget
+            .pass_owner_ref()
+            .work_allowance_for_scheduling();
         let mut outcomes = Vec::with_capacity(catalog.processes.len());
         for process in &catalog.processes {
             let task = (
@@ -13180,7 +13186,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .and_then(|member| member.start_time),
             );
             self.ever_enumerated.insert(task);
-            outcomes.push((task, Self::member_outcome(process, &cut_short)));
+            outcomes.push((
+                task,
+                Self::member_outcome(process, &cut_short, hog_threshold),
+                process.own_work,
+            ));
         }
         let live_pids: BTreeSet<u32> = catalog
             .processes
@@ -13233,13 +13243,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Maps one cataloged member to its cursor outcome. A budget stop
-    /// on a proven generation accrues whatever the result variant
-    /// (the accrual line is the member's work); otherwise a maps
-    /// match or a gap-free scan examines, any other truncation stays
-    /// fresh without accruing, and anything else was never attempted.
+    /// on a proven generation accrues whatever the result variant when
+    /// the member's own work proves exhaustion: a head turn begun with
+    /// the standard allowance, or a mid-queue turn whose own spend
+    /// reached the pass allowance (the hog that actually spent the
+    /// window). Otherwise a maps match or a gap-free scan examines, any
+    /// other truncation stays fresh without accruing, and anything else
+    /// was never attempted.
     fn member_outcome(
         process: &crate::inspect_system::ProcessRecord,
         cut_short: &BTreeSet<u32>,
+        hog_threshold: u64,
     ) -> crate::discovery::scan_pass::MemberOutcome {
         use crate::discovery::scan_pass::MemberOutcome;
         use crate::inspect_system::{MemberStatus, MemberWorkDisposition};
@@ -13247,15 +13261,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .generation
             .as_ref()
             .is_some_and(|member| member.start_time.is_some());
-        if proven_generation
-            && cut_short.contains(&process.pid)
-            && matches!(
-                process.work_disposition,
-                MemberWorkDisposition::StoppedDuringScan {
-                    full_allowance: true
-                }
-            )
-        {
+        let own_exhaustion = match process.work_disposition {
+            MemberWorkDisposition::StoppedDuringScan { full_allowance } => {
+                full_allowance || process.own_work >= hog_threshold
+            }
+            _ => false,
+        };
+        if proven_generation && cut_short.contains(&process.pid) && own_exhaustion {
             return MemberOutcome::CutShortBudgetStop;
         }
         if matches!(process.status, MemberStatus::MapsMatched) {
@@ -15948,6 +15960,7 @@ pub(crate) mod tests {
             pid,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: Vec::new(),
             generation: None,
         };
@@ -19212,6 +19225,7 @@ pub(crate) mod tests {
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,
                 work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+                own_work: 0,
                 objects: (0..objects.len()).collect(),
                 generation,
             }],
@@ -31186,6 +31200,7 @@ exit 0
                         status: crate::inspect_system::MemberStatus::Scanned,
                         work_disposition:
                             crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+                        own_work: 0,
                         objects: Vec::new(),
                         generation: Some(crate::inspect_system::MemberGeneration {
                             start_time: Some(800),
@@ -31258,6 +31273,7 @@ exit 0
                         status: crate::inspect_system::MemberStatus::Scanned,
                         work_disposition:
                             crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+                        own_work: 0,
                         objects: Vec::new(),
                         generation: Some(crate::inspect_system::MemberGeneration {
                             start_time: Some(800),
@@ -31329,6 +31345,7 @@ exit 0
             pid: 8,
             status: crate::inspect_system::MemberStatus::Exited,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: Vec::new(),
             generation: None,
             complete_scan: None,
@@ -31483,6 +31500,7 @@ exit 0
                         status: status.clone(),
                         work_disposition:
                             crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+                        own_work: 0,
                         objects: Vec::new(),
                         generation: None,
                         complete_scan: None,
@@ -46428,7 +46446,7 @@ mod scan_freshness_tests {
             .budget
             .pass_owner()
             .cursor_mut()
-            .note_member_outcomes(&[((999_999_999, Some(7)), MemberOutcome::Examined)]);
+            .note_member_outcomes(&[((999_999_999, Some(7)), MemberOutcome::Examined, 0)]);
         let generation = |start_time| {
             Some(crate::inspect_system::MemberGeneration {
                 start_time,
@@ -46445,6 +46463,7 @@ mod scan_freshness_tests {
             pid,
             status,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: Vec::new(),
             generation: generation(start_time),
             complete_scan: None,
@@ -46544,7 +46563,7 @@ mod scan_freshness_tests {
             let mut coordinator = freshness_coordinator();
             let outcomes: Vec<_> = tasks
                 .iter()
-                .map(|task| (*task, MemberOutcome::Examined))
+                .map(|task| (*task, MemberOutcome::Examined, 0))
                 .collect();
             coordinator
                 .engine
@@ -46603,6 +46622,7 @@ mod scan_freshness_tests {
             pid: 12,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: Vec::new(),
             generation: generation(Some(120)),
             complete_scan: None,
@@ -47677,6 +47697,7 @@ mod maps_skip_memory_tests {
             pid: 12,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: vec![0],
             generation: generation(Some(120)),
             complete_scan: None,
@@ -47728,6 +47749,7 @@ mod maps_skip_memory_tests {
             pid,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: vec![0],
             generation: generation(Some(120)),
             complete_scan: None,
@@ -47759,6 +47781,7 @@ mod maps_skip_memory_tests {
             pid,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects: vec![0],
             generation: generation(Some(120)),
             complete_scan: None,
@@ -47833,6 +47856,7 @@ mod maps_skip_memory_tests {
             pid,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects,
             generation: generation(Some(120)),
             complete_scan: None,
@@ -47902,6 +47926,7 @@ mod maps_skip_memory_tests {
             pid,
             status: MemberStatus::Scanned,
             work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+            own_work: 0,
             objects,
             generation: generation(Some(120)),
             complete_scan: None,
@@ -48060,6 +48085,7 @@ mod stop_diff_tests {
                 pid: NO_SUCH_PID - index as u32,
                 status: MemberStatus::NotSelected { loss: None },
                 work_disposition: crate::inspect_system::MemberWorkDisposition::NoBudgetStop,
+                own_work: 0,
                 objects: Vec::new(),
                 generation: Some(MemberGeneration {
                     start_time: Some(7_000 + index as u64),

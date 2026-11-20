@@ -2030,8 +2030,13 @@ impl SemanticCapture {
         if !retained && io.now() >= receipt.deadline {
             return Err(Refusal::CurrentPartition);
         }
+        // A seal reuses the same retained witness on every retry, so
+        // a witness that no longer matches current truth (its fence
+        // went stale, its epochs moved) is a definitive negative,
+        // not a contended attempt: name it so delivery falls back
+        // promptly instead of retrying through the watchdog delay.
         if !self.receipt_partition_matches(receipt) {
-            return Err(Refusal::CurrentPartition);
+            return Err(Refusal::RetainedWitnessMismatch);
         }
         if io.endpoint(receipt.attachment_slot) != Some(receipt.endpoint) {
             return Err(Refusal::AttachmentMismatch);

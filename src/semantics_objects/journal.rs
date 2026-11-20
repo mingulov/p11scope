@@ -1595,7 +1595,12 @@ pub(crate) const SCOPED_RECOVERY_SLICE: usize = 64;
 /// stop/yield interleave never double-applies.
 pub(crate) struct ScopedRecovery {
     /// The taken break scope (domains to fence, images to wipe).
+    /// Empty for stream recoveries, which fence and wipe everything.
     scope: ScopedWatchdogBreak,
+    /// Whether this recovery voids the whole stream (classify wipes
+    /// every entry, the fence covers every key) rather than one
+    /// stuck session.
+    stream: bool,
     /// Consumed upper at recovery start (fence cut).
     upper: u64,
     /// Prepaid failure storage bound and its lease (held across
@@ -1604,6 +1609,10 @@ pub(crate) struct ScopedRecovery {
     lease: crate::semantics_edge::resources::ResourceLease,
     /// Accumulated preserve + fence effects for the void failure.
     effects: ObjectEffects,
+    /// Stream failure scope, accumulated in key order as the
+    /// all-keys fence visits each key (scoped recoveries scope
+    /// from their break instead).
+    stream_scope: Vec<ObjectDomain>,
     /// Exact wipe membership, built by classification.
     wiped_open: BTreeSet<JournalNativeKey>,
     wiped_refused: BTreeSet<CallIdentity>,
@@ -1692,6 +1701,10 @@ enum ScopedRecoveryPhase {
     TaintDrainRefused { read: usize, write: usize },
     /// Fence stuck domains from the index.
     Fence { index: usize },
+    /// Fence every key past the cursor (stream voids): void fence
+    /// plus model loss per key, bootstrap pins cleared, failure
+    /// scope accumulated.
+    FenceAll { after: Option<JournalDomainKey> },
     /// Release and drop wiped opens past the cursor.
     WipeOpen { after: Option<JournalNativeKey> },
     /// Compact refused begins (read/write cursors into the vec).
@@ -2150,6 +2163,7 @@ impl JournalAdapter {
             ScopedRecoveryPhase::TaintDrainOpen { .. } => "taint-drain-open",
             ScopedRecoveryPhase::TaintDrainRefused { .. } => "taint-drain-refused",
             ScopedRecoveryPhase::Fence { .. } => "fence",
+            ScopedRecoveryPhase::FenceAll { .. } => "fence-all",
             ScopedRecoveryPhase::WipeOpen { .. } => "wipe-open",
             ScopedRecoveryPhase::WipeRefused { .. } => "wipe-refused",
             ScopedRecoveryPhase::Done => "done",
@@ -3573,7 +3587,10 @@ impl JournalAdapter {
     /// custody — refusing no key. Later seals re-prove above the
     /// recorded fence; nothing re-covers fenced history. The
     /// all-domain scope is kept: what is left after the break is a
-    /// missing stream position, which is stream-wide.
+    /// missing stream position, which is stream-wide. Test-only
+    /// synchronous form: production drives the sliced stream
+    /// recovery through the machine budget and yields.
+    #[cfg(test)]
     pub(crate) fn void_ingest_break_inner(
         &mut self,
         model: &mut ObjectSemantics,
@@ -7688,6 +7705,10 @@ impl JournalAdapter {
     /// wiped set keep their abandonments staged for their own seals;
     /// every erased abandonment (including unbound barrier members)
     /// refuses its incarnation or taints its image before the wipe.
+    /// Atomic callers (seal and raw-disposal voids) run this to
+    /// completion: each image's liveness basis builds once through
+    /// the shared cursor-based builder, chunked by the leaf bound,
+    /// instead of rescanning the per-image index per entry.
     fn preserve_abandonment_refusals_scoped(
         &mut self,
         model: &mut ObjectSemantics,
@@ -7697,6 +7718,7 @@ impl JournalAdapter {
         let mut doomed: BTreeSet<JournalDomainKey> = BTreeSet::new();
         let mut taint: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut neutral_absent: Vec<((u64, u64), JournalNativeKey, u32)> = Vec::new();
+        let mut bases: BTreeMap<(u64, u64), PreservedBasis> = BTreeMap::new();
         for (key, entry) in self.open.iter() {
             if only_wiped.is_some_and(|wiped| !wiped.contains(key)) {
                 continue;
@@ -7716,12 +7738,19 @@ impl JournalAdapter {
                 neutral_absent.push((entry.image, *key, entry.function));
                 continue;
             }
-            let live = self.live_keys_for_image(entry.image);
-            match live.as_slice() {
+            loop {
+                let mut left = SCOPED_RECOVERY_SLICE;
+                let mut budget = usize::MAX;
+                if self.preserve_basis_step(&mut bases, entry.image, &mut left, &mut budget) {
+                    break;
+                }
+            }
+            let basis = bases.get(&entry.image).expect("completed basis");
+            match basis.live.as_slice() {
                 [sole] => {
                     doomed.insert(*sole);
                 }
-                [] if !self.image_keys.contains_key(&entry.image) => {
+                [] if !basis.keyed => {
                     taint.insert(entry.image);
                 }
                 [] => {}
@@ -7731,7 +7760,7 @@ impl JournalAdapter {
                         .map(|m| {
                             m.iter()
                                 .filter(|(key, ordinals)| {
-                                    !ordinals.is_empty() && live.contains(key)
+                                    !ordinals.is_empty() && basis.live.contains(key)
                                 })
                                 .map(|(key, _)| *key)
                                 .collect()
@@ -8208,10 +8237,43 @@ impl JournalAdapter {
         self.void_wiped.clear();
         ScopedRecovery {
             scope,
+            stream: false,
             upper,
             bytes,
             lease,
             effects: ObjectEffects::default(),
+            stream_scope: Vec::new(),
+            wiped_open: BTreeSet::new(),
+            wiped_refused: BTreeSet::new(),
+            preserve_doomed: BTreeSet::new(),
+            preserve_taint: BTreeSet::new(),
+            preserve_basis: BTreeMap::new(),
+            doomed_done: BTreeSet::new(),
+            phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
+        }
+    }
+
+    /// Start one stream recovery from a fresh stream break: the same
+    /// sliced phases as a scoped recovery, but classification wipes
+    /// every entry, the fence covers every key, and completion
+    /// invalidates the stream with the global cut. The break flag
+    /// stays set until the re-sync clears it; resumption keys off
+    /// the standing recovery.
+    fn begin_stream_recovery(
+        &mut self,
+        upper: u64,
+        bytes: usize,
+        lease: crate::semantics_edge::resources::ResourceLease,
+    ) -> ScopedRecovery {
+        self.void_wiped.clear();
+        ScopedRecovery {
+            scope: ScopedWatchdogBreak::default(),
+            stream: true,
+            upper,
+            bytes,
+            lease,
+            effects: ObjectEffects::default(),
+            stream_scope: Vec::new(),
             wiped_open: BTreeSet::new(),
             wiped_refused: BTreeSet::new(),
             preserve_doomed: BTreeSet::new(),
@@ -8287,6 +8349,11 @@ impl JournalAdapter {
                         return false;
                     }
                 }
+                ScopedRecoveryPhase::FenceAll { after } => {
+                    if !self.fence_all_slice(model, recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
                 ScopedRecoveryPhase::WipeOpen { after } => {
                     if !self.wipe_open_slice(recovery, after, &mut left, budget) {
                         return false;
@@ -8298,7 +8365,14 @@ impl JournalAdapter {
                     }
                 }
                 ScopedRecoveryPhase::Done => {
+                    // A stream recovery additionally invalidates the
+                    // stream and records the global void cut, like
+                    // the synchronous stream void it replaces.
                     self.retained_census_drift = false;
+                    if recovery.stream {
+                        self.invalidated = true;
+                        self.voided_through = self.voided_through.max(recovery.upper);
+                    }
                     return true;
                 }
             }
@@ -8310,8 +8384,9 @@ impl JournalAdapter {
 
     /// Classify one slice of open entries past the cursor into the
     /// wipe set (stuck entries plus seal-barring unbound staging;
-    /// healthy-claimed entries stay out): returns true when the map
-    /// exhausts. Reads only; the map is untouched.
+    /// healthy-claimed entries stay out; stream recoveries wipe
+    /// every entry): returns true when the map exhausts. Reads
+    /// only; the map is untouched.
     fn classify_open_slice(
         &self,
         recovery: &mut ScopedRecovery,
@@ -8338,6 +8413,10 @@ impl JournalAdapter {
             }
             examined += 1;
             last = Some(*key);
+            if recovery.stream {
+                wiped.push(*key);
+                continue;
+            }
             let barrier = entry.converted_ticket.is_none()
                 && entry.begin_ordinal <= recovery.upper
                 && !self.image_keys.contains_key(&entry.image);
@@ -8366,7 +8445,8 @@ impl JournalAdapter {
     }
 
     /// Classify one slice of refused begins from the index into the
-    /// wipe set: returns true when the list exhausts. Reads only.
+    /// wipe set (stream recoveries wipe every member): returns true
+    /// when the list exhausts. Reads only.
     fn classify_refused_slice(
         &self,
         recovery: &mut ScopedRecovery,
@@ -8382,6 +8462,10 @@ impl JournalAdapter {
                 break;
             }
             examined += 1;
+            if recovery.stream {
+                wiped.push(refused.identity());
+                continue;
+            }
             let barrier =
                 refused.cut <= recovery.upper && !self.image_keys.contains_key(&refused.image);
             let stuck_entry = recovery.scope.images.contains(&refused.image)
@@ -8679,7 +8763,11 @@ impl JournalAdapter {
             return false;
         }
         if recovery.preserve_taint.is_empty() {
-            recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+            recovery.phase = if recovery.stream {
+                ScopedRecoveryPhase::FenceAll { after: None }
+            } else {
+                ScopedRecoveryPhase::Fence { index: 0 }
+            };
         } else {
             recovery.phase = ScopedRecoveryPhase::TaintDrainOpen { after: None };
         }
@@ -8733,6 +8821,10 @@ impl JournalAdapter {
                 );
             }
             self.ledger.release_h8open(removed.begin_ordinal);
+            // The void removed this invocation: record it like the
+            // wipe phase does, so late terminals classify
+            // cause-neutrally instead of promoting.
+            self.void_wiped.insert(key);
         }
         if examined < allowance {
             recovery.phase = ScopedRecoveryPhase::TaintDrainRefused { read: 0, write: 0 };
@@ -8776,7 +8868,11 @@ impl JournalAdapter {
         *budget = budget.saturating_sub(examined);
         if read >= self.refused.len() {
             self.refused.truncate(write);
-            recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+            recovery.phase = if recovery.stream {
+                ScopedRecoveryPhase::FenceAll { after: None }
+            } else {
+                ScopedRecoveryPhase::Fence { index: 0 }
+            };
             true
         } else {
             recovery.phase = ScopedRecoveryPhase::TaintDrainRefused { read, write };
@@ -8860,6 +8956,73 @@ impl JournalAdapter {
             recovery.phase = ScopedRecoveryPhase::Fence {
                 index: index + examined,
             };
+            false
+        }
+    }
+
+    /// Fence one slice of every key past the cursor (stream voids):
+    /// void fence plus model loss for held domains, per-key
+    /// bootstrap pins cleared (only a fresh attestation resumes
+    /// seals), and the failure scope accumulated in key order.
+    /// Returns true when the table exhausts. Fences take maxima,
+    /// so resuming never regresses; each key fences exactly once
+    /// per cursor pass.
+    fn fence_all_slice(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        after: Option<JournalDomainKey>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => self.keys.range((
+                std::ops::Bound::<JournalDomainKey>::Unbounded,
+                std::ops::Bound::<JournalDomainKey>::Unbounded,
+            )),
+            Some(last) => self
+                .keys
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut fenced: Vec<(JournalDomainKey, u64, bool)> = Vec::new();
+        for (key, state) in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*key);
+            fenced.push((*key, state.era, state.model_registered));
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for (key, era, registered) in fenced {
+            {
+                let state = self.keys.get_mut(&key).expect("fenced key");
+                state.void_fence = state.void_fence.max(recovery.upper);
+                state.bootstraps.clear();
+            }
+            let proof = JournalDomainProof { key, era };
+            recovery.stream_scope.push(proof.domain());
+            if !registered {
+                continue;
+            }
+            let lost = model.outcome_lost(
+                super::LostOutcome::Voided(
+                    proof.domain(),
+                    RefCut::sealed(ConsumptionOrdinal(recovery.upper)),
+                ),
+                &mut self.ledger,
+            );
+            recovery.effects.effects.extend(lost.effects);
+        }
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::WipeOpen { after: None };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::FenceAll { after: last };
             false
         }
     }
@@ -8975,7 +9138,16 @@ impl JournalAdapter {
         if read >= self.refused.len() {
             self.refused.truncate(write);
             // The decrement above already removes emptied census
-            // members, so no whole-census sweep is needed here.
+            // members, so no whole-census sweep is needed here. A
+            // stream recovery additionally drops every claim and the
+            // retained census itself, like the synchronous staged
+            // void it replaces (scoped recoveries keep healthy
+            // claims and their census).
+            if recovery.stream {
+                self.claims.clear();
+                self.claim_counts = 0;
+                self.retained_counts.clear();
+            }
             recovery.phase = ScopedRecoveryPhase::Done;
             true
         } else {

@@ -3196,12 +3196,46 @@ impl CallerRegistry {
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) -> (Vec<RegistryInstanceId>, u64, u64) {
-        let touched = self.take_quantum_touched_feeds();
+        let touched: Vec<RegistryInstanceId> =
+            self.take_quantum_touched_feeds().into_iter().collect();
+        self.discard_stuck_feeds(ledger, &touched)
+    }
+
+    /// Discard exactly the proven-stuck feeds' stranded staged calls
+    /// as watchdog stuck-session loss (scoped running-rearm recovery
+    /// with frame provenance only): each named feed drops its whole
+    /// queue by pure disposal (custody released exactly, no
+    /// reduction, no preservation, no replay). Touched-but-healthy
+    /// feeds keep their queues (fresh and carried) for retry; the
+    /// per-quantum touched set still clears, so carried heads resume
+    /// untracked like any held history. Each discarded feed
+    /// contributes its depth as disposed history. Returns the stuck
+    /// feed ids (nonempty at discard, for the scoped void's
+    /// domain/image derivation), the discarded staged-call total and
+    /// the number of feeds that held any (the named loss the re-arm
+    /// gap counts).
+    pub(crate) fn discard_proven_stuck_staged(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        stuck_ids: &[RegistryInstanceId],
+    ) -> (Vec<RegistryInstanceId>, u64, u64) {
+        let _ = self.take_quantum_touched_feeds();
+        self.discard_stuck_feeds(ledger, stuck_ids)
+    }
+
+    /// Drop whole staged queues for exactly the named feeds by pure
+    /// disposal, counting each feed's depth as disposed history.
+    /// Feeds with no row or an empty queue contribute nothing.
+    fn discard_stuck_feeds(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        ids: &[RegistryInstanceId],
+    ) -> (Vec<RegistryInstanceId>, u64, u64) {
         let mut stuck = Vec::new();
         let mut calls = 0u64;
         let mut feeds = 0u64;
-        for id in touched {
-            let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+        for id in ids {
+            let Some(record) = self.instance_state.semantics.get_mut(id) else {
                 continue;
             };
             let depth = record.feed.staged_len();
@@ -3217,7 +3251,7 @@ impl CallerRegistry {
             debug_assert_eq!(record.feed.staged_len(), 0);
             calls = calls.saturating_add(depth as u64);
             feeds = feeds.saturating_add(1);
-            stuck.push(id);
+            stuck.push(*id);
         }
         (stuck, calls, feeds)
     }

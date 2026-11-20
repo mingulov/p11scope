@@ -1380,9 +1380,9 @@ impl JointStaging {
         let head = self.staged.pop_front().expect("retained original head");
         self.frontier = head.position;
         let mut refused = 0;
-        let mut replayed = false;
         if loss || batch.resource_failed() {
             self.history_disposed = self.history_disposed.saturating_add(1);
+            batch.note_head_disposed();
             head.release(ledger);
         } else {
             let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
@@ -1407,13 +1407,14 @@ impl JointStaging {
                 ) {
                     Ok(count) => {
                         refused = count;
-                        replayed = true;
                         self.reduced = self.reduced.saturating_add(1);
                         self.fallback_replayed = self.fallback_replayed.saturating_add(1);
+                        batch.note_head_replayed();
                     }
                     Err(_) => {
                         reducer.invalidate_with_effects(&mut tee);
                         self.history_disposed = self.history_disposed.saturating_add(1);
+                        batch.note_head_disposed();
                         batch.note_resource_failure();
                     }
                 }
@@ -1426,12 +1427,17 @@ impl JointStaging {
         }
         if self.staged.is_empty() {
             self.close_segment(loss, segment_resumable_after(gap), fence);
+            // The completion carries the delivery's totals across all
+            // its slices (each slice disposed exactly one head above),
+            // not just this slice's head.
             (
                 FailureBatchProgress::Complete(if loss {
-                    FailureApplyOutcome::Degraded { disposed: 1 }
+                    FailureApplyOutcome::Degraded {
+                        disposed: batch.delivered_disposed(),
+                    }
                 } else {
                     FailureApplyOutcome::FellBack {
-                        replayed: usize::from(replayed),
+                        replayed: batch.delivered_replayed(),
                     }
                 }),
                 refused,

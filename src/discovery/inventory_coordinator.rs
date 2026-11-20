@@ -12802,6 +12802,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.discard_quantum_touched_staged(ledger)
     }
 
+    /// Discard exactly the proven-stuck feeds' stranded staged calls
+    /// as watchdog stuck-session loss (scoped running-rearm recovery
+    /// with frame provenance only): touched-but-healthy feeds keep
+    /// their queues for retry. Returns the stuck feed ids (nonempty
+    /// at discard), the discarded staged-call total and the number of
+    /// feeds that held any.
+    pub(crate) fn discard_proven_stuck_session(
+        &mut self,
+        stuck_ids: &[crate::discovery::caller_registry::instance_input::RegistryInstanceId],
+    ) -> (
+        Vec<crate::discovery::caller_registry::instance_input::RegistryInstanceId>,
+        u64,
+        u64,
+    ) {
+        let ledger = self.joint_capture.ledger_mut();
+        self.registry.discard_proven_stuck_staged(ledger, stuck_ids)
+    }
+
     /// Record the watchdog scoped break for the stuck session just
     /// discarded: the next Idle collect voids exactly these feeds'
     /// domains/images (plus seal-barring unbound staging) instead of

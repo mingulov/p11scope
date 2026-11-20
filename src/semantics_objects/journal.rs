@@ -1395,6 +1395,80 @@ pub(crate) struct ScopedWatchdogBreak {
     images: Vec<(u64, u64)>,
 }
 
+/// Units of active recovery work per atomic slice (INV-2 stride):
+/// classification, preservation, fence and wipe advance at most this
+/// many entries/keys per slice, charging the machine budget, so one
+/// Idle tick never scans the whole census synchronously.
+pub(crate) const SCOPED_RECOVERY_SLICE: usize = 64;
+
+/// One scoped void in progress: the owner drives it slice by slice
+/// through the machine budget, yielding when the budget exhausts
+/// and resuming on the next Idle tick. Cursors make every phase
+/// resumable; custody releases exactly once (entries leave the open
+/// map as they release, fences take maxima, taints stick), so a
+/// stop/yield interleave never double-applies.
+pub(crate) struct ScopedRecovery {
+    /// The taken break scope (domains to fence, images to wipe).
+    scope: ScopedWatchdogBreak,
+    /// Consumed upper at recovery start (fence cut).
+    upper: u64,
+    /// Prepaid failure storage bound and its lease (held across
+    /// slices until the failure publishes).
+    bytes: usize,
+    lease: crate::semantics_edge::resources::ResourceLease,
+    /// Accumulated preserve + fence effects for the void failure.
+    effects: ObjectEffects,
+    /// Exact wipe membership, built by classification.
+    wiped_open: BTreeSet<JournalNativeKey>,
+    wiped_refused: BTreeSet<CallIdentity>,
+    /// Keys whose abandonment refusal already applied (preserve runs
+    /// once per key across slices).
+    doomed_done: BTreeSet<JournalDomainKey>,
+    /// Current phase and its resume cursor.
+    phase: ScopedRecoveryPhase,
+}
+
+/// Outcome of one bounded barrier scan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum BarrierCheck {
+    /// Unbound staging bars seals.
+    Barrier,
+    /// No barrier stands.
+    Clear,
+    /// Budget exhausted mid-scan: call again to resume.
+    Yielded,
+}
+
+/// Resumable barrier-scan cursors: open resumes by key (valid
+/// across table mutations); refused resumes by index, restarting
+/// when its length moved.
+struct BarrierScan {
+    open_after: Option<JournalNativeKey>,
+    refused_index: usize,
+    refused_len: usize,
+    refused_phase: bool,
+}
+
+/// Resumable scoped-recovery phases in order.
+#[derive(Debug, Clone, Copy)]
+enum ScopedRecoveryPhase {
+    /// Classify open entries past the cursor (None starts at first).
+    ClassifyOpen { after: Option<JournalNativeKey> },
+    /// Classify refused begins from the index.
+    ClassifyRefused { index: usize },
+    /// Preserve abandonments for wiped opens past the cursor.
+    Preserve { after: Option<JournalNativeKey> },
+    /// Fence stuck domains from the index.
+    Fence { index: usize },
+    /// Release and drop wiped opens past the cursor.
+    WipeOpen { after: Option<JournalNativeKey> },
+    /// Compact refused begins (read/write cursors into the vec).
+    WipeRefused { read: usize, write: usize },
+    /// Rebuild nothing: the census stays incremental (each removal
+    /// decrements), so no survivor scan is needed.
+    Done,
+}
+
 pub(crate) struct JournalAdapter {
     /// The current seal attempt's wait cause (internal; never authority
     /// and never user-visible text). Reset at every seal attempt.
@@ -1409,6 +1483,14 @@ pub(crate) struct JournalAdapter {
     /// subsumes it. At most one pends: the Idle collect consumes any
     /// pending break before ingesting the next quantum.
     scoped_break: Option<ScopedWatchdogBreak>,
+    /// A scoped void in progress (sliced recovery): the Idle void
+    /// resumes it across ticks until done. A stream break aborts it
+    /// (the stream void subsumes the partial work); a new scoped
+    /// break unions into the pending slot for the next void.
+    scoped_recovery: Option<ScopedRecovery>,
+    /// A barrier scan in progress (watchdog park check): resumes
+    /// across ticks until it finds a barrier or clears.
+    barrier_scan: Option<BarrierScan>,
     /// Diagnostic-only break source counts (Task 0): breaks recorded
     /// through the dispose arm vs the ingest arm. Saturating;
     /// instrumentation only, never authority.
@@ -1601,6 +1683,8 @@ impl JournalAdapter {
             stream_boundary: None,
             stream_broken: false,
             scoped_break: None,
+            scoped_recovery: None,
+            barrier_scan: None,
             break_dispose: 0,
             break_ingest: 0,
             void_audit: 0,
@@ -1785,10 +1869,39 @@ impl JournalAdapter {
         self.scoped_break.take()
     }
 
+    /// Whether a watchdog scoped break pends: the Idle void observes
+    /// this while prepaying and takes the break only once its lease
+    /// exists, so a temporary pool refusal keeps the scope for retry.
+    pub(crate) fn scoped_break_pending(&self) -> bool {
+        self.scoped_break.is_some()
+    }
+
     /// Drop a pending watchdog scoped break unconsumed: a stream void
     /// already wiped its whole scope.
     pub(crate) fn drop_scoped_break(&mut self) {
         self.scoped_break = None;
+    }
+
+    /// Test-only read of the scoped recovery progress: (phase label,
+    /// wiped-open members, wiped-refused members), or None when no
+    /// recovery stands.
+    #[cfg(test)]
+    pub(crate) fn scoped_recovery_progress_for_test(&self) -> Option<(&'static str, usize, usize)> {
+        let recovery = self.scoped_recovery.as_ref()?;
+        let phase = match recovery.phase {
+            ScopedRecoveryPhase::ClassifyOpen { .. } => "classify-open",
+            ScopedRecoveryPhase::ClassifyRefused { .. } => "classify-refused",
+            ScopedRecoveryPhase::Preserve { .. } => "preserve",
+            ScopedRecoveryPhase::Fence { .. } => "fence",
+            ScopedRecoveryPhase::WipeOpen { .. } => "wipe-open",
+            ScopedRecoveryPhase::WipeRefused { .. } => "wipe-refused",
+            ScopedRecoveryPhase::Done => "done",
+        };
+        Some((
+            phase,
+            recovery.wiped_open.len(),
+            recovery.wiped_refused.len(),
+        ))
     }
 
     /// Test-only read of the adapter invalidation flag; see above.
@@ -3086,67 +3199,6 @@ impl JournalAdapter {
         self.voided_through = self.voided_through.max(upper);
         SealFailure {
             scope: self.affected_failure_scope(),
-            gap,
-            effects,
-            h3_voided: None,
-            fence: Some(upper),
-        }
-    }
-
-    /// End a stuck session after a watchdog re-arm abandoned its
-    /// quantum (scoped break): preserve that session's unbounded
-    /// abandonments as permanent refusals, fence the consumed history
-    /// on its domains only, and drop staged custody for its images
-    /// (plus any seal-barring unbound staging, which would otherwise
-    /// wedge the next frame behind the recovered lane) — refusing no
-    /// key. Later seals re-prove above the recorded fence; nothing
-    /// re-covers fenced history. Unlike a stream break, the stream
-    /// position stays intact: nothing invalidates, no re-sync is
-    /// owed, and the global void cut stays put, so healthy sessions
-    /// keep staged proof and re-prove above their own fences. An
-    /// entry convertible for (or claimed by) a healthy live key is
-    /// never wiped: converted entries wipe by their key, unconverted
-    /// ones only when no healthy claimant names their shape. Wiped
-    /// terminals shed at claim time (their void-wipe evidence routes
-    /// them to plain S1, never to a staged orphan head). At ingest,
-    /// excuse-eligible wipes excuse without tainting, while any other
-    /// wiped BEGIN's late END taints its image fail-closed; no replay
-    /// refusal follows in either arm.
-    pub(crate) fn void_ingest_break_scoped_inner(
-        &mut self,
-        model: &mut ObjectSemantics,
-        gap: JournalGap,
-        scope: ScopedWatchdogBreak,
-    ) -> SealFailure {
-        let upper = self.consumed_through;
-        let mut effects = self.preserve_abandonment_refusals_scoped(model, Some(&scope.images));
-        effects
-            .effects
-            .extend(self.fence_void_scoped(model, upper, &scope.domains).effects);
-        // Pinned bootstraps stay: the audit needs them to verify
-        // staged heads. The fence carries the loss for wiped history:
-        // below-cut re-proof refuses with loss at seal time, while
-        // fresh above-cut births re-prove above the fence. (A rebirth
-        // that reuses an era with a new cut may still mismatch its
-        // pinned cut and stay degraded with a named gap; the lane and
-        // healthy sessions are unaffected.)
-        self.void_staged_scoped(upper, &scope.domains, &scope.images);
-        let mut domains: Vec<ObjectDomain> = scope
-            .domains
-            .iter()
-            .filter_map(|key| {
-                self.keys.get(key).map(|state| {
-                    ObjectDomain::sealed(&JournalDomainProof {
-                        key: *key,
-                        era: state.era,
-                    })
-                })
-            })
-            .collect();
-        domains.sort();
-        domains.dedup();
-        SealFailure {
-            scope: SealFailureScope::AffectedDomains(domains),
             gap,
             effects,
             h3_voided: None,
@@ -6699,29 +6751,22 @@ impl JournalAdapter {
                     .effects
                     .extend(self.fence_void(model, self.consumed_through).effects);
                 if gap == JournalGap::H3Loss {
-                    // Pending keys never sealed, so the fence above
-                    // fenced them without a model gap (unregistered).
-                    // Record one OutcomeLost per pending key here, so
-                    // the loss degrades per key with a named gap
-                    // instead of voiding the whole view silently. The
+                    // Unregistered pending keys never sealed, so the
+                    // fence above fenced them without a model gap.
+                    // Record one OutcomeLost per such key here, so the
+                    // loss degrades per key with a named gap instead
+                    // of voiding the whole view silently. Registered
+                    // keys (including cleared-pin reseeds, which read
+                    // pending) already counted through the fence pass;
+                    // each affected domain counts exactly once. The
                     // global fence and wipe still hold for safety.
-                    let pending: Vec<(JournalDomainKey, u64)> = self
+                    let pending_unregistered = self
                         .keys
                         .iter()
-                        .filter(|(_, state)| state.bootstraps.is_empty())
-                        .map(|(key, state)| (*key, state.era))
-                        .collect();
-                    for (key, era) in pending {
-                        let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-                        let _ = model.register_domain(domain);
-                        let lost = model.outcome_lost(
-                            super::LostOutcome::Voided(
-                                domain,
-                                RefCut::sealed(ConsumptionOrdinal(self.consumed_through)),
-                            ),
-                            &mut self.ledger,
-                        );
-                        effects.effects.extend(lost.effects);
+                        .filter(|(_, state)| state.bootstraps.is_empty() && !state.model_registered)
+                        .count();
+                    for _ in 0..pending_unregistered {
+                        model.count_unregistered_loss();
                     }
                 }
                 // Keyrows B1: the failure records the void's fence, so
@@ -7180,19 +7225,21 @@ impl JournalAdapter {
     }
 
     /// Preserve staged unbounded abandonments as permanent refusals,
-    /// optionally scoped to one stuck session's images (`None`
-    /// preserves every image, for stream voids). Entries outside the
-    /// scope keep their abandonments staged for their own seals.
+    /// optionally scoped to the exact entries one wipe erases (`None`
+    /// preserves every entry, for stream voids). Entries outside the
+    /// wiped set keep their abandonments staged for their own seals;
+    /// every erased abandonment (including unbound barrier members)
+    /// refuses its incarnation or taints its image before the wipe.
     fn preserve_abandonment_refusals_scoped(
         &mut self,
         model: &mut ObjectSemantics,
-        only_images: Option<&[(u64, u64)]>,
+        only_wiped: Option<&BTreeSet<JournalNativeKey>>,
     ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         let mut doomed: BTreeSet<JournalDomainKey> = BTreeSet::new();
         let mut taint: BTreeSet<(u64, u64)> = BTreeSet::new();
-        for entry in self.open.values() {
-            if only_images.is_some_and(|images| !images.contains(&entry.image)) {
+        for (key, entry) in self.open.iter() {
+            if only_wiped.is_some_and(|wiped| !wiped.contains(key)) {
                 continue;
             }
             if !entry.abandon.is_some_and(|staged| {
@@ -7282,38 +7329,6 @@ impl JournalAdapter {
         effects
     }
 
-    /// Fence one scoped void explicitly: only the stuck session's keys
-    /// rise to the voided interval's upper cut, and only their
-    /// model-held domains record the interval as lost. Healthy keys
-    /// keep their fences (and the global void cut stays put), so
-    /// their seals re-prove above their own history. Iterates the
-    /// stuck keys only — never the whole key table.
-    fn fence_void_scoped(
-        &mut self,
-        model: &mut ObjectSemantics,
-        upper: u64,
-        stuck: &[JournalDomainKey],
-    ) -> ObjectEffects {
-        let mut effects = ObjectEffects::default();
-        for key in stuck {
-            let Some(state) = self.keys.get_mut(key) else {
-                continue;
-            };
-            state.void_fence = state.void_fence.max(upper);
-            if !state.model_registered {
-                continue;
-            }
-            let era = state.era;
-            let domain = ObjectDomain::sealed(&JournalDomainProof { key: *key, era });
-            let lost = model.outcome_lost(
-                super::LostOutcome::Voided(domain, RefCut::sealed(ConsumptionOrdinal(upper))),
-                &mut self.ledger,
-            );
-            effects.effects.extend(lost.effects);
-        }
-        effects
-    }
-
     /// Whether a seal barrier stands: unbound staging (an open or
     /// refused begin whose image was never attested) at or below the
     /// consumed frontier. Such entries barrier every seal past them.
@@ -7321,8 +7336,88 @@ impl JournalAdapter {
     /// consumers trip into re-arm and scoped void (which sheds the
     /// barrier) instead of parking (which would degrade them every
     /// frame while the barrier persists).
+    ///
+    /// Test-only synchronous scan: production (the watchdog) uses
+    /// [`Self::has_seal_barrier_bounded`] and yields.
+    #[cfg(test)]
     pub(crate) fn has_seal_barrier(&self) -> bool {
         self.has_unbound_staging(self.consumed_through)
+    }
+
+    /// One bounded barrier scan: unbound staging at or below the
+    /// consumed frontier, in stride slices through the budget with a
+    /// resumable cursor. Yields when the budget exhausts; resumes
+    /// next tick (open resumes by key, valid across table mutations;
+    /// refused restarts when its length moved).
+    pub(crate) fn has_seal_barrier_bounded(&mut self, budget: &mut usize) -> BarrierCheck {
+        let mut scan = self.barrier_scan.take().unwrap_or(BarrierScan {
+            open_after: None,
+            refused_index: 0,
+            refused_len: self.refused.len(),
+            refused_phase: false,
+        });
+        if scan.refused_len != self.refused.len() {
+            scan.refused_index = 0;
+            scan.refused_len = self.refused.len();
+        }
+        let frontier = self.consumed_through;
+        loop {
+            if *budget == 0 {
+                self.barrier_scan = Some(scan);
+                return BarrierCheck::Yielded;
+            }
+            let allowance = SCOPED_RECOVERY_SLICE.min(*budget);
+            let mut examined = 0usize;
+            if !scan.refused_phase {
+                let range = match scan.open_after {
+                    None => self.open.range((
+                        std::ops::Bound::<JournalNativeKey>::Unbounded,
+                        std::ops::Bound::<JournalNativeKey>::Unbounded,
+                    )),
+                    Some(last) => self
+                        .open
+                        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+                };
+                for (key, entry) in range {
+                    if examined >= allowance {
+                        break;
+                    }
+                    examined += 1;
+                    scan.open_after = Some(*key);
+                    if entry.converted_ticket.is_none()
+                        && entry.begin_ordinal <= frontier
+                        && !self.image_keys.contains_key(&entry.image)
+                    {
+                        *budget = budget.saturating_sub(examined);
+                        self.barrier_scan = None;
+                        return BarrierCheck::Barrier;
+                    }
+                }
+                *budget = budget.saturating_sub(examined);
+                if examined < allowance {
+                    scan.refused_phase = true;
+                    scan.refused_index = 0;
+                    scan.refused_len = self.refused.len();
+                    continue;
+                }
+            } else {
+                while scan.refused_index < self.refused.len() && examined < allowance {
+                    let refused = &self.refused[scan.refused_index];
+                    scan.refused_index += 1;
+                    examined += 1;
+                    if refused.cut <= frontier && !self.image_keys.contains_key(&refused.image) {
+                        *budget = budget.saturating_sub(examined);
+                        self.barrier_scan = None;
+                        return BarrierCheck::Barrier;
+                    }
+                }
+                *budget = budget.saturating_sub(examined);
+                if examined < allowance || scan.refused_index >= self.refused.len() {
+                    self.barrier_scan = None;
+                    return BarrierCheck::Clear;
+                }
+            }
+        }
     }
 
     /// Clear pinned bootstrap cuts for one image's keys (reseed): a
@@ -7629,97 +7724,473 @@ impl JournalAdapter {
         }
     }
 
-    /// Drop staged wire truth for a scoped void: the stuck session's
-    /// images plus any seal-barring unbound staging (an open or
-    /// refused begin whose image was never attested bars every seal
-    /// past it, so leaving it would wedge the recovered lane behind
-    /// the shed session). Converted entries wipe by their key;
-    /// unconverted ones wipe only when no healthy claimant names
-    /// their shape, so an entry convertible for (or claimed by) a
-    /// healthy live key is never wiped. Wiped terminals shed at claim
-    /// time (their void-wipe evidence routes them to plain S1, never
-    /// to a staged orphan head), and neutral ones excuse at ingest,
-    /// so no taint and no replay refusal follows. Per-entry custody
-    /// releases keep the ledger exact, and the retained census is
-    /// rebuilt from survivors.
-    fn void_staged_scoped(
+    /// Start one scoped recovery from a taken break: clear the
+    /// wiped-invocation record (rebuilt incrementally by the wipe
+    /// slices) and open classification at the first entry.
+    fn begin_scoped_recovery(
         &mut self,
+        scope: ScopedWatchdogBreak,
         upper: u64,
-        stuck: &[JournalDomainKey],
-        stuck_images: &[(u64, u64)],
-    ) {
-        // Decide the wipe set first (immutable borrows only), then mutate.
-        let mut wiped_open: Vec<JournalNativeKey> = Vec::new();
-        let mut wiped_refused: BTreeSet<CallIdentity> = BTreeSet::new();
-        for (key, entry) in self.open.iter() {
+        bytes: usize,
+        lease: crate::semantics_edge::resources::ResourceLease,
+    ) -> ScopedRecovery {
+        self.void_wiped.clear();
+        ScopedRecovery {
+            scope,
+            upper,
+            bytes,
+            lease,
+            effects: ObjectEffects::default(),
+            wiped_open: BTreeSet::new(),
+            wiped_refused: BTreeSet::new(),
+            doomed_done: BTreeSet::new(),
+            phase: ScopedRecoveryPhase::ClassifyOpen { after: None },
+        }
+    }
+
+    /// Drive one recovery slice (at most [`SCOPED_RECOVERY_SLICE`]
+    /// units and never past the budget), advancing through phases as
+    /// each exhausts: returns true when the recovery completes.
+    /// Charges one unit per examined entry/key against the budget.
+    /// Custody releases exactly once (entries leave the open map as
+    /// they release, fences take maxima, taints stick, each doomed
+    /// key refuses once), so yielding and resuming never
+    /// double-applies.
+    fn recover_scoped_slice(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        budget: &mut usize,
+    ) -> bool {
+        let mut left = SCOPED_RECOVERY_SLICE.min(*budget);
+        if left == 0 {
+            return false;
+        }
+        loop {
+            match recovery.phase {
+                ScopedRecoveryPhase::ClassifyOpen { after } => {
+                    if !self.classify_open_slice(recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::ClassifyRefused { index } => {
+                    if !self.classify_refused_slice(recovery, index, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::Preserve { after } => {
+                    if !self.preserve_slice(model, recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::Fence { index } => {
+                    if !self.fence_slice(model, recovery, index, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::WipeOpen { after } => {
+                    if !self.wipe_open_slice(recovery, after, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::WipeRefused { read, write } => {
+                    if !self.wipe_refused_slice(recovery, read, write, &mut left, budget) {
+                        return false;
+                    }
+                }
+                ScopedRecoveryPhase::Done => {
+                    self.retained_census_drift = false;
+                    return true;
+                }
+            }
+            if left == 0 {
+                return false;
+            }
+        }
+    }
+
+    /// Classify one slice of open entries past the cursor into the
+    /// wipe set (stuck entries plus seal-barring unbound staging;
+    /// healthy-claimed entries stay out): returns true when the map
+    /// exhausts. Reads only; the map is untouched.
+    fn classify_open_slice(
+        &self,
+        recovery: &mut ScopedRecovery,
+        after: Option<JournalNativeKey>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => self.open.range((
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+            )),
+            Some(last) => self
+                .open
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut wiped: Vec<JournalNativeKey> = Vec::new();
+        for (key, entry) in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*key);
             let barrier = entry.converted_ticket.is_none()
-                && entry.begin_ordinal <= upper
+                && entry.begin_ordinal <= recovery.upper
                 && !self.image_keys.contains_key(&entry.image);
             let stuck_entry = match entry.converted_for {
-                Some(converted) => stuck.contains(&converted),
+                Some(converted) => recovery.scope.domains.contains(&converted),
                 None => {
-                    stuck_images.contains(&entry.image)
-                        && !self.has_healthy_claimant(&shape_of_entry(entry), stuck)
+                    recovery.scope.images.contains(&entry.image)
+                        && !self
+                            .has_healthy_claimant(&shape_of_entry(entry), &recovery.scope.domains)
                 }
             };
             if barrier || stuck_entry {
-                wiped_open.push(*key);
+                wiped.push(*key);
             }
         }
-        for refused in self.refused.iter() {
-            let barrier = refused.cut <= upper && !self.image_keys.contains_key(&refused.image);
-            let stuck_entry = stuck_images.contains(&refused.image)
-                && !self.has_healthy_claimant(&refused.shape(), stuck);
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        recovery.wiped_open.extend(wiped);
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::ClassifyRefused { index: 0 };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::ClassifyOpen { after: last };
+            false
+        }
+    }
+
+    /// Classify one slice of refused begins from the index into the
+    /// wipe set: returns true when the list exhausts. Reads only.
+    fn classify_refused_slice(
+        &self,
+        recovery: &mut ScopedRecovery,
+        index: usize,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let mut examined = 0usize;
+        let mut wiped: Vec<CallIdentity> = Vec::new();
+        for refused in self.refused.iter().skip(index) {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            let barrier =
+                refused.cut <= recovery.upper && !self.image_keys.contains_key(&refused.image);
+            let stuck_entry = recovery.scope.images.contains(&refused.image)
+                && !self.has_healthy_claimant(&refused.shape(), &recovery.scope.domains);
             if barrier || stuck_entry {
-                wiped_refused.insert(refused.identity());
+                wiped.push(refused.identity());
             }
         }
-        // Mirror the stream void's wiped-invocation record and
-        // derived-absence notes for exactly the wiped set.
-        self.void_wiped.clear();
-        self.void_wiped.extend(wiped_open.iter().copied());
-        let absent: Vec<((u64, u64), JournalNativeKey, u32)> = wiped_open
-            .iter()
-            .filter_map(|key| self.open.get(key).map(|entry| (*key, entry)))
-            .filter(|(_, entry)| {
-                entry.end.is_none()
-                    && entry.abandon.is_none()
-                    && !entry.begin.no_end()
-                    && entry.corroborated_return.is_none()
-                    && disposes_unclaimable_original(entry.function)
-            })
-            .map(|(key, entry)| (entry.image, key, entry.function))
-            .collect();
-        for (image, key, function) in absent {
-            self.note_derived_absence(image, key, function);
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        recovery.wiped_refused.extend(wiped);
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::Preserve { after: None };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::ClassifyRefused {
+                index: index + examined,
+            };
+            false
         }
-        // Release per-entry custody exactly, then drop the wiped state.
-        // The stuck keys' claims stay: their shapes may still be
-        // named by kept entries, and seals consult the fence (not
-        // claim presence) for loss. Wiped shapes simply never seal.
-        for key in &wiped_open {
-            let entry = self.open.remove(key).expect("wiped open entry");
-            self.ledger.release_h8open(entry.begin_ordinal);
+    }
+
+    /// Preserve one slice of wiped opens past the cursor: every
+    /// erased unbounded abandonment refuses its incarnation or taints
+    /// its image before the wipe. Entries an earlier taint already
+    /// dropped are covered by that taint and skipped. Each doomed key
+    /// refuses once across slices. Returns true when the set
+    /// exhausts.
+    fn preserve_slice(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        after: Option<JournalNativeKey>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => recovery.wiped_open.range((
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+            )),
+            Some(last) => recovery
+                .wiped_open
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut keys: Vec<JournalNativeKey> = Vec::new();
+        for key in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*key);
+            keys.push(*key);
         }
-        self.refused
-            .retain(|refused| !wiped_refused.contains(&refused.identity()));
-        // Rebuild the retained census from survivors: open members
-        // keep iff their native key still stages; refused members iff
-        // their shape still stages.
-        let surviving_refused: BTreeSet<CallIdentity> = self
-            .refused
-            .iter()
-            .map(|refused| refused.identity())
-            .collect();
-        for members in self.retained_counts.values_mut() {
-            members.retain(|member| match member {
-                RetainedMember::Open(native) => self.open.contains_key(native),
-                RetainedMember::Refused(shape) => surviving_refused.contains(&shape.identity),
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for key in keys {
+            // An earlier taint in this pass may already have dropped
+            // (and released) this entry with its image: covered.
+            let Some(entry) = self.open.get(&key) else {
+                continue;
+            };
+            let unbounded = entry.abandon.is_some_and(|staged| {
+                abandon_disposition(staged.abandon.reason())
+                    == Some(AbandonDisposition::UnboundedInvalidation)
             });
+            if !unbounded {
+                continue;
+            }
+            let image = entry.image;
+            let shape = shape_of_entry(entry);
+            let live = self.live_keys_for_image(image);
+            // Mirror the batch preservation decision per entry: a
+            // sole live key is doomed, a keyless image is tainted,
+            // and a shared image dooms its live claimants (or taints
+            // when no claimant names the shape).
+            match live.as_slice() {
+                [sole] => {
+                    self.doom_abandoned_key(model, recovery, *sole);
+                }
+                [] if !self.image_keys.contains_key(&image) => {
+                    self.taint_image(image, TaintCause::UnclaimedInvalidation);
+                }
+                [] => {}
+                _ => {
+                    let claimants: Vec<JournalDomainKey> = self
+                        .claimants_naming(&shape)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|(key, ordinals)| {
+                                    !ordinals.is_empty() && live.contains(key)
+                                })
+                                .map(|(key, _)| *key)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if claimants.is_empty() {
+                        self.taint_image(image, TaintCause::UnclaimedInvalidation);
+                    } else {
+                        for claimant in claimants {
+                            self.doom_abandoned_key(model, recovery, claimant);
+                        }
+                    }
+                }
+            }
         }
-        self.retained_counts
-            .retain(|_, members| !members.is_empty());
-        self.retained_census_drift = false;
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::Fence { index: 0 };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::Preserve { after: last };
+            false
+        }
+    }
+
+    /// Refuse one abandoned key once across preserve slices: its
+    /// model domain (if held) abandons, and the key refuses. Later
+    /// slices skip keys already doomed here.
+    fn doom_abandoned_key(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        key: JournalDomainKey,
+    ) {
+        if self.is_tainted((key.cookie, key.exec)) || !recovery.doomed_done.insert(key) {
+            return;
+        }
+        let (era, registered) = self
+            .keys
+            .get(&key)
+            .map(|state| (state.era, state.model_registered))
+            .expect("doomed key");
+        if registered {
+            let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
+            let refused = model.abandon_domain(domain, &mut self.ledger);
+            recovery.effects.effects.extend(refused.effects);
+        }
+        let lived = self.key_is_live(key);
+        self.keys.get_mut(&key).expect("doomed key").refused = true;
+        self.claims_prune_dirty |= lived;
+    }
+
+    /// Fence one slice of stuck domains from the index (void fence
+    /// plus model loss for held domains): returns true when the scope
+    /// exhausts. Fences take maxima, so resuming never regresses.
+    fn fence_slice(
+        &mut self,
+        model: &mut ObjectSemantics,
+        recovery: &mut ScopedRecovery,
+        index: usize,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let mut examined = 0usize;
+        let mut keys: Vec<JournalDomainKey> = Vec::new();
+        for key in recovery.scope.domains.iter().skip(index) {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            keys.push(*key);
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for key in keys {
+            let Some(state) = self.keys.get_mut(&key) else {
+                continue;
+            };
+            state.void_fence = state.void_fence.max(recovery.upper);
+            if !state.model_registered {
+                continue;
+            }
+            let era = state.era;
+            let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
+            let lost = model.outcome_lost(
+                super::LostOutcome::Voided(
+                    domain,
+                    RefCut::sealed(ConsumptionOrdinal(recovery.upper)),
+                ),
+                &mut self.ledger,
+            );
+            recovery.effects.effects.extend(lost.effects);
+        }
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::WipeOpen { after: None };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::Fence {
+                index: index + examined,
+            };
+            false
+        }
+    }
+
+    /// Drop one slice of wiped opens past the cursor, releasing
+    /// per-entry custody exactly once and decrementing the retained
+    /// census incrementally (no survivor rebuild scan): returns true
+    /// when the set exhausts. Entries preservation already dropped
+    /// are gone with custody released and skipped.
+    fn wipe_open_slice(
+        &mut self,
+        recovery: &mut ScopedRecovery,
+        after: Option<JournalNativeKey>,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let range = match after {
+            None => recovery.wiped_open.range((
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+                std::ops::Bound::<JournalNativeKey>::Unbounded,
+            )),
+            Some(last) => recovery
+                .wiped_open
+                .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+        };
+        let mut examined = 0usize;
+        let mut last = after;
+        let mut keys: Vec<JournalNativeKey> = Vec::new();
+        for key in range {
+            if examined >= allowance {
+                break;
+            }
+            examined += 1;
+            last = Some(*key);
+            keys.push(*key);
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        for key in keys {
+            let Some(entry) = self.open.remove(&key) else {
+                continue;
+            };
+            if entry.converted_ticket.is_none() {
+                self.retained_member_dec(
+                    identity_of_begin(&entry.begin),
+                    RetainedMember::Open(key),
+                );
+            }
+            // Neutral wiped BEGINs excuse their late terminals at
+            // ingest (their void-wipe evidence routes them to plain
+            // S1); anything else taints fail-closed there.
+            if entry.end.is_none()
+                && entry.abandon.is_none()
+                && !entry.begin.no_end()
+                && entry.corroborated_return.is_none()
+                && disposes_unclaimable_original(entry.function)
+            {
+                self.note_derived_absence(entry.image, key, entry.function);
+            }
+            self.ledger.release_h8open(entry.begin_ordinal);
+            self.void_wiped.insert(key);
+        }
+        if examined < allowance {
+            recovery.phase = ScopedRecoveryPhase::WipeRefused { read: 0, write: 0 };
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::WipeOpen { after: last };
+            false
+        }
+    }
+
+    /// Compact one slice of refused begins with read/write cursors,
+    /// dropping wiped members (census decremented) and keeping the
+    /// rest in place: returns true when the list exhausts, truncating
+    /// to the survivors. No separate membership scan.
+    fn wipe_refused_slice(
+        &mut self,
+        recovery: &mut ScopedRecovery,
+        read: usize,
+        write: usize,
+        left: &mut usize,
+        budget: &mut usize,
+    ) -> bool {
+        let allowance = *left;
+        let mut examined = 0usize;
+        let mut read = read;
+        let mut write = write;
+        while read < self.refused.len() && examined < allowance {
+            examined += 1;
+            let refused = self.refused[read];
+            if recovery.wiped_refused.contains(&refused.identity()) {
+                self.retained_refused_dec(&refused);
+            } else {
+                if write != read {
+                    self.refused[write] = refused;
+                }
+                write += 1;
+            }
+            read += 1;
+        }
+        *left -= examined;
+        *budget = budget.saturating_sub(examined);
+        if read >= self.refused.len() {
+            self.refused.truncate(write);
+            // Drop emptied census members left by the removals above.
+            self.retained_counts
+                .retain(|_, members| !members.is_empty());
+            recovery.phase = ScopedRecoveryPhase::Done;
+            true
+        } else {
+            recovery.phase = ScopedRecoveryPhase::WipeRefused { read, write };
+            false
+        }
     }
 
     fn retained_failure_domain(&self, bootstrap: &BootstrapReceipt) -> Option<ObjectDomain> {
@@ -14084,6 +14555,92 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn h3_loss_counts_each_affected_key_exactly_once() {
+        // One H3 loss increments OutcomeLost exactly once per affected
+        // key, whether the key is genuinely unregistered (never
+        // sealed) or registered with cleared bootstrap pins (reseed
+        // cleared them, so the key reads pending but already holds a
+        // model domain). Counting through both the registered fence
+        // pass and the pending pass would overstate the loss.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        // Genuinely unregistered: never sealed, so only the pending
+        // pass can count it.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss refuses the pending key");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one unregistered key counts exactly one loss"
+        );
+        // Registered with cleared pins: sealed once (model domain
+        // held), then the production reseed primitive cleared its
+        // pins, so it reads pending and registered at once.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal registers");
+        scene.adapter.clear_bootstraps_for_reseed(COOKIE, EXEC);
+        let state = scene.adapter.keys.get(&proof.key).expect("sealed key");
+        assert!(
+            state.bootstraps.is_empty() && state.model_registered,
+            "the key reads pending and registered after the reseed clear"
+        );
+        let frontier = scene.adapter.consumed_frontier();
+        let before = scene.model.project().gap(super::ObjectGap::OutcomeLost);
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("H3 loss refuses the cleared-pin key");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(
+            scene.model.project().gap(super::ObjectGap::OutcomeLost) - before,
+            1,
+            "one cleared-pin registered key counts exactly one loss"
+        );
+    }
+
     /// A novelty-broken birth reseeds only when its pre-cut history is
     /// fenced and its image is clean: after an H3 void, the same image
     /// (old affecting history at/below the fence, never tainted) may
@@ -20176,6 +20733,763 @@ pub(crate) mod tests {
             )
             .expect_err("the pre-void birth refuses below the fence");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+    }
+
+    /// Owner-backed harness for scoped-void twins: the real
+    /// JointCaptureOwner (pool-backed ledger, real preflight) with a
+    /// standalone attestation fixture and descriptors, so birth/seal
+    /// setup runs against the owner's own adapter/model and the void
+    /// runs through the production owner path.
+    struct OwnerHarness {
+        owner: super::joint_driver::JointCaptureOwner,
+        pool: crate::semantics_edge::resources::SemanticResourcePool,
+        fixture: AttestationFixture,
+        descriptors:
+            [p11scope_ebpf_common::object_wire::ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        pending_claims: VecDeque<(String, u64)>,
+        paired_admissions: BTreeMap<u64, u64>,
+    }
+
+    impl OwnerHarness {
+        fn new(image: ImageIdentity) -> Self {
+            use crate::semantics_edge::resources::SemanticResourcePool;
+            let descriptors = publish_object_descriptors();
+            assert!(verify_object_descriptors(&descriptors));
+            let pool = SemanticResourcePool::default();
+            let owner = super::joint_driver::JointCaptureOwner::new(
+                JournalLimits::policy(),
+                pool.reserver(),
+            );
+            let mut harness = Self {
+                owner,
+                pool,
+                fixture: AttestationFixture::new(image),
+                descriptors,
+                pending_claims: VecDeque::new(),
+                paired_admissions: BTreeMap::new(),
+            };
+            harness.install_observed_closure();
+            harness
+        }
+
+        fn closure_generation(&self) -> u64 {
+            self.fixture.attachment().generation()
+        }
+
+        fn install_observed_closure(&mut self) {
+            let grant = SessionClosureGrant::observe(self.fixture.attachment());
+            let _ = self.owner.adapter_mut().install_closure_grant(&grant);
+        }
+
+        fn attest(&mut self) -> JournalDomainProof {
+            let admitted = self
+                .fixture
+                .admit_session_function(SESSION, "C_CreateObject");
+            let proof = self
+                .owner
+                .adapter_mut()
+                .attest_key(&admitted)
+                .expect("key attests");
+            self.pending_claims
+                .push_back(("C_CreateObject".into(), SESSION));
+            proof
+        }
+
+        fn prepare_claims(&mut self) {
+            let image = (self.fixture.image.task_cookie, self.fixture.image.exec_id);
+            if self.owner.adapter().is_tainted(image) {
+                return;
+            }
+            let mut inputs: Vec<(u64, u32, Event)> = self
+                .owner
+                .adapter()
+                .open
+                .values()
+                .filter(|entry| entry.image == image && entry.converted_ticket.is_none())
+                .map(|entry| {
+                    let event = entry
+                        .end
+                        .map(|end| end.end.payload_base().event)
+                        .unwrap_or_else(|| original_for_validated_begin(&entry.begin));
+                    (entry.begin_ordinal, entry.function, event)
+                })
+                .collect();
+            inputs.extend(
+                self.owner
+                    .adapter()
+                    .refused
+                    .iter()
+                    .filter(|entry| entry.image == image)
+                    .map(|entry| {
+                        (
+                            entry.cut,
+                            entry.function,
+                            Event {
+                                ts_ns: entry.entry_ns + 100,
+                                duration_ns: 100,
+                                pid_tgid: entry.pid_tgid,
+                                session: entry.session,
+                                slot_id: entry.slot_id,
+                                mechanism: entry.mechanism,
+                                flags: entry.flags,
+                                slot: entry.slot,
+                                user_type: entry.user_type,
+                                capture: entry.capture,
+                                image: ImageIdentity {
+                                    task_cookie: image.0,
+                                    exec_id: image.1,
+                                },
+                                ..Event::default()
+                            },
+                        )
+                    }),
+            );
+            self.admit_paired_inputs(inputs);
+        }
+
+        fn admit_paired_inputs(&mut self, mut inputs: Vec<(u64, u32, Event)>) {
+            inputs.sort_by_key(|input| input.0);
+            for (cut, function, event) in inputs {
+                if self.paired_admissions.contains_key(&cut) {
+                    continue;
+                }
+                let Some(index) = self.pending_claims.iter().position(|(name, session)| {
+                    function_id(name) == function && *session == event.session
+                }) else {
+                    continue;
+                };
+                let (name, _) = self
+                    .pending_claims
+                    .remove(index)
+                    .expect("selected fixture input");
+                let admitted = self.fixture.admit_original_event(&name, event);
+                self.owner
+                    .adapter_mut()
+                    .attest_key(&admitted)
+                    .expect("paired input admits");
+                self.paired_admissions.insert(cut, admitted.h0_ordinal());
+            }
+        }
+
+        fn ingest(&mut self, bytes: &[u8]) -> JournalDisposition {
+            let record =
+                decode_journal_record(bytes, &self.descriptors).expect("test bytes decode");
+            self.owner
+                .adapter_mut()
+                .ingest_any(JournalIngestItem::Journal(record))
+        }
+
+        fn ingest_ordinary(&mut self, event: Event) -> JournalDisposition {
+            let decoded = crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0,
+                ),
+                object: None,
+            };
+            self.owner
+                .adapter_mut()
+                .ingest_any(JournalIngestItem::Ordinary(decoded))
+        }
+
+        fn ingest_quiet(&mut self, event: Event) -> JournalDisposition {
+            let decoded = crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0,
+                ),
+                object: None,
+            };
+            self.owner.adapter_mut().ingest_any_from_raw(
+                JournalIngestItem::Ordinary(decoded),
+                None,
+                true,
+            )
+        }
+
+        /// One seal with paired claims for staged history: the birth
+        /// receipt verifies (or re-verifies) against retained truth.
+        fn seal_empty(&mut self, bootstrap: &BootstrapReceipt) -> Result<SealSuccess, SealFailure> {
+            self.install_observed_closure();
+            self.prepare_claims();
+            let frontier = self.owner.adapter().consumed_frontier();
+            let audit = JournalAuditReceipt::scripted(
+                7,
+                7,
+                None,
+                0,
+                H3DispositionEvidence::scripted_clean(self.fixture.next_token),
+                self.closure_generation(),
+            );
+            let cell = ScriptedFaultCell::steady(audit.fault_after);
+            let mut births =
+                ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(bootstrap));
+            let (adapter, model) = self.owner.parts();
+            adapter.seal(&mut *model, &audit, bootstrap, frontier, &mut births, &cell)
+        }
+    }
+
+    #[test]
+    fn scoped_void_keeps_disjoint_attach_birth_authority() {
+        // A sealed AttachObserved receipt on a healthy image survives
+        // an unrelated scoped void (stuck session plus shed unbound
+        // barrier) through the real owner. The scoped path leaves the
+        // healthy key's fence and the global void cut alone, so
+        // re-verification must succeed; a stream-wide watermark would
+        // refuse it as AttachHistoryBroken.
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let sign = function_id("C_Sign");
+        let shape = begin_bytes(1, 1, create, 0);
+        let mut affecting = ordinary_for(&shape, 0);
+        affecting.slot = 99;
+        affecting.target_function = sign;
+        harness.ingest_ordinary(affecting);
+        let proof = harness.attest();
+        // A second provider instance on the same image: its own
+        // admission authority, hence a distinct key (same-image
+        // sessions separate by caller/router). It attests before any
+        // seal converts (a later attestation would meet a sealed
+        // image) and never seals.
+        let mut stuck_fixture = AttestationFixture::new(image_default());
+        let stuck_admitted = stuck_fixture.admit_session_function(SESSION, "C_CreateObject");
+        let stuck_proof = harness
+            .owner
+            .adapter_mut()
+            .attest_key(&stuck_admitted)
+            .expect("stuck key attests");
+        assert_ne!(
+            proof.key, stuck_proof.key,
+            "the twin covers two distinct keys"
+        );
+        let begin = begin_bytes(1, 1, create, 0);
+        harness.ingest(&begin);
+        harness.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let birth = BootstrapReceipt::attest(
+            harness.owner.adapter(),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::AttachObserved,
+                1,
+                harness.closure_generation(),
+            ),
+        )
+        .expect("pre-existing image births as attach-observed");
+        harness.seal_empty(&birth).expect("healthy receipt seals");
+        let fence_before = harness
+            .owner
+            .adapter()
+            .keys
+            .get(&proof.key)
+            .expect("healthy key")
+            .void_fence;
+        assert_eq!(
+            harness.owner.adapter().voided_through_for_test(),
+            0,
+            "nothing voided before the scoped break"
+        );
+        // An unbound barrier the scoped void sheds.
+        let barrier_image = (COOKIE + 2, EXEC + 2);
+        let barrier = begin_bytes_image(1, 9, create, 0, barrier_image);
+        harness.ingest(&barrier);
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the unbound BEGIN bars seals before the void"
+        );
+        // Direct fixture ingests mark the stream broken; the watchdog
+        // scenario models a linked lane with its stream position
+        // intact, so clear the flag before the scoped break.
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = stuck_proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert_eq!(
+            harness
+                .owner
+                .adapter()
+                .keys
+                .get(&proof.key)
+                .expect("healthy key")
+                .void_fence,
+            fence_before,
+            "the healthy key fence stays put across the scoped void"
+        );
+        assert_eq!(
+            harness.owner.adapter().voided_through_for_test(),
+            0,
+            "the global void cut stays put across the scoped void"
+        );
+        assert!(
+            !harness.owner.adapter().has_seal_barrier(),
+            "the scoped void sheds the unbound barrier"
+        );
+        // The stuck key carries the scoped evidence in its own fence:
+        // a below-fence birth refuses while the healthy receipt seals.
+        assert_eq!(
+            BootstrapReceipt::attest(
+                harness.owner.adapter(),
+                &SessionBirthGrant::scripted(
+                    stuck_proof,
+                    BirthKind::AttachObserved,
+                    0,
+                    harness.closure_generation(),
+                ),
+            ),
+            Err(BirthRefusal::BelowVoidFence),
+            "the stuck key refuses below its scoped fence"
+        );
+        harness
+            .seal_empty(&birth)
+            .expect("the unchanged receipt re-verifies after the scoped void");
+    }
+
+    #[test]
+    fn scoped_void_keeps_disjoint_absence_birth_authority() {
+        // AbsenceAppearance arm: a sealed absence receipt on a healthy
+        // image survives an unrelated scoped void through the real
+        // owner, like the attach arm above.
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let shape = begin_bytes(1, 1, create, 0);
+        let mut seen = ordinary_for(&shape, 0);
+        seen.slot = 99;
+        harness.ingest_quiet(seen);
+        let proof = harness.attest();
+        // A second provider instance on the same image: its own
+        // admission authority, hence a distinct key (same-image
+        // sessions separate by caller/router). It attests before any
+        // seal converts (a later attestation would meet a sealed
+        // image) and never seals.
+        let mut stuck_fixture = AttestationFixture::new(image_default());
+        let stuck_admitted = stuck_fixture.admit_session_function(SESSION, "C_CreateObject");
+        let stuck_proof = harness
+            .owner
+            .adapter_mut()
+            .attest_key(&stuck_admitted)
+            .expect("stuck key attests");
+        assert_ne!(
+            proof.key, stuck_proof.key,
+            "the twin covers two distinct keys"
+        );
+        let begin = begin_bytes(1, 1, create, 0);
+        harness.ingest(&begin);
+        harness.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let birth = BootstrapReceipt::attest(
+            harness.owner.adapter(),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::AbsenceAppearance,
+                1,
+                harness.closure_generation(),
+            ),
+        )
+        .expect("observed quiet life births as absence");
+        harness.seal_empty(&birth).expect("healthy receipt seals");
+        let fence_before = harness
+            .owner
+            .adapter()
+            .keys
+            .get(&proof.key)
+            .expect("healthy key")
+            .void_fence;
+        // An unbound barrier the scoped void sheds.
+        let barrier_image = (COOKIE + 2, EXEC + 2);
+        let barrier = begin_bytes_image(1, 9, create, 0, barrier_image);
+        harness.ingest(&barrier);
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the unbound BEGIN bars seals before the void"
+        );
+        // Direct fixture ingests mark the stream broken; the watchdog
+        // scenario models a linked lane with its stream position
+        // intact, so clear the flag before the scoped break.
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = stuck_proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert_eq!(
+            harness
+                .owner
+                .adapter()
+                .keys
+                .get(&proof.key)
+                .expect("healthy key")
+                .void_fence,
+            fence_before,
+            "the healthy key fence stays put across the scoped void"
+        );
+        assert_eq!(
+            harness.owner.adapter().voided_through_for_test(),
+            0,
+            "the global void cut stays put across the scoped void"
+        );
+        assert!(
+            !harness.owner.adapter().has_seal_barrier(),
+            "the scoped void sheds the unbound barrier"
+        );
+        harness
+            .seal_empty(&birth)
+            .expect("the unchanged receipt re-verifies after the scoped void");
+    }
+
+    #[test]
+    fn scoped_break_is_retried_after_temporary_pool_refusal() {
+        // A scoped void the pool cannot pay for yet keeps its pending
+        // break for retry: the refused tick applies nothing (no fence,
+        // no wipe) and the next tick, once payable, voids exactly
+        // once. Dropping the scope on refusal would let collection
+        // resume without the owed fence, wipe or failure.
+        use super::joint_driver::{JointVoidScope, RawQuantumRefusal};
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let proof = harness.attest();
+        let barrier_image = (COOKIE + 2, EXEC + 2);
+        let barrier = begin_bytes_image(1, 9, create, 0, barrier_image);
+        harness.ingest(&barrier);
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the unbound BEGIN bars seals before the void"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        let key = proof.key;
+        harness.owner.break_scoped_after_running_abandon(&[(
+            key.caller,
+            key.domain_tag,
+            (key.cookie, key.exec),
+            key.router,
+        )]);
+        let bound = harness
+            .owner
+            .void_storage_bound_for_test()
+            .expect("finite void bound");
+        let snapshot = harness.pool.snapshot();
+        let room = snapshot.limit_bytes - snapshot.charged_bytes;
+        assert!(room >= bound, "the pool could pay before the hold");
+        let hold = harness
+            .pool
+            .reserver()
+            .reserve(room - (bound - 1))
+            .expect("the hold leaves the void unpaid");
+        let refused = harness.owner.void_ingest_break();
+        assert!(
+            matches!(refused, Err(RawQuantumRefusal::Resource(_))),
+            "the unpaid void refuses with its pool shortage, got {refused:?}"
+        );
+        assert_eq!(
+            harness
+                .owner
+                .adapter()
+                .keys
+                .get(&proof.key)
+                .expect("stuck key")
+                .void_fence,
+            0,
+            "the refused void fences nothing"
+        );
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the refused void wipes nothing"
+        );
+        drop(hold);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the retried void applies once the pool can pay"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the retried void takes the scoped branch"
+        );
+        assert!(
+            harness
+                .owner
+                .adapter()
+                .keys
+                .get(&proof.key)
+                .expect("stuck key")
+                .void_fence
+                > 0,
+            "the retried void fences its stuck key"
+        );
+        assert!(
+            !harness.owner.adapter().has_seal_barrier(),
+            "the retried void sheds the barrier"
+        );
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(false),
+            "the void applies exactly once"
+        );
+    }
+
+    #[test]
+    fn scoped_barrier_shed_preserves_unbounded_abandonment() {
+        // A collision ABANDON on an unbound barrier open is already
+        // evidence of a provider effect with no known end. The scoped
+        // void sheds the barrier but must preserve the permanent
+        // image taint (like the stream path), so later attestation
+        // refuses instead of rebirthing past erased evidence.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        use super::joint_driver::JointVoidScope;
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        harness.ingest(&begin);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(
+            harness.ingest(&abandon),
+            JournalDisposition::AbandonStaged,
+            "the collision abandonment stages"
+        );
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the unbound open bars seals before the void"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        // No stuck rows survive to name (their history went with the
+        // rows); the void still sheds the seal-barring unbound staging.
+        harness.owner.break_scoped_after_running_abandon(&[]);
+        assert_eq!(
+            harness.owner.void_ingest_break(),
+            Ok(true),
+            "the scoped void applies"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the probe takes the scoped branch"
+        );
+        assert!(
+            !harness.owner.adapter().has_seal_barrier(),
+            "the scoped void sheds the unbound barrier"
+        );
+        assert!(
+            harness
+                .owner
+                .adapter()
+                .image_tainted_for_test((COOKIE, EXEC)),
+            "the erased unbounded abandonment taints its image"
+        );
+        let admitted = harness.fixture.admit();
+        assert_eq!(
+            harness.owner.adapter_mut().attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted),
+            "the abandoned image never rebirths"
+        );
+    }
+
+    #[test]
+    fn scoped_void_runs_bounded_and_resumes_across_yields() {
+        // A scoped void over 75 unbound opens advances in bounded
+        // slices through the budget: tiny budgets yield with partial
+        // progress (recovery persists), resuming completes with every
+        // entry wiped exactly once (ledger census exact, no barrier,
+        // scoped scope recorded once). One unbounded call must never
+        // drain the whole census.
+        use super::joint_driver::{JointVoidScope, RecoveryProgress};
+
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        for i in 0..75u64 {
+            let image = (COOKIE + 100 + i, EXEC);
+            let begin = begin_bytes_image(1 + i, 1, create, 0, image);
+            harness.ingest(&begin);
+        }
+        assert_eq!(
+            harness.owner.adapter().open.len(),
+            75,
+            "all barrier opens stage"
+        );
+        let h8_before = harness.owner.ledger().census();
+        assert_eq!(h8_before, 75, "each open charges one H8 role");
+        assert!(
+            harness.owner.adapter().has_seal_barrier(),
+            "the unbound opens bar seals before the void"
+        );
+        harness.owner.adapter_mut().stream_broken = false;
+        harness.owner.break_scoped_after_running_abandon(&[]);
+        // Tiny budgets yield with partial, persisting progress: the
+        // first slice classifies (nothing wiped yet), later slices
+        // wipe. Recovery persists across the yield boundary (the
+        // stop-interleave resume point).
+        let mut budget = 10usize;
+        assert_eq!(
+            harness.owner.void_ingest_break_bounded(&mut budget),
+            Ok(RecoveryProgress::Yielded),
+            "a 10-unit budget cannot drain 75 opens at once"
+        );
+        assert_eq!(budget, 0, "the slice charges its whole budget");
+        let progress = harness
+            .owner
+            .adapter()
+            .scoped_recovery_progress_for_test()
+            .expect("recovery persists across the yield");
+        assert_eq!(
+            progress.0, "classify-open",
+            "the first slice is still classifying"
+        );
+        assert_eq!(
+            harness.owner.adapter().open.len(),
+            75,
+            "classification wipes nothing"
+        );
+        // Resume to completion through small budgets: every call
+        // either yields or finishes, custody stays exact throughout,
+        // and the void lands exactly once.
+        let mut calls = 1u64;
+        let done = loop {
+            let mut budget = 10usize;
+            calls += 1;
+            match harness.owner.void_ingest_break_bounded(&mut budget) {
+                Ok(RecoveryProgress::Yielded) => {
+                    assert!(
+                        harness
+                            .owner
+                            .adapter()
+                            .scoped_recovery_progress_for_test()
+                            .is_some(),
+                        "recovery persists across every yield"
+                    );
+                }
+                Ok(RecoveryProgress::Done(voided)) => break voided,
+                Err(refusal) => panic!("the bounded void never refuses: {refusal:?}"),
+            }
+            assert!(calls < 1000, "the sliced recovery always terminates");
+        };
+        assert!(done, "the resumed recovery voids");
+        assert!(
+            calls > 2,
+            "75 opens take several 10-unit slices, got {calls}"
+        );
+        assert_eq!(
+            harness.owner.take_last_void_scope(),
+            Some(JointVoidScope::Scoped),
+            "the resumed void takes the scoped branch"
+        );
+        assert!(
+            harness.owner.adapter().open.is_empty(),
+            "every wiped open leaves the map"
+        );
+        assert!(
+            !harness.owner.adapter().has_seal_barrier(),
+            "the resumed void sheds every barrier"
+        );
+        assert_eq!(
+            harness.owner.ledger().census(),
+            0,
+            "every H8 role releases exactly once"
+        );
+        assert!(
+            harness
+                .owner
+                .adapter()
+                .scoped_recovery_progress_for_test()
+                .is_none(),
+            "no recovery stands after completion"
+        );
+        let mut budget = 1024usize;
+        assert_eq!(
+            harness.owner.void_ingest_break_bounded(&mut budget),
+            Ok(RecoveryProgress::Done(false)),
+            "the void applies exactly once"
+        );
+    }
+
+    #[test]
+    fn seal_barrier_check_runs_bounded_and_resumes() {
+        // Clearing 75 attested opens takes several 10-unit barrier
+        // slices (no early exit without a barrier): tiny budgets
+        // yield with the scan persisting, resuming clears. A barrier
+        // still reports as soon as its first member is examined.
+        let mut harness = OwnerHarness::new(image_default());
+        let create = function_id("C_CreateObject");
+        harness.attest();
+        for i in 0..75u64 {
+            let begin = begin_bytes(1 + i, 1, create, 0);
+            harness.ingest(&begin);
+        }
+        assert!(
+            !harness.owner.adapter().has_seal_barrier(),
+            "attested opens bar nothing (control)"
+        );
+        let mut budget = 10usize;
+        assert_eq!(
+            harness
+                .owner
+                .adapter_mut()
+                .has_seal_barrier_bounded(&mut budget),
+            BarrierCheck::Yielded,
+            "10 units cannot clear 75 opens at once"
+        );
+        let mut calls = 1u64;
+        let cleared = loop {
+            let mut budget = 10usize;
+            calls += 1;
+            match harness
+                .owner
+                .adapter_mut()
+                .has_seal_barrier_bounded(&mut budget)
+            {
+                BarrierCheck::Yielded => {}
+                BarrierCheck::Clear => break true,
+                BarrierCheck::Barrier => break false,
+            }
+            assert!(calls < 1000, "the sliced scan always terminates");
+        };
+        assert!(cleared, "the resumed scan clears");
+        assert!(calls > 2, "75 opens take several slices, got {calls}");
+        // One unbound open barriers at once (early exit, still bounded).
+        let barrier = begin_bytes_image(999, 1, create, 0, (COOKIE + 500, EXEC));
+        harness.ingest(&barrier);
+        let mut budget = 1024usize;
+        assert_eq!(
+            harness
+                .owner
+                .adapter_mut()
+                .has_seal_barrier_bounded(&mut budget),
+            BarrierCheck::Barrier,
+            "the scan reports the barrier"
+        );
     }
 
     #[test]

@@ -1168,7 +1168,16 @@ impl JointStaging {
                     && call.abandoned
                     && call.end_cut.is_none()
                     && step.cut().is_some();
-                if !exact || (!end && !loss) {
+                // A per-call disposal: the provider return S1 observed
+                // reduces through the live reducer as usual, with only
+                // the receipts its own span carries (its named loss gap
+                // grants none), so S1 order and session state stay
+                // whole while the call's object detail stays lost.
+                let call_loss = step.phase() == SealReplayPhase::CallLoss
+                    && call.abandoned
+                    && call.end_cut.is_none()
+                    && step.cut().is_some();
+                if !exact || (!end && !loss && !call_loss) {
                     self.correlation_refusals = self.correlation_refusals.saturating_add(1);
                     return (SealBatchProgress::Held, refused);
                 }

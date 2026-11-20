@@ -3125,13 +3125,17 @@ impl JournalAdapter {
             let image = end_image(&end);
             if self.is_tainted(image) {
                 // On a tainted image the release is the taint working
-                // as intended (a refused BEGIN or a dropped open of
-                // any function, any return): consume the excuse
-                // without promoting, so exit-churn terminals never
-                // revoke a shed-taint's lift. Without an excuse the
-                // terminal is new evidence and promotes (duplicates,
-                // foreign terminals). Excusing a dropped
-                // state-changing terminal here stays safe: a
+                // as intended (a refused BEGIN or a dropped open):
+                // consume the excuse without promoting, so exit-churn
+                // terminals never revoke a shed-taint's lift. Without
+                // an excuse the terminal is new evidence and promotes
+                // (duplicates, foreign terminals). A descriptor-bearing
+                // END whose function contradicts the released call is
+                // likewise new evidence: it promotes with
+                // EndBeginMismatch (revoking shed-only lift) instead of
+                // disposing. Descriptor-less terminals (absent tail)
+                // and matching functions still dispose. Excusing a
+                // dropped state-changing terminal here stays safe: a
                 // shed-taint lands only on images without journal
                 // keys, birth and attestation refuse tainted images,
                 // tainted BEGINs refuse, and the taint already
@@ -3140,7 +3144,16 @@ impl JournalAdapter {
                 // staging, and records ingest in ordinal order past
                 // the taint. The lift purge still removes its
                 // absence before the image goes clean.
-                if self.take_derived_absence(image, key).is_some() {
+                if let Some(released) = self.take_derived_absence(image, key) {
+                    if end_tail_function(&end).is_some_and(|carried| carried != released) {
+                        self.taint_image(
+                            image,
+                            TaintCause::Contradiction(JournalContradiction::EndBeginMismatch),
+                        );
+                        return JournalDisposition::Contradiction(
+                            JournalContradiction::EndBeginMismatch,
+                        );
+                    }
                     self.contradictions.note(TaintCause::Contradiction(
                         JournalContradiction::TerminalBeforeBegin,
                     ));
@@ -3157,11 +3170,17 @@ impl JournalAdapter {
                 );
             }
             // On a clean image a terminal with a recorded release
-            // (a void wipe, a shed-taint drop) disposes: the release
-            // already disclosed the loss, so the terminal is expected
-            // fallout, never new taint evidence — regardless of
-            // function or return. The disposed call never proves, and
-            // the void retired the domain's live views, cleared its
+            // (a void wipe, a shed-taint drop) disposes when its
+            // available immutable identity agrees: the release already
+            // disclosed the loss, so a matching terminal is expected
+            // fallout, never new taint evidence — regardless of return.
+            // A descriptor-bearing END for another function is
+            // independently checkable contradiction evidence and taints
+            // with EndBeginMismatch instead; the void explains the
+            // missing BEGIN, never the wrong function. Descriptor-less
+            // terminals (absent tail) and ABANDONs carry no function to
+            // check and still dispose. The disposed call never proves,
+            // and the void retired the domain's live views, cleared its
             // bindings and bumped its generation, so a later create
             // reusing the handle mints a new object instead of naming
             // the destroyed key. The absence is consumed either way:
@@ -3170,8 +3189,16 @@ impl JournalAdapter {
             // keeps removing state-changing absences before an image
             // goes clean, so a destroy that outlived a shed-taint plus
             // lift still taints there instead of riding the lift.
-            let excused = self.take_derived_absence(image, key).is_some();
-            if excused {
+            if let Some(released) = self.take_derived_absence(image, key) {
+                if end_tail_function(&end).is_some_and(|carried| carried != released) {
+                    self.taint_image(
+                        image,
+                        TaintCause::Contradiction(JournalContradiction::EndBeginMismatch),
+                    );
+                    return JournalDisposition::Contradiction(
+                        JournalContradiction::EndBeginMismatch,
+                    );
+                }
                 self.contradictions.note(TaintCause::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
                 ));
@@ -3663,11 +3690,12 @@ impl JournalAdapter {
     /// Record one (image, key) whose terminal is expected-absent
     /// because the journal deliberately released its BEGIN (a taint
     /// refusal/drop, an unclaimable-original disposal, or a void
-    /// wipe), with the released call's function ordinal for the lift
-    /// purge (the arrival gate consumes blindly; only the lift purge
-    /// still keys on function). Capped at the open-table bound;
-    /// past the cap the key is not recorded and its terminal
-    /// promotes (fail closed).
+    /// wipe), with the released call's function ordinal. The arrival
+    /// gate checks a descriptor-bearing END's carried function against
+    /// it (mismatch taints with EndBeginMismatch); descriptor-less
+    /// terminals dispose. The lift purge also keys on function.
+    /// Capped at the open-table bound; past the cap the key is not
+    /// recorded and its terminal promotes (fail closed).
     fn note_derived_absence(&mut self, image: (u64, u64), key: JournalNativeKey, function: u32) {
         if self.derived_absent.len() < self.limits.open_calls {
             self.derived_absent.insert((image, key), function);
@@ -4422,6 +4450,18 @@ fn tail_u32(tail: &[u8; 240], offset: usize) -> u32 {
         tail[offset + 2],
         tail[offset + 3],
     ])
+}
+
+/// A descriptor-bearing END's carried function ordinal, or None when the
+/// tail is absent (no object row, nothing checkable). The descriptor word
+/// is `function + 1`; a zero word (invalid for a validated present tail)
+/// maps to `u32::MAX` so it never matches a retained valid function.
+fn end_tail_function(end: &ValidatedJournalEnd) -> Option<u32> {
+    if end.tail_absent() {
+        return None;
+    }
+    let descriptor = tail_u32(&end.payload_tail(), 4);
+    Some(descriptor.wrapping_sub(1))
 }
 
 /// One validated handle word plus its H7 status to a model handle input:
@@ -5221,6 +5261,62 @@ impl JournalAuditReceipt {
             return Err(JournalGap::ClosureStale);
         }
         Ok(())
+    }
+
+    /// Seal-time fault reliability: a broken reader (unreadable,
+    /// saturated, or above the u32 domain) never absorbs. Returns the
+    /// fatal gap when unreliable, None when the reading is sane.
+    fn seal_reliability_gap(seal_epoch: &Result<u64, FaultReadError>) -> Option<JournalGap> {
+        match seal_epoch {
+            Ok(epoch) if *epoch > u64::from(u32::MAX) => Some(JournalGap::FaultSaturated),
+            Ok(_) => None,
+            Err(FaultReadError::Unreadable) => Some(JournalGap::FaultUnreadable),
+            Err(FaultReadError::Saturated) => Some(JournalGap::FaultSaturated),
+        }
+    }
+
+    /// Every independent audit gate (counters, malformed, discards, H3,
+    /// resource, closure) in check order. Returns the first failing gap,
+    /// None when all pass. A post-collection fault absorb must deny when
+    /// this returns Some, reporting the independent gap instead of Ok.
+    /// Mirrors [`Self::check`]'s independent arms; the fault-change arms
+    /// (within-bracket, chain, reread) stay in check only.
+    fn independent_gap(&self, h3_voided_below: u64, current_closure: u64) -> Option<JournalGap> {
+        if self.counter_error {
+            return Some(JournalGap::CounterUnprovable);
+        }
+        if self.malformed_delta != 0 {
+            return Some(JournalGap::Malformed);
+        }
+        if self.discarded_delta != 0 {
+            return Some(JournalGap::Discarded);
+        }
+        match &self.h3 {
+            H3DispositionEvidence::Exhausted => return Some(JournalGap::H3Exhausted),
+            H3DispositionEvidence::StagedLoss { barrier } => {
+                if *barrier < h3_voided_below || *barrier >= self.h0_below {
+                    return Some(JournalGap::H3Pending);
+                }
+                return Some(JournalGap::H3Loss);
+            }
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor,
+            } => {
+                if *staged_max < self.h0_below.saturating_sub(1)
+                    || pending_floor.is_some_and(|floor| floor < self.h0_below)
+                {
+                    return Some(JournalGap::H3Pending);
+                }
+            }
+        }
+        if self.resource_refused {
+            return Some(JournalGap::ResourceUnavailable);
+        }
+        if self.closure_generation != current_closure {
+            return Some(JournalGap::ClosureStale);
+        }
+        None
     }
 }
 
@@ -7443,19 +7539,81 @@ impl JournalAdapter {
         &mut self,
         model: &mut ObjectSemantics,
         audit: &JournalAuditReceipt,
-        gap: JournalGap,
+        mut gap: JournalGap,
         seal_epoch: Result<u64, FaultReadError>,
     ) -> Result<(), SealFailure> {
+        // Post-collection absorb fast path (no scope scan, no void): a
+        // FaultChanged is either a forward observation (clean bracket,
+        // sane cell, no independent loss) that absorbs, or a fatal result
+        // that voids/stops/refuses with its own (possibly overridden) gap.
+        // Seal reliability and every independent gate deny the absorb and
+        // report their own named gap instead of Ok.
+        if gap == JournalGap::FaultChanged {
+            if let Some(reliability) = JournalAuditReceipt::seal_reliability_gap(&seal_epoch) {
+                // Broken reader shadows nothing: stop/void with its own gap.
+                gap = reliability;
+            } else if audit.fault_error.is_none()
+                && audit.fault_before == audit.fault_after
+                && let Ok(epoch) = seal_epoch
+                && epoch >= audit.fault_after
+                && self.last_fault.is_none_or(|last| epoch >= last)
+            {
+                if let Some(other) =
+                    audit.independent_gap(self.h3_voided_below, self.closure_generation)
+                {
+                    // Independent loss/pending/exhaustion/closure denies
+                    // the absorb: refuse with its named disposition below.
+                    gap = other;
+                } else {
+                    // Post-collection fault: the move landed outside
+                    // every collected interval (between collections or
+                    // after the drain closed), so the bracket proves
+                    // this quantum and the seal absorbs the move
+                    // instead of voiding it. Every BPF fault arm
+                    // discards its call's terminal rather than emitting
+                    // a faulted journal record, so no hidden record
+                    // rides the quantum: dangling begins hold
+                    // per-call, refused joins abandon per-incarnation,
+                    // and H0 invalidates its own era. The first
+                    // observation of the era trips the absence chain
+                    // and pins the baseline; repeats absorb silently.
+                    // Absorbs count no void bucket (the quantum sealed,
+                    // nothing voided) but count their own diagnostic
+                    // bucket by site, like the void split below: absorbed
+                    // faults stay counted and named. An in-bracket move,
+                    // a regressed cell, a broken reader, or any
+                    // independent loss still refuses below.
+                    if audit.fault_before != audit.fault_after
+                        || self
+                            .last_fault
+                            .is_some_and(|last| audit.fault_before != last)
+                    {
+                        self.audit_fault_absorbed_chain =
+                            self.audit_fault_absorbed_chain.saturating_add(1);
+                    } else {
+                        self.audit_fault_absorbed_reread =
+                            self.audit_fault_absorbed_reread.saturating_add(1);
+                    }
+                    let was_audit_failure = self.last_audit_failure;
+                    self.last_audit_failure = Some(self.consumed_through);
+                    let freshest = audit.fault_after.max(epoch);
+                    if self.last_fault.is_none_or(|last| freshest > last) {
+                        self.last_fault = Some(freshest);
+                    } else {
+                        self.last_audit_failure = was_audit_failure;
+                    }
+                    return Ok(());
+                }
+            }
+            // Non-absorbable (within-bracket move, regressed cell) or
+            // overridden (reliability/independent): fall through with gap.
+        }
         // Any audit failure breaks absence-appearance chains: the clean
         // coverage the witness requires is gone from this ordinal on,
         // even when the failure keeps staged inputs. Voids fence the
         // loss explicitly before dropping staged truth, so later proof
         // resumes above a fenced interval instead of silently skipping
-        // it; the fencing effects are reported with the refusal. A
-        // post-collection fault absorb (below) trips the chain the
-        // same way on its first observation, without voiding: the
-        // collected interval stays proved. A repeat observation of an
-        // already-absorbed era restores the chain mark instead.
+        // it; the fencing effects are reported with the refusal.
         // Every O(1) refusal (stop, counters, cuts, the fence)
         // publishes here; the per-row work (preserve, fence, refuse,
         // wipe, the all-key scope) is one deferred rejection the
@@ -7467,7 +7625,6 @@ impl JournalAdapter {
         } else {
             SealFailureScope::Unqualified
         };
-        let was_audit_failure = self.last_audit_failure;
         self.last_audit_failure = Some(self.consumed_through);
         let effects = ObjectEffects::default();
         let mut h3_voided = None;
@@ -7491,49 +7648,6 @@ impl JournalAdapter {
             | JournalGap::ResourceUnavailable
             | JournalGap::Discarded
             | JournalGap::H3Loss => {
-                if gap == JournalGap::FaultChanged
-                    && audit.fault_error.is_none()
-                    && audit.fault_before == audit.fault_after
-                    && let Ok(epoch) = seal_epoch
-                    && epoch >= audit.fault_after
-                    && self.last_fault.is_none_or(|last| epoch >= last)
-                {
-                    // Post-collection fault: the move landed outside
-                    // every collected interval (between collections or
-                    // after the drain closed), so the bracket proves
-                    // this quantum and the seal absorbs the move
-                    // instead of voiding it. Every BPF fault arm
-                    // discards its call's terminal rather than emitting
-                    // a faulted journal record, so no hidden record
-                    // rides the quantum: dangling begins hold
-                    // per-call, refused joins abandon per-incarnation,
-                    // and H0 invalidates its own era. The first
-                    // observation of the era trips the absence chain
-                    // and pins the baseline; repeats absorb silently.
-                    // Absorbs count no void bucket (the quantum sealed,
-                    // nothing voided) but count their own diagnostic
-                    // bucket by site, like the void split below: absorbed
-                    // faults stay counted and named. An in-bracket move
-                    // or a regressed cell still voids below.
-                    if audit.fault_before != audit.fault_after
-                        || self
-                            .last_fault
-                            .is_some_and(|last| audit.fault_before != last)
-                    {
-                        self.audit_fault_absorbed_chain =
-                            self.audit_fault_absorbed_chain.saturating_add(1);
-                    } else {
-                        self.audit_fault_absorbed_reread =
-                            self.audit_fault_absorbed_reread.saturating_add(1);
-                    }
-                    let freshest = audit.fault_after.max(epoch);
-                    if self.last_fault.is_none_or(|last| freshest > last) {
-                        self.last_fault = Some(freshest);
-                    } else {
-                        self.last_audit_failure = was_audit_failure;
-                    }
-                    return Ok(());
-                }
                 // Irreversible refusals first: the deferred void
                 // preserves staged unbounded abandonments as permanent
                 // refusals BEFORE staged custody is dropped, so a void
@@ -7614,11 +7728,15 @@ impl JournalAdapter {
                 }
                 if gap == JournalGap::FaultChanged {
                     // Re-baseline the cumulative chain on the
-                    // freshest observed epoch: the audited close or
-                    // the seal-time re-read, whichever is newer.
+                    // freshest observed epoch: the audited close, the
+                    // seal-time re-read, or the already-pinned baseline,
+                    // whichever is newest. Never regress: a broken reader
+                    // reporting an older epoch must not overwrite a newer
+                    // pinned baseline (7→8→7 keeps 8).
                     let freshest = audit
                         .fault_after
-                        .max(seal_epoch.unwrap_or(audit.fault_after));
+                        .max(seal_epoch.unwrap_or(audit.fault_after))
+                        .max(self.last_fault.unwrap_or(0));
                     self.last_fault = Some(freshest);
                 }
             }
@@ -7695,6 +7813,14 @@ impl JournalAdapter {
                 Err(FaultReadError::Unreadable) => Some(JournalGap::FaultUnreadable),
                 Ok(epoch) if epoch > u64::from(u32::MAX) => Some(JournalGap::FaultSaturated),
                 Ok(epoch) if epoch != audit.fault_after => Some(JournalGap::FaultChanged),
+                // Regression to an older bracket after the frame pinned a
+                // newer baseline (7→8→7): the reader is broken (the native
+                // cell never regresses), so refuse even though the reading
+                // equals the audited epoch. Without this the domain would
+                // convert on stale evidence.
+                Ok(epoch) if self.last_fault.is_some_and(|pinned| epoch != pinned) => {
+                    Some(JournalGap::FaultChanged)
+                }
                 Ok(_) => None,
             };
             if let Some(gap) = gap {

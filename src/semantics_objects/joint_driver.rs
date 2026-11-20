@@ -8,7 +8,8 @@ use super::ledger::{ExistingReservation, LedgerGeneration};
 use super::{
     ConsumptionOrdinal, EndpointClass, FaultEpoch, FaultReadError, JournalAdapter,
     JournalCollection, JournalGap, JournalIngestItem, JournalLimits, JournalNativeKey, OpenEntry,
-    SealFailure, SessionDrainGrant, StagingLedger, end_agrees_with_begin, endpoint_class,
+    SealFailure, SessionDrainGrant, StagingLedger, end_agrees_with_begin, end_tail_function,
+    endpoint_class,
 };
 use crate::attach::SessionDrainProducers;
 use crate::attach::capture::NativeDomainId;
@@ -2488,10 +2489,12 @@ impl RawJointQuantum {
                     // would void the whole collection
                     // (ResourceUnavailable) for image-local noise.
                     // Under exit churn that voids every pass and no
-                    // birth ever seals. Which terminals are excused
-                    // is the journal's rule (neutral calls, clean
-                    // returns, lift purge); presence here is the
-                    // whole collection rule.
+                    // birth ever seals. A descriptor-bearing END whose
+                    // function contradicts its release record is new
+                    // contradiction evidence, not expected fallout: it
+                    // refuses like an unreleased terminal (the journal
+                    // taints with EndBeginMismatch). Matching and
+                    // descriptor-less terminals still dispose.
                     let image = match record {
                         JournalRecord::End(end) => {
                             let base = end.payload_base();
@@ -2504,8 +2507,19 @@ impl RawJointQuantum {
                             unreachable!("begin records return above")
                         }
                     };
-                    if tainted.contains(&image) || absent.contains_key(&(image, key)) {
+                    if tainted.contains(&image) {
                         return None;
+                    }
+                    if let Some(released) = absent.get(&(image, key)) {
+                        let mismatch = match record {
+                            JournalRecord::End(end) => {
+                                end_tail_function(end).is_some_and(|carried| carried != *released)
+                            }
+                            _ => false,
+                        };
+                        if !mismatch {
+                            return None;
+                        }
                     }
                     *refused = true;
                     return None;

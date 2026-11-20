@@ -2725,17 +2725,23 @@ impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::Lane
 }
 
 /// Scripts the length-stash counters over a faithful H0: every
-/// other seam delegates to the scene's shared H0 unchanged.
+/// other seam delegates to the scene's shared H0 unchanged. The
+/// machine polls insert and mismatch independently.
 struct PublishStashLossStub<I> {
     inner: I,
-    stash_loss: std::collections::VecDeque<(u64, u64)>,
+    stash_insert_loss: std::collections::VecDeque<u64>,
+    stash_mismatch_loss: std::collections::VecDeque<u64>,
 }
 
 impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::LaneTestIo
     for PublishStashLossStub<I>
 {
-    fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
-        self.stash_loss.pop_front()
+    fn length_stash_insert_loss(&mut self) -> Option<u64> {
+        self.stash_insert_loss.pop_front()
+    }
+
+    fn length_stash_mismatch_loss(&mut self) -> Option<u64> {
+        self.stash_mismatch_loss.pop_front()
     }
 
     fn stash_pending_floor(&self) -> Option<u64> {
@@ -2937,14 +2943,17 @@ impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::Lane
 
 /// Scripts both loss counters over a faithful H0 and counts every
 /// substituted counter read: the budget twins observe how many loss
-/// lookups each machine slice performs. Every other seam delegates
-/// to the scene's shared H0 unchanged.
+/// lookups each machine slice performs, counting the two stash
+/// lookups independently. Every other seam delegates to the scene's
+/// shared H0 unchanged.
 struct PublishCountedLossStub<I> {
     inner: I,
     ring_loss: std::collections::VecDeque<u64>,
-    stash_loss: std::collections::VecDeque<(u64, u64)>,
+    stash_insert_loss: std::collections::VecDeque<u64>,
+    stash_mismatch_loss: std::collections::VecDeque<u64>,
     ring_polls: std::rc::Rc<std::cell::Cell<usize>>,
-    stash_polls: std::rc::Rc<std::cell::Cell<usize>>,
+    stash_insert_polls: std::rc::Rc<std::cell::Cell<usize>>,
+    stash_mismatch_polls: std::rc::Rc<std::cell::Cell<usize>>,
 }
 
 impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::LaneTestIo
@@ -2955,9 +2964,16 @@ impl<I: crate::inventory_semantics::LaneTestIo> crate::inventory_semantics::Lane
         self.ring_loss.pop_front()
     }
 
-    fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
-        self.stash_polls.set(self.stash_polls.get() + 1);
-        self.stash_loss.pop_front()
+    fn length_stash_insert_loss(&mut self) -> Option<u64> {
+        self.stash_insert_polls
+            .set(self.stash_insert_polls.get() + 1);
+        self.stash_insert_loss.pop_front()
+    }
+
+    fn length_stash_mismatch_loss(&mut self) -> Option<u64> {
+        self.stash_mismatch_polls
+            .set(self.stash_mismatch_polls.get() + 1);
+        self.stash_mismatch_loss.pop_front()
     }
 
     fn stash_pending_floor(&self) -> Option<u64> {
@@ -3350,7 +3366,8 @@ fn joint_machine_publish_discloses_length_stash_loss_rise() {
         .lane
         .install_test_io(Box::new(PublishStashLossStub {
             inner: h0,
-            stash_loss: std::collections::VecDeque::from([(3, 1), (3, 1), (3, 1)]),
+            stash_insert_loss: std::collections::VecDeque::from([3, 3, 3]),
+            stash_mismatch_loss: std::collections::VecDeque::from([1, 1, 1]),
         }));
     let pid = std::process::id();
     for (seq, name) in (1u64..).zip([
@@ -3426,7 +3443,8 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
     scene.native.fail_births = true;
     let h0 = scene.scene.real.h0.clone();
     let ring_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let stash_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let stash_insert_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let stash_mismatch_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
     scene
         .scene
         .real
@@ -3434,9 +3452,11 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
         .install_test_io(Box::new(PublishCountedLossStub {
             inner: h0,
             ring_loss: std::collections::VecDeque::from([9, 9, 9]),
-            stash_loss: std::collections::VecDeque::from([(3, 1), (3, 1), (3, 1)]),
+            stash_insert_loss: std::collections::VecDeque::from([3, 3, 3]),
+            stash_mismatch_loss: std::collections::VecDeque::from([1, 1, 1]),
             ring_polls: std::rc::Rc::clone(&ring_polls),
-            stash_polls: std::rc::Rc::clone(&stash_polls),
+            stash_insert_polls: std::rc::Rc::clone(&stash_insert_polls),
+            stash_mismatch_polls: std::rc::Rc::clone(&stash_mismatch_polls),
         }));
     let pid = std::process::id();
     for (seq, name) in (1u64..).zip([
@@ -3448,7 +3468,9 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
         scene.scene.push(pid, 0, name, seq);
     }
     scene.machine.begin_commit(true).unwrap();
-    let lookups = || ring_polls.get() + stash_polls.get();
+    let lookups = || {
+        ring_polls.get() + stash_insert_polls.get() + stash_mismatch_polls.get()
+    };
     let mut publish_call = None;
     let mut first_lookup_call = None;
     let mut published = 0;
@@ -3484,8 +3506,12 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
         "zero loss lookups on the exhausted publish slice"
     );
     assert_eq!(
-        (ring_polls.get(), stash_polls.get()),
-        (1, 1),
+        (
+            ring_polls.get(),
+            stash_insert_polls.get(),
+            stash_mismatch_polls.get()
+        ),
+        (1, 1, 1),
         "the resume polls each counter exactly once"
     );
     // Each rise stages one named gap at publish; the counts land immediately.
@@ -3553,8 +3579,12 @@ fn joint_machine_publish_budgets_loss_polls_on_the_resume() {
         );
     }
     assert_eq!(
-        (ring_polls.get(), stash_polls.get()),
-        (1, 1),
+        (
+            ring_polls.get(),
+            stash_insert_polls.get(),
+            stash_mismatch_polls.get()
+        ),
+        (1, 1, 1),
         "no lookup repeats past completion"
     );
     let staged: Vec<_> = scene
@@ -3586,7 +3616,8 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
     scene.native.fail_births = true;
     let h0 = scene.scene.real.h0.clone();
     let ring_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let stash_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let stash_insert_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let stash_mismatch_polls = std::rc::Rc::new(std::cell::Cell::new(0usize));
     scene
         .scene
         .real
@@ -3594,18 +3625,11 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
         .install_test_io(Box::new(PublishCountedLossStub {
             inner: h0,
             ring_loss: std::collections::VecDeque::from([9, 9, 9, 9, 9, 9, 9, 9]),
-            stash_loss: std::collections::VecDeque::from([
-                (3, 1),
-                (3, 1),
-                (3, 1),
-                (3, 1),
-                (3, 1),
-                (3, 1),
-                (3, 1),
-                (3, 1),
-            ]),
+            stash_insert_loss: std::collections::VecDeque::from([3, 3, 3, 3, 3, 3, 3, 3]),
+            stash_mismatch_loss: std::collections::VecDeque::from([1, 1, 1, 1, 1, 1, 1, 1]),
             ring_polls: std::rc::Rc::clone(&ring_polls),
-            stash_polls: std::rc::Rc::clone(&stash_polls),
+            stash_insert_polls: std::rc::Rc::clone(&stash_insert_polls),
+            stash_mismatch_polls: std::rc::Rc::clone(&stash_mismatch_polls),
         }));
     let pid = std::process::id();
     for (seq, name) in (1u64..).zip([
@@ -3618,7 +3642,9 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
     }
     scene.enable_finish_fixture(Vec::new());
     scene.begin_finish().unwrap();
-    let lookups = || ring_polls.get() + stash_polls.get();
+    let lookups = || {
+        ring_polls.get() + stash_insert_polls.get() + stash_mismatch_polls.get()
+    };
     let mut publish_calls = 0;
     let mut published = 0;
     for _ in 0..512 {
@@ -3654,9 +3680,9 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
         "the finish commit publishes through the post-publish phase"
     );
     assert_eq!(
-        ring_polls.get(),
-        stash_polls.get(),
-        "every publish polls both counters exactly once"
+        (ring_polls.get(), stash_insert_polls.get()),
+        (stash_mismatch_polls.get(), stash_mismatch_polls.get()),
+        "every publish polls all counters exactly once"
     );
     assert!(ring_polls.get() >= 1, "the resume polls the loss counters");
     let lane = &scene.scene.real.lane;
@@ -3730,8 +3756,8 @@ fn joint_machine_finish_budgets_loss_polls_on_the_resume() {
         );
     }
     assert_eq!(
-        ring_polls.get(),
-        stash_polls.get(),
+        (ring_polls.get(), stash_insert_polls.get()),
+        (stash_mismatch_polls.get(), stash_mismatch_polls.get()),
         "no lookup repeats past completion"
     );
     let coordinator = &scene.scene.real.scene.coordinator;

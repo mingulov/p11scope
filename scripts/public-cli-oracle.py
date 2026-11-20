@@ -77,6 +77,12 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
 # this generic redacted pair; any other skip (entry loss, another
 # discovery reason) is a different family and still fails.
 DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
+# R1 fixed row: live attached counting slots a mid-capture global
+# retirement detached with no same-apply reattach. The affected-slot
+# count rides in evidence.coverage_retired_slots, never in the reason.
+COVERAGE_RETIRED_SKIP = {"name": "counting coverage",
+                         "reason": "counting probes were retired mid-capture; "
+                                   "calls in the retire window were not observed"}
 # Ambient-burst lane: the harness census schema consumed by the burst arm.
 CENSUS_SCHEMA = "p11scope/system-cell-census/v1"
 # PF_KTHREAD, from linux/sched.h: census exits carrying it are kernel
@@ -790,6 +796,28 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0
         and _strategies.get("unavailable") == 1
         and _loader.get("hits") == 0)
+    # Coverage-retired lane 2026-11-20 (controller ruling, 6g round 2):
+    # mt-system's parent plus 4 forked children exit mid-capture; the
+    # engine retires the provider's counting slots exactly when its
+    # last mapper is gone and discloses the tail window under the
+    # fixed R1 row. Per-slot evidence (local instrumented run, exact
+    # CI twin): one window, modules={ModuleId(0)}, slots=68 on the
+    # sole provider object; all 5 workload views retired
+    # ExpectedRemoval with pin-proven exit and zero remaining
+    # mappers; zero GenerationLost intents anywhere; every owned
+    # count exact (gap-gate-neutered oracle pass). Owned counts stay
+    # exact (checked below), zero loss (checked above), no other
+    # class. Any other cell, cause set, skip, slot count (partial
+    # retirements are a different phenomenon) or gap still fails.
+    ok_coverage_retired = (
+        cell == "mt-system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped", "coverage_retired_slots"]
+        and skip_entries == [COVERAGE_RETIRED_SKIP]
+        and evidence.get("modules_skipped") == []
+        and evidence.get("pid_descendant_gaps", 0) == 0
+        and type(evidence.get("coverage_retired_slots", 0)) is int
+        and evidence.get("coverage_retired_slots", 0) == 68)
     # Ambient-burst lane, evidence-only: count cover is not proof, so
     # the census join annotates the failure detail below and never
     # accepts a cell (a real gap-for-gap join needs per-gap identity
@@ -842,7 +870,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
-                or ok_loader_quiet,
+                or ok_loader_quiet or ok_coverage_retired,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and
@@ -855,7 +883,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gap_detail = "lossy or unknown observation gap class"
         if burst_note is not None:
             gap_detail += "; " + burst_note
-        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet,
+        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet
+                or ok_coverage_retired,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")

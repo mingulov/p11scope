@@ -1092,6 +1092,122 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("owned target count differs", result["detail"])
 
+    def test_coverage_retired_passes_on_mt_system_in_strict_mode(self):
+        # Coverage-retired lane 2026-11-20 (controller ruling, 6g
+        # round 2): mt-system's exited workload retires the
+        # provider's full 68-slot cover with exact owned counts.
+        # Shape mirrors privileged-tests run 44751181690 (lossy
+        # [skipped, coverage_retired_slots], 1 fixed R1 skip,
+        # slots=68, gaps=0).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"], "owned-provider-counts")
+
+    def test_coverage_retired_passes_on_mt_system_when_allowed(self):
+        # The R1 shape qualifies relaxed too: the hosted host leg
+        # runs mt-system with the runner-noise flag, and the fixed
+        # retirement disclosure is not runner noise.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts")
+
+    def test_coverage_retired_with_partial_slots_fails_on_mt_system(self):
+        # The R1 pin is the full 68-slot provider cover: a partial
+        # retirement count is a different phenomenon and still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 67
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_coverage_retired_with_other_class_fails_on_mt_system(self):
+        # The R1 arm stays narrow: the retirement disclosure bundled
+        # with any other observation class still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "coverage_retired_slots", "multi_rebuild_gaps"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_coverage_retired_with_wrong_skip_fails_on_mt_system(self):
+        # Only the fixed R1 row discloses the retirement: the same
+        # cause pair with any other skip reason still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "something else"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_coverage_retired_with_count_mismatch_fails_on_mt_system(self):
+        # The R1 arm never waives exact owned counts: the disclosed
+        # retirement with a 39/40 deficit still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 39
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
+    def test_coverage_retired_on_system_fails_in_strict_mode(self):
+        # The R1 disjunct is mt-system-only (only its workload exits
+        # mid-capture): the same shape on the system cell still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "counting coverage",
+                "reason": "counting probes were retired mid-capture; "
+                          "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
     def test_loader_quiet_passes_on_system_in_strict_mode(self):
         # The loader-quiet cell disjunct covers system too: the same
         # transient shape (lone named skip, one unavailable, zero

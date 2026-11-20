@@ -2980,7 +2980,14 @@ fn joint_take_refresh_sweep_preserves_unscanned_for_next_pass() {
     let sibling_slot = match sibling {
         Some(slot) => slot,
         None => {
-            let slot = 7;
+            // Plan numbering owns the low slots (the receipt's own
+            // endpoint among them): take a free slot instead of a
+            // hardcoded one that could overwrite it.
+            let endpoints = harness.io.endpoints.as_ref().expect("scripted endpoints");
+            let mut slot = endpoints.keys().max().copied().unwrap_or(0).saturating_add(1);
+            if slot == receipt.attachment_slot {
+                slot = slot.saturating_add(1);
+            }
             let endpoint = crate::semantic_capture::Endpoint {
                 object: crate::discovery::identity::PinnedObjectId(1),
                 file_slot: 1,
@@ -3082,7 +3089,14 @@ fn joint_take_refresh_sweep_budgeted_single_step_per_pass() {
     let sibling_slot = match sibling {
         Some(slot) => slot,
         None => {
-            let slot = 7;
+            // Plan numbering owns the low slots (the receipt's own
+            // endpoint among them): take a free slot instead of a
+            // hardcoded one that could overwrite it.
+            let endpoints = harness.io.endpoints.as_ref().expect("scripted endpoints");
+            let mut slot = endpoints.keys().max().copied().unwrap_or(0).saturating_add(1);
+            if slot == receipt.attachment_slot {
+                slot = slot.saturating_add(1);
+            }
             let endpoint = crate::semantic_capture::Endpoint {
                 object: crate::discovery::identity::PinnedObjectId(1),
                 file_slot: 1,

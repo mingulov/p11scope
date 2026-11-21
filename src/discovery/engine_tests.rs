@@ -50198,10 +50198,7 @@ fn e06_build_static_sleeper(dir: &Path) -> PathBuf {
         std::process::Command::new("gcc")
             .args(["-nostdlib", "-static", "-o"])
             .arg(&sleeper)
-            .arg(
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/e06-static-sleeper.S")
-            )
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/e06-static-sleeper.S"))
             .status()
             .unwrap()
             .success()
@@ -54678,9 +54675,9 @@ fn e06_spawn_sleepers(exe: &Path, count: usize, settled: bool) -> Vec<SystemScop
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     if let Ok(stable_bytes) = std::fs::read(&maps_path)
                         && let Ok(stable_maps) = parse_maps(&stable_bytes)
-                        && stable_maps.iter().any(|mapping| {
-                            mapping.permissions[2] == b'x' && mapping.inode != 0
-                        })
+                        && stable_maps
+                            .iter()
+                            .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
                         && MapIndex::new(&stable_maps).is_ok()
                     {
                         ready = true;

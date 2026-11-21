@@ -77,9 +77,15 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
 # this generic redacted pair; any other skip (entry loss, another
 # discovery reason) is a different family and still fails.
 DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
-# Exit-ambient row: a discovery subject that exited mid-scan. The render
-# layer folds every mid-flight exit to this finite reason (never dropped,
-# never a pid); it names an ambient short-lived exit, not workload loss.
+# Exit-ambient row: the render layer folds every mid-flight
+# generation pair to this finite reason (never dropped, never a pid).
+# The fold is ambiguous — it also projects the engine's live
+# stale-deferral mark, filed for a still-live process — so an exit
+# excuse requires proof the process actually exited, which no public
+# row carries. The oracle therefore never qualifies this row: any
+# report containing it fails closed at the gap gate, in every mode.
+# Kept as a named constant so the vocabulary pin
+# (test_skip_reason_vocabulary.py) keeps it tied to the producer.
 EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited mid-flight"}
 # R1 fixed row: live attached counting slots a mid-capture global
 # retirement detached with no same-apply reattach. The affected-slot
@@ -758,27 +764,13 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
         and evidence.get("modules_skipped") == []
         and evidence.get("pid_descendant_gaps", 0) == 0)
-    # Exit-ambient lane 2026-11-21 (v0.8.0 flakes), narrowed: a
-    # named mid-flight exit covers only exit rows. The generic
-    # discovery-unavailable row also projects dropped inventory passes
-    # and held-back admissions (render::capture_skipped_out), which are
-    # indistinguishable from tick-quantum deferrals at the published-row
-    # boundary — so any generic companion to an exit row stays a new
-    # shape (fix the discovery failure or remove the churn instead).
-    # This arm accepts any non-empty all-exit list on system/cgroup
-    # scope with exact owned counts (the exiting processes made no
-    # workload calls), zero loss (checked above) and no other class.
-    # Any other reason, cause set, module skip or gap still fails. The
-    # quiet arm above keeps the pure single-deferral shape.
-    ok_exit_ambient = (
-        scope in ("system", "cgroup")
-        and observation.get("status") == "lossy"
-        and observation.get("causes") == ["skipped"]
-        and isinstance(skip_entries, list)
-        and len(skip_entries) >= 1
-        and all(skip == EXIT_MID_FLIGHT_SKIP for skip in skip_entries)
-        and evidence.get("modules_skipped") == []
-        and evidence.get("pid_descendant_gaps", 0) == 0)
+    # No exit-ambient arm: the public mid-flight row also projects
+    # the engine's live stale-deferral mark (filed for a still-live
+    # process with the view retained), so it proves no exit. An exit
+    # excuse requires proof the process actually exited; until the
+    # producer publishes per-row proof, every report carrying the row
+    # fails closed at the gap gate, in every mode. The quiet arm above
+    # keeps the pure single-deferral shape.
     # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient
     # ruling to the system and mt-system cells): quiet VNG guests
     # disclose exactly one ambient descendant exit with no skip
@@ -884,26 +876,9 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0
         and type(evidence.get("coverage_retired_slots", 0)) is int
         and evidence.get("coverage_retired_slots", 0) == 68)
-    # Exit composition 2026-11-21 (fedora host rep26): the same fixed
-    # R1 disclosure plus one folded mid-flight exit. The gap-fold
-    # feature projects an ambient short-lived exit that races discovery
-    # to EXIT_MID_FLIGHT_SKIP instead of the generic quiet row the arm
-    # above accepts; the workload stays fully observed (exact
-    # 64000/64000 on rep26 with zero loss) and the exit row is counted
-    # and disclosed, never silent. Either skip order qualifies; the
-    # cause pair is unchanged. Accepted strict and relaxed alike (the
-    # host twin is the same shape); a sibling fold, a further row, gap
-    # or cause stays a new shape.
-    ok_coverage_retired_exit = (
-        cell == "mt-system"
-        and observation.get("status") == "lossy"
-        and observation.get("causes") == ["skipped", "coverage_retired_slots"]
-        and (skip_entries == [EXIT_MID_FLIGHT_SKIP, COVERAGE_RETIRED_SKIP]
-             or skip_entries == [COVERAGE_RETIRED_SKIP, EXIT_MID_FLIGHT_SKIP])
-        and evidence.get("modules_skipped") == []
-        and evidence.get("pid_descendant_gaps", 0) == 0
-        and type(evidence.get("coverage_retired_slots", 0)) is int
-        and evidence.get("coverage_retired_slots", 0) == 68)
+    # No R1-plus-exit composition either: the folded row beside the
+    # fixed R1 disclosure carries the same unproven exit claim, so the
+    # pair fails closed like the lone row, strict and relaxed alike.
     # Ambient-burst lane, evidence-only: count cover is not proof, so
     # the census join annotates the failure detail below and never
     # accepts a cell (a real gap-for-gap join needs per-gap identity
@@ -956,24 +931,22 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
-                or ok_exit_ambient or ok_loader_quiet or ok_coverage_retired
-                or ok_coverage_retired_noise or ok_coverage_retired_quiet
-                or ok_coverage_retired_exit,
+                or ok_loader_quiet or ok_coverage_retired
+                or ok_coverage_retired_noise or ok_coverage_retired_quiet,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and
                   observation.get("causes") == ["skipped"] and
                   evidence.get("skipped") == [{"name": "discovery subject",
                                                "reason": "discovery unavailable"}])
-        require(ok_exact or ok_gap or ok_ambient or ok_exit_ambient,
+        require(ok_exact or ok_gap or ok_ambient,
                 "lossy or unknown observation gap class")
     elif scope in ("system", "cgroup"):
         gap_detail = "lossy or unknown observation gap class"
         if burst_note is not None:
             gap_detail += "; " + burst_note
-        require(ok_exact or ok_ambient or ok_quiet or ok_exit_ambient or ok_lone_gap
-                or ok_loader_quiet or ok_coverage_retired or ok_coverage_retired_quiet
-                or ok_coverage_retired_exit,
+        require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap
+                or ok_loader_quiet or ok_coverage_retired or ok_coverage_retired_quiet,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")
@@ -988,14 +961,13 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
-    # ok_ambient, ok_quiet, ok_exit_ambient, ok_coverage_retired_exit,
-    # ok_lone_gap or ok_loader_quiet (the pure coverage-retired shapes
-    # qualify plain below): any other cause set failed already, so the
-    # flags (not re-spelled causes) decide the qualification. Metrics
-    # evidence carries no gaps keys, which read as zero below;
-    # profile-cgroup/run cells carry them and must read 0.
+    # ok_ambient, ok_quiet, ok_lone_gap or ok_loader_quiet (the pure
+    # coverage-retired shapes qualify plain below): any other cause
+    # set failed already, so the flags (not re-spelled causes) decide
+    # the qualification. Metrics evidence carries no gaps keys, which
+    # read as zero below; profile-cgroup/run cells carry them and must
+    # read 0.
     ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet))
-    exit_ambient = (not relaxed and (ok_exit_ambient or ok_coverage_retired_exit))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps
@@ -1095,14 +1067,11 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gaps = evidence.get("pid_descendant_gaps", 0)
         skips = sum(1 for skip in evidence.get("skipped", [])
                     if skip == DISCLOSABLE_DISCOVERY_SKIP)
-        exits = sum(1 for skip in evidence.get("skipped", [])
-                    if skip == EXIT_MID_FLIGHT_SKIP)
-        if cell == "mt-system" or skips > 0 or exits > 0:
-            noise = (f"pid_descendant_gaps={gaps}; discovery_skips={skips}; "
-                     f"mid_flight_exits={exits}")
+        if cell == "mt-system" or skips > 0:
+            noise = (f"pid_descendant_gaps={gaps}; discovery_skips={skips}")
         else:
             noise = f"pid_descendant_gaps={gaps}"
-        if gaps > 0 or skips > 0 or exits > 0:
+        if gaps > 0 or skips > 0:
             return "owned-provider-counts-with-runner-noise", (
                 "owned physical-provider counts match independent successful ledger; "
                 f"disclosed runner noise: {noise}; "
@@ -1124,15 +1093,6 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         return "owned-provider-counts-with-ambient-gap", (
             "owned physical-provider counts match independent successful ledger; "
             f"disclosed honest ambient gap: pid_descendant_gaps={gaps}; discovery_skips={skips}; "
-            "per-caller attribution is not established")
-    if exit_ambient:
-        exits = sum(1 for skip in evidence.get("skipped", [])
-                    if skip == EXIT_MID_FLIGHT_SKIP)
-        skips = sum(1 for skip in evidence.get("skipped", [])
-                    if skip == DISCLOSABLE_DISCOVERY_SKIP)
-        return "owned-provider-counts-with-exit-ambient-gap", (
-            "owned physical-provider counts match independent successful ledger; "
-            f"disclosed honest ambient exits: mid_flight_exits={exits}; discovery_skips={skips}; "
             "per-caller attribution is not established")
     return "owned-provider-counts", ("owned physical-provider counts match independent successful ledger; "
                                      "per-caller attribution is not established")

@@ -936,6 +936,14 @@ impl JointStaging {
             .map(|head| (head.position, head.original_invocation))
     }
 
+    /// Test-only charged bytes of the staged head, if any: lets a
+    /// shared-pool twin prove the freed H9 room alone fits the
+    /// association, so only lease retention can refuse the mint.
+    #[cfg(test)]
+    pub(crate) fn staged_head_charged_bytes_for_test(&self) -> Option<u64> {
+        self.staged.front().map(|head| head.charged_bytes())
+    }
+
     /// Borrow the existing FIFO by index during one continuation preflight;
     /// no copied queue or scalar admission can create this native identity.
     pub(crate) fn staged_original_at(&self, index: usize) -> Option<(u64, (u64, u64))> {
@@ -4454,9 +4462,11 @@ pub(crate) struct FeedDisposalCursor {
     pending_peek: Option<PeekedHead>,
     /// Retained H9 charge from a completed unlink whose payload has
     /// not yet dropped: held across yields (including the pop-credit
-    /// boundary) and refunded once after the drop. `None` when no
-    /// unlink has completed ahead of its drop. On terminal
-    /// cancellation the cursor drops with the lease, refunding once.
+    /// boundary), through the captured effects' budgeted drain until
+    /// the mint commits or refuses, and refunded once after the
+    /// payload drop. `None` when no unlink has completed ahead of its
+    /// drop. On terminal cancellation the cursor drops with the
+    /// lease, refunding once.
     pending_lease: Option<(
         usize,
         Option<crate::semantics_edge::resources::ResourceLease>,
@@ -4522,6 +4532,13 @@ impl FeedDisposalCursor {
     #[cfg(test)]
     pub(crate) fn pending_lease_bytes_for_test(&self) -> Option<usize> {
         self.pending_lease.as_ref().map(|(bytes, _)| *bytes)
+    }
+
+    /// Test-only drain state: whether a captured `Started` mint or
+    /// further captured effects still await the budgeted drain.
+    #[cfg(test)]
+    pub(crate) fn has_inflight_drain_for_test(&self) -> bool {
+        self.pending_start.is_some() || !self.pending_effects.is_empty()
     }
 
     /// Test-only read of the throwaway edge's unified read counter
@@ -4698,7 +4715,10 @@ impl FeedDisposalCursor {
                     feed.history_disposed = feed.history_disposed.saturating_add(1);
                     self.pending_head = None;
                     self.head_retired = false;
-                    drop(self.pending_lease.take());
+                    drop(popped);
+                    if self.pending_start.is_none() && self.pending_effects.is_empty() {
+                        drop(self.pending_lease.take());
+                    }
                     continue;
                 }
                 if !self.is_joint {
@@ -4709,6 +4729,7 @@ impl FeedDisposalCursor {
                     feed.frontier = feed.frontier.max(popped.position);
                     feed.history_disposed = feed.history_disposed.saturating_add(1);
                     self.pending_head = None;
+                    drop(popped);
                     drop(self.pending_lease.take());
                     continue;
                 }
@@ -4731,7 +4752,15 @@ impl FeedDisposalCursor {
                 feed.frontier = feed.frontier.max(popped.position);
                 feed.history_disposed = feed.history_disposed.saturating_add(1);
                 self.pending_head = None;
-                drop(self.pending_lease.take());
+                // The payload drops before its lease refunds, and the
+                // lease stays retained while captured effects await
+                // the drain, so the mint commits or refuses with the
+                // H9 custody still held (like the synchronous replay,
+                // which mints while the staged member is live).
+                drop(popped);
+                if self.pending_start.is_none() && self.pending_effects.is_empty() {
+                    drop(self.pending_lease.take());
+                }
                 continue;
             }
             // Drain captured effects FIFO before selecting the next
@@ -4747,6 +4776,10 @@ impl FeedDisposalCursor {
                 if !self.poll_effect_drain(fallback.as_deref_mut(), gate) {
                     return false;
                 }
+                // The drain completed: every captured mint committed
+                // or refused, so the popped payload's retained H9
+                // lease refunds now (after the payload drop).
+                drop(self.pending_lease.take());
                 continue;
             }
             if self.pending_peek.is_none() {
@@ -4777,6 +4810,7 @@ impl FeedDisposalCursor {
                         debug_assert!(self.pending_head.is_none());
                         debug_assert!(self.pending_start.is_none());
                         debug_assert!(self.pending_effects.is_empty());
+                        debug_assert!(self.pending_lease.is_none());
                         let preserved = self.preserved.take().expect("joint finalizes once");
                         // The throwaway stays (resourceless, drained: drop timing
                         // is unobservable) so post-finalize read accounting keeps
@@ -4875,6 +4909,13 @@ impl FeedDisposalCursor {
     ) -> bool {
         use crate::semantics_objects::journal::MintStepOutcome;
         loop {
+            // A drained queue reports done even without gate left:
+            // the caller refunds the popped payload's retained H9
+            // lease on completion, and an empty-but-gateless false
+            // would strand that retention past the finalize.
+            if self.pending_start.is_none() && self.pending_effects.is_empty() {
+                return true;
+            }
             if gate.remaining() == 0 {
                 return false;
             }
@@ -5918,6 +5959,217 @@ mod disposal_tests {
         let ticket = fallback.mint_keyassoc(16).unwrap();
         assert_eq!(ticket, 1, "{tag}: the refusal consumed no ticket");
         fallback.release_keyassoc(ticket);
+    }
+
+    /// Shared-pool custody across a refused mint: the popped head's H9
+    /// lease stays retained while its association mint walks a long
+    /// bucket across credits, so an exact-fit shared pool refuses the
+    /// mint (no room until the H9 refunds after the drain). The freed
+    /// H9 room alone fits the association, so only retention refuses.
+    #[test]
+    fn feed_disposal_shared_pool_h9_lease_held_through_refused_mint() {
+        let tag = "h9-shared-refusal";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        assert_eq!(
+            StagingLedger::assoc_bucket_for_test(15_509),
+            105,
+            "the churn target bucket is pinned"
+        );
+        let assoc_bytes = std::mem::size_of::<OpenKeyUse>() as u64;
+        let mut retained = 0usize;
+        for ticket in 1..15_509u64 {
+            let minted = fallback.mint_keyassoc(assoc_bytes).unwrap();
+            assert_eq!(minted, ticket, "sequential tickets");
+            if StagingLedger::assoc_bucket_for_test(ticket) == 105 {
+                retained += 1;
+            } else {
+                fallback.release_keyassoc(ticket);
+            }
+        }
+        assert_eq!(retained, 32, "32 live tickets collide in bucket 105");
+        assert_eq!(fallback.census(), 32);
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(33);
+        feed.stage(
+            init_call("C_SignInit", 4005, 0x000d, 100),
+            origin("C_SignInit", 4005, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let head_bytes = feed
+            .staged_head_charged_bytes_for_test()
+            .expect("one head staged");
+        assert!(
+            head_bytes >= assoc_bytes,
+            "{tag}: premise: the freed H9 room ({head_bytes}) fits the assoc ({assoc_bytes})"
+        );
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        assert!(
+            fallback.mint_keyassoc(16).is_err(),
+            "{tag}: exact-fit: no room while the H9 is held"
+        );
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let pool_held = pool.snapshot().charged_bytes;
+        let mut polls = 0usize;
+        let mut saw_inflight = false;
+        loop {
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            assert!(gate.spent() <= 64, "{tag} poll {polls} spent above 64");
+            if feed.staged_len() == 0 && cursor.has_inflight_drain_for_test() {
+                saw_inflight = true;
+                assert!(
+                    cursor.pending_lease_bytes_for_test().is_some(),
+                    "{tag} poll {polls}: the H9 lease stays retained across the mint yield"
+                );
+                assert_eq!(
+                    pool.snapshot().charged_bytes,
+                    pool_held,
+                    "{tag} poll {polls}: no pool refund while the mint is in flight"
+                );
+            }
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        assert!(
+            saw_inflight,
+            "{tag}: the 65-leaf walk must yield mid-mint"
+        );
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(
+            keyuse.evidence().rows_refused,
+            1,
+            "{tag}: exactly one refused row"
+        );
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the refused open closes Unknown"
+        );
+        assert_eq!(
+            fallback.census(),
+            32,
+            "{tag}: survivors stay; no assoc minted"
+        );
+        assert!(
+            pool.snapshot().charged_bytes < pool_held,
+            "{tag}: the H9 refunds after the drain"
+        );
+        let ticket = fallback.mint_keyassoc(assoc_bytes).unwrap();
+        assert_eq!(ticket, 15_509, "{tag}: the refusal consumed no ticket");
+        fallback.release_keyassoc(ticket);
+    }
+
+    /// Shared-pool custody across a committed mint: the popped head's
+    /// H9 lease stays retained while its association mint walks a long
+    /// bucket across credits, and refunds only after the mint commits.
+    /// The pool never drops below its held charge while the drain is
+    /// in flight.
+    #[test]
+    fn feed_disposal_shared_pool_h9_lease_held_through_committed_mint() {
+        let tag = "h9-shared-commit";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        assert_eq!(
+            StagingLedger::assoc_bucket_for_test(15_509),
+            105,
+            "the churn target bucket is pinned"
+        );
+        let assoc_bytes = std::mem::size_of::<OpenKeyUse>() as u64;
+        let mut retained = 0usize;
+        for ticket in 1..15_509u64 {
+            let minted = fallback.mint_keyassoc(assoc_bytes).unwrap();
+            assert_eq!(minted, ticket, "sequential tickets");
+            if StagingLedger::assoc_bucket_for_test(ticket) == 105 {
+                retained += 1;
+            } else {
+                fallback.release_keyassoc(ticket);
+            }
+        }
+        assert_eq!(retained, 32, "32 live tickets collide in bucket 105");
+        assert_eq!(fallback.census(), 32);
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(35);
+        feed.stage(
+            init_call("C_SignInit", 4006, 0x000d, 100),
+            origin("C_SignInit", 4006, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let pool_held = pool.snapshot().charged_bytes;
+        let mut polls = 0usize;
+        let mut saw_inflight = false;
+        loop {
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            assert!(gate.spent() <= 64, "{tag} poll {polls} spent above 64");
+            if feed.staged_len() == 0 && cursor.has_inflight_drain_for_test() {
+                saw_inflight = true;
+                assert!(
+                    cursor.pending_lease_bytes_for_test().is_some(),
+                    "{tag} poll {polls}: the H9 lease stays retained across the mint yield"
+                );
+                assert!(
+                    pool.snapshot().charged_bytes >= pool_held,
+                    "{tag} poll {polls}: no early refund while the drain is in flight"
+                );
+            }
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        assert!(
+            saw_inflight,
+            "{tag}: the 65-leaf walk must yield mid-mint"
+        );
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(
+            keyuse.evidence().rows_refused,
+            0,
+            "{tag}: no refusal with room"
+        );
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the truncated open closes Unknown"
+        );
+        assert_eq!(
+            fallback.census(),
+            32,
+            "{tag}: survivors stay; the head assoc released exactly once"
+        );
+        assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
     }
 
     /// Budgeted Started drain matches the synchronous Started arm

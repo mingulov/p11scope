@@ -809,7 +809,7 @@ class JournalGateTests(unittest.TestCase):
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")
-        self.assertIn("journal pair incomplete", row["detail"])
+        self.assertIn("journal pair incomplete (1 of 2 roots missing)", row["detail"])
 
     def test_unlinked_lane_fails(self):
         # No journal rows and no routed calls: the cell fails even

@@ -54834,6 +54834,38 @@ fn e06_spawn_sleeps_accepts_statically_linked_child() {
     }
 }
 
+/// The static parker is accepted even when its scratch path contains
+/// `.so` (e.g. a `.source` directory): the shared helper makes no
+/// provider-shape assumption, so incidental TMPDIR spelling must not
+/// fail the fixture. Builds under a `.source` subdir on purpose, so
+/// the spelling is pinned even on clean TMPDIRs.
+#[test]
+fn e06_static_sleeper_accepted_under_dot_so_scratch_path() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let dot_so = dir.path().join(".source");
+    std::fs::create_dir_all(&dot_so).expect("a dot-so scratch dir");
+    let sleeper = e06_build_static_sleeper(&dot_so);
+    let mut children = e06_spawn_sleeps_with(&sleeper, 2);
+    assert_eq!(children.len(), 2);
+    for guard in &children {
+        let pid = guard.pid();
+        let bytes = std::fs::read(format!("/proc/{pid}/maps")).expect("readable maps");
+        let maps = parse_maps(&bytes).expect("parseable maps");
+        assert!(
+            !maps.iter().any(crate::discovery::scan::is_provider_mapping),
+            "static child {pid} maps no provider shape"
+        );
+        assert!(
+            maps.iter()
+                .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0),
+            "static child {pid} keeps a file-backed executable mapping"
+        );
+    }
+    for child in &mut children {
+        child.reap().unwrap();
+    }
+}
+
 fn e06_write_listing(scope_dir: &Path, pids: &[u32]) {
     let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
     std::fs::write(scope_dir.join("cgroup.procs"), listing).expect("a cgroup.procs");

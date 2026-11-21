@@ -10,6 +10,7 @@ import json
 import mmap
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import stat
@@ -244,6 +245,56 @@ def replace_successful_totals(report, ledger, totals):
     ledger[-1] = "LEDGER " + json.dumps(payload)
     for row, total in zip(report["functions"], totals):
         row["calls"] = total
+
+
+# The engine's live stale-deferral mark (src/discovery/engine.rs
+# `queue_retirement_within`): filed when the retained pin re-reads
+# Current or unprovable — the process is still live — while the view
+# stays retained for the next pass.
+LIVE_DEFERRAL_INTERNAL_REASON = (
+    "a stale generation report was contradicted or unprovable on pin "
+    "recheck; retirement deferred")
+
+
+def producer_render_source():
+    return (ROOT / "src" / "render.rs").read_text(encoding="utf-8")
+
+
+def producer_const(name):
+    """The exact string value of a `const NAME: &str = "..."` in render.rs."""
+    match = re.search(
+        r'const %s: &str =\s*\n?\s*"((?:[^"\\]|\\.)*)"' % re.escape(name),
+        producer_render_source(),
+    )
+    assert match is not None, f"producer constant {name} missing from render.rs"
+    return match.group(1).replace('\\"', '"').replace("\\\\", "\\")
+
+
+def producer_exit_row():
+    """The public exit row as the producer defines it today.
+
+    Built from the render.rs constants, never a pasted copy, so the
+    rejection twins below always judge the row the producer emits.
+    """
+    return {"name": producer_const("DISCOVERY_SUBJECT"),
+            "reason": producer_const("MID_FLIGHT_REASON")}
+
+
+def assert_live_deferral_still_folds():
+    """Prove the live stale-deferral mark still folds to the exit row.
+
+    Fails loudly (never vacuously green) if the producer stops
+    filing the live mark or stops folding it: either change revisits
+    these twins, since the rejection below exists only because the
+    fold is ambiguous. The behavioral pin is
+    render::mid_flight_generation_pairs_project_to_one_public_reason.
+    """
+    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
+    assert LIVE_DEFERRAL_INTERNAL_REASON in engine, \
+        "producer stopped filing the live stale-deferral mark"
+    fold = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
+    assert LIVE_DEFERRAL_INTERNAL_REASON in fold, \
+        "producer stopped folding the live deferral to the exit row"
 
 
 class OracleTests(unittest.TestCase):
@@ -1041,23 +1092,28 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_exit_ambient_with_single_exit_passes_on_system_in_strict_mode(self):
-        # The narrow single-transient shape: one ambient exit, no
-        # deferral, exact counts. This is the inferred quiet-runner CI
-        # shape (a lone short-lived exit in an otherwise exact window;
-        # the attempt-1 CI JSON is unrecoverable, so the instance is
-        # inferred from local reproductions, not proven).
+    def test_exit_ambient_with_single_exit_fails_on_system_in_strict_mode(self):
+        # An exit excuse requires proof the process actually exited.
+        # The public exit row also projects the engine's live
+        # stale-deferral mark (filed for a still-live process with the
+        # view retained), so a lone row with exact counts and zero
+        # loss is ambiguous — a live deferral, not a proven exit —
+        # and the oracle rejects it fail-closed at the gap gate. The
+        # row under test comes from the producer's own constants and
+        # the fold assertion above proves the live mark still maps to
+        # it. Control: test_lone_gap_passes_on_system_in_strict_mode
+        # keeps the proven-exit positive (gaps=1, no skips) with the
+        # same exact counts.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case(mutate, cell="system")
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=1", result["detail"])
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_exit_ambient_with_other_reason_fails_in_strict_mode(self):
         # The exit arm names exactly two finite reasons: a mid-flight
@@ -1108,21 +1164,21 @@ class RunnerNoiseTests(unittest.TestCase):
                       result["detail"])
 
     def test_exit_ambient_with_count_mismatch_fails_in_strict_mode(self):
-        # The exit arm never waives exact owned counts: exit-only
-        # skips with a 499/500 deficit still fail strict at the count
-        # gate (the shape must first pass the gap gate, which also
-        # pins multi-exit-only acceptance there).
+        # Exit-only skips with a 499/500 deficit still fail strict —
+        # at the gap gate, since no arm qualifies the ambiguous exit
+        # row even with exact counts (the deficit never reaches the
+        # count check).
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row), dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
             d["functions"][0]["calls"] = 499
         result = self.run_case(mutate, cell="system", want=1)
-        self.assertIn("owned target count differs", result["detail"])
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_exit_ambient_with_deferral_mix_fails_when_allowed(self):
         # Relaxed twin of the strict mixed rejection: the hosted host
@@ -1146,82 +1202,77 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_exit_ambient_with_single_exit_passes_on_system_when_allowed(self):
-        # Relaxed disclosure twin of the strict single-exit pass: a
-        # pure ambient exit under the flag must not qualify as plain
-        # owned-provider-counts; it keeps the runner-noise
-        # qualification and names the exit count.
+    def test_exit_ambient_with_single_exit_fails_on_system_when_allowed(self):
+        # Relaxed twin of the strict single-row rejection: the flag
+        # discloses runner noise, never an unproven exit row — the
+        # lone ambiguous row stays red at the gap gate in relaxed
+        # mode too.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="system",
-                               allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
-        self.assertIn("mid_flight_exits=1", result["detail"])
+                               allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_exit_ambient_with_multi_exit_passes_on_system_in_strict_mode(self):
-        # The narrowed arm still accepts any non-empty all-exit list:
-        # every row names the same finite mid-flight cause, exact
-        # counts and zero loss backstop it, and the detail discloses
-        # the exit count with zero generic skips.
+    def test_exit_ambient_with_multi_exit_fails_on_system_in_strict_mode(self):
+        # A live deferral counted alongside genuine exits: the
+        # producer's live stale-deferral projection is row-identical
+        # to a true exit row, so the oracle cannot tell which rows
+        # are proven exits and the exit count is unsound. An
+        # all-exit list with exact counts and zero loss still fails
+        # strict at the gap gate — counting more rows never proves
+        # any of them.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row), dict(exit_row),
+                                        dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case(mutate, cell="system")
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=3", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_exit_ambient_with_multi_exit_passes_on_system_when_allowed(self):
-        # Relaxed twin of the multi-exit pass: an all-exit list under
-        # the flag keeps the runner-noise qualification and names the
-        # exit count in its detail.
+    def test_exit_ambient_with_multi_exit_fails_on_system_when_allowed(self):
+        # Relaxed twin of the multi-exit rejection: an all-exit list
+        # under the flag stays red at the gap gate, exactly like the
+        # strict multi-exit shape.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row), dict(exit_row),
+                                        dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="system",
-                               allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
-        self.assertIn("mid_flight_exits=3", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+                               allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_exit_ambient_with_single_exit_passes_on_cgroup_in_strict_mode(self):
-        # The exit arm covers cgroup scope exactly like system scope:
-        # a lone named exit on profile-cgroup qualifies strict with
-        # the exit-ambient label and a counted disclosure.
+    def test_exit_ambient_with_single_exit_fails_on_cgroup_in_strict_mode(self):
+        # Cgroup twin of the strict single-row rejection: a lone
+        # ambiguous exit row on profile-cgroup stays red at the gap
+        # gate, exactly like the system-scope row.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
             d["capture"]["scope"] = "cgroup"
             r["scope"] = "cgroup"
             d["evidence"]["attach_backend"]["scope_filter"] = None
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case(mutate, cell="profile-cgroup")
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=1", result["detail"])
+        result = self.run_case(mutate, cell="profile-cgroup", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_exit_ambient_with_deferral_mix_fails_on_cgroup_in_strict_mode(self):
         # Cgroup twin of the strict mixed rejection: a named exit
@@ -1628,37 +1679,37 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("owned target count differs", result["detail"])
 
-    def test_coverage_retired_exit_passes_in_strict_mode(self):
-        # Exit composition (fedora host rep26, 2026-11-21): the fixed
-        # R1 disclosure plus one folded mid-flight exit qualifies
-        # strict with exact counts. Shape mirrors the loop failure
-        # (lossy [skipped, coverage_retired_slots], [R1, exit] skips
-        # in this order, slots=68, gaps=0, exact 64000/64000): the
-        # gap-fold renamed the quiet row the coverage-quiet pin
-        # accepted, and the exit row must be counted and disclosed,
-        # never silent.
+    def test_coverage_retired_exit_fails_in_strict_mode(self):
+        # The R1 composition inherits the exit row's ambiguity (fedora
+        # host rep26 shape: lossy [skipped, coverage_retired_slots],
+        # [R1, exit] skips in this order, slots=68, gaps=0, exact
+        # counts): the folded row beside the fixed R1 disclosure
+        # carries no exit proof, so the pair fails closed at the gap
+        # gate with exact counts and zero loss.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "counting coverage",
                  "reason": "counting probes were retired mid-capture; "
                            "calls in the retire window were not observed"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+                dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=1", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_coverage_retired_exit_reversed_passes_in_strict_mode(self):
+    def test_coverage_retired_exit_reversed_fails_in_strict_mode(self):
         # Skip order is not load-bearing: the same pair in reverse
-        # order qualifies strict too, with the same exit disclosure.
+        # order fails strict too, at the gap gate.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                dict(exit_row),
                 {"name": "counting coverage",
                  "reason": "counting probes were retired mid-capture; "
                            "calls in the retire window were not observed"}]
@@ -1666,31 +1717,29 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=1", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
-    def test_coverage_retired_exit_passes_when_allowed(self):
-        # The exit composition qualifies relaxed too: the flagged host
-        # leg keeps the runner-noise qualification and names the exit
-        # count, exactly like the r2 relaxed exit-disclosure rule.
+    def test_coverage_retired_exit_fails_when_allowed(self):
+        # Relaxed twin of the R1 composition rejection: the flagged
+        # host leg stays red at the gap gate, exactly like strict.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "counting coverage",
                  "reason": "counting probes were retired mid-capture; "
                            "calls in the retire window were not observed"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+                dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
-        self.assertIn("mid_flight_exits=1", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True,
+                                         want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_coverage_retired_exit_with_sibling_reason_fails(self):
         # The exit composition names exactly one folded reason: the R1
@@ -1715,21 +1764,26 @@ class RunnerNoiseTests(unittest.TestCase):
                       result["detail"])
 
     def test_coverage_retired_exit_with_count_mismatch_fails(self):
-        # The exit composition never waives exact owned counts: the
-        # disclosed pair with a 39/40 deficit still fails.
+        # The exit composition with a 39/40 deficit still fails — at
+        # the gap gate, since no arm qualifies the ambiguous exit row
+        # even with exact counts (the deficit never reaches the count
+        # check).
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "counting coverage",
                  "reason": "counting probes were retired mid-capture; "
                            "calls in the retire window were not observed"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+                dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
             d["functions"][0]["calls"] = 39
         result = self.run_case_mt_system(mutate, want=1)
-        self.assertIn("owned target count differs", result["detail"])
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_coverage_retired_exit_with_partial_slots_fails(self):
         # The exit composition pins the full 68-slot provider cover

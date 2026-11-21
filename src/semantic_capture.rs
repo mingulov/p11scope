@@ -5237,7 +5237,6 @@ impl SemanticCapture {
         }
         // Collection never routes; every batch (including empty batches) audits.
         let _ = self.audit(io, &mut report);
-        self.terminal_tasks(&mut report);
         for (position, record, origin) in batch {
             if record.base.event.event_type != event_type::CALL {
                 report.outcomes.push(TickOutcome::Other(OtherRecord {
@@ -5354,6 +5353,10 @@ impl SemanticCapture {
                 });
             }
         }
+        // Terminal retirement runs after the collected batch routes, so
+        // already-collected calls join before their task's exit retires
+        // the image; retiring first shed them as retired.
+        self.terminal_tasks(&mut report);
         self.batch_failed = false;
         self.prune_jobs();
         let expired: Vec<_> = self

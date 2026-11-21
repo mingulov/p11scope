@@ -48593,8 +48593,12 @@ fn candidate_selection_prefers_rare_providers_over_pid_order() {
 /// singleton group whose unique file sorts before the settled group.
 /// Selection is rarity order, never a lowest-pid prefix: a highest-pid
 /// transient selects `[highest, lowest]` and a second-pid transient selects
-/// `[second, lowest]`. The reconcile-cursor prefix assertion holds only for
-/// one shape (identical settled sleepers); two shapes follow this order.
+/// `[second, lowest]`. A pure subset without the transient (a partial
+/// `.so` set) also breaks the prefix: the settled group's unique file is
+/// rarer, so the settled group sorts first and a highest-pid subset
+/// selects `[lowest, subset]`. The reconcile-cursor prefix assertion holds
+/// only for one shape (identical settled sleepers); two shapes follow this
+/// order.
 #[test]
 fn selection_prefers_ld_so_cache_transient_before_settled_group() {
     fn map_entry(path: &str, inode: u64) -> MapEntry {
@@ -48623,6 +48627,15 @@ fn selection_prefers_ld_so_cache_transient_before_settled_group() {
         entries.push(map_entry("/etc/ld.so.cache", 2001));
         entries
     }
+    fn subset() -> Vec<MapEntry> {
+        // A partial `.so` set with no transient: the settled group's
+        // unique file (libm) is rarer than the shared files, so the
+        // settled group sorts first.
+        vec![
+            map_entry("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", 1001),
+            map_entry("/usr/lib/x86_64-linux-gnu/libc.so.6", 1002),
+        ]
+    }
     // Highest-pid transient: `[highest, lowest]`, the CI failure shape.
     let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
         (100, settled()),
@@ -48641,6 +48654,15 @@ fn selection_prefers_ld_so_cache_transient_before_settled_group() {
         (104, settled()),
     ];
     assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![101, 100]);
+    // Highest-pid pure subset: `[lowest, subset]`, not a pid prefix.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (100, settled()),
+        (101, settled()),
+        (102, settled()),
+        (103, settled()),
+        (104, subset()),
+    ];
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![100, 104]);
 }
 
 /// F2: the published over-cap diagnostic agrees with the actual selected
@@ -54546,6 +54568,12 @@ fn e06_cgroup_args(
     }
 }
 
+/// Settle/convergence poll budget for [`e06_spawn_sleeps`]: 1000 polls at
+/// 5 ms (5 s). The per-child readiness loop and the global shape tail
+/// share one budget so a sibling descheduled after settling cannot time
+/// out the tail while the per-child window would still have waited.
+const E06_SETTLE_POLLS: usize = 1000;
+
 fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
     let guards: Vec<SystemScopeChildGuard> = (0..count)
         .map(|_| {
@@ -54577,7 +54605,7 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
         let wchan = format!("/proc/{pid}/wchan");
         let maps_path = format!("/proc/{pid}/maps");
         let mut settled = false;
-        for _ in 0..1000 {
+        for _ in 0..E06_SETTLE_POLLS {
             if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
                 let sleeping = std::fs::read_to_string(&wchan)
                     .ok()
@@ -54615,7 +54643,7 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
     // Global shape convergence: per-child settling can still leave siblings
     // on different snapshots (one settled while another was descheduled
     // mid-startup). Wait until every sibling maps the same provider shape.
-    for _ in 0..400 {
+    for _ in 0..E06_SETTLE_POLLS {
         let mut shapes: Vec<BTreeSet<ObjectKey>> = Vec::new();
         let mut converged = true;
         for guard in &guards {
@@ -54662,6 +54690,9 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
 /// when the maps carry a non-empty `.so` set with no `/etc/ld.so.cache`
 /// transient (mapped by `ld` during startup; its ".so" substring makes it a
 /// shape member whose singleton rarity-orders before the settled group).
+/// Assumes `sleep` is dynamically linked: a static binary mapping no
+/// `.so` at all never settles (`None` forever), failing loudly at the
+/// readiness assert rather than testing an unmapped path.
 fn e06_settled_shape(maps: &[MapEntry]) -> Option<BTreeSet<ObjectKey>> {
     if maps.iter().any(|mapping| {
         mapping.raw_path.as_ref().is_some_and(|path| {

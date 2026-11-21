@@ -22735,6 +22735,239 @@ fn key_operation_reseed_after_ordered_fallback_allows_same_proof() {
     assert_eq!(staging.mode(), FeedMode::Joint);
 }
 
+/// A reseeded segment that stages into stuck audits degrades back to
+/// S1 instead of wedging the lane: four consecutive stuck passes
+/// (within the streak gap) end the segment with a cooldown, so the
+/// commit lane never spends its re-arm bound on one reseed.
+#[test]
+fn key_operation_reseeded_segment_stuck_four_passes_degrades() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(staging.reselect_joint(&fresh), "the loss reseeds");
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    for (i, ns) in [0u64, 1_000_000_000, 2_000_000_000].into_iter().enumerate() {
+        assert!(
+            !staging.note_reseeded_stuck_pass(ns),
+            "streak {} keeps Joint",
+            i + 1
+        );
+        assert_eq!(staging.mode(), FeedMode::Joint);
+    }
+    assert!(
+        staging.note_reseeded_stuck_pass(3_000_000_000),
+        "the fourth consecutive stuck pass degrades"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert!(staging.degraded_loss());
+    assert!(!staging.reseed_eligible(), "cooling feeds queue nothing");
+}
+
+/// Scattered stuck passes (beyond the streak gap) never degrade a
+/// reseeded segment, and the twenty-pass cooldown ticks back to
+/// eligible exactly when served.
+#[test]
+fn key_operation_reseeded_segment_scattered_stuck_never_degrades() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(staging.reselect_joint(&fresh), "the loss reseeds");
+    for ns in [
+        0u64,
+        6_000_000_000,
+        12_000_000_000,
+        18_000_000_000,
+        24_000_000_000,
+    ] {
+        assert!(
+            !staging.note_reseeded_stuck_pass(ns),
+            "scattered stuck never degrades"
+        );
+    }
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    for i in 0..4u64 {
+        staging.note_reseeded_stuck_pass(30_000_000_000 + i * 1_000_000_000);
+    }
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert!(!staging.reseed_eligible());
+    for _ in 0..19 {
+        staging.tick_reseed_cooldown();
+    }
+    assert!(
+        !staging.reseed_eligible(),
+        "nineteen ticks do not serve the cooldown"
+    );
+    staging.tick_reseed_cooldown();
+    assert!(staging.reseed_eligible(), "the cooldown resumes next pass");
+}
+
+/// A pristine Joint feed (never reseeded) never degrades through the
+/// reseeded-segment path: the liveness backstop covers only reseed
+/// arms, never base behavior.
+#[test]
+fn key_operation_pristine_segment_stuck_never_degrades() {
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    for i in 0..10u64 {
+        assert!(
+            !staging.note_reseeded_stuck_pass(i * 1_000_000_000),
+            "pristine feeds never degrade here"
+        );
+    }
+    assert_eq!(staging.mode(), FeedMode::Joint);
+}
+
+/// The watchdog trip ends a reseeded segment: later stuck passes
+/// neither degrade nor clobber the watchdog window, and direct
+/// reductions still count under it.
+#[test]
+fn key_operation_reseeded_segment_watchdog_trip_unmarks() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(staging.reselect_joint(&fresh), "the loss reseeds");
+    assert!(staging.note_watchdog_trip());
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert!(staging.watchdog_tripped());
+    for i in 0..5u64 {
+        assert!(
+            !staging.note_reseeded_stuck_pass(i * 1_000_000_000),
+            "a watchdog-tripped feed never degrades here"
+        );
+    }
+    let unsealed = staging.watchdog_unsealed();
+    staging.note_direct_reduction("C_Sign");
+    assert_eq!(
+        staging.watchdog_unsealed(),
+        unsealed + 1,
+        "the watchdog window survives stuck passes"
+    );
+}
+
 /// A voided feed reseeds onto a fresh incarnation's domain too: the new
 /// receipt names a strictly newer incarnation of the same binding
 /// with a strictly newer cut at/above the fence, starting a new Joint
@@ -23740,6 +23973,98 @@ fn key_operation_second_birth_after_tainted_fallback_names_unresumable() {
             .iter()
             .any(|gap| gap.reason == "joint_birth_segment_unresumable"),
         "the refused birth names the unresumable segment"
+    );
+}
+
+/// Four consecutive stuck passes degrade a reseeded feed through the
+/// registry path: S1Only, `joint_feeds` back to 0, and one counted
+/// `joint_reentry_stuck_degraded` gap naming the caller.
+#[test]
+fn key_operation_reseeded_feed_stuck_four_passes_names_degraded() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "the void ends the feed degraded: {outcome:?}"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), fresh),
+        "a second birth installs for the voided instance"
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "the fresh receipt reseeds Joint"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+    for (i, ns) in [0u64, 1_000_000_000, 2_000_000_000].into_iter().enumerate() {
+        guarded.registry.note_reseeded_stuck_passes(&[joint_id], ns);
+        assert_eq!(
+            guarded.registry.feed_mode_for_test(joint_id),
+            Some(FeedMode::Joint),
+            "streak {} keeps Joint",
+            i + 1
+        );
+    }
+    guarded
+        .registry
+        .note_reseeded_stuck_passes(&[joint_id], 3_000_000_000);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the fourth consecutive stuck pass degrades"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .any(|gap| gap.reason == "joint_reentry_stuck_degraded"),
+        "the degrade names the stuck reseed"
     );
 }
 

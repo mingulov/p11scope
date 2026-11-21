@@ -8,6 +8,21 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* Page-edge interface name placement (interface 12): 1 maps the provider
+ * file itself so the name sits in a provider mapping; 0 keeps the
+ * historical anonymous page. Only the discovery version-matrix case sets
+ * this; every other build is unchanged. */
+#ifndef BOUNDARY_PROVIDER_MAP
+#define BOUNDARY_PROVIDER_MAP 0
+#endif
+#if BOUNDARY_PROVIDER_MAP
+/* _GNU_SOURCE arrives from the compiler command line (dladdr needs it
+ * before any system header); the flagged version-matrix build passes it. */
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#endif
+
 typedef unsigned char CK_BYTE;
 typedef unsigned long CK_ULONG;
 typedef unsigned long CK_RV;
@@ -169,8 +184,48 @@ static void make_short_legacy(void) {
 }
 
 #if !CAPACITY_UNIQUE
+#if BOUNDARY_PROVIDER_MAP
+/* Discovery refuses names outside the provider's own mappings, so the
+ * page-edge name lives in a private mapping of the provider file itself
+ * (located through dladdr), keeping the exact edge layout with an
+ * unmapped guard page. Returns 1 with boundary_name placed, 0 when the
+ * file cannot be remapped (deleted, unreachable). */
+static int try_provider_boundary_name(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    Dl_info info;
+    struct stat st;
+    int fd;
+    if (!dladdr((void *)try_provider_boundary_name, &info) || !info.dli_fname)
+        return 0;
+    fd = open(info.dli_fname, O_RDONLY);
+    if (fd < 0) return 0;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return 0;
+    }
+    size_t file_pages = ((size_t)st.st_size + (size_t)page - 1) / (size_t)page;
+    size_t map_len = (file_pages + 1) * (size_t)page;
+    unsigned char *file_region =
+        mmap(0, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (file_region == MAP_FAILED) return 0;
+    unsigned char *guard = file_region + file_pages * (size_t)page;
+    if (munmap(guard, (size_t)page) != 0) {
+        munmap(file_region, map_len);
+        return 0;
+    }
+    boundary_name = (char *)(guard - sizeof("PKCS 11"));
+    memcpy(boundary_name, "PKCS 11", sizeof("PKCS 11"));
+    return 1;
+}
+#endif
 static void make_boundary_name(void) {
     long page = sysconf(_SC_PAGESIZE);
+#if BOUNDARY_PROVIDER_MAP
+    /* A fallback keeps the fixture alive where the provider file is gone;
+     * the name is then refused like any other foreign mapping. */
+    if (try_provider_boundary_name()) return;
+#endif
     unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (region == MAP_FAILED) __builtin_trap();

@@ -140,6 +140,8 @@ fn standard_and_corroborated_interfaces_cover_every_published_boundary() {
             "-DLEGACY_MAJOR=2",
             "-DLEGACY_MINOR=40",
             "-DMATRIX_INTERFACES=1",
+            "-DBOUNDARY_PROVIDER_MAP=1",
+            "-D_GNU_SOURCE",
         ],
     );
     let manifest = discover(&provider).unwrap();

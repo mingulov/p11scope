@@ -3235,6 +3235,10 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
 /// module, pid) a per-receipt row shares with its summary.
 type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 
+/// One ranked ordinary gap group: (count, scope-only, first folded
+/// index).
+type OrdinaryGapGroup = (usize, bool, usize);
+
 /// First folded index over indexed rows (`usize::MAX` when empty; no
 /// emitted group is ever empty, so this only types the fold).
 fn first_folded_index(rows: &[(usize, &GapView)]) -> usize {
@@ -3312,8 +3316,9 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             ordinary.push((index, gap));
         }
     }
-    // Each ordinary group keeps (count, scope-only, first folded index).
-    let mut groups: std::collections::BTreeMap<(String, String), (usize, bool, usize)> =
+    // Each ordinary group keeps its count, scope flag and first
+    // folded index for the ceiling insertion.
+    let mut groups: std::collections::BTreeMap<(String, String), OrdinaryGapGroup> =
         std::collections::BTreeMap::new();
     // Deferred-attach fold: the stop-time summaries append while the
     // per-receipt rows stay, so concise groups each covered
@@ -3507,7 +3512,8 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     if groups.is_empty() && ceiling.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<((String, String), (usize, bool, usize))> = groups.into_iter().collect();
+    let mut ranked: Vec<((String, String), OrdinaryGapGroup)> =
+        groups.into_iter().collect();
     ranked.sort_by(|left, right| {
         // `Option` orders `None` below every `Some`, so a missing
         // rank maps to last place explicitly.

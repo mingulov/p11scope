@@ -2457,24 +2457,78 @@ mod tests {
         assert!(error.contains("non-readable"), "{error}");
     }
 
+    /// One out-of-provider pointer must publish nothing: the address
+    /// has to be readable (so the refusal comes from the provider-scope
+    /// check, not an earlier arm) and the refusal stays recorded.
+    fn assert_name_outside_provider_is_refused(
+        memory: &ProcessMemory,
+        index: &maps::MapIndex<'_>,
+        address: usize,
+        label: &str,
+    ) {
+        let containing = index.containing(address as u64).unwrap_or_else(|| {
+            panic!("{label}: the probe address must be mapped")
+        });
+        assert_eq!(
+            containing.permissions[0], b'r',
+            "{label}: the probe address must stay readable"
+        );
+        let name = read_name(memory, index, TEST_PROVIDER_KEY, address);
+        assert!(
+            name.raw.is_none(),
+            "{label}: out-of-provider bytes were published: {name:?}"
+        );
+        let error = name.error.as_deref().unwrap_or_else(|| {
+            panic!("{label}: an out-of-provider pointer needs a recorded refusal: {name:?}")
+        });
+        assert!(error.contains("provider mappings"), "{label}: {error}");
+    }
+
     #[test]
     fn interface_name_outside_provider_mappings_is_refused() {
         let memory = ProcessMemory::open().unwrap();
+        let entries = read_self_maps().unwrap();
+        let index = validated_map_index(&entries).unwrap();
         // A hostile provider can point pInterfaceName at any readable
-        // mapping; the stack buffer below stands in for environment
-        // memory (the helper retains its environment). Readable with an
-        // in-mapping NUL is not enough: only provider bytes may publish.
-        let stack_name = b"HOSTILE_STACK_NAME\0";
-        let name = read_name_at(&memory, TEST_PROVIDER_KEY, stack_name.as_ptr() as usize);
-        assert!(
-            name.raw.is_none(),
-            "out-of-provider bytes were published: {name:?}"
+        // mapping; readable with an in-mapping NUL is not enough: only
+        // provider bytes may publish. Each buffer below pins a different
+        // refusal arm while staying live, readable and NUL-terminated.
+        // The .rodata literal is file-backed with the wrong key: the
+        // foreign-File arm.
+        let rodata_name = b"HOSTILE_RODATA_NAME\0";
+        let rodata_addr = rodata_name.as_ptr() as usize;
+        let file_key = match index.resolve(rodata_addr as u64) {
+            maps::Resolved::File { device, inode, .. } => ObjectKey { device, inode },
+            resolved => panic!("the literal must stay file-backed: {resolved:?}"),
+        };
+        assert_ne!(
+            file_key, TEST_PROVIDER_KEY,
+            "the literal must keep the wrong key"
         );
-        let error = name
-            .error
-            .as_deref()
-            .expect("an out-of-provider pointer needs a recorded refusal: {name:?}");
-        assert!(error.contains("provider mappings"), "{error}");
+        assert_name_outside_provider_is_refused(&memory, &index, rodata_addr, "rodata");
+        // Real heap and stack buffers are Anonymous mappings: the
+        // stack/environment arm, where heap and environment secrets live
+        // (the helper retains its environment).
+        let heap_name: Box<[u8]> = b"HOSTILE_HEAP_NAME\0".to_vec().into_boxed_slice();
+        let heap_addr = heap_name.as_ptr() as usize;
+        assert!(
+            matches!(
+                index.resolve(heap_addr as u64),
+                maps::Resolved::Anonymous
+            ),
+            "the heap buffer must stay anonymous"
+        );
+        assert_name_outside_provider_is_refused(&memory, &index, heap_addr, "heap");
+        let stack_name = *b"HOSTILE_STACK_NAME\0";
+        let stack_addr = stack_name.as_ptr() as usize;
+        assert!(
+            matches!(
+                index.resolve(stack_addr as u64),
+                maps::Resolved::Anonymous
+            ),
+            "the stack buffer must stay anonymous"
+        );
+        assert_name_outside_provider_is_refused(&memory, &index, stack_addr, "stack");
     }
 
     /// A real address-bearing header failure, proving the probes below

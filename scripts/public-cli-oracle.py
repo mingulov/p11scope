@@ -945,7 +945,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                   observation.get("causes") == ["skipped"] and
                   evidence.get("skipped") == [{"name": "discovery subject",
                                                "reason": "discovery unavailable"}])
-        require(ok_exact or ok_gap or ok_ambient,
+        require(ok_exact or ok_gap or ok_ambient or ok_exit_ambient,
                 "lossy or unknown observation gap class")
     elif scope in ("system", "cgroup"):
         gap_detail = "lossy or unknown observation gap class"
@@ -1073,11 +1073,14 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         gaps = evidence.get("pid_descendant_gaps", 0)
         skips = sum(1 for skip in evidence.get("skipped", [])
                     if skip == DISCLOSABLE_DISCOVERY_SKIP)
-        if cell == "mt-system" or skips > 0:
-            noise = f"pid_descendant_gaps={gaps}; discovery_skips={skips}"
+        exits = sum(1 for skip in evidence.get("skipped", [])
+                    if skip == EXIT_MID_FLIGHT_SKIP)
+        if cell == "mt-system" or skips > 0 or exits > 0:
+            noise = (f"pid_descendant_gaps={gaps}; discovery_skips={skips}; "
+                     f"mid_flight_exits={exits}")
         else:
             noise = f"pid_descendant_gaps={gaps}"
-        if gaps > 0 or skips > 0:
+        if gaps > 0 or skips > 0 or exits > 0:
             return "owned-provider-counts-with-runner-noise", (
                 "owned physical-provider counts match independent successful ledger; "
                 f"disclosed runner noise: {noise}; "
@@ -1086,7 +1089,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
             "owned physical-provider counts match independent successful ledger; "
             f"disclosed runner noise: {noise}; "
             "per-caller attribution is not established")
-    if gap66 and observation.get("causes") == ["skipped"]:
+    if (gap66 and observation.get("causes") == ["skipped"]
+            and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]):
         return "owned-provider-counts-with-66-discovery-gap", (
             "owned physical-provider counts match independent successful ledger; "
             "disclosed 6.6 discovery gap: discovery subject/discovery unavailable; "

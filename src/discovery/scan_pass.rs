@@ -128,7 +128,7 @@ pub(crate) struct DecodeCursorKey {
 /// the documented staleness bound (same class as the long-standing
 /// cross-pass export-fact cache; runtime-built tables outside file-backed
 /// data were already out of the memory scan's reach).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct MappingFingerprintEntry {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -143,6 +143,54 @@ pub(crate) struct MappingFingerprintEntry {
 pub(crate) struct SweepFrontier {
     pub(crate) snapshot: usize,
     pub(crate) word: u64,
+}
+
+/// Committed per-cursor progress for the snapshot resume decision: the
+/// layout the frontiers were recorded under, both sweep frontiers, the
+/// decoded-table count and completion. Same cursor key plus same layout
+/// is the same work; anything else is churn, never progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommittedCursorProgress {
+    /// Hash of the cursor's mapping fingerprint: the layout this
+    /// progress was recorded under. A remap changes it, so frontiers
+    /// from a shifted layout never compare as advance.
+    pub(crate) layout: u64,
+    /// Table-sweep frontier.
+    pub(crate) tables: SweepFrontier,
+    /// Interface-sweep frontier.
+    pub(crate) interfaces: SweepFrontier,
+    /// Cached tables decoded so far.
+    pub(crate) tables_decoded: usize,
+    /// Both sweeps finished.
+    pub(crate) complete: bool,
+}
+
+impl CommittedCursorProgress {
+    /// Summarize one carried cursor's committed progress.
+    pub(crate) fn of(cursor: &DecodeCursor) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cursor.fingerprint.hash(&mut hasher);
+        Self {
+            layout: hasher.finish(),
+            tables: cursor.tables,
+            interfaces: cursor.interfaces,
+            tables_decoded: cursor.cached_tables.len(),
+            complete: cursor.complete,
+        }
+    }
+
+    /// Lexicographic sweep position: table snapshot and word, then
+    /// interface snapshot and word. A strict increase on the same
+    /// cursor and layout is intra-object progress.
+    pub(crate) fn sweep_position(&self) -> (usize, u64, usize, u64) {
+        (
+            self.tables.snapshot,
+            self.tables.word,
+            self.interfaces.snapshot,
+            self.interfaces.word,
+        )
+    }
 }
 
 /// Resumable decode progress for one object: how far the table and

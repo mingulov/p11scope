@@ -1014,14 +1014,18 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_exit_ambient_passes_on_system_in_strict_mode(self):
-        # Exit-ambient lane 2026-11-21 (v0.8.0 flakes): a host with
-        # ambient short-lived exits discloses each as a mid-flight
-        # discovery skip plus coincidental deferrals. Strict system
-        # scope accepts the mixed finite-reason shape with exact owned
-        # counts; any other reason, cause or gap still fails. Shape
+    def test_exit_ambient_with_deferral_mix_fails_in_strict_mode(self):
+        # Exit-ambient lane 2026-11-21 (v0.8.0 flakes), narrowed: a
+        # named exit covers only exit rows. The generic
+        # discovery-unavailable row also projects dropped inventory
+        # passes and held-back admissions (src/render.rs
+        # capture_skipped_out, pinned by
+        # render::dropped_pass_gaps_project_to_a_schema_reason), which
+        # are indistinguishable from tick-quantum deferrals at the
+        # public boundary — so any generic companion to an exit row
+        # stays red even with exact owned counts and zero loss. Shape
         # mirrors the local counter-counts-system reproduction (lossy
-        # [skipped], 3 exits + 2 deferrals, all functions exact).
+        # [skipped], 3 exits + 2 generics, all functions exact).
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "process exited mid-flight"},
@@ -1033,11 +1037,9 @@ class RunnerNoiseTests(unittest.TestCase):
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case(mutate, cell="system")
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=3", result["detail"])
-        self.assertIn("discovery_skips=2", result["detail"])
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_exit_ambient_with_single_exit_passes_on_system_in_strict_mode(self):
         # The narrow single-transient shape: one ambient exit, no
@@ -1106,12 +1108,14 @@ class RunnerNoiseTests(unittest.TestCase):
                       result["detail"])
 
     def test_exit_ambient_with_count_mismatch_fails_in_strict_mode(self):
-        # The exit arm never waives exact owned counts: mixed
-        # exit/deferral skips with a 499/500 deficit still fail strict.
+        # The exit arm never waives exact owned counts: exit-only
+        # skips with a 499/500 deficit still fail strict at the count
+        # gate (the shape must first pass the gap gate, which also
+        # pins multi-exit-only acceptance there).
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
             ]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
@@ -1120,12 +1124,12 @@ class RunnerNoiseTests(unittest.TestCase):
         result = self.run_case(mutate, cell="system", want=1)
         self.assertIn("owned target count differs", result["detail"])
 
-    def test_exit_ambient_passes_on_system_when_allowed(self):
-        # Relaxed disclosure twin of the strict mixed pass: the hosted
-        # host leg runs `system` with --allow-pid-descendant-gaps, so
-        # an accepted exit/deferral mix must keep the runner-noise
-        # qualification and name both row counts in its detail. An
-        # undisclosed exit row (missing mid_flight_exits) fails here.
+    def test_exit_ambient_with_deferral_mix_fails_when_allowed(self):
+        # Relaxed twin of the strict mixed rejection: the hosted host
+        # leg runs `system` with --allow-pid-descendant-gaps, but the
+        # flag discloses runner noise, never an unrelated generic
+        # discovery row beside a named exit — the mixed shape stays
+        # red at the gap gate in relaxed mode too.
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "process exited mid-flight"},
@@ -1138,11 +1142,9 @@ class RunnerNoiseTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="system",
-                               allow_pid_descendant_gaps=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-runner-noise")
-        self.assertIn("mid_flight_exits=3", result["detail"])
-        self.assertIn("discovery_skips=2", result["detail"])
+                               allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_exit_ambient_with_single_exit_passes_on_system_when_allowed(self):
         # Relaxed disclosure twin of the strict single-exit pass: a
@@ -1161,6 +1163,119 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertEqual(result["qualification"],
                          "owned-provider-counts-with-runner-noise")
         self.assertIn("mid_flight_exits=1", result["detail"])
+
+    def test_exit_ambient_with_multi_exit_passes_on_system_in_strict_mode(self):
+        # The narrowed arm still accepts any non-empty all-exit list:
+        # every row names the same finite mid-flight cause, exact
+        # counts and zero loss backstop it, and the detail discloses
+        # the exit count with zero generic skips.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-exit-ambient-gap")
+        self.assertIn("mid_flight_exits=3", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_exit_ambient_with_multi_exit_passes_on_system_when_allowed(self):
+        # Relaxed twin of the multi-exit pass: an all-exit list under
+        # the flag keeps the runner-noise qualification and names the
+        # exit count in its detail.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system",
+                               allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("mid_flight_exits=3", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_exit_ambient_with_single_exit_passes_on_cgroup_in_strict_mode(self):
+        # The exit arm covers cgroup scope exactly like system scope:
+        # a lone named exit on profile-cgroup qualifies strict with
+        # the exit-ambient label and a counted disclosure.
+        def mutate(d, l, r):
+            d["capture"]["scope"] = "cgroup"
+            r["scope"] = "cgroup"
+            d["evidence"]["attach_backend"]["scope_filter"] = None
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="profile-cgroup")
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-exit-ambient-gap")
+        self.assertIn("mid_flight_exits=1", result["detail"])
+
+    def test_exit_ambient_with_deferral_mix_fails_on_cgroup_in_strict_mode(self):
+        # Cgroup twin of the strict mixed rejection: a named exit
+        # beside a generic discovery row on profile-cgroup stays red
+        # at the gap gate, exactly like the system-scope mix.
+        def mutate(d, l, r):
+            d["capture"]["scope"] = "cgroup"
+            r["scope"] = "cgroup"
+            d["evidence"]["attach_backend"]["scope_filter"] = None
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="profile-cgroup", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_exit_ambient_with_other_reason_fails_on_system_when_allowed(self):
+        # Relaxed twin of the strict other-reason rejection: the exit
+        # arm names exactly the finite exit reason, so a mid-flight
+        # exit bundled with any other skip reason still fails relaxed.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "something else"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system",
+                               allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_exit_ambient_with_other_class_fails_on_system_when_allowed(self):
+        # Relaxed twin of the strict other-class rejection: an exit
+        # skip bundled with a descendant gap still fails relaxed (the
+        # relaxed gap cause never joins a skip row outside the ruled
+        # mt-system family).
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system",
+                               allow_pid_descendant_gaps=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_loader_quiet_passes_on_mt_system_in_strict_mode(self):
         # K1 (v0.8.0 integration): a short-lived workload view recorded
@@ -1615,6 +1730,52 @@ class RunnerNoiseTests(unittest.TestCase):
             d["functions"][0]["calls"] = 39
         result = self.run_case_mt_system(mutate, want=1)
         self.assertIn("owned target count differs", result["detail"])
+
+    def test_coverage_retired_exit_with_partial_slots_fails(self):
+        # The exit composition pins the full 68-slot provider cover
+        # exactly like the lone-R1 arm: the same healthy ledger and
+        # receipt with slots 67 stays a new shape and still fails at
+        # the gap gate, strict and relaxed alike.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 67
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True,
+                                         want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_coverage_retired_exit_with_gap_fails(self):
+        # A further descendant gap on top of the exit composition
+        # stays a new shape and still fails, strict and relaxed alike.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "coverage_retired_slots", "pid_descendant_gaps"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True,
+                                         want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_loader_quiet_passes_on_system_in_strict_mode(self):
         # The loader-quiet cell disjunct covers system too: the same

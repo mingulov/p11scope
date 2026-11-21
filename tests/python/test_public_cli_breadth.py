@@ -713,11 +713,11 @@ class SelectEndpoint66GapTests(unittest.TestCase):
                                allow_66_discovery_gap=True)
         self.assertEqual(result["qualification"], "owned-provider-counts")
 
-    def test_exit_ambient_passes_with_exit_qualification_when_allowed(self):
-        # The 6.6 flag must not be stricter than strict for other
-        # already-ruled shapes: an exit/deferral mix on
-        # select-endpoint-system qualifies with the exit-ambient
-        # label (not the 66-transient label), naming both row counts.
+    def test_exit_ambient_with_deferral_mix_fails_with_66_flag(self):
+        # The narrowed exit arm rejects a generic companion on the 6.6
+        # leg too: an exit/deferral mix on select-endpoint-system with
+        # the 66 flag stays red at the gap gate (it is neither the
+        # single-generic 66 transient nor the all-exit shape).
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "process exited mid-flight"},
@@ -728,11 +728,29 @@ class SelectEndpoint66GapTests(unittest.TestCase):
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_exit_ambient_with_exit_only_passes_with_66_flag(self):
+        # The 6.6 flag must not be stricter than strict for other
+        # already-ruled shapes: an all-exit list on
+        # select-endpoint-system qualifies with the exit-ambient
+        # label (not the 66-transient label), naming the exit count.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="select-endpoint-system",
                                allow_66_discovery_gap=True)
         self.assertEqual(result["qualification"],
                          "owned-provider-counts-with-exit-ambient-gap")
         self.assertIn("mid_flight_exits=2", result["detail"])
-        self.assertIn("discovery_skips=1", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
 
 
 PROVIDER = r'''
@@ -1708,13 +1726,13 @@ class SystemAmbientGapTests(unittest.TestCase):
         self.assertIn("pid_descendant_gaps=0", result["detail"])
         self.assertIn("discovery_skips=1", result["detail"])
 
-    def test_exit_ambient_passes_strict_counter_counts_system(self):
-        # Exit-ambient lane 2026-11-21 (v0.8.0 flakes): the real CI
-        # cell counter-counts-system shows the mixed exit/deferral
-        # shape (lossy [skipped], exact owned counts, no gaps key in
-        # metrics evidence). Strict system scope accepts it with the
-        # exit-ambient label, naming both row counts. Shape mirrors
-        # the local 3-exit+2-deferral reproduction.
+    def test_exit_ambient_with_deferral_mix_fails_strict_counter_counts_system(self):
+        # Exit-ambient lane 2026-11-21 (v0.8.0 flakes), narrowed: the
+        # real CI cell counter-counts-system must reject a generic
+        # companion beside named exits (lossy [skipped], exact owned
+        # counts, no gaps key in metrics evidence). Strict system
+        # scope keeps the mixed shape red at the gap gate. Shape
+        # mirrors the local 3-exit+2-generic reproduction.
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "process exited mid-flight"},
@@ -1726,11 +1744,28 @@ class SystemAmbientGapTests(unittest.TestCase):
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="counter-counts-system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_exit_ambient_with_exit_only_passes_strict_counter_counts_system(self):
+        # The narrowed arm still accepts an all-exit list on the real
+        # CI metrics cell with the exit-ambient label, naming the
+        # exit count and zero generic skips.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="counter-counts-system")
         self.assertEqual(result["qualification"],
                          "owned-provider-counts-with-exit-ambient-gap")
         self.assertIn("mid_flight_exits=3", result["detail"])
-        self.assertIn("discovery_skips=2", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
 
     def test_quiet_lone_skip_passes_strict_metrics_cgroup(self):
         # Ambient-skip lane 2026-11-10: the quiet 6.18 vng leg shows

@@ -2468,9 +2468,9 @@ mod tests {
         address: usize,
         label: &str,
     ) {
-        let containing = index.containing(address as u64).unwrap_or_else(|| {
-            panic!("{label}: the probe address must be mapped")
-        });
+        let containing = index
+            .containing(address as u64)
+            .unwrap_or_else(|| panic!("{label}: the probe address must be mapped"));
         assert_eq!(
             containing.permissions[0], b'r',
             "{label}: the probe address must stay readable"
@@ -2514,20 +2514,14 @@ mod tests {
         let heap_name: Box<[u8]> = b"HOSTILE_HEAP_NAME\0".to_vec().into_boxed_slice();
         let heap_addr = heap_name.as_ptr() as usize;
         assert!(
-            matches!(
-                index.resolve(heap_addr as u64),
-                maps::Resolved::Anonymous
-            ),
+            matches!(index.resolve(heap_addr as u64), maps::Resolved::Anonymous),
             "the heap buffer must stay anonymous"
         );
         assert_name_outside_provider_is_refused(&memory, &index, heap_addr, "heap");
         let stack_name = *b"HOSTILE_STACK_NAME\0";
         let stack_addr = stack_name.as_ptr() as usize;
         assert!(
-            matches!(
-                index.resolve(stack_addr as u64),
-                maps::Resolved::Anonymous
-            ),
+            matches!(index.resolve(stack_addr as u64), maps::Resolved::Anonymous),
             "the stack buffer must stay anonymous"
         );
         assert_name_outside_provider_is_refused(&memory, &index, stack_addr, "stack");

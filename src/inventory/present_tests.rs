@@ -7456,36 +7456,53 @@ fn provider_line_with_two_docker_containers_reads_multiple_origins() {
 
 /// Repeated scan-ceiling stops fold into one named counted row in
 /// text (exact total, nothing hidden) while JSON keeps every
-/// record: thirty per-caller ceiling trips render as a single
+/// record: thirty per-pid ceiling trips — bare and wrapped wordings,
+/// which the registry cannot merge — render as a single
 /// `scan budget exhausted` line with the summed count, and an
-/// unrelated row still renders on its own line.
+/// unrelated row still renders on its own line. Driven through the
+/// real registry-to-presentation path, like the slow-host shape.
 #[test]
 fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
-    let harness = varied_harness();
-    let document = harness.render();
-    let mut presentation = capture_for(&harness, &document);
-    let mut gaps = Vec::new();
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    let (mut harness, _caller) = single_caller_harness("present-ceiling-fold", 1);
+    let wordings = [
+        WORK_CEILING_REASON.to_string(),
+        format!("memory scan refused: final mapping validation unavailable: {WORK_CEILING_REASON}"),
+        format!("memory scan refused: process generation changed during acquisition: {WORK_CEILING_REASON}"),
+    ];
     for index in 0u32..30 {
-        gaps.push(GapView {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(1000 + index),
+                subject: "capture discovery".into(),
+                reason: wordings[index as usize % wordings.len()].clone(),
+                budget: None,
+            });
+    }
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
             caller: None,
             module: None,
-            pid: Some(1000 + index),
-            subject: "capture discovery".into(),
-            reason: "scan budget exhausted".into(),
+            pid: None,
+            subject: "exact image authority unavailable".into(),
+            reason: "no BPF image identity".into(),
             budget: None,
-            repeats: 1,
         });
-    }
-    gaps.push(GapView {
-        caller: None,
-        module: None,
-        pid: None,
-        subject: "exact image authority unavailable".into(),
-        reason: "no BPF image identity".into(),
-        budget: None,
-        repeats: 1,
-    });
-    presentation.gaps = gaps;
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(
+        presentation.gaps.len(),
+        31,
+        "every trip projects its own row: {:?}",
+        presentation.gaps.len()
+    );
     let snapshot = render_snapshot(&presentation);
     let folded: Vec<&str> = snapshot
         .lines()
@@ -7503,7 +7520,13 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
     let out = crate::inventory::render_json_from_presentation(&presentation);
     let kept = out["gaps"].as_array().unwrap();
     assert_eq!(kept.len(), 31, "JSON keeps every record: {kept:?}");
-    assert_eq!(kept.iter().filter(|gap| gap["reason"] == "scan budget exhausted").count(), 30);
+    assert_eq!(
+        kept.iter()
+            .filter(|gap| gap["reason"] == "scan budget exhausted")
+            .count(),
+        30,
+        "every ceiling trip keeps its renamed record: {kept:?}"
+    );
 }
 
 /// The ceiling fold maps the exact internal wordings only: the bare

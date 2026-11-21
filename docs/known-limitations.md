@@ -227,10 +227,14 @@ Private_Dirty + SwapPss 33.6 → 42.5 MiB (+2.56 MiB/h incl. swap, swap
 itself 0 throughout; VmRSS +2.30 MiB/h), retained callers flat at 174
 with 454 retirements recycled and 0 refusals. That churn carried no
 attributed calls (`folded 0`), so fold-driven recycling is evidenced
-by the lifetime twin and fold cells, not by that plateau. The remaining slope is
-accounted saturating structures (unbound-image census +1.03 MiB/h
-toward its cap, ever-enumerated set +0.18 MiB/h), not caller or edge
-retention, which stay flat. A 5000-exited-callers-with-calls lifetime
+by the lifetime twin and fold cells, not by that plateau. Follow-up
+bounding folds the remaining per-pass growers the same way: the
+run-wide unbound-image census keeps a 512-image recent window with
+exact per-exe aggregates, enumeration memory keeps the latest pass,
+and pair tombstones drain past two prune graces — all with exact
+totals — so the soak slope flattens past warm-up instead of climbing
+toward the caps (which stay as backstops). Caller and edge retention
+stay flat throughout. A 5000-exited-callers-with-calls lifetime
 twin holds 0 refusals with a flat census past the budget.
 
 ### Short-lived processes never scanned
@@ -2861,16 +2865,22 @@ The old bounds are measurements, not a product startup SLA.
   tombstones the row is folded into the same aggregate and counted once
   in `budgets.native_departed.pair_prune_overflow`: no base is forgotten
   silently and the map does not grow; only exact per-pair revival is
-  lost, and the published overflow count says so. `pair_dropped_rows`
+  lost, and the published overflow count says so. Tombstones past the
+  keep window (two prune graces past pruning) drain by age on the same
+  pass with the same counting, so the tombstone map stays flat under
+  churn instead of living until domain stop. `pair_dropped_rows`
   and `pair_dropped_base` publish the exact aggregate. Every other
   per-pid or per-image structure is hard-capped and its saturation is
   published: the run-wide unidentified caller-image set (16,384;
   `unbound_images_saturated` with `unidentified_pids_dropped`), the
   per-module image sets (4,096; `images_saturated` with `pids_dropped`),
   and the enumeration memory (65,536 tasks, with the documented
-  stop-time over-report when a live task is evicted). Under sustained
-  churn those caps bind within hours; afterwards the same memory is
-  reused, so no per-ever structure grows without a bound.
+  stop-time over-report when a live task is evicted). Per-pass folding
+  keeps the run-wide structures flat well below those caps instead:
+  unbound images fold past a 512-image window into exact per-exe
+  aggregates, enumeration memory keeps the latest pass, and pair
+  tombstones drain by age — all with exact totals and the caps as
+  backstops — so no per-ever structure grows without a bound.
 
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 

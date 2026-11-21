@@ -1155,7 +1155,8 @@ Additive budgets are:
   aggregate of dropped witness-pair rows whose base passed the 180 s grace
   and left `pair_targets`, and of their absolute counted bases (folded per
   domain and object class). `pair_prune_overflow` counts the rows folded
-  into that aggregate past the exact per-pair revival-tombstone bound; each
+  into that aggregate past the exact per-pair revival-tombstone bound or
+  past its keep window (two prune graces past pruning); each
   row is counted once, its base is still in the aggregate, and only exact
   per-pair revival is lost: a later revival starts from zero, so its new
   absolute is staged as growth rather than rebased past the folded base

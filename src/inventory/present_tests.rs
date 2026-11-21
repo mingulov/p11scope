@@ -7576,3 +7576,183 @@ fn ceiling_fold_maps_exact_wordings_only() {
     );
     assert_eq!(fold_scan_ceiling_reason("some unrelated reason"), None);
 }
+
+/// The ceiling projection reads only the scan's own budget-stop
+/// wordings: a completed no-table diagnosis whose module path happens
+/// to carry the ceiling sentence keeps its real reason (and its
+/// discovery advice) on every surface, while the genuine bare and
+/// wrapped stops beside it still fold. Driven registry to JSON.
+#[test]
+fn ceiling_projection_keeps_a_no_table_diagnosis_whose_path_quotes_the_ceiling() {
+    use crate::discovery::scan::{WORK_CEILING_REASON, no_table_found_reason};
+    let poisoned = format!("/opt/{WORK_CEILING_REASON}/libtoken.so");
+    let diagnosis = no_table_found_reason(&poisoned, false);
+    assert_eq!(
+        fold_scan_ceiling_reason(&diagnosis),
+        None,
+        "a diagnosis quoting the sentence in its path is not a budget stop"
+    );
+    let (mut harness, _caller) = single_caller_harness("present-ceiling-provenance", 1);
+    let rows = [
+        (Some(41), poisoned.clone(), diagnosis.clone()),
+        (
+            Some(42),
+            "capture discovery".to_string(),
+            WORK_CEILING_REASON.to_string(),
+        ),
+        (
+            Some(43),
+            "capture discovery".to_string(),
+            format!(
+                "memory scan refused: final mapping validation unavailable: {WORK_CEILING_REASON}"
+            ),
+        ),
+    ];
+    for (pid, subject, reason) in &rows {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: *pid,
+                subject: subject.clone(),
+                reason: reason.clone(),
+                budget: None,
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let diagnosed: Vec<&GapView> = presentation
+        .gaps
+        .iter()
+        .filter(|gap| gap.pid == Some(41))
+        .collect();
+    assert_eq!(diagnosed.len(), 1, "the diagnosis keeps its own row");
+    assert_eq!(
+        diagnosed[0].reason, diagnosis,
+        "the diagnosis keeps its exact reason and advice"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let reasons: Vec<&str> = out["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|gap| gap["reason"].as_str())
+        .collect();
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|reason| **reason == "scan budget exhausted")
+            .count(),
+        2,
+        "the genuine bare and wrapped stops fold: {reasons:?}"
+    );
+    assert!(
+        reasons.contains(&diagnosis.as_str()),
+        "JSON keeps the diagnosis verbatim: {reasons:?}"
+    );
+}
+
+/// Both snapshot text surfaces state the ceiling family's exact event
+/// total: rows that each repeat sum their repeats (concise and
+/// verbose agree), verbose places the folded line at the family's
+/// first row ahead of later unrelated rows, and a lone event renders
+/// bare on both. JSON keeps each record with its own repeats.
+#[test]
+fn snapshot_text_states_the_exact_ceiling_event_total() {
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    let record = |harness: &mut Harness, pid: u32, subject: &str, reason: &str| {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(pid),
+                subject: subject.into(),
+                reason: reason.into(),
+                budget: None,
+            });
+    };
+    let wrapped = format!(
+        "memory scan refused: process generation changed during acquisition: {WORK_CEILING_REASON}"
+    );
+    let (mut harness, _caller) = single_caller_harness("present-ceiling-totals", 1);
+    for _ in 0..3 {
+        record(&mut harness, 1001, "capture discovery", WORK_CEILING_REASON);
+    }
+    record(
+        &mut harness,
+        1002,
+        "exact image authority unavailable",
+        "no BPF image identity",
+    );
+    for _ in 0..2 {
+        record(&mut harness, 1003, "capture discovery", &wrapped);
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let concise = render_snapshot(&presentation);
+    let concise_folded: Vec<&str> = concise
+        .lines()
+        .filter(|line| line.contains("scan budget exhausted"))
+        .collect();
+    assert_eq!(
+        concise_folded,
+        ["  5 x capture discovery - scan budget exhausted"],
+        "concise states the summed event total: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let folded_at = verbose
+        .find("gap [capture discovery] scan budget exhausted (5 times)")
+        .unwrap_or_else(|| panic!("verbose states the summed event total: {verbose}"));
+    let unrelated_at = verbose
+        .find("no BPF image identity")
+        .expect("the unrelated row renders");
+    assert!(
+        folded_at < unrelated_at,
+        "the folded line stands at the family's first row: {verbose}"
+    );
+    assert_eq!(
+        verbose.matches("scan budget exhausted").count(),
+        1,
+        "the family folds into one line: {verbose}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let mut repeats: Vec<u64> = out["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|gap| gap["reason"] == "scan budget exhausted")
+        .map(|gap| gap["repeats"].as_u64().unwrap())
+        .collect();
+    repeats.sort_unstable();
+    assert_eq!(
+        repeats,
+        vec![2, 3],
+        "JSON keeps each record and its repeats"
+    );
+
+    let (mut lone, _caller) = single_caller_harness("present-ceiling-lone", 1);
+    record(&mut lone, 1001, "capture discovery", WORK_CEILING_REASON);
+    lone.commit();
+    let document = lone.render();
+    let presentation = capture_for(&lone, &document);
+    let concise = render_snapshot(&presentation);
+    assert!(
+        concise
+            .lines()
+            .any(|line| line == "  capture discovery - scan budget exhausted"),
+        "a lone event renders bare in concise text: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose
+            .lines()
+            .any(|line| line == "gap [capture discovery] scan budget exhausted"),
+        "a lone event renders bare in verbose text: {verbose}"
+    );
+}

@@ -17104,9 +17104,24 @@ mod tests {
     /// a work-ceiling (or I/O, deadline, clock, table/interface
     /// window) wait never defers a scan whole. A future `Wait`
     /// cause that should defer whole must file under the wait
-    /// subject too — this table fails until it does.
+    /// subject too. The exhaustive match below stops compiling when a
+    /// cause is added, so the table cannot silently miss one.
     #[test]
     fn wait_causes_split_the_wait_subject_by_handle_class() {
+        const fn tabled(cause: WaitCause) {
+            match cause {
+                WaitCause::HandleExhaustion
+                | WaitCause::ReserveStop
+                | WaitCause::BudgetStop
+                | WaitCause::IoCeiling
+                | WaitCause::WorkCeiling
+                | WaitCause::Deadline
+                | WaitCause::ClockUnavailable
+                | WaitCause::TableWindowCeiling
+                | WaitCause::InterfaceWindowCeiling => {}
+            }
+        }
+        tabled(WaitCause::WorkCeiling);
         let key = ObjectKey {
             device: Device { major: 8, minor: 1 },
             inode: INODE,

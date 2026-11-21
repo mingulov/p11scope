@@ -193,6 +193,138 @@ pub(crate) struct DecodeCursor {
     pub(crate) seq: u64,
 }
 
+/// How far one object's decode got, ordered lexicographically:
+/// completion first, then the table and interface sweep frontiers,
+/// then the rows cached so far. Every component is bounded by the
+/// object's own layout (mapping count, mapping words, decodable
+/// rows), so for one cursor identity a strictly increasing sequence
+/// of ranks is finite.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CursorRank {
+    complete: bool,
+    tables: (usize, u64),
+    interfaces: (usize, u64),
+    cached_tables: usize,
+    cached_interfaces: usize,
+}
+
+impl DecodeCursor {
+    /// This cursor's position in the snapshot resume order.
+    pub(crate) fn rank(&self) -> CursorRank {
+        CursorRank {
+            complete: self.complete,
+            tables: (self.tables.snapshot, self.tables.word),
+            interfaces: (self.interfaces.snapshot, self.interfaces.word),
+            cached_tables: self.cached_tables.len(),
+            cached_interfaces: self.cached_interfaces.len(),
+        }
+    }
+}
+
+/// What the snapshot driver may run after one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeGrant {
+    /// Nothing further: the snapshot keeps the passes it ran.
+    Stop,
+    /// Unfinished decode work advanced: resume it on a fresh allowance.
+    Continue,
+    /// The scan converged with no bind budget left: one settle pass
+    /// re-emits the decode at ~zero work so the bind runs.
+    Settle,
+}
+
+/// The snapshot's resume ledger: the best rank every cursor identity
+/// (process generation, file pin, image) reached during this
+/// snapshot, plus the snapshot's one settle grant. A pass advances
+/// only when some identity strictly passes its own best, so a cursor
+/// that was evicted, unmapped, invalidated or restarted behind its old
+/// frontier never counts as progress again, and two positions cannot
+/// alternate forever. Identities first seen after pass zero count only
+/// when they did real decode work and their process generation was
+/// born by the snapshot's start: a process born later never extends
+/// the snapshot. The identity set is therefore finite and every
+/// identity's rank lives in a bounded order, so the snapshot ends
+/// without any pass-count gate; work left unfinished stays named by
+/// the live in-progress gap.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotResumeLedger {
+    best: BTreeMap<DecodeCursorKey, (CursorRank, bool)>,
+    born_by_ticks: Option<u64>,
+    passes: u64,
+    settle_spent: bool,
+}
+
+impl SnapshotResumeLedger {
+    /// A ledger for a snapshot that starts now. `born_by_ticks` is the
+    /// snapshot start in `/proc` start-time ticks; `None` (unreadable
+    /// clock) admits no identity first seen after pass zero.
+    pub(crate) fn new(born_by_ticks: Option<u64>) -> Self {
+        Self {
+            best: BTreeMap::new(),
+            born_by_ticks,
+            passes: 0,
+            settle_spent: false,
+        }
+    }
+
+    /// The snapshot start read from the process start-time clock.
+    pub(crate) fn starting_now() -> Self {
+        let born_by_ticks = super::pause::boot_ns().map(|ns| ns / super::pause::clock_tick_ns());
+        Self::new(born_by_ticks)
+    }
+
+    /// Record one pass and decide what may follow it. `work_stop` is
+    /// whether the pass's transaction stopped on the shared work
+    /// allowance (the only outcome that resumes); `unfinished` whether
+    /// any cursor is still unfinished; `frontier` every carried
+    /// cursor's identity and rank. Every pass is recorded, whatever
+    /// the grant, so a later pass compares against the whole snapshot.
+    pub(crate) fn grant(
+        &mut self,
+        work_stop: bool,
+        unfinished: bool,
+        frontier: &[(DecodeCursorKey, CursorRank)],
+    ) -> ResumeGrant {
+        let first_pass = self.passes == 0;
+        self.passes = self.passes.saturating_add(1);
+        let mut advanced = false;
+        for (key, rank) in frontier {
+            match self.best.get_mut(key) {
+                Some((best, eligible)) => {
+                    if *rank > *best {
+                        *best = *rank;
+                        advanced |= *eligible;
+                    }
+                }
+                None => {
+                    let eligible = first_pass
+                        || self
+                            .born_by_ticks
+                            .is_some_and(|born_by| key.start_time <= born_by);
+                    advanced |= eligible && *rank > CursorRank::default();
+                    self.best.insert(key.clone(), (*rank, eligible));
+                }
+            }
+        }
+        if !work_stop {
+            return ResumeGrant::Stop;
+        }
+        if unfinished {
+            // Pass zero has no earlier position to stall against.
+            return if advanced || first_pass {
+                ResumeGrant::Continue
+            } else {
+                ResumeGrant::Stop
+            };
+        }
+        if self.settle_spent {
+            return ResumeGrant::Stop;
+        }
+        self.settle_spent = true;
+        ResumeGrant::Settle
+    }
+}
+
 /// Accounted bytes of one decode cursor: the key and struct shells plus
 /// the fingerprint, the cached tables and interfaces (entries included),
 /// and the anchor map. Payload bytes only, like the sibling file-fact
@@ -2177,6 +2309,45 @@ impl ScanPassOwner {
 }
 
 #[cfg(test)]
+impl CursorRank {
+    /// A posed rank for ledger twins.
+    pub(crate) fn for_test(
+        complete: bool,
+        tables: (usize, u64),
+        interfaces: (usize, u64),
+        cached_tables: usize,
+    ) -> Self {
+        Self {
+            complete,
+            tables,
+            interfaces,
+            cached_tables,
+            cached_interfaces: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl DecodeCursorKey {
+    /// A posed cursor identity for ledger twins: `inode` names the
+    /// object, `start_time` the process generation.
+    pub(crate) fn for_test(pid: u32, start_time: u64, inode: u64) -> Self {
+        let file = std::fs::File::open("/bin/sh").expect("a pinnable file");
+        Self {
+            pid,
+            start_time,
+            file: InspectedFileKey {
+                device: Device { major: 8, minor: 1 },
+                inode,
+                pin: crate::discovery::identity::pin_of(&file).expect("a file pin"),
+                fd_dev: 7,
+            },
+            exec: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         BUDGET_STOP_DEMOTE_AFTER, ChargeOutcome, MemberOutcome, ScanPassOwner, demotion_gap_subject,
@@ -2843,5 +3014,185 @@ mod tests {
                 .contains_key(&(10, Some(100))),
             "the old incarnation's spend never transfers"
         );
+    }
+
+    mod resume_ledger {
+        use super::super::{CursorRank, DecodeCursorKey, ResumeGrant, SnapshotResumeLedger};
+
+        fn rank(complete: bool, word: u64) -> CursorRank {
+            CursorRank::for_test(complete, (0, word), (0, 0), 0)
+        }
+
+        /// Two positions that each look ahead of the other in some
+        /// aggregate (an evicted completed cursor restarting while
+        /// another's frontier moves, then the reverse) never alternate
+        /// into further passes: each identity must pass its own best in
+        /// this snapshot, so the grants stop after the genuine advance
+        /// and stay stopped however long the alternation runs.
+        #[test]
+        fn resume_ledger_never_cycles_between_positions() {
+            let a = DecodeCursorKey::for_test(10, 5, 1);
+            let b = DecodeCursorKey::for_test(10, 5, 2);
+            let x = vec![(a.clone(), rank(true, 0)), (b.clone(), rank(false, 900))];
+            let y = vec![(a.clone(), rank(false, 0)), (b.clone(), rank(false, 950))];
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            let grants: Vec<ResumeGrant> = (0..32)
+                .map(|pass| ledger.grant(true, true, if pass % 2 == 0 { &x } else { &y }))
+                .collect();
+            assert_eq!(
+                grants[..2],
+                [ResumeGrant::Continue, ResumeGrant::Continue],
+                "pass zero resumes and the genuine frontier advance resumes"
+            );
+            assert!(
+                grants[2..].iter().all(|grant| *grant == ResumeGrant::Stop),
+                "alternating positions never resume again: {grants:?}"
+            );
+            // The same holds for an evicted cursor that reappears behind
+            // its old frontier, alone.
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            assert_eq!(
+                ledger.grant(true, true, &[(b.clone(), rank(false, 900))]),
+                ResumeGrant::Continue
+            );
+            assert_eq!(ledger.grant(true, true, &[]), ResumeGrant::Stop);
+            assert_eq!(
+                ledger.grant(true, true, &[(b.clone(), rank(false, 400))]),
+                ResumeGrant::Stop,
+                "a restarted cursor behind its best is not progress"
+            );
+            assert_eq!(
+                ledger.grant(true, true, &[(b, rank(false, 900))]),
+                ResumeGrant::Stop,
+                "regaining the old best is not progress either"
+            );
+        }
+
+        /// The snapshot owns one settle grant: a converged pass with no
+        /// bind budget left settles once, and a later converged pass —
+        /// even after more unfinished work advanced in between — never
+        /// settles again.
+        #[test]
+        fn resume_ledger_grants_one_settle_per_snapshot() {
+            let a = DecodeCursorKey::for_test(10, 5, 1);
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            assert_eq!(
+                ledger.grant(true, true, &[(a.clone(), rank(false, 10))]),
+                ResumeGrant::Continue
+            );
+            assert_eq!(
+                ledger.grant(true, false, &[(a.clone(), rank(true, 10))]),
+                ResumeGrant::Settle
+            );
+            let b = DecodeCursorKey::for_test(11, 6, 2);
+            assert_eq!(
+                ledger.grant(
+                    true,
+                    true,
+                    &[(a.clone(), rank(true, 10)), (b.clone(), rank(false, 3))]
+                ),
+                ResumeGrant::Continue,
+                "new unfinished work of a pre-snapshot process still resumes"
+            );
+            assert_eq!(
+                ledger.grant(true, false, &[(a, rank(true, 10)), (b, rank(true, 3))]),
+                ResumeGrant::Stop,
+                "the settle retry is spent"
+            );
+            // A scan that converges in pass zero settles once, too.
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            assert_eq!(ledger.grant(true, false, &[]), ResumeGrant::Settle);
+            assert_eq!(ledger.grant(true, false, &[]), ResumeGrant::Stop);
+        }
+
+        /// Healthy convergence: one cursor's frontier advancing pass by
+        /// pass keeps resuming with no pass-count gate, its completion
+        /// resumes, and the converged scan settles once; an unchanged
+        /// position stalls; only a work stop ever resumes.
+        #[test]
+        fn resume_ledger_follows_one_frontier_to_convergence() {
+            let a = DecodeCursorKey::for_test(10, 5, 1);
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            for word in (0..64).map(|step| 100 * step + 1) {
+                assert_eq!(
+                    ledger.grant(true, true, &[(a.clone(), rank(false, word))]),
+                    ResumeGrant::Continue,
+                    "frontier {word} advanced"
+                );
+            }
+            assert_eq!(
+                ledger.grant(true, true, &[(a.clone(), rank(true, 0))]),
+                ResumeGrant::Continue,
+                "completion outranks any frontier"
+            );
+            assert_eq!(
+                ledger.grant(true, false, &[(a.clone(), rank(true, 0))]),
+                ResumeGrant::Settle
+            );
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            assert_eq!(
+                ledger.grant(true, true, &[(a.clone(), rank(false, 7))]),
+                ResumeGrant::Continue
+            );
+            assert_eq!(
+                ledger.grant(true, true, &[(a.clone(), rank(false, 7))]),
+                ResumeGrant::Stop,
+                "an unchanged position stalls"
+            );
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            assert_eq!(
+                ledger.grant(false, true, &[(a.clone(), rank(false, 7))]),
+                ResumeGrant::Stop
+            );
+            assert_eq!(
+                ledger.grant(false, true, &[(a, rank(false, 8))]),
+                ResumeGrant::Stop,
+                "an advancing pass that did not stop on work never resumes"
+            );
+        }
+
+        /// Identities first seen after pass zero extend the snapshot
+        /// only with real decode work and only for process generations
+        /// born by the snapshot's start; reached growth alone, a later
+        /// birth, or an unreadable start clock never does.
+        #[test]
+        fn resume_ledger_bounds_late_identities() {
+            let old = DecodeCursorKey::for_test(10, 5, 1);
+            let base = vec![(old.clone(), rank(false, 50))];
+            let with = |key: DecodeCursorKey, word: u64| {
+                let mut frontier = base.clone();
+                frontier.push((key, rank(false, word)));
+                frontier
+            };
+            let mut ledger = SnapshotResumeLedger::new(Some(100));
+            assert_eq!(ledger.grant(true, true, &base), ResumeGrant::Continue);
+            assert_eq!(
+                ledger.grant(true, true, &with(DecodeCursorKey::for_test(20, 80, 2), 0)),
+                ResumeGrant::Stop,
+                "a reached object with no decode work is not progress"
+            );
+            assert_eq!(
+                ledger.grant(true, true, &with(DecodeCursorKey::for_test(21, 200, 3), 9)),
+                ResumeGrant::Stop,
+                "a process born after the snapshot started never extends it"
+            );
+            assert_eq!(
+                ledger.grant(true, true, &with(DecodeCursorKey::for_test(21, 200, 3), 90)),
+                ResumeGrant::Stop,
+                "nor does its later progress"
+            );
+            assert_eq!(
+                ledger.grant(true, true, &with(DecodeCursorKey::for_test(22, 100, 4), 9)),
+                ResumeGrant::Continue,
+                "a pre-snapshot process reached late with real work resumes"
+            );
+            let mut ledger = SnapshotResumeLedger::new(None);
+            assert_eq!(ledger.grant(true, true, &base), ResumeGrant::Continue);
+            assert_eq!(
+                ledger.grant(true, true, &with(DecodeCursorKey::for_test(22, 1, 4), 9)),
+                ResumeGrant::Stop,
+                "an unreadable start clock admits no late identity"
+            );
+        }
     }
 }

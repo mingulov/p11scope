@@ -469,14 +469,15 @@ pub(crate) struct GapView {
 /// resumed pass completes the work.
 pub(crate) const SCAN_BUDGET_EXHAUSTED_REASON: &str = "scan budget exhausted";
 
-/// Fold one internal gap reason to its finite public row, if it
-/// names a scan work-ceiling stop: the bare ceiling sentence or the
-/// same sentence wrapped in a scan refusal, whatever subject filed
-/// it. Near misses (deadline, clock and I/O ceilings, bare
-/// prefixes, unrelated reasons) never fold.
+/// Fold one internal gap reason to its finite public row, if it is a
+/// scan work-ceiling stop exactly as the scan files it: the bare
+/// ceiling sentence or the same sentence wrapped in one of the scan's
+/// refusals, whatever subject filed it. The scan's vocabulary owner
+/// decides membership; near misses (deadline, clock and I/O ceilings,
+/// bare prefixes, unrelated reasons, and any text that merely quotes
+/// the sentence, such as a module path inside a diagnosis) never fold.
 pub(crate) fn fold_scan_ceiling_reason(reason: &str) -> Option<&'static str> {
-    reason
-        .contains(crate::discovery::scan::WORK_CEILING_REASON)
+    crate::discovery::scan::is_work_ceiling_stop_reason(reason)
         .then_some(SCAN_BUDGET_EXHAUSTED_REASON)
 }
 
@@ -2845,6 +2846,16 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     format!("{head}{kept_full}...{tail}")
 }
 
+/// One concise line for a lone folded event: the group line without
+/// its count, `  {subject} - {reason}`, cut by the same rules.
+fn gap_bare_line(subject: &str, reason: &str) -> String {
+    let line = gap_group_line(1, subject, reason);
+    match line.strip_prefix("  1 x ") {
+        Some(rest) => format!("  {rest}"),
+        None => line,
+    }
+}
+
 /// The neutral successor spelling of
 /// [`crate::discovery::scan::REPLACED_PROVIDER_REASON`] (the wording
 /// lane owns the constant): `present` matches it verbatim so the text
@@ -3201,7 +3212,9 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// groups; beyond that one fold line names the remainder. Plain words
 /// only (reusing `gap_plain_*`); per-gap `gap [` lines stay
 /// verbose-only. Counts distinct loss rows like the coverage line, not
-/// `repeats` (JSON carries `repeats`). Empty when no loss gaps are
+/// `repeats` (JSON carries `repeats`), except the folded scan-budget
+/// family, which states its exact summed event total and renders a
+/// lone event bare. Empty when no loss gaps are
 /// retained;
 /// suppressed-but-unretained gaps stay in the coverage line.
 /// Per-pass kernel-thread absence notes fold into one counted line
@@ -3266,12 +3279,15 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     let mut kthreads: Vec<&GapView> = Vec::new();
     let mut replaced: Vec<&GapView> = Vec::new();
     let mut maps: Vec<&GapView> = Vec::new();
+    let mut ceiling: Vec<&GapView> = Vec::new();
     let mut rest: Vec<&GapView> = Vec::new();
     for gap in gaps.iter() {
         if is_concise_redundant_per_key_off_gap(gap) {
             continue;
         }
-        if gap.caller.is_none()
+        if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
+            ceiling.push(gap);
+        } else if gap.caller.is_none()
             && gap.module.is_none()
             && gap.pid.is_none()
             && gap_plain_subject(&gap.subject, &gap.reason) == "kernel threads"
@@ -3391,6 +3407,32 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         entry.0 += maps.len();
         entry.1 = false;
     }
+    // The folded ceiling family states its exact event total, like the
+    // verbose fold: every folded row's repeats summed per subject (a
+    // pass stop recorded twice is two stops), and a lone event renders
+    // bare. Its line takes the ordinary ranked place, like every
+    // concise group.
+    let mut bare: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
+    let mut ceiling_events: std::collections::BTreeMap<(String, String), (u64, bool)> =
+        std::collections::BTreeMap::new();
+    for gap in ceiling {
+        let subject = escape_controls(gap_plain_subject(&gap.subject, &gap.reason)).into_owned();
+        let reason = escape_controls(gap_plain_reason(&gap.subject, &gap.reason)).into_owned();
+        let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
+        let entry = ceiling_events.entry((subject, reason)).or_insert((0, true));
+        entry.0 = entry.0.saturating_add(gap.repeats);
+        entry.1 = entry.1 && scope;
+    }
+    for (key, (events, scope)) in ceiling_events {
+        if events == 1 {
+            bare.insert(key.clone());
+        }
+        let entry = groups.entry(key).or_insert((0, scope));
+        entry.0 = entry
+            .0
+            .saturating_add(usize::try_from(events).unwrap_or(usize::MAX));
+        entry.1 = entry.1 && scope;
+    }
     if groups.is_empty() {
         return Vec::new();
     }
@@ -3407,7 +3449,11 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     });
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
     for ((subject, reason), (count, _)) in ranked.iter().take(GAP_GROUPS_SHOWN) {
-        lines.push(gap_group_line(*count, subject, reason));
+        if *count == 1 && bare.contains(&(subject.clone(), reason.clone())) {
+            lines.push(gap_bare_line(subject, reason));
+        } else {
+            lines.push(gap_group_line(*count, subject, reason));
+        }
     }
     let rest = ranked.len().saturating_sub(GAP_GROUPS_SHOWN);
     if rest == 1 {

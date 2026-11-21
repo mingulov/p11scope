@@ -44,9 +44,8 @@ use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
-    BudgetConsumption, COLLECTION_STOP_REASON, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome,
-    ScanRequest, ScannedModule, Skipped, WORK_CEILING_REASON, scan_process_view_examined,
-    scan_skip_truncates,
+    BudgetConsumption, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest,
+    ScannedModule, Skipped, scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
@@ -1305,10 +1304,7 @@ fn scan_pinned_member_inner(
         .view_scan_progress(pid, generation.start_time)
         .is_some()
     {
-        gaps.retain(|gap| {
-            !(gap.reason.contains(WORK_CEILING_REASON)
-                || gap.reason.contains(COLLECTION_STOP_REASON))
-        });
+        gaps.retain(|gap| !crate::discovery::scan::is_raw_pass_budget_stop(&gap.reason));
     }
     let mapping_scan_completed = outcome.mapping_scan_completed();
     let (modules, status) = match outcome {

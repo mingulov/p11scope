@@ -113,6 +113,52 @@ pub(crate) const INTERFACE_WINDOW_CEILING_REASON: &str =
     "discovery window interface decode allowance reached; remaining interface data was not decoded";
 pub(crate) const COLLECTION_STOP_REASON: &str =
     "cgroup collection stopped or shared work allowance exhausted";
+/// Whether `reason` is a scan work-ceiling stop exactly as the scan
+/// files it: the bare ceiling sentence, or one of the scan's own
+/// refusal wrappers around exactly that sentence. Membership, never a
+/// substring search: a diagnosis whose module path quotes the
+/// sentence is not a budget stop.
+pub(crate) fn is_work_ceiling_stop_reason(reason: &str) -> bool {
+    reason == WORK_CEILING_REASON
+        || [
+            FINAL_MAPS_UNAVAILABLE_REASON,
+            INITIAL_MAPS_UNAVAILABLE_REASON,
+            SCAN_GENERATION_CHANGED_REASON,
+        ]
+        .iter()
+        .any(|wrapper| {
+            reason
+                .strip_prefix(wrapper)
+                .and_then(|rest| rest.strip_prefix(": "))
+                == Some(WORK_CEILING_REASON)
+        })
+}
+
+/// Whether `reason` is a raw pass-budget stop (work ceiling or
+/// collection stop) that a continuing scan supersedes with its
+/// in-progress gap. The stop sentence must close the reason's
+/// producer-owned tail — bare, or after a `prefix: ` composition,
+/// optionally followed by the pin loop's own wait tail — so text that
+/// merely quotes a stop sentence earlier (a module path inside a
+/// diagnosis) never classifies.
+pub(crate) fn is_raw_pass_budget_stop(reason: &str) -> bool {
+    let rest = [
+        "; the pin waits for the next tick",
+        "; the run does not retry",
+    ]
+    .iter()
+    .find_map(|tail| reason.strip_suffix(tail))
+    .unwrap_or(reason);
+    [WORK_CEILING_REASON, COLLECTION_STOP_REASON]
+        .iter()
+        .any(|stop| {
+            rest == *stop
+                || rest
+                    .strip_suffix(stop)
+                    .is_some_and(|head| head.ends_with(": "))
+        })
+}
+
 /// Stable marker inside the scan's own verified-absence vocabulary. The
 /// scan-to-live-candidate completeness boundary (`scan_skip_truncates`)
 /// matches these markers — the push sites below must keep using them.
@@ -1204,27 +1250,14 @@ impl RetainedFileFacts {
         !self.decode_cursors.is_empty()
     }
 
-    /// `(frontier snapshots, frontier words)` summed over the whole
-    /// carried bundle: how far every object's table and interface
-    /// sweeps reached. `None` exactly when [`scan_progress_totals`]
-    /// is `None` (no unfinished cursor). The snapshot resume rule
-    /// advances on any strict increase here (or in completed objects
-    /// or decoded tables), so intra-object sweep advance that
-    /// completes no object and decodes no new table still counts as
-    /// progress instead of stalling the snapshot.
-    pub(crate) fn scan_frontier_totals(&self) -> Option<(u64, u64)> {
-        self.scan_progress_totals()?;
-        let mut snapshots = 0u64;
-        let mut words = 0u64;
-        for cursor in self.decode_cursors.values() {
-            snapshots = snapshots
-                .saturating_add(cursor.tables.snapshot as u64)
-                .saturating_add(cursor.interfaces.snapshot as u64);
-            words = words
-                .saturating_add(cursor.tables.word)
-                .saturating_add(cursor.interfaces.word);
-        }
-        Some((snapshots, words))
+    /// Every carried cursor's identity and resume rank: what the
+    /// snapshot resume ledger compares pass by pass, per identity, so
+    /// sums over a changing cursor set can never pass for progress.
+    pub(crate) fn resume_frontier(&self) -> Vec<(DecodeCursorKey, super::scan_pass::CursorRank)> {
+        self.decode_cursors
+            .iter()
+            .map(|(key, cursor)| (key.clone(), cursor.rank()))
+            .collect()
     }
 
     /// `(done, total, tables)` over the whole carried bundle: completed
@@ -1274,9 +1307,7 @@ fn continued_view_gap(
     start_time: Option<u64>,
 ) -> Option<(String, String)> {
     let gap = budget.view_in_progress_gap(pid, start_time)?;
-    skipped.retain(|skip| {
-        !(skip.reason.contains(WORK_CEILING_REASON) || skip.reason.contains(COLLECTION_STOP_REASON))
-    });
+    skipped.retain(|skip| !is_raw_pass_budget_stop(&skip.reason));
     Some(gap)
 }
 
@@ -3396,24 +3427,42 @@ fn reread_table_extent(
     Some(extent)
 }
 
-/// Whether re-decoding `extent` (re-read from current memory) under the
-/// sweep's rules yields exactly `table` — or extends a cached legacy
-/// prefix to its full decode. A sweep that stops mid-table stages the
-/// `known_prefix` row; the proof re-reads the full declared extent, so
-/// strict equality would fail the genuine extension into a fresh
-/// rescan every pass (a resume livelock under tight recurring
-/// budgets). Extension is progress, not a change: every cached row
-/// must re-decode identically at the head of the fresh row, so a
-/// same-path exec or a writable-byte mutation under an unchanged
-/// layout still fails. A shorter or divergent fresh row still fails.
-fn table_extent_matches(
+/// How a cached row may re-prove against current memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CachedRowProof {
+    /// Complete replay re-emits the cached row as published. The head
+    /// must re-decode identically (equal, or a cached `known_prefix`
+    /// the fresh decode extends: a stale-short legacy prefix publishes
+    /// as `known_prefix`, never fuller than memory), and a cached
+    /// structural refutation (`extension_impossible`, the evidence a
+    /// `full` legacy-prefix label rests on) must still hold in the
+    /// fresh decode. A refutation that current bytes no longer prove
+    /// fails the replay into a rescan, so an old completeness proof is
+    /// never carried past a healed tail.
+    Replay,
+    /// Unfinished continuation accepts the same head proof whatever
+    /// the cached refutation says; the caller then keeps only the
+    /// evidence the fresh decode still proves, so a refutation never
+    /// outlives the bytes it rested on.
+    Continue,
+}
+
+/// Re-decode `extent` (re-read from current memory) under the sweep's
+/// rules and return the row to carry on: `None` when the cached row no
+/// longer re-proves. Every cached entry must re-decode identically at
+/// the head of the fresh row, so a same-path exec or a mutation of the
+/// cached head under an unchanged layout fails; a shorter or
+/// divergent fresh row fails. The returned row is the fresh decode,
+/// whose evidence (including `extension_impossible`) is current.
+fn reprove_cached_table(
     layout: LinuxLayout,
     table: &ScannedTable,
     extent: &[u8],
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
-) -> bool {
-    match decode_candidate(
+    proof: CachedRowProof,
+) -> Option<ScannedTable> {
+    let Ok(Some((fresh, _))) = decode_candidate(
         layout,
         extent,
         0,
@@ -3424,19 +3473,28 @@ fn table_extent_matches(
             runtime_view: None,
             strict_tail: true,
         },
-    ) {
-        Ok(Some((fresh, _))) => fresh == *table || table_prefix_compatible(table, &fresh),
-        _ => false,
-    }
+    ) else {
+        return None;
+    };
+    let head = fresh == *table || table_prefix_compatible(table, &fresh);
+    let accepted = match proof {
+        CachedRowProof::Replay => {
+            head && (!table.extension_impossible || fresh.extension_impossible)
+        }
+        CachedRowProof::Continue => head,
+    };
+    accepted.then_some(fresh)
 }
 
 /// Whether the cached row is a strict `known_prefix` of the fresh
-/// decode: same version, address and file offset, and every cached
-/// entry, null hole and unpinned record re-decoded identically at
-/// the head of the fresh row. Publication flags stay ignored like
-/// in `PartialEq` (monotonic observation, not identity).
+/// decode: same version, address and file offset, at least one decoded
+/// slot, and every cached entry, null hole and unpinned record
+/// re-decoded identically at the head of the fresh row. Publication
+/// flags stay ignored like in `PartialEq` (monotonic observation, not
+/// identity).
 fn table_prefix_compatible(cached: &ScannedTable, fresh: &ScannedTable) -> bool {
     cached.walk == "known_prefix"
+        && cached.decoded_slot_count() > 0
         && cached.version == fresh.version
         && cached.address == fresh.address
         && cached.file_offset == fresh.file_offset
@@ -3447,12 +3505,12 @@ fn table_prefix_compatible(cached: &ScannedTable, fresh: &ScannedTable) -> bool 
 
 /// Re-prove one cached table against current memory for complete
 /// replay: the table's full declared extent is re-read (charged) and
-/// re-decoded under the sweep's rules, and must equal the cached row
-/// or extend its legacy prefix (see [`table_extent_matches`]).
-/// Identity alone cannot see a same-path exec or a writable-byte
-/// mutation under an unchanged layout, so any short read, decode
-/// mismatch, refusal or stop fails the whole replay into a fresh
-/// rescan. Anchor-recovered rows, which the direct decoder rejects by
+/// re-decoded under the sweep's rules, and must re-prove the cached
+/// head with any cached structural refutation still current (see
+/// [`CachedRowProof::Replay`]). Identity alone cannot see a same-path
+/// exec or a mutation of the cached head under an unchanged layout, so
+/// any short read, head mismatch, refutation current bytes no longer
+/// prove, refusal or stop fails the whole replay into a fresh rescan. Anchor-recovered rows, which the direct decoder rejects by
 /// design, conservatively rescan.
 fn verify_cached_table(
     layout: LinuxLayout,
@@ -3464,7 +3522,7 @@ fn verify_cached_table(
     let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
         return false;
     };
-    table_extent_matches(layout, table, &extent, maps, budget)
+    reprove_cached_table(layout, table, &extent, maps, budget, CachedRowProof::Replay).is_some()
 }
 
 pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
@@ -9236,16 +9294,30 @@ fn scan_view_examined_mode(
                 inventory: dependency.inventory.clone(),
                 ..ScanDependencies::default()
             };
-            if let Some(cursor) = &resumed {
-                for table in &cursor.cached_tables {
+            if let Some(cursor) = &mut resumed {
+                for table in &mut cursor.cached_tables {
                     let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
                         proven = false;
                         break;
                     };
-                    if !table_extent_matches(layout, table, &extent, &map_index, budget) {
+                    // The cached row carries on (the resumed sweep and
+                    // its repeat identities are keyed on it), but never
+                    // with evidence current bytes no longer prove: a
+                    // structural refutation the fresh decode lacks is
+                    // dropped here, so the later publish cannot label
+                    // the prefix `full` past a healed tail.
+                    let Some(fresh) = reprove_cached_table(
+                        layout,
+                        table,
+                        &extent,
+                        &map_index,
+                        budget,
+                        CachedRowProof::Continue,
+                    ) else {
                         proven = false;
                         break;
-                    }
+                    };
+                    table.extension_impossible &= fresh.extension_impossible;
                     recollected.retain_tables(
                         std::slice::from_ref(table),
                         &extent,
@@ -22893,6 +22965,41 @@ int main(int argc, char **argv) {
     /// unfinished cursors — none, another view's, or only completed —
     /// every gap stays verbatim, so a stall keeps its exact raw wording.
     #[test]
+    fn continued_view_gap_keeps_a_diagnosis_whose_path_quotes_a_stop() {
+        let poisoned = format!("/opt/{WORK_CEILING_REASON}/{COLLECTION_STOP_REASON}/libtoken.so");
+        let diagnosis = no_table_found_reason(&poisoned, true);
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key, cursor) = decode_cursor_for_test(7, 9, 11, false, 0);
+        assert!(budget.record_decode_cursor(key, cursor));
+        let mut skipped = vec![
+            Skipped {
+                subject: poisoned.clone(),
+                reason: diagnosis.clone(),
+            },
+            Skipped {
+                subject: "m".into(),
+                reason: WORK_CEILING_REASON.into(),
+            },
+            Skipped {
+                subject: crate::discovery::identity::PIN_WAIT_SUBJECT.into(),
+                reason: format!(
+                    "{poisoned}: read failed: {WORK_CEILING_REASON}; the pin waits for the next tick"
+                ),
+            },
+        ];
+        assert!(continued_view_gap(&mut skipped, &budget, 7, Some(9)).is_some());
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|skip| skip.reason.as_str())
+                .collect::<Vec<_>>(),
+            vec![diagnosis.as_str()],
+            "only the raw stops drop; the diagnosis quoting them in its path stays"
+        );
+    }
+
+    #[test]
     fn continued_view_gap_drops_raw_stops_only_while_unfinished() {
         let skips = || {
             vec![
@@ -23874,6 +23981,241 @@ int main(int argc, char **argv) {
         assert!(
             carried.decode_cursors_for_test().is_empty(),
             "a proven mapping change discards the cached decode"
+        );
+    }
+
+    /// Overwrite the populated fixture's table at `0x4800` with a 3.0
+    /// table: a complete 68-slot legacy prefix (own text, one NULL,
+    /// dependency text) and a 24-slot extension that either points
+    /// into the provider's own writable data (structurally refuting
+    /// the 92-wide layout) or into dependency text (a valid 3.0
+    /// extension).
+    fn write_30_table_with_tail(mem: &File, tail_valid: bool) {
+        use std::os::unix::fs::FileExt as _;
+        let mut table = vec![0u8; (STANDARD_30_SLOTS + 1) * 8];
+        table[..2].copy_from_slice(&[3, 0]);
+        for slot in 0..STANDARD_30_SLOTS {
+            let pointer: u64 = match slot {
+                0 => 0x1100,
+                1 => 0,
+                _ if slot < LEGACY_PREFIX_SLOTS || tail_valid => 0x9100,
+                _ => 0x4500,
+            };
+            table[(slot + 1) * 8..(slot + 2) * 8].copy_from_slice(&pointer.to_le_bytes());
+        }
+        mem.write_all_at(&table, 0x4800).unwrap();
+    }
+
+    /// The fixture's tables as `(address, decoded slots, walk,
+    /// extension refuted)`: what a surface publishes about them.
+    fn published_shape(outcome: &ScanOutcome) -> Vec<(u64, usize, &'static str, bool)> {
+        outcome
+            .modules()
+            .iter()
+            .flat_map(|module| module.tables.iter())
+            .map(|table| {
+                (
+                    table.address,
+                    table.decoded_slot_count(),
+                    table.walk,
+                    table.extension_impossible,
+                )
+            })
+            .collect()
+    }
+
+    /// A fresh decode of the fixture's current memory: the shape a
+    /// replay may never claim more than.
+    fn fresh_published_shape(tail_valid: bool) -> Vec<(u64, usize, &'static str, bool)> {
+        let mut fresh = BracketFixture::new(8, true);
+        write_30_table_with_tail(&fresh.mem, tail_valid);
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (outcome, _) = armed_scan_pass(&mut fresh, limits, RetainedFileFacts::default());
+        published_shape(&outcome.unwrap())
+    }
+
+    /// Complete replay never republishes a stale structural
+    /// refutation: pass one completes a 3.0 table whose extension
+    /// points into writable data (a refuted 68-slot `known_prefix`
+    /// row), the writable tail then becomes a valid extension under
+    /// unchanged mappings, and pass two must publish what a fresh
+    /// decode of current memory publishes (the 92-slot table), never
+    /// the cached 68-slot row and its old completeness proof.
+    #[test]
+    fn complete_replay_never_republishes_a_refuted_prefix_after_its_tail_heals() {
+        let mut fixture = BracketFixture::new(8, true);
+        write_30_table_with_tail(&fixture.mem, false);
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let (first, carried) = armed_scan_pass(&mut fixture, limits, RetainedFileFacts::default());
+        let first = first.unwrap();
+        assert_eq!(
+            published_shape(&first),
+            vec![(0x4800, LEGACY_PREFIX_SLOTS, "known_prefix", true)],
+            "pass one decodes the refuted legacy prefix (setup pin)"
+        );
+        assert_eq!(
+            carried.cursor_counts(),
+            (1, 0),
+            "pass one completes its cursor (setup pin)"
+        );
+        write_30_table_with_tail(&fixture.mem, true);
+        assert_eq!(
+            fresh_published_shape(true),
+            vec![(0x4800, STANDARD_30_SLOTS, "full", false)],
+            "a fresh decode of the healed tail is the full 3.0 table (setup pin)"
+        );
+        fixture.maps_reads = 0;
+        let (second, _) = armed_scan_pass(&mut fixture, limits, carried);
+        assert_eq!(
+            published_shape(&second.unwrap()),
+            fresh_published_shape(true),
+            "the replay publishes what current memory decodes, never the stale refuted prefix"
+        );
+    }
+
+    /// The unvalidated use-time proof carries current evidence too: a
+    /// bracket that starved after the sweeps stages the refuted
+    /// 68-slot row unvalidated; the tail then heals, and the resumed
+    /// pass re-proves the row's head against current memory. The
+    /// extension is accepted as progress (no rescan livelock), but the
+    /// carried row loses the refutation current bytes no longer prove,
+    /// so the converged pass never publishes more than a fresh scan:
+    /// the head stays a `known_prefix` without a completeness proof.
+    #[test]
+    fn unvalidated_resume_drops_a_refutation_its_extension_disproves() {
+        let limits = ScanLimits {
+            per_object_bytes: u64::MAX,
+            total_bytes: u64::MAX,
+        };
+        let mut probe = BracketFixture::new(8, true);
+        write_30_table_with_tail(&probe.mem, false);
+        let (outcome, _) = armed_scan_pass(&mut probe, limits, RetainedFileFacts::default());
+        outcome.unwrap();
+        let (_, swept_work) = probe.before_b.expect("calibration reaches the maps-B open");
+        let mut fixture = BracketFixture::new(8, true);
+        write_30_table_with_tail(&fixture.mem, false);
+        let mut budget =
+            CaptureWorkBudget::new(limits).with_retained_file_facts(RetainedFileFacts::default());
+        budget.set_work_ceiling_for_test(swept_work);
+        let _ = fixture.run(&mut budget).unwrap();
+        let carried = budget.take_retained_file_facts();
+        let cursors = carried.decode_cursors_for_test();
+        assert_eq!(
+            cursors.len(),
+            1,
+            "the starved bracket stages one cursor (setup pin)"
+        );
+        assert!(
+            !cursors[0].1.validated && !cursors[0].1.complete,
+            "the staged cursor rides unvalidated (setup pin)"
+        );
+        assert_eq!(
+            cursors[0]
+                .1
+                .cached_tables
+                .iter()
+                .map(|table| (table.decoded_slot_count(), table.extension_impossible))
+                .collect::<Vec<_>>(),
+            vec![(LEGACY_PREFIX_SLOTS, true)],
+            "the staged row is the refuted prefix (setup pin)"
+        );
+        write_30_table_with_tail(&fixture.mem, true);
+        fixture.maps_reads = 0;
+        let (second, carried) = armed_scan_pass(&mut fixture, limits, carried);
+        assert_eq!(carried.cursor_counts().1, 0, "the resumed pass converges");
+        assert_eq!(
+            fresh_published_shape(true),
+            vec![(0x4800, STANDARD_30_SLOTS, "full", false)],
+            "a fresh decode of the healed tail is the full 3.0 table (setup pin)"
+        );
+        let published = published_shape(&second.unwrap());
+        assert!(
+            published.iter().all(|(_, _, _, refuted)| !refuted),
+            "no carried row keeps a refutation current memory no longer proves: {published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .all(|(_, slots, _, _)| *slots <= STANDARD_30_SLOTS),
+            "nothing publishes fuller than a fresh decode: {published:?}"
+        );
+    }
+
+    /// The prefix proof's fail-closed side: a cached `known_prefix` row
+    /// re-proves only when every cached entry, hole and unpinned record
+    /// re-decodes identically at the head of the fresh row. Divergent
+    /// heads, shorter fresh rows, other identities, non-prefix cached
+    /// rows and a cached row with no decoded slot all fail.
+    #[test]
+    fn prefix_proof_refuses_divergent_shorter_and_empty_rows() {
+        let entry = |offset: u64| ScannedEntry {
+            name: "C_Initialize",
+            object: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 999,
+            },
+            object_path: "/dependency.so".into(),
+            file_offset: offset,
+        };
+        let row = |walk: &'static str, offsets: &[u64]| ScannedTable {
+            version: (3, 0),
+            walk,
+            entries: offsets.iter().map(|offset| entry(*offset)).collect(),
+            null_entries: Vec::new(),
+            unpinned: Vec::new(),
+            address: 0x4800,
+            file_offset: Some(0x2800),
+            live_return: false,
+            manifest_supported: false,
+            extension_impossible: false,
+        };
+        let cached = row("known_prefix", &[0x100, 0x200]);
+        assert!(
+            table_prefix_compatible(&cached, &row("full", &[0x100, 0x200, 0x300])),
+            "a genuine extension re-proves"
+        );
+        assert!(
+            !table_prefix_compatible(&cached, &row("full", &[0x100, 0x999, 0x300])),
+            "a divergent head fails"
+        );
+        assert!(
+            !table_prefix_compatible(&cached, &row("full", &[0x100])),
+            "a shorter fresh row fails"
+        );
+        let mut moved = row("full", &[0x100, 0x200, 0x300]);
+        moved.address = 0x4900;
+        assert!(
+            !table_prefix_compatible(&cached, &moved),
+            "another address fails"
+        );
+        let mut relocated = row("full", &[0x100, 0x200, 0x300]);
+        relocated.file_offset = Some(0x2900);
+        assert!(
+            !table_prefix_compatible(&cached, &relocated),
+            "another file offset fails"
+        );
+        let mut other_version = row("full", &[0x100, 0x200, 0x300]);
+        other_version.version = (3, 1);
+        assert!(
+            !table_prefix_compatible(&cached, &other_version),
+            "another version fails"
+        );
+        assert!(
+            !table_prefix_compatible(
+                &row("full", &[0x100, 0x200]),
+                &row("full", &[0x100, 0x200, 0x300])
+            ),
+            "only a cached known prefix may extend"
+        );
+        assert!(
+            !table_prefix_compatible(&row("known_prefix", &[]), &row("full", &[0x100])),
+            "a cached row with no decoded slot proves nothing"
         );
     }
 

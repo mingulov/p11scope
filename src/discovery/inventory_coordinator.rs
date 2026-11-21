@@ -174,12 +174,13 @@ pub(crate) struct CgroupCompletion {
     /// into a continuation instead of a terminal exhaustion verdict.
     /// `None` once converged (or when no scan ever ran).
     pub(crate) progress: Option<(usize, usize, usize)>,
-    /// Summed sweep frontiers beside [`progress`](Self::progress):
-    /// the snapshot resume rule advances on any strict increase in
-    /// completed objects, decoded tables or frontiers, so
-    /// intra-object sweep advance counts as progress. `None`
-    /// exactly when `progress` is `None`.
-    pub(crate) progress_fingerprint: Option<(u64, u64)>,
+    /// Every carried cursor's identity and resume rank after this
+    /// pass: the snapshot resume ledger compares them per identity
+    /// against the best each reached earlier in the snapshot.
+    pub(crate) resume_frontier: Vec<(
+        crate::discovery::scan_pass::DecodeCursorKey,
+        crate::discovery::scan_pass::CursorRank,
+    )>,
 }
 
 impl CgroupCompletion {
@@ -5126,7 +5127,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Stash the last valid progress summary before the bundle leaves
     /// for a worker. Only non-empty bundles update the stash (an empty
     /// take is a first pass or a post-discard restart, never new
-    /// information); a converged bundle clears it.
+    /// information); a converged bundle clears it. The stash serves
+    /// only while the worker holds the bundle or after a discarded
+    /// return; an accepted return replaces it with the returned
+    /// bundle's own totals.
     fn stash_scan_progress(&mut self) {
         if self.cgroup_file_facts.has_decode_cursors() {
             self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
@@ -5245,7 +5249,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // coordinator without facts, so the next pass re-reads instead of
         // reusing anything stale.
         self.cgroup_file_facts = collection.take_retained_file_facts();
-        self.stash_scan_progress();
+        // An accepted return is the progress truth, even empty: the
+        // sole unfinished cursor may have left with its unmapped
+        // object, and the summary stashed while the worker held the
+        // bundle must not outlive it.
+        self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
         let work = collection.work();
         let events = self
             .adapter
@@ -5304,7 +5312,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             admitted: 0,
             scan_callers: 0,
             progress: None,
-            progress_fingerprint: None,
+            resume_frontier: Vec::new(),
+        });
+    }
+
+    /// Pose one cgroup completion carrying resume progress: the
+    /// transaction outcome, the `(done, total, tables)` totals and the
+    /// per-identity frontier the snapshot ledger reads.
+    #[cfg(test)]
+    pub(crate) fn pose_cgroup_resume_completion_for_test(
+        &mut self,
+        outcome: ScopedCollectionOutcome,
+        progress: Option<(usize, usize, usize)>,
+        resume_frontier: Vec<(
+            crate::discovery::scan_pass::DecodeCursorKey,
+            crate::discovery::scan_pass::CursorRank,
+        )>,
+    ) {
+        self.completed_cgroup = Some(CgroupCompletion {
+            state: CgroupWalkState::default(),
+            outcome,
+            events: Vec::new(),
+            admitted: 0,
+            scan_callers: 0,
+            progress,
+            resume_frontier,
         });
     }
 
@@ -12988,7 +13020,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 admitted: completion.admitted,
                 scan_callers: completion.scan_callers,
                 progress: self.cgroup_file_facts.scan_progress_totals(),
-                progress_fingerprint: self.cgroup_file_facts.scan_frontier_totals(),
+                resume_frontier: self.cgroup_file_facts.resume_frontier(),
             });
             // A cgroup-scope capture opens the same native lane, so its
             // pass seam releases departed native state exactly like the
@@ -21251,6 +21283,60 @@ pub(crate) mod tests {
         assert!(
             scene.coordinator.live_scan_progress_gap().is_some(),
             "the last valid progress summary stays live while the worker owns the bundle"
+        );
+    }
+
+    /// An accepted worker return is the progress truth, even empty:
+    /// when the sole unfinished cursor leaves the bundle (its object
+    /// unmapped, so the scan removed it with no replacement), the
+    /// returned bundle carries no cursor and the live terminal gap must
+    /// not fall back to the summary stashed while the worker held the
+    /// bundle.
+    #[test]
+    fn accepted_empty_return_clears_the_stashed_progress() {
+        const ALLOWANCE: u64 = 30_000;
+        const BLOB_BYTES: usize = 2_400_000;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = gcc_table_last_provider(dir.path(), "table-last.so", BLOB_BYTES);
+        let mut scene = CgroupTableScene::new_with_providers(dir, &[], &[provider.as_path()]);
+        let mut state = CgroupWalkState::default();
+        let _ = continued_cgroup_pass_with_window(
+            &mut scene,
+            &mut state,
+            CgroupWalkLimits::default(),
+            ALLOWANCE,
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_some(),
+            "pass one must leave live progress (setup pin)"
+        );
+        // The pass-two job takes the bundle (the stash keeps pass one's
+        // summary while the worker owns it); the worker removes the
+        // unmapped object's cursor and returns no replacement.
+        let taken = std::mem::take(&mut state);
+        let starved = CgroupWalkLimits {
+            work_units: 0,
+            ..CgroupWalkLimits::default()
+        };
+        let job = scene
+            .coordinator
+            .cgroup_collector(taken, starved, CollectionControl::new(None), None)
+            .unwrap();
+        let mut collection = job();
+        let returned = collection.take_retained_file_facts();
+        assert!(
+            returned.scan_progress_totals().is_some(),
+            "the worker held the unfinished cursor (setup pin)"
+        );
+        // Taking the bundle out models the worker's removal: the
+        // collection now returns an empty bundle.
+        scene
+            .coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_none(),
+            "an accepted return without cursors names no stale in-progress gap"
         );
     }
 

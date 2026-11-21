@@ -43,9 +43,8 @@ impl<'a> ObservedDriver<'a> {
                     limits: CgroupWalkLimits::default(),
                     control,
                     deadline: None,
-                    last_outcome: None,
-                    last_resume: CgroupResumePosition::default(),
-                    prev_resume: CgroupResumePosition::default(),
+                    resume: Some(crate::discovery::scan_pass::SnapshotResumeLedger::starting_now()),
+                    grant: crate::discovery::scan_pass::ResumeGrant::Stop,
                 }),
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -1177,14 +1176,18 @@ fn cgroup_runtime_snapshot_resumes_across_passes_until_converged() {
     );
 }
 
-/// The snapshot resume rule, posed state by state: only a work stop
-/// resumes; unfinished advancing progress continues the scan
-/// (completed objects, decoded tables or sweep frontiers — never
-/// reached-object growth alone); a converged scan with no bind
-/// budget gets exactly one settle pass; duration runs, stops and
-/// every other outcome keep the single snapshot.
+/// The snapshot resume rule, posed pass by pass through the driver's
+/// own pass boundary (`finish_pass` records each completion in the
+/// snapshot ledger): only a work stop resumes; unfinished work
+/// continues while some cursor identity passes its own best rank in
+/// this snapshot (completion, either sweep frontier, cached rows —
+/// never reached-object growth alone, a regression, or a position
+/// that alternates with an earlier one); a converged scan with no bind
+/// budget gets the snapshot's single settle pass; duration runs,
+/// stops and every other outcome keep the single snapshot.
 #[test]
 fn cgroup_snapshot_resume_rule_answers_posed_states() {
+    use crate::discovery::scan_pass::{CursorRank, DecodeCursorKey};
     use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
     use crate::scope::inventory_cgroup::CgroupIncomplete;
     let work_limit = || {
@@ -1192,78 +1195,122 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
             CgroupIncomplete::WorkLimit,
         ))
     };
-    let position = |progress: Option<(usize, usize, usize)>,
-                    fingerprint: Option<(u64, u64)>|
-     -> CgroupResumePosition {
-        CgroupResumePosition {
-            progress,
-            fingerprint,
-        }
+    let a = DecodeCursorKey::for_test(10, 1, 1);
+    let b = DecodeCursorKey::for_test(10, 1, 2);
+    let rank = |complete: bool, tables: (usize, u64), interfaces: (usize, u64), cached: usize| {
+        CursorRank::for_test(complete, tables, interfaces, cached)
     };
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
     let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
-    // Nothing unfinished never resumes.
-    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit());
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(None, None);
-    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(None, None);
+    let mut report = PassReport {
+        pass: 0,
+        scanned: 0,
+        maps_matched: 0,
+        native_callers: 0,
+        scan_callers: 0,
+        engine_changed: false,
+        pending_refresh: Vec::new(),
+        events: Vec::new(),
+        timings: crate::timing::StageTimings::new(),
+    };
+    let mut pass = |driver: &mut ObservedDriver<'_>,
+                    outcome: ScopedCollectionOutcome,
+                    frontier: Vec<(DecodeCursorKey, CursorRank)>|
+     -> bool {
+        let unfinished = frontier.iter().any(|(_, rank)| *rank < rank_done());
+        driver
+            .inner
+            .coordinator
+            .pose_cgroup_resume_completion_for_test(
+                outcome,
+                unfinished.then_some((0, frontier.len(), 0)),
+                frontier,
+            );
+        driver
+            .inner
+            .finish_pass(&mut report)
+            .expect("the pass finishes");
+        driver.inner.snapshot_resume_pending()
+    };
+    fn rank_done() -> crate::discovery::scan_pass::CursorRank {
+        crate::discovery::scan_pass::CursorRank::for_test(true, (0, 0), (0, 0), 0)
+    }
+    let fresh_driver = |driver: &mut ObservedDriver<'_>| {
+        let cgroup = driver.inner.cgroup.as_mut().unwrap();
+        cgroup.resume = Some(crate::discovery::scan_pass::SnapshotResumeLedger::starting_now());
+        cgroup.grant = crate::discovery::scan_pass::ResumeGrant::Stop;
+    };
+    // Nothing recorded yet never resumes.
     assert!(!driver.inner.snapshot_resume_pending());
     // The first unfinished pass always resumes.
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 360)));
-    assert!(driver.inner.snapshot_resume_pending());
+    let start = rank(false, (0, 360), (0, 0), 4);
+    assert!(pass(&mut driver, work_limit(), vec![(a.clone(), start)]));
     // Each advance coordinate resumes on its own.
-    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(Some((0, 1, 4)), Some((0, 360)));
-    for (progress, fingerprint) in [
-        (Some((1, 1, 4)), Some((0, 360))),
-        (Some((0, 1, 5)), Some((0, 360))),
-        (Some((0, 1, 4)), Some((1, 360))),
-        (Some((0, 1, 4)), Some((0, 361))),
+    for advanced in [
+        rank(false, (0, 361), (0, 0), 4),
+        rank(false, (1, 0), (0, 0), 4),
+        rank(false, (1, 0), (0, 5), 4),
+        rank(false, (1, 0), (0, 5), 5),
+        rank(true, (0, 0), (0, 0), 0),
     ] {
-        driver.inner.cgroup.as_mut().unwrap().last_resume = position(progress, fingerprint);
         assert!(
-            driver.inner.snapshot_resume_pending(),
-            "advancing to {progress:?}/{fingerprint:?} must resume"
+            pass(
+                &mut driver,
+                work_limit(),
+                vec![(a.clone(), advanced), (b.clone(), start)]
+            ),
+            "advancing to {advanced:?} must resume"
         );
     }
     // An unchanged position stalls: a full fresh allowance moved
     // nothing, so the snapshot ends honestly.
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 360)));
-    assert!(!driver.inner.snapshot_resume_pending());
-    // Reached-object growth alone never resumes: genuine discovery
-    // sweeps, decodes or completes with it, while growth without
-    // any of those is churn, not progress.
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 2, 4)), Some((0, 360)));
-    assert!(!driver.inner.snapshot_resume_pending());
-    // A regressed position (dropped cursor, fresh restart behind
-    // the old frontier) never resumes either.
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 359)));
-    assert!(!driver.inner.snapshot_resume_pending());
-    // A converged scan with no bind budget gets one settle pass.
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(None, None);
-    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(Some((0, 1, 4)), Some((0, 360)));
-    assert!(driver.inner.snapshot_resume_pending());
-    // Two consecutive no-progress passes end the snapshot: the
-    // settle retry is spent.
-    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(None, None);
-    assert!(!driver.inner.snapshot_resume_pending());
-    // A scan that fits pass zero with no bind budget left still
-    // settles once (no previous position to compare against).
-    let cgroup = driver.inner.cgroup.as_ref().unwrap();
-    assert!(cgroup.settle_pending(1));
-    assert!(!cgroup.settle_pending(2));
-    // Only a work stop resumes: a complete transaction and any
-    // other incomplete outcome keep the single snapshot, even
-    // with unfinished progress posed.
-    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 361)));
-    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(Some((0, 1, 4)), Some((0, 360)));
-    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(ScopedCollectionOutcome::Complete);
-    assert!(!driver.inner.snapshot_resume_pending());
-    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(ScopedCollectionOutcome::Incomplete(
-        ScopedCollectionGap::ScanIncomplete,
+    let held = vec![(a.clone(), rank_done()), (b.clone(), start)];
+    assert!(!pass(&mut driver, work_limit(), held.clone()));
+    // Reached-object growth alone never resumes.
+    let mut grown = held.clone();
+    grown.push((DecodeCursorKey::for_test(10, 1, 3), CursorRank::default()));
+    assert!(!pass(&mut driver, work_limit(), grown));
+    // A regressed or alternating position (a dropped cursor, a fresh
+    // restart behind the old frontier) never resumes either.
+    assert!(!pass(
+        &mut driver,
+        work_limit(),
+        vec![
+            (a.clone(), rank(false, (0, 1), (0, 0), 0)),
+            (b.clone(), start)
+        ]
     ));
-    assert!(!driver.inner.snapshot_resume_pending());
+    assert!(!pass(&mut driver, work_limit(), held.clone()));
+    // A converged scan with no bind budget gets one settle pass, and
+    // only one: renewed unfinished work after it may resume, but a
+    // later converged pass never settles again.
+    assert!(pass(
+        &mut driver,
+        work_limit(),
+        vec![(a.clone(), rank_done()), (b.clone(), rank_done())]
+    ));
+    assert!(!pass(
+        &mut driver,
+        work_limit(),
+        vec![(a.clone(), rank_done()), (b.clone(), rank_done())]
+    ));
+    // Only a work stop resumes: a complete transaction and any other
+    // incomplete outcome keep the single snapshot, even with advancing
+    // progress posed.
+    fresh_driver(&mut driver);
+    assert!(!pass(
+        &mut driver,
+        ScopedCollectionOutcome::Complete,
+        vec![(a.clone(), start)]
+    ));
+    assert!(!pass(
+        &mut driver,
+        ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete),
+        vec![(a.clone(), rank(false, (0, 400), (0, 0), 4))]
+    ));
     // Duration runs, stops and a latched control never resume.
-    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit());
-    assert!(driver.inner.snapshot_resume_pending());
+    fresh_driver(&mut driver);
+    assert!(pass(&mut driver, work_limit(), vec![(a.clone(), start)]));
     driver.inner.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     assert!(!driver.inner.snapshot_resume_pending());
     driver.inner.deadline = None;

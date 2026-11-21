@@ -46,6 +46,7 @@ impl<'a> ObservedDriver<'a> {
                     last_outcome: None,
                     last_resume: CgroupResumePosition::default(),
                     prev_resume: CgroupResumePosition::default(),
+                    resume_high_water: std::collections::BTreeMap::new(),
                     settle_granted: false,
                 }),
                 max_scan_pids: None,
@@ -1236,15 +1237,31 @@ fn resume_position(
     }
 }
 
-/// Pose both resume slots on a driver.
+/// Pose both resume slots on a driver: the previous position doubles
+/// as the whole decided history, so single-step poses read exactly
+/// like the old adjacent rule while the decision runs the real
+/// high-water comparison.
 fn pose_resume(
     driver: &mut ClassicDriver<'_>,
     last: CgroupResumePosition,
     prev: CgroupResumePosition,
 ) {
     let cgroup = driver.cgroup.as_mut().unwrap();
+    cgroup.resume_high_water = prev.cursors.clone().unwrap_or_default();
     cgroup.last_resume = last;
     cgroup.prev_resume = prev;
+}
+
+/// Install one pass position, merging the superseded one into the
+/// high-water exactly like `finish_pass`, then decide: the multi-pass
+/// twins drive sequences through this so every decision reads the
+/// real retained history.
+fn pass_resume(driver: &mut ClassicDriver<'_>, last: CgroupResumePosition) -> bool {
+    let cgroup = driver.cgroup.as_mut().unwrap();
+    let previous = std::mem::replace(&mut cgroup.last_resume, last);
+    cgroup.merge_resume_high_water(&previous);
+    cgroup.prev_resume = previous;
+    driver.snapshot_resume_pending()
 }
 
 /// The snapshot settle grant is single-use across churn: a convergence
@@ -1481,6 +1498,167 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
     assert!(driver.inner.snapshot_resume_pending());
     driver.inner.cgroup.as_ref().unwrap().control.cancel();
     assert!(!driver.inner.snapshot_resume_pending());
+}
+
+/// Overlapping same-key cursor cycles stall: two cursors alternating
+/// table frontiers (900,950) and (950,900) grant while ground is
+/// uncovered, then stall in both directions once the high-water covers
+/// every frontier. An adjacent comparison grants all 32 transitions.
+#[test]
+fn cgroup_snapshot_resume_refuses_overlapping_cursor_cycles() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    for swapped in [false, true] {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+        driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+        let k1 = resume_key(7, 9, 11);
+        let k2 = resume_key(7, 9, 12);
+        let at = |w1: u64, w2: u64| {
+            let (w1, w2) = if swapped { (w2, w1) } else { (w1, w2) };
+            resume_position(vec![
+                (k1.clone(), resume_progress(100, (0, w1), (0, 0), 4, false)),
+                (k2.clone(), resume_progress(100, (0, w2), (0, 0), 4, false)),
+            ])
+        };
+        let s1 = at(900, 950);
+        let s2 = at(950, 900);
+        assert!(
+            pass_resume(&mut driver.inner, s1.clone()),
+            "swapped={swapped}: the first unfinished pass resumes"
+        );
+        assert!(
+            pass_resume(&mut driver.inner, s2.clone()),
+            "swapped={swapped}: the first uncovered advance grants once"
+        );
+        for round in 0..16 {
+            assert!(
+                !pass_resume(&mut driver.inner, s1.clone()),
+                "swapped={swapped} round {round}: covered ground stalls"
+            );
+            assert!(
+                !pass_resume(&mut driver.inner, s2.clone()),
+                "swapped={swapped} round {round}: the cycle never re-admits"
+            );
+        }
+    }
+}
+
+/// The high-water survives temporary disappearance: a cursor that
+/// leaves for a pass and returns to covered ground stalls, while a
+/// return past the retained high-water resumes.
+#[test]
+fn cgroup_snapshot_resume_retains_high_water_across_disappearance() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let k1 = resume_key(7, 9, 11);
+    let k2 = resume_key(7, 9, 12);
+    let at = |w1: Option<u64>, w2: u64| {
+        let mut entries = Vec::new();
+        if let Some(w1) = w1 {
+            entries.push((k1.clone(), resume_progress(100, (0, w1), (0, 0), 4, false)));
+        }
+        entries.push((k2.clone(), resume_progress(100, (0, w2), (0, 0), 4, false)));
+        resume_position(entries)
+    };
+    assert!(pass_resume(&mut driver.inner, at(Some(900), 500)));
+    assert!(
+        pass_resume(&mut driver.inner, at(None, 600)),
+        "the remaining cursor still advances while its sibling is gone"
+    );
+    assert!(
+        !pass_resume(&mut driver.inner, at(Some(900), 600)),
+        "a return to covered ground stalls even after a disappearance"
+    );
+    assert!(
+        pass_resume(&mut driver.inner, at(Some(950), 600)),
+        "a return past the retained high-water resumes"
+    );
+}
+
+/// Healthy multi-pass convergence still resumes: same identities,
+/// same layouts, advancing sweep frontiers, decoded tables and
+/// completion grant pass after pass until the scan converges; the
+/// converged scan settles exactly once and then ends.
+#[test]
+fn cgroup_snapshot_resume_converges_across_healthy_multi_pass_advance() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let k1 = resume_key(7, 9, 11);
+    let k2 = resume_key(7, 9, 12);
+    assert!(pass_resume(
+        &mut driver.inner,
+        resume_position(vec![
+            (k1.clone(), resume_progress(100, (0, 100), (0, 0), 0, false)),
+            (k2.clone(), resume_progress(100, (0, 100), (0, 0), 0, false)),
+        ]),
+    ));
+    assert!(
+        pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (k1.clone(), resume_progress(100, (0, 200), (0, 0), 1, false)),
+                (k2.clone(), resume_progress(100, (0, 100), (0, 0), 0, false)),
+            ]),
+        ),
+        "a further table frontier with a new decoded table resumes"
+    );
+    assert!(
+        pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (
+                    k1.clone(),
+                    resume_progress(100, (0, 200), (0, 50), 1, false),
+                ),
+                (k2.clone(), resume_progress(100, (1, 0), (0, 0), 0, false)),
+            ]),
+        ),
+        "interface and snapshot advances resume"
+    );
+    assert!(
+        pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (k1.clone(), resume_progress(100, (0, 200), (0, 50), 1, true)),
+                (k2.clone(), resume_progress(100, (1, 0), (0, 0), 0, false)),
+            ]),
+        ),
+        "completion resumes"
+    );
+    assert!(
+        pass_resume(
+            &mut driver.inner,
+            resume_position(vec![(
+                k2.clone(),
+                resume_progress(100, (9, 999), (9, 999), 9, false)
+            )]),
+        ),
+        "a lone remaining cursor resumes on its own advance"
+    );
+    assert!(
+        pass_resume(&mut driver.inner, resume_position(vec![])),
+        "the converged scan gets its one settle pass"
+    );
+    assert!(
+        !pass_resume(&mut driver.inner, resume_position(vec![])),
+        "the spent settle grant ends the snapshot"
+    );
 }
 
 #[test]

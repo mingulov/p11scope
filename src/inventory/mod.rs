@@ -2463,8 +2463,9 @@ impl InventorySelection {
 /// carried bundle — every cursor's work identity (process generation,
 /// file pin, executable image) with its layout-bound frontiers.
 /// `None` exactly when no cursor is unfinished. The snapshot rule
-/// compares same-key, same-layout progress only, so churn never reads
-/// as advance.
+/// advances only past the per-identity high-water over every decided
+/// pass, so churn never reads as advance and covered ground never
+/// re-admits.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CgroupResumePosition {
     cursors: Option<
@@ -2487,6 +2488,17 @@ struct CgroupDriverState {
     last_outcome: Option<crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome>,
     last_resume: CgroupResumePosition,
     prev_resume: CgroupResumePosition,
+    /// Per-identity resume high-water over every decided pass: the
+    /// furthest committed progress admitted for each work identity
+    /// (cursor key), retained across regressions, invalidations and
+    /// temporary disappearance. Only ground past it resumes, so two
+    /// cursors alternating over covered frontiers stall instead of
+    /// cycling. Bounded like the carried cursor map; identities past
+    /// the bound stay churn.
+    resume_high_water: BTreeMap<
+        crate::discovery::scan_pass::DecodeCursorKey,
+        crate::discovery::scan_pass::CommittedCursorProgress,
+    >,
     /// Whether the snapshot's one settle pass was granted: once spent,
     /// later convergences end the snapshot instead of settling again.
     settle_granted: bool,
@@ -2511,35 +2523,79 @@ impl CgroupDriverState {
             last_outcome: None,
             last_resume: CgroupResumePosition::default(),
             prev_resume: CgroupResumePosition::default(),
+            resume_high_water: BTreeMap::new(),
             settle_granted: false,
         })
     }
 
-    /// Whether the last pass left unfinished decode progress that
-    /// advanced since the previous pass: some cursor present in both
-    /// passes under the same layout (generation, pin, mappings) reached
-    /// a further lexicographic sweep position, decoded more tables, or
-    /// completed. New, removed or relaid-out cursors are churn, never
-    /// progress: an unchanged or churned position means the fresh
-    /// allowance moved no committed work forward, so the snapshot stops
-    /// and reports the live in-progress gap honestly instead of
-    /// spinning. The first unfinished pass always resumes (no previous
-    /// position to stall against).
+    /// Whether the last pass left unfinished decode progress past the
+    /// admitted high-water: some cursor reached, under the same layout
+    /// (generation, pin, mappings), a further lexicographic sweep
+    /// position, more decoded tables, or completion than every decided
+    /// pass admitted for its identity. New, removed or relaid-out
+    /// cursors are churn, never progress, and so is a return to
+    /// covered ground: an adjacent comparison would let two cursors
+    /// alternate advances forever, each masking the other's
+    /// regression. When nothing moves past the high-water the fresh
+    /// allowance moved no committed work forward, so the snapshot
+    /// stops and reports the live in-progress gap honestly instead of
+    /// spinning. The first unfinished pass always resumes (no covered
+    /// ground to stall against).
     fn resume_advancing(&self) -> bool {
         let Some(last) = &self.last_resume.cursors else {
             return false;
         };
-        let Some(prev) = &self.prev_resume.cursors else {
+        if self.resume_high_water.is_empty() {
             return true;
-        };
+        }
         last.iter().any(|(key, last_p)| {
-            prev.get(key).is_some_and(|prev_p| {
-                last_p.layout == prev_p.layout
-                    && (last_p.sweep_position() > prev_p.sweep_position()
-                        || last_p.tables_decoded > prev_p.tables_decoded
-                        || (!prev_p.complete && last_p.complete))
+            self.resume_high_water.get(key).is_some_and(|high| {
+                last_p.layout == high.layout
+                    && (last_p.sweep_position() > high.sweep_position()
+                        || last_p.tables_decoded > high.tables_decoded
+                        || (!high.complete && last_p.complete))
             })
         })
+    }
+
+    /// Merge one decided pass position into the snapshot's resume
+    /// high-water. New identities seed at their decided progress
+    /// without granting (arrival is not advance); admitted identities
+    /// rise monotonically, so regressions, invalidations and temporary
+    /// disappearance keep the furthest covered ground. A relaid-out
+    /// cursor re-baselines without granting, so later progress under
+    /// the new layout compares against it instead of the shifted one.
+    /// Admission is bounded like the carried cursor map; identities
+    /// past the bound stay churn.
+    fn merge_resume_high_water(&mut self, decided: &CgroupResumePosition) {
+        let Some(cursors) = &decided.cursors else {
+            return;
+        };
+        for (key, progress) in cursors {
+            match self.resume_high_water.get(key).copied() {
+                None => {
+                    if self.resume_high_water.len()
+                        < crate::discovery::scan_pass::MAX_DECODE_CURSORS
+                    {
+                        self.resume_high_water.insert(key.clone(), *progress);
+                    }
+                }
+                Some(high) => {
+                    if high.layout != progress.layout {
+                        self.resume_high_water.insert(key.clone(), *progress);
+                    } else {
+                        let mut raised = high;
+                        if progress.sweep_position() > high.sweep_position() {
+                            raised.tables = progress.tables;
+                            raised.interfaces = progress.interfaces;
+                        }
+                        raised.tables_decoded = raised.tables_decoded.max(progress.tables_decoded);
+                        raised.complete = raised.complete || progress.complete;
+                        self.resume_high_water.insert(key.clone(), raised);
+                    }
+                }
+            }
+        }
     }
 
     /// Whether the snapshot owes its one settle pass: the last pass left
@@ -7274,7 +7330,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             })?;
             let warning = completion.driver_warning();
             cgroup.continuation = Some(completion.state);
-            cgroup.prev_resume = std::mem::take(&mut cgroup.last_resume);
+            let decided = std::mem::take(&mut cgroup.last_resume);
+            cgroup.merge_resume_high_water(&decided);
+            cgroup.prev_resume = decided;
             cgroup.last_resume = CgroupResumePosition {
                 cursors: completion.progress_cursors,
             };
@@ -31137,6 +31195,7 @@ mod seal_readiness_tests {
             last_outcome: None,
             last_resume: CgroupResumePosition::default(),
             prev_resume: CgroupResumePosition::default(),
+            resume_high_water: BTreeMap::new(),
             settle_granted: false,
         });
         let root = tempfile::tempdir().expect("cgroup root");

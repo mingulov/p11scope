@@ -481,10 +481,15 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   run follow-up passes while same-cursor progress advances, plus
   one settle pass — plus three-route classification). No allowance
   is sized to fit any provider: any app size converges over several
-  passes. Convergence is monotone per-cursor progress (same
-  generation, pin and layout; invalidation or replacement never
-  resumes); when no cursor advances, the snapshot stops and the
-  live in-progress gap names the work left.
+  passes. Convergence is monotone per-cursor progress past a
+  per-identity high-water (same generation, pin and layout): the
+  snapshot retains the furthest admitted frontiers across
+  regressions, invalidations and disappearance within a bounded
+  identity set, seeding arrivals without granting, so an
+  alternating return to covered ground stalls; invalidation or
+  replacement never resumes. When no cursor advances past the
+  high-water, the snapshot stops and the live in-progress gap
+  names the work left.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

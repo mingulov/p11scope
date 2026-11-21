@@ -289,6 +289,7 @@ pub fn discover_with_self_memory(
         legacy_240.as_deref(),
         &memory,
         &map_index,
+        module_map_key,
         &mut objects,
     );
 
@@ -305,6 +306,7 @@ pub fn discover_with_self_memory(
         &inventory_tables,
         module_path,
         module_file_key,
+        module_map_key,
         &module_identity,
         &mut objects,
     );
@@ -762,10 +764,18 @@ struct NameRead {
 }
 
 /// A NUL-terminated name of at most [`INTERFACE_NAME_CAP`] bytes, read only
-/// inside the readable maps entry that contains `address`. A pointer outside
-/// a readable mapping is refused without a read, and a name without an
-/// in-mapping NUL is unreadable.
-fn read_name(memory: &ProcessMemory, maps: &maps::MapIndex<'_>, address: usize) -> NameRead {
+/// inside the readable provider mapping that contains `address`. A pointer
+/// outside a readable mapping, or inside a readable mapping that is not the
+/// provider's own, is refused without a read, and a name without an
+/// in-mapping NUL is unreadable. The provider key is the validated loaded
+/// module key, so a hostile name pointer cannot reach stack, environment or
+/// unrelated mappings.
+fn read_name(
+    memory: &ProcessMemory,
+    maps: &maps::MapIndex<'_>,
+    module_key: ObjectKey,
+    address: usize,
+) -> NameRead {
     if address == 0 {
         return NameRead {
             raw: None,
@@ -788,6 +798,17 @@ fn read_name(memory: &ProcessMemory, maps: &maps::MapIndex<'_>, address: usize) 
             error: Some(format!(
                 "name pointer in a non-readable mapping at 0x{address:x}"
             )),
+        };
+    }
+    let provider = match maps.resolve(address as u64) {
+        maps::Resolved::File { device, inode, .. } => ObjectKey { device, inode } == module_key,
+        _ => false,
+    };
+    if !provider {
+        return NameRead {
+            raw: None,
+            lossy: None,
+            error: Some("name pointer outside the provider mappings".into()),
         };
     }
     let mapping_bytes = mapping.end - address as u64;
@@ -1058,6 +1079,7 @@ fn legacy_surface(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn interface_records(
     acquisition: Result<Option<Vec<RawInterface>>, String>,
     raw_export: Option<usize>,
@@ -1065,6 +1087,7 @@ fn interface_records(
     legacy_240: Option<&[usize]>,
     memory: &ProcessMemory,
     maps: &maps::MapIndex<'_>,
+    module_key: ObjectKey,
     objects: &mut ObjectTable,
 ) -> (
     Acquisition,
@@ -1095,7 +1118,7 @@ fn interface_records(
     let mut vendor = Vec::new();
     let mut table_ptrs = Vec::new();
     for (index, entry) in raw.into_iter().enumerate() {
-        let name = read_name(memory, maps, entry.name_ptr as usize);
+        let name = read_name(memory, maps, module_key, entry.name_ptr as usize);
         let exact = name.raw.as_deref() == Some(b"PKCS 11".as_slice()) && name.error.is_none();
         let version = read_version(memory, entry.func_list as usize);
 
@@ -1347,6 +1370,7 @@ fn selection_acquisition(
     inventory_tables: &[Option<usize>],
     module_path: &Path,
     module_file_key: ObjectKey,
+    module_key: ObjectKey,
     module_identity: &ObjectIdentity,
     objects: &mut ObjectTable,
 ) -> (SelectionAcquisition, Vec<RawSelectionQuery>) {
@@ -1404,7 +1428,7 @@ fn selection_acquisition(
                                 .map_err(|_| SelectionFailure::UnreadableInterface)?;
                         let inventory_matches =
                             selection_inventory_indices(inventory_tables, table_pointer);
-                        let name = read_name(memory, maps_a, name_pointer);
+                        let name = read_name(memory, maps_a, module_key, name_pointer);
                         let version_read = read_version(memory, table_pointer);
                         let name_class = selection_name_class(&name, name_pointer);
                         let mut version_class =
@@ -1455,7 +1479,7 @@ fn selection_acquisition(
                         // and metadata again before accepting a heap or file view.
                         let confirmed_interface = read_interface(memory, output as usize)
                             .map_err(|_| SelectionFailure::ProviderChanged)?;
-                        let confirmed_name = read_name(memory, maps_a, name_pointer);
+                        let confirmed_name = read_name(memory, maps_a, module_key, name_pointer);
                         if confirmed_interface != (name_pointer, table_pointer, returned_flags)
                             || confirmed_name.raw != name.raw
                             || confirmed_name.error != name.error
@@ -2261,24 +2285,69 @@ mod tests {
     }
 
     /// Reads one provider name the way discovery does: against this
-    /// process's live maps.
-    fn read_name_at(memory: &ProcessMemory, address: usize) -> NameRead {
+    /// process's live maps, scoped to `module_key`.
+    fn read_name_at(memory: &ProcessMemory, module_key: ObjectKey, address: usize) -> NameRead {
         let entries = read_self_maps().unwrap();
         let index = validated_map_index(&entries).unwrap();
-        read_name(memory, &index, address)
+        read_name(memory, &index, module_key, address)
+    }
+
+    const TEST_PROVIDER_KEY: ObjectKey = ObjectKey {
+        device: Device { major: 8, minor: 1 },
+        inode: 7,
+    };
+
+    /// Clone the live mappings containing `addrs`, re-keyed as provider
+    /// mappings: the bounds stay exactly what the kernel reported, only
+    /// provenance is scripted, so the 64-byte cap and the in-mapping bound
+    /// stay testable now that foreign mappings are refused.
+    fn provider_view(
+        entries: &[maps::MapEntry],
+        addrs: &[u64],
+        module_key: ObjectKey,
+    ) -> Vec<maps::MapEntry> {
+        let index = validated_map_index(entries).unwrap();
+        let mut view = Vec::new();
+        for addr in addrs {
+            let containing = index.containing(*addr).expect("test buffer is mapped");
+            if view
+                .iter()
+                .all(|entry: &maps::MapEntry| entry.start != containing.start)
+            {
+                let mut entry = containing.clone();
+                entry.device = module_key.device;
+                entry.inode = module_key.inode;
+                entry.raw_path = Some(b"/provider.so".to_vec());
+                view.push(entry);
+            }
+        }
+        view.sort_by_key(|entry| entry.start);
+        view
     }
 
     #[test]
     fn provider_names_are_read_through_a_bounded_snapshot() {
         let memory = ProcessMemory::open().unwrap();
         let exact = b"PKCS 11\0ignored";
-        let name = read_name_at(&memory, exact.as_ptr() as usize);
+        let overlong = [b'x'; INTERFACE_NAME_CAP];
+        let entries = read_self_maps().unwrap();
+        let view = provider_view(
+            &entries,
+            &[exact.as_ptr() as u64, overlong.as_ptr() as u64],
+            TEST_PROVIDER_KEY,
+        );
+        let index = validated_map_index(&view).unwrap();
+        let name = read_name(&memory, &index, TEST_PROVIDER_KEY, exact.as_ptr() as usize);
         assert_eq!(name.raw.as_deref(), Some(b"PKCS 11".as_slice()));
         assert_eq!(name.lossy.as_deref(), Some("PKCS 11"));
         assert_eq!(name.error, None);
 
-        let overlong = [b'x'; INTERFACE_NAME_CAP];
-        let name = read_name_at(&memory, overlong.as_ptr() as usize);
+        let name = read_name(
+            &memory,
+            &index,
+            TEST_PROVIDER_KEY,
+            overlong.as_ptr() as usize,
+        );
         assert!(name.error.as_deref().unwrap().contains("overlong"));
         assert_eq!(name.raw.as_deref(), Some(overlong.as_slice()));
 
@@ -2320,7 +2389,14 @@ mod tests {
         assert_eq!(containing.permissions[0], b'r');
         assert_eq!(containing.end, address as u64 + PREFIX.len() as u64);
 
-        let name = read_name_at(&memory, address as usize);
+        let view = provider_view(&entries, &[address as u64], TEST_PROVIDER_KEY);
+        let provider_index = validated_map_index(&view).unwrap();
+        let name = read_name(
+            &memory,
+            &provider_index,
+            TEST_PROVIDER_KEY,
+            address as usize,
+        );
         assert_eq!(unsafe { libc::munmap(base, page * 2) }, 0);
 
         let error = name.error.as_deref().expect("an in-VMA NUL is required");
@@ -2338,7 +2414,7 @@ mod tests {
     fn interface_name_outside_readable_mappings_is_refused() {
         let memory = ProcessMemory::open().unwrap();
 
-        let unmapped = read_name_at(&memory, usize::MAX);
+        let unmapped = read_name_at(&memory, TEST_PROVIDER_KEY, usize::MAX);
         assert!(unmapped.raw.is_none());
         let error = unmapped
             .error
@@ -2364,7 +2440,7 @@ mod tests {
         }
         assert_eq!(unsafe { libc::mprotect(base, page, libc::PROT_NONE) }, 0);
 
-        let unreadable = read_name_at(&memory, base as usize);
+        let unreadable = read_name_at(&memory, TEST_PROVIDER_KEY, base as usize);
         assert_eq!(unsafe { libc::munmap(base, page) }, 0);
 
         assert!(unreadable.raw.is_none());
@@ -2383,15 +2459,16 @@ mod tests {
         // memory (the helper retains its environment). Readable with an
         // in-mapping NUL is not enough: only provider bytes may publish.
         let stack_name = b"HOSTILE_STACK_NAME\0";
-        let name = read_name_at(&memory, stack_name.as_ptr() as usize);
+        let name = read_name_at(&memory, TEST_PROVIDER_KEY, stack_name.as_ptr() as usize);
         assert!(
             name.raw.is_none(),
             "out-of-provider bytes were published: {name:?}"
         );
-        assert!(
-            name.error.is_some(),
-            "an out-of-provider pointer needs a recorded refusal: {name:?}"
-        );
+        let error = name
+            .error
+            .as_deref()
+            .expect("an out-of-provider pointer needs a recorded refusal: {name:?}");
+        assert!(error.contains("provider mappings"), "{error}");
     }
 
     /// A real address-bearing header failure, proving the probes below
@@ -2479,7 +2556,15 @@ mod tests {
     fn interface_name_read_is_capped_at_64_bytes() {
         let memory = ProcessMemory::open().unwrap();
         let overlong = vec![b'x'; 256];
-        let name = read_name_at(&memory, overlong.as_ptr() as usize);
+        let entries = read_self_maps().unwrap();
+        let view = provider_view(&entries, &[overlong.as_ptr() as u64], TEST_PROVIDER_KEY);
+        let index = validated_map_index(&view).unwrap();
+        let name = read_name(
+            &memory,
+            &index,
+            TEST_PROVIDER_KEY,
+            overlong.as_ptr() as usize,
+        );
         assert_eq!(name.raw.as_deref().map(<[u8]>::len), Some(64));
         let error = name
             .error

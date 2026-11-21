@@ -155,11 +155,13 @@ attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia
 attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_lp64
 # W3-2 kernel-identity gates: WRONLY EPERM, the section 6.5 functional
 # probe (hardlink-match vs copy-NONE plus the stale-generation phase),
-# its nested-pidns twin (kind observers run nested), the whole-system
-# shape cell, and the anchor-handle validator.
+# its nested-pidns twin (kind observers run nested), the TID-scoped
+# nonleader anchor run, the whole-system shape cell, and the
+# anchor-handle validator.
 attach::identity_iter::tests::anchor_maps_validate_real_handles
 attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none
 attach::identity_iter::tests::functional_probe_passes_in_nested_pid_namespace
+attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
 attach::identity_iter::tests::whole_system_run_covers_all_children
 attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
 # 5.15 identity-denial cell: real BTF named-fix refusal through the
@@ -812,6 +814,10 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_b
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n20480_default_lp64
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8193_refuses_lp64
+# WP-7 stop-after-last-waiter: the full prep/offset matrix over a linked
+# journal session (~3 min, gcc + SoftHSM2); the S3 suite also rows it
+# through scripts/ci/stop-races.sh.
+inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 # G21 default-ring wrap needs 266 changing observed rounds per leg (532 per
 # two-leg cell; 260 counted + 4 shared + fence + proof per leg, 264 without
 # fence/proof; ~12 min pid / ~27 min system per cell at declared 250ms pid /
@@ -875,9 +881,6 @@ discovery::sweep_attribution::tests::d4_thread_mapping_helper
 discovery::sweep_attribution::tests::d4_clone_without_files_mapping_helper
 discovery::sweep_attribution::tests::d4_zombie_single_survivor_mapping_helper
 attach::prearm_witness::prearm_witness_tests::witness_fixture_entrypoint
-# TID-scoped nonleader anchor run (installs nothing live; strict BPF
-# load): needs root with a live nonleader thread, run by hand.
-attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing
 attach::tests::bpf_loop_probe_reports_helper_presence_on_live_kernel
 # Historical/private opt-in counter refusals; never current host positives.
 attach::counter_banks::tests::counter_preparation_refuses_without_bpf_loop_on_old_kernels
@@ -885,7 +888,6 @@ metrics::counter_reader::tests::counter_bank_session_verifier_complexity_refuses
 # Unprivileged system-population graph sizing: memory, drain and release
 # are hard gates, the stop time is measured and disclosed (R-40).
 discovery::engine::tests::collected_graph_peak_fits_pool_at_system_scale
-inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 )
 SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
@@ -903,12 +905,12 @@ SKIP_REASONS=(
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; run this --exact selector --ignored as root in an authorized BPF lane"
 "needs default FULL libtest built with P11SCOPE_IMAGE_BANK_PROOF=1 and a Multi-capable host; prior E3 acceptance, a quiet exclusive host and matched production cost inputs P11_BANK_N5_PRODUCTION_NS_1/P11_BANK_N5_PRODUCTION_NS_4 required; run this --exact selector --ignored as root in an authorized BPF lane (E4/N5)"
 "needs a P11SCOPE_SMALL_STATE_MAPS=1 libtest build (the default binary fails its build gate by design); run by hand as root from that build with the variable set"
-"needs an external barrier controller: P11SCOPE_I3A_RETIREMENT_MODE=worker|synchronous plus a root-owned 0700 CONTROL_DIR, a NONCE, and an external party to write the release file; no in-repo controller exists, so run once per mode by hand"
+"needs an external barrier controller: P11SCOPE_I3A_RETIREMENT_MODE=worker|synchronous plus a root-owned 0700 CONTROL_DIR, a NONCE, and an external party to write the release file; no in-repo controller exists, so run once per mode by hand (synchronous mode needs lifecycle churn during the hold so the negative control sees isolated ring loss)"
 "private helper re-executed by DiscoveryLifecycleFixture with P11SCOPE_TEST_DISCOVERY_PROVIDER/MANIFEST; its own docs say it is not a separate passing test"
 "private count-manifest cache helper invoked only by count_manifest_full_and_tail_share_the_scan_inspection_cache with P11SCOPE_COUNT_MANIFEST_FULL/P11SCOPE_COUNT_MANIFEST_TAIL; the ordinary parent builds and validates its inputs, not an independent live cell"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
 "unprivileged C7 A2 timing loop (indicative wall time, no pass/fail bar); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture, ideally from a --release build"
-"needs a live root-owned target with two private cross-device mounts (same inode, distinct dev) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"
+"needs a live root-owned target with two private cross-device mounts (same inode, distinct dev; an overlay lower/merged pair works) plus P11SCOPE_ALIAS_COLLISION_PID/HINT/TARGET/HARDLINK"
 "needs a frozen supervisor config via P11SCOPE_FIRST_USE_PROBE_CONFIG plus an exclusive BPF lane; its verdict requires an external owned oracle"
 "private seccomp helper re-executed by real_pidfd_denial_preserves_proc_identity_without_signal_authority with P11SCOPE_TEST_PIDFD_DENIAL_*; that unprivileged test is its only passing form"
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
@@ -919,12 +921,10 @@ SKIP_REASONS=(
 "private re-exec entrypoint for the owned literal-clone parity fixture; missing owned configuration fails and this helper never qualifies independently"
 "private re-exec entrypoint for the owned single-survivor zombie fixture; missing owning socket/source fails and this helper never qualifies independently"
 "private re-exec entrypoint for the P2-7 witness fixture children (P11SCOPE_PW_CHILD modes); missing fixture configuration fails and this helper never qualifies independently"
-"needs root with a live nonleader thread for the TID-scoped anchor run (strict BPF load, installs nothing live); run the exact ignored test by hand as root in an authorized BPF lane with --test-threads=1 --nocapture"
 "live-kernel BPF lane: reports bpf_loop helper presence without asserting it; run exact --ignored as root in an authorized BPF lane"
 "pre-5.17 kernel lane: proves preparation refuses cleanly without the bpf_loop helper (passes vacuously on newer hosts); run exact --ignored as root on that kernel lane"
 "6.1 E2BIG lane: proves the verifier-budget refusal maps before lifecycle without activating; run exact --ignored as root on the 6.1 verifier-budget host"
 "unprivileged system-population graph sizing (4096 pin files plus 16384 native links; memory, drain and release asserts gate, the stop time is measured, not gated); not a campaign cell: run by hand with --exact <path> --ignored --test-threads=1 --nocapture on a host whose hard RLIMIT_NOFILE fits the population"
-"needs root, gcc/softhsm tooling and a built observer with p11scope-discover beside it; run by hand via scripts/ci/stop-races.sh (results.jsonl entry), unscheduled in CI"
 )
 
 # Btrfs campaign cells: run only with --include-btrfs. Each needs

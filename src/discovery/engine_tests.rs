@@ -54820,9 +54820,7 @@ fn e06_spawn_sleeps_accepts_statically_linked_child() {
         let bytes = std::fs::read(format!("/proc/{pid}/maps")).expect("readable maps");
         let maps = parse_maps(&bytes).expect("parseable maps");
         assert!(
-            !maps
-                .iter()
-                .any(|mapping| crate::discovery::scan::is_provider_mapping(mapping)),
+            !maps.iter().any(crate::discovery::scan::is_provider_mapping),
             "static child {pid} maps no provider shape"
         );
         assert!(

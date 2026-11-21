@@ -498,27 +498,20 @@ impl<'a> JournalLeaves<'a> {
         if self.adapter.image_taint_blocks(key.image(), fence) {
             return None;
         }
-        self.refuse_key(key, fence, capable)
+        self.refuse_key(key, capable)
     }
 
     /// Refuse one key (publishing first) and return its held model
-    /// domain's abandonment. `died_at` evidences the refusal (the
-    /// void's upper for preserved dooms, the consumption point
-    /// otherwise) and `capable` whether a capable frame grounds it,
-    /// for incarnation fencing.
-    fn refuse_key(
-        &mut self,
-        key: JournalDomainKey,
-        died_at: u64,
-        capable: bool,
-    ) -> Option<DomainRetirement> {
+    /// domain's abandonment. `capable` tells whether a capable frame
+    /// grounds it, for incarnation fencing.
+    fn refuse_key(&mut self, key: JournalDomainKey, capable: bool) -> Option<DomainRetirement> {
         let lived = self.adapter.key_is_live(key);
         let (era, registered) = {
             let state = self.adapter.keys.get_mut(&key).expect("refused key");
             state.refused = true;
             (state.era, state.model_registered)
         };
-        self.adapter.note_refused_mark(key, died_at, capable);
+        self.adapter.note_refused_mark(key, capable);
         self.adapter.claims_prune_dirty |= lived;
         registered.then(|| {
             DomainRetirement::abandon(ObjectDomain::sealed(&JournalDomainProof { key, era }))
@@ -670,8 +663,7 @@ impl<'a> JournalLeaves<'a> {
             }
             // Unlocalized disposal evidences stream corruption:
             // unknown effects from live frames never mint past it.
-            self.adapter
-                .note_refused_mark(key, self.adapter.consumed_through, true);
+            self.adapter.note_refused_mark(key, true);
             return Some(FenceAllVisit {
                 key,
                 scope,
@@ -818,13 +810,12 @@ impl<'a> JournalLeaves<'a> {
         self.visit();
         let era = self.adapter.keys[&key].era;
         let lived = self.adapter.key_is_live(key);
-        let died_at = self.adapter.consumed_through;
         self.adapter
             .keys
             .get_mut(&key)
             .expect("stopped key")
             .refused = true;
-        self.adapter.note_refused_mark(key, died_at, false);
+        self.adapter.note_refused_mark(key, false);
         self.adapter.claims_prune_dirty |= lived;
         DomainRetirement::abandon(ObjectDomain::sealed(&JournalDomainProof { key, era }))
     }
@@ -956,8 +947,7 @@ impl<'a> JournalLeaves<'a> {
         }
         // Disposed raw content is unknown effects from a live stream:
         // the refusal never mints past it.
-        let died_at = self.adapter.consumed_through;
-        Some((key, Some(scope), self.refuse_key(key, died_at, true)))
+        Some((key, Some(scope), self.refuse_key(key, true)))
     }
 
     /// Drop the open entry after `after` when its image is tainted (one
@@ -1104,8 +1094,7 @@ impl<'a> JournalLeaves<'a> {
         }
         // An S1-only bulk refusal marks history unproven, never
         // invalid: fresh proof past a void re-proves it.
-        let died_at = self.adapter.consumed_through;
-        Some((key, self.refuse_key(key, died_at, false)))
+        Some((key, self.refuse_key(key, false)))
     }
 
     /// The S1-only subject after `after` (one unit): its shape when it

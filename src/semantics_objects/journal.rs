@@ -755,28 +755,22 @@ struct ImageSighting {
 
 /// One key's attribution of its image's staged history at a frontier.
 /// Death evidence for one dead journal key, kept outside the
-/// size-pinned per-key state (only dead keys hold an entry): when
-/// each death was recorded and whether any refusal grounds in a
-/// capable frame. A fresh incarnation mints only for recorded,
-/// fenced, non-capable deaths; test-posed flags without an entry
-/// never mint.
+/// size-pinned per-key state (only dead keys hold an entry): which
+/// deaths were recorded and whether any refusal grounds in a
+/// capable frame. A fresh incarnation mints only for recorded
+/// deaths on a fenced key, never past a capable frame, and never
+/// for test-posed flags without an entry. No ordinals: the dead key
+/// never seals again, births cut at the current frontier, and claims
+/// gate conversion, so a mint re-examines nothing regardless of when
+/// the death landed relative to the fence.
 #[derive(Debug, Default)]
 struct JournalDeathMarks {
-    /// Refusal ordinal plus capable-frame grounding.
-    refused: Option<(u64, bool)>,
-    /// Taint ordinal (its confusion does not transfer domains).
-    tainted: Option<u64>,
-    /// Clean-close ordinal.
-    ended: Option<u64>,
-}
-
-impl JournalDeathMarks {
-    /// Whether the recorded refusal mints past the fence: fenced,
-    /// covered by its void, and grounded in a dead frame.
-    fn refused_mints(&self, fence: u64) -> bool {
-        self.refused
-            .is_some_and(|(at, capable)| !capable && at <= fence)
-    }
+    /// Refusal grounding: capable frame (never mints) or dead frame.
+    refused_capable: Option<bool>,
+    /// Tainted (its confusion does not transfer domains).
+    tainted: bool,
+    /// Clean close.
+    ended: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4217,7 +4211,7 @@ impl JournalAdapter {
             let lived = self.key_is_live(key);
             if let Some(state) = self.keys.get_mut(&key) {
                 state.tainted = true;
-                self.note_tainted_mark(key, self.consumed_through);
+                self.note_tainted_mark(key);
             }
             self.claims_prune_dirty |= lived;
             self.taint_overflow_pending.insert(image, at + 1);
@@ -6610,31 +6604,32 @@ impl JournalAdapter {
         reason == p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT
     }
 
-    /// Whether a fresh incarnation may mint for a permanently dead key:
-    /// a void fenced it past everything it sealed. A refusal mints
-    /// only when fenced, covered by its void, and grounded in a dead
-    /// frame (never a capable one); a taint mints once recorded (its
-    /// confusion does not transfer to a fresh domain); a clean close
-    /// mints once fenced past it. An unrecorded death never mints.
+    /// Whether a fresh incarnation may mint for a permanently dead
+    /// key: some void fenced it, every death is recorded, and no
+    /// refusal grounds in a capable frame. Unlike the sibling rule
+    /// (a live sibling keeps sealing, so its fence must cover its
+    /// sealed history), a dead key never seals again, so neither the
+    /// fence position relative to its sealed history nor the death
+    /// position relative to the fence matters: births cut at the
+    /// current frontier and claims gate conversion.
     fn incarnation_mint_eligible(&self, latest: JournalDomainKey) -> bool {
         self.keys.get(&latest).is_some_and(|state| {
             state.void_fence > 0
-                && state.void_fence >= state.sealed_through
                 && (!state.refused
                     || self
                         .death_marks
                         .get(&latest)
-                        .is_some_and(|marks| marks.refused_mints(state.void_fence)))
+                        .is_some_and(|marks| marks.refused_capable == Some(false)))
                 && (!state.tainted
                     || self
                         .death_marks
                         .get(&latest)
-                        .is_some_and(|marks| marks.tainted.is_some()))
+                        .is_some_and(|marks| marks.tainted))
                 && (!state.era_ended
                     || self
                         .death_marks
                         .get(&latest)
-                        .is_some_and(|marks| marks.ended.is_some_and(|at| at <= state.void_fence)))
+                        .is_some_and(|marks| marks.ended))
         })
     }
 
@@ -8477,7 +8472,7 @@ impl JournalAdapter {
             }
             let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("doomed key").refused = true;
-            self.note_refused_mark(key, fence, capable);
+            self.note_refused_mark(key, capable);
             self.claims_prune_dirty |= lived;
         }
         effects
@@ -9529,9 +9524,8 @@ impl JournalAdapter {
         let ticket =
             self.issue_doom_rejection(key, live, super::state::DomainRetirement::abandon(domain));
         let lived = self.key_is_live(key);
-        let died_at = self.consumed_through;
         self.keys.get_mut(&key).expect("sealed key").refused = true;
-        self.note_refused_mark(key, died_at, capable);
+        self.note_refused_mark(key, capable);
         self.claims_prune_dirty |= lived;
         let mut failure = SealFailure {
             take_failed: None,
@@ -9734,32 +9728,26 @@ impl JournalAdapter {
     /// point, recording the death ordinal for incarnation fencing.
     fn surprise_taint_key(&mut self, key: JournalDomainKey) {
         let lived = self.key_is_live(key);
-        let died_at = self.consumed_through;
         self.keys.get_mut(&key).expect("sealed key").tainted = true;
-        self.note_tainted_mark(key, died_at);
+        self.note_tainted_mark(key);
         self.claims_prune_dirty |= lived;
     }
 
-    /// Record one key's refusal evidence (ordinal plus capable-frame
-    /// grounding) for incarnation fencing.
-    fn note_refused_mark(&mut self, key: JournalDomainKey, died_at: u64, capable: bool) {
+    /// Record one key's refusal grounding (capable frame or dead
+    /// frame) for incarnation fencing.
+    fn note_refused_mark(&mut self, key: JournalDomainKey, capable: bool) {
         let marks = self.death_marks.entry(key).or_default();
-        marks.refused = Some(match marks.refused {
-            Some((at, was_capable)) => (at.min(died_at), was_capable || capable),
-            None => (died_at, capable),
-        });
+        marks.refused_capable = Some(marks.refused_capable.map_or(capable, |was| was || capable));
     }
 
-    /// Record one key's taint ordinal for incarnation fencing.
-    fn note_tainted_mark(&mut self, key: JournalDomainKey, died_at: u64) {
-        let marks = self.death_marks.entry(key).or_default();
-        marks.tainted = Some(marks.tainted.map_or(died_at, |at| at.min(died_at)));
+    /// Record one key's taint for incarnation fencing.
+    fn note_tainted_mark(&mut self, key: JournalDomainKey) {
+        self.death_marks.entry(key).or_default().tainted = true;
     }
 
-    /// Record one key's clean-close ordinal for incarnation fencing.
-    fn note_ended_mark(&mut self, key: JournalDomainKey, died_at: u64) {
-        let marks = self.death_marks.entry(key).or_default();
-        marks.ended = Some(marks.ended.map_or(died_at, |at| at.min(died_at)));
+    /// Record one key's clean close for incarnation fencing.
+    fn note_ended_mark(&mut self, key: JournalDomainKey) {
+        self.death_marks.entry(key).or_default().ended = true;
     }
 
     /// Register, convert (refused, begins, terminals, abandonments),
@@ -10247,9 +10235,8 @@ impl JournalAdapter {
         });
         if ended {
             let lived = self.key_is_live(key);
-            let died_at = self.consumed_through;
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
-            self.note_ended_mark(key, died_at);
+            self.note_ended_mark(key);
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
                 take_failed: None,
@@ -25614,6 +25601,118 @@ pub(crate) mod tests {
             .expect("the incarnation tracks new sessions past the void");
         assert_eq!(success.prefix.settled().len(), 1);
         assert_eq!(success.prefix.domain(), reborn.domain());
+        let stale = scene
+            .seal_at(&bootstrap, 8)
+            .expect_err("the doomed proof keeps refusing");
+        assert_eq!(stale.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_seal_time_exit_doom_mints_past_it() {
+        // Joint re-entry after a seal-time doom: healthy tracking, a
+        // fault void, same-key rebirth with post-void seals, then a
+        // seal-time doom grounded in a dead frame (an exit
+        // abandonment with corroborated negative evidence). The doom
+        // is fresh (past the fence) and the key sealed past the
+        // fence, yet a fresh incarnation still mints: the dead key
+        // never seals again, births cut at the current frontier, and
+        // claims gate conversion, so nothing re-examines the sealed
+        // history. The doomed proof keeps refusing.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene.attest();
+        let second = begin_bytes(1, 2, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene
+            .seal_at(&rebirth, 8)
+            .expect("same-key rebirth seals past the void");
+        assert!(
+            scene.adapter.keys[&proof.key].sealed_through > fence,
+            "the rebirth seals past the old fence"
+        );
+        // Seal-time doom: an exit abandonment with corroborated
+        // negative evidence, discovered at seal (no void).
+        scene.attest_session_function(SESSION, "C_GetAttributeValue");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 3, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 3, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let doom = scene
+            .seal_at(&rebirth, 8)
+            .expect_err("seal-time doom refuses");
+        assert_eq!(doom.gap, JournalGap::DomainTainted);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("doomed key")
+                .refused,
+            "the seal dooms the key on negative evidence"
+        );
+        // The dead binding mints past its fresh exit-grounded doom.
+        let reborn = scene.attest_function("C_CreateObject");
+        assert_ne!(
+            reborn.key, proof.key,
+            "re-entry mints past a fenced exit-grounded doom"
+        );
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            scene.adapter.consumed_through,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let third = begin_bytes(1, 4, create, 0);
+        scene.ingest(&third);
+        scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 80));
+        let success = scene
+            .seal_at(&rebirth, 8)
+            .expect("the incarnation tracks past the doom");
+        assert_eq!(success.prefix.settled().len(), 1);
         let stale = scene
             .seal_at(&bootstrap, 8)
             .expect_err("the doomed proof keeps refusing");

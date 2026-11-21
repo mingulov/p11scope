@@ -1168,7 +1168,7 @@ class JournalGateTests(unittest.TestCase):
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "nonqualifying")
-        self.assertIn("guest stages never ran", row["detail"])
+        self.assertIn("guest stage record corrupt", row["detail"])
 
     def test_key_sizes_run_with_workload_ready_bel_fails(self):
         # A workload-ready stage with a trailing BEL is not the exact
@@ -1182,7 +1182,7 @@ class JournalGateTests(unittest.TestCase):
         (row,) = self.read_rows(out)
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "nonqualifying")
-        self.assertIn("guest stages never ran", row["detail"])
+        self.assertIn("guest stage record corrupt", row["detail"])
 
     def test_key_sizes_run_with_release_suffix_fails(self):
         # A guest release with a second equals section is not the

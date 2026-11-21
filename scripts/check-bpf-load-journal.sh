@@ -475,8 +475,14 @@ for KERNEL in "$@"; do
         infra_fail "vng run failed or timed out"
         continue
     fi
-    if ! grep -aEq '^journal-rc=[0-9]+$' "$VNG_LOG"; then
-        infra_fail "no guest exit line"
+    # Guest status records are identified by label, then the intended
+    # singleton is validated before use: a missing, corrupt or
+    # contradictory record refuses as infrastructure, never falls
+    # back to an older well-shaped line.
+    J_RC_LABELS=$(grep -ac '^journal-rc=' "$VNG_LOG" || true)
+    J_RC_GOOD=$(grep -acE '^journal-rc=[0-9]+$' "$VNG_LOG" || true)
+    if [ "$J_RC_LABELS" != 1 ] || [ "$J_RC_GOOD" != 1 ]; then
+        infra_fail "guest exit line missing, corrupt or contradictory"
         continue
     fi
     # The boot-config staging line is printed but not gated: vng's
@@ -486,20 +492,37 @@ for KERNEL in "$@"; do
     # it strictly after successful boot staging, loop mount and tmp
     # checks, and every staging failure returns before it.
     grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
-    if ! grep -aEq '^guest-work-ready=ext4 uid-mode=0:700 TMPDIR=/var/tmp/p11scope-bpf\.[^=[:space:][:cntrl:]]+$' "$VNG_LOG"; then
+    WORK_READY_LABELS=$(grep -ac '^guest-work-ready=' "$VNG_LOG" || true)
+    WORK_READY_GOOD=$(grep -acE '^guest-work-ready=ext4 uid-mode=0:700 TMPDIR=/var/tmp/p11scope-bpf\.[A-Za-z0-9_]{6,}$' "$VNG_LOG" || true)
+    if [ "$WORK_READY_LABELS" != 1 ] || [ "$WORK_READY_GOOD" != 1 ]; then
         infra_fail "guest work area never readied"
         continue
     fi
-    if ! grep -a '^guest-release=' "$VNG_LOG" | tail -1 | grep -aEq '^guest-release=[^=[:space:][:cntrl:]]+$'; then
-        GUEST_RELEASE=$(grep -a '^guest-release=' "$VNG_LOG" | tail -1 | cut -d= -f2-)
-        infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
+    GUEST_RELEASE_LABELS=$(grep -ac '^guest-release=' "$VNG_LOG" || true)
+    GUEST_RELEASE_GOOD=$(grep -acE '^guest-release=[^=[:space:][:cntrl:]]+$' "$VNG_LOG" || true)
+    if [ "$GUEST_RELEASE_LABELS" != 1 ] || [ "$GUEST_RELEASE_GOOD" != 1 ]; then
+        infra_fail "guest release line missing, corrupt or contradictory (expected $KERNEL)"
         continue
     fi
-    GUEST_RELEASE=$(grep -aE '^guest-release=[^=[:space:][:cntrl:]]+$' "$VNG_LOG" | tail -1 | cut -d= -f2)
+    GUEST_RELEASE=$(grep -aE '^guest-release=[^=[:space:][:cntrl:]]+$' "$VNG_LOG" | cut -d= -f2)
     if release_ok "$KERNEL" "$GUEST_RELEASE"; then
         echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
     else
         infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
+        continue
+    fi
+    # Stage records: any label that is not a known exact form is
+    # corrupt, and any kind appearing twice is contradictory; both
+    # refuse before the vetoes and positives below.
+    if grep -a '^guest-stage=' "$VNG_LOG" | grep -aqEv '^guest-stage=(token-ok|token-failed|workload-ready|workload-not-ready|observer-rc=[0-9]+)$'; then
+        infra_fail "guest stage record corrupt"
+        continue
+    fi
+    TOKEN_STAGES=$(grep -acE '^guest-stage=token-(ok|failed)$' "$VNG_LOG" || true)
+    WORKLOAD_STAGES=$(grep -acE '^guest-stage=workload-(ready|not-ready)$' "$VNG_LOG" || true)
+    OBSERVER_STAGES=$(grep -acE '^guest-stage=observer-rc=[0-9]+$' "$VNG_LOG" || true)
+    if [ "$TOKEN_STAGES" -gt 1 ] || [ "$WORKLOAD_STAGES" -gt 1 ] || [ "$OBSERVER_STAGES" -gt 1 ]; then
+        infra_fail "guest stage records contradictory"
         continue
     fi
     if grep -aEq '^guest-stage=token-failed$' "$VNG_LOG"; then
@@ -515,7 +538,7 @@ for KERNEL in "$@"; do
         infra_fail "guest stages never ran"
         continue
     fi
-    J_RC=$(grep -aE '^journal-rc=[0-9]+$' "$VNG_LOG" | tail -1 | cut -d= -f2)
+    J_RC=$(grep -aE '^journal-rc=[0-9]+$' "$VNG_LOG" | cut -d= -f2)
     echo "# journal rc=$J_RC"
     # Both journal roots loaded, from the raw probe rows (the report
     # below gates counts, but only budgets gate presence, so the pair
@@ -611,9 +634,13 @@ PY
         if [ ! -f "$J_TXT" ] || ! grep -q 'live capture \(needs CAP_\|refused:\|unavailable:\|did not start:\)' "$J_TXT"; then
             add_reason "finite live-capture refusal missing"
         fi
-        if [ "$J_RC" = 0 ]; then
-            add_reason "observer exited 0 on a pre-Multi kernel"
-        fi
+        case "$J_RC" in
+            1) ;;
+            124) add_reason "observer timed out past its backstop (rc=124), not a finite refusal" ;;
+            129|130|131|132|133|134|135|136|137|138|139|140|141|142|143)
+                add_reason "observer signaled (rc=$J_RC), not a finite refusal" ;;
+            *) add_reason "observer exited rc=$J_RC, want 1 (finite refusal)" ;;
+        esac
         if [ "$PROBE_OK" != 1 ]; then
             add_reason "probe rows unreadable or corrupt"
         fi

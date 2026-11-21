@@ -130,6 +130,31 @@ const SEED_IDS: &[u64] = &[
 ];
 const GOST_IDS: &[u64] = &[0x00001221, 0x00001222, 0x00001223, 0x00001224];
 
+/// Controller ruling fix2 (2026-11-21, keygen-family inference):
+/// per-family key-pair-generation tables (sorted, for binary
+/// search). Each member names exactly one family, so it infers
+/// (source: mechanism) — family-only, never consulted by
+/// `classify_size`, so the parameter set still comes only from
+/// lengths or template values. KEA keygen names DH (its derives
+/// are DH); Edwards keygen names EdDSA. Montgomery, GOSTR3410,
+/// HSS/XMSS keygens name no single family and stay out (pinned by
+/// `infer_nothing_spots`); single-key `_KEY_GEN` and
+/// `_PARAMETER_GEN` ids are outside the ruling's key-pair scope.
+const KEYGEN_RSA_IDS: &[u64] = &[0x00000000, 0x0000000a];
+const KEYGEN_DSA_IDS: &[u64] = &[0x00000010];
+const KEYGEN_DH_IDS: &[u64] = &[0x00000020, 0x00000030, 0x00001010];
+const KEYGEN_EC_IDS: &[u64] = &[0x00001040, 0x0000140b];
+const KEYGEN_EDDSA_IDS: &[u64] = &[0x00001055];
+const KEYGEN_ML_KEM_IDS: &[u64] = &[0x0000000f];
+const KEYGEN_ML_DSA_IDS: &[u64] = &[0x0000001c];
+const KEYGEN_SLH_DSA_IDS: &[u64] = &[0x0000002d];
+/// The attested vendor keygen twin of [`NSS_ML_KEM_IDS`]:
+/// `CKM_NSS_ML_KEM_KEY_PAIR_GEN` (`0xCE53_4380`, NSS
+/// `lib/util/pkcs11n.h` `CKM_NSS + 48`), which NSS TLS uses on
+/// non-FIPS softoken. Same family-only inference as the standard
+/// PQC keygen ids; legacy Kyber keygen stays silent.
+const NSS_ML_KEM_KEYGEN_IDS: &[u64] = &[0xCE53_4380];
+
 /// §5.2 mechanism subsets: the ECDSA sign/verify ids (ECDSA plus the
 /// nine hash variants).
 const ECDSA_IDS: &[u64] = &[
@@ -170,11 +195,15 @@ const AES_KW_KWP_ID: u64 = 0x0000210b;
 const AES_KW_PKCS7_ID: u64 = 0x0000210c;
 
 /// Infer the §4.2 family for one mechanism id, or `None` when the id
-/// infers nothing (unlisted, vendor, keygen/parameter-gen, CMS_SIG,
-/// PBKD2, PBA, or an unobserved legacy id). Full-width equality:
-/// hostile-width aliases never match. The one exception is the
-/// attested NSS ML-KEM operation id ([`NSS_ML_KEM_IDS`]), which
-/// infers exactly like standard `CKM_ML_KEM`.
+/// infers nothing (unlisted, vendor, single-key/parameter-gen,
+/// CMS_SIG, PBKD2, PBA, ambiguous or family-less keygen, or an
+/// unobserved legacy id). Full-width equality: hostile-width
+/// aliases never match. Key-pair-generation ids that name exactly
+/// one family infer it (controller ruling fix2, family-only: no
+/// length map consults them). The vendor exceptions are the
+/// attested NSS ML-KEM operation id ([`NSS_ML_KEM_IDS`]) and its
+/// keygen twin ([`NSS_ML_KEM_KEYGEN_IDS`]), which infer exactly
+/// like the standard ids.
 pub(crate) fn infer_family(mechanism: u64) -> Option<KeyFamily> {
     // Spec order; each table is sorted for binary search.
     if RSA_IDS.binary_search(&mechanism).is_ok() {
@@ -242,6 +271,36 @@ pub(crate) fn infer_family(mechanism: u64) -> Option<KeyFamily> {
     }
     if GOST_IDS.binary_search(&mechanism).is_ok() {
         return Some(KeyFamily::Gost);
+    }
+    // Key-pair generation naming exactly one family (controller
+    // ruling fix2): family-only inference, disjoint from every
+    // operation table above, so order carries no aliasing risk.
+    if KEYGEN_RSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Rsa);
+    }
+    if KEYGEN_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Dsa);
+    }
+    if KEYGEN_DH_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Dh);
+    }
+    if KEYGEN_EC_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Ec);
+    }
+    if KEYGEN_EDDSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::Eddsa);
+    }
+    if KEYGEN_ML_KEM_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::MlKem);
+    }
+    if KEYGEN_ML_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::MlDsa);
+    }
+    if KEYGEN_SLH_DSA_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::SlhDsa);
+    }
+    if NSS_ML_KEM_KEYGEN_IDS.binary_search(&mechanism).is_ok() {
+        return Some(KeyFamily::MlKem);
     }
     None
 }
@@ -1230,7 +1289,7 @@ mod tests {
     // Exhaustive §4.2 classification: (id, CKM name, expected family).
     // Generated from the reviewed assignment; names reviewed vs spec §4.2.
     const CATALOG_EXPECTED: &[(u64, &str, Option<KeyFamily>)] = &[
-        (0x00000000, "CKM_RSA_PKCS_KEY_PAIR_GEN", None),
+        (0x00000000, "CKM_RSA_PKCS_KEY_PAIR_GEN", Some(KeyFamily::Rsa)),
         (0x00000001, "CKM_RSA_PKCS", Some(KeyFamily::Rsa)),
         (0x00000002, "CKM_RSA_9796", Some(KeyFamily::Rsa)),
         (0x00000003, "CKM_RSA_X_509", Some(KeyFamily::Rsa)),
@@ -1240,13 +1299,13 @@ mod tests {
         (0x00000007, "CKM_RIPEMD128_RSA_PKCS", Some(KeyFamily::Rsa)),
         (0x00000008, "CKM_RIPEMD160_RSA_PKCS", Some(KeyFamily::Rsa)),
         (0x00000009, "CKM_RSA_PKCS_OAEP", Some(KeyFamily::Rsa)),
-        (0x0000000a, "CKM_RSA_X9_31_KEY_PAIR_GEN", None),
+        (0x0000000a, "CKM_RSA_X9_31_KEY_PAIR_GEN", Some(KeyFamily::Rsa)),
         (0x0000000b, "CKM_RSA_X9_31", Some(KeyFamily::Rsa)),
         (0x0000000c, "CKM_SHA1_RSA_X9_31", Some(KeyFamily::Rsa)),
         (0x0000000d, "CKM_RSA_PKCS_PSS", Some(KeyFamily::Rsa)),
         (0x0000000e, "CKM_SHA1_RSA_PKCS_PSS", Some(KeyFamily::Rsa)),
-        (0x0000000f, "CKM_ML_KEM_KEY_PAIR_GEN", None),
-        (0x00000010, "CKM_DSA_KEY_PAIR_GEN", None),
+        (0x0000000f, "CKM_ML_KEM_KEY_PAIR_GEN", Some(KeyFamily::MlKem)),
+        (0x00000010, "CKM_DSA_KEY_PAIR_GEN", Some(KeyFamily::Dsa)),
         (0x00000011, "CKM_DSA", Some(KeyFamily::Dsa)),
         (0x00000012, "CKM_DSA_SHA1", Some(KeyFamily::Dsa)),
         (0x00000013, "CKM_DSA_SHA224", Some(KeyFamily::Dsa)),
@@ -1258,10 +1317,10 @@ mod tests {
         (0x00000019, "CKM_DSA_SHA3_256", Some(KeyFamily::Dsa)),
         (0x0000001a, "CKM_DSA_SHA3_384", Some(KeyFamily::Dsa)),
         (0x0000001b, "CKM_DSA_SHA3_512", Some(KeyFamily::Dsa)),
-        (0x0000001c, "CKM_ML_DSA_KEY_PAIR_GEN", None),
+        (0x0000001c, "CKM_ML_DSA_KEY_PAIR_GEN", Some(KeyFamily::MlDsa)),
         (0x0000001d, "CKM_ML_DSA", Some(KeyFamily::MlDsa)),
         (0x0000001f, "CKM_HASH_ML_DSA", Some(KeyFamily::MlDsa)),
-        (0x00000020, "CKM_DH_PKCS_KEY_PAIR_GEN", None),
+        (0x00000020, "CKM_DH_PKCS_KEY_PAIR_GEN", Some(KeyFamily::Dh)),
         (0x00000021, "CKM_DH_PKCS_DERIVE", Some(KeyFamily::Dh)),
         (0x00000023, "CKM_HASH_ML_DSA_SHA224", Some(KeyFamily::MlDsa)),
         (0x00000024, "CKM_HASH_ML_DSA_SHA256", Some(KeyFamily::MlDsa)),
@@ -1297,9 +1356,9 @@ mod tests {
             "CKM_HASH_ML_DSA_SHAKE256",
             Some(KeyFamily::MlDsa),
         ),
-        (0x0000002d, "CKM_SLH_DSA_KEY_PAIR_GEN", None),
+        (0x0000002d, "CKM_SLH_DSA_KEY_PAIR_GEN", Some(KeyFamily::SlhDsa)),
         (0x0000002e, "CKM_SLH_DSA", Some(KeyFamily::SlhDsa)),
-        (0x00000030, "CKM_X9_42_DH_KEY_PAIR_GEN", None),
+        (0x00000030, "CKM_X9_42_DH_KEY_PAIR_GEN", Some(KeyFamily::Dh)),
         (0x00000031, "CKM_X9_42_DH_DERIVE", Some(KeyFamily::Dh)),
         (
             0x00000032,
@@ -1925,7 +1984,7 @@ mod tests {
         (0x00001008, "CKM_SKIPJACK_WRAP", None),
         (0x00001009, "CKM_SKIPJACK_PRIVATE_WRAP", None),
         (0x0000100a, "CKM_SKIPJACK_RELAYX", None),
-        (0x00001010, "CKM_KEA_KEY_PAIR_GEN", None),
+        (0x00001010, "CKM_KEA_KEY_PAIR_GEN", Some(KeyFamily::Dh)),
         (0x00001011, "CKM_KEA_KEY_DERIVE", Some(KeyFamily::Dh)),
         (0x00001012, "CKM_KEA_DERIVE", Some(KeyFamily::Dh)),
         (0x00001020, "CKM_FORTEZZA_TIMESTAMP", None),
@@ -1936,7 +1995,7 @@ mod tests {
         (0x00001034, "CKM_BATON_COUNTER", None),
         (0x00001035, "CKM_BATON_SHUFFLE", None),
         (0x00001036, "CKM_BATON_WRAP", None),
-        (0x00001040, "CKM_EC_KEY_PAIR_GEN", None),
+        (0x00001040, "CKM_EC_KEY_PAIR_GEN", Some(KeyFamily::Ec)),
         (0x00001041, "CKM_ECDSA", Some(KeyFamily::Ec)),
         (0x00001042, "CKM_ECDSA_SHA1", Some(KeyFamily::Ec)),
         (0x00001043, "CKM_ECDSA_SHA224", Some(KeyFamily::Ec)),
@@ -1952,7 +2011,7 @@ mod tests {
         (0x00001052, "CKM_ECMQV_DERIVE", Some(KeyFamily::Ec)),
         (0x00001053, "CKM_ECDH_AES_KEY_WRAP", Some(KeyFamily::Ec)),
         (0x00001054, "CKM_RSA_AES_KEY_WRAP", Some(KeyFamily::Rsa)),
-        (0x00001055, "CKM_EC_EDWARDS_KEY_PAIR_GEN", None),
+        (0x00001055, "CKM_EC_EDWARDS_KEY_PAIR_GEN", Some(KeyFamily::Eddsa)),
         (0x00001056, "CKM_EC_MONTGOMERY_KEY_PAIR_GEN", None),
         (0x00001057, "CKM_EDDSA", Some(KeyFamily::Eddsa)),
         (0x00001060, "CKM_JUNIPER_KEY_GEN", None),
@@ -2019,7 +2078,7 @@ mod tests {
         (0x00001226, "CKM_CHACHA20", Some(KeyFamily::Chacha20)),
         (0x00001227, "CKM_POLY1305_KEY_GEN", None),
         (0x00001228, "CKM_POLY1305", Some(KeyFamily::Poly1305)),
-        (0x0000140b, "CKM_EC_KEY_PAIR_GEN_W_EXTRA_BITS", None),
+        (0x0000140b, "CKM_EC_KEY_PAIR_GEN_W_EXTRA_BITS", Some(KeyFamily::Ec)),
         (0x00002000, "CKM_DSA_PARAMETER_GEN", None),
         (0x00002001, "CKM_DH_PKCS_PARAMETER_GEN", None),
         (0x00002002, "CKM_X9_42_DH_PARAMETER_GEN", None),
@@ -2190,7 +2249,7 @@ mod tests {
                 listed += 1;
             }
         }
-        assert_eq!(listed, 261, "listed ids across 21 families");
+        assert_eq!(listed, 273, "listed ids across 21 families");
         for (id, name) in &universe {
             assert!(
                 CATALOG_EXPECTED.iter().any(|(pinned_id, pinned_name, _)| {
@@ -2202,20 +2261,36 @@ mod tests {
     }
 
     /// Hand-typed infer-nothing spots (independent of the generated
-    /// table): vendor, keygen/parameter-gen, CMS_SIG/PBA/PBKD2,
-    /// digests, unobserved legacy, and hostile-width aliases.
+    /// table): vendor, CMS_SIG/PBA/PBKD2, single-key generation,
+    /// parameter-gen, keygen without one family, digests, unobserved
+    /// legacy, and hostile-width aliases.
+    ///
+    /// Controller ruling fix2 (2026-11-21, keygen-family inference):
+    /// key-pair-generation mechanisms that name exactly one family
+    /// now infer it (see `keygen_mechanisms_naming_one_family_infer_it`),
+    /// so the RSA/EC keygen spots left this list. Everything here
+    /// still names no single family: multi-family or family-less
+    /// generation, single-key generation (out of that ruling's
+    /// key-pair scope — those templates carry `CKA_KEY_TYPE`), and
+    /// the non-generation spots.
     #[test]
     fn infer_nothing_spots() {
         for id in [
             0x8000_0000u64,
             0xCE53_43A9,
+            0xCE53_437D,      // CKM_NSS_KYBER_KEY_PAIR_GEN (Kyber is not ML-KEM)
+            0xCE53_437F,      // CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN (vendor rule)
             u64::MAX,
             0x0000_0500,      // CKM_CMS_SIG
             0x0000_03B0,      // CKM_PKCS5_PBKD2
             0x0000_03C0,      // CKM_PBA_SHA1_WITH_SHA1_HMAC
-            0x0000_0000,      // CKM_RSA_PKCS_KEY_PAIR_GEN
-            0x0000_1040,      // CKM_EC_KEY_PAIR_GEN
-            0x0000_0350,      // CKM_GENERIC_SECRET_KEY_GEN
+            0x0000_0350,      // CKM_GENERIC_SECRET_KEY_GEN (single-key gen)
+            0x0000_1080,      // CKM_AES_KEY_GEN (single-key gen)
+            0x0000_1056,      // CKM_EC_MONTGOMERY_KEY_PAIR_GEN (ECDH vs XEdDSA)
+            0x0000_1200,      // CKM_GOSTR3410_KEY_PAIR_GEN (signing keys, not the cipher family)
+            0x0000_4032,      // CKM_HSS_KEY_PAIR_GEN (no family)
+            0x0000_4034,      // CKM_XMSS_KEY_PAIR_GEN (no family)
+            0x0000_4035,      // CKM_XMSSMT_KEY_PAIR_GEN (no family)
             0x0000_2000,      // CKM_DSA_PARAMETER_GEN
             0x0000_2005,      // CKM_DSA_FIPS_G_GEN
             0x0000_0250,      // CKM_SHA256 (digest)
@@ -2244,15 +2319,71 @@ mod tests {
     /// family: `CKM_NSS_ML_KEM` (`0xCE53_4381`, NSS
     /// `lib/util/pkcs11n.h` `CKM_NSS + 49`, exposed by softokn with
     /// encapsulate/decapsulate flags beside standard `CKM_ML_KEM`)
-    /// names ML-KEM exactly like the standard id. The vendor keygen
-    /// id stays silent under the creation rule, like every
-    /// `_KEY_PAIR_GEN` id.
+    /// names ML-KEM exactly like the standard id. Controller ruling
+    /// fix2 (keygen-family inference): the vendor keygen id
+    /// (`0xCE53_4380`, `CKM_NSS + 48`) infers ML-KEM too,
+    /// family-only like every listed `_KEY_PAIR_GEN` id.
     #[test]
     fn nss_ml_kem_vendor_mechanism_infers_family() {
         const NSS_ML_KEM: u64 = 0xCE53_4381;
         const NSS_ML_KEM_KEY_PAIR_GEN: u64 = 0xCE53_4380;
         assert_eq!(infer_family(NSS_ML_KEM), Some(KeyFamily::MlKem));
-        assert_eq!(infer_family(NSS_ML_KEM_KEY_PAIR_GEN), None);
+        assert_eq!(infer_family(NSS_ML_KEM_KEY_PAIR_GEN), Some(KeyFamily::MlKem));
+    }
+
+    /// Controller ruling fix2 (2026-11-21, keygen-family
+    /// inference): a key-pair-generation mechanism that names exactly
+    /// one family infers it (source: mechanism). Family-only: no
+    /// length map consults these ids, so the parameter set still
+    /// comes only from lengths or template values. KEA keygen names
+    /// the DH family (its derives are DH); Edwards keygen names
+    /// EdDSA; the NSS vendor ML-KEM keygen names ML-KEM like its
+    /// operation id.
+    #[test]
+    fn keygen_mechanisms_naming_one_family_infer_it() {
+        for (id, family) in [
+            (0x0000_0000u64, KeyFamily::Rsa), // CKM_RSA_PKCS_KEY_PAIR_GEN
+            (0x0000_000a, KeyFamily::Rsa),    // CKM_RSA_X9_31_KEY_PAIR_GEN
+            (0x0000_000f, KeyFamily::MlKem),  // CKM_ML_KEM_KEY_PAIR_GEN
+            (0x0000_0010, KeyFamily::Dsa),    // CKM_DSA_KEY_PAIR_GEN
+            (0x0000_001c, KeyFamily::MlDsa),  // CKM_ML_DSA_KEY_PAIR_GEN
+            (0x0000_0020, KeyFamily::Dh),     // CKM_DH_PKCS_KEY_PAIR_GEN
+            (0x0000_002d, KeyFamily::SlhDsa), // CKM_SLH_DSA_KEY_PAIR_GEN
+            (0x0000_0030, KeyFamily::Dh),     // CKM_X9_42_DH_KEY_PAIR_GEN
+            (0x0000_1010, KeyFamily::Dh),     // CKM_KEA_KEY_PAIR_GEN
+            (0x0000_1040, KeyFamily::Ec),     // CKM_EC_KEY_PAIR_GEN
+            (0x0000_1055, KeyFamily::Eddsa),  // CKM_EC_EDWARDS_KEY_PAIR_GEN
+            (0x0000_140b, KeyFamily::Ec),     // CKM_EC_KEY_PAIR_GEN_W_EXTRA_BITS
+            (0xCE53_4380, KeyFamily::MlKem),  // CKM_NSS_ML_KEM_KEY_PAIR_GEN
+        ] {
+            assert_eq!(infer_family(id), Some(family), "keygen id 0x{id:x} infers");
+        }
+    }
+
+    /// Keygen ids stay family-only: a length under a keygen id never
+    /// neighbor-maps into a size class. The reason names the missing
+    /// map (the id is listed), never a neighboring class.
+    #[test]
+    fn keygen_mechanisms_classify_no_length_map() {
+        use EvidenceTag::*;
+        for mechanism in [
+            0x0000_0000u64, // RSA keygen under a signature length
+            0x0000_000f,   // ML-KEM keygen under a ciphertext length
+            0xCE53_4380,   // NSS vendor ML-KEM keygen
+        ] {
+            let tag = if mechanism == 0x0000_0000 {
+                SignOutput
+            } else {
+                EncapsulateOutput
+            };
+            assert_eq!(
+                classify_size(Some(mechanism), tag, 1088),
+                SizeOutcome::Unknown {
+                    reason: REASON_NO_LENGTH_MAP
+                },
+                "keygen id 0x{mechanism:x} classifies no size"
+            );
+        }
     }
 
     /// NSS legacy Kyber vendor mechanisms infer nothing: Kyber is
@@ -2302,10 +2433,12 @@ mod tests {
                 reason: REASON_NO_LENGTH_MAP
             }
         );
+        // Controller ruling fix2: the listed keygen id names the
+        // missing map (family-only by design), never a neighbor.
         assert_eq!(
             classify_size(Some(NSS_ML_KEM_KEY_PAIR_GEN), EncapsulateOutput, 1088),
             SizeOutcome::Unknown {
-                reason: REASON_UNLISTED_MECHANISM
+                reason: REASON_NO_LENGTH_MAP
             }
         );
         assert_eq!(

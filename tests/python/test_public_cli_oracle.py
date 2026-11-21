@@ -50,6 +50,8 @@ VERDICT_COUNTERS = (
     "unpublished_mechanisms", "vendor_interfaces")
 PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
                   "pid_descendant_gaps", "multi_rebuild_gaps",
+                  "pid_descendant_gaps_admitted",
+                  "member_stop_attached", "member_stop_unattached",
                   "learned_staged_files", "learned_event_loss",
                   "learned_cap_skipped")
 
@@ -125,6 +127,8 @@ def inputs(*, metrics=False, system=False):
         attach_backend={"selection": "singles", "fallback": None,
                         "scope_filter": None if system else "perf-task+bpf"},
         pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        pid_descendant_gaps_admitted=0,
+        member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
         learned_cap_skipped=0)
     if metrics:
@@ -211,6 +215,8 @@ def inputs_mt_system(*, calls=40):
         attach_mechanisms=["per-offset"],
         attach_backend={"selection": "singles", "fallback": None, "scope_filter": None},
         pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        pid_descendant_gaps_admitted=0,
+        member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
         learned_cap_skipped=0)
     ledger = ["TARGET " + json.dumps(row) for row in targets]

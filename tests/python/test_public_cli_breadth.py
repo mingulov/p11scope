@@ -45,6 +45,8 @@ VERDICT_COUNTERS = (
     "unpublished_mechanisms", "vendor_interfaces")
 PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
                   "pid_descendant_gaps", "multi_rebuild_gaps",
+                  "pid_descendant_gaps_admitted",
+                  "member_stop_attached", "member_stop_unattached",
                   "learned_staged_files", "learned_event_loss",
                   "learned_cap_skipped")
 
@@ -104,6 +106,8 @@ def inputs(*, metrics=False, scope="pid", calls=None, cell="profile-pid"):
         attach_backend={"selection": "singles", "fallback": None,
                         "scope_filter": None if scope in ("system", "cgroup") else "perf-task+bpf"},
         pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        pid_descendant_gaps_admitted=0,
+        member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
         learned_cap_skipped=0)
     if metrics:
@@ -239,6 +243,8 @@ def inputs_mt(*, metrics=False, scope="pid", calls=24, errors=0, cell):
         attach_backend={"selection": "singles", "fallback": None,
                         "scope_filter": None if scope == "system" else "perf-task+bpf"},
         pid_descendant_gaps=0, multi_rebuild_gaps=0,
+        pid_descendant_gaps_admitted=0,
+        member_stop_attached=0, member_stop_unattached=0,
         learned_staged_files=0, learned_event_loss=0,
         learned_cap_skipped=0)
     if metrics:

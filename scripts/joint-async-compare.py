@@ -127,6 +127,12 @@ UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "same_thread_nested"}
 # v9-only unknown reasons: refused below v9, never silently dropped.
 V9_ONLY_UNKNOWN = {"same_thread_nested"}
+# v9-only gap reasons: refused below v9, never silently dropped.
+V9_ONLY_GAPS = {"same_thread_nested", "unknown_mechanism_rows_refused"}
+# Paired (subject, reason) rows that prove v9 gap content: the nested
+# gap rides model, the refused mechanism detail rides key_operation.
+V9_ONLY_GAP_ROWS = {("model", "same_thread_nested"),
+                    ("key_operation", "unknown_mechanism_rows_refused")}
 STATUSES = {"populated", "partial", "stale", "unavailable"}
 STATUS_REASONS = {"none", "bootstrap_unavailable", "live_joint_feed_absent",
                   "proof_refused_fallback",
@@ -850,6 +856,24 @@ def _check_unattributed(document, tag):
              f"{tag}: snapshot unattributed rows out of frozen order")
 
 
+def _require_v9_content(document, tag):
+    """A v9 snapshot names the same-thread-nested reason on an unknown
+    row or a model gap (rowless gaps promote too), or carries
+    unknown-row mechanism detail (rows or the refusal gap). The rows
+    and gaps passed their checks before this runs, so a listed v9-only
+    reason is already well-formed. v9 needs no v7 content: proved rows
+    carry the inferred keys (blank when unknown) either way."""
+    for row in document["unknown_key_operations"]:
+        if row["reason"] in V9_ONLY_UNKNOWN:
+            return
+        if row.get("mechanisms"):
+            return
+    for row in document["gaps"]["rows"]:
+        if (row["subject"], row["reason"]) in V9_ONLY_GAP_ROWS:
+            return
+    _require(False, f"{tag}: snapshot v9 without same-thread-nested content")
+
+
 def validate_snapshot(document, tag):
     """Validate the frozen H9 subset; refuse anything but populated output."""
     keys = {"version", "revision", "status", "reason", "sessions",
@@ -920,6 +944,8 @@ def validate_snapshot(document, tag):
         _require(row["subject"] in ("model", "key_operation"),
                  f"{where}: subject invalid")
         _require(type(row["reason"]) is str, f"{where}: reason invalid")
+        _require(version >= 9 or row["reason"] not in V9_ONLY_GAPS,
+                 f"{where}: v9-only gap reason in v{version} section")
         _require(_integer(row["repeats"]), f"{where}: repeats out of range")
     _require(_integer(gaps["suppressed"]),
              f"{tag}: snapshot gaps suppressed out of range")
@@ -940,6 +966,8 @@ def validate_snapshot(document, tag):
              f"{tag}: snapshot allocation_refused changed")
     _require(budgets["refusal_reason"] == "none",
              f"{tag}: snapshot refusal_reason changed")
+    if version == 9:
+        _require_v9_content(document, tag)
     return document
 
 

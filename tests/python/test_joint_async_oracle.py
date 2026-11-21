@@ -868,6 +868,73 @@ class PairedPathTwins(unittest.TestCase):
                            "reason": "duplicate_completion", "repeats": 2}])
         self.assertEqual(single["unknown_key_operations"][0]["completed"], 4)
 
+    def test_async_v9_snapshot_dispatch(self):
+        # v9 iff same-thread-nested content: a nested unknown row or a
+        # model gap naming same_thread_nested promotes; a bare v9
+        # version is refused, and any pre-v9 carrier of the v9-only
+        # row or gap reason is refused (content-based dispatch,
+        # inventory-v1.md object observations). Structural level: the
+        # exact ledger/gap checks below still own their fixture.
+        oracle = require_oracle(self)
+        _collision, joint, _single = paired(oracle, "poll_msg")
+        nested_row = {"category": "operation",
+                      "reason": "same_thread_nested",
+                      "unit": "operations", "completed": 1, "failed": 0,
+                      "cancelled": 0, "unknown": 0, "active": 0}
+        nested_gap = {"subject": "model", "reason": "same_thread_nested",
+                      "repeats": 1}
+
+        def promoted(version):
+            snapshot = copy.deepcopy(joint)
+            snapshot["version"] = version
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                row["inferred_family"] = {"status": "unknown", "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown", "detail": None,
+                                        "completions": 0}
+            return snapshot
+
+        with self.subTest("v9 unknown-row shape validates"):
+            snapshot = promoted(9)
+            snapshot["unknown_key_operations"].append(dict(nested_row))
+            snapshot["unknown_key_operations"].sort(
+                key=lambda row: (row["category"], row["reason"]))
+            snapshot["budgets"]["unknown_rows"]["occupied"] = len(
+                snapshot["unknown_key_operations"])
+            oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v9 model-gap shape validates"):
+            snapshot = promoted(9)
+            snapshot["gaps"]["rows"].append(dict(nested_gap))
+            oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v9 without nested content refused"):
+            with self.assertRaisesRegex(
+                    oracle.LedgerError,
+                    "without same-thread-nested content"):
+                oracle.validate_snapshot(promoted(9), "joint")
+        with self.subTest("v7 carrying the nested unknown row refused"):
+            snapshot = promoted(7)
+            snapshot["unknown_key_operations"].append(dict(nested_row))
+            snapshot["unknown_key_operations"].sort(
+                key=lambda row: (row["category"], row["reason"]))
+            snapshot["budgets"]["unknown_rows"]["occupied"] = len(
+                snapshot["unknown_key_operations"])
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "v9-only unknown reason"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v7 carrying the nested model gap refused"):
+            snapshot = promoted(7)
+            snapshot["gaps"]["rows"].append(dict(nested_gap))
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "v9-only gap reason"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v1 carrying the nested model gap refused"):
+            snapshot = copy.deepcopy(joint)
+            snapshot["gaps"]["rows"].append(dict(nested_gap))
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "v9-only gap reason"):
+                oracle.validate_snapshot(snapshot, "joint")
+
     def test_mutation_challenger_joined_rejected(self):
         oracle = require_oracle(self)
         collision, joint, _single = paired(oracle, "poll_msg")
@@ -1556,6 +1623,59 @@ class AsyncStreamTwins(unittest.TestCase):
             self.assertIn("async refused: ledger A: first row must be ready",
                           completed.stderr)
             self.assertNotIn("Traceback", completed.stderr)
+
+    def test_cli_v9_dispatch_refuses_before_compare(self):
+        # The CLI dispatches on content, not the version number: a v9
+        # joint snapshot without nested evidence and a v7 joint
+        # snapshot carrying the v9-only model gap are refused even
+        # though the ledgers are healthy (the bare v9 returned 0
+        # before the fix).
+        require_oracle(self)
+        oracle = ORACLE
+        _collision, joint, single = paired(oracle, "poll_msg")
+        rows_a = build_ledger(SCEN["owner_poll"], plan_poll_owner(2),
+                              pid=4242)
+        rows_b = build_ledger(SCEN["chal_message"],
+                              plan_message_challenger(2), pid=4343)
+
+        def promoted(version):
+            snapshot = copy.deepcopy(joint)
+            snapshot["version"] = version
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                row["inferred_family"] = {"status": "unknown", "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown", "detail": None,
+                                        "completions": 0}
+            return snapshot
+
+        version_only = promoted(9)
+        old_carrier = promoted(7)
+        old_carrier["gaps"]["rows"].append(
+            {"subject": "model", "reason": "same_thread_nested",
+             "repeats": 1})
+        cases = (("v9 without nested content", version_only,
+                  "without same-thread-nested content"),
+                 ("v7 carrying the nested model gap", old_carrier,
+                  "v9-only gap reason"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_a = Path(tmp) / "a.jsonl"
+            ledger_b = Path(tmp) / "b.jsonl"
+            snap_joint = Path(tmp) / "joint.json"
+            snap_single = Path(tmp) / "s1only.json"
+            write_jsonl(ledger_a, rows_a)
+            write_jsonl(ledger_b, rows_b)
+            write_json(snap_single, single)
+            for name, snapshot, pattern in cases:
+                with self.subTest(name):
+                    write_json(snap_joint, snapshot)
+                    completed = subprocess.run(
+                        ["python3", "-I", str(ORACLE_PATH), str(ledger_a),
+                         str(ledger_b), str(snap_joint), str(snap_single)],
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(completed.returncode, 1,
+                                     completed.stderr)
+                    self.assertRegex(completed.stderr, pattern)
 
 
 REFUSAL_PROVIDER = """/* Test-only non-stub provider: no marker export, so the stub-only emitter refuses it. */

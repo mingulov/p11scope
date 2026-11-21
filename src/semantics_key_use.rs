@@ -1988,9 +1988,8 @@ pub(crate) fn unbound_reason_for(category: &str) -> &'static str {
 /// session (the known instance is the NSS softoken EC-keygen pairwise
 /// self-test; a same-thread nested call from an application signal
 /// handler or a provider callback nests too, so the issuer is never
-/// proven), so its key birth is the still-in-flight outer call and no
-/// receipt binds it. A named unknown row — never binding the inner
-/// call to a key — never a dropped terminal.
+/// proven), so the inner key join is withheld under this reason.
+/// A named unknown row — never a dropped terminal.
 pub(crate) const SAME_THREAD_NESTED_REASON: &str = "same_thread_nested";
 
 /// The frozen unknown-key reason for a receipt-less terminal:

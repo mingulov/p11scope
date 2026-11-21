@@ -877,8 +877,8 @@ pub(crate) enum ObjectEffect {
         /// The view's frozen creation-mechanism birth fact
         /// (controller ruling fix2, F4): `Some` only for
         /// Generate/GeneratePair views minted with a guarded
-        /// return-time mechanism id.
-        creation_mechanism: Option<u64>,
+        /// return-time mechanism id in the 32-bit namespace.
+        creation_mechanism: Option<u32>,
     },
     Destroyed {
         call: CallToken,

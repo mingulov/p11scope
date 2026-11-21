@@ -47,17 +47,17 @@ const _: () = {
     assert!(std::mem::align_of::<super::AsyncId>() == 8);
     assert!(std::mem::size_of::<super::SemanticCall>() == 96);
     // H9 stores the machine's fixed key receipt (niche-filled
-    // `Option<KeyReceipt>`, 56 bytes with the frozen key-type code
+    // `Option<KeyReceipt>`, 48 bytes with the frozen key-type code
     // and the fix2 F4 creation-mechanism birth fact); the machine
     // charge below still dominates the node plus entry. Keymeta
     // adds the per-operation corroboration slot (`Option<u64>` has
     // no niche: +16 over the H9 layout); the machine charge
     // doubles so the node-plus-entry invariant below still holds.
     // Fix2 F4 adds the receipt's creation-mechanism birth fact
-    // (`Option<u64>`: +16 over the keymeta layout, 88 to 104);
-    // the doubled charge still dominates, as the invariant below
+    // (`Option<u32>`: +8 over the keymeta layout, 88 to 96); the
+    // doubled charge still dominates, as the invariant below
     // re-checks.
-    assert!(std::mem::size_of::<super::OpMachine>() == 104);
+    assert!(std::mem::size_of::<super::OpMachine>() == 96);
     assert!(std::mem::size_of::<super::EdgeMechStat>() == 104);
     // Final lease-bearing layouts, rather than the earlier probe types.
     // Each record carries its originating H0 position (`Option<u64>`
@@ -130,7 +130,7 @@ pub(crate) const SEMANTIC_TRANSITION_SCRATCH: usize = 1024 * 1024;
 pub(crate) const REDUCER_BASE_CHARGE: usize = 8192;
 pub(crate) const OPEN_BINDING_CHARGE: usize = 512;
 // Keymeta corroboration slot plus the frozen key-type code, plus the
-// fix2 F4 creation-mechanism birth fact: the 104-byte machine keeps
+// fix2 F4 creation-mechanism birth fact: the 96-byte machine keeps
 // the 2048 charge with the same dominance margin (raised 1024 to
 // 2048); 8192 machines reserve 16 MiB worst case, still far under
 // the pool limit.

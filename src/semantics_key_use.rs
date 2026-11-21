@@ -2559,7 +2559,7 @@ fn seed_creation_family(
     established: Option<crate::keymeta::EstablishedKind>,
     established_type: Option<crate::keymeta::EstablishedKind>,
     use_mechanism: Option<u64>,
-    creation_mechanism: Option<u64>,
+    creation_mechanism: Option<u32>,
 ) {
     use crate::keymeta::infer_family;
     if established.is_some() || established_type.is_some() {
@@ -2571,6 +2571,7 @@ fn seed_creation_family(
     let Some(created) = creation_mechanism else {
         return;
     };
+    let created = u64::from(created);
     if infer_family(created).is_none() {
         return;
     }
@@ -2780,8 +2781,9 @@ struct OpenAssoc {
     established_type: Option<crate::keymeta::EstablishedKind>,
     /// The receipt's frozen creation-mechanism birth fact
     /// (controller ruling fix2, F4): the Generate/GeneratePair
-    /// mechanism id, or `None` for every other origin.
-    creation_mechanism: Option<u64>,
+    /// mechanism id in the 32-bit namespace, or `None` for every
+    /// other origin.
+    creation_mechanism: Option<u32>,
 }
 
 /// One receipt resolved to its bucket at admission, before any

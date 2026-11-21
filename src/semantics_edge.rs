@@ -311,8 +311,9 @@ pub(crate) struct KeyReceipt {
     pub lost: bool,
     /// The viewed object's frozen creation-mechanism birth fact
     /// (controller ruling fix2, F4): the Generate/GeneratePair
-    /// mechanism id, or `None` for every other origin.
-    pub creation_mechanism: Option<u64>,
+    /// mechanism id in the 32-bit namespace, or `None` for every
+    /// other origin.
+    pub creation_mechanism: Option<u32>,
 }
 
 impl From<&SemanticCall> for EffectOrigin {

@@ -516,7 +516,28 @@ struct ViewRecord {
     /// family lets the row show the inferred family when the key
     /// type stays unknown; every other creation family keeps
     /// `None` (an operation mechanism never types a derived key).
-    creation_mechanism: Option<u64>,
+    /// The 32-bit namespace holds every real id; anything wider is
+    /// a hostile-width alias and is never retained.
+    creation_mechanism: Option<u32>,
+}
+
+/// The retainable creation-mechanism id for one creation
+/// completion (controller ruling fix2, F4):
+/// Generate/GeneratePair only, and only ids that fit the 32-bit
+/// mechanism namespace. Wider values are hostile-width aliases
+/// (the existing full-width rule: an accepted constant ORed with
+/// `1 << 32` is not that constant), never retained.
+fn creation_mechanism_value(family: CreationFamily, mechanism: MechanismEvidence) -> Option<u32> {
+    if !matches!(
+        family,
+        CreationFamily::Generate | CreationFamily::GeneratePair
+    ) {
+        return None;
+    }
+    let MechanismEvidence::Value(id) = mechanism else {
+        return None;
+    };
+    u32::try_from(id).ok()
 }
 
 impl ViewRecord {
@@ -721,7 +742,7 @@ enum DeferredInput {
         attribution_valid: bool,
         first_observed: bool,
         lost: bool,
-        creation_mechanism: Option<u64>,
+        creation_mechanism: Option<u32>,
     },
 }
 
@@ -3396,20 +3417,10 @@ impl ModelState {
                         view.creation_expects_curve_params = family == CreationFamily::Create
                             || (family == CreationFamily::GeneratePair && slot == 0);
                         // Controller ruling fix2 (F4): keep the
-                        // guarded return-time mechanism id on
-                        // Generate/GeneratePair views only — a
-                        // key-pair-generation mechanism naming
-                        // exactly one family types the created key,
-                        // while an operation mechanism never types
-                        // a derived, unwrapped or KEM-created key.
-                        if matches!(
-                            family,
-                            CreationFamily::Generate | CreationFamily::GeneratePair
-                        ) && let MechanismEvidence::Value(mechanism) =
-                            completion.return_mechanism
-                        {
-                            view.creation_mechanism = Some(mechanism);
-                        }
+                        // retainable creation-mechanism id (see
+                        // `creation_mechanism_value`).
+                        view.creation_mechanism =
+                            creation_mechanism_value(family, completion.return_mechanism);
                         for kind in [
                             SafeAttributeKind::Class,
                             SafeAttributeKind::KeyType,
@@ -5209,6 +5220,56 @@ mod tests {
             keypair_private: false,
             creation_expects_curve_params: false,
             creation_mechanism: None,
+        }
+    }
+
+    // Controller ruling fix2 (F4): only Generate/GeneratePair
+    // completions retain a creation-mechanism id, and only ids in
+    // the 32-bit namespace — a hostile-width alias is never
+    // retained, however its low word reads.
+    #[test]
+    fn creation_mechanism_value_keeps_generations_in_namespace() {
+        use super::{CreationFamily, MechanismEvidence, creation_mechanism_value};
+        assert_eq!(
+            creation_mechanism_value(
+                CreationFamily::GeneratePair,
+                MechanismEvidence::Value(0x0f)
+            ),
+            Some(0x0f)
+        );
+        assert_eq!(
+            creation_mechanism_value(
+                CreationFamily::Generate,
+                MechanismEvidence::Value(0xCE53_4380)
+            ),
+            Some(0xCE53_4380)
+        );
+        for family in [
+            CreationFamily::Create,
+            CreationFamily::Copy,
+            CreationFamily::Derive,
+            CreationFamily::Unwrap,
+            CreationFamily::Encapsulate,
+            CreationFamily::Decapsulate,
+        ] {
+            assert_eq!(
+                creation_mechanism_value(family, MechanismEvidence::Value(0x0f)),
+                None,
+                "{family:?} retains nothing"
+            );
+        }
+        for mechanism in [
+            MechanismEvidence::NotCaptured,
+            MechanismEvidence::Null,
+            MechanismEvidence::Unreadable,
+            MechanismEvidence::Value(1 << 32 | 0x0f),
+            MechanismEvidence::Value(u64::MAX),
+        ] {
+            assert_eq!(
+                creation_mechanism_value(CreationFamily::GeneratePair, mechanism),
+                None,
+                "{mechanism:?} retains nothing"
+            );
         }
     }
 

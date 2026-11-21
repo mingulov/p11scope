@@ -38954,6 +38954,72 @@ int main(void) {
         );
     }
 
+    /// Churn bound (v080-rss-churn-bound twin G2): the live stream
+    /// view retains one full run-wide pid vector per pass, so process
+    /// churn grows the retained presentation without bound. Past the
+    /// retention bound the view keeps a bounded sample plus exact
+    /// totals instead of one entry per churn fork.
+    #[test]
+    fn stream_view_unbound_sample_stays_bounded_under_churn() {
+        let (mut native, _) = NativeScene::new();
+        let rows: Vec<_> = (0..600)
+            .map(|index| native.row(41 + index, 1, 1000 + index as u32, 210 + index, 0))
+            .collect();
+        native.witness(rows);
+        assert_eq!(
+            native.scene.coordinator.registry.unidentified_images(),
+            600,
+            "every churn row stages its unidentified image"
+        );
+        let presentation = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "native",
+            0,
+            2_000,
+            1,
+        );
+        assert!(
+            presentation.unbound_pids.len() <= 512,
+            "the retained view sample stays bounded: {}",
+            presentation.unbound_pids.len()
+        );
+    }
+
+    /// Churn-scale text guard (v080-rss-churn-bound): the concise
+    /// unidentified-caller lines keep the same facts and counts past
+    /// the retention bound — the oldest pids, the exact image total,
+    /// and the exact folded call bound per executable group.
+    #[test]
+    fn churn_scale_unidentified_lines_keep_exact_counts() {
+        let (mut native, _) = NativeScene::new();
+        let rows: Vec<_> = (0..600)
+            .map(|index| native.row(41 + index, 1, 1000 + index as u32, 210 + index, 0))
+            .collect();
+        native.witness(rows);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"], 600,
+            "the run-wide image total stays exact"
+        );
+        let entries = document["modules"][0]["unbound_use"]["entries"]
+            .as_u64()
+            .expect("module entries publish");
+        let callers = format!(
+            "unidentified callers: at least {entries} calls from 600 caller processes not fully identified (exited or never scanned); host pids 1000, 1001, 1002, 1003, 1004 (+595 more; not running now or never scanned)"
+        );
+        assert!(
+            text.lines().any(|candidate| candidate == callers),
+            "concise names the oldest pids with the exact more-count:\n{text}"
+        );
+        let exes = format!(
+            "unidentified executables: executable unknown (no exec record) ({entries} calls, host pids 1000, 1001, 1002, 1003, 1004 (+595 more))"
+        );
+        assert!(
+            text.lines().any(|candidate| candidate == exes),
+            "concise groups the folded calls with the exact more-count:\n{text}"
+        );
+    }
+
     /// Unidentified callers read as not fully identified (the executable
     /// line below may name the program), and the unattributed-use line
     /// above uses the same numbers with the same nouns (calls, caller
@@ -39576,6 +39642,62 @@ int main(void) {
             .prune_departed_native_state(1_000 + 2 * EXEC_STATE_GRACE_NS);
         assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 1);
         assert_eq!(native.scene.coordinator.pruned_pair_totals(), (2, 21));
+    }
+
+    /// Churn bound (v080-rss-churn-bound twin G4): pair tombstones
+    /// must drain by age every pass, not only at domain stop. Past
+    /// the tombstone keep window the exact per-pair base leaves the
+    /// map into the exact class aggregate it already joined at prune
+    /// time, and the prune overflow counts the fold once — so the
+    /// map stays flat under churn while totals stay exact.
+    #[test]
+    fn pair_tombstones_expire_past_the_revival_window_into_exact_totals() {
+        let (mut native, _caller) = NativeScene::new();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: 1_000,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(1_000 + EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "the pruned base keeps its exact revival tombstone first"
+        );
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 5),
+            "the base joins the exact aggregate at prune time"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(1_000 + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            0,
+            "the tombstone drains by age instead of living until domain stop"
+        );
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 5),
+            "expiry keeps the counted aggregate, never the per-pair row"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            1,
+            "the age fold counts exactly once, like a bound fold"
+        );
     }
 
     /// A pruned dropped pair that revives, re-drops and is pruned again
@@ -43037,6 +43159,60 @@ mod scan_freshness_tests {
             .into_iter()
             .collect();
         assert_eq!(coordinator.scan_freshness_for_test(), expected);
+    }
+
+    /// Churn bound (v080-rss-churn-bound twin G3): enumeration memory
+    /// must not keep every departed churn child forever. A task the
+    /// latest pass no longer enumerates leaves `ever_enumerated` on
+    /// that pass (a departed pid can never re-verify, and a recycled
+    /// pid reads fresh), while tasks the latest pass still enumerates
+    /// stay remembered.
+    #[test]
+    fn applied_pass_evicts_departed_tasks_from_enumeration_memory() {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut coordinator = freshness_coordinator();
+        let generation = |start_time| {
+            Some(crate::inspect_system::MemberGeneration {
+                start_time,
+                exe: None,
+            })
+        };
+        let record = |pid, start_time, status| ProcessRecord {
+            pid,
+            status,
+            objects: Vec::new(),
+            generation: generation(start_time),
+            complete_scan: None,
+            application: unexamined_application(),
+            hints_examined: true,
+        };
+        let mut first = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        first
+            .processes
+            .push(record(12, Some(120), MemberStatus::Scanned));
+        coordinator.note_applied_scan_tasks(&first);
+        assert_eq!(
+            coordinator.ever_enumerated_for_test(),
+            BTreeSet::from([(11, Some(110)), (12, Some(120))]),
+            "the first pass remembers both enumerated tasks"
+        );
+        let second = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        coordinator.note_applied_scan_tasks(&second);
+        assert_eq!(
+            coordinator.ever_enumerated_for_test(),
+            BTreeSet::from([(11, Some(110))]),
+            "the departed churn child leaves enumeration memory on the next pass"
+        );
     }
 
     /// The selection projection re-validates recorded start-times against

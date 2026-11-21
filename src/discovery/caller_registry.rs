@@ -12295,6 +12295,64 @@ pub(crate) mod tests {
         assert_eq!(registry.unidentified_pids()[0].exe, exe);
     }
 
+    /// Churn bound (v080-rss-churn-bound twin G1): one image per churn
+    /// fork must not grow the run-wide retained set without bound:
+    /// past the retention bound the oldest images fold into exact
+    /// aggregates, so the retained sample stays bounded while the
+    /// published total stays exact.
+    #[test]
+    fn run_wide_unbound_retention_stays_bounded_under_churn() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        let resolved = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::SystemIndex);
+        const IMAGES: u64 = 1200;
+        for index in 0..IMAGES {
+            let cookie = DomainCookie::scripted(domain, 41 + index);
+            let exe = if index % 2 == 0 {
+                provisional.clone()
+            } else {
+                resolved.clone()
+            };
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1000 + index,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(
+                    cookie,
+                    1000 + index as u32,
+                    1000 + index,
+                    2,
+                    exe,
+                )),
+            );
+            if index % 100 == 99 {
+                registry.publish();
+            }
+        }
+        registry.publish();
+        assert_eq!(
+            registry.unidentified_images(),
+            IMAGES,
+            "every churn image counts exactly once"
+        );
+        assert!(
+            registry.unidentified_pids().len() <= 512,
+            "the retained run-wide sample stays bounded: {}",
+            registry.unidentified_pids().len()
+        );
+        assert!(
+            !registry.unidentified_images_saturated(),
+            "folding is retention, never saturation"
+        );
+    }
+
     /// Resolve-once: a refresh row never replaces the stored
     /// executable (only the EXEC backfill and the loss flip update
     /// it); calls still accumulate and the first call stays minimal.

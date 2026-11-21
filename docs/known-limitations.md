@@ -1232,8 +1232,8 @@ callers scanned so far with the `collection incomplete (stopped by
 operator)` gap (scan-only, counts not attached, no completeness
 claimed), while `--pid`/`--system` finish the in-flight collection
 and keep it scan-only. Overrun past a deadline is bounded by one
-full bounded pass (shared per-pass work allowance: 16M units on every
-scope; cgroup walk limits: 4096
+full bounded pass (shared per-pass work allowance: 16M units on
+Detailed passes, 1M units on inventory passes; cgroup walk limits: 4096
 directories, 65536 members, 8 MiB total, 70 FDs; at most 128 pinned
 processes; deep-scan cap default 32; no wall-clock cap; a hung
 filesystem call still blocks like before). The first

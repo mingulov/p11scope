@@ -3001,7 +3001,7 @@ totals larger than the whole production read window
 guards against crafted files — 64 MiB for an inventory pass, 512 MiB
 for a `profile`/`trace` capture. Under `--cgroup`, one inventory pass
 shares that single 64 MiB attempted-read window across every member and
-every file it examines. One pass also shares a single 16M-unit
+every file it examines. One pass also shares a single 1M-unit
 discovery work allowance across every member it scans (each decoded
 table word costs one unit; snapshot bytes ride the I/O window, never
 the work allowance, so re-reads cannot stall a pass before any

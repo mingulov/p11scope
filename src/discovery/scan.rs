@@ -1863,7 +1863,7 @@ impl CaptureWorkBudget {
     /// bytes collection-work conversion. Parsed entries are charged
     /// separately through `spend`, so converting the bytes too would
     /// debit one pandoc-sized walk (55 MB = 1.7M units) against the
-    /// shared pass allowance and stop the whole pass early. Still
+    /// 1 MiB cgroup collection allowance and stop the whole pass. Still
     /// polls the collection stop (0 units) so an operator stop or
     /// deadline reaches the read without charging it.
     pub(crate) fn record_window_io(&mut self, bytes: usize) {

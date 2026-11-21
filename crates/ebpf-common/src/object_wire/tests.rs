@@ -61,11 +61,13 @@ fn unwrap_descriptor() -> ObjectDescriptorWire {
 
 /// Hand-built encapsulate row (function 92 is `C_EncapsulateKey`).
 fn encapsulate_descriptor() -> ObjectDescriptorWire {
+    // Controller ruling fix2 (T0 KEM template reads): the output
+    // template pair rides the frozen row.
     ObjectDescriptorWire {
         function: 92,
         input_args: [2, N],
         result_args: [7, N],
-        template_args: [N, N, N, N],
+        template_args: [3, 4, N, N],
         find_capacity_arg: N,
         find_count_arg: N,
         action: OBJECT_ACTION_ENCAPSULATE,
@@ -75,11 +77,13 @@ fn encapsulate_descriptor() -> ObjectDescriptorWire {
 
 /// Hand-built decapsulate row (function 93 is `C_DecapsulateKey`).
 fn decapsulate_descriptor() -> ObjectDescriptorWire {
+    // Controller ruling fix2 (T0 KEM template reads): the output
+    // template pair rides the frozen row.
     ObjectDescriptorWire {
         function: 93,
         input_args: [2, N],
         result_args: [7, N],
-        template_args: [N, N, N, N],
+        template_args: [3, 4, N, N],
         find_capacity_arg: N,
         find_count_arg: N,
         action: OBJECT_ACTION_DECAPSULATE,
@@ -378,7 +382,8 @@ fn object_producer_kem_wire_codes_are_append_only() {
 #[test]
 fn object_producer_kem_tail_pins_input_result_and_zero_lists() {
     // A valid encapsulate tail: one value input, one value result,
-    // all-zero requested lists (T0: absent pairs stay all-zero).
+    // all-zero requested lists (absent pairs stay all-zero; the
+    // authorized pair 0 carries a valid list, possibly empty).
     let mut tail = [0u8; OBJECT_TAIL_BYTES];
     put_u16(&mut tail, 0, OBJECT_CALL_VERSION);
     put_u16(&mut tail, 2, OBJECT_CALL_BYTES);
@@ -391,12 +396,21 @@ fn object_producer_kem_tail_pins_input_result_and_zero_lists() {
     tail[114] = 1;
     let descriptor = encapsulate_descriptor();
     assert!(validate_object_tail(&tail, &descriptor));
-    // A nonzero requested list refuses: KEM template pairs are absent.
-    for offset in [128, 128 + 33, 164, 164 + 33] {
+    // Pair 1 stays absent: any nonzero byte refuses.
+    for offset in [164, 164 + 33] {
         let mut bad = tail;
         bad[offset] = 1;
         assert!(!validate_object_tail(&bad, &descriptor), "offset {offset}");
     }
+    // Pair 0 (controller ruling fix2) carries valid lists: an
+    // inspected-empty pair-0 list validates, while a nonzero cell
+    // past the inspected count refuses.
+    let mut empty = tail;
+    empty[128 + 33] = 1;
+    assert!(validate_object_tail(&empty, &descriptor));
+    let mut bad = tail;
+    bad[128] = 1;
+    assert!(!validate_object_tail(&bad, &descriptor), "offset 128");
     // Descriptor-present input/result slots require non-absent statuses.
     let mut bad = tail;
     bad[112] = 0;

@@ -592,9 +592,12 @@ pub fn adapter_kem_entry(
     }
     // The ordinals below duplicate the KEM rows; refuse loudly if
     // the frozen row disagrees rather than reading the wrong args.
+    // The template pair (controller ruling fix2) is inspected by
+    // the attributes adapter; this adapter still only guards its
+    // span from pointer/count scalars alone.
     if row.input_args != [2, ARG_NONE]
         || row.result_args != [7, ARG_NONE]
-        || row.template_args != [ARG_NONE, ARG_NONE, ARG_NONE, ARG_NONE]
+        || row.template_args != [3, 4, ARG_NONE, ARG_NONE]
         || row.find_capacity_arg != ARG_NONE
         || row.find_count_arg != ARG_NONE
     {

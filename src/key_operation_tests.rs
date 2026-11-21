@@ -14612,6 +14612,61 @@ fn key_operation_unknown_mechanism_ids_merge_on_absorb() {
     assert_eq!(live[0].further_mechanism_terminals, 0);
 }
 
+/// Controller ruling fix2 (T0 KEM template reads, Gap 4): a KEM
+/// output template establishes its non-secret facts on the fresh
+/// key — class, key type and value length promote with
+/// `creation_success` and the shared secret labels. `CKA_VALUE`
+/// has no selector in the read set (pinned by the closed-set
+/// test), so secret bytes never read.
+#[test]
+fn key_operation_kem_output_template_establishes_shared_secret() {
+    use crate::key_operation_projection::producer::commit;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut encap = ShapedS1 {
+        input0: Some((CREATED_KEY, 1)),
+        kem_result: Some((KEM_OUTPUT_KEY, 1)),
+        ..ShapedS1::shaped("C_EncapsulateKey", CkRv::OK.0, 0x17, kem_encap_capture())
+    };
+    encap.request_cells = vec![(1u8, 1u8, 4u16), (2, 1, 0x10), (4, 1, 32)];
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &encap,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let secret = committed
+        .objects
+        .iter()
+        .find(|row| row.creation == Some("encapsulate"))
+        .expect("the shared secret projects");
+    assert_eq!(secret.established.class.scalar, Some(4));
+    assert_eq!(secret.established.key_type.scalar, Some(0x10));
+    assert_eq!(secret.established.value_len.scalar, Some(32));
+    assert_eq!(secret.established.class.source, Some("creation_success"));
+    assert_eq!(secret.established.key_type.source, Some("creation_success"));
+    assert_eq!(
+        secret.established.value_len.source,
+        Some("creation_success")
+    );
+    assert_eq!(secret.label, Some("generic_256"));
+}
+
 /// Unique scratch roots for fixture processes (parallel-safe).
 static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

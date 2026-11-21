@@ -199,11 +199,13 @@ pub enum ObjectAction {
     Find,
     GetAttributes,
     SetAttributes,
-    /// `C_EncapsulateKey` (T0): one key input, one named scalar
-    /// result, no template reads.
+    /// `C_EncapsulateKey`: one key input, one named scalar
+    /// result, and the output template pair (controller ruling
+    /// fix2: the same bounded non-secret reads as other creation
+    /// templates — never `CKA_VALUE` or secret-bearing attributes).
     Encapsulate,
-    /// `C_DecapsulateKey` (T0): one key input, one named scalar
-    /// result, no template reads.
+    /// `C_DecapsulateKey`: one key input, one named scalar result,
+    /// and the output template pair (same ruling, same bounds).
     Decapsulate,
 }
 
@@ -289,16 +291,20 @@ pub fn object_descriptor(function: u32) -> Option<ObjectCaptureDescriptor> {
             template_args: [(5, 6), (ARG_NONE, ARG_NONE)],
             ..ObjectCaptureDescriptor::new(ObjectAction::Unwrap)
         },
-        // T0 KEM: key input at arg 2, scalar result at arg 7, no
-        // template pairs (never authorized, never read).
+        // KEM: key input at arg 2, scalar result at arg 7, and
+        // the output template pair at args (3, 4) (controller
+        // ruling fix2: bounded non-secret reads through the same
+        // template reader as other creation templates).
         "C_EncapsulateKey" => ObjectCaptureDescriptor {
             input_args: [2, ARG_NONE],
             result_pointer_args: [7, ARG_NONE],
+            template_args: [(3, 4), (ARG_NONE, ARG_NONE)],
             ..ObjectCaptureDescriptor::new(ObjectAction::Encapsulate)
         },
         "C_DecapsulateKey" => ObjectCaptureDescriptor {
             input_args: [2, ARG_NONE],
             result_pointer_args: [7, ARG_NONE],
+            template_args: [(3, 4), (ARG_NONE, ARG_NONE)],
             ..ObjectCaptureDescriptor::new(ObjectAction::Decapsulate)
         },
         "C_DestroyObject" => ObjectCaptureDescriptor {

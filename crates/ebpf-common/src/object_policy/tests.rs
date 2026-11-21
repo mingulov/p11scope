@@ -906,10 +906,11 @@ fn s2s3_derive_scalar_phkey_is_authorized() {
     assert!(!valid_object_descriptor(id, &changed));
 }
 
-// Mutation caught: a KEM template-pointee authorization (T0 forbids it),
-// a scalar mechanism guard on the named KEM result, or a moved argument.
+// Mutation caught: a missing KEM output-template pair (controller
+// ruling fix2 authorizes it), a scalar mechanism guard on the named
+// KEM result, or a moved argument.
 #[test]
-fn s2s3_kem_descriptors_are_named_scalar_result_without_templates() {
+fn s2s3_kem_descriptors_are_named_scalar_result_with_output_template() {
     for (name, action) in [
         ("C_EncapsulateKey", Encapsulate),
         ("C_DecapsulateKey", Decapsulate),
@@ -921,8 +922,8 @@ fn s2s3_kem_descriptors_are_named_scalar_result_without_templates() {
         assert_eq!(descriptor.result_pointer_args, [7, N], "{name}");
         assert_eq!(
             descriptor.template_args,
-            [(N, N), (N, N)],
-            "{name}: T0 keeps template pairs absent"
+            [(3, 4), (N, N)],
+            "{name}: the output template pair is authorized"
         );
         assert_eq!(descriptor.find_capacity_arg, N, "{name}");
         assert_eq!(descriptor.find_count_ptr_arg, N, "{name}");
@@ -939,10 +940,12 @@ fn s2s3_kem_descriptors_are_named_scalar_result_without_templates() {
                 "{name}: {mechanism:?}"
             );
         }
-        // Any template authorization breaks exact descriptor validation.
-        let mut templated = descriptor;
-        templated.template_args = [(3, 4), (N, N)];
-        assert!(!valid_object_descriptor(id, &templated), "{name}");
+        // The authorized pair validates exactly; any other pair
+        // breaks exact descriptor validation.
+        assert!(valid_object_descriptor(id, &descriptor), "{name}");
+        let mut retempleted = descriptor;
+        retempleted.template_args = [(5, 6), (N, N)];
+        assert!(!valid_object_descriptor(id, &retempleted), "{name}");
     }
 }
 

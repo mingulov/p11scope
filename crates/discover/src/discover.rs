@@ -768,8 +768,10 @@ struct NameRead {
 /// outside a readable mapping, or inside a readable mapping that is not the
 /// provider's own, is refused without a read, and a name without an
 /// in-mapping NUL is unreadable. The provider key is the validated loaded
-/// module key, so a hostile name pointer cannot reach stack, environment or
-/// unrelated mappings.
+/// module key, so a hostile name pointer cannot cause a read from stack,
+/// environment or unrelated mappings. Bytes the provider itself placed in
+/// its own file mapping, writable segments included, are provider data:
+/// the scope rule is where the observer reads, not what the provider wrote.
 fn read_name(
     memory: &ProcessMemory,
     maps: &maps::MapIndex<'_>,

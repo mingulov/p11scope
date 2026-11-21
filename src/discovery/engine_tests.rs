@@ -54805,29 +54805,55 @@ fn e06_spawned_sleeps_share_one_settled_provider_shape() {
     }
 }
 
+/// Assert a parked static child maps no shared object, by file identity:
+/// every file-backed mapping (inode != 0; [vdso]/[vvar]/anonymous have
+/// inode 0) carries the one (device, inode) key, and one of those
+/// mappings is the parker executable itself (exact file-name suffix).
+/// Compares maps entries only within the maps device domain (never
+/// fstat-vs-maps: Btrfs st_dev differs from the mapped device), and
+/// never runs the `.so`-substring production heuristic, so incidental
+/// TMPDIR spelling (e.g. a `.source` directory) cannot fail it.
+fn e06_assert_static_child_single_file(pid: u32, maps: &[MapEntry], exe_name: &str) {
+    let backed: Vec<&MapEntry> = maps.iter().filter(|entry| entry.inode != 0).collect();
+    assert!(!backed.is_empty(), "static child {pid} maps no file at all");
+    let first = ObjectKey::of(backed[0]);
+    assert!(
+        backed.iter().all(|entry| ObjectKey::of(entry) == first),
+        "static child {pid} maps a second file besides its own executable"
+    );
+    assert!(
+        backed.iter().any(|entry| entry
+            .raw_path
+            .as_ref()
+            .is_some_and(|path| path.ends_with(exe_name.as_bytes()))),
+        "static child {pid} maps no path ending in {exe_name}"
+    );
+    assert!(
+        backed.iter().any(|entry| entry.permissions[2] == b'x'),
+        "static child {pid} keeps a file-backed executable mapping"
+    );
+}
+
 /// The shared sleeper helper accepts a statically linked child: a parked
-/// parker with no `.so` maps at all is a usable provider-free process
-/// (twin: the settled-shape helper still requires a dynamic layout for
-/// its shape assertions). Spawns two to cover the sibling path as well.
+/// parker mapping only its own file (no shared object) is a usable
+/// provider-free process (twin: the settled-shape helper still requires
+/// a dynamic layout for its shape assertions). Spawns two to cover the
+/// sibling path as well.
 #[test]
 fn e06_spawn_sleeps_accepts_statically_linked_child() {
     let dir = tempfile::tempdir().expect("a fixture directory");
     let sleeper = e06_build_static_sleeper(dir.path());
+    let exe = sleeper
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a sleeper file name");
     let mut children = e06_spawn_sleeps_with(&sleeper, 2);
     assert_eq!(children.len(), 2);
     for guard in &children {
         let pid = guard.pid();
         let bytes = std::fs::read(format!("/proc/{pid}/maps")).expect("readable maps");
         let maps = parse_maps(&bytes).expect("parseable maps");
-        assert!(
-            !maps.iter().any(crate::discovery::scan::is_provider_mapping),
-            "static child {pid} maps no provider shape"
-        );
-        assert!(
-            maps.iter()
-                .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0),
-            "static child {pid} keeps a file-backed executable mapping"
-        );
+        e06_assert_static_child_single_file(pid, &maps, exe);
     }
     for child in &mut children {
         child.reap().unwrap();
@@ -54836,34 +54862,122 @@ fn e06_spawn_sleeps_accepts_statically_linked_child() {
 
 /// The static parker is accepted even when its scratch path contains
 /// `.so` (e.g. a `.source` directory): the shared helper makes no
-/// provider-shape assumption, so incidental TMPDIR spelling must not
-/// fail the fixture. Builds under a `.source` subdir on purpose, so
-/// the spelling is pinned even on clean TMPDIRs.
+/// provider-shape assumption, and the no-shared-object assertion below
+/// reads file identity, never path spelling — so incidental TMPDIR
+/// spelling cannot fail the fixture. Builds under a `.source` subdir
+/// on purpose, so the spelling is pinned even on clean TMPDIRs.
 #[test]
 fn e06_static_sleeper_accepted_under_dot_so_scratch_path() {
     let dir = tempfile::tempdir().expect("a fixture directory");
     let dot_so = dir.path().join(".source");
     std::fs::create_dir_all(&dot_so).expect("a dot-so scratch dir");
     let sleeper = e06_build_static_sleeper(&dot_so);
+    let exe = sleeper
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a sleeper file name");
     let mut children = e06_spawn_sleeps_with(&sleeper, 2);
     assert_eq!(children.len(), 2);
     for guard in &children {
         let pid = guard.pid();
         let bytes = std::fs::read(format!("/proc/{pid}/maps")).expect("readable maps");
         let maps = parse_maps(&bytes).expect("parseable maps");
-        assert!(
-            !maps.iter().any(crate::discovery::scan::is_provider_mapping),
-            "static child {pid} maps no provider shape"
-        );
-        assert!(
-            maps.iter()
-                .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0),
-            "static child {pid} keeps a file-backed executable mapping"
-        );
+        e06_assert_static_child_single_file(pid, &maps, exe);
     }
     for child in &mut children {
         child.reap().unwrap();
     }
+}
+
+/// The empty-shape condition for static-like maps, pinned without a
+/// process: file-backed executable mappings of one non-`.so` file
+/// settle to no provider shape (`None`), so the settled helper keeps
+/// failing loudly on static layouts instead of admitting them (the
+/// convergence negative control, independent of TMPDIR spelling).
+#[test]
+fn e06_settled_shape_rejects_static_like_maps() {
+    let maps = vec![
+        MapEntry {
+            start: 0x400000,
+            end: 0x401000,
+            file_offset: 0,
+            permissions: *b"r--p",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 71,
+            raw_path: Some(b"/tmp/work/e06-static-sleeper".to_vec()),
+        },
+        MapEntry {
+            start: 0x401000,
+            end: 0x402000,
+            file_offset: 0x1000,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 71,
+            raw_path: Some(b"/tmp/work/e06-static-sleeper".to_vec()),
+        },
+        MapEntry {
+            start: 0x7fff0000,
+            end: 0x7fff1000,
+            file_offset: 0,
+            permissions: *b"r--p",
+            device: p11scope_manifest::maps::Device { major: 0, minor: 0 },
+            inode: 0,
+            raw_path: Some(b"[vdso]".to_vec()),
+        },
+    ];
+    assert!(
+        e06_settled_shape(&maps).is_none(),
+        "static-like maps settle to no provider shape"
+    );
+}
+
+/// Control for the empty-shape pin above: one mapped `.so` still
+/// settles, so the `None` is the maps' emptiness, not a dead helper.
+#[test]
+fn e06_settled_shape_accepts_dynamic_like_maps() {
+    let maps = vec![MapEntry {
+        start: 0x7f000000,
+        end: 0x7f001000,
+        file_offset: 0,
+        permissions: *b"r-xp",
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode: 72,
+        raw_path: Some(b"/usr/lib/x86_64-linux-gnu/libc.so.6".to_vec()),
+    }];
+    let shape = e06_settled_shape(&maps);
+    assert!(
+        shape.is_some_and(|shape| shape.len() == 1),
+        "dynamic-like maps settle to one provider shape"
+    );
+}
+
+/// The single-file assertion is non-vacuous: a second mapped file
+/// fails it, so the live static tests above prove their children map
+/// only the parker.
+#[test]
+#[should_panic(expected = "maps a second file")]
+fn e06_static_single_file_assertion_rejects_a_second_file() {
+    let maps = vec![
+        MapEntry {
+            start: 0x400000,
+            end: 0x401000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 71,
+            raw_path: Some(b"/tmp/work/e06-static-sleeper".to_vec()),
+        },
+        MapEntry {
+            start: 0x7f000000,
+            end: 0x7f001000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 72,
+            raw_path: Some(b"/usr/lib/x86_64-linux-gnu/libc.so.6".to_vec()),
+        },
+    ];
+    e06_assert_static_child_single_file(4242, &maps, "e06-static-sleeper");
 }
 
 fn e06_write_listing(scope_dir: &Path, pids: &[u32]) {

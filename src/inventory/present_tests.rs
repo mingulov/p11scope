@@ -7453,3 +7453,91 @@ fn provider_line_with_two_docker_containers_reads_multiple_origins() {
         " [multiple origins]"
     );
 }
+
+/// Repeated scan-ceiling stops fold into one named counted row in
+/// text (exact total, nothing hidden) while JSON keeps every
+/// record: thirty per-caller ceiling trips render as a single
+/// `scan budget exhausted` line with the summed count, and an
+/// unrelated row still renders on its own line.
+#[test]
+fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let mut presentation = capture_for(&harness, &document);
+    let mut gaps = Vec::new();
+    for index in 0u32..30 {
+        gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(1000 + index),
+            subject: "capture discovery".into(),
+            reason: "scan budget exhausted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "exact image authority unavailable".into(),
+        reason: "no BPF image identity".into(),
+        budget: None,
+        repeats: 1,
+    });
+    presentation.gaps = gaps;
+    let snapshot = render_snapshot(&presentation);
+    let folded: Vec<&str> = snapshot
+        .lines()
+        .filter(|line| line.contains("scan budget exhausted"))
+        .collect();
+    assert_eq!(
+        folded,
+        ["gap [capture discovery] scan budget exhausted (30 times)"],
+        "thirty ceiling trips fold into one exact counted row: {snapshot}"
+    );
+    assert!(
+        snapshot.contains("gap [process identity checked from /proc (PID and start time), not by the kernel (exact image authority unavailable)] no BPF image identity"),
+        "unrelated rows still render on their own line: {snapshot}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let kept = out["gaps"].as_array().unwrap();
+    assert_eq!(kept.len(), 31, "JSON keeps every record: {kept:?}");
+    assert_eq!(kept.iter().filter(|gap| gap["reason"] == "scan budget exhausted").count(), 30);
+}
+
+/// The ceiling fold maps the exact internal wordings only: the bare
+/// work-ceiling sentence and its scan-refusal wrappings fold;
+/// near misses (the deadline twin, a bare prefix, unrelated
+/// reasons) never fold.
+#[test]
+fn ceiling_fold_maps_exact_wordings_only() {
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    assert_eq!(
+        fold_scan_ceiling_reason(
+            "memory scan refused: final mapping validation unavailable: capture discovery work ceiling reached; remaining provider bytes were not scanned"
+        ),
+        Some("scan budget exhausted")
+    );
+    assert_eq!(
+        fold_scan_ceiling_reason(
+            "memory scan refused: process generation changed during acquisition: capture discovery work ceiling reached; remaining provider bytes were not scanned"
+        ),
+        Some("scan budget exhausted")
+    );
+    assert_eq!(
+        fold_scan_ceiling_reason(WORK_CEILING_REASON),
+        Some("scan budget exhausted")
+    );
+    assert_eq!(
+        fold_scan_ceiling_reason(
+            "capture discovery deadline reached; remaining provider bytes were not scanned"
+        ),
+        None
+    );
+    assert_eq!(
+        fold_scan_ceiling_reason("capture discovery work ceiling reached"),
+        None
+    );
+    assert_eq!(fold_scan_ceiling_reason("some unrelated reason"), None);
+}

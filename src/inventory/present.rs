@@ -462,6 +462,13 @@ pub(crate) struct GapView {
     pub repeats: u64,
 }
 
+/// Fold one internal gap reason to its finite public row, if it is a
+/// repeated-noise family member. Stubbed until the fold lands.
+#[cfg(test)]
+pub(crate) fn fold_scan_ceiling_reason(_reason: &str) -> Option<&'static str> {
+    None
+}
+
 /// Shared allocation charges and actual owned-state counts at publication.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SemanticResourceView {

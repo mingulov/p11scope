@@ -10,6 +10,7 @@ system-scope-measure.py.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,56 @@ def provider_pin():
                                "mtime_ns": 123, "ctime_ns": 456},
                 mapping={"dev": [8, 1], "ino": 71, "file_offset": 0,
                          "length": 4096, "permissions": "r--p"})
+
+
+# The engine's live stale-deferral mark (src/discovery/engine.rs
+# `queue_retirement_within`): filed when the retained pin re-reads
+# Current or unprovable — the process is still live — while the view
+# stays retained for the next pass.
+LIVE_DEFERRAL_INTERNAL_REASON = (
+    "a stale generation report was contradicted or unprovable on pin "
+    "recheck; retirement deferred")
+
+
+def producer_render_source():
+    return (ROOT / "src" / "render.rs").read_text(encoding="utf-8")
+
+
+def producer_const(name):
+    """The exact string value of a `const NAME: &str = "..."` in render.rs."""
+    match = re.search(
+        r'const %s: &str =\s*\n?\s*"((?:[^"\\]|\\.)*)"' % re.escape(name),
+        producer_render_source(),
+    )
+    assert match is not None, f"producer constant {name} missing from render.rs"
+    return match.group(1).replace('\\"', '"').replace("\\\\", "\\")
+
+
+def producer_exit_row():
+    """The public exit row as the producer defines it today.
+
+    Built from the render.rs constants, never a pasted copy, so the
+    rejection twins below always judge the row the producer emits.
+    """
+    return {"name": producer_const("DISCOVERY_SUBJECT"),
+            "reason": producer_const("MID_FLIGHT_REASON")}
+
+
+def assert_live_deferral_still_folds():
+    """Prove the live stale-deferral mark still folds to the exit row.
+
+    Fails loudly (never vacuously green) if the producer stops
+    filing the live mark or stops folding it: either change revisits
+    these twins, since the rejection below exists only because the
+    fold is ambiguous. The behavioral pin is
+    render::mid_flight_generation_pairs_project_to_one_public_reason.
+    """
+    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
+    assert LIVE_DEFERRAL_INTERNAL_REASON in engine, \
+        "producer stopped filing the live stale-deferral mark"
+    fold = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
+    assert LIVE_DEFERRAL_INTERNAL_REASON in fold, \
+        "producer stopped folding the live deferral to the exit row"
 
 
 def inputs(*, metrics=False, scope="pid", calls=None, cell="profile-pid"):
@@ -732,25 +783,21 @@ class SelectEndpoint66GapTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_exit_ambient_with_exit_only_passes_with_66_flag(self):
-        # The 6.6 flag must not be stricter than strict for other
-        # already-ruled shapes: an all-exit list on
-        # select-endpoint-system qualifies with the exit-ambient
-        # label (not the 66-transient label), naming the exit count.
+    def test_exit_ambient_with_exit_only_fails_with_66_flag(self):
+        # The 6.6 flag discloses only the single-generic 66 transient:
+        # an all-exit list on select-endpoint-system carries no exit
+        # proof, so it stays red at the gap gate under the flag too.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row), dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
         result = self.run_case(mutate, cell="select-endpoint-system",
-                               allow_66_discovery_gap=True)
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=2", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+                               allow_66_discovery_gap=True, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
 
 PROVIDER = r'''
@@ -1748,24 +1795,21 @@ class SystemAmbientGapTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
-    def test_exit_ambient_with_exit_only_passes_strict_counter_counts_system(self):
-        # The narrowed arm still accepts an all-exit list on the real
-        # CI metrics cell with the exit-ambient label, naming the
-        # exit count and zero generic skips.
+    def test_exit_ambient_with_exit_only_fails_strict_counter_counts_system(self):
+        # The real CI metrics cell rejects the ambiguous all-exit
+        # list too: exit rows carry no exit proof, so the shape stays
+        # red at the gap gate with exact owned counts and zero loss.
+        exit_row = producer_exit_row()
+        assert_live_deferral_still_folds()
         def mutate(d, l, r):
-            d["evidence"]["skipped"] = [
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-                {"name": "discovery subject", "reason": "process exited mid-flight"},
-            ]
+            d["evidence"]["skipped"] = [dict(exit_row), dict(exit_row),
+                                        dict(exit_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
-        result = self.run_case(mutate, cell="counter-counts-system")
-        self.assertEqual(result["qualification"],
-                         "owned-provider-counts-with-exit-ambient-gap")
-        self.assertIn("mid_flight_exits=3", result["detail"])
-        self.assertIn("discovery_skips=0", result["detail"])
+        result = self.run_case(mutate, cell="counter-counts-system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
 
     def test_quiet_lone_skip_passes_strict_metrics_cgroup(self):
         # Ambient-skip lane 2026-11-10: the quiet 6.18 vng leg shows

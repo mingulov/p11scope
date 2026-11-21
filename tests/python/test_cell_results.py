@@ -107,22 +107,17 @@ class CheckCellResultsTests(unittest.TestCase):
                                   "counts match; disclosed 6.6 discovery gap")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_exit_ambient_gap_qualification_accepted(self):
-        # Exit-ambient lane 2026-11-21 (v0.8.0 flakes): the oracle's
-        # new label must stay in the checker's qualified set, or live
-        # CI fails while both suites stay green. Pins the exact string
-        # in both directions (pass accepted, fail rejected).
+    def test_exit_ambient_gap_qualification_rejected(self):
+        # The oracle no longer emits the exit-ambient label (an exit
+        # excuse requires proof the process exited, and the ambiguous
+        # mid-flight row fails closed): the checker's closed set
+        # rejects it, like the retired burst label below.
         result = run_checker([row("counter-counts-system", True,
                                   "owned-provider-counts-with-exit-ambient-gap",
                                   "counts match; disclosed honest ambient exits: "
                                   "mid_flight_exits=3; discovery_skips=2")])
-        self.assertEqual(result.returncode, 0, result.stderr)
-        result = run_checker([row("counter-counts-system", False,
-                                  "owned-provider-counts-with-exit-ambient-gap",
-                                  "counts match; disclosed honest ambient exits")])
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("failed qualified cell counter-counts-system",
-                      result.stderr)
+        self.assertIn("unknown qualification", result.stderr)
 
     def test_ambient_burst_qualification_rejected(self):
         # The oracle no longer emits the burst label (evidence-only

@@ -5747,12 +5747,29 @@ impl JournalAdapter {
             self.invalidated = false;
             self.stream_boundary = Some(cut.clone());
         }
-        match &self.stream_boundary {
-            Some(boundary) if boundary.same_boundary(cut) => {}
-            None if self.consumed_through == 0 && cut.is_initial() => {
-                self.stream_boundary = Some(cut.clone());
+        // An S1-only lane links no object-journal producer, so no
+        // Joint certification depends on this stream (OD33/R-50):
+        // its boundary tracks the frontier instead of Prefix-refusing
+        // past the resync quantum, so every collected quantum
+        // resolves its birth cut and reseed retries can offer. The
+        // void fence (not the boundary) still guards voided history
+        // at attest and reseed; foreign producers still refuse
+        // earlier via ForeignCapture/Foreign, and
+        // malformed/discarded still ride explicit voids. A linked
+        // lane keeps the exact boundary.
+        let matches = self
+            .stream_boundary
+            .as_ref()
+            .is_some_and(|boundary| boundary.same_boundary(cut));
+        let initial =
+            self.stream_boundary.is_none() && self.consumed_through == 0 && cut.is_initial();
+        if !matches && !initial {
+            if producers.journal_linked() {
+                return Err(BirthCutRefusal::Prefix);
             }
-            _ => return Err(BirthCutRefusal::Prefix),
+            self.stream_boundary = Some(cut.clone());
+        } else if initial {
+            self.stream_boundary = Some(cut.clone());
         }
         Ok(JournalBirthCut {
             binding: BirthStreamBinding {

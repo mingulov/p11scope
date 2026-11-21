@@ -9812,10 +9812,28 @@ fn joint_machine_break_void_queues_reseed_for_rearm() {
     // Continued calls keep reducing S1 under the counted fallback
     // window; the re-armed birth itself needs a live lane (shell
     // fixtures re-arm nothing further), so the full reseed is pinned
-    // at the frame instead.
+    // at the frame instead. But the still-waiting feed is re-queued
+    // without a new void: a birth refused on transient pressure
+    // retries instead of stranding the feed until the next void.
     let direct_before = fixture.direct_fallback_total();
     fixture.scene.push(pid, 0, "C_CreateObject", 5);
     fixture.published_labeled("rebirth", None);
+    assert_eq!(
+        feed_mode(&fixture),
+        crate::semantics_key_use::FeedMode::S1Only,
+        "no live lane means no rebirth in this fixture"
+    );
+    // A further clean quantum (no void anywhere) still re-arms the
+    // waiting feed: a birth refused on transient pressure retries
+    // instead of stranding the feed until the next void.
+    let rearmed_before = fixture.scene.real.lane.reseed_rearm_calls_for_test().len();
+    fixture.scene.push(pid, 0, "C_SignInit", 6);
+    fixture.published_labeled("retry", None);
+    assert_eq!(
+        fixture.scene.real.lane.reseed_rearm_calls_for_test().len(),
+        rearmed_before + 1,
+        "the waiting feed re-arms again without a new void"
+    );
     assert_eq!(
         feed_mode(&fixture),
         crate::semantics_key_use::FeedMode::S1Only,

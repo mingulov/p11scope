@@ -217,9 +217,15 @@ _DOING = ("(preparing p11scope's self-probe|loading p11scope's BPF programs"
           "|attaching p11scope's probes)")
 _OPERATION = ("(prepare p11scope's self-probe|load p11scope's BPF programs"
               "|attach p11scope's probes)")
-# The errno name as strerror renders it: every Linux name starts with a
-# capital or `.` (ELIBBAD) and may carry `:` (ETOOMANYREFS).
-_ERRNO = r"( \([A-Z.][A-Za-z0-9 ,.:'/-]{0,80}\))?"
+# The errno name as strerror renders it. Every Linux name but two fits
+# the plain class: a capital first, no `:` anywhere. The two exceptions
+# are exact literals, so a leading `.` or any `:` is accepted only in
+# them: ELIBSCN (81) starts with `.`, ETOOMANYREFS (109) carries `:`.
+_ERRNO_PUNCTUATED = (".lib section in a.out corrupted",
+                     "Too many references: cannot splice")
+_ERRNO = (r"( \(([A-Z][A-Za-z0-9 ,.'/-]{0,80}|"
+          + "|".join(re.escape(name) for name in _ERRNO_PUNCTUATED)
+          + r")\))?")
 _SCAN_TAIL = re.escape(
     "; run 'p11scope doctor' for host readiness, or use 'p11scope inventory "
     "--capture scan' or 'p11scope inspect --pid N' for a scan without capture.")

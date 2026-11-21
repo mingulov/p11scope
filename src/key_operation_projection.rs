@@ -2331,7 +2331,7 @@ pub(crate) mod producer {
             ObjectGap::PairDuplicate => "pair_duplicate",
             ObjectGap::NullMechanismCancel => "null_mechanism_cancel",
             ObjectGap::SameSessionOverlap => "same_session_overlap",
-            ObjectGap::SameThreadNested => "same_thread_nested",
+            ObjectGap::SameThreadNested => crate::semantics_key_use::SAME_THREAD_NESTED_REASON,
             ObjectGap::OverlapUncertain => "overlap_uncertain",
             ObjectGap::OutputCollision => "output_collision",
             ObjectGap::StaleOrigin => "stale_origin",

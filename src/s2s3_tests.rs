@@ -2158,6 +2158,59 @@ fn s2s3_same_thread_nested_binds() {
     );
 }
 
+/// The nested pre-scan and the main overlap loop share one collected
+/// domain set: a nested pair plus an unrelated cross-thread
+/// same-session overlap in one quantum classifies each side exactly.
+/// The inner names the precise gap (pre-scan hit); the outer skips
+/// its nested inner yet still sees the third call in the main loop
+/// (so it stays uncertain instead of binding); the third call stays
+/// uncertain. A botched sharing (an emptied or consumed set between
+/// the passes) would bind the outer or drop the inner gap.
+#[test]
+fn s2s3_same_thread_nested_inner_named_while_outer_overlaps() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        4,
+        sign_init(SA, H1)
+            .thread(THREAD_A)
+            .mech(MechanismEvidence::Value(ECDSA)),
+        5,
+        ok().mech(MechanismEvidence::Value(ECDSA)),
+    );
+    let third = h.run(
+        6,
+        call("C_GenerateKey").on(SA).thread(THREAD_B),
+        7,
+        ok().result(0, H3),
+    );
+    h.done(outer, 8, ok().result(0, H1).result(1, H2));
+    let effects = h.settle(8);
+    assert_eq!(
+        unresolved(&effects, inner),
+        Some(ObjectGap::SameThreadNested),
+        "the nested inner keeps the precise gap"
+    );
+    assert_eq!(
+        unresolved(&effects, outer),
+        Some(ObjectGap::SameSessionOverlap),
+        "the outer skips its nested inner but still overlaps the third call"
+    );
+    assert_eq!(
+        unresolved(&effects, third),
+        Some(ObjectGap::SameSessionOverlap),
+        "the cross-thread overlap stays conservative"
+    );
+    assert_eq!(created(&effects, outer, 0), None);
+    assert_eq!(created(&effects, third, 0), None);
+    assert_eq!(
+        h.project().gap(ObjectGap::SameThreadNested),
+        1,
+        "exactly one nested model gap"
+    );
+}
+
 #[test]
 fn s2s3_same_thread_nested_migrated_return_stays_uncertain() {
     // Controller ruling v080-nss-ec-double R2: the re-entry proof
@@ -2291,42 +2344,62 @@ fn s2s3_same_thread_nested_sequential_tid_reuse_stays_separate() {
 /// R3 zero-half guard (RVS idea): a zero pid or tid half never nests,
 /// even with strict same-thread geometry. Unreachable in production
 /// (the journal refuses zero halves at admission), but the model
-/// proof stays self-contained. RED-first: fails before the guard
-/// (0 == 0 would nest), passes after.
+/// proof stays self-contained. The matrix zeroes one site at a time
+/// (inner begin, inner end, outer begin, outer end) in each of the
+/// three zero shapes (both halves, low half only, high half only);
+/// the all-zero case pins the guard as a whole (RED-first: fails
+/// before the guard since 0 == 0 would nest). Each single-zero case
+/// also fails thread equality, so the matrix characterizes the guard
+/// conjunction rather than proving any one arm necessary alone: a
+/// zero-half thread can never equal a live thread, which makes
+/// single arms individually redundant given equality (dropping one
+/// arm keeps the matrix green; dropping the whole guard fails the
+/// all-zero case).
 #[test]
 fn s2s3_same_thread_nested_zero_thread_halves_stay_uncertain() {
-    const ZERO_THREAD: u64 = 0;
-    let mut h = Hist::qualified();
-    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
-    let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(ZERO_THREAD));
-    let inner = h.run(
-        4,
-        sign_init(SA, H1).thread(ZERO_THREAD),
-        5,
-        ok().thread(ZERO_THREAD),
-    );
-    h.done(outer, 6, ok().result(0, H1).result(1, H2));
-    let effects = h.settle(6);
-    assert_eq!(created(&effects, outer, 0), None);
-    assert_eq!(
-        unresolved(&effects, outer),
-        Some(ObjectGap::SameSessionOverlap)
-    );
-    assert_eq!(
-        unresolved(&effects, inner),
-        Some(ObjectGap::SameSessionOverlap)
-    );
-    assert!(
-        !effects.effects.iter().any(|effect| matches!(
-            effect,
-            ObjectEffect::Unresolved {
-                reason: ObjectGap::SameThreadNested,
-                ..
-            }
-        )),
-        "zero thread halves name no nested gap"
-    );
-    assert!(h.project().objects.is_empty());
+    const BOTH_ZERO: u64 = 0;
+    const LOW_HALF_ZERO: u64 = 0x1111_1111_0000_0000;
+    const HIGH_HALF_ZERO: u64 = 0x0000_0000_2222_2222;
+    let check = |inner_begin: u64, inner_end: u64, outer_begin: u64, outer_end: u64| {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(outer_begin));
+        let inner = h.run(
+            4,
+            sign_init(SA, H1).thread(inner_begin),
+            5,
+            ok().thread(inner_end),
+        );
+        h.done(outer, 6, ok().result(0, H1).result(1, H2).thread(outer_end));
+        let effects = h.settle(6);
+        assert_eq!(created(&effects, outer, 0), None);
+        assert_eq!(
+            unresolved(&effects, outer),
+            Some(ObjectGap::SameSessionOverlap)
+        );
+        assert_eq!(
+            unresolved(&effects, inner),
+            Some(ObjectGap::SameSessionOverlap)
+        );
+        assert!(
+            !effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Unresolved {
+                    reason: ObjectGap::SameThreadNested,
+                    ..
+                }
+            )),
+            "zero thread halves name no nested gap"
+        );
+        assert!(h.project().objects.is_empty());
+    };
+    check(BOTH_ZERO, BOTH_ZERO, BOTH_ZERO, BOTH_ZERO);
+    for shape in [BOTH_ZERO, LOW_HALF_ZERO, HIGH_HALF_ZERO] {
+        check(shape, THREAD_A, THREAD_A, THREAD_A);
+        check(THREAD_A, shape, THREAD_A, THREAD_A);
+        check(THREAD_A, THREAD_A, shape, THREAD_A);
+        check(THREAD_A, THREAD_A, THREAD_A, shape);
+    }
 }
 
 #[test]

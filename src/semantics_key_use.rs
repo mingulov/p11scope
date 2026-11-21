@@ -954,6 +954,61 @@ impl JointStaging {
         Ok(())
     }
 
+    /// Replay one exact-matched staged head through the edge with
+    /// the reducer teed. `internal` seal evidence is recomputed from
+    /// this head's effect span on every call (never threaded through
+    /// from the caller), so the single and batch tee sites cannot
+    /// route the same span differently. Returns `(replayed,
+    /// refused)`: on H3 resource refusal (N14) the live S1 is
+    /// invalidated with terminals teed (opens close as Unknown, like
+    /// S1Only exhaustion) and the head counts as disposed history
+    /// (its claim was already consumed above).
+    #[allow(clippy::too_many_arguments)] // One replay needs the exact head, span, reducer, sink and ledgers.
+    pub(crate) fn replay_staged_head<S: OperationSink>(
+        &mut self,
+        reducer: &mut EdgeSemantics,
+        facts: &SemanticCall,
+        origin: &EffectOrigin,
+        source: Option<&crate::semantics_objects::journal::StagedResourceOrigin>,
+        receipts: &[KeyReceipt],
+        effects: &[ObjectEffect],
+        call: &SealedCall,
+        keyuse: &mut KeyUseReducer,
+        instance: RegistryInstanceId,
+        sink: &mut S,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> (bool, u64) {
+        let completion = KeyUseReducer::completion_evidence_for_effects(effects, call);
+        let internal = KeyUseReducer::is_same_thread_nested(effects, call);
+        let mut tee = KeyUseTee {
+            outer: sink,
+            keyuse,
+            instance,
+            shared: Some(ledger),
+            fallback,
+            source,
+        };
+        match reducer.observe_joint_with_resources(
+            facts,
+            origin,
+            receipts,
+            &completion,
+            internal,
+            &mut tee,
+        ) {
+            Ok(refused) => {
+                self.reduced = self.reduced.saturating_add(1);
+                (true, refused)
+            }
+            Err(_) => {
+                reducer.invalidate_with_effects(&mut tee);
+                self.history_disposed = self.history_disposed.saturating_add(1);
+                (false, 0)
+            }
+        }
+    }
+
     /// Apply one seal: replay the staged head iff the seal settled
     /// exactly its call — one settled call, exact-matched against
     /// the head (catalog function, session, mechanism shape),
@@ -1066,42 +1121,27 @@ impl JointStaging {
         // The seal's retirements already applied above (H9 §66),
         // before this replay: a terminal the replay emits can never
         // complete a binding this seal just unproved.
-        let completion =
-            KeyUseReducer::completion_evidence_for_effects(&seal.effects.effects, &settled[0]);
-        let internal = KeyUseReducer::is_same_thread_nested(&seal.effects.effects, &settled[0]);
-        let outcome = {
-            let mut tee = KeyUseTee {
-                outer: sink,
-                keyuse,
-                instance,
-                shared: Some(&mut *ledger),
-                fallback: assoc_fallback,
-                source: head.resource_origin.as_ref(),
-            };
-            match reducer.observe_joint_with_resources(
-                &head.facts,
-                &head.origin,
-                &receipts,
-                &completion,
-                internal,
-                &mut tee,
-            ) {
-                Ok(refused) => {
-                    self.reduced = self.reduced.saturating_add(1);
-                    (SealApplyOutcome::ReplayedOne, refused)
-                }
-                Err(_) => {
-                    // H3 resource refusal (N14): the S1 growth doesn't
-                    // fit. Invalidate live S1 with terminals teed (opens
-                    // close as Unknown, like S1Only exhaustion), dispose
-                    // the un-replayable head as history (claim already
-                    // consumed above), and keep
-                    // the feed Joint for later seals.
-                    reducer.invalidate_with_effects(&mut tee);
-                    self.history_disposed = self.history_disposed.saturating_add(1);
-                    (SealApplyOutcome::ResourceRefused, 0)
-                }
-            }
+        let (replayed_head, refused_head) = self.replay_staged_head(
+            reducer,
+            &head.facts,
+            &head.origin,
+            head.resource_origin.as_ref(),
+            &receipts,
+            &seal.effects.effects,
+            &settled[0],
+            keyuse,
+            instance,
+            sink,
+            ledger,
+            assoc_fallback,
+        );
+        // H3 resource refusal (N14) keeps the feed Joint for later
+        // seals; the shared replay already invalidated live S1 and
+        // disposed the head as history.
+        let outcome = if replayed_head {
+            (SealApplyOutcome::ReplayedOne, refused_head)
+        } else {
+            (SealApplyOutcome::ResourceRefused, 0)
         };
         if early_release {
             drop(head);
@@ -1201,41 +1241,25 @@ impl JointStaging {
                 }
                 self.redeemed = self.redeemed.saturating_add(1);
                 let receipts = keyuse.receipts_for_effects(effects, call, head.position);
-                let completion = KeyUseReducer::completion_evidence_for_effects(effects, call);
-                let internal = KeyUseReducer::is_same_thread_nested(effects, call);
                 let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
                 if early_release {
                     ledger.release(head.position, head.charged_bytes());
                 }
-                let outcome = {
-                    let mut tee = KeyUseTee {
-                        outer: sink,
-                        keyuse,
-                        instance,
-                        shared: Some(&mut *ledger),
-                        fallback: assoc_fallback.as_deref_mut(),
-                        source: head.resource_origin.as_ref(),
-                    };
-                    match reducer.observe_joint_with_resources(
-                        &head.facts,
-                        &head.origin,
-                        &receipts,
-                        &completion,
-                        internal,
-                        &mut tee,
-                    ) {
-                        Ok(count) => {
-                            self.reduced = self.reduced.saturating_add(1);
-                            refused = refused.saturating_add(count);
-                            true
-                        }
-                        Err(_) => {
-                            reducer.invalidate_with_effects(&mut tee);
-                            self.history_disposed = self.history_disposed.saturating_add(1);
-                            false
-                        }
-                    }
-                };
+                let (outcome, count) = self.replay_staged_head(
+                    reducer,
+                    &head.facts,
+                    &head.origin,
+                    head.resource_origin.as_ref(),
+                    &receipts,
+                    effects,
+                    call,
+                    keyuse,
+                    instance,
+                    sink,
+                    ledger,
+                    assoc_fallback.as_deref_mut(),
+                );
+                refused = refused.saturating_add(count);
                 if early_release {
                     drop(head);
                 } else {

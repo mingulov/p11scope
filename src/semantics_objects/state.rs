@@ -2127,7 +2127,11 @@ impl ModelState {
         // the `same_thread_nested` unknown row. The metadata flag is
         // unread downstream whenever interference is `Some` (every
         // consumer early-returns on the gap), so `false` is exact.
-        let nested = self.domain_calls(x.domain).into_iter().any(|token_y| {
+        // One per-call domain scan: the pending set is collected once
+        // and shared by this pre-scan and the main overlap loop below
+        // instead of collecting the same Vec twice per settled call.
+        let domain = self.domain_calls(x.domain);
+        let nested = domain.iter().copied().any(|token_y| {
             if token_y == token {
                 return false;
             }
@@ -2160,7 +2164,7 @@ impl ModelState {
             None
         };
         let mut metadata = false;
-        for token_y in self.domain_calls(x.domain) {
+        for token_y in domain {
             if token_y == token {
                 continue;
             }

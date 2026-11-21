@@ -572,19 +572,26 @@ class ObservedRsaTests(unittest.TestCase):
             ("CATEGORIES", ORACLE.CATEGORIES, defs["category"]["enum"]),
             ("ROLES", ORACLE.ROLES, defs["role"]["enum"]),
             ("UNITS", ORACLE.UNITS, defs["unit"]["enum"]),
+            # The script carries the v9-only unknown reason ahead of
+            # the frozen base schema (v1-v7 never emit it: the nested
+            # terminal promotes its section to v9). The v9 schema file
+            # pins the reason (see the v9-only test below); the union
+            # keeps this v1 pin correct.
             ("UNKNOWN_REASONS", ORACLE.UNKNOWN_REASONS,
-             defs["unknown_reason"]["enum"]),
+             set(defs["unknown_reason"]["enum"]) | {"same_thread_nested"}),
             ("GAP_SUBJECTS", ORACLE.GAP_SUBJECTS,
              defs["gap_row"]["properties"]["subject"]["enum"]),
-            # The script carries the two new v7-only gap reasons ahead
-            # of the frozen base schema (v1-v6 never emit them: each
-            # implies admitted lengths, hence non-blank rows, hence
-            # v7). The v7 schema file pins both reasons (see the
-            # v7-only test below); the union keeps this v1 pin
-            # correct.
+            # The script carries the two v7-only gap reasons plus the
+            # v9-only nested gap ahead of the frozen base schema (v1-v6
+            # never emit the v7 pair: each implies admitted lengths,
+            # hence non-blank rows, hence v7; v1-v7 never emit the
+            # nested gap: it promotes its section to v9). The v7 and
+            # v9 schema files pin their reasons (see the version-only
+            # tests below); the union keeps this v1 pin correct.
             ("GAP_REASONS", ORACLE.GAP_REASONS,
              set(defs["gap_reason"]["enum"])
-             | {"corroboration_mismatch", "wrapped_park_refused"}),
+             | {"corroboration_mismatch", "wrapped_park_refused",
+                "same_thread_nested"}),
             ("CURVE_LABELS", ORACLE.CURVE_LABELS,
              [name for name in
               defs["metadata_field_curve"]["properties"]["value"]["enum"]
@@ -932,6 +939,39 @@ class ObservedRsaTests(unittest.TestCase):
                 self.assertNotIn(reason, base)
                 self.assertIn(reason, ORACLE.GAP_REASONS)
 
+    def test_oracle_v9_reason_lives_only_in_v9_schema(self):
+        # The v9-only reason is pinned in the v9 schema file (both the
+        # unknown-reason and gap-reason enums) and absent from the
+        # frozen base and v7 files (v1-v7 never carry it: nested
+        # content promotes its section to v9).
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v9.schema.json",
+                  encoding="utf-8") as stream:
+            v9 = json.load(stream)["$defs"]
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v7.schema.json",
+                  encoding="utf-8") as stream:
+            v7 = json.load(stream)["$defs"]
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations.schema.json",
+                  encoding="utf-8") as stream:
+            base = json.load(stream)["$defs"]
+        with self.subTest("unknown enum"):
+            self.assertIn("same_thread_nested",
+                          v9["unknown_reason"]["enum"])
+            self.assertNotIn("same_thread_nested",
+                             v7["unknown_reason"]["enum"])
+            self.assertNotIn("same_thread_nested",
+                             base["unknown_reason"]["enum"])
+            self.assertIn("same_thread_nested", ORACLE.UNKNOWN_REASONS)
+        with self.subTest("gap enum"):
+            self.assertIn("same_thread_nested", v9["gap_reason"]["enum"])
+            self.assertNotIn("same_thread_nested",
+                             v7["gap_reason"]["enum"])
+            self.assertNotIn("same_thread_nested",
+                             base["gap_reason"]["enum"])
+            self.assertIn("same_thread_nested", ORACLE.GAP_REASONS)
+
     def test_h9_v7_section_checks_structurally(self):
         # v7 shape: the v6 object blocks plus inferred keys on every
         # key row. The closed size detail refuses malformed shapes;
@@ -1010,6 +1050,184 @@ class ObservedRsaTests(unittest.TestCase):
                 "suppressed": 0}
             facts = ORACLE.check_section(mutated)
             self.assertEqual(len(facts["gaps"]["rows"]), 2)
+
+    def test_h9_v9_section_checks_structurally(self):
+        # v9 shape: the v6 object blocks plus inferred keys on every
+        # key row (blank when unknown, valued when inferred), plus
+        # same-thread-nested content on an unknown row or a model gap.
+        # v9 needs no v7 content; below v9 the nested reason is
+        # refused on rows and gaps alike.
+        section = observed("clean.json")
+        section["version"] = 9
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "unknown",
+                                      "value": None, "completions": 0}
+            row["inferred_size"] = {"status": "unknown",
+                                    "detail": None, "completions": 0}
+        nested_row = {"category": "sign", "reason": "same_thread_nested",
+                      "unit": "operations", "completed": 1, "failed": 0,
+                      "cancelled": 0, "unknown": 0, "active": 0}
+        with self.subTest("v9 unknown-row shape checks, blank inferred"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"] = [dict(nested_row)]
+            mutated["budgets"]["unknown_rows"]["occupied"] = 1
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["unknown"]), 1)
+        with self.subTest("v9 unknown-row shape checks, valued inferred"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"] = [dict(nested_row)]
+            mutated["budgets"]["unknown_rows"]["occupied"] = 1
+            for row in mutated["key_operations"]:
+                row["inferred_family"] = {"status": "inferred",
+                                          "value": "rsa", "completions": 1}
+                row["inferred_size"] = {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048,
+                               "modulus_bytes": 256,
+                               "evidence": "sign_output"},
+                    "completions": 1}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["unknown"]), 1)
+        with self.subTest("v9 rowless-gap shape checks"):
+            mutated = copy.deepcopy(section)
+            mutated["gaps"] = {
+                "rows": [{"subject": "model",
+                          "reason": "same_thread_nested", "repeats": 1}],
+                "suppressed": 0}
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["gaps"]["rows"]), 1)
+            self.assertEqual(len(facts["unknown"]), 0)
+        with self.subTest("v9 without nested content refused"):
+            with self.assertRaisesRegex(
+                    ORACLE.OracleRefusal,
+                    "v9 section without same-thread-nested content"):
+                ORACLE.check_section(copy.deepcopy(section))
+        with self.subTest("v9 with valued inferred but no nested content refused"):
+            mutated = copy.deepcopy(section)
+            for row in mutated["key_operations"]:
+                row["inferred_family"] = {"status": "inferred",
+                                          "value": "rsa", "completions": 1}
+                row["inferred_size"] = {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048,
+                               "modulus_bytes": 256,
+                               "evidence": "sign_output"},
+                    "completions": 1}
+            with self.assertRaisesRegex(
+                    ORACLE.OracleRefusal,
+                    "v9 section without same-thread-nested content"):
+                ORACLE.check_section(mutated)
+        with self.subTest("v9 with stripped inferred keys refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"] = [dict(nested_row)]
+            mutated["budgets"]["unknown_rows"]["occupied"] = 1
+            del mutated["key_operations"][0]["inferred_size"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v7 carrying the nested unknown row refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 7
+            mutated["unknown_key_operations"] = [dict(nested_row)]
+            mutated["budgets"]["unknown_rows"]["occupied"] = 1
+            for row in mutated["key_operations"]:
+                row["inferred_family"] = {"status": "inferred",
+                                          "value": "rsa", "completions": 1}
+                row["inferred_size"] = {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048,
+                               "modulus_bytes": 256,
+                               "evidence": "sign_output"},
+                    "completions": 1}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "v9-only unknown reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("v7 carrying the nested model gap refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 7
+            mutated["gaps"] = {
+                "rows": [{"subject": "model",
+                          "reason": "same_thread_nested", "repeats": 1}],
+                "suppressed": 0}
+            for row in mutated["key_operations"]:
+                row["inferred_family"] = {"status": "inferred",
+                                          "value": "rsa", "completions": 1}
+                row["inferred_size"] = {
+                    "status": "inferred",
+                    "detail": {"kind": "rsa", "size_class": 2048,
+                               "modulus_bytes": 256,
+                               "evidence": "sign_output"},
+                    "completions": 1}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "v9-only gap reason"):
+                ORACLE.check_section(mutated)
+        with self.subTest("v6 carrying the nested unknown row refused"):
+            v6 = observed("clean.json")
+            v6["version"] = 6
+            v6["unattributed"] = []
+            for row in v6["objects"]:
+                for name, block in (("requested", row["requested"]),
+                                    ("established", row["established"])):
+                    block["parameter_set"] = {"status": "unknown",
+                                              "value": None, "source": None,
+                                              "reason": None}
+                    for cell_name, cell in block.items():
+                        if cell_name == "parameter_set":
+                            continue
+                        if name == "established" and cell["status"] == "value":
+                            cell["source"] = "query"
+                        else:
+                            cell["source"] = None
+                        cell["reason"] = None
+                row["queries"]["parameter_set"] = "not_queried"
+            v6["unknown_key_operations"] = [dict(nested_row)]
+            v6["budgets"]["unknown_rows"]["occupied"] = 1
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "v9-only unknown reason"):
+                ORACLE.check_section(v6)
+        with self.subTest("v6 carrying the nested model gap refused"):
+            v6 = observed("clean.json")
+            v6["version"] = 6
+            v6["unattributed"] = []
+            for row in v6["objects"]:
+                for name, block in (("requested", row["requested"]),
+                                    ("established", row["established"])):
+                    block["parameter_set"] = {"status": "unknown",
+                                              "value": None, "source": None,
+                                              "reason": None}
+                    for cell_name, cell in block.items():
+                        if cell_name == "parameter_set":
+                            continue
+                        if name == "established" and cell["status"] == "value":
+                            cell["source"] = "query"
+                        else:
+                            cell["source"] = None
+                        cell["reason"] = None
+                row["queries"]["parameter_set"] = "not_queried"
+            v6["gaps"] = {
+                "rows": [{"subject": "model",
+                          "reason": "same_thread_nested", "repeats": 1}],
+                "suppressed": 0}
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "v9-only gap reason"):
+                ORACLE.check_section(v6)
 
     def test_h9_v7_size_detail_closed_variants(self):
         # Closed per-kind variants (§10.2): the shared specimen table

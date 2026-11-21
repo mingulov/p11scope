@@ -1500,7 +1500,7 @@ fn key_operation_same_thread_nested_binds() {
             &sealed.effects.effects,
             outer
         ),
-        "the keygen reads back caller-issued"
+        "the keygen reads back not-nested"
     );
 
     // The self-test init keeps its conservative join under the
@@ -1729,12 +1729,159 @@ fn key_operation_same_thread_nested_gap_promotes_v9() {
     assert_eq!(observations_version(&bare), OBSERVATIONS_VERSION_V9);
 }
 
+/// The nested quantum replays through the shared staging tee into
+/// the reducer, not past it: the 3-call nested scene (outer keygen
+/// with an inner sign-init plus its bare sign, all on one thread)
+/// seals once, and each head replays through `replay_staged_head` —
+/// the one tee both `apply_seal` and `apply_seal_batch` call, which
+/// recomputes `internal` seal evidence from each head's effect span
+/// — committing to the `(sign, same_thread_nested)` unknown row plus
+/// v9. Forcing `internal=false` in the shared tee fails this test
+/// (the terminal would route to `unbound`). Staging FIFO/correlation
+/// around the tee is covered by the single-feed tests; the Unresolved
+/// matching inside is ticket-qualified, so the whole-seal span here
+/// and the frame's per-step spans agree.
+#[test]
+fn key_operation_same_thread_nested_tee_routes() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V9, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    use crate::semantics_objects::ObjectGap;
+    const PUBLIC: u64 = 0xD2D2_D2D2_D2D2_D2D2;
+    const PRIVATE: u64 = 0xD3D3_D3D3_D3D3_D3D3;
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+
+    // Open the session first (model only, unstaged).
+    let mut open = ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0);
+    open.session = Some(SESSION);
+    let admitted = admit_call_input(&mut scene, &open);
+    scene.adapter.attest_key(&admitted).expect("open attests");
+    ingest_call(&mut scene, &open, admitted.h0_ordinal());
+    scene.seal().expect("open quantum seals");
+
+    // Admit the nested triple in H0 admission (END) order with
+    // begin-order journal sequences, all on thread 1, retaining each
+    // head's S1 facts for the shared-tee replay below.
+    let mut pair = ShapedS1::shaped("C_GenerateKeyPair", CkRv::OK.0, 0, 0);
+    pair.pair_results = Some((PUBLIC, PRIVATE));
+    let mut selftest_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    selftest_init.input0 = Some((PUBLIC, 1));
+    let selftest_sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let admitted = admit_call_input_with_sequence(&mut scene, &selftest_init, 1, 3);
+    scene.adapter.attest_key(&admitted).expect("init attests");
+    let (init_facts, init_pos) = (admitted.s1_facts().clone(), admitted.h0_ordinal());
+    let admitted = admit_call_input_with_sequence(&mut scene, &selftest_sign, 1, 4);
+    scene.adapter.attest_key(&admitted).expect("sign attests");
+    let (sign_facts, sign_pos) = (admitted.s1_facts().clone(), admitted.h0_ordinal());
+    let admitted = admit_call_input_with_sequence(&mut scene, &pair, 1, 2);
+    scene.adapter.attest_key(&admitted).expect("pair attests");
+    let (pair_facts, pair_pos) = (admitted.s1_facts().clone(), admitted.h0_ordinal());
+
+    // Ingest in wire order, then one seal: the settlement watermark
+    // holds every nested end until the outer call completes, so all
+    // three settle together.
+    ingest_begin_for_position(&mut scene, &pair, pair_pos);
+    ingest_begin_for_position(&mut scene, &selftest_init, init_pos);
+    ingest_end_for_position(&mut scene, &selftest_init, init_pos);
+    ingest_begin_for_position(&mut scene, &selftest_sign, sign_pos);
+    ingest_end_for_position(&mut scene, &selftest_sign, sign_pos);
+    ingest_end_for_position(&mut scene, &pair, pair_pos);
+    let sealed = scene.seal().expect("nested quantum seals");
+    assert_eq!(
+        sealed.prefix.settled().len(),
+        3,
+        "the nested triple settles together"
+    );
+    // Replay each head through the shared staging tee in admission
+    // order with real seal effects and receipts; the tee recomputes
+    // `internal` per head, so the nested init (and only it) rides
+    // the internal route. Legacy test heads carry no resource
+    // origin, hence `source: None`.
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let settled_for = |name: &str| {
+        let fid = crate::kinds::function_id(name).unwrap();
+        sealed
+            .prefix
+            .settled()
+            .iter()
+            .find(|settled| settled.function == fid)
+            .expect("nested call settled")
+    };
+    let mut refused_total = 0u64;
+    for (name, facts, position) in [
+        ("C_SignInit", &init_facts, init_pos),
+        ("C_Sign", &sign_facts, sign_pos),
+        ("C_GenerateKeyPair", &pair_facts, pair_pos),
+    ] {
+        let settled = settled_for(name);
+        let receipts = keyuse.receipts_for_call(&sealed, settled, &scene.model, position);
+        let origin = EffectOrigin::from(facts);
+        let (replayed, refused) = staging.replay_staged_head(
+            &mut joint,
+            facts,
+            &origin,
+            None,
+            &receipts,
+            &sealed.effects.effects,
+            settled,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            scene.adapter.ledger_mut(),
+            None,
+        );
+        assert!(replayed, "{name} replays through the shared tee");
+        refused_total += refused;
+    }
+    assert_eq!(refused_total, 0);
+    assert_eq!(
+        scene.model.project().gap(ObjectGap::SameThreadNested),
+        1,
+        "the nested self-test names the model gap"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V9,
+        "the nested replay promotes its section to v9"
+    );
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| {
+            row.category == "sign"
+                && row.reason == crate::semantics_key_use::SAME_THREAD_NESTED_REASON
+        })
+        .expect("the nested terminal names (sign, same_thread_nested)");
+    assert_eq!(
+        (
+            row.completed,
+            row.failed,
+            row.cancelled,
+            row.unknown,
+            row.active,
+        ),
+        (1, 0, 0, 0, 0),
+        "the nested terminal counts exactly once"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_eq!(rendered["version"], 9);
+}
+
 /// R3 task (a): the same-thread nested reason must not overclaim
 /// the issuer — a same-thread nested call from an application signal
 /// handler or a provider-invoked application callback re-entering
 /// PKCS#11 on the same session also nests — so the row/gap name is
 /// `same_thread_nested` (what the model proves: same thread, strict
-/// nesting, same session), never `same_thread_nested`. The nested
+/// nesting, same session), never the issuer. The nested
 /// terminal never binds its inner call to a key: it routes to the
 /// named unknown row, never a proved row.
 #[test]
@@ -1926,6 +2073,13 @@ fn key_operation_v9_unknown_row_keeps_blank_inferred_keys() {
         committed.key_operations[0].inferred.is_some(),
         "v9 keeps inferred keys even without v7 content"
     );
+    assert!(
+        !committed.key_operations[0]
+            .inferred
+            .as_ref()
+            .is_some_and(|keys| keys.is_v7_content()),
+        "no v7 content: the v9 trigger alone keeps the keys"
+    );
     let rendered = object_observations_json(&committed);
     assert_eq!(rendered["version"], 9);
     let row = &rendered["key_operations"][0];
@@ -2049,6 +2203,13 @@ fn key_operation_v9_model_gap_keeps_blank_inferred_keys() {
     assert!(
         committed.key_operations[0].inferred.is_some(),
         "v9 keeps inferred keys even without v7 content"
+    );
+    assert!(
+        !committed.key_operations[0]
+            .inferred
+            .as_ref()
+            .is_some_and(|keys| keys.is_v7_content()),
+        "no v7 content: the v9 trigger alone keeps the keys"
     );
     let rendered = object_observations_json(&committed);
     assert_eq!(rendered["version"], 9);
@@ -9705,8 +9866,26 @@ fn key_operation_schema_contract() {
     );
     assert_eq!(enums("/$defs/unit/enum"), table(&UNIT_LABELS));
     assert_eq!(enums("/$defs/metadata_label/enum"), table(&METADATA_LABELS));
-    assert_eq!(enums("/$defs/unknown_reason/enum"), table(&UNKNOWN_REASONS));
-    assert_eq!(enums("/$defs/gap_reason/enum"), table(&GAP_REASONS));
+    // The frozen v1 file predates the v9-only same-thread-nested
+    // reason (versions 1-7 never carry it): v1 carries the six
+    // ordinary unknown reasons and the 52 pre-nested gap reasons,
+    // while the contract tables carry the full producer
+    // vocabularies (seven and 53). The v9 schema file pins the full
+    // sets (`key_operation_schema_v9_pins_same_thread_nested_reason`).
+    let mut v1_unknown: Vec<String> = table(&UNKNOWN_REASONS);
+    v1_unknown.retain(|reason| reason != crate::semantics_key_use::SAME_THREAD_NESTED_REASON);
+    assert_eq!(
+        enums("/$defs/unknown_reason/enum"),
+        v1_unknown,
+        "v1 stays frozen without the v9-only reason"
+    );
+    let mut v1_gaps: Vec<String> = table(&GAP_REASONS);
+    v1_gaps.retain(|reason| reason != crate::semantics_key_use::SAME_THREAD_NESTED_REASON);
+    assert_eq!(
+        enums("/$defs/gap_reason/enum"),
+        v1_gaps,
+        "v1 stays frozen without the v9-only gap"
+    );
     assert_eq!(enums("/$defs/query_status/enum"), table(&QUERY_STATUSES));
     assert_eq!(
         defs["row_budget"]["properties"]["limit"],
@@ -16263,6 +16442,10 @@ fn key_operation_allocation_pressure_is_bounded_across_passes() {
         phase_b.emitter_tracked, phase_b.published_rows,
         "tracking bounded by the live publication"
     );
+    // Scenario-local envelope, not the bucket count: this churn
+    // scene names no nested terminal, so at most the 23 categories
+    // times the six ordinary reasons (138) can go live. The full
+    // reducer vocabulary is UNKNOWN_BUCKETS (23 times seven, 161).
     assert!(phase_b.unknown_live <= 138, "fixed summaries stay fixed");
 
     // Live/peak envelope: churn grows only per retained bucket.
@@ -32518,8 +32701,8 @@ fn key_operation_schema_v7_pins_inferred_keys() {
 /// The v9 schema pins the same-thread nested contract: version
 /// constant 9, the seven-member unknown-reason enum (the frozen six
 /// plus `same_thread_nested`), the gap enum plus the precise
-/// internal gap, and otherwise v7-identical shapes. The v7 file
-/// stays frozen and forbids the new reason.
+/// internal gap, and otherwise v7-identical shapes. The v1 and v7
+/// files stay frozen and forbid the new reason.
 #[test]
 fn key_operation_schema_v9_pins_same_thread_nested_reason() {
     use crate::key_operation_projection::contract::UNKNOWN_REASONS;
@@ -32528,6 +32711,7 @@ fn key_operation_schema_v9_pins_same_thread_nested_reason() {
         serde_json::from_str(&std::fs::read_to_string(root.join(name)).expect("schema file reads"))
             .expect("schema parses")
     };
+    let v1 = read("docs/schema/inventory-v1-object-observations.schema.json");
     let v7 = read("docs/schema/inventory-v1-object-observations-v7.schema.json");
     let v9 = read("docs/schema/inventory-v1-object-observations-v9.schema.json");
     let sorted = |values: Vec<String>| -> Vec<String> {
@@ -32560,6 +32744,19 @@ fn key_operation_schema_v9_pins_same_thread_nested_reason() {
         !values(&v7, "/$defs/unknown_reason/enum").contains(&"same_thread_nested".to_string()),
         "v7 stays frozen without the new reason"
     );
+    assert!(
+        !values(&v1, "/$defs/unknown_reason/enum").contains(&"same_thread_nested".to_string()),
+        "v1 stays frozen without the new reason"
+    );
+    assert!(
+        !values(&v1, "/$defs/gap_reason/enum").contains(&"same_thread_nested".to_string()),
+        "v1 stays frozen without the new gap"
+    );
+    assert_eq!(
+        values(&v1, "/$defs/unknown_reason/enum").len(),
+        6,
+        "v1 keeps the six ordinary unknown reasons"
+    );
     // The gap vocabulary gains the precise internal gap and
     // nothing else.
     let mut v7_gaps = values(&v7, "/$defs/gap_reason/enum");
@@ -32589,6 +32786,96 @@ fn key_operation_schema_v9_pins_same_thread_nested_reason() {
             "v9 keeps the v7 shape at {pointer}"
         );
     }
+}
+
+/// A v1-tagged document carrying the v9-only reason fails v1
+/// validation, while real nested output passes v9: the frozen v1
+/// file forbids `same_thread_nested` in both the unknown-reason and
+/// gap-reason enums, and only the v9 file admits it. The v1 half
+/// injects the reason into the frozen golden (otherwise v1-valid, so
+/// the refusal names the enum); the v9 half renders a real nested
+/// commit through the edge and reducer, never hand-built JSON.
+#[test]
+fn key_operation_schema_v1_refuses_same_thread_nested_while_v9_accepts() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::object_observations_json;
+    use crate::key_operation_projection::producer::commit;
+    use crate::keymeta::CompletionEvidence;
+    use crate::semantics_key_use::KeyUseReducer;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let v1_schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations.schema.json"),
+        )
+        .expect("v1 schema reads"),
+    )
+    .expect("v1 schema parses");
+    let v1_validator = jsonschema::options()
+        .build(&v1_schema)
+        .expect("v1 schema builds");
+    let golden: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("tests/fixtures/key-operations/object-observations.json"),
+        )
+        .expect("golden reads"),
+    )
+    .expect("golden parses");
+    assert!(
+        v1_validator.is_valid(&golden),
+        "the untouched golden stays v1-valid"
+    );
+    let mut nested_unknown = golden.clone();
+    nested_unknown["unknown_key_operations"][0]["reason"] =
+        serde_json::Value::String("same_thread_nested".to_string());
+    assert!(
+        !v1_validator.is_valid(&nested_unknown),
+        "v1 refuses the v9-only unknown reason at version 1"
+    );
+    let mut nested_gap = golden.clone();
+    nested_gap["gaps"]["rows"][0]["reason"] =
+        serde_json::Value::String("same_thread_nested".to_string());
+    assert!(
+        !v1_validator.is_valid(&nested_gap),
+        "v1 refuses the v9-only gap reason at version 1"
+    );
+    // The same machine string on real nested output validates under
+    // v9: an internal sign terminal through the real edge and
+    // reducer into a committed section.
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut assoc_ledger = StagingLedger::new();
+    for (facts, internal) in [
+        (init("C_SignInit", 7, RSA_PKCS, 100), true),
+        (op("C_Sign", 7, 200), true),
+    ] {
+        edge.observe_joint_with_resources(
+            &facts,
+            &EffectOrigin::from(&facts),
+            &[],
+            &CompletionEvidence::NONE,
+            internal,
+            &mut sink,
+        )
+        .expect("nested call replays");
+    }
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let scene = JointScene::new();
+    let staging = JointStaging::select_s1_only();
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let rendered = object_observations_json(&committed);
+    assert!(
+        rendered["unknown_key_operations"]
+            .as_array()
+            .expect("unknown rows render")
+            .iter()
+            .any(|row| row["category"] == "sign" && row["reason"] == "same_thread_nested"),
+        "the rendered section names the nested row"
+    );
+    assert_valid_v9_section(&rendered);
 }
 
 /// The v7 size-detail linkage is closed: `detail`/`conflict_detail`

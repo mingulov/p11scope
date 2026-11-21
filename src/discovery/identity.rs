@@ -10986,20 +10986,14 @@ fn record_scanned_candidate(
             // proven entries contradicting at insert) fails a key
             // closed. The failed view binds nothing — the proof fence
             // in `id_for_scanned` refuses it — while proven peers keep
-            // counting. Skip shapes stay exactly as before.
+            // counting. Skip shapes stay exactly as before. A gone
+            // view's loss files here too: the gap names the loss, the
+            // key (and every live view's pins on it) is left alone,
+            // and unlike a wait this never defers for a retry that
+            // cannot help.
             skipped.push(Skipped {
                 subject: raw.path,
                 reason: outcome.reason().to_string(),
-            });
-        }
-        Err(PinFailure::Gone { reason }) => {
-            // The view died mid-pin: loss, not forgery evidence. File the
-            // gap like a refusal but leave the key (and every live view's
-            // pins on it) alone; unlike a wait, a dead view never becomes
-            // pinnable, so this never defers for retry.
-            skipped.push(Skipped {
-                subject: raw.path,
-                reason,
             });
         }
     }
@@ -18272,7 +18266,7 @@ mod tests {
             &mut budget,
         );
         assert!(
-            !matches!(outcome, Err(PinFailure::Refused(_))),
+            !matches!(outcome, Err(PinOutcome::Unproven { .. })),
             "a dead view's pin failure must not refuse (it would reject a live key): {:?}",
             outcome.as_ref().map(|_| ()),
         );
@@ -18303,7 +18297,7 @@ mod tests {
             &mut budget,
         );
         assert!(
-            matches!(outcome, Err(PinFailure::Refused(_))),
+            matches!(outcome, Err(PinOutcome::Unproven { .. })),
             "a live view's pin failure must keep refusing: {:?}",
             outcome.as_ref().map(|_| ()),
         );
@@ -18336,7 +18330,7 @@ mod tests {
             &mut budget,
         );
         assert!(
-            matches!(outcome, Err(PinFailure::Refused(_))),
+            matches!(outcome, Err(PinOutcome::Unproven { .. })),
             "a zero work cap can never heal, so it must refuse (fail fast): {:?}",
             outcome.as_ref().map(|_| ()),
         );
@@ -18364,7 +18358,7 @@ mod tests {
             &mut budget,
         );
         assert!(
-            matches!(outcome, Err(PinFailure::Wait { .. })),
+            matches!(outcome, Err(PinOutcome::Wait { .. })),
             "budget exhaustion must wait (it would reject a live key): {:?}",
             outcome.as_ref().map(|_| ()),
         );
@@ -18396,7 +18390,7 @@ mod tests {
             &mut pinned,
             ProcessViewId(1),
             raw,
-            Err(PinFailure::Gone {
+            Err(PinOutcome::Gone { evidence: ExitEvidence::ProcessGenerationExited,
                 reason: "mapping identity unavailable".into(),
             }),
             &mut skipped,
@@ -18411,6 +18405,74 @@ mod tests {
             skipped.iter().any(|skip| !skip.reason.is_empty()),
             "the gone observation still files its gap: {skipped:?}"
         );
+    }
+
+    /// The wait-subject split: only the handle-class waits
+    /// (`HandleExhaustion`, `ReserveStop`, `BudgetStop`) file under
+    /// the fixed wait subject the defer-whole classifiers recognise;
+    /// every other `Wait` cause files under its own path subject, so
+    /// a work-ceiling (or I/O, deadline, clock, table/interface
+    /// window) wait never defers a scan whole. A future `Wait`
+    /// cause that should defer whole must file under the wait
+    /// subject too — this table fails until it does.
+    #[test]
+    fn wait_causes_split_the_wait_subject_by_handle_class() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let raw = image_pins(&[(key, "aaaaaaaa", 1)])
+            .by_id
+            .pop_first()
+            .unwrap()
+            .1
+            .raw;
+        for cause in [
+            WaitCause::HandleExhaustion,
+            WaitCause::ReserveStop,
+            WaitCause::BudgetStop,
+            WaitCause::IoCeiling,
+            WaitCause::WorkCeiling,
+            WaitCause::Deadline,
+            WaitCause::ClockUnavailable,
+            WaitCause::TableWindowCeiling,
+            WaitCause::InterfaceWindowCeiling,
+        ] {
+            let mut pinned = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            record_scanned_candidate(
+                &mut pinned,
+                ProcessViewId(0),
+                raw.clone(),
+                Err(PinOutcome::Wait {
+                    cause,
+                    retry: RetryOwner::ViewRescan,
+                    reason: "wait for the next pass".to_string(),
+                }),
+                &mut skipped,
+                true,
+            );
+            assert_eq!(skipped.len(), 1, "{cause:?} files exactly one skip");
+            let handle_class = matches!(
+                cause,
+                WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop
+            );
+            if handle_class {
+                assert_eq!(
+                    skipped[0].subject, PIN_WAIT_SUBJECT,
+                    "{cause:?} must file the defer-whole wait subject"
+                );
+            } else {
+                assert_eq!(
+                    skipped[0].subject, raw.path,
+                    "{cause:?} must not file the defer-whole wait subject"
+                );
+            }
+            assert!(
+                !pinned.rejects(key),
+                "{cause:?} never rejects the key"
+            );
+        }
     }
 
     #[test]

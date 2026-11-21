@@ -453,7 +453,7 @@ fn pin_failure_scrubs_without_group_rejection() {
         &mut pins,
         ProcessViewId(3),
         raw.clone(),
-        Err(PinFailure::Refused("TEST refused".to_string())),
+        Err(PinOutcome::Unproven { cause: UnprovenCause::OpenFailed, reason: "TEST refused".to_string() }),
         &mut skipped,
         false,
     );
@@ -481,7 +481,7 @@ fn same_store_refusal_pair_publishes_ambiguity_without_rejection() {
         &mut pins,
         ProcessViewId(1),
         raw.clone(),
-        Err(PinFailure::Refused("TEST refused one".to_string())),
+        Err(PinOutcome::Unproven { cause: UnprovenCause::OpenFailed, reason: "TEST refused one".to_string() }),
         &mut skipped,
         false,
     );
@@ -493,7 +493,7 @@ fn same_store_refusal_pair_publishes_ambiguity_without_rejection() {
         &mut pins,
         ProcessViewId(2),
         raw.clone(),
-        Err(PinFailure::Refused("TEST refused two".to_string())),
+        Err(PinOutcome::Unproven { cause: UnprovenCause::OpenFailed, reason: "TEST refused two".to_string() }),
         &mut skipped,
         false,
     );
@@ -520,7 +520,7 @@ fn absorb_pairs_refusals_across_stores_into_ambiguity() {
         &mut first,
         ProcessViewId(1),
         raw.clone(),
-        Err(PinFailure::Refused("TEST refused one".to_string())),
+        Err(PinOutcome::Unproven { cause: UnprovenCause::OpenFailed, reason: "TEST refused one".to_string() }),
         &mut skipped,
         false,
     );
@@ -529,7 +529,7 @@ fn absorb_pairs_refusals_across_stores_into_ambiguity() {
         &mut second,
         ProcessViewId(2),
         raw.clone(),
-        Err(PinFailure::Refused("TEST refused two".to_string())),
+        Err(PinOutcome::Unproven { cause: UnprovenCause::OpenFailed, reason: "TEST refused two".to_string() }),
         &mut skipped,
         false,
     );
@@ -562,7 +562,7 @@ fn file_after_refuse_group_rejects_with_a_contradiction_gap() {
         &mut pins,
         ProcessViewId(1),
         raw.clone(),
-        Err(PinFailure::Refused("TEST refused".to_string())),
+        Err(PinOutcome::Unproven { cause: UnprovenCause::OpenFailed, reason: "TEST refused".to_string() }),
         &mut skipped,
         false,
     );

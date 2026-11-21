@@ -2338,6 +2338,15 @@ pub(crate) const JOINT_BIRTH_UNAVAILABLE_SUBJECT: &str = "Joint birth unavailabl
 /// under: per-call losses name their caller, capture-wide voids do not.
 pub(crate) const JOINT_RETAINED_S1_SUBJECT: &str = "Joint key operations unavailable; retained S1";
 
+/// The subject one Joint re-entry discloses under when a voided feed
+/// reseeds onto a fresh birth: per-key tracking resumes for the
+/// process while the voided window stays counted beside it.
+pub(crate) const JOINT_REENTRY_SUBJECT: &str = "Joint key operations recovered after void";
+
+/// The reason a Joint re-entry discloses: one counted row per feed
+/// that reseeds onto a fresh birth after a void.
+pub(crate) const JOINT_REENTRY_COMPLETED_REASON: &str = "joint_reentry_completed";
+
 /// The reason only the presentation-synthesized bootstrap row carries
 /// ([`silent_bootstrap_gap`]): no retained registry recording uses it.
 /// Shared with [`is_synthetic_bootstrap_gap`] so the producer and the
@@ -3604,6 +3613,9 @@ fn gap_plain_reason<'a>(subject: &str, reason: &'a str) -> &'a str {
     }
     if reason == "joint_resume_deferred_below_fence" {
         return "per-key tracking waits to restart after lost history";
+    }
+    if reason == JOINT_REENTRY_COMPLETED_REASON {
+        return "per-key tracking restarted after lost history";
     }
     // The deferred-admission note (a non-loss retry) names its retry;
     // every other semantic-unavailable site is plain unavailability.

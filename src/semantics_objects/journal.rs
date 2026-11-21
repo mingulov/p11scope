@@ -429,9 +429,12 @@ impl JournalTicket {
 // ---------------------------------------------------------------------------
 
 /// One journal-tracked incarnation key: the native domain tag, the H3-bound
-/// caller, the exact image (task cookie plus exec id) and the H3 router.
-/// Keys are never removed until the adapter drops, so a refused or ended
-/// incarnation is never silently reborn under the same key.
+/// caller, the exact image (task cookie plus exec id), the H3 router,
+/// and the journal-minted incarnation. Keys are never removed until
+/// the adapter drops, so a refused or ended incarnation is never
+/// silently reborn under the same key; instead, a dead void-fenced
+/// binding mints the next incarnation (same binding, fresh state and
+/// model domain) for post-void re-entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(in crate::semantics_objects) struct JournalDomainKey {
     domain_tag: u64,
@@ -439,12 +442,23 @@ pub(in crate::semantics_objects) struct JournalDomainKey {
     cookie: u64,
     exec: u64,
     router: u64,
+    incarnation: u32,
 }
 
 impl JournalDomainKey {
     /// The key's image (task cookie plus exec id).
     pub(in crate::semantics_objects) fn image(&self) -> (u64, u64) {
         (self.cookie, self.exec)
+    }
+
+    /// Whether two keys name the same admission binding (same domain,
+    /// caller, image and router), whatever their incarnations.
+    pub(in crate::semantics_objects) fn same_binding(&self, other: &Self) -> bool {
+        self.domain_tag == other.domain_tag
+            && self.caller == other.caller
+            && self.cookie == other.cookie
+            && self.exec == other.exec
+            && self.router == other.router
     }
 }
 
@@ -694,6 +708,15 @@ enum CallAttribution {
 }
 
 impl JournalDomainProof {
+    /// Whether this proof supersedes an older proof as a reseed
+    /// target: the same admission binding at a strictly newer
+    /// incarnation. A sibling instance's proof (another router or
+    /// caller) never supersedes: it names another feed, never this
+    /// feed's next incarnation.
+    pub(crate) fn reseed_supersedes(&self, old: &Self) -> bool {
+        self.key.same_binding(&old.key) && self.key.incarnation > old.key.incarnation
+    }
+
     pub(crate) fn matches_admitted(&self, admitted: &AdmittedInstanceCall) -> bool {
         let (native, image, router, caller) = admitted.journal_binding();
         self.key.domain_tag == native.journal_tag()
@@ -709,6 +732,7 @@ impl JournalDomainProof {
             self.key.domain_tag,
             self.key.router,
             self.era,
+            self.key.incarnation,
         )
     }
 }
@@ -730,14 +754,42 @@ struct ImageSighting {
 }
 
 /// One key's attribution of its image's staged history at a frontier.
+/// Death evidence for one dead journal key, kept outside the
+/// size-pinned per-key state (only dead keys hold an entry): when
+/// each death was recorded and whether any refusal grounds in a
+/// capable frame. A fresh incarnation mints only for recorded,
+/// fenced, non-capable deaths; test-posed flags without an entry
+/// never mint.
+#[derive(Debug, Default)]
+struct JournalDeathMarks {
+    /// Refusal ordinal plus capable-frame grounding.
+    refused: Option<(u64, bool)>,
+    /// Taint ordinal (its confusion does not transfer domains).
+    tainted: Option<u64>,
+    /// Clean-close ordinal.
+    ended: Option<u64>,
+}
+
+impl JournalDeathMarks {
+    /// Whether the recorded refusal mints past the fence: fenced,
+    /// covered by its void, and grounded in a dead frame.
+    fn refused_mints(&self, fence: u64) -> bool {
+        self.refused
+            .is_some_and(|(at, capable)| !capable && at <= fence)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttributionReadiness {
     /// Every staged call is attributed and this key's claims cover its own.
     Ready,
     /// A claim can still arrive: the seal waits (`BoundNotReady`).
     Pending,
-    /// A staged call no claim can ever name: the seal ends named.
-    Unmatched,
+    /// A staged call no claim can ever name: the seal ends named,
+    /// carrying the unmatched evidence (`Some` wiped ordinal when
+    /// every unmatched entry evidences void-released history, `None`
+    /// once any evidences unknown effects).
+    Unmatched(Option<u64>),
 }
 
 /// Whether one unclaimed staged call's END sits at an H0 position the
@@ -1093,6 +1145,18 @@ pub(crate) struct JointVoidCounts {
     /// Voids that ended at least one Joint feed (scope round): counted
     /// once per void no matter how many feeds it ended.
     pub(crate) voids_ended_joint_feed: u64,
+}
+
+/// Diagnostic-only Joint re-entry counters: the run-global re-entry
+/// events. Counts only; instrumentation only, never authority.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct JointReentryCounts {
+    /// New keys bound past void-fenced live registered siblings.
+    pub(crate) sibling_binds: u64,
+    /// Fresh incarnations minted for dead fenced bindings.
+    pub(crate) incarnations: u64,
+    /// Fenced taint quarantines lifted for fresh births.
+    pub(crate) taint_lifts: u64,
 }
 
 /// Diagnostic-only Joint void telemetry (Task 0): where stream breaks
@@ -1667,6 +1731,10 @@ pub(crate) struct ScopedRecovery {
     /// everything before applying anything keeps a later decision
     /// from observing an earlier doom's refusal.
     pub(in crate::semantics_objects) preserve_doomed: BTreeSet<JournalDomainKey>,
+    /// Doomed keys grounded in a capable frame's abandonment (a
+    /// subset of `preserve_doomed`): their doom never mints a fresh
+    /// incarnation past it.
+    pub(in crate::semantics_objects) preserve_doomed_capable: BTreeSet<JournalDomainKey>,
     pub(in crate::semantics_objects) preserve_taint: BTreeSet<(u64, u64)>,
     /// Fixed liveness basis per decided image, built incrementally
     /// under the recovery budget: live keys collected so far plus
@@ -1758,6 +1826,10 @@ pub(in crate::semantics_objects) struct CheckedRead {
     pub(in crate::semantics_objects) shape: StagedShape,
     pub(in crate::semantics_objects) function: u32,
     pub(in crate::semantics_objects) image: (u64, u64),
+    /// Whether the preserved abandonment leaves a capable frame (only
+    /// meaningful on preserve-phase reads): a doom grounded in one
+    /// never mints a fresh incarnation past it.
+    pub(in crate::semantics_objects) capable: bool,
 }
 
 impl CheckedRead {
@@ -1768,6 +1840,7 @@ impl CheckedRead {
             shape,
             function: 0,
             image: (0, 0),
+            capable: false,
         }
     }
 
@@ -1781,6 +1854,7 @@ impl CheckedRead {
             shape,
             function: 0,
             image: (0, 0),
+            capable: false,
         }
     }
 
@@ -1791,6 +1865,7 @@ impl CheckedRead {
             shape,
             function: 0,
             image: (0, 0),
+            capable: false,
         }
     }
 
@@ -1799,6 +1874,7 @@ impl CheckedRead {
         shape: StagedShape,
         function: u32,
         image: (u64, u64),
+        capable: bool,
     ) -> Self {
         Self {
             native: Some(native),
@@ -1806,6 +1882,7 @@ impl CheckedRead {
             shape,
             function,
             image,
+            capable,
         }
     }
 }
@@ -2071,6 +2148,13 @@ pub(crate) struct JournalAdapter {
     /// round): one per void however many feeds it ended. Saturating;
     /// instrumentation only, never authority.
     voids_ended_joint_feed: u64,
+    /// Diagnostic-only Joint re-entry counts: new keys bound past
+    /// void-fenced siblings, fresh incarnations minted for dead fenced
+    /// bindings, and fenced taint quarantines lifted. Saturating;
+    /// instrumentation only, never authority.
+    reentry_sibling_binds: u64,
+    reentry_incarnations: u64,
+    reentry_taint_lifts: u64,
     /// Diagnostic-only seal bootstrap refusal arms: which
     /// bootstrap check refused a seal, by arm. Saturating;
     /// instrumentation only, never authority.
@@ -2089,12 +2173,27 @@ pub(crate) struct JournalAdapter {
     physical_return_floors: BTreeMap<u64, u64>,
     refused: Vec<RefusedBegin>,
     keys: BTreeMap<JournalDomainKey, JournalDomainState>,
+    /// Death evidence for dead keys (one entry per dead key, bounded
+    /// by the key table): when each death was recorded and whether
+    /// any refusal grounds in a capable frame. Lives outside the
+    /// size-pinned per-key state; incarnation minting reads it.
+    death_marks: BTreeMap<JournalDomainKey, JournalDeathMarks>,
     image_keys: BTreeMap<(u64, u64), Vec<JournalDomainKey>>,
     /// Individually retained taints, capped at the sighting bound (the
     /// same image population). Past the cap, `taint_overflow` latches
     /// and every untracked image counts as tainted — the conservative
     /// bounded fallback: no per-image retention, no silent admission.
     tainted_images: BTreeSet<(u64, u64)>,
+    /// Taint evidence per retained tainted image: `Some(ordinal)` when
+    /// every contradiction evidences explicitly voided history (a
+    /// void-wiped invocation's ordinal — re-presented voided records
+    /// contradicting retained floors), `None` once any contradiction
+    /// evidences unknown effects (a genuine inconsistency, an
+    /// unaccounted abandonment, disposed raw content). A `Some` taint
+    /// lifts for fresh births at/above the void fence covering it; a
+    /// `None` taint never lifts. Same cap as the taint set; entries
+    /// leave with their taint.
+    taint_evidence: BTreeMap<(u64, u64), Option<u64>>,
     taint_overflow: bool,
     /// Taint-overflow key marks still owed: images whose taint
     /// overflowed the retained set, each with its resume cursor
@@ -2204,11 +2303,14 @@ pub(crate) struct JournalAdapter {
     /// created after a void cannot certify the voided interval.
     /// Monotone; every fence-voiding seal advances it.
     voided_through: u64,
-    /// Exact native invocations the most recent `void_staged` wiped.
-    /// Replaced at every void (an admission from an older wipe falls to
-    /// the cause-neutral unretained route), bounded by the open table
+    /// Exact native invocations the most recent `void_staged` wiped,
+    /// with the consumed ordinal each was wiped at. Replaced at every
+    /// void (an admission from an older wipe falls to the cause-neutral
+    /// unretained route), bounded by the open table
     /// (`limits.open_calls`) and never identity authority by itself.
-    void_wiped: BTreeSet<JournalNativeKey>,
+    /// The wiped ordinal scopes taint evidence: a contradiction on a
+    /// wiped invocation evidences voided history, never fresh proof.
+    void_wiped: BTreeMap<JournalNativeKey, u64>,
     /// Last sealed checked-fault epoch: the cumulative chain. Each
     /// seal's collection must open at this epoch and the seal-time
     /// re-read must still show the audited one; a move anywhere in
@@ -2276,14 +2378,19 @@ impl JournalAdapter {
             audit_fault_unreadable: 0,
             audit_resource_unavailable: 0,
             voids_ended_joint_feed: 0,
+            reentry_sibling_binds: 0,
+            reentry_incarnations: 0,
+            reentry_taint_lifts: 0,
             seal_bootstrap: SealBootstrapCounts::default(),
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
             refused: Vec::new(),
             keys: BTreeMap::new(),
+            death_marks: BTreeMap::new(),
             image_keys: BTreeMap::new(),
             tainted_images: BTreeSet::new(),
+            taint_evidence: BTreeMap::new(),
             taint_overflow: false,
             taint_overflow_pending: BTreeMap::new(),
             taint_overflow_after: None,
@@ -2312,7 +2419,7 @@ impl JournalAdapter {
             last_audit_failure: None,
             h3_voided_below: 0,
             voided_through: 0,
-            void_wiped: BTreeSet::new(),
+            void_wiped: BTreeMap::new(),
             last_fault: None,
             drain_pins: BTreeMap::new(),
             invalidated: false,
@@ -2421,24 +2528,32 @@ impl JournalAdapter {
     /// member is (caller, domain tag, image cookie/exec, router). A
     /// pending break unions with the new members (both still need
     /// voiding); a stream break subsumes any pending scoped break at
-    /// consume time.
+    /// consume time. Members name bindings; the scope covers each
+    /// binding's current incarnation.
     pub(crate) fn break_scoped_for_watchdog(&mut self, members: &[(u32, u64, (u64, u64), u64)]) {
+        let scoped: Vec<(JournalDomainKey, (u64, u64))> = members
+            .iter()
+            .map(|(caller, tag, image, router)| {
+                let base = JournalDomainKey {
+                    domain_tag: *tag,
+                    caller: *caller,
+                    cookie: image.0,
+                    exec: image.1,
+                    router: *router,
+                    incarnation: 0,
+                };
+                (self.binding_scoped_key(base), *image)
+            })
+            .collect();
         let entry = self
             .scoped_break
             .get_or_insert_with(ScopedWatchdogBreak::default);
-        for (caller, tag, image, router) in members {
-            let key = JournalDomainKey {
-                domain_tag: *tag,
-                caller: *caller,
-                cookie: image.0,
-                exec: image.1,
-                router: *router,
-            };
+        for (key, image) in scoped {
             if !entry.domains.contains(&key) {
                 entry.domains.push(key);
             }
-            if !entry.images.contains(image) {
-                entry.images.push(*image);
+            if !entry.images.contains(&image) {
+                entry.images.push(image);
             }
         }
     }
@@ -2860,7 +2975,7 @@ impl JournalAdapter {
                 }
             };
             if !self.note_sighting(*image, affecting, next) {
-                self.taint_image(*image, TaintCause::SightingFailure);
+                self.taint_image_at(*image, TaintCause::SightingFailure, Some(next));
                 return None;
             }
         }
@@ -2965,27 +3080,34 @@ impl JournalAdapter {
         match endpoint_class(function) {
             Some(EndpointClass::ModeledAffecting) => {}
             Some(EndpointClass::NegativeOnlyAffecting) if begin.no_end() => {
-                self.taint_image(image, TaintCause::NegativeOnlyInvalidated);
+                let evidence = self.contradiction_evidence(key);
+                self.taint_image_at(image, TaintCause::NegativeOnlyInvalidated, evidence);
                 return JournalDisposition::NegativeOnlyInvalidated;
             }
             _ => {
-                self.taint_image(
+                let evidence = self.contradiction_evidence(key);
+                self.taint_image_at(
                     image,
                     TaintCause::Contradiction(JournalContradiction::UnclosedEndpoint),
+                    evidence,
                 );
                 return JournalDisposition::Contradiction(JournalContradiction::UnclosedEndpoint);
             }
         }
-        if self.is_tainted(image) {
+        if self.image_taint_blocks(image, self.voided_through) {
             // Its terminal will arrive unmatched: expected-absent
-            // because of this refusal, never a promotion.
+            // because of this refusal, never a promotion. A taint
+            // evidencing only fenced history does not refuse fresh
+            // records: they ingest for the rebirth above the fence.
             self.note_derived_absence(image, key, function);
             return JournalDisposition::Refused;
         }
         if self.open.contains_key(&key) {
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::DuplicateBegin),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateBegin);
         }
@@ -2993,9 +3115,11 @@ impl JournalAdapter {
         // begin below an observed sequence is genuinely regressive.
         match self.floors.get(&begin.thread()) {
             Some(floor) if *floor >= begin.sequence() => {
-                self.taint_image(
+                let evidence = self.contradiction_evidence(key);
+                self.taint_image_at(
                     image,
                     TaintCause::Contradiction(JournalContradiction::SequenceRegression),
+                    evidence,
                 );
                 return JournalDisposition::Contradiction(JournalContradiction::SequenceRegression);
             }
@@ -3004,18 +3128,22 @@ impl JournalAdapter {
         if !self.floors.contains_key(&begin.thread())
             && self.floors.len() >= self.limits.thread_floors
         {
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::FloorExhausted),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::FloorExhausted);
         }
         if !self.physical_return_floors.contains_key(&begin.pid_tgid())
             && self.physical_return_floors.len() >= self.limits.thread_floors
         {
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::FloorExhausted),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::FloorExhausted);
         }
@@ -3025,9 +3153,11 @@ impl JournalAdapter {
             .or_default();
         if begin.pid_tgid() as u32 == 0 || begin.pid_tgid() >> 32 == 0 || begin.entry_ns() < *floor
         {
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::SequenceRegression),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::SequenceRegression);
         }
@@ -3088,9 +3218,12 @@ impl JournalAdapter {
         image: (u64, u64),
     ) -> JournalDisposition {
         if self.refused.len() >= self.limits.refused_begins {
-            self.taint_image(
+            let key = (begin.thread(), begin.sequence());
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::RefusedOverflow),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::RefusedOverflow);
         }
@@ -3129,9 +3262,11 @@ impl JournalAdapter {
                         JournalContradiction::TerminalBeforeBegin,
                     );
                 }
-                self.taint_image(
+                let evidence = self.contradiction_evidence(key);
+                self.taint_image_at(
                     image,
                     TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+                    evidence,
                 );
                 return JournalDisposition::Contradiction(
                     JournalContradiction::TerminalBeforeBegin,
@@ -3176,44 +3311,54 @@ impl JournalAdapter {
                     JournalContradiction::TerminalBeforeBegin,
                 );
             }
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.is_tainted(entry.image) {
+        if self.image_taint_blocks(entry.image, self.voided_through) {
             return JournalDisposition::Refused;
         }
         if entry.end.is_some() || entry.abandon.is_some() {
             let image = entry.image;
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::DuplicateTerminal),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateTerminal);
         }
         if entry.begin.no_end() {
             let image = entry.image;
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::NoEndCompleted),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::NoEndCompleted);
         }
         if entry.corroborated_return.is_some() {
             let image = entry.image;
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::CallAndEnd),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::CallAndEnd);
         }
         if !end_agrees_with_begin(&entry.begin, &end) {
             let image = entry.image;
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::EndBeginMismatch),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch);
         }
@@ -3246,20 +3391,24 @@ impl JournalAdapter {
                     JournalContradiction::TerminalBeforeBegin,
                 );
             }
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.is_tainted(entry.image) {
+        if self.image_taint_blocks(entry.image, self.voided_through) {
             return JournalDisposition::Refused;
         }
         if entry.end.is_some() || entry.abandon.is_some() {
             let image = entry.image;
-            self.taint_image(
+            let evidence = self.contradiction_evidence(key);
+            self.taint_image_at(
                 image,
                 TaintCause::Contradiction(JournalContradiction::DuplicateTerminal),
+                evidence,
             );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateTerminal);
         }
@@ -3303,37 +3452,39 @@ impl JournalAdapter {
             }
         }
         if matches.iter().any(|(_, _, ended)| *ended) {
-            let images: Vec<(u64, u64)> = matches
+            let evidenced: Vec<((u64, u64), Option<u64>)> = matches
                 .iter()
-                .map(|(_, image, _)| *image)
+                .map(|(key, image, _)| (*image, self.contradiction_evidence(*key)))
                 .chain(
                     refused_matches
                         .iter()
-                        .map(|index| self.refused[*index].image),
+                        .map(|index| (self.refused[*index].image, None)),
                 )
                 .collect();
-            for image in images {
-                self.taint_image(
+            for (image, evidence) in evidenced {
+                self.taint_image_at(
                     image,
                     TaintCause::Contradiction(JournalContradiction::CallAndEnd),
+                    evidence,
                 );
             }
             return JournalDisposition::Contradiction(JournalContradiction::CallAndEnd);
         }
         if matches.len() + refused_matches.len() > 1 {
-            let images: Vec<(u64, u64)> = matches
+            let evidenced: Vec<((u64, u64), Option<u64>)> = matches
                 .iter()
-                .map(|(_, image, _)| *image)
+                .map(|(key, image, _)| (*image, self.contradiction_evidence(*key)))
                 .chain(
                     refused_matches
                         .iter()
-                        .map(|index| self.refused[*index].image),
+                        .map(|index| (self.refused[*index].image, None)),
                 )
                 .collect();
-            for image in images {
-                self.taint_image(
+            for (image, evidence) in evidenced {
+                self.taint_image_at(
                     image,
                     TaintCause::Contradiction(JournalContradiction::AmbiguousReturn),
+                    evidence,
                 );
             }
             return JournalDisposition::Contradiction(JournalContradiction::AmbiguousReturn);
@@ -3415,6 +3566,23 @@ impl JournalAdapter {
     /// per-key gauges are not carried (they recompute from this owner's
     /// own retained state on read). Instrumentation only, never
     /// authority.
+    /// Diagnostic-only Joint re-entry counts: the run-global
+    /// re-entry events. Counts only; instrumentation only, never
+    /// authority.
+    pub(crate) fn joint_reentry_counts(&self) -> JointReentryCounts {
+        JointReentryCounts {
+            sibling_binds: self.reentry_sibling_binds,
+            incarnations: self.reentry_incarnations,
+            taint_lifts: self.reentry_taint_lifts,
+        }
+    }
+
+    pub(crate) fn carry_joint_reentry_counts(&mut self, carried: &JointReentryCounts) {
+        self.reentry_sibling_binds = carried.sibling_binds;
+        self.reentry_incarnations = carried.incarnations;
+        self.reentry_taint_lifts = carried.taint_lifts;
+    }
+
     pub(crate) fn carry_joint_void_counts(&mut self, carried: &JointVoidCounts) {
         self.break_dispose = carried.break_dispose;
         self.break_ingest = carried.break_ingest;
@@ -3548,8 +3716,16 @@ impl JournalAdapter {
     /// is new. A later seal already refuses the image once the mark
     /// lands; entry removal follows through a bounded drain. The
     /// synchronous [`Self::taint_image`] below marks then drains
-    /// inline for its existing callers.
-    fn taint_image_mark(&mut self, image: (u64, u64), cause: TaintCause) -> bool {
+    /// inline for its existing callers. `evidence` is `Some` wiped
+    /// ordinal for contradictions on void-released invocations and
+    /// `None` for unknown effects (permanent); re-taints combine
+    /// (permanent sticks, ordinals take the maximum).
+    fn taint_image_mark(
+        &mut self,
+        image: (u64, u64),
+        cause: TaintCause,
+        evidence: Option<u64>,
+    ) -> bool {
         self.contradictions.note(cause);
         if cause == TaintCause::OtherCallerRefused {
             // A shed-taint is lift-eligible only when it lands on a
@@ -3557,6 +3733,7 @@ impl JournalAdapter {
             // not gain eligibility. Past the provenance cap the taint
             // lands but never lifts (fail closed).
             if self.is_tainted(image) {
+                self.note_image_taint_at(image, evidence);
                 return false;
             }
             if self.shed_only_taints.len() < self.limits.image_sightings {
@@ -3567,17 +3744,42 @@ impl JournalAdapter {
             // re-taint of a shed-tainted image still inside its grace.
             self.shed_only_taints.remove(&image);
             if self.is_tainted(image) {
+                self.note_image_taint_at(image, evidence);
                 return false;
             }
         }
-        self.note_image_taint(image);
+        self.note_image_taint_at(image, evidence);
         true
     }
 
+    /// Taint one image for unknown effects (permanent: never lifts).
+    /// Callers evidencing explicitly voided history (a contradiction
+    /// on a void-released invocation) use [`Self::taint_image_at`].
     fn taint_image(&mut self, image: (u64, u64), cause: TaintCause) {
-        if !self.taint_image_mark(image, cause) {
+        self.taint_image_at(image, cause, None);
+    }
+
+    /// Taint one image: `Some` wiped ordinal for contradictions on
+    /// void-released invocations (lifts once fenced), `None` for
+    /// unknown effects (permanent).
+    fn taint_image_at(&mut self, image: (u64, u64), cause: TaintCause, evidence: Option<u64>) {
+        if !self.taint_image_mark(image, cause, evidence) {
             return;
         }
+        self.taint_image_drain(image);
+    }
+
+    /// Evidence for a contradiction on one native invocation: the
+    /// wiped ordinal when the latest void released it (re-presented
+    /// voided history evidences the explicitly voided window),
+    /// `None` (permanent) otherwise.
+    fn contradiction_evidence(&self, native: JournalNativeKey) -> Option<u64> {
+        self.void_wiped.get(&native).copied()
+    }
+
+    /// Drop one tainted image's staged rows (the synchronous drain for
+    /// [`Self::taint_image_at`]).
+    fn taint_image_drain(&mut self, image: (u64, u64)) {
         // Opens dropped by this taint leave their terminals
         // expected-absent: record their keys so the unmatched
         // terminals do not promote a shed-taint to permanent. The
@@ -3629,6 +3831,7 @@ impl JournalAdapter {
             return;
         }
         self.tainted_images.remove(&image);
+        self.taint_evidence.remove(&image);
         self.shed_only_taints.remove(&image);
         self.lifted_images.insert(image);
         // The lift keeps neutral absences but purges state-changing
@@ -3681,7 +3884,12 @@ impl JournalAdapter {
         if self.image_keys.contains_key(&image) {
             return false;
         }
-        self.taint_image(image, TaintCause::OtherCallerRefused);
+        // Shed history is observed-but-unattributed
+        // (attach-observed-like), so a void fencing it lifts the
+        // quarantine for fresh births above; timely binding still
+        // lifts through `untaint_shed_image`.
+        let evidence = self.consumed_through;
+        self.taint_image_at(image, TaintCause::OtherCallerRefused, Some(evidence));
         true
     }
 
@@ -3698,7 +3906,7 @@ impl JournalAdapter {
     /// never reseeds — the shed-then-bind refusal without a lift stays.
     /// Untracked images never reseed.
     pub(crate) fn novelty_broken_reseed_eligible(&self, image: (u64, u64)) -> bool {
-        if self.is_tainted(image) {
+        if self.image_taint_blocks(image, self.voided_through) {
             return false;
         }
         let Some(sighting) = self.sightings.get(&image) else {
@@ -3713,23 +3921,25 @@ impl JournalAdapter {
     /// raw/original-refusal evidence: shed-only lift eligibility is
     /// revoked first, including for an already shed-tainted image,
     /// then the taint is recorded as before. Telemetry, bounds and
-    /// per-key effects match `note_image_taint`; only the shed-only
+    /// per-key effects match `note_image_taint_at`; only the shed-only
     /// provenance changes. Every refusal path that bypasses
-    /// `taint_image` must route through this.
+    /// `taint_image` must route through this. Disposed raw content is
+    /// unknown effects: the taint never lifts.
     fn promote_image_taint(&mut self, image: (u64, u64)) {
         self.shed_only_taints.remove(&image);
         if !self.is_tainted(image) {
-            self.note_image_taint(image);
+            self.note_image_taint_at(image, None);
         }
     }
 
-    /// Record only the irreversible image evidence. A raw batch marks its
-    /// images together, then disposes the existing bounded staging once.
-    /// Past the retention cap this publishes the refusal (overflow
-    /// latch plus dropped sighting, so seals refuse at once) and
-    /// enqueues the image's key marks for the bounded drain: no
-    /// per-key scan runs here.
-    fn note_image_taint(&mut self, image: (u64, u64)) {
+    /// Record only the irreversible image evidence. A raw batch marks
+    /// its images together, then disposes the existing bounded staging
+    /// once. Past the retention cap this publishes the refusal
+    /// (overflow latch plus dropped sighting, so seals refuse at once)
+    /// and enqueues the image's key marks for the bounded drain: no
+    /// per-key scan runs here. Re-taints combine: permanent sticks,
+    /// wiped ordinals take the maximum.
+    fn note_image_taint_at(&mut self, image: (u64, u64), evidence: Option<u64>) {
         if !self.tainted_images.contains(&image)
             && self.tainted_images.len() >= self.limits.image_sightings
         {
@@ -3743,9 +3953,67 @@ impl JournalAdapter {
             if self.image_keys.contains_key(&image) {
                 self.taint_overflow_pending.entry(image).or_insert(0);
             }
-        } else if self.tainted_images.insert(image) {
+            return;
+        }
+        if self.tainted_images.insert(image) {
             self.claims_prune_dirty = true;
         }
+        self.taint_evidence
+            .entry(image)
+            .and_modify(|kept| {
+                *kept = match (*kept, evidence) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                }
+            })
+            .or_insert(evidence);
+    }
+
+    /// Whether the image's taint blocks proof fenced at `fence`: the
+    /// image is tainted and its evidence is permanent (unknown
+    /// effects) or sits past the fence. A taint evidencing only
+    /// fenced voided history lifts: re-presented voided records
+    /// contradict only the explicitly lost window, so a birth
+    /// at/above the fence proves independent history. Untracked
+    /// overflow images always block, as does every taint when no void
+    /// ever fenced anything.
+    fn image_taint_blocks(&self, image: (u64, u64), fence: u64) -> bool {
+        if !self.tainted_images.contains(&image) {
+            return self.taint_overflow && !self.sightings.contains_key(&image);
+        }
+        if fence == 0 {
+            return true;
+        }
+        !self
+            .taint_evidence
+            .get(&image)
+            .is_some_and(|evidence| evidence.is_some_and(|at| at <= fence))
+    }
+
+    /// Drop a taint quarantine whose voided-history evidence the
+    /// global void fence covers, counting the lift. Idempotent.
+    /// Permanent taints never remove, and only a globally fenced
+    /// taint removes: per-key fences scope the read-only predicate
+    /// above, never removal, so one key's fence cannot lift another
+    /// key's block.
+    fn lift_fenced_image_taint(&mut self, image: (u64, u64)) -> bool {
+        if !self.tainted_images.contains(&image) {
+            return false;
+        }
+        let lifts = self.voided_through > 0
+            && self
+                .taint_evidence
+                .get(&image)
+                .is_some_and(|evidence| evidence.is_some_and(|at| at <= self.voided_through));
+        if !lifts {
+            return false;
+        }
+        self.tainted_images.remove(&image);
+        self.taint_evidence.remove(&image);
+        self.shed_only_taints.remove(&image);
+        self.reentry_taint_lifts = self.reentry_taint_lifts.saturating_add(1);
+        self.claims_prune_dirty = true;
+        true
     }
 
     /// Whether taint-overflow key marks are still owed.
@@ -3856,7 +4124,7 @@ impl JournalAdapter {
         gap: JournalGap,
     ) -> SealFailure {
         let upper = self.consumed_through;
-        let mut effects = self.preserve_abandonment_refusals(model);
+        let mut effects = self.preserve_abandonment_refusals(model, upper);
         effects
             .effects
             .extend(self.fence_void(model, upper).effects);
@@ -3949,6 +4217,7 @@ impl JournalAdapter {
             let lived = self.key_is_live(key);
             if let Some(state) = self.keys.get_mut(&key) {
                 state.tainted = true;
+                self.note_tainted_mark(key, self.consumed_through);
             }
             self.claims_prune_dirty |= lived;
             self.taint_overflow_pending.insert(image, at + 1);
@@ -6178,7 +6447,7 @@ impl JournalAdapter {
         if !marker_ok {
             return Err(BirthRefusal::EvidenceMismatch);
         }
-        if self.is_tainted(image) {
+        if self.image_taint_blocks(image, fenced_through) {
             return Err(BirthRefusal::ImageTainted);
         }
         let Some(sighting) = self.sightings.get(&image) else {
@@ -6245,54 +6514,204 @@ impl JournalAdapter {
         if self.stopped || self.invalidated {
             return Err(AttestationRefusal::Stopped);
         }
-        let (domain, image, router, caller) = admitted.journal_binding();
-        let key = JournalDomainKey {
-            domain_tag: domain.journal_tag(),
-            caller: caller.0,
-            cookie: image.task_cookie,
-            exec: image.exec_id,
-            router: router.get(),
-        };
-        if self.is_tainted((key.cookie, key.exec)) {
+        let key = self.resolve_binding_key(admitted);
+        let fresh = !self.keys.contains_key(&key);
+        let fenced_through = self
+            .keys
+            .get(&key)
+            .map(|state| state.void_fence)
+            .unwrap_or(0)
+            .max(self.voided_through);
+        if self.image_taint_blocks((key.cookie, key.exec), fenced_through) {
             return Err(AttestationRefusal::ImageTainted);
         }
-        if !self.keys.contains_key(&key)
+        if fresh
             && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
-            && siblings.iter().any(|sibling| {
-                sibling != &key && self.key_is_live(*sibling) && self.keys[sibling].model_registered
-            })
+            && siblings
+                .iter()
+                .any(|sibling| sibling != &key && self.sibling_holds_unfenced_history(*sibling))
         {
             return Err(AttestationRefusal::ImageSealed);
         }
-        if !self.keys.contains_key(&key) && self.keys.len() >= self.limits.domain_keys {
+        if fresh && self.keys.len() >= self.limits.domain_keys {
             return Err(AttestationRefusal::KeysExhausted);
         }
         Ok(())
     }
 
-    /// Bind one H3-admitted call's incarnation to a journal key without
-    /// claiming the invocation before its original START is ingested: exact
-    /// native domain, caller, image and router, plus the adapter-tracked
-    /// era. Re-attestation after a fault-void returns the live key; a
-    /// tainted image or a full key table refuses. A second live key for
-    /// an image whose key already converted refuses: sole-key
-    /// attributions cannot be re-examined.
-    /// Birth and closure are verified on top of this binding by
-    /// [`BootstrapReceipt::attest`].
-    pub(crate) fn bind_admitted_key(
-        &mut self,
-        admitted: &AdmittedInstanceCall,
-    ) -> Result<JournalDomainProof, AttestationRefusal> {
-        self.probe_admitted_key(admitted)?;
+    /// Resolve one admission binding to its effective journal key: the
+    /// live incarnation when one is live; else a fresh incarnation when
+    /// every retained incarnation is permanently dead
+    /// (refused/tainted/ended, never merely image-quarantined) and the
+    /// latest is void-fenced past everything it sealed with every
+    /// recorded death inside the fence; else the latest retained
+    /// incarnation (dead: binds keep returning it and its seals keep
+    /// refusing). At most one incarnation per binding is ever live.
+    /// Retained incarnations of one admission binding: the live one
+    /// when any is live, and the latest minted. The per-image list
+    /// appends in mint order, so one pass finds both.
+    fn binding_incarnations(
+        &self,
+        base: JournalDomainKey,
+    ) -> (Option<JournalDomainKey>, Option<JournalDomainKey>) {
+        let mut live = None;
+        let mut latest = None;
+        if let Some(siblings) = self.image_keys.get(&(base.cookie, base.exec)) {
+            for sibling in siblings {
+                if !sibling.same_binding(&base) {
+                    continue;
+                }
+                if live.is_none() && self.key_is_live(*sibling) {
+                    live = Some(*sibling);
+                }
+                latest = Some(*sibling);
+            }
+        }
+        (live, latest)
+    }
+
+    fn resolve_binding_key(&self, admitted: &AdmittedInstanceCall) -> JournalDomainKey {
         let (domain, image, router, caller) = admitted.journal_binding();
-        let key = JournalDomainKey {
+        let base = JournalDomainKey {
             domain_tag: domain.journal_tag(),
             caller: caller.0,
             cookie: image.task_cookie,
             exec: image.exec_id,
             router: router.get(),
+            incarnation: 0,
         };
+        let (live, latest) = self.binding_incarnations(base);
+        if let Some(key) = live {
+            return key;
+        }
+        let Some(last) = latest else {
+            return base;
+        };
+        let permanently_dead = self
+            .keys
+            .get(&last)
+            .is_some_and(|state| state.refused || state.tainted || state.era_ended);
+        if permanently_dead && self.incarnation_mint_eligible(last) {
+            JournalDomainKey {
+                incarnation: last.incarnation.saturating_add(1),
+                ..last
+            }
+        } else {
+            last
+        }
+    }
+
+    /// Whether an abandonment reason proves its provider frame dead
+    /// (an exec or exit teardown): only a dead frame's doom mints a
+    /// fresh incarnation. Every other unbounded reason leaves a
+    /// capable frame whose unknown effects could interact with any
+    /// future history, so its doom never mints.
+    fn abandon_proves_frame_dead(reason: u32) -> bool {
+        reason == p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT
+    }
+
+    /// Whether a fresh incarnation may mint for a permanently dead key:
+    /// a void fenced it past everything it sealed. A refusal mints
+    /// only when fenced, covered by its void, and grounded in a dead
+    /// frame (never a capable one); a taint mints once recorded (its
+    /// confusion does not transfer to a fresh domain); a clean close
+    /// mints once fenced past it. An unrecorded death never mints.
+    fn incarnation_mint_eligible(&self, latest: JournalDomainKey) -> bool {
+        self.keys.get(&latest).is_some_and(|state| {
+            state.void_fence > 0
+                && state.void_fence >= state.sealed_through
+                && (!state.refused
+                    || self
+                        .death_marks
+                        .get(&latest)
+                        .is_some_and(|marks| marks.refused_mints(state.void_fence)))
+                && (!state.tainted
+                    || self
+                        .death_marks
+                        .get(&latest)
+                        .is_some_and(|marks| marks.tainted.is_some()))
+                && (!state.era_ended
+                    || self
+                        .death_marks
+                        .get(&latest)
+                        .is_some_and(|marks| marks.ended.is_some_and(|at| at <= state.void_fence)))
+        })
+    }
+
+    /// Latest retained incarnation of one admission binding for void
+    /// scoping (the live one when any is live): scoped breaks name
+    /// bindings, and the scope covers the binding's current key.
+    fn binding_scoped_key(&self, base: JournalDomainKey) -> JournalDomainKey {
+        let (live, latest) = self.binding_incarnations(base);
+        live.or(latest).unwrap_or(base)
+    }
+
+    /// Whether a live registered sibling still seals genuinely new
+    /// history, so a second key for the image would re-examine its
+    /// sole-key attributions. A sibling fenced past everything it
+    /// converted (a void fence strictly above zero and at/above its
+    /// sealed frontier) holds no history a fresh birth at/above the
+    /// fence could re-examine: its staged custody was wiped, its
+    /// model domain voided, and later births refuse below the fence.
+    /// Such a sibling never blocks a new incarnation for the image.
+    fn sibling_holds_unfenced_history(&self, sibling: JournalDomainKey) -> bool {
+        self.key_is_live(sibling)
+            && self.keys.get(&sibling).is_some_and(|state| {
+                state.model_registered
+                    && !(state.void_fence > 0 && state.void_fence >= state.sealed_through)
+            })
+    }
+
+    /// Bind one H3-admitted call's incarnation to a journal key without
+    /// claiming the invocation before its original START is ingested: the
+    /// binding's live incarnation, or a fresh incarnation when every
+    /// retained one is permanently dead and void-fenced, plus the
+    /// adapter-tracked era. Re-attestation after a fault-void returns
+    /// the live key; a tainted image or a full key table refuses. A
+    /// second live key for an image whose key already converted
+    /// refuses: sole-key attributions cannot be re-examined — unless
+    /// every live registered sibling is void-fenced past its sealed
+    /// history, in which case the new key re-enters Joint past the
+    /// void (counted). Birth and closure are verified on top of this
+    /// binding by [`BootstrapReceipt::attest`].
+    pub(crate) fn bind_admitted_key(
+        &mut self,
+        admitted: &AdmittedInstanceCall,
+    ) -> Result<JournalDomainProof, AttestationRefusal> {
+        self.probe_admitted_key(admitted)?;
+        let (_, image, _, _) = admitted.journal_binding();
+        // The probe passed through any fenced quarantine: drop it
+        // (counted, idempotent) so later strict reads see clean proof.
+        self.lift_fenced_image_taint((image.task_cookie, image.exec_id));
+        let key = self.resolve_binding_key(admitted);
+        // Re-entry mints count once: a fresh incarnation of a dead
+        // fenced binding, or a fresh binding beside void-fenced live
+        // registered siblings (the probe already refused unfenced
+        // ones).
+        let fresh = !self.keys.contains_key(&key);
+        let minted_incarnation = fresh && key.incarnation > 0;
+        let fenced_siblings = fresh
+            && !minted_incarnation
+            && self
+                .image_keys
+                .get(&(key.cookie, key.exec))
+                .is_some_and(|siblings| {
+                    siblings.iter().any(|sibling| {
+                        *sibling != key
+                            && self.key_is_live(*sibling)
+                            && self.keys.get(sibling).is_some_and(|state| {
+                                state.model_registered
+                                    && state.void_fence > 0
+                                    && state.void_fence >= state.sealed_through
+                            })
+                    })
+                });
         if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.entry(key) {
+            if minted_incarnation {
+                self.reentry_incarnations = self.reentry_incarnations.saturating_add(1);
+            } else if fenced_siblings {
+                self.reentry_sibling_binds = self.reentry_sibling_binds.saturating_add(1);
+            }
             vacant.insert(JournalDomainState::default());
             self.image_keys
                 .entry((key.cookie, key.exec))
@@ -6414,7 +6833,7 @@ impl JournalAdapter {
         if self.open.contains_key(&resource.invocation()) {
             return PlainS1Cause::Unclaimable;
         }
-        if self.void_wiped.contains(&resource.invocation()) {
+        if self.void_wiped.contains_key(&resource.invocation()) {
             PlainS1Cause::Voided
         } else {
             PlainS1Cause::Unretained
@@ -6571,13 +6990,17 @@ impl JournalAdapter {
     ) -> Result<JournalDomainKey, joint_driver::RawQuantumRefusal> {
         use joint_driver::RawQuantumRefusal;
         let (native, image, router, caller) = admitted.journal_binding();
-        let key = JournalDomainKey {
+        let base = JournalDomainKey {
             domain_tag: native.journal_tag(),
             caller: caller.0,
             cookie: image.task_cookie,
             exec: image.exec_id,
             router: router.get(),
+            incarnation: 0,
         };
+        // Retained incarnations only: subjects mark onto the binding's
+        // current key, never a hypothetical mint.
+        let key = self.binding_scoped_key(base);
         let entry = self
             .retained_admission_entry(admitted)
             .ok_or(RawQuantumRefusal::Admission)?;
@@ -6727,12 +7150,13 @@ impl JournalAdapter {
     }
 
     /// Whether one key can still seal: bound, unrefused, untainted,
-    /// unterminated, on an untainted image.
+    /// unterminated, on an image whose taint (if any) quarantines only
+    /// fenced history.
     fn key_is_live(&self, key: JournalDomainKey) -> bool {
         self.keys
             .get(&key)
             .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
-            && !self.is_tainted((key.cookie, key.exec))
+            && !self.image_taint_blocks((key.cookie, key.exec), self.voided_through)
     }
 
     /// Live keys bound for one image: the attribution set a seal
@@ -7626,6 +8050,9 @@ impl JournalAdapter {
     ) -> Result<SealSuccess, SealFailure> {
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
+        // A quarantine evidencing only fenced history lifts here (counted,
+        // idempotent); anything else still refuses below.
+        self.lift_fenced_image_taint((key.cookie, key.exec));
         let Some(state) = self.keys.get(&key) else {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
@@ -7635,7 +8062,10 @@ impl JournalAdapter {
         if state.refused || state.tainted {
             return Err(self.failure(JournalGap::DomainTainted));
         }
-        if self.is_tainted((key.cookie, key.exec)) {
+        if self.image_taint_blocks(
+            (key.cookie, key.exec),
+            state.void_fence.max(self.voided_through),
+        ) {
             return Err(self.failure(JournalGap::ImageTainted));
         }
         // The collection's drain must be the EVENTS-map identity the
@@ -7785,11 +8215,11 @@ impl JournalAdapter {
             AttributionReadiness::Pending => {
                 return Err(self.wait(SealWait::AttributionPending));
             }
-            AttributionReadiness::Unmatched => {
+            AttributionReadiness::Unmatched(evidence) => {
                 // No claim can ever name this staged call: the image's
                 // history cannot be accounted for under any key. End the
                 // attempt named (like duplicate claims) instead of holding.
-                self.taint_image(image, TaintCause::ClaimUnmatched);
+                self.taint_image_at(image, TaintCause::ClaimUnmatched, evidence);
                 return Err(self.failure(JournalGap::ClaimUnmatched));
             }
         }
@@ -7948,8 +8378,12 @@ impl JournalAdapter {
     /// effects), as does a keyless one. Either way the void fence
     /// never becomes replacement birth authority over continuing
     /// provider effects.
-    fn preserve_abandonment_refusals(&mut self, model: &mut ObjectSemantics) -> ObjectEffects {
-        self.preserve_abandonment_refusals_scoped(model, None)
+    fn preserve_abandonment_refusals(
+        &mut self,
+        model: &mut ObjectSemantics,
+        fence: u64,
+    ) -> ObjectEffects {
+        self.preserve_abandonment_refusals_scoped(model, None, fence)
     }
 
     /// Preserve staged unbounded abandonments as permanent refusals,
@@ -7961,14 +8395,18 @@ impl JournalAdapter {
     /// Atomic callers (seal and raw-disposal voids) run this to
     /// completion: each image's liveness basis builds once through
     /// the shared cursor-based builder, chunked by the leaf bound,
-    /// instead of rescanning the per-image index per entry.
+    /// instead of rescanning the per-image index per entry. `fence`
+    /// is the void's upper: it evidences the taints this wipe decides
+    /// and scopes the doom's taint skip (a fenced quarantine never
+    /// excuses a doom).
     fn preserve_abandonment_refusals_scoped(
         &mut self,
         model: &mut ObjectSemantics,
         only_wiped: Option<&BTreeSet<JournalNativeKey>>,
+        fence: u64,
     ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
-        let mut doomed: BTreeSet<JournalDomainKey> = BTreeSet::new();
+        let mut doomed: BTreeMap<JournalDomainKey, bool> = BTreeMap::new();
         let mut taint: BTreeSet<(u64, u64)> = BTreeSet::new();
         let mut neutral_absent: Vec<((u64, u64), JournalNativeKey, u32)> = Vec::new();
         let mut bases: BTreeMap<(u64, u64), PreservedBasis> = BTreeMap::new();
@@ -7976,10 +8414,12 @@ impl JournalAdapter {
             if only_wiped.is_some_and(|wiped| !wiped.contains(key)) {
                 continue;
             }
-            if !entry.abandon.is_some_and(|staged| {
-                abandon_disposition(staged.abandon.reason())
-                    == Some(AbandonDisposition::UnboundedInvalidation)
-            }) {
+            let Some(staged) = entry.abandon.as_ref() else {
+                continue;
+            };
+            if abandon_disposition(staged.abandon.reason())
+                != Some(AbandonDisposition::UnboundedInvalidation)
+            {
                 continue;
             }
             if self.abandonment_disposes_here(entry) {
@@ -8003,16 +8443,26 @@ impl JournalAdapter {
             if tainted {
                 taint.insert(entry.image);
             }
-            doomed.extend(keys);
+            // A doom grounded in any capable frame never mints past
+            // it; only an exit-grounded doom does.
+            let capable = !Self::abandon_proves_frame_dead(staged.abandon.reason());
+            for key in keys {
+                doomed
+                    .entry(key)
+                    .and_modify(|kept| *kept |= capable)
+                    .or_insert(capable);
+            }
         }
         for (image, key, function) in neutral_absent {
             self.note_derived_absence(image, key, function);
         }
         for image in taint {
-            self.taint_image(image, TaintCause::UnclaimedInvalidation);
+            // Unaccounted abandonments evidence unknown continuing
+            // effects: the taint never lifts, even once fenced.
+            self.taint_image_at(image, TaintCause::UnclaimedInvalidation, None);
         }
-        for key in doomed {
-            if self.is_tainted((key.cookie, key.exec)) {
+        for (key, capable) in doomed {
+            if self.image_taint_blocks((key.cookie, key.exec), fence) {
                 continue;
             }
             let (era, registered) = self
@@ -8027,6 +8477,7 @@ impl JournalAdapter {
             }
             let lived = self.key_is_live(key);
             self.keys.get_mut(&key).expect("doomed key").refused = true;
+            self.note_refused_mark(key, fence, capable);
             self.claims_prune_dirty |= lived;
         }
         effects
@@ -8203,9 +8654,15 @@ impl JournalAdapter {
         audit: &JournalAuditReceipt,
     ) -> AttributionReadiness {
         let image = (key.cookie, key.exec);
-        let mut needs: BTreeMap<CallIdentity, u64> = BTreeMap::new();
+        let mut needs: BTreeMap<CallIdentity, (u64, u64, bool)> = BTreeMap::new();
         let mut pending = false;
-        for entry in self.open.values() {
+        let mut unmatched_perm = false;
+        let mut unmatched_max: Option<u64> = None;
+        let mut note_unmatched = |evidence: Option<u64>| match evidence {
+            None => unmatched_perm = true,
+            Some(at) => unmatched_max = Some(unmatched_max.map_or(at, |kept| kept.max(at))),
+        };
+        for (native, entry) in self.open.iter() {
             if entry.image != image
                 || entry.converted_ticket.is_some()
                 || entry.begin_ordinal > frontier
@@ -8215,14 +8672,20 @@ impl JournalAdapter {
             let shape = shape_of_entry(entry);
             match self.attribute_call(key, &shape, live) {
                 CallAttribution::Mine => {
-                    *needs.entry(shape.identity).or_default() += 1;
+                    let slot = needs.entry(shape.identity).or_default();
+                    slot.0 += 1;
+                    match self.contradiction_evidence(*native) {
+                        None => slot.2 = true,
+                        Some(at) => slot.1 = slot.1.max(at),
+                    }
                 }
                 CallAttribution::Sibling => {}
                 CallAttribution::Unclaimed => {
                     if self.identity_claimed(&shape.identity)
                         || admission_disposed_unclaimed(entry, audit)
                     {
-                        return AttributionReadiness::Unmatched;
+                        note_unmatched(self.contradiction_evidence(*native));
+                        continue;
                     }
                     pending = true;
                 }
@@ -8235,19 +8698,25 @@ impl JournalAdapter {
             let shape = refused.shape();
             match self.attribute_call(key, &shape, live) {
                 CallAttribution::Mine => {
-                    *needs.entry(shape.identity).or_default() += 1;
+                    let slot = needs.entry(shape.identity).or_default();
+                    slot.0 += 1;
+                    // Capacity artifacts carry no native key: a
+                    // multiset collision on one evidences unknown
+                    // effects, never voided history alone.
+                    slot.2 = true;
                 }
                 CallAttribution::Sibling => {}
                 CallAttribution::Unclaimed => {
                     if self.identity_claimed(&shape.identity) {
-                        return AttributionReadiness::Unmatched;
+                        note_unmatched(None);
+                        continue;
                     }
                     pending = true;
                 }
             }
         }
         let mut covered = true;
-        for (identity, need) in needs {
+        for (identity, (need, max, perm)) in needs {
             let have = self
                 .claims
                 .get(&identity)
@@ -8256,12 +8725,16 @@ impl JournalAdapter {
                 .unwrap_or(0);
             if have < need {
                 if need > 1 {
-                    return AttributionReadiness::Unmatched;
+                    note_unmatched((!perm).then_some(max));
+                    continue;
                 }
                 covered = false;
             }
         }
-        if pending || !covered {
+        if unmatched_perm || unmatched_max.is_some() {
+            let evidence = if unmatched_perm { None } else { unmatched_max };
+            AttributionReadiness::Unmatched(evidence)
+        } else if pending || !covered {
             AttributionReadiness::Pending
         } else {
             AttributionReadiness::Ready
@@ -8435,7 +8908,11 @@ impl JournalAdapter {
         // bounded by the open-table limit, and an admission older than
         // the latest void is classified cause-neutrally.
         self.void_wiped.clear();
-        self.void_wiped.extend(self.open.keys().copied());
+        self.void_wiped.extend(
+            self.open
+                .iter()
+                .map(|(native, entry)| (*native, entry.begin_ordinal)),
+        );
         debug_assert!(self.void_wiped.len() <= self.limits.open_calls);
         // The wiped BEGINs' terminals will arrive unmatched: the void
         // deliberately released them, so they are expected-absent, never
@@ -8498,6 +8975,7 @@ impl JournalAdapter {
             wiped_open: BTreeSet::new(),
             wiped_refused: BTreeSet::new(),
             preserve_doomed: BTreeSet::new(),
+            preserve_doomed_capable: BTreeSet::new(),
             preserve_taint: BTreeSet::new(),
             preserve_basis: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
@@ -8542,6 +9020,7 @@ impl JournalAdapter {
             wiped_open: BTreeSet::new(),
             wiped_refused: BTreeSet::new(),
             preserve_doomed: BTreeSet::new(),
+            preserve_doomed_capable: BTreeSet::new(),
             preserve_taint: BTreeSet::new(),
             preserve_basis: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
@@ -8766,6 +9245,7 @@ impl JournalAdapter {
             wiped_open: BTreeSet::new(),
             wiped_refused: BTreeSet::new(),
             preserve_doomed: BTreeSet::new(),
+            preserve_doomed_capable: BTreeSet::new(),
             preserve_taint: BTreeSet::new(),
             preserve_basis: BTreeMap::new(),
             doomed_done: BTreeSet::new(),
@@ -9030,13 +9510,16 @@ impl JournalAdapter {
     /// it, dispose its staged entries, and refuse the seal with the
     /// tainted-domain gap. Both seal-time doom paths (a staged
     /// non-effect-free abandonment, a model disagreement on
-    /// per-call disposal) share this exact refusal.
+    /// per-call disposal) share this exact refusal. `capable` tells
+    /// whether any grounding abandonment leaves a capable frame (no
+    /// fresh incarnation ever mints past those).
     fn doom_key_for_abandonment(
         &mut self,
         model: &mut ObjectSemantics,
         key: JournalDomainKey,
         bootstrap: &BootstrapReceipt,
         live: &[JournalDomainKey],
+        capable: bool,
     ) -> SealFailure {
         let domain = ObjectDomain::sealed(&bootstrap.proof());
         // The key refusal publishes here; its image's staged rows and the
@@ -9046,7 +9529,9 @@ impl JournalAdapter {
         let ticket =
             self.issue_doom_rejection(key, live, super::state::DomainRetirement::abandon(domain));
         let lived = self.key_is_live(key);
+        let died_at = self.consumed_through;
         self.keys.get_mut(&key).expect("sealed key").refused = true;
+        self.note_refused_mark(key, died_at, capable);
         self.claims_prune_dirty |= lived;
         let mut failure = SealFailure {
             take_failed: None,
@@ -9093,27 +9578,30 @@ impl JournalAdapter {
         // itself runs inside conversion, where the replay builder gives
         // its effects and its exact call an original terminal step.
         let mut dooming = false;
+        let mut capable = false;
         let mut disposable: BTreeSet<JournalNativeKey> = BTreeSet::new();
         for (native, entry) in &self.open {
-            if !self.abandons_here(key, &live, entry)
-                || entry.begin_ordinal > frontier
-                || !entry.abandon.is_some_and(|staged| {
-                    staged.ordinal <= frontier
-                        && abandon_disposition(staged.abandon.reason())
-                            == Some(AbandonDisposition::UnboundedInvalidation)
-                })
-            {
+            let Some(staged) = entry.abandon.as_ref().filter(|staged| {
+                staged.ordinal <= frontier
+                    && abandon_disposition(staged.abandon.reason())
+                        == Some(AbandonDisposition::UnboundedInvalidation)
+            }) else {
+                continue;
+            };
+            if !self.abandons_here(key, &live, entry) || entry.begin_ordinal > frontier {
                 continue;
             }
             if self.abandonment_disposes_here(entry) {
                 disposable.insert(*native);
             } else {
                 dooming = true;
-                break;
+                // A doom grounded in any capable frame never mints
+                // past it; only an exit-grounded doom does.
+                capable |= !Self::abandon_proves_frame_dead(staged.abandon.reason());
             }
         }
         if dooming {
-            return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live));
+            return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live, capable));
         }
         // This key's bounded abandonments need their corroborating
         // returns within the frontier; otherwise the bound is not ready
@@ -9242,6 +9730,38 @@ impl JournalAdapter {
         Ok(())
     }
 
+    /// Taint one key for a model surprise at the current consumption
+    /// point, recording the death ordinal for incarnation fencing.
+    fn surprise_taint_key(&mut self, key: JournalDomainKey) {
+        let lived = self.key_is_live(key);
+        let died_at = self.consumed_through;
+        self.keys.get_mut(&key).expect("sealed key").tainted = true;
+        self.note_tainted_mark(key, died_at);
+        self.claims_prune_dirty |= lived;
+    }
+
+    /// Record one key's refusal evidence (ordinal plus capable-frame
+    /// grounding) for incarnation fencing.
+    fn note_refused_mark(&mut self, key: JournalDomainKey, died_at: u64, capable: bool) {
+        let marks = self.death_marks.entry(key).or_default();
+        marks.refused = Some(match marks.refused {
+            Some((at, was_capable)) => (at.min(died_at), was_capable || capable),
+            None => (died_at, capable),
+        });
+    }
+
+    /// Record one key's taint ordinal for incarnation fencing.
+    fn note_tainted_mark(&mut self, key: JournalDomainKey, died_at: u64) {
+        let marks = self.death_marks.entry(key).or_default();
+        marks.tainted = Some(marks.tainted.map_or(died_at, |at| at.min(died_at)));
+    }
+
+    /// Record one key's clean-close ordinal for incarnation fencing.
+    fn note_ended_mark(&mut self, key: JournalDomainKey, died_at: u64) {
+        let marks = self.death_marks.entry(key).or_default();
+        marks.ended = Some(marks.ended.map_or(died_at, |at| at.min(died_at)));
+    }
+
     /// Register, convert (refused, begins, terminals, abandonments),
     /// settle, prune. Infallible by construction; a model surprise taints
     /// the key and fails the seal closed.
@@ -9261,9 +9781,7 @@ impl JournalAdapter {
         let domain = ObjectDomain::sealed(&bootstrap.proof());
         let mut effects = ObjectEffects::default();
         if model.register_domain(domain).is_err() {
-            let lived = self.key_is_live(key);
-            self.keys.get_mut(&key).expect("sealed key").tainted = true;
-            self.claims_prune_dirty |= lived;
+            self.surprise_taint_key(key);
             return Err(SealFailure {
                 take_failed: None,
                 gap: JournalGap::ModelRefused,
@@ -9334,9 +9852,7 @@ impl JournalAdapter {
                         Some(retained.bounded_upper.map_or(upper, |kept| kept.max(upper)));
                 }
                 None => {
-                    let lived = self.key_is_live(key);
-                    self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                    self.claims_prune_dirty |= lived;
+                    self.surprise_taint_key(key);
                     return Err(SealFailure {
                         take_failed: None,
                         gap: JournalGap::ModelRefused,
@@ -9385,9 +9901,7 @@ impl JournalAdapter {
             // minted from another invocation.
             let identity = identity_of_begin(&entry.begin);
             let Some(claim) = self.peek_claim(&identity, key) else {
-                let lived = self.key_is_live(key);
-                self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                self.claims_prune_dirty |= lived;
+                self.surprise_taint_key(key);
                 return Err(SealFailure {
                     take_failed: None,
                     gap: JournalGap::ModelRefused,
@@ -9457,9 +9971,7 @@ impl JournalAdapter {
                     });
                 }
                 Err(_) => {
-                    let lived = self.key_is_live(key);
-                    self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                    self.claims_prune_dirty |= lived;
+                    self.surprise_taint_key(key);
                     // The unconverted OpenEntry still owns its original
                     // role/charge; refusal never erased or recreated it.
                     return Err(SealFailure {
@@ -9602,9 +10114,7 @@ impl JournalAdapter {
                 && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
             {
                 let Some(at) = entry.corroborated_return else {
-                    let lived = self.key_is_live(key);
-                    self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                    self.claims_prune_dirty |= lived;
+                    self.surprise_taint_key(key);
                     return Err(SealFailure {
                         take_failed: None,
                         gap: JournalGap::ModelRefused,
@@ -9646,9 +10156,7 @@ impl JournalAdapter {
                 let start = effects.effects.len();
                 let Some(lost) = model.dispose_abandoned_per_call(Some(token), &mut self.ledger)
                 else {
-                    let lived = self.key_is_live(key);
-                    self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                    self.claims_prune_dirty |= lived;
+                    self.surprise_taint_key(key);
                     return Err(SealFailure {
                         take_failed: None,
                         gap: JournalGap::ModelRefused,
@@ -9739,7 +10247,9 @@ impl JournalAdapter {
         });
         if ended {
             let lived = self.key_is_live(key);
+            let died_at = self.consumed_through;
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
+            self.note_ended_mark(key, died_at);
             self.claims_prune_dirty |= lived;
             return Err(SealFailure {
                 take_failed: None,
@@ -24884,12 +25394,31 @@ pub(crate) mod tests {
             "a neutral void dooms nothing"
         );
         let fence = scene.adapter.consumed_through;
+        let second = begin_bytes(1, 2, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        // The sibling's admission pairs the staged entry's physical
+        // words (production admissions carry the observed invocation's
+        // own words; the scene pairs them like `prepare_claims` does
+        // for the first fixture).
         let mut other = AttestationFixture::new(image_default());
+        let staged = scene
+            .adapter
+            .open
+            .values()
+            .find(|entry| entry.begin_ordinal > fence)
+            .expect("post-void staged entry");
+        let staged_cut = staged.begin_ordinal;
+        let staged_event = staged.end.expect("staged END").end.payload_base().event;
+        let admitted = other.admit_original_event("C_CreateObject", staged_event);
         let sibling = scene
             .adapter
-            .attest_key(&other.admit())
+            .attest_key(&admitted)
             .expect("a sibling binds past a void-fenced sibling");
         assert_ne!(sibling.key, proof.key, "the fresh instance names a new key");
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
         let grant = SessionBirthGrant::scripted(
             sibling,
             BirthKind::AbsenceAppearance,
@@ -24898,9 +25427,6 @@ pub(crate) mod tests {
         );
         let rebirth =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
-        let second = begin_bytes(1, 2, create, 0);
-        scene.ingest(&second);
-        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
         let success = scene
             .seal_at(&rebirth, 8)
             .expect("the sibling tracks new sessions past the void");
@@ -25062,13 +25588,7 @@ pub(crate) mod tests {
             "the void dooms the key on negative evidence"
         );
         let fence = scene.adapter.consumed_through;
-        let admitted = scene
-            .fixture
-            .admit_session_function(SESSION, "C_CreateObject");
-        let reborn = scene
-            .adapter
-            .attest_key(&admitted)
-            .expect("a dead fenced binding rebinds");
+        let reborn = scene.attest_function("C_CreateObject");
         assert_ne!(
             reborn.key, proof.key,
             "re-entry mints a fresh incarnation, never the doomed key"
@@ -25180,14 +25700,11 @@ pub(crate) mod tests {
             "the mid-storm doom stuck"
         );
         let fence = scene.adapter.consumed_through;
-        let admitted = scene
-            .fixture
-            .admit_session_function(SESSION, "C_CreateObject");
-        let reborn = scene
-            .adapter
-            .attest_key(&admitted)
-            .expect("a dead fenced binding rebinds after the storm");
-        assert_ne!(reborn.key, proof.key);
+        let reborn = scene.attest_function("C_CreateObject");
+        assert_ne!(
+            reborn.key, proof.key,
+            "re-entry mints a fresh incarnation after the storm"
+        );
         let grant = SessionBirthGrant::scripted(
             reborn,
             BirthKind::AbsenceAppearance,
@@ -29257,6 +29774,7 @@ pub(crate) mod tests {
             cookie: COOKIE + 9,
             exec: EXEC + 9,
             router: 9999,
+            incarnation: 0,
         };
         let receipt = BootstrapReceipt::scripted(
             JournalDomainProof {

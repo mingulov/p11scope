@@ -2128,6 +2128,12 @@ fn run_with_terminal_budget(
             skip_eras,
             voids.voids_ended_joint_feed,
         ));
+        let reentry = coordinator.joint_reentry_diagnosis();
+        inventory_diagnostic(&crate::inventory_semantics::joint_reentry_line(
+            reentry.sibling_binds,
+            reentry.incarnations,
+            reentry.taint_lifts,
+        ));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         inventory_diagnostic(&crate::inventory_semantics::joint_audit_subjects_line(
             subjects.marks,
@@ -9299,6 +9305,12 @@ fn run_dashboard(
             voids.audit_resource_unavailable,
             skip_eras,
             voids.voids_ended_joint_feed,
+        ));
+        let reentry = coordinator.joint_reentry_diagnosis();
+        display.notice(&crate::inventory_semantics::joint_reentry_line(
+            reentry.sibling_binds,
+            reentry.incarnations,
+            reentry.taint_lifts,
         ));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         display.notice(&crate::inventory_semantics::joint_audit_subjects_line(

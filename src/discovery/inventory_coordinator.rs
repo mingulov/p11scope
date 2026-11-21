@@ -3354,6 +3354,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_capture.adapter().joint_void_diagnosis()
     }
 
+    /// Joint re-entry telemetry: sibling binds past fenced siblings,
+    /// fresh incarnations minted, and fenced taint quarantines lifted
+    /// (diagnostics).
+    pub(crate) fn joint_reentry_diagnosis(
+        &self,
+    ) -> crate::semantics_objects::journal::JointReentryCounts {
+        self.joint_capture.adapter().joint_reentry_counts()
+    }
+
     /// Seal bootstrap telemetry: which bootstrap check refused a
     /// seal, by arm (bootstrap-arm diagnostics).
     pub(crate) fn joint_seal_bootstrap_diagnosis(
@@ -3459,6 +3468,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Take queued reseed images for fresh births, clearing the queue.
     pub(crate) fn drain_joint_reseed_queue(&mut self) -> Vec<p11scope_ebpf_common::ImageIdentity> {
         self.registry.drain_joint_reseed_queue()
+    }
+
+    /// Queue reseed images for every feed waiting on a rebirth after a
+    /// voided collect. Returns how many images were queued.
+    pub(crate) fn queue_reseed_for_ended_feeds(&mut self) -> usize {
+        self.registry.queue_reseed_for_ended_feeds()
     }
 
     /// Calls into `service_collected_finish_records_with` (test count).

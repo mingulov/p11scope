@@ -3523,6 +3523,11 @@ impl LiveJointMachine {
                                     .label()
                             ),
                         );
+                        // Stream voids return no seal failure, so no
+                        // delivery queues their reseed: queue every
+                        // feed the void ended here, so the Births
+                        // phase re-arms them for one more birth.
+                        coordinator.queue_reseed_for_ended_feeds();
                     }
                 }
                 // Recompute the collection allowance after recovery:

@@ -376,14 +376,15 @@ fn preserve(
             return true;
         };
         // The entry's read and disposal decision persist across yields.
-        let (image, shape) = match recovery.decided.take() {
-            Some(read) => (read.image, read.shape),
+        let (image, shape, capable) = match recovery.decided.take() {
+            Some(read) => (read.image, read.shape, read.capable),
             None => {
                 let read = match recovery.check.take() {
                     Some(read) => PreserveRead::Check {
                         shape: read.shape,
                         function: read.function,
                         image: read.image,
+                        capable: read.capable,
                     },
                     None => {
                         let Some(paid) = credit.pay() else {
@@ -398,11 +399,16 @@ fn preserve(
                         decided = Some(native);
                         continue;
                     }
-                    PreserveRead::Unbounded { image, shape } => (image, shape),
+                    PreserveRead::Unbounded {
+                        image,
+                        shape,
+                        capable,
+                    } => (image, shape, capable),
                     PreserveRead::Check {
                         shape,
                         function,
                         image,
+                        capable,
                     } => {
                         // Undecidable disposal keeps the doom (fail closed).
                         let disposes = match journal.claim_probe(
@@ -416,8 +422,9 @@ fn preserve(
                             }
                             ClaimProbe::Never => false,
                             ClaimProbe::Yield => {
-                                recovery.check =
-                                    Some(CheckedRead::preserve(native, shape, function, image));
+                                recovery.check = Some(CheckedRead::preserve(
+                                    native, shape, function, image, capable,
+                                ));
                                 recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
                                 return false;
                             }
@@ -426,12 +433,12 @@ fn preserve(
                             decided = Some(native);
                             continue;
                         }
-                        (image, shape)
+                        (image, shape, capable)
                     }
                 }
             }
         };
-        recovery.decided = Some(CheckedRead::preserve(native, shape, 0, image));
+        recovery.decided = Some(CheckedRead::preserve(native, shape, 0, image, capable));
         if !basis_step(journal, &mut recovery.preserve_basis, image, credit) {
             recovery.phase = ScopedRecoveryPhase::Preserve { after: decided };
             return false;
@@ -474,6 +481,13 @@ fn preserve(
         recovery.decided = None;
         if tainted {
             recovery.preserve_taint.insert(image);
+        }
+        if capable {
+            // A doom grounded in any capable frame never mints past
+            // it; only an exit-grounded doom does.
+            recovery
+                .preserve_doomed_capable
+                .extend(doomed.iter().copied());
         }
         recovery.preserve_doomed.extend(doomed);
         decided = Some(native);
@@ -554,7 +568,8 @@ fn preserve_doom(
         let paid = credit.pay().expect("credit left");
         after = Some(key);
         if recovery.doomed_done.insert(key) {
-            recovery.model_retire = journal.doom_abandoned_key(key, paid);
+            let capable = recovery.preserve_doomed_capable.contains(&key);
+            recovery.model_retire = journal.doom_abandoned_key(key, recovery.upper, capable, paid);
         } else {
             drop(paid);
         }
@@ -722,7 +737,7 @@ fn wipe_open(
                         continue;
                     }
                     WipeOpen::Check { shape, function } => {
-                        CheckedRead::preserve(native, shape, function, (0, 0))
+                        CheckedRead::preserve(native, shape, function, (0, 0), false)
                     }
                 }
             }

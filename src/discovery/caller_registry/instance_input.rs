@@ -2458,6 +2458,47 @@ impl CallerRegistry {
         std::mem::take(&mut self.joint_reseed_queue)
     }
 
+    /// Queue reseed images for every feed a voided collect affects:
+    /// live Joint feeds (a stream void ends all Joint history, so
+    /// their next seals end their segments) and feeds already waiting
+    /// on a rebirth (an ended segment with drained staging and no
+    /// watchdog trip). The machine calls this once per voided collect
+    /// (stream voids never deliver a seal failure, so the delivery
+    /// path cannot queue for them); audit voids queue through
+    /// delivery as well, and duplicates are skipped. A scoped void
+    /// over-queues healthy feeds harmlessly: re-arm is idempotent and
+    /// a Joint feed ignores a later birth. Bounded by the queue cap;
+    /// the scan itself is bounded by the registry limit. Returns how
+    /// many images were queued.
+    pub(crate) fn queue_reseed_for_ended_feeds(&mut self) -> usize {
+        use crate::semantics_key_use::FeedMode;
+        let mut queued = 0usize;
+        let ids: Vec<RegistryInstanceId> = self
+            .instance_state
+            .semantics
+            .iter()
+            .filter(|(_, record)| {
+                record.feed.mode() == FeedMode::Joint || record.feed.reseed_eligible()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let Some(record) = self.instance_state.records.get(&id) else {
+                continue;
+            };
+            let image = record.key.image;
+            if self.joint_reseed_queue.contains(&image) {
+                continue;
+            }
+            if self.joint_reseed_queue.len() >= crate::discovery::instances::MAX_PENDING {
+                break;
+            }
+            self.joint_reseed_queue.push(image);
+            queued += 1;
+        }
+        queued
+    }
+
     /// Queue one reseed image (a fenced void ending the test arranges
     /// separately, or not at all): the machine twin drives the drain
     /// without a full void.
@@ -3427,6 +3468,17 @@ impl CallerRegistry {
                         {
                             self.joint_feeds = self.joint_feeds.saturating_add(1);
                             self.joint_accounting = true;
+                            // The voided window stays counted beside
+                            // this recovery: one row per reseed.
+                            self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                                caller: Some(input.caller),
+                                module: Some(module),
+                                pid: None,
+                                subject: crate::inventory_present::JOINT_REENTRY_SUBJECT.into(),
+                                reason: crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
+                                    .into(),
+                                budget: None,
+                            });
                         } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only
                         {
                             // The fresh receipt names another incarnation,

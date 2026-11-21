@@ -68,11 +68,17 @@ pub(in crate::semantics_objects) enum PreserveRead {
         shape: StagedShape,
         function: u32,
         image: (u64, u64),
+        /// Whether the abandonment leaves a capable frame: a doom
+        /// grounded in one never mints a fresh incarnation past it.
+        capable: bool,
     },
     /// An unbounded abandonment that keeps continuing effects: decide.
     Unbounded {
         image: (u64, u64),
         shape: StagedShape,
+        /// Whether the abandonment leaves a capable frame: a doom
+        /// grounded in one never mints a fresh incarnation past it.
+        capable: bool,
     },
 }
 
@@ -414,24 +420,26 @@ impl<'a> JournalLeaves<'a> {
             return PreserveRead::Settled;
         };
         self.visit();
-        let unbounded = entry.abandon.is_some_and(|staged| {
+        let Some(staged) = entry.abandon.as_ref().filter(|staged| {
             abandon_disposition(staged.abandon.reason())
                 == Some(AbandonDisposition::UnboundedInvalidation)
-        });
-        if !unbounded {
+        }) else {
             return PreserveRead::Settled;
-        }
+        };
         let shape = shape_of_entry(entry);
+        let capable = !JournalAdapter::abandon_proves_frame_dead(staged.abandon.reason());
         if abandonment_disposes_per_call(entry.function) && !entry.negative_return {
             return PreserveRead::Check {
                 shape,
                 function: entry.function,
                 image: entry.image,
+                capable,
             };
         }
         PreserveRead::Unbounded {
             image: entry.image,
             shape,
+            capable,
         }
     }
 
@@ -466,32 +474,51 @@ impl<'a> JournalLeaves<'a> {
         _paid: Paid,
     ) {
         self.visit();
+        // Unaccounted abandonments evidence unknown continuing
+        // effects: the taint never lifts, even once fenced.
         self.adapter
-            .taint_image_mark(image, TaintCause::UnclaimedInvalidation);
+            .taint_image_mark(image, TaintCause::UnclaimedInvalidation, None);
     }
 
-    /// Refuse one decided abandoned key (one unit) unless its image is
-    /// tainted: the refusal publishes now, and its held model domain's
-    /// retirement is returned for the shared budget.
+    /// Refuse one decided abandoned key (one unit) unless its image's
+    /// taint blocks past the void's fence: the refusal publishes now,
+    /// and its held model domain's retirement is returned for the
+    /// shared budget. A fenced quarantine never excuses the doom (the
+    /// taint may lift while the negative evidence must stand).
+    /// `capable` tells whether any grounding abandonment leaves a
+    /// capable frame (no fresh incarnation ever mints past those).
     pub(in crate::semantics_objects) fn doom_abandoned_key(
         &mut self,
         key: JournalDomainKey,
+        fence: u64,
+        capable: bool,
         _paid: Paid,
     ) -> Option<DomainRetirement> {
         self.visit();
-        if self.adapter.is_tainted(key.image()) {
+        if self.adapter.image_taint_blocks(key.image(), fence) {
             return None;
         }
-        self.refuse_key(key)
+        self.refuse_key(key, fence, capable)
     }
 
     /// Refuse one key (publishing first) and return its held model
-    /// domain's abandonment.
-    fn refuse_key(&mut self, key: JournalDomainKey) -> Option<DomainRetirement> {
+    /// domain's abandonment. `died_at` evidences the refusal (the
+    /// void's upper for preserved dooms, the consumption point
+    /// otherwise) and `capable` whether a capable frame grounds it,
+    /// for incarnation fencing.
+    fn refuse_key(
+        &mut self,
+        key: JournalDomainKey,
+        died_at: u64,
+        capable: bool,
+    ) -> Option<DomainRetirement> {
         let lived = self.adapter.key_is_live(key);
-        let state = self.adapter.keys.get_mut(&key).expect("refused key");
-        state.refused = true;
-        let (era, registered) = (state.era, state.model_registered);
+        let (era, registered) = {
+            let state = self.adapter.keys.get_mut(&key).expect("refused key");
+            state.refused = true;
+            (state.era, state.model_registered)
+        };
+        self.adapter.note_refused_mark(key, died_at, capable);
         self.adapter.claims_prune_dirty |= lived;
         registered.then(|| {
             DomainRetirement::abandon(ObjectDomain::sealed(&JournalDomainProof { key, era }))
@@ -524,10 +551,11 @@ impl<'a> JournalLeaves<'a> {
         let (native, entry) = super::next_after(&self.adapter.open, after)?;
         self.visit();
         if taint.contains(&entry.image) {
-            let (image, function) = (entry.image, entry.function);
+            let (image, function, begin_ordinal) =
+                (entry.image, entry.function, entry.begin_ordinal);
             self.adapter.note_derived_absence(image, native, function);
             self.drop_open(native);
-            self.adapter.void_wiped.insert(native);
+            self.adapter.void_wiped.insert(native, begin_ordinal);
         }
         Some(native)
     }
@@ -640,6 +668,10 @@ impl<'a> JournalLeaves<'a> {
                 }
                 self.adapter.claims_prune_dirty |= lived;
             }
+            // Unlocalized disposal evidences stream corruption:
+            // unknown effects from live frames never mint past it.
+            self.adapter
+                .note_refused_mark(key, self.adapter.consumed_through, true);
             return Some(FenceAllVisit {
                 key,
                 scope,
@@ -728,7 +760,7 @@ impl<'a> JournalLeaves<'a> {
             self.adapter
                 .note_derived_absence(entry.image, native, entry.function);
         }
-        self.adapter.void_wiped.insert(native);
+        self.adapter.void_wiped.insert(native, entry.begin_ordinal);
     }
 
     // ---- Stop and scope ------------------------------------------------
@@ -786,11 +818,13 @@ impl<'a> JournalLeaves<'a> {
         self.visit();
         let era = self.adapter.keys[&key].era;
         let lived = self.adapter.key_is_live(key);
+        let died_at = self.adapter.consumed_through;
         self.adapter
             .keys
             .get_mut(&key)
             .expect("stopped key")
             .refused = true;
+        self.adapter.note_refused_mark(key, died_at, false);
         self.adapter.claims_prune_dirty |= lived;
         DomainRetirement::abandon(ObjectDomain::sealed(&JournalDomainProof { key, era }))
     }
@@ -920,7 +954,10 @@ impl<'a> JournalLeaves<'a> {
         if state.refused {
             return Some((key, Some(scope), None));
         }
-        Some((key, Some(scope), self.refuse_key(key)))
+        // Disposed raw content is unknown effects from a live stream:
+        // the refusal never mints past it.
+        let died_at = self.adapter.consumed_through;
+        Some((key, Some(scope), self.refuse_key(key, died_at, true)))
     }
 
     /// Drop the open entry after `after` when its image is tainted (one
@@ -1065,7 +1102,10 @@ impl<'a> JournalLeaves<'a> {
         if state.refused {
             return Some((key, None));
         }
-        Some((key, self.refuse_key(key)))
+        // An S1-only bulk refusal marks history unproven, never
+        // invalid: fresh proof past a void re-proves it.
+        let died_at = self.adapter.consumed_through;
+        Some((key, self.refuse_key(key, died_at, false)))
     }
 
     /// The S1-only subject after `after` (one unit): its shape when it

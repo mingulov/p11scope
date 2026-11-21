@@ -125,7 +125,8 @@ pub(crate) struct ObjectDomain {
     image: u64,
     native_source: u64,
     instance: u64,
-    init_era: u64,
+    init_era: u32,
+    incarnation: u32,
 }
 redacted_debug!(ObjectDomain);
 
@@ -140,12 +141,14 @@ impl ObjectDomain {
         instance: u64,
         init_era: u64,
     ) -> Self {
+        debug_assert!(init_era <= u64::from(u32::MAX));
         Self {
             caller,
             image,
             native_source,
             instance,
-            init_era,
+            init_era: init_era as u32,
+            incarnation: 0,
         }
     }
 
@@ -164,13 +167,19 @@ impl ObjectDomain {
         native_source: u64,
         instance: u64,
         init_era: u64,
+        incarnation: u32,
     ) -> Self {
+        // Eras never advance past one (an ended era is terminal; no
+        // next-era path exists), so the era always fits beside the
+        // incarnation in the pinned 40-byte layout.
+        debug_assert!(init_era <= u64::from(u32::MAX));
         Self {
             caller,
             image,
             native_source,
             instance,
-            init_era,
+            init_era: init_era as u32,
+            incarnation,
         }
     }
 

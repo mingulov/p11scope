@@ -594,15 +594,20 @@ impl JointStaging {
     /// Reseed a voided feed onto a fresh birth receipt at or above its
     /// recorded fence (Task 3 re-selection): the old below-fence receipt
     /// never resumes, but a fresh receipt for the same incarnation with
-    /// a strictly newer cut starts a new Joint segment. Only a feed that
-    /// ended a segment (fallback or loss), drained its staging, and never
-    /// tripped may reseed — and never onto another incarnation's receipt
-    /// (wrong-key), a cut at/below the old cut (no progress), or a cut
-    /// below the recorded fence (would certify voided history). A clean
-    /// reseed clears the loss/fallback latches and baselines disposed
-    /// history like [`Self::resume_joint`]: the closed segment stays
-    /// counted, new disposal latches again. Returns whether the mode
-    /// changed.
+    /// a strictly newer cut starts a new Joint segment. A fresh
+    /// incarnation's domain reseeds too when its proof supersedes the
+    /// old proof (same binding, strictly newer incarnation): the
+    /// adapter minted it only because the old incarnation is dead and
+    /// void-fenced, and its birth was attested at/above the fence. A
+    /// sibling instance's receipt never reseeds (another router or
+    /// caller names another feed). Only a feed that ended a segment
+    /// (fallback or loss), drained its staging, and never tripped may
+    /// reseed — and never onto a foreign receipt (wrong-key), a cut
+    /// at/below the old cut (no progress), or a cut below the recorded
+    /// fence (would certify voided history). A clean reseed clears the
+    /// loss/fallback latches and baselines disposed history like
+    /// [`Self::resume_joint`]: the closed segment stays counted, new
+    /// disposal latches again. Returns whether the mode changed.
     pub(crate) fn reselect_joint(
         &mut self,
         receipt: &crate::semantics_objects::journal::BootstrapReceipt,
@@ -613,7 +618,7 @@ impl JointStaging {
         if !self.reseed_eligible() {
             return false;
         }
-        if receipt.domain() != old.domain() {
+        if receipt.domain() != old.domain() && !receipt.proof().reseed_supersedes(&old.proof()) {
             return false;
         }
         if receipt.birth_cut() <= old.birth_cut() {

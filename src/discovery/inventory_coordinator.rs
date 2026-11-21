@@ -763,6 +763,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// so pruning never double-counts it. Past the bound a due row is
     /// folded into `pair_dropped_totals` and `pair_prune_overflow`
     /// counts it once, so neither the map nor the counters grow.
+    /// Tombstones past the keep window drain by age on the same pass
+    /// (counted in the same overflow); the stop-time domain finish
+    /// stays as the backstop.
     pair_dropped_tombstones: HashMap<PairKey, PrunedPairBase>,
     /// Exact aggregate of pruned dropped-pair bases per key class
     /// (domain and object): rows and saturating base total. Counts stay
@@ -940,10 +943,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// singletons, failing toward never-skip. Replaced wholesale with
     /// the digests; discarded passes record nothing.
     mapper_groups_prior: BTreeMap<usize, BTreeSet<u32>>,
-    /// Every task identity enumerated by an applied pass, across passes:
-    /// the terminal stop diff reports live tasks this never saw, so a
-    /// starter that never execs cannot stay invisible. Capped (departed
-    /// tasks evict first); discarded passes record nothing.
+    /// Every task identity the latest applied pass enumerated: the
+    /// terminal stop diff reports live tasks this never saw, so a
+    /// starter that never execs cannot stay invisible. Each applied
+    /// pass evicts tasks it no longer enumerates first (a departed
+    /// pid can never re-verify, and a recycled pid reads fresh), so
+    /// churn cannot grow this past the live enumeration; the cap
+    /// below stays as the backstop and discarded passes record
+    /// nothing.
     ever_enumerated: BTreeSet<(u32, Option<u64>)>,
     /// The terminal stop diff already disclosed: a repeated terminal
     /// call stays silent.
@@ -1069,11 +1076,20 @@ const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
 /// retained; only evidence no retained caller can consult prunes here.
 const EXEC_STATE_GRACE_NS: u64 = 180 * 1_000_000_000;
 /// Dropped pair bases kept as exact revival tombstones. Never lowered:
-/// each entry is ~40 B, so the full bound is a few MiB. Past it a due
+/// each entry is ~56 B, so the full bound is a few MiB. Past it a due
 /// row is folded into the exact class aggregate and
 /// `pair_prune_overflow` counts it once; no base is ever forgotten and
 /// `pair_targets` stays bounded.
 const MAX_PRUNED_PAIR_TOMBSTONES: usize = 65_536;
+/// How long a pruned dropped-pair tombstone stays available to a late
+/// revival: two prune graces past the prune that created it. Older
+/// tombstones drain by age every pass (their bases already joined the
+/// exact class aggregate at prune time) and `pair_prune_overflow`
+/// counts each age fold once, like a bound fold — so the map stays
+/// flat under churn instead of living until domain stop. A later
+/// revival past an expired tombstone starts from zero, exactly like
+/// past a bound-folded row.
+const PAIR_TOMBSTONE_KEEP_NS: u64 = 2 * EXEC_STATE_GRACE_NS;
 /// Pruned EXEC stashes remembered per cookie. Past it the domain latches
 /// EXEC loss and `exec_pruned_overflow` counts the discarded tombstones;
 /// a missing record then reads `exec_record_lost`, never
@@ -5844,7 +5860,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// row is folded into the same exact aggregate and the overflow
     /// counts it once, so `pair_targets` never grows without bound and
     /// no base is forgotten silently (only exact per-pair revival is
-    /// lost, and the published overflow count says so).
+    /// lost, and the published overflow count says so). Tombstones
+    /// older than the keep window drain by age on the same pass (their
+    /// bases already joined the aggregate at prune time): the overflow
+    /// counts each age fold once, so the tombstone map stays flat
+    /// under churn instead of living until domain stop.
     fn prune_dropped_pair_targets(&mut self, now_ns: u64) {
         let due: Vec<PairKey> = self
             .pair_targets
@@ -5875,12 +5895,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // tombstone keeps the exact base while the bound has room,
             // otherwise the row is aggregate-only and counted.
             if self.pair_dropped_tombstones.len() < self.pair_prune_cap {
-                self.pair_dropped_tombstones
-                    .insert(key, PrunedPairBase { base, base_since });
+                self.pair_dropped_tombstones.insert(
+                    key,
+                    PrunedPairBase {
+                        base,
+                        base_since,
+                        pruned_since: now_ns,
+                    },
+                );
             } else {
                 self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(1);
             }
         }
+        // Age drain: tombstones past the keep window leave the map;
+        // their bases stay in the exact aggregate, and the overflow
+        // counts each age fold once, like a bound fold.
+        let mut expired = 0u64;
+        self.pair_dropped_tombstones.retain(|_, tomb| {
+            if now_ns.saturating_sub(tomb.pruned_since) >= PAIR_TOMBSTONE_KEEP_NS {
+                expired = expired.saturating_add(1);
+                false
+            } else {
+                true
+            }
+        });
+        self.pair_prune_overflow = self.pair_prune_overflow.saturating_add(expired);
     }
 
     /// Settle one pair recovery that can never suspend: a Dropped or
@@ -12603,6 +12642,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .collect();
         retain_current_tasks(&mut self.scan_freshness, &current);
+        // Enumeration memory keeps the latest pass only: tasks this
+        // pass no longer enumerates leave before the inserts, so
+        // departed churn children never accumulate across passes. A
+        // live task this pass missed over-reports as unknown at the
+        // stop — the safe direction, like the overflow sweep below.
+        retain_current_tasks(&mut self.ever_enumerated, &current);
         for process in &catalog.processes {
             let task = (
                 process.pid,
@@ -14117,12 +14162,15 @@ struct PairKeyClass {
     object: u32,
 }
 
-/// One pruned dropped pair's absolute base and its read anchor: a late
-/// revival rebases past exactly this, so pruning never double-counts.
+/// One pruned dropped pair's absolute base, its read anchor, and the
+/// pass it left the live map: a late revival rebases past exactly
+/// this, so pruning never double-counts, and a tombstone older than
+/// the keep window drains by age instead of living until domain stop.
 #[derive(Debug, Clone, Copy)]
 struct PrunedPairBase {
     base: u64,
     base_since: u64,
+    pruned_since: u64,
 }
 
 /// Exact aggregate of pruned dropped-pair bases for one class.
@@ -39569,6 +39617,7 @@ int main(void) {
             PrunedPairBase {
                 base: 5,
                 base_since: 100,
+                pruned_since: 100,
             },
         );
         native.stage(NativeBatch::Finish {

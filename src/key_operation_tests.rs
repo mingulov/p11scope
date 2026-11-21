@@ -22632,6 +22632,109 @@ fn key_operation_reseed_after_fenced_h3_loss_succeeds() {
     }
 }
 
+/// A tainted fallback never reseeds onto the same proof: the domain
+/// cannot audit (its seals would fall back forever), so arming a new
+/// Joint segment would stage into a stuck session until the commit
+/// lane spends its re-arm bound and stops. The feed stays S1Only with
+/// its fallback counted; only a superseding fresh incarnation (new
+/// proof) may reseed.
+#[test]
+fn key_operation_reseed_after_tainted_fallback_refuses_same_proof() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::DomainTainted,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "a tainted seal falls back: {outcome:?}"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert!(staging.fell_back());
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        !staging.reselect_joint(&fresh),
+        "a tainted segment never reseeds onto the same proof"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert!(staging.fell_back(), "the fallback stays counted");
+}
+
+/// An ordered capacity fallback (transient, base-resumable) still
+/// reseeds onto the same proof: only proof-destroyed fallbacks refuse.
+#[test]
+fn key_operation_reseed_after_ordered_fallback_allows_same_proof() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let (replayed, _) = staging.ordered_fallback(
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        Some(scene.adapter.ledger_mut()),
+        None,
+    );
+    assert_eq!(replayed, 1, "the staged call replays S1-direct");
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert!(staging.fell_back());
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        staging.reselect_joint(&fresh),
+        "a transient fallback reseeds onto the same proof"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+}
+
 /// A voided feed reseeds onto a fresh incarnation's domain too: the new
 /// receipt names a strictly newer incarnation of the same binding
 /// with a strictly newer cut at/above the fence, starting a new Joint
@@ -22768,6 +22871,95 @@ fn key_operation_reseed_onto_new_domain_incarnation() {
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
     assert_eq!(staging.staged_len(), 1, "new calls stage Joint again");
+}
+
+/// A superseding fresh incarnation still reseeds a tainted fallback:
+/// the new proof names a fresh domain that can audit, so the
+/// proof-destroyed gate (same proof only) does not apply.
+#[test]
+fn key_operation_reseed_superseding_incarnation_bypasses_tainted_fallback() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let generation = bootstrap.closure_generation();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::DomainTainted,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "a tainted seal falls back: {outcome:?}"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    // The same binding mints a fresh incarnation through real doom
+    // groundwork (independent of the feed's taint), which births at
+    // the fault fence above the taint fence.
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    assert_eq!(
+        scene.ingest(&outer),
+        JournalDisposition::BeginAdmitted,
+        "doom groundwork stages"
+    );
+    assert_eq!(
+        scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+        JournalDisposition::ReturnObserved
+    );
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+    assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    assert!(fence > 1, "the fence advances past the taint fence");
+    let admitted = scene.fixture.admit_function("C_CreateObject");
+    let incarnation = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("a dead fenced binding rebinds");
+    let grant =
+        SessionBirthGrant::scripted(incarnation, BirthKind::AbsenceAppearance, fence, generation);
+    let fresh = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+    assert!(
+        staging.reselect_joint(&fresh),
+        "a fresh incarnation reseeds past a tainted fallback"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    assert_eq!(staging.selected_receipt(), Some(&fresh));
 }
 
 /// Joint re-entry never confuses voided rows with fresh proof: after
@@ -23468,6 +23660,87 @@ fn key_operation_second_birth_after_fenced_void_reseeds_feed() {
         "the fresh receipt at the fence reseeds Joint"
     );
     assert_eq!(guarded.registry.joint_feeds(), 1);
+}
+
+/// A second birth onto a tainted fallback never reseeds: the voided
+/// feed keeps S1Only with its fallback counted, and the refused birth
+/// names the proof-destroyed segment instead of the receipt.
+#[test]
+fn key_operation_second_birth_after_tainted_fallback_names_unresumable() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::DomainTainted,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the taint ends the feed fallen back: {outcome:?}"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only)
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), fresh),
+        "a second birth installs for the voided instance"
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the same proof never reseeds a tainted segment"
+    );
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .any(|gap| gap.reason == "joint_birth_segment_unresumable"),
+        "the refused birth names the unresumable segment"
+    );
 }
 
 /// A second birth naming another incarnation never reseeds: the voided

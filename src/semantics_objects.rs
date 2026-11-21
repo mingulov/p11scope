@@ -398,10 +398,10 @@ pub(crate) enum ObjectGap {
     /// instance is the NSS softoken EC-keygen pairwise self-test;
     /// a same-thread nested call from an application signal handler
     /// or a provider callback nests too, so the issuer is never
-    /// proven), so its key birth is the still-in-flight outer call
-    /// and its joins stay unproven. H9 routes the terminal to the
-    /// `same_thread_nested` unknown row — never binding the inner
-    /// call to a key — while the outer call's outputs bind.
+    /// proven), so the inner key join is withheld under this
+    /// precise reason. H9 routes the terminal to the
+    /// `same_thread_nested` unknown row; the nested pair alone
+    /// does not obstruct otherwise provable outer outputs.
     /// Cross-thread or unprovable overlap keeps
     /// `SameSessionOverlap`.
     SameThreadNested,

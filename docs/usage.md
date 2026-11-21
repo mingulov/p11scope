@@ -1772,12 +1772,13 @@ Limits that matter in pods:
   session), never the issuer — a same-thread nested call from an
   application signal handler or a provider-invoked application
   callback re-entering PKCS#11 on the same session nests too. The
-  outer creation's outputs still bind (so the caller's later uses
-  bind to the created key), while the inner call's own terminal is
+  inner call's key join is withheld and its own terminal is
   reported on the named `same_thread_nested` unknown row instead of
   `unbound` (with `-v` beside the tallies, and as the row's `reason`
-  in `--json`, section version 9), never binding the inner call to a
-  key. Cross-thread or otherwise unprovable same-session overlap
+  in `--json`, section version 9); the nested pair alone does not
+  obstruct otherwise provable outer outputs (so when nothing else
+  is unproven, the caller's later uses bind to the created key).
+  Cross-thread or otherwise unprovable same-session overlap
   keeps the conservative shape: the fenced creation's outputs stay
   unknown and later uses report `unbound`. With `-v`, objects created from templates
   beyond eight slots are counted on their own line (`  template

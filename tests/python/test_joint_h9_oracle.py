@@ -556,6 +556,65 @@ class SnapshotTwins(unittest.TestCase):
         with self.assertRaisesRegex(oracle.LedgerError, "rows out of order"):
             oracle.validate_snapshot(snapshot)
 
+    def test_h9_v9_snapshot_dispatch(self):
+        # v9 iff same-thread-nested content: a nested unknown row or a
+        # model gap naming same_thread_nested promotes; a bare v9
+        # version is refused, and any pre-v9 carrier of the v9-only
+        # row or gap reason is refused (content-based dispatch,
+        # inventory-v1.md object observations).
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+        nested_row = {"category": "sign", "reason": "same_thread_nested",
+                      "unit": "operations", "completed": 1, "failed": 0,
+                      "cancelled": 0, "unknown": 0, "active": 0}
+        nested_gap = {"subject": "model", "reason": "same_thread_nested",
+                      "repeats": 1}
+
+        def promoted(version):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = version
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                row["inferred_family"] = {"status": "unknown", "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown", "detail": None,
+                                        "completions": 0}
+            return snapshot
+
+        with self.subTest("v9 unknown-row shape validates"):
+            snapshot = promoted(9)
+            snapshot["unknown_key_operations"] = [dict(nested_row)]
+            snapshot["budgets"]["unknown_rows"]["occupied"] = 1
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("v9 model-gap shape validates"):
+            snapshot = promoted(9)
+            snapshot["gaps"] = {"rows": [dict(nested_gap)], "suppressed": 0}
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("v9 without nested content refused"):
+            with self.assertRaisesRegex(
+                    oracle.LedgerError,
+                    "without same-thread-nested content"):
+                oracle.validate_snapshot(promoted(9))
+        with self.subTest("v7 carrying the nested unknown row refused"):
+            snapshot = promoted(7)
+            snapshot["unknown_key_operations"] = [dict(nested_row)]
+            snapshot["budgets"]["unknown_rows"]["occupied"] = 1
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "v9-only unknown reason"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v7 carrying the nested model gap refused"):
+            snapshot = promoted(7)
+            snapshot["gaps"] = {"rows": [dict(nested_gap)], "suppressed": 0}
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "v9-only gap reason"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v1 carrying the nested model gap refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["gaps"] = {"rows": [dict(nested_gap)], "suppressed": 0}
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "v9-only gap reason"):
+                oracle.validate_snapshot(snapshot)
+
 
 class CompareTwins(unittest.TestCase):
     def test_healthy_modes_pass_with_stream(self):
@@ -1781,6 +1840,53 @@ class StreamTwins(unittest.TestCase):
             self.assertIn("h9 refused: ledger A: first row must be ready",
                           completed.stderr)
             self.assertNotIn("Traceback", completed.stderr)
+
+    def test_cli_v9_dispatch_refuses_before_compare(self):
+        # The CLI dispatches on content, not the version number: a v9
+        # snapshot without nested evidence and a v7 snapshot carrying
+        # the v9-only model gap are refused even though the ledgers
+        # are healthy (both returned 0 before the fix).
+        require_oracle(self)
+        oracle = ORACLE
+        _, _, first, second = validated_pair(oracle, "interleave")
+
+        def promoted(version):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = version
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                row["inferred_family"] = {"status": "unknown", "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown", "detail": None,
+                                        "completions": 0}
+            return snapshot
+
+        version_only = promoted(9)
+        old_carrier = promoted(7)
+        old_carrier["gaps"] = {
+            "rows": [{"subject": "model",
+                      "reason": "same_thread_nested", "repeats": 1}],
+            "suppressed": 0}
+        cases = (("v9 without nested content", version_only,
+                  "without same-thread-nested content"),
+                 ("v7 carrying the nested model gap", old_carrier,
+                  "v9-only gap reason"))
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger_a = Path(tmp) / "a.jsonl"
+            ledger_b = Path(tmp) / "b.jsonl"
+            snap = Path(tmp) / "snap.json"
+            write_jsonl(ledger_a, healthy_ledger(MODES["interleave"][0]))
+            write_jsonl(ledger_b, healthy_ledger(MODES["interleave"][1]))
+            for name, snapshot, pattern in cases:
+                with self.subTest(name):
+                    write_json(snap, snapshot)
+                    completed = subprocess.run(
+                        ["python3", "-I", str(ORACLE_PATH), str(ledger_a),
+                         str(ledger_b), str(snap)],
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual(completed.returncode, 1,
+                                     completed.stderr)
+                    self.assertRegex(completed.stderr, pattern)
 
 
 REFUSAL_PROVIDER = """/* Test-only non-stub provider: no marker export, so the stub-only emitter refuses it. */

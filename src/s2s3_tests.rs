@@ -2108,10 +2108,11 @@ fn s2s3_same_thread_nested_binds() {
     // twin: a call starting and ending on one thread strictly inside
     // another open call on the same session is same-thread nested
     // re-entry (the NSS softoken EC-keygen pairwise self-test
-    // shape). The outer creation's outputs bind; the caller's later
-    // uses bind to the created key; the inner call keeps its
-    // conservative join (its key birth is the in-flight outer call)
-    // under the precise internal gap.
+    // shape). The nested pair alone does not obstruct the outer
+    // outputs — nothing else is unproven in this scene, so the
+    // outer creation's outputs bind and the caller's later uses
+    // bind to the created key — while the inner call's key join
+    // is withheld under the precise internal gap.
     let mut h = Hist::qualified();
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
@@ -2339,6 +2340,45 @@ fn s2s3_same_thread_nested_sequential_tid_reuse_stays_separate() {
         )),
         "sequential tid reuse names no nested gap"
     );
+}
+
+/// Same-thread partial (interleaved, non-nested) overlap: two
+/// same-session creations on one thread whose intervals intersect
+/// without containment (A starts inside nothing, B starts inside A
+/// but ends at/after A's end). Strict nesting needs a later begin
+/// AND an earlier end, so neither call nests: both keep the
+/// conservative gap, nothing binds, and no nested gap is named.
+/// This pins the predicate's two temporal arms (`inner.begin <=
+/// outer.begin`, `inner_completion.cut >= outer_end`).
+#[test]
+fn s2s3_same_thread_nested_partial_overlap_stays_uncertain() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let a = h.begin(3, call("C_GenerateKey").on(SA).thread(THREAD_A));
+    let b = h.begin(5, call("C_GenerateKey").on(SA).thread(THREAD_A));
+    h.done(a, 7, ok().result(0, H1));
+    h.done(b, 9, ok().result(0, H2));
+    let effects = h.settle(9);
+    assert_eq!(created(&effects, a, 0), None);
+    assert_eq!(created(&effects, b, 0), None);
+    assert_eq!(unresolved(&effects, a), Some(ObjectGap::SameSessionOverlap));
+    assert_eq!(unresolved(&effects, b), Some(ObjectGap::SameSessionOverlap));
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved {
+                reason: ObjectGap::SameThreadNested,
+                ..
+            }
+        )),
+        "partial overlap names no nested gap"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::SameThreadNested),
+        0,
+        "no nested model gap for partial overlap"
+    );
+    assert!(h.project().objects.is_empty());
 }
 
 /// R3 zero-half guard (RVS idea): a zero pid or tid half never nests,

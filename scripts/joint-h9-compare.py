@@ -137,6 +137,8 @@ UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "same_thread_nested"}
 # v9-only unknown reasons: refused below v9, never silently dropped.
 V9_ONLY_UNKNOWN = {"same_thread_nested"}
+# v9-only gap reasons: refused below v9, never silently dropped.
+V9_ONLY_GAPS = {"same_thread_nested"}
 STATUSES = {"populated", "partial", "stale", "unavailable"}
 STATUS_REASONS = {"none", "bootstrap_unavailable", "live_joint_feed_absent",
                   "proof_refused_fallback",
@@ -692,6 +694,21 @@ def _check_unattributed(document):
              "snapshot unattributed rows out of frozen order")
 
 
+def _require_v9_content(document):
+    """A v9 snapshot names the same-thread-nested reason on an unknown
+    row or a model gap (rowless gaps promote too). The rows and gaps
+    passed their checks before this runs, so a listed v9-only reason
+    is already well-formed. v9 needs no v7 content: proved rows carry
+    the inferred keys (blank when unknown) either way."""
+    for row in document["unknown_key_operations"]:
+        if row["reason"] in V9_ONLY_UNKNOWN:
+            return
+    for row in document["gaps"]["rows"]:
+        if row["subject"] == "model" and row["reason"] in V9_ONLY_GAPS:
+            return
+    _require(False, "snapshot v9 without same-thread-nested content")
+
+
 def validate_snapshot(document):
     """Validate the frozen H9 subset; refuse anything but populated output."""
     keys = {"version", "revision", "status", "reason", "sessions",
@@ -760,6 +777,8 @@ def validate_snapshot(document):
         _require(row["subject"] in ("model", "key_operation"),
                  f"{where}: subject invalid")
         _require(type(row["reason"]) is str, f"{where}: reason invalid")
+        _require(version >= 9 or row["reason"] not in V9_ONLY_GAPS,
+                 f"{where}: v9-only gap reason in v{version} section")
         _require(_integer(row["repeats"]), f"{where}: repeats out of range")
     _require(_integer(gaps["suppressed"]), "snapshot gaps suppressed out of range")
     budgets = document["budgets"]
@@ -779,6 +798,8 @@ def validate_snapshot(document):
              "snapshot allocation_refused changed")
     _require(budgets["refusal_reason"] == "none",
              "snapshot refusal_reason changed")
+    if version == 9:
+        _require_v9_content(document)
     return document
 
 

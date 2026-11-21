@@ -2121,10 +2121,9 @@ impl ModelState {
         // same-thread nested re-entry names its own gap before any
         // other overlap is considered, so the classification never
         // depends on pair order. A call strictly inside another open
-        // non-neutral call on the same session and thread keeps its
-        // conservative join (its key birth is the in-flight outer
-        // call) under the precise reason; H9 routes its terminal to
-        // the `same_thread_nested` unknown row. The metadata flag is
+        // non-neutral call on the same session and thread withholds its
+        // inner key join under the precise reason; H9 routes its terminal
+        // to the `same_thread_nested` unknown row. The metadata flag is
         // unread downstream whenever interference is `Some` (every
         // consumer early-returns on the gap), so `false` is exact.
         // One per-call domain scan: the pending set is collected once
@@ -2183,12 +2182,13 @@ impl ModelState {
                 // strictly-nested inner call runs entirely inside
                 // this call on one thread — no concurrent
                 // interleaving with this call's joins from another
-                // thread — so the outer call ignores it and its
-                // outputs bind. (The inner call itself returned
-                // `SameThreadNested` from the pre-scan above; its
-                // issuer is never proven and its terminal never
-                // binds a key.) Cross-thread or otherwise unprovable
-                // overlap keeps the conservative gap.
+                // thread — so the outer call ignores it and the
+                // nested pair alone does not obstruct otherwise
+                // provable outer outputs. (The inner call itself
+                // returned `SameThreadNested` from the pre-scan
+                // above; its issuer is never proven.) Cross-thread
+                // or otherwise unprovable overlap keeps the
+                // conservative gap.
                 if Self::strictly_nested_same_thread(y, x) {
                     continue;
                 }

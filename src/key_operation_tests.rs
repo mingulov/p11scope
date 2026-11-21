@@ -22633,54 +22633,58 @@ fn key_operation_reseed_after_fenced_h3_loss_succeeds() {
 }
 
 /// A voided feed reseeds onto a fresh incarnation's domain too: the new
-/// receipt names the same image with a strictly newer cut at/above the
-/// fence, starting a new Joint segment while the closed segment stays
-/// counted. Another image, a cut at/below the old cut, or below the
-/// fence refuses (never the wrong key, never voided history).
+/// receipt names a strictly newer incarnation of the same binding
+/// with a strictly newer cut at/above the fence, starting a new Joint
+/// segment while the closed segment stays counted. A sibling
+/// instance's proof, another image, a cut at/below the old cut, or
+/// below the fence refuses (never the wrong key, never voided
+/// history).
 #[test]
 fn key_operation_reseed_onto_new_domain_incarnation() {
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
 
     let instance = RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     assert_eq!(bootstrap.birth_cut(), 0);
-    // A sibling key for the same image (the fresh instance or
-    // incarnation): bound before any seal, so no sole-key conversion
-    // blocks it yet.
-    let mut other = AttestationFixture::new(ImageIdentity {
-        task_cookie: COOKIE,
-        exec_id: EXEC,
-    });
-    let sibling = scene
-        .adapter
-        .attest_key(&other.admit_function("C_CreateObject"))
-        .expect("sibling binds beside the unconverted key");
     let generation = bootstrap.closure_generation();
-    assert_ne!(
-        BootstrapReceipt::scripted(sibling, BirthKind::AttachObserved, 0, generation).domain(),
-        bootstrap.domain(),
-        "the sibling tracks its own domain"
-    );
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut edge = EdgeSemantics::default();
     let mut keyuse = KeyUseReducer::new();
     let mut sink = Vec::new();
-    prepare_call(
-        &mut scene,
-        &mut staging,
-        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    // Doom the tracked key through a real void: a staged abandonment
+    // with corroborated negative evidence, then the moved seal-time
+    // fault cell voids and the real failure delivers to the feed. The
+    // doom groundwork uses its own thread, outside the scene's paired
+    // call sequences.
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    assert_eq!(
+        scene.ingest(&outer),
+        JournalDisposition::BeginAdmitted,
+        "doom groundwork stages"
     );
-    let mut failure = scene.adapter.scripted_failure(
-        JournalGap::FaultChanged,
-        &bootstrap,
-        crate::semantics_objects::ObjectEffects::default(),
+    assert_eq!(
+        scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+        JournalDisposition::ReturnObserved
     );
-    failure.fence = Some(2);
-    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+    assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    assert!(fence > 1, "the fence advances past the old cut");
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, _) = staging.apply_algorithm_failure_for_test(
         &failure,
-        &mut h3,
+        &mut clean,
         &scene.model,
         scene.adapter.ledger_mut(),
         &mut edge,
@@ -22698,9 +22702,36 @@ fn key_operation_reseed_onto_new_domain_incarnation() {
         "the void ends the segment: {outcome:?}"
     );
     assert_eq!(staging.mode(), FeedMode::S1Only);
-    assert_eq!(staging.segment_fence_for_test(), Some(2));
-    // Guards first (all refuse without mutating): another image, a cut
-    // at the old cut, and a cut below the fence.
+    // The same binding mints a fresh incarnation (the doomed key never
+    // rebinds), which births at the fence.
+    let admitted = scene.fixture.admit_function("C_CreateObject");
+    let incarnation = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("a dead fenced binding rebinds");
+    assert_ne!(
+        incarnation, scene.proof,
+        "re-entry mints a fresh incarnation, never the doomed key"
+    );
+    let grant =
+        SessionBirthGrant::scripted(incarnation, BirthKind::AbsenceAppearance, fence, generation);
+    let fresh = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+    assert_ne!(
+        fresh.domain(),
+        bootstrap.domain(),
+        "the incarnation tracks its own domain"
+    );
+    // Guards first (all refuse without mutating): a sibling instance's
+    // proof, another image, a cut at the old cut, and a cut below the
+    // fence.
+    let mut other = AttestationFixture::new(ImageIdentity {
+        task_cookie: COOKIE,
+        exec_id: EXEC,
+    });
+    let sibling = scene
+        .adapter
+        .attest_key(&other.admit_function("C_CreateObject"))
+        .expect("a sibling binds beside the dead key");
     let mut foreign_fixture = AttestationFixture::new(ImageIdentity {
         task_cookie: COOKIE + 1,
         exec_id: EXEC,
@@ -22710,11 +22741,12 @@ fn key_operation_reseed_onto_new_domain_incarnation() {
         .attest_key(&foreign_fixture.admit_function("C_CreateObject"))
         .expect("foreign image binds its own key");
     for (proof, cut, why) in [
-        (foreign, 3u64, "another image never reseeds this feed"),
-        (sibling, 0u64, "a cut at the old cut is no progress"),
+        (sibling, fence, "a sibling instance never reseeds this feed"),
+        (foreign, fence, "another image never reseeds this feed"),
+        (incarnation, 0u64, "a cut at the old cut is no progress"),
         (
-            sibling,
-            1u64,
+            incarnation,
+            fence - 1,
             "a cut below the fence would certify voided history",
         ),
     ] {
@@ -22722,7 +22754,6 @@ fn key_operation_reseed_onto_new_domain_incarnation() {
         assert!(!staging.reselect_joint(&receipt), "{why}");
     }
     assert_eq!(staging.mode(), FeedMode::S1Only);
-    let fresh = BootstrapReceipt::scripted(sibling, BirthKind::AttachObserved, 2, generation);
     assert!(
         staging.reselect_joint(&fresh),
         "a fresh incarnation at the fence reseeds"
@@ -22739,12 +22770,14 @@ fn key_operation_reseed_onto_new_domain_incarnation() {
     assert_eq!(staging.staged_len(), 1, "new calls stage Joint again");
 }
 
-/// Joint re-entry keeps old handles unknown: after a void fences the
-/// tracked history and re-presented voided bytes taint the image, a
-/// fresh birth at the fence lifts the quarantine and a new segment
-/// tracks new sessions. Signs on the pre-void session/key land on
-/// unknown-key rows, never on new keys; signs on post-void sessions
-/// with a re-learned key table attribute.
+/// Joint re-entry never confuses voided rows with fresh proof: after
+/// a void fences the tracked history and re-presented voided bytes
+/// taint the image, a fresh birth at the fence lifts the quarantine
+/// and a new segment tracks again. Calls in-flight across the void
+/// stay unknown (never attributed); the pre-void rows freeze with
+/// their loss counted; post-void use re-proves onto fresh rows — an
+/// old handle re-binds its own fresh row, never a new key's row and
+/// never by reopening its voided row.
 #[test]
 fn key_operation_reentry_old_handles_stay_unknown() {
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
@@ -22819,14 +22852,25 @@ fn key_operation_reentry_old_handles_stay_unknown() {
         .find(|row| row.category == "sign")
         .expect("the healthy sign attributes");
     assert_eq!(old_row.completed, 1);
+    let old_object = old_row.object;
     assert!(
         committed.unknown_key_operations.is_empty(),
         "no unknown rows while healthy: {:?}",
         committed.unknown_key_operations
     );
 
-    // Stage one more call (stays open across the void), saving its
-    // exact BEGIN bytes for the post-void re-presentation below.
+    // A second old-handle sign stages across the void (its proof is
+    // voided with it), plus one more call whose exact BEGIN bytes the
+    // post-void re-presentation below reuses.
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    let (_, init_position) = attest_and_stage(&mut scene, &mut staging, &init);
+    ingest_call(&mut scene, &init, init_position);
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    let (_, sign_position) = attest_and_stage(&mut scene, &mut staging, &sign);
+    ingest_call(&mut scene, &sign, sign_position);
     let pending = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
     let (_, position) = attest_and_stage(&mut scene, &mut staging, &pending);
     let wiped_begin = scene
@@ -23009,27 +23053,50 @@ fn key_operation_reentry_old_handles_stay_unknown() {
     );
 
     let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
-    let unknown: Vec<_> = committed
-        .unknown_key_operations
+    // The voided window stays unknown: the three calls in flight
+    // across the void dispose as counted record loss, never attribute
+    // and never replay onto a row.
+    let unattributed = crate::key_operation_projection::producer::unattributed(&[&staging]);
+    assert_eq!(
+        unattributed
+            .iter()
+            .map(|row| (row.reason, row.count))
+            .collect::<Vec<_>>(),
+        [("record_lost", 3)],
+        "the voided window counts its loss"
+    );
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "disposed calls replay nowhere: {:?}",
+        committed.unknown_key_operations
+    );
+    let sign_rows: Vec<_> = committed
+        .key_operations
         .iter()
         .filter(|row| row.category == "sign")
         .collect();
     assert_eq!(
-        unknown.iter().map(|row| row.completed).sum::<u64>(),
-        1,
-        "the old-handle sign lands unknown-key, never attributed: {:?}",
-        committed.unknown_key_operations
-    );
-    let attributed: u64 = committed
-        .key_operations
-        .iter()
-        .filter(|row| row.category == "sign")
-        .map(|row| row.completed)
-        .sum();
-    assert_eq!(
-        attributed, 2,
-        "healthy plus re-entered signs attribute: {:?}",
+        sign_rows.iter().map(|row| row.completed).sum::<u64>(),
+        3,
+        "healthy, re-entered and re-proven signs attribute: {:?}",
         committed.key_operations
+    );
+    let mut objects: Vec<_> = sign_rows.iter().map(|row| row.object).collect();
+    objects.sort_unstable();
+    objects.dedup();
+    assert_eq!(
+        objects.len(),
+        3,
+        "each sign binds its own row, never another key's: {:?}",
+        committed.key_operations
+    );
+    let frozen = sign_rows
+        .iter()
+        .find(|row| row.object == old_object)
+        .expect("the voided row stands");
+    assert_eq!(
+        frozen.completed, 1,
+        "the voided row freezes with its loss counted"
     );
 }
 

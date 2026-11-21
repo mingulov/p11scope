@@ -481,15 +481,21 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   run follow-up passes while same-cursor progress advances, plus
   one settle pass — plus three-route classification). No allowance
   is sized to fit any provider: any app size converges over several
-  passes. Convergence is monotone per-cursor progress past a
-  per-identity high-water (same generation, pin and layout): the
-  snapshot retains the furthest admitted frontiers across
-  regressions, invalidations and disappearance within a bounded
-  identity set, seeding arrivals without granting, so an
-  alternating return to covered ground stalls; invalidation or
-  replacement never resumes. When no cursor advances past the
-  high-water, the snapshot stops and the live in-progress gap
-  names the work left.
+  passes. One owner decides termination: the driver's
+  `SnapshotResumeLedger`, which observes every decided pass with
+  every carried cursor (completed ones included). It keeps covered
+  ground per (work identity, layout) pair — the furthest
+  lexicographic sweep position, the most decoded tables and
+  completion — never evicted and capped at the cursor bound. A
+  WorkLimit pass is granted only by the single initial grant, the
+  single settle grant, or a strict rise of an admitted pair's
+  covered ground; a completed pair is never passed again. Each
+  pair's ground is bounded by its layout and the pair set is
+  finite, so a recurring layout, a restart behind a frontier, an
+  alternating return to covered ground, a disappearance or a
+  restart after completion stalls instead of re-earning a pass;
+  arrivals seed without granting. When nothing rises, the snapshot
+  stops and the live in-progress gap names the work left.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

@@ -313,12 +313,6 @@ pub(crate) struct CgroupCollection {
     eligible: BTreeSet<u32>,
     timings: StageTimings,
     observer: Option<crate::cgroup_stop_acceptance::Transaction>,
-    /// `(done, total, tables)` over the decode cursors this pass took
-    /// back: `Some` while objects are unfinished, snapshotted when the
-    /// bundle moves (the worker owns it between passes), so the
-    /// transaction's gap keeps naming live progress instead of
-    /// collapsing to a terminal verdict the moment work stops.
-    resume_progress: Option<(usize, usize, usize)>,
 }
 impl CgroupCollection {
     /// Freezes this collection's stop state where its worker returned
@@ -653,30 +647,14 @@ impl CgroupCollection {
                 ScopedCollectionGap::ScanIncomplete,
             ));
         }
-        let outcome = self.outcome();
-        if outcome != ScopedCollectionOutcome::Complete {
-            // A shared-work stop with live resumable progress projects
-            // continuation, not terminal exhaustion: the next pass
-            // resumes the unfinished cursors from their frontiers. Any
-            // other stop keeps its raw transaction gap verbatim.
-            if outcome
-                == ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
-                    crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit,
-                ))
-                && let Some((done, total, tables)) = self.resume_progress
-            {
-                collection.scope_gaps.push(PidGap {
-                    pid: None,
-                    subject: crate::discovery::scan_pass::SCAN_IN_PROGRESS_SUBJECT.into(),
-                    reason: crate::discovery::scan_pass::scan_in_progress_reason(
-                        done, total, tables,
-                    ),
-                    generic: false,
-                });
-            } else {
-                collection.scope_gaps.push(scope_gap(outcome.reason()));
-            }
-        }
+        // No transaction scope gap is pushed here: per-pass
+        // continuation is signaled by the driver warning and the
+        // live terminal gap (both render current progress), while
+        // terminal verdicts are owned solely by the commit path
+        // (which skips resumed progress and records each stall
+        // once). Pushing here as well would persist every pass's
+        // in-progress totals as stale history and record each
+        // stall verdict twice.
         let mut catalog = assemble(
             collection,
             bound,
@@ -787,16 +765,10 @@ impl CgroupCollection {
     /// an unchanged file is reused with no reads and a changed file is
     /// read again. Empty when the collection never scanned.
     pub(crate) fn take_retained_file_facts(&mut self) -> crate::discovery::scan::RetainedFileFacts {
-        let facts = self
-            .collection
+        self.collection
             .as_mut()
             .map(|collection| collection.budget.take_retained_file_facts())
-            .unwrap_or_default();
-        // Snapshot the live progress totals while the worker owns the
-        // bundle: the transaction's gap projection below reads this,
-        // not the moved bundle.
-        self.resume_progress = facts.scan_progress_totals();
-        facts
+            .unwrap_or_default()
     }
     #[cfg(test)]
     pub(crate) fn used_work(&self) -> usize {
@@ -900,14 +872,6 @@ fn empty_bound() -> Bound {
         unresolved: Vec::new(),
         bind_gaps: Vec::new(),
         count_manifests: Vec::new(),
-    }
-}
-fn scope_gap(reason: &str) -> PidGap {
-    PidGap {
-        pid: None,
-        subject: "cgroup scope transaction incomplete".into(),
-        reason: reason.into(),
-        generic: false,
     }
 }
 
@@ -1337,7 +1301,6 @@ pub(crate) fn collect_with(
         eligible,
         timings,
         observer,
-        resume_progress: None,
     }
 }
 

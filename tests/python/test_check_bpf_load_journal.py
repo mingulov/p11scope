@@ -26,6 +26,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/check-bpf-load-journal.sh"
+HELPER = ROOT / "scripts/journal-load-verdict.py"
 KERNEL = "v6.6.157"
 CONTROL_KERNEL = "v5.15.221"
 CONTROL_KERNEL_61 = "v6.1.188"
@@ -263,6 +264,99 @@ p11scope: semantic lane ready; mechanisms and API results are recorded from now 
 key operations: not reported (per-key tracking is off)
 """
 
+#: The finite pre-Multi live-capture refusal in each producer arm of
+#: src/attach/multi_host.rs (MultiHostRefusal's Display and
+#: denied_line), as src/main.rs prints it (`p11scope: {error}`). Every
+#: arm must qualify the refusal control; ScriptContractTests pins the
+#: fixed text of each against the producer source.
+_SCAN_TAIL = ("; run 'p11scope doctor' for host readiness, or use 'p11scope "
+              "inventory --capture scan' or 'p11scope inspect --pid N' for a "
+              "scan without capture.\n")
+LIVE_REFUSAL_FORMS = {
+    "unavailable": "p11scope: inventory --system: live capture unavailable: loading p11scope's "
+                   "BPF programs is not supported on this host" + _SCAN_TAIL,
+    "unavailable-errno": "p11scope: inventory --system: live capture unavailable: attaching "
+                         "p11scope's probes is not supported on this host "
+                         "(Invalid argument)" + _SCAN_TAIL,
+    "did-not-start": "p11scope: inventory --system: live capture did not start: preparing "
+                     "p11scope's self-probe failed (Unknown error 524)"
+                     + _SCAN_TAIL,
+    "refused-userns": "p11scope: inventory --system: live capture refused: capture is unavailable "
+                      "here because BPF and uprobes need capabilities in the "
+                      "host user namespace "
+                      "(user-namespace-without-host-capabilities); run "
+                      "p11scope on the host or with the five-capability "
+                      "rootful command (see deploy/README.md); or use "
+                      "'p11scope inspect --pid N' for a scan without "
+                      "capture.\n",
+    "refused-held": "p11scope: inventory --system: live capture refused: the kernel refused to "
+                    "load p11scope's BPF programs (Operation not permitted) "
+                    "with CAP_BPF and CAP_PERFMON held - a kernel lockdown, an "
+                    "LSM policy, or a container's seccomp profile is refusing "
+                    "BPF here. Run 'p11scope doctor' for host readiness, or "
+                    "use 'p11scope inspect --pid N' for a scan without "
+                    "capture.\n",
+    "refused-sysadmin": "p11scope: inventory --system: live capture refused: the kernel refused "
+                        "to attach p11scope's probes with CAP_SYS_ADMIN held "
+                        "- a kernel lockdown, an LSM policy, or a container's "
+                        "seccomp profile is refusing BPF here. Run 'p11scope "
+                        "doctor' for host readiness, or use 'p11scope inspect "
+                        "--pid N' for a scan without capture.\n",
+    "needs-both": "p11scope: inventory --system: live capture needs CAP_BPF (load BPF programs "
+                  "and attach probes); needs CAP_PERFMON (load BPF programs "
+                  "alongside CAP_BPF): the kernel refused to load p11scope's "
+                  "BPF programs (Operation not permitted). Grant the minimal "
+                  "set: sudo setcap 'cap_bpf,cap_checkpoint_restore,"
+                  "cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' "
+                  "/usr/local/bin/p11scope, or use 'p11scope inspect --pid N' "
+                  "for a scan without capture.\n",
+    "needs-perfmon-quoted": "p11scope: inventory --system: live capture needs CAP_PERFMON (load "
+                            "BPF programs alongside CAP_BPF): the kernel "
+                            "refused to load p11scope's BPF programs. Grant "
+                            "the minimal set: sudo setcap 'cap_bpf,"
+                            "cap_checkpoint_restore,cap_dac_read_search,"
+                            "cap_perfmon,cap_sys_ptrace=ep' '/opt/my "
+                            "tools/p11scope', or use 'p11scope inspect --pid "
+                            "N' for a scan without capture.\n",
+}
+
+#: Malformed refusal twins: each keeps a real lead and the final words
+#: but changes fixed producer text, repeats the record or cuts it.
+LIVE_REFUSAL_TWINS = {
+    "invented-cause": "p11scope: inventory --system: live capture unavailable: unrelated "
+                      "diagnostic for a scan without capture.\n",
+    "changed-doing": LIVE_REFUSAL_FORMS["unavailable"].replace(
+        "loading p11scope's BPF programs", "loading something else"),
+    "changed-retry": LIVE_REFUSAL_FORMS["did-not-start"].replace(
+        "'p11scope inventory --capture scan'", "'p11scope fix-it'"),
+    "changed-cause": LIVE_REFUSAL_FORMS["refused-held"].replace(
+        "a kernel lockdown, an LSM policy", "an unknown cause"),
+    "changed-setcap": LIVE_REFUSAL_FORMS["needs-both"].replace(
+        "cap_sys_ptrace=ep", "cap_sys_admin=ep"),
+    "invented-capability": LIVE_REFUSAL_FORMS["needs-both"].replace(
+        "needs CAP_PERFMON (load BPF programs alongside CAP_BPF)",
+        "needs CAP_SYS_MODULE (load modules)"),
+    "duplicated": LIVE_REFUSAL_FORMS["unavailable"] * 2,
+    "truncated-retry": LIVE_REFUSAL_FORMS["unavailable"].split("; run")[0] + "\n",
+    "trailing-text": LIVE_REFUSAL_FORMS["unavailable"].rstrip("\n") + " extra\n",
+    "bel-byte": LIVE_REFUSAL_FORMS["unavailable"].replace(
+        "on this host", "on this\x07host"),
+    "second-lead": LIVE_REFUSAL_FORMS["unavailable"]
+                   + "p11scope: inventory --system: live capture did not start\n",
+    "second-bare-lead": LIVE_REFUSAL_FORMS["unavailable"]
+                        + "p11scope: live capture did not start\n",
+    "missing-context": LIVE_REFUSAL_FORMS["unavailable"].replace(
+        "p11scope: inventory --system: ", "p11scope: "),
+    "other-context": LIVE_REFUSAL_FORMS["unavailable"].replace(
+        "inventory --system: ", "inventory --pid 1: "),
+}
+
+#: A row the probe never writes: a load record with only the root and
+#: loaded fields. The report's typed check rejects it, so it can never
+#: supply evidence for any gate.
+INCOMPLETE_LOAD_ROW = {"record": "load", "root": "p11_entry_journal",
+                       "loaded": False}
+
 TOOL_SOURCE = r'''
 import json,os,pathlib,subprocess,sys,tempfile
 name=pathlib.Path(sys.argv[0]).name; args=sys.argv[1:]
@@ -288,11 +382,27 @@ if name=='vng':
             elif mangle=='workload-ready-bel' and line==b'guest-stage=workload-ready': line=b'guest-stage=workload-ready\x07'
             elif mangle=='release-suffix' and line.startswith(b'guest-release='): line=line+b'=unexpected'
             elif mangle=='journal-rc-suffix' and line.startswith(b'journal-rc='): line=line+b'=unexpected'
+            elif mangle=='journal-rc-leading-zero' and line.startswith(b'journal-rc='): line=b'journal-rc=0'+line[len(b'journal-rc='):]
+            elif mangle=='observer-rc-124' and line.startswith(b'guest-stage=observer-rc='): line=b'guest-stage=observer-rc=124'
+            elif mangle=='observer-rc-drop' and line.startswith(b'guest-stage=observer-rc='): continue
+            elif mangle=='observer-rc-bare' and line.startswith(b'guest-stage=observer-rc='): line=b'guest-stage=observer-rc'
             fixed.append(line)
+        if mangle=='stages-reordered':
+            token=fixed.index(b'guest-stage=token-ok')
+            workload=fixed.index(b'guest-stage=workload-ready')
+            fixed[token],fixed[workload]=fixed[workload],fixed[token]
         if mangle=='journal-rc-append-corrupt':
             extra=b'journal-rc=0=unexpected'
             if fixed and fixed[-1]==b'': fixed.insert(len(fixed)-1,extra)
             else: fixed.append(extra)
+        elif mangle=='journal-rc-append-bare':
+            extra=b'journal-rc'
+            if fixed and fixed[-1]==b'': fixed.insert(len(fixed)-1,extra)
+            else: fixed.append(extra)
+        elif mangle=='observer-rc-append-duplicate':
+            extra=b'guest-stage=observer-rc=0'
+            index=next(i for i,l in enumerate(fixed) if l.startswith(b'guest-stage=observer-rc='))
+            fixed.insert(index+1,extra)
         elif mangle=='token-failed-append-malformed':
             extra=b'guest-stage=token-failedEXTRA'
             if fixed and fixed[-1]==b'': fixed.insert(len(fixed)-1,extra)
@@ -344,6 +454,7 @@ if name=='observer':
         elif corrupt=='printable': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}trailing\n')
         elif corrupt=='ff': os.write(9,b'\xff\n')
         elif corrupt=='nonobject': os.write(9,b'[]\n')
+        elif corrupt=='deep': os.write(9,b'['*100000+b'0'+b']'*100000+b'\n')
     texts=json.loads((root/'texts.json').read_text())
     sys.stdout.write(texts[mode]['text'])
     sys.exit(texts[mode]['rc'])
@@ -424,6 +535,10 @@ class JournalGateTests(unittest.TestCase):
             "refusal-515-fragment": [],
             "refused-noseal-fragment": [row for row in rows if row["btf_id"] == 48],
             "refused-noseal-loaded": rows,
+            "refusal-515-incomplete": [INCOMPLETE_LOAD_ROW],
+            "refused-noseal-incomplete": [INCOMPLETE_LOAD_ROW],
+            **{f"refusal-form-{name}": [] for name in LIVE_REFUSAL_FORMS},
+            **{f"refusal-twin-{name}": [] for name in LIVE_REFUSAL_TWINS},
         }))
         (self.work / "texts.json").write_text(json.dumps({
             "linked": {"rc": 0, "text": LINKED_TEXT},
@@ -542,17 +657,17 @@ class JournalGateTests(unittest.TestCase):
             "timeout": {"rc": 124, "text": ""},
             "crash": {"rc": 1, "text": LINKED_TEXT + "thread 'main' panicked at src/x.rs:1\n"},
             "refusal-515": {"rc": 1, "text":
-                "p11scope: live capture unavailable: loading p11scope's BPF "
+                "p11scope: inventory --system: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness, or use 'p11scope inventory --capture scan' "
                 "or 'p11scope inspect --pid N' for a scan without capture.\n"},
             "refusal-515-loaded": {"rc": 1, "text":
-                "p11scope: live capture unavailable: loading p11scope's BPF "
+                "p11scope: inventory --system: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness, or use 'p11scope inventory --capture scan' "
                 "or 'p11scope inspect --pid N' for a scan without capture.\n"},
             "refusal-515-timeout": {"rc": 124, "text":
-                "p11scope: live capture unavailable: loading p11scope's BPF "
+                "p11scope: inventory --system: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness, or use 'p11scope inventory --capture scan' "
                 "or 'p11scope inspect --pid N' for a scan without capture.\n"},
@@ -562,6 +677,16 @@ class JournalGateTests(unittest.TestCase):
                 "unrelated diagnostic: "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object\n"},
+            "refusal-515-incomplete": {"rc": 1, "text": LIVE_REFUSAL_FORMS["unavailable"]},
+            "refused-noseal-incomplete": {"rc": 0, "text":
+                "p11scope: key operations unavailable: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"},
+            **{f"refusal-form-{name}": {"rc": 1, "text": text}
+               for name, text in LIVE_REFUSAL_FORMS.items()},
+            **{f"refusal-twin-{name}": {"rc": 1, "text": text}
+               for name, text in LIVE_REFUSAL_TWINS.items()},
         }))
         tool = self.bin / "tool"
         tool.write_text("#!" + sys.executable + "\n" + TOOL_SOURCE)
@@ -1619,6 +1744,136 @@ class JournalGateTests(unittest.TestCase):
         self.assertIn("exact journal-pair-unavailable-in-build refusal missing",
                       row["detail"])
 
+    # One strict record grammar per input (scripts/journal-load-verdict.py):
+    # the refusal controls read probe rows through the verifier report's
+    # typed parser, a row-local decode failure keeps independently
+    # validated loads, guest exits must agree, and the pre-Multi refusal
+    # must be one exact producer form.
+
+    def test_refusal_control_with_incomplete_load_row_fails(self):
+        # A load record with only root and loaded fields is not a probe
+        # row the report accepts, so it cannot prove "no journal loads".
+        result, out = self.run_gate(CONTROL_KERNEL, mode="refusal-515-incomplete")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+
+    def test_omitted_build_with_incomplete_load_row_fails(self):
+        result, out = self.run_gate(KERNEL, mode="refused-noseal-incomplete",
+                                    expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+
+    def test_refusal_control_with_undecodable_suffix_retains_loads(self):
+        # A record nested past the JSON decoder's recursion limit after
+        # the loaded rows: the stream is corrupt, and the validated
+        # journal loads before it still refuse the control.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515-loaded",
+            extra={"FAKE_PROBE_CORRUPT": "deep"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertIn("journal pair loaded", row["detail"])
+
+    def test_omitted_build_with_undecodable_suffix_retains_loads(self):
+        result, out = self.run_gate(
+            KERNEL, mode="refused-noseal-loaded",
+            extra={"FAKE_PROBE_CORRUPT": "deep"}, expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertIn("although the build omits the object", row["detail"])
+
+    def test_load_with_undecodable_suffix_keeps_the_loaded_pair(self):
+        # The load leg fails on the corrupt stream, but never claims the
+        # validated pair rows are missing.
+        result, out = self.run_gate(KERNEL, extra={"FAKE_PROBE_CORRUPT": "deep"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertNotIn("journal pair missing", row["detail"])
+        self.assertNotIn("journal pair incomplete", row["detail"])
+
+    def assert_guest_refused(self, result, out, reason):
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn(reason, row["detail"])
+
+    def test_observer_exit_disagreeing_with_the_leg_is_nonqualifying(self):
+        # The observer stage reports a timeout while the leg's exit is
+        # the healthy status of each path: the guest records disagree.
+        for name, kernel, mode, expect in (
+                ("linked", KERNEL, "linked", None),
+                ("control", CONTROL_KERNEL, "refusal-515", None),
+                ("omitted", KERNEL, "refused-noseal", "0")):
+            with self.subTest(name):
+                self.setUp()
+                result, out = self.run_gate(
+                    kernel, mode=mode, expect_journal=expect,
+                    extra={"FAKE_VNG_MANGLE": "observer-rc-124"})
+                self.assert_guest_refused(result, out, "disagrees with guest leg exit")
+                self.observer_argv()
+
+    def test_bare_duplicate_journal_rc_is_nonqualifying(self):
+        for name, kernel, mode, expect in (
+                ("linked", KERNEL, "linked", None),
+                ("control", CONTROL_KERNEL, "refusal-515", None),
+                ("omitted", KERNEL, "refused-noseal", "0")):
+            with self.subTest(name):
+                self.setUp()
+                result, out = self.run_gate(
+                    kernel, mode=mode, expect_journal=expect,
+                    extra={"FAKE_VNG_MANGLE": "journal-rc-append-bare"})
+                self.assert_guest_refused(result, out, "guest exit")
+
+    def test_malformed_guest_status_records_are_nonqualifying(self):
+        for mangle, reason in (
+                ("observer-rc-drop", "guest observer exit record missing"),
+                ("observer-rc-bare", "guest stage record corrupt"),
+                ("observer-rc-append-duplicate", "guest stage records contradictory"),
+                ("stages-reordered", "out of order"),
+                ("journal-rc-leading-zero", "guest exit")):
+            with self.subTest(mangle):
+                self.setUp()
+                result, out = self.run_gate(
+                    KERNEL, extra={"FAKE_VNG_MANGLE": mangle})
+                self.assert_guest_refused(result, out, reason)
+
+    def test_every_live_capture_refusal_form_qualifies_the_control(self):
+        for name in LIVE_REFUSAL_FORMS:
+            with self.subTest(name):
+                self.setUp()
+                result, out = self.run_gate(CONTROL_KERNEL,
+                                            mode=f"refusal-form-{name}")
+                self.assertEqual(result.returncode, 0, result.stdout)
+                (row,) = self.read_rows(out)
+                self.assertTrue(row["pass"])
+                self.assertEqual(row["qualification"], "qualified")
+                self.assertIn("refused live-capture", row["detail"])
+
+    def test_malformed_live_capture_refusals_fail_the_control(self):
+        for name in LIVE_REFUSAL_TWINS:
+            with self.subTest(name):
+                self.setUp()
+                result, out = self.run_gate(CONTROL_KERNEL,
+                                            mode=f"refusal-twin-{name}")
+                self.assertEqual(result.returncode, 1, result.stdout)
+                (row,) = self.read_rows(out)
+                self.assertFalse(row["pass"])
+                self.assertEqual(row["qualification"], "failed")
+                self.assertIn("finite live-capture refusal missing", row["detail"])
+
     def test_observer_timeout_fails(self):
         result, out = self.run_gate(KERNEL, mode="timeout")
         self.assertEqual(result.returncode, 1, result.stdout)
@@ -1825,7 +2080,12 @@ class ScriptContractTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(SCRIPT.is_file(),
                         "scripts/check-bpf-load-journal.sh is missing")
-        self.text = SCRIPT.read_text(encoding="ascii")
+        # The gate's record grammar lives in its typed verdict helper,
+        # which the script calls for every verdict: pin both.
+        self.assertTrue(HELPER.is_file(),
+                        "scripts/journal-load-verdict.py is missing")
+        self.script = SCRIPT.read_text(encoding="ascii")
+        self.text = self.script + HELPER.read_text(encoding="ascii")
 
     def test_scores_journal_object_by_btf_group(self):
         self.assertIn("--object journal", self.text)
@@ -1839,7 +2099,16 @@ class ScriptContractTests(unittest.TestCase):
 
     def test_names_the_finite_refusal_reasons(self):
         self.assertIn("journal-pair-unavailable-in-build", self.text)
-        self.assertIn("p11scope: live capture (needs ", self.text)
+        # Every producer lead of the pre-Multi refusal keeps its own
+        # form (src/attach/multi_host.rs), each qualified by a healthy
+        # fixture in test_every_live_capture_refusal_form_qualifies_the_control.
+        for lead in ('LIVE_REFUSAL_CONTEXT = "p11scope: inventory --system: "',
+                     "{_CONTEXT}live capture unavailable: ",
+                     "{_CONTEXT}live capture did not start: ",
+                     "{_CONTEXT}live capture refused: ",
+                     "{_CONTEXT}live capture {_NEEDS}: ",
+                     "needs CAP_BPF", "needs CAP_PERFMON"):
+            self.assertIn(lead, self.text)
         self.assertIn("for a scan without capture", self.text)
         self.assertIn("p11scope: key operations unavailable", self.text)
 
@@ -1869,6 +2138,16 @@ class ScriptContractTests(unittest.TestCase):
         for package in ("gcc", "softhsm2", "libsofthsm2", "python3",
                         "virtme-ng"):
             self.assertIn(package, self.text)
+
+    def test_every_verdict_goes_through_the_helper(self):
+        # One grammar: the script itself parses no probe row and no
+        # observer proof line; the helper owns all of them.
+        for call in ('"$VERDICT" guest', '"$VERDICT" verdict',
+                     '"$VERDICT" budgets', '"$VERDICT" row'):
+            self.assertIn(call, self.script)
+        for parsed in ("json.loads", "semantic lane ready",
+                       "joint decoder", "journal-rc=[0-9]"):
+            self.assertNotIn(parsed, self.script)
 
     def test_reuses_the_shared_guest_release_match(self):
         # The rc-aware match lives in exactly one place: the journal

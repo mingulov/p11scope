@@ -48584,6 +48584,59 @@ fn candidate_selection_prefers_rare_providers_over_pid_order() {
     assert_eq!(select_deep_scan_candidates(&sweep, 3), vec![7, 8, 9001]);
 }
 
+/// Rarity contract for linker-startup transients: a sleeper whose maps still
+/// carry `/etc/ld.so.cache` (mapped by `ld` during startup, unmapped once
+/// settled; the path contains ".so" so it is a shape member) forms a
+/// singleton group whose unique file sorts before the settled group.
+/// Selection is rarity order, never a lowest-pid prefix: a highest-pid
+/// transient selects `[highest, lowest]` and a second-pid transient selects
+/// `[second, lowest]`. The reconcile-cursor prefix assertion holds only for
+/// one shape (identical settled sleepers); two shapes follow this order.
+#[test]
+fn selection_prefers_ld_so_cache_transient_before_settled_group() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 0, minor: 35 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    fn settled() -> Vec<MapEntry> {
+        vec![
+            map_entry("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", 1001),
+            map_entry("/usr/lib/x86_64-linux-gnu/libc.so.6", 1002),
+            map_entry("/usr/lib/x86_64-linux-gnu/libm.so.6", 1003),
+        ]
+    }
+    fn transient() -> Vec<MapEntry> {
+        let mut entries = settled();
+        entries.push(map_entry("/etc/ld.so.cache", 2001));
+        entries
+    }
+    // Highest-pid transient: `[highest, lowest]`, the CI failure shape.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (100, settled()),
+        (101, settled()),
+        (102, settled()),
+        (103, settled()),
+        (104, transient()),
+    ];
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![104, 100]);
+    // Second-pid transient: `[second, lowest]`.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (100, settled()),
+        (101, transient()),
+        (102, settled()),
+        (103, settled()),
+        (104, settled()),
+    ];
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![101, 100]);
+}
+
 /// F2: the published over-cap diagnostic agrees with the actual selected
 /// set — real counts, the cap, and the rarity method, never a "first N"
 /// prefix claim and never a pid. Refresh counts new candidates only.
@@ -54542,6 +54595,48 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
         assert!(settled, "sleep child {pid} never settled");
     }
     guards
+}
+
+/// `e06_spawn_sleeps` readiness: every child has finished dynamic-linker
+/// startup — identical provider shapes (the same `.so` key set, no
+/// `/etc/ld.so.cache` transient) — so a capped selection sees one shape and
+/// admits the lowest pid. A child settled mid-startup (wchan "0" with a
+/// partial maps snapshot) forms a singleton that rarity orders before the
+/// settled group, breaking lowest-pid-prefix assertions downstream.
+#[test]
+fn e06_spawned_sleeps_share_one_settled_provider_shape() {
+    let mut sleeps = e06_spawn_sleeps(5);
+    let mut shapes: Vec<BTreeSet<ObjectKey>> = Vec::new();
+    for guard in &sleeps {
+        let pid = guard.pid();
+        let bytes = std::fs::read(format!("/proc/{pid}/maps")).expect("readable maps");
+        let maps = parse_maps(&bytes).expect("parseable maps");
+        for mapping in &maps {
+            if let Some(path) = &mapping.raw_path
+                && path
+                    .windows(b"ld.so.cache".len())
+                    .any(|window| window == b"ld.so.cache")
+            {
+                panic!("sleep child {pid} still maps /etc/ld.so.cache: unsettled startup");
+            }
+        }
+        let key: BTreeSet<ObjectKey> = maps
+            .iter()
+            .filter(|entry| crate::discovery::scan::is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        assert!(!key.is_empty(), "sleep child {pid} maps no provider shape");
+        shapes.push(key);
+    }
+    for (index, shape) in shapes.iter().enumerate().skip(1) {
+        assert_eq!(
+            *shape, shapes[0],
+            "sleeper {index} shape differs from sleeper 0: startup race"
+        );
+    }
+    for child in &mut sleeps {
+        child.reap().unwrap();
+    }
 }
 
 fn e06_write_listing(scope_dir: &Path, pids: &[u32]) {

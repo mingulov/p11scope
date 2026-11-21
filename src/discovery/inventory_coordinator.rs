@@ -175,15 +175,13 @@ pub(crate) struct CgroupCompletion {
     /// `None` once converged (or when no scan ever ran).
     pub(crate) progress: Option<(usize, usize, usize)>,
     /// Committed per-cursor progress beside [`progress`](Self::progress):
-    /// the snapshot resume rule advances only on same-key, same-layout
-    /// progress, so churn never resumes while intra-object sweep
-    /// advance counts as progress. `None` exactly when `progress` is
-    /// `None`.
-    pub(crate) progress_cursors: Option<
-        BTreeMap<
-            crate::discovery::scan_pass::DecodeCursorKey,
-            crate::discovery::scan_pass::CommittedCursorProgress,
-        >,
+    /// every carried cursor, completed ones included, for the snapshot
+    /// resume ledger, which advances only past the covered ground of a
+    /// same-identity, same-layout pair, so churn never resumes while
+    /// intra-object sweep advance counts as progress.
+    pub(crate) progress_cursors: BTreeMap<
+        crate::discovery::scan_pass::DecodeCursorKey,
+        crate::discovery::scan_pass::CommittedCursorProgress,
     >,
 }
 
@@ -5325,7 +5323,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             admitted: 0,
             scan_callers: 0,
             progress: None,
-            progress_cursors: None,
+            progress_cursors: BTreeMap::new(),
         });
     }
 
@@ -38904,8 +38902,8 @@ int main(void) {
             "the stash serves the live gap while the worker owns the bundle"
         );
         let mut collection = collect();
-        // The worker observed the sole object unmap and returns an empty
-        // bundle: drain what the live scene scanned to that shape.
+        // Pose the empty-return shape a sole object's unmap produces:
+        // drain what the live scene scanned (no unmap is performed).
         let _drained = collection.take_retained_file_facts();
         coordinator
             .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())

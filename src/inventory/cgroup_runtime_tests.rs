@@ -44,10 +44,7 @@ impl<'a> ObservedDriver<'a> {
                     control,
                     deadline: None,
                     last_outcome: None,
-                    last_resume: CgroupResumePosition::default(),
-                    prev_resume: CgroupResumePosition::default(),
-                    resume_high_water: std::collections::BTreeMap::new(),
-                    settle_granted: false,
+                    resume: SnapshotResumeLedger::default(),
                 }),
                 max_scan_pids: None,
                 guard: UnavailableImageGuard,
@@ -1223,44 +1220,47 @@ fn resume_progress(
     }
 }
 
-/// Pose one resume position from cursor entries, mirroring production:
-/// `None` exactly when no cursor is unfinished, otherwise every cursor.
+/// One posed resume position, mirroring production: every carried
+/// cursor, completed ones included.
+type PosedResumePosition = std::collections::BTreeMap<
+    crate::discovery::scan_pass::DecodeCursorKey,
+    crate::discovery::scan_pass::CommittedCursorProgress,
+>;
+
+/// Pose one resume position from cursor entries.
 fn resume_position(
     entries: Vec<(
         crate::discovery::scan_pass::DecodeCursorKey,
         crate::discovery::scan_pass::CommittedCursorProgress,
     )>,
-) -> CgroupResumePosition {
-    let unfinished = entries.iter().any(|(_, progress)| !progress.complete);
-    CgroupResumePosition {
-        cursors: unfinished.then(|| entries.into_iter().collect()),
-    }
+) -> PosedResumePosition {
+    entries.into_iter().collect()
 }
 
-/// Pose both resume slots on a driver: the previous position doubles
-/// as the whole decided history, so single-step poses read exactly
-/// like the old adjacent rule while the decision runs the real
-/// high-water comparison.
+/// Pose one decision on a driver: a fresh ledger whose whole decided
+/// history is `prev`, then the real observation of `last`, so
+/// single-step poses read like an adjacent rule while the decision
+/// runs the real ledger. The spent settle grant carries over.
 fn pose_resume(
     driver: &mut ClassicDriver<'_>,
-    last: CgroupResumePosition,
-    prev: CgroupResumePosition,
+    last: PosedResumePosition,
+    prev: PosedResumePosition,
 ) {
     let cgroup = driver.cgroup.as_mut().unwrap();
-    cgroup.resume_high_water = prev.cursors.clone().unwrap_or_default();
-    cgroup.last_resume = last;
-    cgroup.prev_resume = prev;
+    let settle_granted = cgroup.resume.settle_granted;
+    cgroup.resume = SnapshotResumeLedger {
+        settle_granted,
+        ..SnapshotResumeLedger::default()
+    };
+    cgroup.resume.observe(&prev);
+    cgroup.resume.observe(&last);
 }
 
-/// Install one pass position, merging the superseded one into the
-/// high-water exactly like `finish_pass`, then decide: the multi-pass
-/// twins drive sequences through this so every decision reads the
-/// real retained history.
-fn pass_resume(driver: &mut ClassicDriver<'_>, last: CgroupResumePosition) -> bool {
-    let cgroup = driver.cgroup.as_mut().unwrap();
-    let previous = std::mem::replace(&mut cgroup.last_resume, last);
-    cgroup.merge_resume_high_water(&previous);
-    cgroup.prev_resume = previous;
+/// Observe one pass position exactly like `finish_pass`, then decide:
+/// the multi-pass twins drive sequences through this so every
+/// decision reads the real retained history.
+fn pass_resume(driver: &mut ClassicDriver<'_>, last: PosedResumePosition) -> bool {
+    driver.cgroup.as_mut().unwrap().resume.observe(&last);
     driver.snapshot_resume_pending()
 }
 
@@ -1465,10 +1465,10 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
     assert!(!driver.inner.snapshot_resume_pending());
     // A scan that fits pass zero with no bind budget left still
     // settles once (no previous position to compare against).
-    driver.inner.cgroup.as_mut().unwrap().settle_granted = false;
+    driver.inner.cgroup.as_mut().unwrap().resume.settle_granted = false;
     let cgroup = driver.inner.cgroup.as_ref().unwrap();
-    assert!(cgroup.settle_pending(1));
-    assert!(!cgroup.settle_pending(2));
+    assert!(cgroup.resume.settle_pending(1));
+    assert!(!cgroup.resume.settle_pending(2));
     // Only a work stop resumes: a complete transaction and any
     // other incomplete outcome keep the single snapshot, even
     // with unfinished progress posed.

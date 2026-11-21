@@ -1205,29 +1205,24 @@ impl RetainedFileFacts {
     }
 
     /// Committed per-cursor progress over the whole carried bundle, for
-    /// the snapshot resume decision: every cursor's work identity with
-    /// its layout-bound frontiers. `None` exactly when
-    /// [`scan_progress_totals`](Self::scan_progress_totals) is `None`
-    /// (no unfinished cursor). The resume rule compares same-key,
-    /// same-layout progress only, so churn (new, removed or relaid-out
-    /// cursors) never reads as advance, while intra-object sweep
-    /// advance that completes no object and decodes no new table still
-    /// counts as progress instead of stalling the snapshot.
+    /// the snapshot resume ledger: every carried cursor's work identity
+    /// with its layout-bound frontiers, completed cursors included (empty
+    /// only when no cursor is carried). Whether any cursor is unfinished
+    /// is read from the same entries, so completed progress stays in the
+    /// decided history across settlement instead of vanishing behind a
+    /// `None`.
     pub(crate) fn scan_cursor_progress(
         &self,
-    ) -> Option<BTreeMap<DecodeCursorKey, super::scan_pass::CommittedCursorProgress>> {
-        self.scan_progress_totals()?;
-        Some(
-            self.decode_cursors
-                .iter()
-                .map(|(key, cursor)| {
-                    (
-                        key.clone(),
-                        super::scan_pass::CommittedCursorProgress::of(cursor),
-                    )
-                })
-                .collect(),
-        )
+    ) -> BTreeMap<DecodeCursorKey, super::scan_pass::CommittedCursorProgress> {
+        self.decode_cursors
+            .iter()
+            .map(|(key, cursor)| {
+                (
+                    key.clone(),
+                    super::scan_pass::CommittedCursorProgress::of(cursor),
+                )
+            })
+            .collect()
     }
 
     /// `(done, total, tables)` over the whole carried bundle: completed

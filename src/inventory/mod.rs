@@ -2459,21 +2459,132 @@ impl InventorySelection {
     }
 }
 
-/// One pass's resume position: committed per-cursor progress over the
-/// carried bundle — every cursor's work identity (process generation,
-/// file pin, executable image) with its layout-bound frontiers.
-/// `None` exactly when no cursor is unfinished. The snapshot rule
-/// advances only past the per-identity high-water over every decided
-/// pass, so churn never reads as advance and covered ground never
-/// re-admits.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct CgroupResumePosition {
-    cursors: Option<
-        BTreeMap<
+/// Covered ground of one admitted (work identity, layout) pair: the
+/// furthest lexicographic sweep position, the most decoded tables and
+/// whether any observed pass completed it. Each component only rises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoveredFrontier {
+    sweep: (usize, u64, usize, u64),
+    tables_decoded: usize,
+    complete: bool,
+}
+
+impl CoveredFrontier {
+    fn of(progress: &crate::discovery::scan_pass::CommittedCursorProgress) -> Self {
+        Self {
+            sweep: progress.sweep_position(),
+            tables_decoded: progress.tables_decoded,
+            complete: progress.complete,
+        }
+    }
+
+    /// Whether `progress` reaches past this covered ground. A completed
+    /// sweep is never passed: a restart under the same identity and
+    /// layout re-scans ground an earlier pass already finished.
+    fn passed_by(&self, progress: &crate::discovery::scan_pass::CommittedCursorProgress) -> bool {
+        !self.complete
+            && (progress.sweep_position() > self.sweep
+                || progress.tables_decoded > self.tables_decoded
+                || progress.complete)
+    }
+
+    fn raise(&mut self, progress: &crate::discovery::scan_pass::CommittedCursorProgress) {
+        self.sweep = self.sweep.max(progress.sweep_position());
+        self.tables_decoded = self.tables_decoded.max(progress.tables_decoded);
+        self.complete |= progress.complete;
+    }
+}
+
+/// The snapshot's single resume-termination owner. `finish_pass`
+/// observes every decided pass once, with every carried cursor —
+/// completed ones included — so the ledger holds the whole decided
+/// history; the resume and settle decisions only read it.
+///
+/// Termination: a WorkLimit pass is granted only by (a) the one
+/// initial grant, spent by the first observation with unfinished work;
+/// (b) the one settle grant; or (c) an observation that strictly
+/// raises the covered ground of an already admitted (identity, layout)
+/// pair. Pairs are keyed by layout as well as identity, so a layout
+/// change never overwrites another layout's covered ground, and they
+/// are never evicted: a revisited layout, a restart behind a frontier,
+/// a temporary disappearance or a restart after completion compares
+/// against everything covered before. Admission is capped at the
+/// carried cursor bound and each pair's covered ground is bounded by
+/// its layout, so (c) holds only finitely often. Arrival (a new pair)
+/// seeds without granting. Work left by a stall stays the named
+/// in-progress gap.
+#[derive(Debug, Default)]
+struct SnapshotResumeLedger {
+    covered: BTreeMap<(crate::discovery::scan_pass::DecodeCursorKey, u64), CoveredFrontier>,
+    /// The last observed pass left unfinished cursors.
+    unfinished: bool,
+    /// The observed pass before it left unfinished cursors.
+    prev_unfinished: bool,
+    /// The last observation earns a resume: it raised an admitted
+    /// pair's covered ground or spent the initial grant.
+    advanced: bool,
+    /// The initial unfinished grant was spent.
+    initial_granted: bool,
+    /// The one settle pass was granted: once spent, later convergences
+    /// end the snapshot instead of settling again.
+    settle_granted: bool,
+}
+
+impl SnapshotResumeLedger {
+    /// Observe one decided pass — every carried cursor's committed
+    /// progress: decide whether it advanced, then fold it into the
+    /// covered ground.
+    fn observe(
+        &mut self,
+        cursors: &BTreeMap<
             crate::discovery::scan_pass::DecodeCursorKey,
             crate::discovery::scan_pass::CommittedCursorProgress,
         >,
-    >,
+    ) {
+        let unfinished = cursors.values().any(|progress| !progress.complete);
+        let mut raised = false;
+        for (key, progress) in cursors {
+            let pair = (key.clone(), progress.layout);
+            match self.covered.get_mut(&pair) {
+                Some(covered) => {
+                    raised |= covered.passed_by(progress);
+                    covered.raise(progress);
+                }
+                None => {
+                    if self.covered.len() < crate::discovery::scan_pass::MAX_DECODE_CURSORS {
+                        self.covered.insert(pair, CoveredFrontier::of(progress));
+                    }
+                }
+            }
+        }
+        let initial = unfinished && !self.initial_granted;
+        self.initial_granted |= unfinished;
+        self.prev_unfinished = self.unfinished;
+        self.unfinished = unfinished;
+        self.advanced = unfinished && (raised || initial);
+    }
+
+    /// Whether the last pass left unfinished decode progress that earns
+    /// another pass: past the covered ground of an admitted (identity,
+    /// layout) pair, or the first unfinished pass. When nothing moves
+    /// past covered ground the fresh allowance moved no committed work
+    /// forward, so the snapshot stops and reports the live in-progress
+    /// gap honestly instead of spinning.
+    fn advancing(&self) -> bool {
+        self.advanced
+    }
+
+    /// Whether the snapshot owes its one settle pass: the last pass left
+    /// no unfinished decode progress, but the transaction still
+    /// stopped on the work allowance — a scan that converged with
+    /// no budget left to bind and publish. The settle pass re-emits
+    /// the completed decode at ~zero work with a fresh allowance,
+    /// so the bind runs. The grant is explicit and single-use: once
+    /// spent, later convergences end the snapshot honestly instead of
+    /// spinning on a bind that never fits.
+    fn settle_pending(&self, passes: u64) -> bool {
+        !self.unfinished && !self.settle_granted && (self.prev_unfinished || passes == 1)
+    }
 }
 
 struct CgroupDriverState {
@@ -2482,26 +2593,12 @@ struct CgroupDriverState {
     control: crate::scope::inventory_cgroup::CollectionControl,
     deadline: Option<Instant>,
     observer: Option<crate::cgroup_stop_acceptance::Observer>,
-    /// The last completion's outcome and resume position, plus the
-    /// previous pass's position: the snapshot resume decision reads
-    /// these (unfinished + advancing means another pass).
+    /// The last completion's outcome: the snapshot resume decision
+    /// reads it with the resume ledger (a work stop plus an advancing
+    /// ledger means another pass).
     last_outcome: Option<crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome>,
-    last_resume: CgroupResumePosition,
-    prev_resume: CgroupResumePosition,
-    /// Per-identity resume high-water over every decided pass: the
-    /// furthest committed progress admitted for each work identity
-    /// (cursor key), retained across regressions, invalidations and
-    /// temporary disappearance. Only ground past it resumes, so two
-    /// cursors alternating over covered frontiers stall instead of
-    /// cycling. Bounded like the carried cursor map; identities past
-    /// the bound stay churn.
-    resume_high_water: BTreeMap<
-        crate::discovery::scan_pass::DecodeCursorKey,
-        crate::discovery::scan_pass::CommittedCursorProgress,
-    >,
-    /// Whether the snapshot's one settle pass was granted: once spent,
-    /// later convergences end the snapshot instead of settling again.
-    settle_granted: bool,
+    /// The single owner of the snapshot's resume termination.
+    resume: SnapshotResumeLedger,
 }
 
 impl CgroupDriverState {
@@ -2521,95 +2618,8 @@ impl CgroupDriverState {
             deadline,
             observer: crate::cgroup_stop_acceptance::Observer::from_environment()?,
             last_outcome: None,
-            last_resume: CgroupResumePosition::default(),
-            prev_resume: CgroupResumePosition::default(),
-            resume_high_water: BTreeMap::new(),
-            settle_granted: false,
+            resume: SnapshotResumeLedger::default(),
         })
-    }
-
-    /// Whether the last pass left unfinished decode progress past the
-    /// admitted high-water: some cursor reached, under the same layout
-    /// (generation, pin, mappings), a further lexicographic sweep
-    /// position, more decoded tables, or completion than every decided
-    /// pass admitted for its identity. New, removed or relaid-out
-    /// cursors are churn, never progress, and so is a return to
-    /// covered ground: an adjacent comparison would let two cursors
-    /// alternate advances forever, each masking the other's
-    /// regression. When nothing moves past the high-water the fresh
-    /// allowance moved no committed work forward, so the snapshot
-    /// stops and reports the live in-progress gap honestly instead of
-    /// spinning. The first unfinished pass always resumes (no covered
-    /// ground to stall against).
-    fn resume_advancing(&self) -> bool {
-        let Some(last) = &self.last_resume.cursors else {
-            return false;
-        };
-        if self.resume_high_water.is_empty() {
-            return true;
-        }
-        last.iter().any(|(key, last_p)| {
-            self.resume_high_water.get(key).is_some_and(|high| {
-                last_p.layout == high.layout
-                    && (last_p.sweep_position() > high.sweep_position()
-                        || last_p.tables_decoded > high.tables_decoded
-                        || (!high.complete && last_p.complete))
-            })
-        })
-    }
-
-    /// Merge one decided pass position into the snapshot's resume
-    /// high-water. New identities seed at their decided progress
-    /// without granting (arrival is not advance); admitted identities
-    /// rise monotonically, so regressions, invalidations and temporary
-    /// disappearance keep the furthest covered ground. A relaid-out
-    /// cursor re-baselines without granting, so later progress under
-    /// the new layout compares against it instead of the shifted one.
-    /// Admission is bounded like the carried cursor map; identities
-    /// past the bound stay churn.
-    fn merge_resume_high_water(&mut self, decided: &CgroupResumePosition) {
-        let Some(cursors) = &decided.cursors else {
-            return;
-        };
-        for (key, progress) in cursors {
-            match self.resume_high_water.get(key).copied() {
-                None => {
-                    if self.resume_high_water.len()
-                        < crate::discovery::scan_pass::MAX_DECODE_CURSORS
-                    {
-                        self.resume_high_water.insert(key.clone(), *progress);
-                    }
-                }
-                Some(high) => {
-                    if high.layout != progress.layout {
-                        self.resume_high_water.insert(key.clone(), *progress);
-                    } else {
-                        let mut raised = high;
-                        if progress.sweep_position() > high.sweep_position() {
-                            raised.tables = progress.tables;
-                            raised.interfaces = progress.interfaces;
-                        }
-                        raised.tables_decoded = raised.tables_decoded.max(progress.tables_decoded);
-                        raised.complete = raised.complete || progress.complete;
-                        self.resume_high_water.insert(key.clone(), raised);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Whether the snapshot owes its one settle pass: the last pass left
-    /// no unfinished decode progress, but the transaction still
-    /// stopped on the work allowance — a scan that converged with
-    /// no budget left to bind and publish. The settle pass re-emits
-    /// the completed decode at ~zero work with a fresh allowance,
-    /// so the bind runs. The grant is explicit and single-use: once
-    /// spent, later convergences end the snapshot honestly instead of
-    /// spinning on a bind that never fits.
-    fn settle_pending(&self, passes: u64) -> bool {
-        self.last_resume.cursors.is_none()
-            && !self.settle_granted
-            && (self.prev_resume.cursors.is_some() || passes == 1)
     }
 }
 
@@ -7313,11 +7323,11 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if !work_stop {
             return false;
         }
-        if cgroup.resume_advancing() {
+        if cgroup.resume.advancing() {
             return true;
         }
-        if cgroup.settle_pending(passes) {
-            cgroup.settle_granted = true;
+        if cgroup.resume.settle_pending(passes) {
+            cgroup.resume.settle_granted = true;
             return true;
         }
         false
@@ -7330,12 +7340,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             })?;
             let warning = completion.driver_warning();
             cgroup.continuation = Some(completion.state);
-            let decided = std::mem::take(&mut cgroup.last_resume);
-            cgroup.merge_resume_high_water(&decided);
-            cgroup.prev_resume = decided;
-            cgroup.last_resume = CgroupResumePosition {
-                cursors: completion.progress_cursors,
-            };
+            cgroup.resume.observe(&completion.progress_cursors);
             cgroup.last_outcome = Some(completion.outcome);
             report.scan_callers = completion.scan_callers;
             if let Some(warning) = warning {
@@ -31193,10 +31198,7 @@ mod seal_readiness_tests {
             deadline: Some(deadline),
             observer: None,
             last_outcome: None,
-            last_resume: CgroupResumePosition::default(),
-            prev_resume: CgroupResumePosition::default(),
-            resume_high_water: BTreeMap::new(),
-            settle_granted: false,
+            resume: SnapshotResumeLedger::default(),
         });
         let root = tempfile::tempdir().expect("cgroup root");
         driver.seal_scope = Scope::Cgroup {

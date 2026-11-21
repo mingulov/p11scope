@@ -3424,47 +3424,46 @@ fn decode_reread_table_extent(
     }
 }
 
-/// Whether a fresh re-decode confirms a cached row for replay: exact
-/// identity plus agreement on the structural-refutation evidence
-/// (`extension_impossible`, which `PartialEq` ignores as monotonic
-/// observation). A cached refutation the fresh decode no longer
-/// reproduces is stale — the row must rescan, never replay — while a
-/// proof both rows agree on (or both lack) still confirms. Complete
-/// replay requires this match; unfinished continuation additionally
-/// accepts a genuine legacy-prefix extension (`allow_prefix`, see
-/// [`table_prefix_compatible`]).
-fn rows_match_for_replay(cached: &ScannedTable, fresh: &ScannedTable, allow_prefix: bool) -> bool {
-    if fresh.extension_impossible != cached.extension_impossible {
-        return false;
+/// The row one cached table carries after re-proof against a fresh
+/// re-decode, or `None` when the row must rescan. A stale refutation
+/// proof — a cached proof the fresh decode no longer reproduces —
+/// never publishes: same-entries rows carry with the proof cleared,
+/// while a stale proof beside changed entries rescans to the fresh
+/// truth (a one-time step-up, never an oscillation). Every other
+/// shape carries cached exactly on equality or genuine prefix
+/// extension (matching what the sweep re-decodes, so resume stays
+/// coherent); a divergent or shorter fresh row (a same-path exec, a
+/// writable-byte mutation, an anchor-recovered row the direct decoder
+/// rejects) rescans.
+fn carried_replay_row(cached: &ScannedTable, fresh: &ScannedTable) -> Option<ScannedTable> {
+    if cached.extension_impossible && !fresh.extension_impossible {
+        if fresh == cached {
+            let mut carried = cached.clone();
+            carried.extension_impossible = false;
+            return Some(carried);
+        } else {
+            return None;
+        }
     }
-    if fresh == cached {
-        return true;
+    if fresh == cached || table_prefix_compatible(cached, fresh) {
+        return Some(cached.clone());
     }
-    allow_prefix && table_prefix_compatible(cached, fresh)
+    None
 }
 
-/// Whether re-decoding `extent` (re-read from current memory) under the
-/// sweep's rules yields exactly `table` — or extends a cached legacy
-/// prefix to its full decode. A sweep that stops mid-table stages the
-/// `known_prefix` row; the proof re-reads the full declared extent, so
-/// strict equality would fail the genuine extension into a fresh
-/// rescan every pass (a resume livelock under tight recurring
-/// budgets). Extension is progress, not a change: every cached row
-/// must re-decode identically at the head of the fresh row, so a
-/// same-path exec or a writable-byte mutation under an unchanged
-/// layout still fails. A shorter or divergent fresh row still fails —
-/// and so does a fresh row that no longer reproduces the cached
-/// structural-refutation evidence, whose staleness fails the proof
-/// into a fresh rescan instead of carrying it to publish.
-fn table_extent_matches(
+/// Re-prove one cached table against a re-read extent: re-decode under
+/// the sweep's rules and confirm against the cached row (see
+/// [`carried_replay_row`]). `None` on any short decode, refusal, stop
+/// or divergence fails the replay into a fresh rescan.
+fn reprove_cached_table(
     layout: LinuxLayout,
     table: &ScannedTable,
     extent: &[u8],
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
-) -> bool {
-    decode_reread_table_extent(layout, table.address, extent, maps, budget)
-        .is_some_and(|fresh| rows_match_for_replay(table, &fresh, true))
+) -> Option<ScannedTable> {
+    let fresh = decode_reread_table_extent(layout, table.address, extent, maps, budget)?;
+    carried_replay_row(table, &fresh)
 }
 
 /// Whether the cached row is a strict `known_prefix` of the fresh
@@ -3480,31 +3479,6 @@ fn table_prefix_compatible(cached: &ScannedTable, fresh: &ScannedTable) -> bool 
         && fresh.entries.starts_with(&cached.entries)
         && fresh.null_entries.starts_with(&cached.null_entries)
         && fresh.unpinned.starts_with(&cached.unpinned)
-}
-
-/// Re-prove one cached table against current memory for complete
-/// replay: the table's full declared extent is re-read (charged) and
-/// re-decoded under the sweep's rules, and must equal the cached row
-/// including its structural-refutation evidence. A legacy-prefix
-/// extension never replays here — the fresh row rescans instead, so
-/// an invalidated tail proof cannot publish as a complete surface.
-/// Identity alone cannot see a same-path exec or a writable-byte
-/// mutation under an unchanged layout, so any short read, decode
-/// mismatch, refusal or stop fails the whole replay into a fresh
-/// rescan. Anchor-recovered rows, which the direct decoder rejects by
-/// design, conservatively rescan.
-fn verify_cached_table(
-    layout: LinuxLayout,
-    table: &ScannedTable,
-    mem: &impl ScanMemory,
-    maps: &MapIndex<'_>,
-    budget: &mut CaptureWorkBudget,
-) -> bool {
-    let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
-        return false;
-    };
-    decode_reread_table_extent(layout, table.address, &extent, maps, budget)
-        .is_some_and(|fresh| rows_match_for_replay(table, &fresh, false))
 }
 
 pub(crate) fn exact_table_bytes(header: &[u8], layout: LinuxLayout) -> Option<usize> {
@@ -9315,33 +9289,40 @@ fn scan_view_examined_mode(
         }
         if resumed.as_ref().is_some_and(|cursor| !cursor.validated) {
             // Use-time proof for unvalidated rows: re-read every cached
-            // table's extent from current memory, re-decode and compare,
-            // and re-collect targets from the re-proven bytes. A mid-pass
-            // flap the unrun bracket cannot see fails here into a fresh
-            // rescan instead of poisoning the resume.
+            // table's extent from current memory, re-decode and re-prove,
+            // and re-collect targets from the re-proven bytes. A stale
+            // refutation proof is invalidated (or rescanned beside
+            // changed entries); a mid-pass flap the unrun bracket cannot
+            // see fails here into a fresh rescan instead of poisoning
+            // the resume.
             let mut proven = true;
             let mut recollected = ScanDependencies {
                 inventory: dependency.inventory.clone(),
                 ..ScanDependencies::default()
             };
+            let mut carried_tables: Vec<ScannedTable> = Vec::new();
             if let Some(cursor) = &resumed {
+                carried_tables.reserve(cursor.cached_tables.len());
                 for table in &cursor.cached_tables {
                     let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
                         proven = false;
                         break;
                     };
-                    if !table_extent_matches(layout, table, &extent, &map_index, budget) {
+                    let Some(carried) =
+                        reprove_cached_table(layout, table, &extent, &map_index, budget)
+                    else {
                         proven = false;
                         break;
-                    }
+                    };
                     recollected.retain_tables(
-                        std::slice::from_ref(table),
+                        std::slice::from_ref(&carried),
                         &extent,
-                        table.address,
+                        carried.address,
                         layout,
                         &map_index,
                         budget,
                     );
+                    carried_tables.push(carried);
                 }
             }
             if proven && recollected.invalid_span {
@@ -9349,6 +9330,9 @@ fn scan_view_examined_mode(
             }
             if proven {
                 dependency.targets = std::mem::take(&mut recollected.targets);
+                if let Some(cursor) = resumed.as_mut() {
+                    cursor.cached_tables = carried_tables;
+                }
             } else {
                 budget.drop_stale_decode_cursors(pid, key.device, key.inode);
                 dependency.targets.clear();
@@ -9357,18 +9341,19 @@ fn scan_view_examined_mode(
         }
         if let Some(cursor) = resumed.as_ref().filter(|cursor| cursor.complete) {
             // Validated complete: re-emit the cached decode after
-            // proving its bytes still decode the same tables. Identity
+            // re-proving its bytes against current memory. Identity
             // (pin, fingerprint, dependencies, process generation)
             // cannot see a same-path exec or a writable-byte mutation
             // under an unchanged layout, so every cached table's full
             // declared extent is re-read from current memory and
-            // re-decoded; any short read, decode mismatch, refusal or
-            // stop discards the cursor and rescans fresh. The
-            // fingerprint proves the own layout frozen and the use
-            // check above re-proved every dependency range; the
-            // bracket below still re-validates the re-retained
-            // targets and the generation before this re-emit can
-            // publish.
+            // re-decoded; a stale refutation proof is invalidated (or
+            // rescanned beside changed entries), while any short read,
+            // decode divergence, refusal or stop discards the cursor
+            // and rescans fresh. The fingerprint proves the own layout
+            // frozen and the use check above re-proved every dependency
+            // range; the bracket below still re-validates the
+            // re-retained targets and the generation before this
+            // re-emit can publish.
             //
             // Residual (documented): a completed object with no tables
             // replays its absence on identity alone — there are no
@@ -9389,15 +9374,24 @@ fn scan_view_examined_mode(
                     });
                 }
             }
+            let mut carried_tables: Vec<ScannedTable> =
+                Vec::with_capacity(cursor.cached_tables.len());
             let mut replay_verified = true;
             for table in &cursor.cached_tables {
-                if !verify_cached_table(layout, table, mem, &map_index, budget) {
+                let Some(extent) = reread_table_extent(layout, table, mem, budget) else {
                     replay_verified = false;
                     break;
-                }
+                };
+                let Some(carried) =
+                    reprove_cached_table(layout, table, &extent, &map_index, budget)
+                else {
+                    replay_verified = false;
+                    break;
+                };
+                carried_tables.push(carried);
             }
             if !replay_verified {
-                // Stale bytes under a matching identity (same-path
+                // Divergent bytes under a matching identity (same-path
                 // exec, runtime mutation): the cursor is discarded and
                 // the fresh scan below supersedes it. Stale re-retained
                 // targets are cleared so they cannot poison the fresh
@@ -9405,6 +9399,8 @@ fn scan_view_examined_mode(
                 budget.drop_stale_decode_cursors(pid, key.device, key.inode);
                 dependency.targets.clear();
                 resumed = None;
+            } else if let Some(cursor) = resumed.as_mut() {
+                cursor.cached_tables = carried_tables;
             }
         }
         if let Some(cursor) = resumed.as_ref().filter(|cursor| cursor.complete) {
@@ -23996,14 +23992,14 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// A cached 68-slot legacy prefix with a proven refutation must not
-    /// replay past a writable-tail change: when the current tail decodes
-    /// the full 92 slots under unchanged mappings, complete replay refuses
-    /// the cached row — its old tail proof no longer holds — instead of
-    /// publishing the 68-slot surface as complete. An unchanged tail
-    /// still replays (the stability control).
+    /// Re-proof never publishes a stale refutation proof: same-entries
+    /// rows carry with the proof cleared, while a stale proof beside
+    /// changed entries rescans to the fresh truth. Every other shape
+    /// carries cached exactly on equality or genuine prefix extension
+    /// (matching what the sweep re-decodes); a divergent or shorter
+    /// fresh row rescans.
     #[test]
-    fn complete_replay_refuses_an_invalidated_legacy_prefix() {
+    fn reproof_invalidates_stale_proofs_and_carries_cached_otherwise() {
         let maps = mislabelled_fixture_maps();
         let map_index = MapIndex::new(&maps).unwrap();
         let decode = |snapshot: &[u8]| {
@@ -24023,101 +24019,67 @@ int main(int argc, char **argv) {
             .expect("the image must decode")
             .0
         };
-        let cached = decode(&mislabelled_snapshot(0x0003, 68, 24));
-        assert_eq!(cached.decoded_slot_count(), 68);
-        assert_eq!(cached.walk, "known_prefix");
-        assert!(
-            cached.extension_impossible,
-            "the cached row carries the refutation proof"
-        );
-        let fresh_bytes = mislabelled_snapshot(0x0003, 92, 0);
-        let changed = tempfile::tempfile().unwrap();
-        changed.set_len(0x8000).unwrap();
-        std::os::unix::fs::FileExt::write_all_at(&changed, &fresh_bytes, 0x7000).unwrap();
-        assert!(
-            !verify_cached_table(
+        let reprove = |cached: &ScannedTable, extent: &[u8]| {
+            reprove_cached_table(
                 LinuxLayout::Lp64,
-                &cached,
-                &changed,
+                cached,
+                extent,
                 &map_index,
                 &mut CaptureWorkBudget::default(),
-            ),
-            "complete replay refuses the invalidated prefix"
-        );
-        let stable = tempfile::tempfile().unwrap();
-        stable.set_len(0x8000).unwrap();
-        std::os::unix::fs::FileExt::write_all_at(
-            &stable,
-            &mislabelled_snapshot(0x0003, 68, 24),
-            0x7000,
-        )
-        .unwrap();
-        assert!(
-            verify_cached_table(
-                LinuxLayout::Lp64,
-                &cached,
-                &stable,
-                &map_index,
-                &mut CaptureWorkBudget::default(),
-            ),
-            "an unchanged tail still replays"
-        );
-    }
-
-    /// Unfinished continuation keeps the relaxed head match for genuine
-    /// prefix extension (a truncated 68-slot row growing to its full
-    /// 92-slot decode still continues), but a cached refutation proof
-    /// that the fresh decode no longer reproduces fails the proof into
-    /// a fresh rescan instead of carrying the stale proof to publish.
-    #[test]
-    fn unfinished_continuation_rejects_a_stale_tail_proof_but_keeps_genuine_extension() {
-        let maps = mislabelled_fixture_maps();
-        let map_index = MapIndex::new(&maps).unwrap();
-        let decode = |snapshot: &[u8]| {
-            decode_candidate(
-                LinuxLayout::Lp64,
-                snapshot,
-                0,
-                0x7000,
-                &map_index,
-                &mut CaptureWorkBudget::default(),
-                DecodeContext {
-                    runtime_view: None,
-                    strict_tail: true,
-                },
             )
-            .expect("budget must admit the decode")
-            .expect("the image must decode")
-            .0
         };
+        // Stale proof plus extension: rescan to the fresh truth (the
+        // end-to-end twin below pins the published surface).
         let stale = decode(&mislabelled_snapshot(0x0003, 68, 24));
+        assert_eq!(stale.decoded_slot_count(), 68);
+        assert_eq!(stale.walk, "known_prefix");
         assert!(stale.extension_impossible);
         let extended = mislabelled_snapshot(0x0003, 92, 0);
         assert!(
-            !table_extent_matches(
-                LinuxLayout::Lp64,
-                &stale,
-                &extended,
-                &map_index,
-                &mut CaptureWorkBudget::default(),
-            ),
-            "a stale refutation proof fails into a fresh rescan"
+            reprove(&stale, &extended).is_none(),
+            "a stale proof beside changed entries rescans"
         );
+        // Stale proof with identical entries: carry with the proof
+        // cleared, keeping the monotonic observation flags.
+        let mut cached = stale.clone();
+        cached.live_return = true;
+        let mut fresh_same = stale.clone();
+        fresh_same.extension_impossible = false;
+        fresh_same.live_return = false;
+        let carried =
+            carried_replay_row(&cached, &fresh_same).expect("stale same-entries invalidates");
+        assert_eq!(carried.decoded_slot_count(), 68);
+        assert!(
+            !carried.extension_impossible,
+            "the stale refutation is cleared, never published"
+        );
+        assert!(
+            carried.live_return,
+            "invalidation preserves monotonic observation flags"
+        );
+        // Stable rows carry cached.
+        let stable =
+            reprove(&stale, &mislabelled_snapshot(0x0003, 68, 24)).expect("stable replays");
+        assert_eq!(stable.decoded_slot_count(), 68);
+        assert!(stable.extension_impossible);
+        // Genuine extension carries cached (matching the sweep).
         let truncated = decode(&mislabelled_snapshot(0x0003, 68, 0));
-        assert_eq!(truncated.decoded_slot_count(), 68);
+        assert!(!truncated.extension_impossible);
+        let grown = reprove(&truncated, &extended).expect("genuine extension carries cached");
+        assert_eq!(grown.decoded_slot_count(), 68);
+        assert!(!grown.extension_impossible);
+        // A divergent head rescans.
+        let mut divergent = extended.clone();
+        divergent[8 + 5 * 8..8 + 6 * 8].copy_from_slice(&0x1600u64.to_le_bytes());
         assert!(
-            !truncated.extension_impossible,
-            "a truncated prefix carries no refutation proof"
+            reprove(&stale, &divergent).is_none(),
+            "a divergent head rescans"
         );
+        // A shorter fresh row rescans.
+        let full = decode(&mislabelled_snapshot(0x0003, 92, 0));
         assert!(
-            table_extent_matches(
-                LinuxLayout::Lp64,
-                &truncated,
-                &extended,
-                &map_index,
-                &mut CaptureWorkBudget::default(),
-            ),
-            "genuine prefix extension still continues"
+            reprove(&full, &mislabelled_snapshot(0x0003, 68, 0)).is_none(),
+            "a shorter row rescans"
         );
     }
 

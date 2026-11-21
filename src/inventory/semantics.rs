@@ -1003,6 +1003,12 @@ pub(crate) struct AttestedSemanticLane {
     length_stash_seen: (u64, u64),
     /// Cumulative disclosed length-stash losses; feed the summary.
     length_stash_loss: (u64, u64),
+    /// Undisclosed insert-failure rise from the split poll, waiting
+    /// for its mismatch half: normal resume and the terminal hold
+    /// take it exactly once through
+    /// [`Self::take_pending_stash_insert_delta`], so an interrupted
+    /// Finish never strands it in a dropped machine phase.
+    pending_stash_insert_delta: Option<u64>,
     /// A length-stash counter read failed: the summary may
     /// undercount until a later good read restores the exact
     /// cumulative totals. Latched, never cleared.
@@ -2253,6 +2259,7 @@ impl AttestedSemanticLane {
             events_loss_unknown_reported: false,
             length_stash_seen: (0, 0),
             length_stash_loss: (0, 0),
+            pending_stash_insert_delta: None,
             length_loss_unknown: false,
             length_loss_unknown_reported: false,
             last_collection_saturated: false,
@@ -2517,6 +2524,7 @@ impl AttestedSemanticLane {
             events_loss_unknown_reported: false,
             length_stash_seen: (0, 0),
             length_stash_loss: (0, 0),
+            pending_stash_insert_delta: None,
             length_loss_unknown: false,
             length_loss_unknown_reported: false,
             last_collection_saturated: false,
@@ -2864,11 +2872,31 @@ impl AttestedSemanticLane {
 
     /// Fold one insert-counter read into the lane: `Some(delta)` on
     /// a rise. Updates only the insert half of the shared baseline;
-    /// the kernel counter only grows.
+    /// the kernel counter only grows. A rise also waits in
+    /// [`Self::pending_stash_insert_delta`] for its mismatch half:
+    /// normal resume and the terminal hold take it exactly once, so
+    /// an interrupted slice never strands it.
     fn note_length_insert_total(&mut self, insert: u64) -> Option<u64> {
         let delta = insert.saturating_sub(self.length_stash_seen.0);
         self.length_stash_seen.0 = insert;
-        (delta > 0).then_some(delta)
+        if delta > 0 {
+            let pending = self
+                .pending_stash_insert_delta
+                .unwrap_or(0)
+                .saturating_add(delta);
+            self.pending_stash_insert_delta = Some(pending);
+            Some(delta)
+        } else {
+            None
+        }
+    }
+
+    /// Take the undisclosed insert-failure rise once, for disclosure
+    /// beside its mismatch half. Normal resume and the terminal hold
+    /// share this take: whoever discloses first gets the delta, the
+    /// other sees `None`, so the rise counts exactly once.
+    pub(crate) fn take_pending_stash_insert_delta(&mut self) -> Option<u64> {
+        self.pending_stash_insert_delta.take()
     }
 
     /// Fold one mismatch-counter read into the lane: `Some(delta)`

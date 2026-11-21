@@ -6474,7 +6474,6 @@ impl CallerRegistry {
         );
         let applied = self.apply_staged(observer, ledger.as_deref_mut());
         self.complete_publication(ledger);
-        self.fold_unbound_retention();
         applied
     }
 
@@ -6532,6 +6531,10 @@ impl CallerRegistry {
                 observer.as_mut().expect("enabled count observer")(count);
             }
         }
+        // Retention follows every apply, on the plain and joint paths
+        // alike: staged rows just landed in the live maps, so fold the
+        // run-wide images past the bound before any reader runs.
+        self.fold_unbound_retention();
         applied
     }
 
@@ -12666,6 +12669,45 @@ pub(crate) mod tests {
         assert!(
             !registry.unidentified_images_saturated(),
             "folding is retention, never saturation"
+        );
+    }
+
+    /// The fold runs at the apply choke point, not just on the plain
+    /// publish path: staged rows applied directly (as the joint path
+    /// does) fold past the retention bound with exact totals.
+    #[test]
+    fn unbound_fold_runs_on_every_apply_path() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        for index in 0..600u64 {
+            let cookie = DomainCookie::scripted(domain, 41 + index);
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1000 + index,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(
+                    cookie,
+                    1000 + index as u32,
+                    1000 + index,
+                    2,
+                    provisional.clone(),
+                )),
+            );
+        }
+        let applied = registry.apply_staged(None, None);
+        assert_eq!(applied, 600, "every staged row applies");
+        assert_eq!(registry.unidentified_images(), 600);
+        assert_eq!(
+            registry.unidentified_pids().len(),
+            512,
+            "the direct apply folds past the retention bound"
         );
     }
 

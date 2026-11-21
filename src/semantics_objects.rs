@@ -391,17 +391,20 @@ pub(crate) enum ObjectGap {
     NullMechanismCancel,
     // Joins.
     SameSessionOverlap,
-    /// Provider-internal re-entry (controller ruling
-    /// v080-nss-ec-double R2, 2026-11-21): the call started and
-    /// ended on one native thread strictly inside another open call
-    /// on the same session (the known instance is the NSS softoken
-    /// EC-keygen pairwise self-test), so its key birth is the
-    /// still-in-flight outer call and its joins stay unproven. The
-    /// precise name for this overlap: H9 routes the terminal to the
-    /// `provider_internal` unknown row, while the outer call's
-    /// outputs bind. Cross-thread or unprovable overlap keeps
+    /// Same-thread nested re-entry (controller ruling
+    /// v080-nss-ec-double R2, 2026-11-21; renamed neutral in R3):
+    /// the call started and ended on one native thread strictly
+    /// inside another open call on the same session (the known
+    /// instance is the NSS softoken EC-keygen pairwise self-test;
+    /// a same-thread nested call from an application signal handler
+    /// or a provider callback nests too, so the issuer is never
+    /// proven), so its key birth is the still-in-flight outer call
+    /// and its joins stay unproven. H9 routes the terminal to the
+    /// `same_thread_nested` unknown row — never binding the inner
+    /// call to a key — while the outer call's outputs bind.
+    /// Cross-thread or unprovable overlap keeps
     /// `SameSessionOverlap`.
-    ProviderInternal,
+    SameThreadNested,
     OverlapUncertain,
     OutputCollision,
     StaleOrigin,
@@ -709,7 +712,7 @@ pub(crate) struct OriginFact {
     /// Native thread identity at entry (kernel pid_tgid, already
     /// captured on the journal BEGIN): privileged internal
     /// correlation only, never rendered. Proves same-thread nesting
-    /// for provider-internal re-entry (controller ruling
+    /// for same-thread nested re-entry (controller ruling
     /// v080-nss-ec-double R2, 2026-11-21).
     pub(crate) thread: u64,
 }

@@ -59,12 +59,13 @@ pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// exactly when a row carries non-blank inferred content or a
 /// v7-only gap does; v1–v6 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
-/// Section version 9 (provider-internal re-entry): v7 vocabulary
-/// plus the `provider_internal` unknown-key and gap reasons
+/// Section version 9 (same-thread nested re-entry): v7 vocabulary
+/// plus the `same_thread_nested` unknown-key and gap reasons
 /// (version 8 is taken by the Task 7 provider/token/mechanism
 /// section in the shared allocator, spec §10.1). The renderer emits
-/// v9 exactly when an unknown row names it; v1–v7 output stays
-/// byte-stable.
+/// v9 exactly when an unknown row or a model gap names that reason;
+/// v1–v7 output stays byte-stable. The nested terminal never binds
+/// its inner call to a key.
 pub(crate) const OBSERVATIONS_VERSION_V9: u8 = 9;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
@@ -489,7 +490,7 @@ pub(crate) mod contract {
     ];
 
     /// Frozen unknown-key reasons (H9 §82 plus the R2
-    /// provider-internal re-entry reason).
+    /// same-thread nested re-entry reason).
     pub(crate) const UNKNOWN_REASONS: [&str; 7] = [
         "unbound",
         "key_join_lost",
@@ -497,7 +498,7 @@ pub(crate) mod contract {
         "metadata_conflicting",
         "role_unavailable",
         "not_applicable",
-        crate::semantics_key_use::PROVIDER_INTERNAL_REASON,
+        crate::semantics_key_use::SAME_THREAD_NESTED_REASON,
     ];
 
     pub(crate) const UNKNOWN_ROW_KEYS: [&str; 8] = [
@@ -554,7 +555,7 @@ pub(crate) mod contract {
         "pair_duplicate",
         "null_mechanism_cancel",
         "same_session_overlap",
-        "provider_internal",
+        "same_thread_nested",
         "overlap_uncertain",
         "output_collision",
         "stale_origin",
@@ -1433,22 +1434,22 @@ fn has_v7_gap_content(observations: &ObjectObservations) -> bool {
     })
 }
 
-/// v9-only unknown content: a provider-internal re-entry row that
+/// v9-only unknown content: a same-thread nested re-entry row that
 /// v1–v7 vocabularies forbid.
 fn has_v9_unknown_content(observations: &ObjectObservations) -> bool {
     observations
         .unknown_key_operations
         .iter()
-        .any(|row| row.reason == crate::semantics_key_use::PROVIDER_INTERNAL_REASON)
+        .any(|row| row.reason == crate::semantics_key_use::SAME_THREAD_NESTED_REASON)
 }
 
-/// v9-only gap content: a provider-internal re-entry gap that v1–v7
-/// vocabularies forbid. A rowless internal gap (a nested call with
+/// v9-only gap content: a same-thread nested re-entry gap that v1–v7
+/// vocabularies forbid. A rowless nested gap (a nested call with
 /// no key-operation terminal) still promotes its section to v9, so
 /// the named gap never rides a version whose vocabulary forbids it.
 fn has_v9_gap_content(observations: &ObjectObservations) -> bool {
     observations.gaps.iter().any(|gap| {
-        gap.subject == "model" && gap.reason == crate::semantics_key_use::PROVIDER_INTERNAL_REASON
+        gap.subject == "model" && gap.reason == crate::semantics_key_use::SAME_THREAD_NESTED_REASON
     })
 }
 
@@ -1981,17 +1982,23 @@ pub(crate) mod producer {
         // v7 keeps the inferred keys on every proved row, whether a
         // row carries non-blank content or a v7-only gap does, so a
         // gap-driven v7 section still renders all 15 keys per row.
-        // Below v7 every row drops its keys (uniform fill above,
-        // frozen 13 below). Model gaps (collected after this) never
-        // trigger v7, and the at-most-three key-side gaps sort
-        // before them under the 256-cap, so this decision equals the
-        // final one.
+        // v9 keeps them too: v9 is v7 vocabulary plus the
+        // same-thread-nested reason, so every v9 proved row renders
+        // all 15 keys even without v7 content (GLM R2 F1). Below
+        // v7/v9 every row drops its keys (uniform fill above,
+        // frozen 13 below). Model gaps are collected after this, so
+        // the v9 model-gap trigger is read from the `model`
+        // projection parameter; the unknown-row trigger is already
+        // in `observations`. The at-most-three key-side gaps sort
+        // before model gaps under the 256-cap, so this decision
+        // equals the final one.
         let v7 = observations.key_operations.iter().any(|row| {
             row.inferred
                 .as_ref()
                 .is_some_and(|keys| keys.is_v7_content())
         }) || has_v7_gap_content(observations);
-        if !v7 {
+        let v9 = has_v9_unknown_content(observations) || model.gap(ObjectGap::SameThreadNested) > 0;
+        if !(v7 || v9) {
             for row in &mut observations.key_operations {
                 row.inferred = None;
             }
@@ -2324,7 +2331,7 @@ pub(crate) mod producer {
             ObjectGap::PairDuplicate => "pair_duplicate",
             ObjectGap::NullMechanismCancel => "null_mechanism_cancel",
             ObjectGap::SameSessionOverlap => "same_session_overlap",
-            ObjectGap::ProviderInternal => "provider_internal",
+            ObjectGap::SameThreadNested => "same_thread_nested",
             ObjectGap::OverlapUncertain => "overlap_uncertain",
             ObjectGap::OutputCollision => "output_collision",
             ObjectGap::StaleOrigin => "stale_origin",

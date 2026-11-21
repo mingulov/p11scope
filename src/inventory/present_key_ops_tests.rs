@@ -2308,11 +2308,12 @@ fn key_ops_unknown_bucket_reads_unknown_keys_lines() {
     );
 }
 
-/// A provider-internal self-test row tallies under `unknown keys`:
-/// concise counts it, verbose names the `provider_internal` reason
-/// (controller ruling v080-nss-ec-double R2).
+/// A same-thread nested row (e.g. the NSS self-test shape) tallies
+/// under `unknown keys`: concise counts it, verbose names the
+/// `same_thread_nested` reason (controller ruling v080-nss-ec-double
+/// R2, renamed neutral in R3: the issuer is never proven).
 #[test]
-fn key_ops_provider_internal_row_names_its_reason() {
+fn key_ops_same_thread_nested_row_names_its_reason() {
     let mut observations = populated(3);
     observations.sessions.push(SessionRow {
         session: 7,
@@ -2322,7 +2323,7 @@ fn key_ops_provider_internal_row_names_its_reason() {
     observations.objects.push(object_row(11));
     observations.unknown_key_operations.push(UnknownAggRow {
         category: "sign",
-        reason: crate::semantics_key_use::PROVIDER_INTERNAL_REASON,
+        reason: crate::semantics_key_use::SAME_THREAD_NESTED_REASON,
         unit: "operations",
         completed: 1,
         failed: 0,
@@ -2340,13 +2341,13 @@ fn key_ops_provider_internal_row_names_its_reason() {
             "key operations: 1 key on 0 providers; rev 3 populated; 1 session",
             "  unknown keys: sign 1 completed, 0 returned errors, 0 active operations",
         ],
-        "concise counts the internal row:\n{concise}"
+        "concise counts the nested row:\n{concise}"
     );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let block = key_ops_block(&verbose);
     assert_eq!(
         block[1],
-        "  unknown keys: sign 1 completed, 0 returned errors, 0 active operations (provider_internal)",
+        "  unknown keys: sign 1 completed, 0 returned errors, 0 active operations (same_thread_nested)",
         "verbose names the machine reason:\n{verbose}"
     );
 }

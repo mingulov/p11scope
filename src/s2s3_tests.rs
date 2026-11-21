@@ -57,11 +57,13 @@ const CKM_CHACHA20: u64 = 0x1226;
 
 /// Distinct native threads for the overlap twins (controller ruling
 /// v080-nss-ec-double R2): same-thread strict nesting is
-/// provider-internal re-entry; cross-thread overlap stays
+/// same-thread nested re-entry; cross-thread overlap stays
 /// conservative. Far from reference cuts, which double as default
-/// threads.
-const THREAD_A: u64 = 0x7A11_CE01;
-const THREAD_B: u64 = 0x7A11_CE02;
+/// threads. Both are realistic pid_tgid values (nonzero pid and tid
+/// halves, same process, different threads), so the R3 zero-half
+/// guard accepts them; thread 0 stays the guard's negative twin.
+const THREAD_A: u64 = 0x1111_1111_2222_2222;
+const THREAD_B: u64 = 0x1111_1111_3333_3333;
 
 const CKA_CLASS: u64 = 0x0000;
 const CKA_TOKEN: u64 = 0x0001;
@@ -2066,8 +2068,8 @@ fn s2s3_concurrent_session_contract_same_session_overlap_is_uncertain() {
     // another thread, so re-entry is unprovable and both creations
     // stay fenced under the generic gap, never the precise internal
     // one. The same-thread twin
-    // (s2s3_provider_internal_same_thread_nesting_binds) proves the
-    // provider-internal re-entry exemption.
+    // (s2s3_same_thread_nested_binds) proves the
+    // same-thread nested re-entry exemption.
     let mut h = Hist::qualified();
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     let a = h.begin(3, create(SA).thread(THREAD_A));
@@ -2091,7 +2093,7 @@ fn s2s3_concurrent_session_contract_same_session_overlap_is_uncertain() {
         !effects.effects.iter().any(|effect| matches!(
             effect,
             ObjectEffect::Unresolved {
-                reason: ObjectGap::ProviderInternal,
+                reason: ObjectGap::SameThreadNested,
                 ..
             }
         )),
@@ -2101,10 +2103,10 @@ fn s2s3_concurrent_session_contract_same_session_overlap_is_uncertain() {
 }
 
 #[test]
-fn s2s3_provider_internal_same_thread_nesting_binds() {
+fn s2s3_same_thread_nested_binds() {
     // Controller ruling v080-nss-ec-double R2 (2026-11-21), positive
     // twin: a call starting and ending on one thread strictly inside
-    // another open call on the same session is provider-internal
+    // another open call on the same session is same-thread nested
     // re-entry (the NSS softoken EC-keygen pairwise self-test
     // shape). The outer creation's outputs bind; the caller's later
     // uses bind to the created key; the inner call keeps its
@@ -2128,7 +2130,7 @@ fn s2s3_provider_internal_same_thread_nesting_binds() {
     assert_ne!(public, private, "pair halves are distinct views");
     assert_eq!(
         unresolved(&effects, inner),
-        Some(ObjectGap::ProviderInternal),
+        Some(ObjectGap::SameThreadNested),
         "the inner join stays conservative under the precise gap"
     );
     assert_eq!(
@@ -2157,7 +2159,7 @@ fn s2s3_provider_internal_same_thread_nesting_binds() {
 }
 
 #[test]
-fn s2s3_provider_internal_migrated_return_stays_uncertain() {
+fn s2s3_same_thread_nested_migrated_return_stays_uncertain() {
     // Controller ruling v080-nss-ec-double R2: the re-entry proof
     // needs the SAME thread at both ends — a nested call returning
     // on another thread is unprovable migration, so both calls keep
@@ -2186,11 +2188,143 @@ fn s2s3_provider_internal_migrated_return_stays_uncertain() {
         !effects.effects.iter().any(|effect| matches!(
             effect,
             ObjectEffect::Unresolved {
-                reason: ObjectGap::ProviderInternal,
+                reason: ObjectGap::SameThreadNested,
                 ..
             }
         )),
         "a migrated return names no internal gap"
+    );
+    assert!(h.project().objects.is_empty());
+}
+
+/// HY4 R2 F3(b): session separation — same-thread strict nesting on
+/// DIFFERENT sessions is not re-entry (the predicate requires equal
+/// session handles), so both creations bind with no nested gap.
+#[test]
+fn s2s3_same_thread_nested_different_sessions_stay_separate() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    h.run(3, open_in(slot(SLOT1)), 4, ok().session_out(SB));
+    let outer = h.begin(5, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        6,
+        call("C_GenerateKey").on(SB).thread(THREAD_A),
+        7,
+        ok().result(0, H3),
+    );
+    h.done(outer, 8, ok().result(0, H1).result(1, H2));
+    let effects = h.settle(8);
+    assert!(
+        created(&effects, outer, 0).is_some(),
+        "the outer creation binds"
+    );
+    assert!(
+        created(&effects, inner, 0).is_some(),
+        "the cross-session inner binds"
+    );
+    assert_eq!(unresolved(&effects, outer), None);
+    assert_eq!(unresolved(&effects, inner), None);
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved {
+                reason: ObjectGap::SameThreadNested,
+                ..
+            }
+        )),
+        "cross-session nesting names no nested gap"
+    );
+    assert_eq!(
+        h.project().gap(ObjectGap::SameThreadNested),
+        0,
+        "no nested model gap across sessions"
+    );
+}
+
+/// HY4 R2 F3(a), sequential tid reuse: the outer call completes
+/// before the inner begins on the same numeric thread id (a new
+/// thread reusing the tid for a later sequential call). Cut ordering
+/// alone refuses nesting (inner.begin exceeds the outer end), so both
+/// bind with no nested gap. Overlapping reuse while the outer is
+/// still open is fenced before the inner settles (BPF/journal
+/// liveness invariant, outside this diff; the `!y.fenced` guards and
+/// the P4-M3 fencing tests cover that path).
+#[test]
+fn s2s3_same_thread_nested_sequential_tid_reuse_stays_separate() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let outer = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA).thread(THREAD_A),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let inner = h.run(
+        5,
+        call("C_GenerateKey").on(SA).thread(THREAD_A),
+        6,
+        ok().result(0, H3),
+    );
+    let effects = h.settle(6);
+    assert!(
+        created(&effects, outer, 0).is_some(),
+        "the outer creation binds"
+    );
+    assert!(
+        created(&effects, inner, 0).is_some(),
+        "the later sequential call binds"
+    );
+    assert_eq!(unresolved(&effects, outer), None);
+    assert_eq!(unresolved(&effects, inner), None);
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved {
+                reason: ObjectGap::SameThreadNested,
+                ..
+            }
+        )),
+        "sequential tid reuse names no nested gap"
+    );
+}
+
+/// R3 zero-half guard (RVS idea): a zero pid or tid half never nests,
+/// even with strict same-thread geometry. Unreachable in production
+/// (the journal refuses zero halves at admission), but the model
+/// proof stays self-contained. RED-first: fails before the guard
+/// (0 == 0 would nest), passes after.
+#[test]
+fn s2s3_same_thread_nested_zero_thread_halves_stay_uncertain() {
+    const ZERO_THREAD: u64 = 0;
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(ZERO_THREAD));
+    let inner = h.run(
+        4,
+        sign_init(SA, H1).thread(ZERO_THREAD),
+        5,
+        ok().thread(ZERO_THREAD),
+    );
+    h.done(outer, 6, ok().result(0, H1).result(1, H2));
+    let effects = h.settle(6);
+    assert_eq!(created(&effects, outer, 0), None);
+    assert_eq!(
+        unresolved(&effects, outer),
+        Some(ObjectGap::SameSessionOverlap)
+    );
+    assert_eq!(
+        unresolved(&effects, inner),
+        Some(ObjectGap::SameSessionOverlap)
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved {
+                reason: ObjectGap::SameThreadNested,
+                ..
+            }
+        )),
+        "zero thread halves name no nested gap"
     );
     assert!(h.project().objects.is_empty());
 }

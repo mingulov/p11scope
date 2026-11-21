@@ -345,10 +345,10 @@ impl EffectOrigin {
 /// `Started` carries the machine's fixed key receipt (`None` for
 /// S1Only or unassociated starts); `DirectCompleted` carries the
 /// call's positional receipts (at most two); `Ended` joins by id.
-/// `internal` names a provider-internal re-entrant call (seal
+/// `internal` names a same-thread nested re-entrant call (seal
 /// evidence, fixed at the call that starts the machine or the
 /// direct); the reducer routes its receipt-less terminal to the
-/// `provider_internal` unknown row instead of `unbound`.
+/// `same_thread_nested` unknown row instead of `unbound`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OperationEffect {
     Started {
@@ -1126,7 +1126,7 @@ impl EdgeSemantics {
     /// (unit-test defaults; production registry reducers always
     /// carry one) replay unresourced.
     /// `internal` is seal evidence that this call is
-    /// provider-internal re-entry: it rides the `Started` /
+    /// same-thread nested re-entry: it rides the `Started` /
     /// `DirectCompleted` the call emits (async paths emit no start
     /// of their own, so they take none).
     pub(crate) fn observe_joint_with_resources<S: OperationSink>(

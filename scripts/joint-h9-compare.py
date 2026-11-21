@@ -77,7 +77,7 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 9)
 LABELS = {"rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128",
           "aes_192", "aes_256", "aes_other", "ec_p256", "ec_p384", "ec_p521"}
 # H9 section v4 (DEMO-4 late attach): a first-observed key whose
@@ -133,7 +133,10 @@ PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44",
             "slh_dsa_192s", "slh_dsa_192f", "slh_dsa_256s", "slh_dsa_256f")
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
-                   "metadata_conflicting", "role_unavailable", "not_applicable"}
+                   "metadata_conflicting", "role_unavailable", "not_applicable",
+                   "same_thread_nested"}
+# v9-only unknown reasons: refused below v9, never silently dropped.
+V9_ONLY_UNKNOWN = {"same_thread_nested"}
 STATUSES = {"populated", "partial", "stale", "unavailable"}
 STATUS_REASONS = {"none", "bootstrap_unavailable", "live_joint_feed_absent",
                   "proof_refused_fallback",
@@ -543,13 +546,15 @@ def _check_key_row(row, where, roles=ROLES, labels=LABELS, version=1):
             row["metadata_at_use"])
 
 
-def _check_unknown_row(row, where):
+def _check_unknown_row(row, where, version=1):
     _require(type(row) is dict, f"{where}: unknown row must be an object")
     _keys(row, {"category", "reason", "unit"} | set(UNKNOWN_COUNTERS))
     _require(row["category"] in CATEGORIES,
              f"{where}: unknown row category invalid")
     _require(row["reason"] in UNKNOWN_REASONS,
              f"{where}: unknown row reason invalid")
+    _require(version >= 9 or row["reason"] not in V9_ONLY_UNKNOWN,
+             f"{where}: v9-only unknown reason in v{version} section")
     _require(row["unit"] in UNITS, f"{where}: unknown row unit invalid")
     want_unit = ("message_contexts" if row["category"].startswith("message_")
                  else "operations")
@@ -660,11 +665,11 @@ def _check_unattributed(document):
     """Validate not-attributed counters: present iff version >= 3.
 
     Version 3 requires a nonempty list (it is emitted iff a count
-    exists); versions 4, 5, 6 and 7 always carry the key and it may be
-    empty.
+    exists); versions 4, 5, 6, 7 and 9 always carry the key and it may
+    be empty.
     """
     version = document["version"]
-    if version not in (3, 4, 5, 6, 7):
+    if version not in (3, 4, 5, 6, 7, 9):
         _require("unattributed" not in document,
                  "unattributed counters before section version 3")
         return
@@ -692,7 +697,7 @@ def validate_snapshot(document):
     keys = {"version", "revision", "status", "reason", "sessions",
             "objects", "key_operations", "unknown_key_operations",
             "gaps", "budgets"}
-    if type(document) is dict and document.get("version") in (3, 4, 5, 6, 7):
+    if type(document) is dict and document.get("version") in (3, 4, 5, 6, 7, 9):
         keys |= {"unattributed"}
     _keys(document, keys)
     _check_unattributed(document)
@@ -740,7 +745,7 @@ def validate_snapshot(document):
     _check_sorted_unique(known_keys, "snapshot key rows")
     _require(type(document["unknown_key_operations"]) is list,
              "snapshot unknown_key_operations must be a list")
-    unknown_keys = [_check_unknown_row(row, f"snapshot unknown row {position}")
+    unknown_keys = [_check_unknown_row(row, f"snapshot unknown row {position}", version)
                     for position, row in enumerate(document["unknown_key_operations"])]
     _check_sorted_unique(unknown_keys, "snapshot unknown rows")
     gaps = document["gaps"]
@@ -821,7 +826,7 @@ def compare_pair(first, second, snapshot):
                               version))] = row
     unknown = {}
     for row in snapshot["unknown_key_operations"]:
-        unknown[(_check_unknown_row(row, "snapshot unknown row"))] = row
+        unknown[(_check_unknown_row(row, "snapshot unknown row", version))] = row
     objects = {row["object"] for row in snapshot["objects"]}
     keyed, unkeyed = {}, {}
     for feed in feeds:
@@ -956,7 +961,7 @@ def compare_stream(events, feeds, snapshot):
                 key = ("known", _check_key_row(event["row"], where, roles,
                                                 labels, version))
             else:
-                key = ("unknown", _check_unknown_row(event["row"], where))
+                key = ("unknown", _check_unknown_row(event["row"], where, version))
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "pass_committed":

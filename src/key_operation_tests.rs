@@ -1399,14 +1399,14 @@ fn key_operation_single_feed_exactly_once() {
 /// production-path positive twin: real journal bytes with one native
 /// thread throughout — a sign self-test (`C_SignInit` + `C_Sign`)
 /// strictly inside an open `C_GenerateKeyPair` on the same session is
-/// provider-internal re-entry. The keygen outputs bind (no
+/// same-thread nested re-entry. The keygen outputs bind (no
 /// tombstone), the self-test joins stay conservative under the
 /// precise internal gap, the helper reads that gap back for the H9
 /// terminal route, and the caller's later sign binds to the created
 /// key. Row-level routing of the internal terminal is pinned by
-/// `key_operation_provider_internal_terminal_routes`.
+/// `key_operation_same_thread_nested_terminal_routes`.
 #[test]
-fn key_operation_provider_internal_same_thread_nesting_binds() {
+fn key_operation_same_thread_nested_binds() {
     use crate::semantics_objects::{ObjectEffect, ObjectGap};
     const PUBLIC: u64 = 0xD2D2_D2D2_D2D2_D2D2;
     const PRIVATE: u64 = 0xD3D3_D3D3_D3D3_D3D3;
@@ -1496,7 +1496,7 @@ fn key_operation_provider_internal_same_thread_nesting_binds() {
         "the keygen binds with no gap at all"
     );
     assert!(
-        !crate::semantics_key_use::KeyUseReducer::is_provider_internal(
+        !crate::semantics_key_use::KeyUseReducer::is_same_thread_nested(
             &sealed.effects.effects,
             outer
         ),
@@ -1511,12 +1511,12 @@ fn key_operation_provider_internal_same_thread_nesting_binds() {
         sealed.effects.effects.iter().any(|effect| matches!(
             effect,
             ObjectEffect::Unresolved { call, reason }
-                if *call == init.ticket && *reason == ObjectGap::ProviderInternal
+                if *call == init.ticket && *reason == ObjectGap::SameThreadNested
         )),
         "the self-test join stays conservative under the precise gap"
     );
     assert!(
-        crate::semantics_key_use::KeyUseReducer::is_provider_internal(
+        crate::semantics_key_use::KeyUseReducer::is_same_thread_nested(
             &sealed.effects.effects,
             init
         ),
@@ -1553,18 +1553,18 @@ fn key_operation_provider_internal_same_thread_nesting_binds() {
     // no tombstone breakage.
     let projection = scene.model.project();
     assert_eq!(projection.objects.len(), 2);
-    assert_eq!(projection.gap(ObjectGap::ProviderInternal), 1);
+    assert_eq!(projection.gap(ObjectGap::SameThreadNested), 1);
     assert_eq!(projection.gap(ObjectGap::SameSessionOverlap), 0);
     assert_eq!(projection.gap(ObjectGap::DependencyBroken), 0);
 }
 
 /// Controller ruling v080-nss-ec-double R2: H9 routes an internal
-/// call's receipt-less terminal to the named `provider_internal`
+/// call's receipt-less terminal to the named `same_thread_nested`
 /// unknown row (v9 section), while an ordinary receipt-less terminal
 /// keeps `unbound`. Driven through the real edge and reducer into a
 /// committed section.
 #[test]
-fn key_operation_provider_internal_terminal_routes() {
+fn key_operation_same_thread_nested_terminal_routes() {
     use crate::key_operation_projection::producer::commit;
     use crate::keymeta::CompletionEvidence;
     let instance =
@@ -1609,7 +1609,7 @@ fn key_operation_provider_internal_terminal_routes() {
         .iter()
         .filter(|row| {
             row.category == "sign"
-                && row.reason == crate::semantics_key_use::PROVIDER_INTERNAL_REASON
+                && row.reason == crate::semantics_key_use::SAME_THREAD_NESTED_REASON
         })
         .collect();
     assert_eq!(internal.len(), 1, "exactly one internal sign row");
@@ -1642,16 +1642,79 @@ fn key_operation_provider_internal_terminal_routes() {
             .as_array()
             .expect("unknown rows render")
             .iter()
-            .any(|row| row["category"] == "sign" && row["reason"] == "provider_internal"),
-        "the rendered section names the internal row"
+            .any(|row| row["category"] == "sign" && row["reason"] == "same_thread_nested"),
+        "the rendered section names the nested row"
     );
 }
 
-/// A rowless internal gap still promotes its section to v9: a nested
+/// RV R2 F3 (D3): a nested keygen direct also names
+/// `same_thread_nested`. A receipt-less `C_GenerateKey` direct with
+/// `internal=true` drives through the real edge and reducer into a
+/// committed section, asserting the `(generate_key,
+/// same_thread_nested)` row and v9.
+#[test]
+fn key_operation_same_thread_nested_direct_routes() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V9, object_observations_json, observations_version,
+    };
+    use crate::keymeta::CompletionEvidence;
+    use crate::semantics_edge::EffectOrigin;
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut assoc_ledger = StagingLedger::new();
+    let c = op("C_GenerateKey", 7, 100);
+    edge.observe_joint_with_resources(
+        &c,
+        &EffectOrigin::from(&c),
+        &[],
+        &CompletionEvidence::NONE,
+        true,
+        &mut sink,
+    )
+    .expect("nested direct replays");
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let scene = JointScene::new();
+    let staging = JointStaging::select_s1_only();
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V9,
+        "the nested direct promotes its section to v9"
+    );
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| {
+            row.category == "generate_key"
+                && row.reason == crate::semantics_key_use::SAME_THREAD_NESTED_REASON
+        })
+        .expect("the nested direct names (generate_key, same_thread_nested)");
+    assert_eq!(
+        (
+            row.completed,
+            row.failed,
+            row.cancelled,
+            row.unknown,
+            row.active,
+        ),
+        (1, 0, 0, 0, 0),
+        "the nested direct counts exactly once"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_eq!(rendered["version"], 9);
+}
+
+/// A rowless nested gap still promotes its section to v9: a nested
 /// call with no key-operation terminal (a non-key use inside another
 /// call) names the gap without any unknown row.
 #[test]
-fn key_operation_provider_internal_gap_promotes_v9() {
+fn key_operation_same_thread_nested_gap_promotes_v9() {
     use crate::key_operation_projection::{
         GapRow, OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V9, ObjectObservations,
         observations_version,
@@ -1660,10 +1723,442 @@ fn key_operation_provider_internal_gap_promotes_v9() {
     assert_eq!(observations_version(&bare), OBSERVATIONS_VERSION);
     bare.gaps.push(GapRow {
         subject: "model",
-        reason: crate::semantics_key_use::PROVIDER_INTERNAL_REASON,
+        reason: crate::semantics_key_use::SAME_THREAD_NESTED_REASON,
         repeats: 1,
     });
     assert_eq!(observations_version(&bare), OBSERVATIONS_VERSION_V9);
+}
+
+/// R3 task (a): the same-thread nested reason must not overclaim
+/// the issuer — a same-thread nested call from an application signal
+/// handler or a provider-invoked application callback re-entering
+/// PKCS#11 on the same session also nests — so the row/gap name is
+/// `same_thread_nested` (what the model proves: same thread, strict
+/// nesting, same session), never `same_thread_nested`. The nested
+/// terminal never binds its inner call to a key: it routes to the
+/// named unknown row, never a proved row.
+#[test]
+fn key_operation_same_thread_nested_reason_is_neutral() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V9, observations_version};
+    use crate::keymeta::CompletionEvidence;
+    use crate::semantics_edge::EffectOrigin;
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut assoc_ledger = StagingLedger::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    edge.observe_joint_with_resources(
+        &c,
+        &EffectOrigin::from(&c),
+        &[],
+        &CompletionEvidence::NONE,
+        true,
+        &mut sink,
+    )
+    .expect("nested init replays");
+    let c = op("C_Sign", 7, 200);
+    edge.observe_joint_with_resources(
+        &c,
+        &EffectOrigin::from(&c),
+        &[],
+        &CompletionEvidence::NONE,
+        true,
+        &mut sink,
+    )
+    .expect("nested op replays");
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let scene = JointScene::new();
+    let staging = JointStaging::select_s1_only();
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V9,
+        "the nested row promotes its section to v9"
+    );
+    assert!(
+        committed
+            .unknown_key_operations
+            .iter()
+            .any(|row| { row.category == "sign" && row.reason == "same_thread_nested" }),
+        "the nested terminal names the neutral same_thread_nested reason: {:?}",
+        committed
+            .unknown_key_operations
+            .iter()
+            .map(|row| row.reason)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        committed.key_operations.is_empty(),
+        "the nested terminal never binds a proved row"
+    );
+}
+
+/// Validate a rendered v9 section against the frozen v9 schema file
+/// (real `commit` output, not hand-built JSON): version const 9 plus
+/// all 15 keys on every proved row. Used by the v9 shape twins in
+/// both no-v7 (blank inferred) and v7 (valued inferred) shapes.
+fn assert_valid_v9_section(rendered: &serde_json::Value) {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema_file: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v9.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::options()
+        .build(&schema_file)
+        .expect("v9 schema builds");
+    assert!(
+        validator.is_valid(rendered),
+        "committed v9 section validates against the frozen v9 schema"
+    );
+    assert_eq!(rendered["version"], 9);
+    for row in rendered["key_operations"].as_array().unwrap() {
+        assert_eq!(
+            row.as_object().unwrap().len(),
+            15,
+            "v9 proved rows carry all 15 keys"
+        );
+    }
+}
+
+/// GLM R2 F1 (blocking), production path: a v9 section with a proved
+/// row but no v7 content must still render all 15 keys per row. The
+/// proved AES sign is mechanism-free (blank inference, no v7), while
+/// an internal unknown terminal promotes the section to v9 via its
+/// row. Before the fix `commit` stripped `inferred` when `!v7`,
+/// emitting schema-invalid 13-key rows in a v9 section.
+#[test]
+fn key_operation_v9_unknown_row_keeps_blank_inferred_keys() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V9, object_observations_json, observations_version,
+    };
+    use crate::keymeta::CompletionEvidence;
+    use crate::semantics_edge::EffectOrigin;
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut assoc_ledger = StagingLedger::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    // Internal unknown terminal on another session: promotes to v9
+    // via its row, without adding any proved row or v7 content.
+    let before = sink.len();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    joint
+        .observe_joint_with_resources(
+            &c,
+            &EffectOrigin::from(&c),
+            &[],
+            &CompletionEvidence::NONE,
+            true,
+            &mut sink,
+        )
+        .expect("internal init replays");
+    let c = op("C_Sign", 7, 200);
+    joint
+        .observe_joint_with_resources(
+            &c,
+            &EffectOrigin::from(&c),
+            &[],
+            &CompletionEvidence::NONE,
+            true,
+            &mut sink,
+        )
+        .expect("internal op replays");
+    for effect in &sink[before..] {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V9,
+        "the internal row promotes its section to v9"
+    );
+    assert_eq!(committed.key_operations.len(), 1, "one proved row");
+    assert!(
+        committed.key_operations[0].inferred.is_some(),
+        "v9 keeps inferred keys even without v7 content"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_eq!(rendered["version"], 9);
+    let row = &rendered["key_operations"][0];
+    assert!(
+        row.get("inferred_family").is_some() && row.get("inferred_size").is_some(),
+        "v9 renders 15 keys per proved row, not 13: {}",
+        serde_json::to_string(row).unwrap_or_default()
+    );
+    assert_valid_v9_section(&rendered);
+}
+
+/// GLM R2 F1 (blocking), rowless-gap trigger: a v9 section promoted
+/// by a model gap alone (no internal unknown row) must still render
+/// all 15 keys per proved row. The nested keygen self-test names the
+/// model gap; the proved AES sign stays mechanism-free (blank
+/// inference). Before the fix the row-shape decision ran before
+/// model gaps were collected, so it missed the v9 trigger and
+/// stripped `inferred`.
+#[test]
+fn key_operation_v9_model_gap_keeps_blank_inferred_keys() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V9, object_observations_json, observations_version,
+    };
+    use crate::semantics_objects::{ObjectEffect, ObjectGap};
+    const PUBLIC: u64 = 0xD2D2_D2D2_D2D2_D2D2;
+    const PRIVATE: u64 = 0xD3D3_D3D3_D3D3_D3D3;
+    let mechanism_free = capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL;
+    let mut scene = JointScene::new();
+    // Nested self-test first (model only): opens the session, then a
+    // same-thread keygen+sign-init nesting that names the precise
+    // model gap. No staging/keyuse yet, so no unknown row follows.
+    let mut open = ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0);
+    open.session = Some(SESSION);
+    let admitted = admit_call_input(&mut scene, &open);
+    scene.adapter.attest_key(&admitted).expect("open attests");
+    ingest_call(&mut scene, &open, admitted.h0_ordinal());
+    scene.seal().expect("open quantum seals");
+    let mut pair = ShapedS1::shaped("C_GenerateKeyPair", CkRv::OK.0, 0, 0);
+    pair.pair_results = Some((PUBLIC, PRIVATE));
+    let mut selftest_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    selftest_init.input0 = Some((PUBLIC, 1));
+    let selftest_sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let admitted = admit_call_input_with_sequence(&mut scene, &selftest_init, 1, 3);
+    scene.adapter.attest_key(&admitted).expect("init attests");
+    let init_pos = admitted.h0_ordinal();
+    let admitted = admit_call_input_with_sequence(&mut scene, &selftest_sign, 1, 4);
+    scene.adapter.attest_key(&admitted).expect("sign attests");
+    let sign_pos = admitted.h0_ordinal();
+    let admitted = admit_call_input_with_sequence(&mut scene, &pair, 1, 2);
+    scene.adapter.attest_key(&admitted).expect("pair attests");
+    let pair_pos = admitted.h0_ordinal();
+    ingest_begin_for_position(&mut scene, &pair, pair_pos);
+    ingest_begin_for_position(&mut scene, &selftest_init, init_pos);
+    ingest_end_for_position(&mut scene, &selftest_init, init_pos);
+    ingest_begin_for_position(&mut scene, &selftest_sign, sign_pos);
+    ingest_end_for_position(&mut scene, &selftest_sign, sign_pos);
+    ingest_end_for_position(&mut scene, &pair, pair_pos);
+    let sealed = scene.seal().expect("nested quantum seals");
+    assert!(
+        sealed.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved { reason, .. }
+                if *reason == ObjectGap::SameThreadNested
+        )),
+        "the nested self-test names the model gap"
+    );
+    // Proved AES row after the nesting (staging starts here, so the
+    // nested calls never reach keyuse and no unknown row follows).
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0, mechanism_free),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V9,
+        "the rowless model gap promotes its section to v9"
+    );
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "no unknown row: the gap rides rowless"
+    );
+    assert_eq!(committed.key_operations.len(), 1, "one proved row");
+    assert!(
+        committed.key_operations[0].inferred.is_some(),
+        "v9 keeps inferred keys even without v7 content"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_eq!(rendered["version"], 9);
+    let row = &rendered["key_operations"][0];
+    assert!(
+        row.get("inferred_family").is_some() && row.get("inferred_size").is_some(),
+        "v9 renders 15 keys per proved row, not 13: {}",
+        serde_json::to_string(row).unwrap_or_default()
+    );
+    assert_valid_v9_section(&rendered);
+}
+
+/// R3 v7-shape twin: a v9 section WITH valued inferred content (the
+/// proved AES sign carries an AES mechanism, so its family infers)
+/// plus a nested unknown terminal. Both v9 triggers (valued inferred
+/// and nested row) hold; the section validates with 15-key rows.
+#[test]
+fn key_operation_v9_valued_inferred_validates() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V9, object_observations_json, observations_version,
+    };
+    use crate::keymeta::CompletionEvidence;
+    use crate::semantics_edge::EffectOrigin;
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut assoc_ledger = StagingLedger::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x1fu16), (4u8, 1u8, 32u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, AES_GCM, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let before = sink.len();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    joint
+        .observe_joint_with_resources(
+            &c,
+            &EffectOrigin::from(&c),
+            &[],
+            &CompletionEvidence::NONE,
+            true,
+            &mut sink,
+        )
+        .expect("nested init replays");
+    let c = op("C_Sign", 7, 200);
+    joint
+        .observe_joint_with_resources(
+            &c,
+            &EffectOrigin::from(&c),
+            &[],
+            &CompletionEvidence::NONE,
+            true,
+            &mut sink,
+        )
+        .expect("nested op replays");
+    for effect in &sink[before..] {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V9,
+        "nested content promotes to v9 (v7 content present too)"
+    );
+    assert_eq!(committed.key_operations.len(), 1, "one proved row");
+    assert!(
+        committed.key_operations[0]
+            .inferred
+            .as_ref()
+            .is_some_and(|keys| keys.is_v7_content()),
+        "the AES mechanism values the inferred family (v7 content)"
+    );
+    let rendered = object_observations_json(&committed);
+    assert_valid_v9_section(&rendered);
 }
 
 /// Controller ruling v080-nss-ec-double R2 (2026-11-21),
@@ -1672,7 +2167,7 @@ fn key_operation_provider_internal_gap_promotes_v9() {
 /// `SameSessionOverlap` fencing stands on both calls, nothing binds,
 /// and the precise internal gap is never named.
 #[test]
-fn key_operation_provider_internal_cross_thread_overlap_stays_uncertain() {
+fn key_operation_same_thread_nested_cross_thread_overlap_stays_uncertain() {
     const PUBLIC: u64 = 0xD2D2_D2D2_D2D2_D2D2;
     const PRIVATE: u64 = 0xD3D3_D3D3_D3D3_D3D3;
     let mut scene = JointScene::new();
@@ -1739,7 +2234,7 @@ fn key_operation_provider_internal_cross_thread_overlap_stays_uncertain() {
         !sealed.effects.effects.iter().any(|effect| matches!(
             effect,
             crate::semantics_objects::ObjectEffect::Unresolved {
-                reason: crate::semantics_objects::ObjectGap::ProviderInternal,
+                reason: crate::semantics_objects::ObjectGap::SameThreadNested,
                 ..
             }
         )),
@@ -9319,7 +9814,7 @@ fn key_operation_schema_contract() {
         crate::semantics_objects::ObjectGap::PairDuplicate,
         crate::semantics_objects::ObjectGap::NullMechanismCancel,
         crate::semantics_objects::ObjectGap::SameSessionOverlap,
-        crate::semantics_objects::ObjectGap::ProviderInternal,
+        crate::semantics_objects::ObjectGap::SameThreadNested,
         crate::semantics_objects::ObjectGap::OverlapUncertain,
         crate::semantics_objects::ObjectGap::OutputCollision,
         crate::semantics_objects::ObjectGap::StaleOrigin,
@@ -32020,13 +32515,13 @@ fn key_operation_schema_v7_pins_inferred_keys() {
     );
 }
 
-/// The v9 schema pins the provider-internal contract: version
+/// The v9 schema pins the same-thread nested contract: version
 /// constant 9, the seven-member unknown-reason enum (the frozen six
-/// plus `provider_internal`), the gap enum plus the precise
+/// plus `same_thread_nested`), the gap enum plus the precise
 /// internal gap, and otherwise v7-identical shapes. The v7 file
 /// stays frozen and forbids the new reason.
 #[test]
-fn key_operation_schema_v9_pins_provider_internal_reason() {
+fn key_operation_schema_v9_pins_same_thread_nested_reason() {
     use crate::key_operation_projection::contract::UNKNOWN_REASONS;
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let read = |name: &str| -> serde_json::Value {
@@ -32060,15 +32555,15 @@ fn key_operation_schema_v9_pins_provider_internal_reason() {
         table(&UNKNOWN_REASONS),
         "v9 carries the full seven-member reason enum"
     );
-    assert!(values(&v9, "/$defs/unknown_reason/enum").contains(&"provider_internal".to_string()));
+    assert!(values(&v9, "/$defs/unknown_reason/enum").contains(&"same_thread_nested".to_string()));
     assert!(
-        !values(&v7, "/$defs/unknown_reason/enum").contains(&"provider_internal".to_string()),
+        !values(&v7, "/$defs/unknown_reason/enum").contains(&"same_thread_nested".to_string()),
         "v7 stays frozen without the new reason"
     );
     // The gap vocabulary gains the precise internal gap and
     // nothing else.
     let mut v7_gaps = values(&v7, "/$defs/gap_reason/enum");
-    v7_gaps.push("provider_internal".to_string());
+    v7_gaps.push("same_thread_nested".to_string());
     v7_gaps.sort();
     assert_eq!(
         values(&v9, "/$defs/gap_reason/enum"),

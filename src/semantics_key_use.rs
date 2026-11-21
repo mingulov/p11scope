@@ -1068,7 +1068,7 @@ impl JointStaging {
         // complete a binding this seal just unproved.
         let completion =
             KeyUseReducer::completion_evidence_for_effects(&seal.effects.effects, &settled[0]);
-        let internal = KeyUseReducer::is_provider_internal(&seal.effects.effects, &settled[0]);
+        let internal = KeyUseReducer::is_same_thread_nested(&seal.effects.effects, &settled[0]);
         let outcome = {
             let mut tee = KeyUseTee {
                 outer: sink,
@@ -1202,7 +1202,7 @@ impl JointStaging {
                 self.redeemed = self.redeemed.saturating_add(1);
                 let receipts = keyuse.receipts_for_effects(effects, call, head.position);
                 let completion = KeyUseReducer::completion_evidence_for_effects(effects, call);
-                let internal = KeyUseReducer::is_provider_internal(effects, call);
+                let internal = KeyUseReducer::is_same_thread_nested(effects, call);
                 let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
                 if early_release {
                     ledger.release(head.position, head.charged_bytes());
@@ -1957,22 +1957,25 @@ pub(crate) fn unbound_reason_for(category: &str) -> &'static str {
     }
 }
 
-/// The frozen unknown-key reason for a provider-internal re-entrant
-/// call's terminal (controller ruling v080-nss-ec-double R2,
-/// 2026-11-21): the call started and ended on one thread strictly
-/// inside another open call on the same session (the known instance
-/// is the NSS softoken EC-keygen pairwise self-test), so its key
-/// birth is the still-in-flight outer call and no receipt binds it.
-/// A named unknown row, never a dropped terminal.
-pub(crate) const PROVIDER_INTERNAL_REASON: &str = "provider_internal";
+/// The frozen unknown-key reason for a same-thread nested
+/// re-entrant call's terminal (controller ruling v080-nss-ec-double
+/// R2, 2026-11-21; renamed neutral in R3): the call started and
+/// ended on one thread strictly inside another open call on the same
+/// session (the known instance is the NSS softoken EC-keygen pairwise
+/// self-test; a same-thread nested call from an application signal
+/// handler or a provider callback nests too, so the issuer is never
+/// proven), so its key birth is the still-in-flight outer call and no
+/// receipt binds it. A named unknown row — never binding the inner
+/// call to a key — never a dropped terminal.
+pub(crate) const SAME_THREAD_NESTED_REASON: &str = "same_thread_nested";
 
 /// The frozen unknown-key reason for a receipt-less terminal:
-/// provider-internal re-entry names itself whatever the category
+/// same-thread nested re-entry names itself whatever the category
 /// (the re-entry explains the missing receipt, subsuming the
 /// category default); everything else keeps [`unbound_reason_for`].
 pub(crate) fn unknown_reason_for(category: &str, internal: bool) -> &'static str {
     if internal {
-        PROVIDER_INTERNAL_REASON
+        SAME_THREAD_NESTED_REASON
     } else {
         unbound_reason_for(category)
     }
@@ -2268,7 +2271,7 @@ pub(crate) const UNKNOWN_CATEGORIES: [&str; 23] = [
 ];
 
 /// The fixed unknown-summary reason vocabulary (H9 §82 plus the
-/// R2 provider-internal re-entry reason). Mirrors the frozen
+/// R2 same-thread nested re-entry reason). Mirrors the frozen
 /// contract table; the schema contract test pins them equal.
 pub(crate) const UNKNOWN_REASONS: [&str; 7] = [
     "unbound",
@@ -2277,7 +2280,7 @@ pub(crate) const UNKNOWN_REASONS: [&str; 7] = [
     "metadata_conflicting",
     "role_unavailable",
     "not_applicable",
-    PROVIDER_INTERNAL_REASON,
+    SAME_THREAD_NESTED_REASON,
 ];
 
 /// Fixed unknown summaries: every category × reason pair exists, so
@@ -2834,9 +2837,9 @@ pub(crate) struct OpenKeyUse {
     /// Whether any receipt bound (receipt-less opens close to the
     /// unknown-key summary with explicit evidence — never loss).
     bound: bool,
-    /// Whether the starting call is provider-internal re-entry
+    /// Whether the starting call is same-thread nested re-entry
     /// (seal evidence, fixed at start): its receipt-less terminal
-    /// routes to the `provider_internal` unknown row.
+    /// routes to the `same_thread_nested` unknown row.
     internal: bool,
     /// The open's prospective-association ticket plus which ledger
     /// minted it (N1c): ends release to the minting ledger, or pend
@@ -2852,8 +2855,8 @@ pub(crate) struct RefusedOpen {
     pub instance: RegistryInstanceId,
     pub category: &'static str,
     pub started_ts_ns: u64,
-    /// Whether the refused start is provider-internal re-entry:
-    /// its terminal keeps the `provider_internal` route.
+    /// Whether the refused start is same-thread nested re-entry:
+    /// its terminal keeps the `same_thread_nested` route.
     pub internal: bool,
 }
 
@@ -2878,8 +2881,9 @@ pub(crate) struct KeyUseReducer {
     unknown: [UnknownCounters; UNKNOWN_BUCKETS],
     /// Fixed unknown summaries ever live (N9): once a summary row
     /// emits, its zero-active replacement emits forever after, so the
-    /// cumulative consumer never keeps stale activity. Fixed 138
-    /// flags — within the finite summary bound, never cleared.
+    /// cumulative consumer never keeps stale activity. Fixed 161
+    /// flags (23 categories × 7 reasons) — within the finite summary
+    /// bound, never cleared.
     unknown_ever_live: [bool; UNKNOWN_BUCKETS],
     capacity: usize,
     evidence: KeyUseEvidence,
@@ -3940,17 +3944,17 @@ impl KeyUseReducer {
         self.receipts_for_effects(&seal.effects.effects, settled, position)
     }
 
-    /// Whether the settled call is provider-internal re-entry: the
+    /// Whether the settled call is same-thread nested re-entry: the
     /// model left exactly this ticket unresolved under the precise
-    /// `ProviderInternal` gap. Ticket-qualified like the receipts
+    /// `SameThreadNested` gap. Ticket-qualified like the receipts
     /// below — never another call's gap.
-    pub(crate) fn is_provider_internal(effects: &[ObjectEffect], settled: &SealedCall) -> bool {
+    pub(crate) fn is_same_thread_nested(effects: &[ObjectEffect], settled: &SealedCall) -> bool {
         effects.iter().any(|effect| {
             matches!(
                 effect,
                 ObjectEffect::Unresolved { call, reason }
                     if *call == settled.ticket
-                        && *reason == crate::semantics_objects::ObjectGap::ProviderInternal
+                        && *reason == crate::semantics_objects::ObjectGap::SameThreadNested
             )
         })
     }

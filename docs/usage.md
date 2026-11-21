@@ -1767,15 +1767,19 @@ Limits that matter in pods:
   caller-issued EC sign and verify can show two completions each;
   that is the provider's own activity, not an overcount. A call that
   starts and ends on one thread strictly inside another open call on
-  the same session is classified provider-internal re-entry: the
+  the same session is classified same-thread nested re-entry: the
+  name describes the proven shape (one thread, strict nesting, one
+  session), never the issuer — a same-thread nested call from an
+  application signal handler or a provider-invoked application
+  callback re-entering PKCS#11 on the same session nests too. The
   outer creation's outputs still bind (so the caller's later uses
   bind to the created key), while the inner call's own terminal is
-  reported on the named `provider_internal` unknown row instead of
+  reported on the named `same_thread_nested` unknown row instead of
   `unbound` (with `-v` beside the tallies, and as the row's `reason`
-  in `--json`, section version 9). Cross-thread or otherwise
-  unprovable same-session overlap keeps the conservative shape: the
-  fenced creation's outputs stay unknown and later uses report
-  `unbound`. With `-v`, objects created from templates
+  in `--json`, section version 9), never binding the inner call to a
+  key. Cross-thread or otherwise unprovable same-session overlap
+  keeps the conservative shape: the fenced creation's outputs stay
+  unknown and later uses report `unbound`. With `-v`, objects created from templates
   beyond eight slots are counted on their own line (`  template
   truncated (first 8 attributes captured) (N objects)`); `--json`
   carries the same reason on each unseen metadata field. Templates

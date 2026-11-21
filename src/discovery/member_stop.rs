@@ -206,7 +206,8 @@ pub(crate) struct MemberStopStats {
     pub(crate) unreadable: u64,
     pub(crate) departed: u64,
     /// Stopped members kept for a retry: not pinnable, membership
-    /// unverified, or no signal authority for the resume.
+    /// unverified, no signal authority for the resume, or maps unreadable
+    /// while the stop still holds (retried next pass, no gap yet).
     pub(crate) resume_unavailable: u64,
     /// Rows whose tgid now names a process outside the run tree.
     pub(crate) not_members: u64,
@@ -761,6 +762,33 @@ impl Engine {
         crate::process::PidPin::open(tgid)
     }
 
+    /// One maps snapshot of a stopped member: its retained proc handle,
+    /// its executable rows with the stopping row first, and its
+    /// FUSE-backed devices. A single attempt of the intake's bounded
+    /// per-pass retries (tests can script the failure).
+    fn read_member_snapshot<'a>(
+        &self,
+        pin: &'a crate::process::PidPin,
+        tgid: u32,
+        stop: &MemberStop,
+        deadline: std::time::Instant,
+    ) -> Result<(crate::process::ProcPin<'a>, Vec<ExecRow>, BTreeSet<u64>), String> {
+        #[cfg(not(test))]
+        let _ = tgid;
+        let proc = pin.open_proc_dir()?;
+        #[cfg(test)]
+        if self.member_stops.maps_fail.contains(&tgid) {
+            return Err("scripted maps failure".to_string());
+        }
+        let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
+        let (fuse, overlay) = self.member_mount_devices(&proc, deadline)?;
+        Ok((
+            proc,
+            with_stopping_row(exec_rows(&maps), stop, &overlay),
+            fuse,
+        ))
+    }
+
     /// Holds `pin` as if a provider staging were pending since `since_ns`.
     #[cfg(test)]
     pub(crate) fn hold_member_for_test(
@@ -968,70 +996,87 @@ impl Engine {
             }
         }
         let deadline = (std::time::Instant::now() + self.member_budget()).min(pass_deadline);
-        #[cfg(test)]
-        let scripted_maps_failure = self.member_stops.maps_fail.contains(&tgid);
-        #[cfg(not(test))]
-        let scripted_maps_failure = false;
-        let rows = pin
-            .open_proc_dir()
-            .and_then(|proc| {
-                if scripted_maps_failure {
-                    return Err("scripted maps failure".to_string());
+        // A read that fails while the stop still proves the member ran
+        // nothing retries instead of filing the gap at once: a stopped
+        // member cannot run unobserved, and a dying one never returns to
+        // userspace, so an instant gap would be false (a teardown race —
+        // SIGKILL landing between the intake check and this read — files
+        // exactly that false gap today). Bounded attempts per pass, then
+        // the row waits for the next pass; the hold bound still resumes it
+        // there with the named gap. Only a member that provably ran past
+        // the mapping — or whose stop proof is lost — files the gap at
+        // once, and then the gap is true.
+        let mut snapshot = None;
+        let mut last_error = String::new();
+        for _ in 0..MEMBER_STOP_UNREADABLE_READ_ATTEMPTS_PER_PASS {
+            match self.read_member_snapshot(&pin, tgid, &stop, deadline) {
+                Ok(read) => {
+                    snapshot = Some(read);
+                    break;
                 }
-                let maps = proc.read_maps(deadline, MEMBER_STOP_MAPS_BYTES)?;
-                let (fuse, overlay) = self.member_mount_devices(&proc, deadline)?;
-                Ok((
-                    proc,
-                    with_stopping_row(exec_rows(&maps), &stop, &overlay),
-                    fuse,
-                ))
-            })
-            .map(|(proc, rows, fuse)| {
-                // A FUSE-backed file is never opened: its server may be
-                // another stopped member, and the open would block this
-                // thread (and every bound) until it ran again.
-                let (fuse_rows, rows): (Vec<_>, Vec<_>) = rows
-                    .into_iter()
-                    .partition(|row| fuse.contains(&row.maps_dev) || fuse.contains(&row.key.dev));
-                (
-                    self.prove_member_rows(&pin, &proc, rows, deadline),
-                    fuse_rows,
-                )
-            });
-        let ((cleared, providers), fuse_rows) = match rows {
-            Ok(proven) => proven,
-            Err(error) => {
-                if member_died_with_row_pending(tgid) {
-                    // Died between the intake check and this read: the
-                    // same gated withdrawal as above, not an unreadable
-                    // live member (a corpse counts departed, never
-                    // unreadable).
-                    let doubt = silent_corpse_withdrawal(
-                        stop.nr_threads == 1,
-                        pin.start_time(),
-                        stop.hook_ts_ns,
-                    );
-                    let _ = io.withdraw(tgid);
-                    let _ = pin.send_signal(libc::SIGCONT);
-                    self.member_stops.stats.departed =
-                        self.member_stops.stats.departed.saturating_add(1);
-                    if let Some(why) = doubt {
-                        self.note_first_use_gap(tgid, why);
+                Err(error) => {
+                    last_error = error;
+                    if member_died_with_row_pending(tgid) {
+                        // Died between the intake check and this read: the
+                        // same gated withdrawal as above, not an unreadable
+                        // live member (a corpse counts departed, never
+                        // unreadable).
+                        let doubt = silent_corpse_withdrawal(
+                            stop.nr_threads == 1,
+                            pin.start_time(),
+                            stop.hook_ts_ns,
+                        );
+                        let _ = io.withdraw(tgid);
+                        let _ = pin.send_signal(libc::SIGCONT);
+                        self.member_stops.stats.departed =
+                            self.member_stops.stats.departed.saturating_add(1);
+                        if let Some(why) = doubt {
+                            self.note_first_use_gap(tgid, why);
+                        }
+                        return false;
                     }
-                    return false;
+                    if !stop_still_proves_nothing_ran(&pin, tgid, since_ns) {
+                        self.member_stops.stats.unreadable =
+                            self.member_stops.stats.unreadable.saturating_add(1);
+                        if crate::run::capture_diagnostics_on() {
+                            eprintln!(
+                                "p11scope: stopped run member {tgid} unreadable: {last_error}; resumed"
+                            );
+                        }
+                        self.resume_or_force(io, &pin, since_ns, now_ns, stop.nr_threads == 1);
+                        // Nothing about its stopping file is proven: it may be a
+                        // provider whose first calls now run unwatched.
+                        self.note_first_use_gap(tgid, "its maps were unreadable");
+                        return false;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
                 }
-                self.member_stops.stats.unreadable =
-                    self.member_stops.stats.unreadable.saturating_add(1);
-                if crate::run::capture_diagnostics_on() {
-                    eprintln!("p11scope: stopped run member {tgid} unreadable: {error}; resumed");
-                }
-                self.resume_or_force(io, &pin, since_ns, now_ns, stop.nr_threads == 1);
-                // Nothing about its stopping file is proven: it may be a
-                // provider whose first calls now run unwatched.
-                self.note_first_use_gap(tgid, "its maps were unreadable");
-                return false;
             }
+        }
+        let Some((proc, rows, fuse)) = snapshot else {
+            // Still unreadable with the stop intact: the row waits for the
+            // next pass (no gap; the member waits stopped). Inside the
+            // bound this keeps the row; at the bound the member resumes
+            // with the named gap (its first calls may run unwatched).
+            self.retry_or_force(
+                io,
+                tgid,
+                since_ns,
+                now_ns,
+                &format!("maps unreadable while the stop still holds: {last_error}"),
+                stop.nr_threads == 1,
+            );
+            return false;
         };
+        // A FUSE-backed file is never opened: its server may be
+        // another stopped member, and the open would block this
+        // thread (and every bound) until it ran again.
+        let (fuse_rows, rows): (Vec<_>, Vec<_>) = rows
+            .into_iter()
+            .partition(|row| fuse.contains(&row.maps_dev) || fuse.contains(&row.key.dev));
+        let (cleared, providers) = self.prove_member_rows(&pin, &proc, rows, deadline);
         for key in &cleared {
             self.clear_member_file(io, *key);
         }
@@ -2341,7 +2386,7 @@ d000-e000 r-xp 00000000 103:05 77  /opt/with space.so\n";
     #[test]
     fn stop_hold_samples_pin_every_task_shape() {
         // Stopped, dead and dying hold.
-        for state in [b'T', b'Z', b'X', b'x'] {
+        for state in *b"TZXx" {
             assert!(
                 all_tasks_constrained(&[(state, None)]),
                 "{} holds",
@@ -2362,7 +2407,7 @@ d000-e000 r-xp 00000000 103:05 77  /opt/with space.so\n";
         );
         assert!(all_tasks_constrained(&[]), "reaped holds vacuously");
         // Anything that may run userspace files.
-        for state in [b'R', b'S', b'D', b't', b'K', b'W', b'P', b'I', b'?'] {
+        for state in *b"RSDtKWPI?" {
             assert!(
                 !all_tasks_constrained(&[(state, None)]),
                 "{} files",

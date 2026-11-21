@@ -7923,6 +7923,39 @@ fn teardown_wait_and_reprove(
     process::whole_group_proven_exited(view)
 }
 
+/// Cap of the post-scan `gone` micro-wait: a member with a fatal signal
+/// pending enters `do_exit` within microseconds (scheduler latency on a
+/// loaded host), so 10 ms covers it with margin, while a live group pays
+/// at most 10 ms — and only when its leader is already dead or exiting
+/// (ordinary live leaders never wait).
+const GONE_REWAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// One bounded re-proof for a mem-`gone` the post-scan proof cannot yet
+/// prove: when the leader is already dead or exiting, waits (pidfd, at
+/// most [`GONE_REWAIT_TIMEOUT`], immediate wake when the group exits) and
+/// re-proves once. True (silent) only when the re-proof holds; a live
+/// survivor, a live leader, or a pin without a pidfd keeps the latch
+/// loud. Records one `gone_rewait` span when the wait runs (never when
+/// the trigger refuses it), with its own cap — the shared teardown
+/// budget is untouched.
+fn gone_rewait_and_reprove(view: &ProcessView, stage: &mut crate::timing::StageTimings) -> bool {
+    if !process::leader_dead_or_exiting(view) {
+        return false;
+    }
+    if view.retained_pin().pidfd().is_err() {
+        return false;
+    }
+    let wait_start = crate::attach::monotonic_ns();
+    let _ = view.retained_pin().wait_ready(Some(GONE_REWAIT_TIMEOUT));
+    stage.span(
+        crate::timing::StageKind::Scan,
+        "gone_rewait",
+        wait_start,
+        crate::attach::monotonic_ns(),
+    );
+    process::whole_group_proven_exited(view)
+}
+
 /// One scan plus its pins plus its shape proof: the modules, the pins,
 /// the completeness verdict, the negative examined-file evidence, and
 /// the provider `.so`-set of the scan's own initial maps.
@@ -8039,11 +8072,18 @@ fn scan_and_pin_with_proof(
     // end of the process, not capture-wide loss. Only a `gone` pays for
     // the proof read; any other unavailable reason stays latched either
     // way, and a live group (unproven, no teardown wait) stays loud.
+    // Below it, one bounded micro-wait covers the multi-threaded teardown
+    // the deferral above cannot see: a zombie leader with a member that
+    // holds a fatal signal but has not entered `do_exit` yet fails the
+    // census for microseconds, and the leader never shows the
+    // `PF_EXITING`-not-zombie shape that would wait for it.
     let gone_silenced = outcome.unavailable_reason() == Some("gone")
         && if deferral_ran {
             deferred_proven
+        } else if process::whole_group_proven_exited(view) {
+            true
         } else {
-            process::whole_group_proven_exited(view)
+            gone_rewait_and_reprove(view, stage)
         };
     if !gone_silenced {
         counters.scan_unavailable = counters.scan_unavailable.or(outcome.unavailable_reason());

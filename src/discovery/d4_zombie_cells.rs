@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 /// exits its own thread via raw `exit(2)`. Killed and reaped on drop.
 /// The survivors share the child's frozen post-fork mappings, so their
 /// maps stay byte-stable for like-for-like reads.
-struct ZombieLeaderGroup {
+pub(crate) struct ZombieLeaderGroup {
     tgid: u32,
     survivor: u32,
     second: Option<u32>,
@@ -68,7 +68,12 @@ extern "C" fn clone_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
 }
 
 impl ZombieLeaderGroup {
-    fn spawn() -> Self {
+    /// The group's tgid (the zombie leader's pid).
+    pub(crate) fn tgid(&self) -> u32 {
+        self.tgid
+    }
+
+    pub(crate) fn spawn() -> Self {
         let (tgid, survivors) = Self::spawn_inner(1);
         Self {
             tgid,

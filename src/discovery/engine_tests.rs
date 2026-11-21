@@ -92327,6 +92327,8 @@ fn member_stop_row(
         hook_ts_ns: 1,
         vm_start,
         vm_end,
+        nr_threads: 1,
+        reserved: 0,
     }
 }
 
@@ -92576,6 +92578,8 @@ fn member_stop_resume_keeps_the_row_without_signal_authority() {
         hook_ts_ns: 1,
         vm_start: 0x1000,
         vm_end: 0x2000,
+        nr_threads: 1,
+        reserved: 0,
     };
     io.rows.insert(pid, row);
     // Wrong start time: the fallback pin cannot be re-proven.
@@ -92613,6 +92617,8 @@ fn stopped_member_with_row(io: &mut ScriptedMemberStops) -> (std::process::Child
             hook_ts_ns: stop_ns,
             vm_start: 0x1000,
             vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
         },
     );
     (child, pid, stop_ns)
@@ -92824,6 +92830,378 @@ fn member_stop_guard_loss_drain_withdraws_a_dead_member_silently() {
     let _ = child.wait();
 }
 
+/// A `MemberStopIo` that SIGKILLs one scripted member in the middle of
+/// its intake, so death lands between two production checks
+/// deterministically. The kill waits for both death seams (`/proc` stat
+/// and the hold's pidfd), so a twin that proceeds to a hold resolve is
+/// stable too. The test still owns the child handle and reaps it.
+struct KillingMemberStops {
+    inner: ScriptedMemberStops,
+    victim: u32,
+    /// Kill on the next membership read (after the pre-check, before the
+    /// maps read): the unreadable/unproven re-checks meet the corpse.
+    kill_on_membership: bool,
+    /// Kill on the next file clearance (after the maps snapshot was read
+    /// and proven, before the unproven re-check): site 3 meets a corpse
+    /// with staged providers.
+    kill_on_clear: bool,
+    killed: bool,
+}
+
+impl KillingMemberStops {
+    fn for_membership(inner: ScriptedMemberStops, victim: u32) -> Self {
+        Self {
+            inner,
+            victim,
+            kill_on_membership: true,
+            kill_on_clear: false,
+            killed: false,
+        }
+    }
+
+    fn for_clear(inner: ScriptedMemberStops, victim: u32) -> Self {
+        Self {
+            inner,
+            victim,
+            kill_on_membership: false,
+            kill_on_clear: true,
+            killed: false,
+        }
+    }
+
+    fn kill_victim(&mut self) {
+        assert_eq!(
+            unsafe { libc::kill(self.victim as i32, libc::SIGKILL) },
+            0,
+            "the victim is signalled"
+        );
+        wait_zombie_for_test(self.victim);
+        for _ in 0..500 {
+            if let Ok(pin) = crate::process::PidPin::open(self.victim)
+                && matches!(pin.original_exited(), Ok(true))
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!(
+            "member {} never looked exited through its pidfd",
+            self.victim
+        );
+    }
+}
+
+impl MemberStopIo for KillingMemberStops {
+    fn pending(&mut self) -> Result<Vec<(u32, p11scope_ebpf_common::MemberStop)>, String> {
+        self.inner.pending()
+    }
+    fn clear(&mut self, file: p11scope_ebpf_common::MemberFileKey) -> Result<(), String> {
+        if self.kill_on_clear && !self.killed {
+            self.killed = true;
+            self.kill_victim();
+        }
+        self.inner.clear(file)
+    }
+    fn withdraw(&mut self, tgid: u32) -> Result<(), String> {
+        self.inner.withdraw(tgid)
+    }
+    fn counters(&mut self) -> Result<[u64; 4], String> {
+        self.inner.counters()
+    }
+    fn deactivate(&mut self) -> Result<(), String> {
+        self.inner.deactivate()
+    }
+    fn quiesce(&mut self) -> bool {
+        self.inner.quiesce()
+    }
+    fn is_run_member(&mut self, pin: &crate::process::PidPin) -> Result<bool, String> {
+        if self.kill_on_membership && !self.killed && pin.pid() == self.victim {
+            self.killed = true;
+            self.kill_victim();
+        }
+        self.inner.is_run_member(pin)
+    }
+    fn guard_lost(&mut self) -> bool {
+        self.inner.guard_lost()
+    }
+    fn tgid_in_run_tree(&mut self, tgid: u32) -> Result<bool, String> {
+        self.inner.tgid_in_run_tree(tgid)
+    }
+}
+
+/// A corpse stopped while multi-threaded keeps its first-use gap: a
+/// sibling thread may have run userspace code after the stopping mapping
+/// while the group stop propagated to it (a mapping it made in that
+/// window took the hook's EEXIST path, unstaged and uncounted). The
+/// departure still counts exactly once.
+#[test]
+fn member_stop_multi_threaded_corpse_files_the_first_use_gap() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    io.rows.get_mut(&pid).expect("scripted row").nr_threads = 2;
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        files_the_first_use_row(&engine),
+        "a multi-threaded corpse keeps its gap"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted once"
+    );
+    let _ = child.wait();
+}
+
+/// A corpse whose process number names a process born after its stop
+/// keeps its first-use gap: the new occupant's mappings fell into the
+/// stale row's EEXIST shadow and ran unprotected. The departure still
+/// counts exactly once.
+#[test]
+fn member_stop_reused_number_corpse_files_the_first_use_gap() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, _stop_ns) = stopped_member_with_row(&mut io);
+    io.rows.get_mut(&pid).expect("scripted row").hook_ts_ns = 1;
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, crate::attach::monotonic_ns());
+    assert!(
+        files_the_first_use_row(&engine),
+        "a reused number keeps its gap"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted once"
+    );
+    let _ = child.wait();
+}
+
+/// Twin of `member_stop_unproven_stopping_file_beside_a_provider_files_the_row`
+/// for a member that dies after its snapshot was proven: site 3 counts
+/// the departure, the corpse's staged providers resolve it in the same
+/// pass, and the departure counts exactly once.
+#[test]
+fn member_stop_corpse_with_staged_providers_counts_departed_once() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    stop_member_for_test(pid);
+    let mut inner = ScriptedMemberStops::default();
+    let stop_ns = crate::attach::monotonic_ns().unwrap();
+    inner.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: stop_ns,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
+        },
+    );
+    let mut io = KillingMemberStops::for_clear(inner, pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        io.killed,
+        "the kill seam fired between the snapshot and site 3"
+    );
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the provider stages from the live snapshot"
+    );
+    assert!(
+        !engine.member_stops_held(),
+        "the corpse's hold resolves in the same pass"
+    );
+    assert_eq!(io.inner.withdrawn, vec![pid], "the row withdraws once");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "one departure, not two"
+    );
+    assert!(
+        !files_the_first_use_row(&engine),
+        "a single-threaded corpse owes no gap"
+    );
+    let _ = fixture.child.wait();
+}
+
+/// The intake's unreadable-maps re-check is the silencer when death lands
+/// between the pre-check and the maps read: alive at the pre-check, a
+/// corpse with failed maps after. (The union twin kills before the
+/// service, so the pre-check catches it and never reaches this hunk.)
+#[test]
+fn member_stop_mid_intake_death_with_unreadable_maps_withdraws_silently() {
+    let mut inner = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut inner);
+    let mut io = KillingMemberStops::for_membership(inner, pid);
+    let mut engine = member_stop_engine();
+    engine.member_stops.maps_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(io.killed, "the kill seam fired after the pre-check");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no gap for a corpse with unreadable maps"
+    );
+    assert!(!io.inner.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted"
+    );
+    let _ = child.wait();
+}
+
+/// The intake's unproven-file re-check is the silencer when death lands
+/// between the pre-check and the proof: alive at the pre-check, a corpse
+/// with an empty maps snapshot after. (The mountinfo override keeps the
+/// zombie's unreadable mount namespace from routing to the unreadable
+/// re-check instead.)
+#[test]
+fn member_stop_mid_intake_death_with_unproven_file_withdraws_silently() {
+    let mut inner = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut inner);
+    let mut io = KillingMemberStops::for_membership(inner, pid);
+    let mut engine = member_stop_engine();
+    engine.member_stops.fuse_devs = Some(BTreeSet::new());
+    engine.member_stops.overlay_devs = Some(BTreeSet::new());
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(io.killed, "the kill seam fired after the pre-check");
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no gap for a corpse with an unproven file"
+    );
+    assert!(!io.inner.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted"
+    );
+    let _ = child.wait();
+}
+
+/// The intake pre-check withdraws a dead member as departed before any
+/// membership read: a corpse whose number is also scripted outside the
+/// run tree counts departed, not not-members.
+#[test]
+fn member_stop_precheck_withdraws_a_dead_non_member_as_departed() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    io.non_members.insert(pid);
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no gap for a dead member"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    let stats = engine.member_stop_stats_for_test();
+    assert_eq!(stats.departed, 1, "the departure is counted");
+    assert_eq!(
+        stats.not_members, 0,
+        "the pre-check runs before the membership read"
+    );
+    let _ = child.wait();
+}
+
+/// A dead leader with a live survivor is not a corpse: the full task
+/// enumeration finds the survivor and the loud path files the gap.
+#[test]
+fn member_stop_dead_leader_with_live_survivor_files_the_first_use_gap() {
+    use crate::discovery::sweep_attribution::tests::d4_zombie_cells::ZombieLeaderGroup;
+    let group = ZombieLeaderGroup::spawn();
+    let pid = group.tgid();
+    let mut io = ScriptedMemberStops::default();
+    let stop_ns = crate::attach::monotonic_ns().unwrap();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: stop_ns,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
+        },
+    );
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        files_the_first_use_row(&engine),
+        "a live survivor keeps the gap loud"
+    );
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        0,
+        "no silent withdrawal for the living"
+    );
+}
+
+/// Capture end counts a held member that died waiting for its attach:
+/// release-time departures are visible like drain-time ones.
+#[test]
+fn member_stop_release_counts_a_held_corpse_as_departed() {
+    let (mut fixture, _view, _module, _pins) = loaded_seed_provider();
+    let pid = fixture.child.id();
+    let library = fixture._dir.path().join("seed-provider.so");
+    stop_member_for_test(pid);
+    let key = member_exec_key_for_test(pid, &library);
+    let (vm_start, vm_end) = member_exec_range_for_test(pid, &library);
+    let mut io = ScriptedMemberStops::default();
+    let stop_ns = crate::attach::monotonic_ns().unwrap();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: key,
+            hook_ts_ns: stop_ns,
+            vm_start,
+            vm_end,
+            nr_threads: 1,
+            reserved: 0,
+        },
+    );
+    let mut engine = member_stop_engine();
+    engine.pause_owned_batch = true;
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        engine.member_stops_held(),
+        "held: {:?}",
+        engine.member_stop_stats_for_test()
+    );
+    let _ = fixture.child.kill();
+    wait_zombie_for_test(pid);
+    engine.release_member_stops(&mut io);
+    assert!(!engine.member_stops_held(), "the hold ends at release");
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the release-time departure counts"
+    );
+    assert!(
+        !files_the_first_use_row(&engine),
+        "the release files no gap for a staged corpse"
+    );
+    let _ = fixture.child.wait();
+}
+
 /// Twin: at the bound, a tgid whose process was born after the row's
 /// stop is another process (the member exited and its number was
 /// reused): its row is withdrawn and it is never signalled.
@@ -92845,6 +93223,8 @@ fn member_stop_bound_never_signals_a_process_born_after_the_stop() {
             hook_ts_ns: 1,
             vm_start: 0x1000,
             vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
         },
     );
     let mut engine = member_stop_engine();
@@ -93018,6 +93398,8 @@ fn member_stop_unreadable_exit_state_never_abandons_a_held_member() {
         hook_ts_ns: 1,
         vm_start: 0x1000,
         vm_end: 0x2000,
+        nr_threads: 1,
+        reserved: 0,
     };
     io.rows.insert(pid, row);
     let mut engine = member_stop_engine();
@@ -93446,6 +93828,8 @@ fn member_stop_release_withdraws_a_gone_members_row() {
             hook_ts_ns: 1,
             vm_start: 0x1000,
             vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
         },
     );
     let mut engine = member_stop_engine();
@@ -94301,6 +94685,8 @@ fn member_stop_unproven_stopping_file_beside_a_provider_files_the_row() {
             hook_ts_ns: 1,
             vm_start: 0x1000,
             vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
         },
     );
     let mut engine = member_stop_engine();

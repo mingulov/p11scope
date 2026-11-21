@@ -64,15 +64,21 @@ struct ms_file {
 _Static_assert(sizeof(struct ms_file) == 16, "file key ABI");
 
 /* MS_STOPS value: the file whose mapping requested the stop, the
- * monotonic time of the request and the new mapping's exact range. */
+ * monotonic time of the request, the new mapping's exact range, and the
+ * stopped thread-group's size at the stop (nr_threads; 0 when the hook
+ * could not read it). Userspace withdraws a dead member silently only
+ * from a single-threaded stop of its own generation. */
 struct ms_stop {
     struct ms_file file;
     u64 hook_ts_ns;
     u64 vm_start;
     u64 vm_end;
+    u32 nr_threads;
+    u32 reserved;
 };
-_Static_assert(sizeof(struct ms_stop) == 40, "stop ABI");
+_Static_assert(sizeof(struct ms_stop) == 48, "stop ABI");
 _Static_assert(__builtin_offsetof(struct ms_stop, hook_ts_ns) == 16, "stop time");
 _Static_assert(__builtin_offsetof(struct ms_stop, vm_start) == 24, "stop range");
+_Static_assert(__builtin_offsetof(struct ms_stop, nr_threads) == 40, "stop threads");
 
 #endif

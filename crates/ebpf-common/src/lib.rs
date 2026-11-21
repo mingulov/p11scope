@@ -985,9 +985,14 @@ pub struct MemberStopConfig {
 }
 
 /// One pending member stop: the file whose mapping requested it, the
-/// kernel time of the request (`CLOCK_MONOTONIC`) and the new mapping's
+/// kernel time of the request (`CLOCK_MONOTONIC`), the new mapping's
 /// exact range, which names its `maps` row whatever inode or device the
-/// row prints (overlayfs).
+/// row prints (overlayfs), and the stopped thread-group's size at the
+/// stop. A dead member withdraws silently only from a single-threaded
+/// stop of its own generation: a sibling thread may run userspace code
+/// after the stopping mapping while the group stop propagates to it, so
+/// a multi-threaded corpse keeps its first-use gap. Zero means the hook
+/// could not read the count, which also keeps the gap.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct MemberStop {
@@ -995,6 +1000,9 @@ pub struct MemberStop {
     pub hook_ts_ns: u64,
     pub vm_start: u64,
     pub vm_end: u64,
+    pub nr_threads: u32,
+    /// Must be zero (explicit padding; the hook zero-initializes the row).
+    pub reserved: u32,
 }
 
 fn zero_discovery_payload(record: &DiscoveryRecord) -> bool {
@@ -3187,10 +3195,12 @@ mod tests {
     #[test]
     fn member_stop_shapes_are_fixed() {
         assert_eq!(core::mem::size_of::<MemberFileKey>(), 16);
-        assert_eq!(core::mem::size_of::<MemberStop>(), 40);
+        assert_eq!(core::mem::size_of::<MemberStop>(), 48);
         assert_eq!(core::mem::offset_of!(MemberStop, hook_ts_ns), 16);
         assert_eq!(core::mem::offset_of!(MemberStop, vm_start), 24);
         assert_eq!(core::mem::offset_of!(MemberStop, vm_end), 32);
+        assert_eq!(core::mem::offset_of!(MemberStop, nr_threads), 40);
+        assert_eq!(core::mem::offset_of!(MemberStop, reserved), 44);
         assert_eq!(core::mem::size_of::<MemberStopConfig>(), 8);
         assert_eq!(core::mem::offset_of!(MemberStopConfig, exempt_tgid), 4);
     }

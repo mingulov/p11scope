@@ -8869,4 +8869,4 @@ mod d4_overlay_cells;
 #[path = "d4_population_cells.rs"]
 mod d4_population_cells;
 #[path = "d4_zombie_cells.rs"]
-mod d4_zombie_cells;
+pub(crate) mod d4_zombie_cells;

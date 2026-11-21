@@ -1872,6 +1872,8 @@ mod tests {
             hook_ts_ns: 1,
             vm_start: 0x3000,
             vm_end: 0x4000,
+            nr_threads: 1,
+            reserved: 0,
         };
         let rows = with_stopping_row(vec![row.clone()], &stop, &BTreeSet::new());
         assert!(!rows.iter().any(|row| row.stopping), "not an overlay");
@@ -1926,6 +1928,8 @@ mod tests {
             hook_ts_ns: 1,
             vm_start,
             vm_end,
+            nr_threads: 1,
+            reserved: 0,
         };
         let rows = with_stopping_row(
             vec![row(1, 7, 0x3000, 0x4000)],
@@ -2006,6 +2010,8 @@ mod tests {
             hook_ts_ns: 1,
             vm_start,
             vm_end: vm_start + 0x1000,
+            nr_threads: 1,
+            reserved: 0,
         };
         // Same domain: the exact row moves first, nothing is added.
         let rows = with_stopping_row(

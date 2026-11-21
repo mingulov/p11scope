@@ -2524,4 +2524,4 @@ impl MemberProbe for OsMemberProbe<'_> {
 
 #[cfg(test)]
 #[path = "sweep_attribution_tests.rs"]
-mod tests;
+pub(crate) mod tests;

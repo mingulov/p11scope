@@ -521,7 +521,7 @@ mod tests {
             assert_eq!(map.max_entries(), *entries, "{name} entries");
             assert_eq!(map.map_flags(), *flags, "{name} flags");
         }
-        assert_eq!(stop_value, 40);
+        assert_eq!(stop_value, 48);
     }
 
     /// Waits for `child` to exit within 10 s; on timeout fails with the

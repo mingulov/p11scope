@@ -2199,6 +2199,12 @@ fn run_with_terminal_budget(
         ));
         let decoder = resolve_joint_decoder_malformed(semantic_lane.as_ref(), &coordinator);
         inventory_diagnostic(&crate::inventory_semantics::joint_decoder_line(decoder));
+        let reentry = coordinator.joint_reentry_diagnosis();
+        inventory_diagnostic(&crate::inventory_semantics::joint_reentry_line(
+            reentry.sibling_binds,
+            reentry.incarnations,
+            reentry.taint_lifts,
+        ));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         inventory_diagnostic(&crate::inventory_semantics::joint_audit_subjects_line(
             subjects.marks,
@@ -9988,6 +9994,12 @@ fn run_dashboard(
         ));
         let decoder = resolve_joint_decoder_malformed(semantic_lane.as_ref(), &coordinator);
         display.notice(&crate::inventory_semantics::joint_decoder_line(decoder));
+        let reentry = coordinator.joint_reentry_diagnosis();
+        display.notice(&crate::inventory_semantics::joint_reentry_line(
+            reentry.sibling_binds,
+            reentry.incarnations,
+            reentry.taint_lifts,
+        ));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         display.notice(&crate::inventory_semantics::joint_audit_subjects_line(
             subjects.marks,

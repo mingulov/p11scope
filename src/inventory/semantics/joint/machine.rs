@@ -3576,8 +3576,17 @@ impl LiveJointMachine {
                                         .label()
                                 ),
                             );
+                            // Stream voids return no seal failure, so no
+                            // delivery queues their reseed: queue every
+                            // feed the void ended here, so the Births
+                            // phase re-arms them for one more birth.
+                            coordinator.queue_reseed_for_ended_feeds();
                         } else {
                             coordinator.start_staged_disposal();
+                            // Same reseed queue as the scoped path: the
+                            // void ended feeds here too, and staged
+                            // disposal does not re-arm them.
+                            coordinator.queue_reseed_for_ended_feeds();
                             budget.spend(1);
                             return (Phase::VoidingStaged, Ok(Step::Continue));
                         }

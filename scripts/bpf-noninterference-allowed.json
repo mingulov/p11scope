@@ -1249,6 +1249,102 @@
    "identical": [],
    "lane": "v0.8.0 relaxed template classifier (fix1 lane)",
    "rationale": "Cumulative v0.6.0-anchored shape of the relaxed-dialect tip: the widened template value sets (all assigned CKO/CKK ids plus the attested NSS spelling, ValueLen 1..=4096, ModulusBits 256..=16384, secp256k1/brainpool plus SoftHSM PrintableString Edwards forms, 4-byte CK_ULONG reads, concat derives) plus the always-inline scalar classifier join the shared object classifier/reader, which compile into the default Detailed object only. The Detailed object gains .text (+1832 B, cumulative +4080) with matching .BTF.ext line info and debug/reloc moves; uprobe, maps, .BTF and the symbol tables are unchanged, and no section is added or removed. Both Inventory objects keep exactly the transition-14 code sizes (.text +112/+176 B, uprobe +128 B, maps +28 B); only DWARF bytes move with the added source lines."
+  },
+  {
+   "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+   "candidate_revision": "v0.8.0 PQC cell fix2 (measured at 8271adcbacbeb5ff6f79c3da9727c987e9f6f237; the intervening v6.6 budget re-pin and this record commit add only non-BPF inputs; DWARF string sizes confirmed from CI output)",
+   "changed": {
+    "p11scope-ebpf": {
+     "added": {},
+     "deltas": {
+      ".BTF": 345,
+      ".BTF.ext": 1752,
+      ".debug_abbrev": 52,
+      ".debug_addr": 312,
+      ".debug_frame": 24,
+      ".debug_info": 3929,
+      ".debug_line": 1287,
+      ".debug_loclists": 2326,
+      ".debug_rnglists": 1194,
+      ".debug_str": 1430,
+      ".debug_str_offsets": 164,
+      ".rel.BTF": 32,
+      ".rel.BTF.ext": 1760,
+      ".rel.debug_addr": 624,
+      ".rel.debug_frame": 32,
+      ".rel.debug_info": 1888,
+      ".rel.debug_line": 16,
+      ".rel.debug_str_offsets": 656,
+      ".rel.text": 160,
+      ".reluprobe": 96,
+      ".strtab": 52,
+      ".symtab": 72,
+      ".text": 4120,
+      "maps": 56,
+      "uprobe": 592
+     },
+     "removed": []
+    },
+    "p11scope-ebpf-inventory": {
+     "added": {},
+     "deltas": {
+      ".BTF": 37,
+      ".BTF.ext": 128,
+      ".debug_abbrev": -43,
+      ".debug_addr": 88,
+      ".debug_info": 1111,
+      ".debug_line": 102,
+      ".debug_loclists": 383,
+      ".debug_rnglists": 41,
+      ".debug_str": 264,
+      ".debug_str_offsets": 76,
+      ".rel.BTF": 16,
+      ".rel.BTF.ext": 128,
+      ".rel.debug_addr": 176,
+      ".rel.debug_info": 416,
+      ".rel.debug_str_offsets": 304,
+      ".rel.text": 32,
+      ".reluprobe": 32,
+      ".strtab": 9,
+      ".symtab": 24,
+      ".text": 112,
+      "maps": 28,
+      "uprobe": 128
+     },
+     "removed": []
+    },
+    "p11scope-ebpf-inventory-callers": {
+     "added": {},
+     "deltas": {
+      ".BTF": 37,
+      ".BTF.ext": 144,
+      ".debug_abbrev": -43,
+      ".debug_addr": 88,
+      ".debug_info": 1145,
+      ".debug_line": 106,
+      ".debug_loclists": 391,
+      ".debug_rnglists": 51,
+      ".debug_str": 254,
+      ".debug_str_offsets": 76,
+      ".rel.BTF": 16,
+      ".rel.BTF.ext": 144,
+      ".rel.debug_addr": 176,
+      ".rel.debug_info": 416,
+      ".rel.debug_str_offsets": 304,
+      ".rel.text": 32,
+      ".reluprobe": 32,
+      ".strtab": 9,
+      ".symtab": 24,
+      ".text": 176,
+      "maps": 28,
+      "uprobe": 128
+     },
+     "removed": []
+    }
+   },
+   "identical": [],
+   "lane": "v0.8.0 PQC cell fix2 (T0 KEM reads plus vendor key type)",
+   "rationale": "Cumulative v0.6.0-anchored shape of the fix2 tip: the NSS vendor ChaCha20 key-type arm joins classify_attribute_scalar and the KEM output-template pair joins the frozen descriptors (data) with the adapter guard constant, all compiling into the default Detailed object only. The Detailed object gains .text (+40 B, cumulative +4120) with matching .BTF.ext line info and debug/reloc moves; uprobe, maps, .BTF and the symbol tables are unchanged, and no section is added or removed. Both Inventory objects keep byte-identical deltas to the fix1 record (.text +112/+176 B, uprobe +128 B, maps +28 B). Deltas taken verbatim from the CI comparison output."
   }
   ],
   "version": 1

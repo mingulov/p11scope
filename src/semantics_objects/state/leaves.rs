@@ -1,3 +1,5 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The paid model-row surface a domain retirement is driven through.
 //!
 //! [`ModelLeaves`] wraps the model state behind a field private to this

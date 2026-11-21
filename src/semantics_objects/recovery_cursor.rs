@@ -1,3 +1,5 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! The bounded recovery cursors: sliced voids, deferred adapter
 //! rejections and model domain retirements.
 //!

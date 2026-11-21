@@ -20718,14 +20718,16 @@ pub(crate) mod tests {
     }
 
     /// The haskoki twin: one member maps two 6 MiB-data objects ahead of
-    /// a real provider. Each large object costs ~786K pass work units
-    /// of decode words (snapshot bytes ride the I/O window, never the
-    /// work allowance), so the first pass must still reach the provider
-    /// placed after them: the production pass work allowance fits a
-    /// haskoki-class member.
+    /// a real provider. Together they cost past one 1M-unit pass work
+    /// allowance, so the first pass must stop with resumable progress
+    /// named (never with terminal exhaustion) and the resumed passes
+    /// must converge on the provider placed after the large-data
+    /// objects. This pins resume, not fit: a pass allowance that
+    /// fits the whole member in one pass fails the first assertion.
     #[test]
     fn cgroup_pass_scans_haskoki_sized_data_and_reaches_its_provider() {
         const BIG_DATA_BYTES: usize = 6 << 20;
+        const PASS_CAP: usize = 10;
         let dir = tempfile::tempdir().unwrap();
         let roles = inode_ordered_role_paths(
             dir.path(),
@@ -20753,32 +20755,70 @@ pub(crate) mod tests {
             &[roles[0].as_path(), roles[1].as_path(), roles[2].as_path()],
         );
 
-        let first = scene.pass();
-        let stopped: Vec<_> = first
-            .gaps
-            .iter()
-            .filter(|(_, _, reason)| {
-                reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
-                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
-            })
-            .collect();
-        assert!(
-            stopped.is_empty(),
-            "the first pass must fit a haskoki-class member in its work allowance: {stopped:?}"
-        );
+        // Thread the real walk continuation across passes, like the
+        // driver threads it: every pass resumes where the last stopped.
+        let mut state = CgroupWalkState::default();
+        let (first, _) =
+            continued_cgroup_pass(&mut scene, &mut state, CgroupWalkLimits::default());
         assert!(
             first
-                .modules
+                .gaps
                 .iter()
-                .any(|path| path.contains("scoped-provider")),
-            "the first pass must reach the provider placed after the large-data objects: {:?}",
-            first.modules
+                .any(|(_, subject, _)| subject == "scan_in_progress"),
+            "pass one must leave resumable progress at the 1M allowance: {first:?}"
         );
         assert!(
-            first.used_work > (1 << 20),
-            "the pass must actually spend haskoki-class work (past the old 1M ceiling), \
-             not skip the large data: used {} units",
+            scene.coordinator.live_scan_progress_gap().is_some(),
+            "the carried progress is live after pass one"
+        );
+        assert!(
+            first.used_work <= (1 << 20),
+            "one pass never spends past its allowance: used {} units",
             first.used_work
+        );
+        let mut total_work = first.used_work;
+        let mut passes = 1;
+        let mut modules = first.modules.clone();
+        let mut converged = false;
+        while passes < PASS_CAP {
+            let (report, _) =
+                continued_cgroup_pass(&mut scene, &mut state, CgroupWalkLimits::default());
+            total_work = total_work.saturating_add(report.used_work);
+            passes += 1;
+            modules = report.modules.clone();
+            let busy = report.gaps.iter().any(|(_, subject, reason)| {
+                subject == "scan_in_progress"
+                    || reason.contains(crate::discovery::scan::WORK_CEILING_REASON)
+                    || reason.contains(crate::discovery::scan::COLLECTION_STOP_REASON)
+            });
+            if !busy {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "the resumed passes must converge to a clean view within {PASS_CAP} passes"
+        );
+        assert!(
+            modules
+                .iter()
+                .any(|path| path.contains("scoped-provider")),
+            "the resumed passes must reach the provider placed after the large-data objects: {modules:?}"
+        );
+        assert!(
+            total_work > (1 << 20),
+            "the member must actually cost haskoki-class work (past one 1M allowance), \
+             not skip the large data: spent {total_work} units over {passes} passes"
+        );
+        assert!(
+            !has_terminal_work_exhaustion(&scene.coordinator),
+            "no stale exhaustion verdict survives the converged passes: {:?}",
+            scene.coordinator.registry().gaps()
+        );
+        assert!(
+            scene.coordinator.live_scan_progress_gap().is_none(),
+            "the converged terminal shows no in-progress gap"
         );
     }
 

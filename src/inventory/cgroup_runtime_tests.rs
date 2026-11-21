@@ -1005,6 +1005,173 @@ fn cgroup_runtime_no_duration_consumes_delayed_events_and_continuation_once() {
     );
 }
 
+/// Compile C sources with gcc into the test tmp dir.
+fn gcc_fixture(
+    dir: &std::path::Path,
+    out: &str,
+    sources: &[&std::path::Path],
+    args: &[&str],
+    libs: &[&str],
+) -> PathBuf {
+    let bin = dir.join(out);
+    let mut cmd = std::process::Command::new("gcc");
+    cmd.args(args)
+        .arg("-o")
+        .arg(&bin)
+        .args(sources)
+        .args(libs);
+    assert!(
+        cmd.status().unwrap().success(),
+        "gcc failed for {out}: {cmd:?}"
+    );
+    bin
+}
+
+/// A cgroup scene whose single provider carries `bytes` of
+/// file-backed data plus one hook export: past any single 1M-unit
+/// pass allowance, so a snapshot must resume across passes to find
+/// it. Mirrors the small provider scene with a haskoki-class object.
+fn big_data_cgroup_scene(
+    bytes: usize,
+) -> (
+    tempfile::TempDir,
+    crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+    InventoryCoordinator<OsProcessSource>,
+) {
+    use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = dir.path().join("big-data.c");
+    std::fs::write(
+        &source,
+        format!(
+            "/* {bytes} bytes of file-backed data. */\n\
+             __attribute__((used)) static const unsigned char fixture_blob[{bytes}] = {{1}};\n"
+        ),
+    )
+    .unwrap();
+    // The blob rides with a real hook implementation, so the driver's
+    // `--call` surface succeeds exactly as on the small provider.
+    let matrix = manifest.join("crates/discover/tests/fixture/version_matrix.c");
+    let provider = gcc_fixture(
+        dir.path(),
+        "big-data.so",
+        &[source.as_path(), matrix.as_path()],
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    gcc_fixture(
+        dir.path(),
+        "scoped-driver",
+        &[manifest.join("tests/fixtures/catalog-driver.c").as_path()],
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let ready = dir.path().join("ready");
+    let child = OwnedStoppedChild::spawn_stopped(
+        std::process::Command::new(dir.path().join("scoped-driver"))
+            .arg("--ready")
+            .arg(&ready)
+            .arg("--call")
+            .arg(&provider)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        |pid| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned provider child did not finish startup"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // SAFETY: pid names the child retained by spawn_stopped.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+        },
+    );
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", child.id()),
+    )
+    .unwrap();
+    let mut coordinator = InventoryCoordinator::new(
+        crate::scope::cgroup(dir.path()).unwrap(),
+        HookRegistry::builtin(),
+        vec![provider],
+        vec![],
+        OsProcessSource,
+        crate::discovery::caller_registry::RegistryLimits::default_limits(),
+    )
+    .unwrap();
+    coordinator.begin_capture_coverage(crate::attach::capture::CaptureScopeCoverage::Cgroup);
+    (dir, child, coordinator)
+}
+
+/// A snapshot (no deadline) over a haskoki-class member runs follow-up
+/// passes while decode progress is unfinished, then converges: the
+/// provider is found, no stale exhaustion verdict survives, and the
+/// terminal shows no in-progress gap. This pins resume, not fit: a
+/// single-pass snapshot fails the collection count.
+#[test]
+fn cgroup_runtime_snapshot_resumes_across_passes_until_converged() {
+    const BIG_DATA_BYTES: usize = 12 << 20;
+    const PASS_CAP: usize = 10;
+    let (_fixture, _child, mut coordinator) = big_data_cgroup_scene(BIG_DATA_BYTES);
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    let mut publications = 0;
+    let result = run_classic_finalizing::<PidPin, _, FacadeLane>(
+        &mut driver,
+        None,
+        &clock(&|| false),
+        None,
+        &mut |_, publication| {
+            if matches!(publication, Publish::Pass { .. }) {
+                publications += 1;
+            }
+            Ok(())
+        },
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let collections = driver.collections.load(Ordering::SeqCst);
+    assert!(
+        collections >= 2,
+        "a haskoki-class member cannot fit one 1M pass: {collections} collection ran"
+    );
+    assert!(
+        collections <= PASS_CAP,
+        "the resumed snapshot must terminate: {collections} collections ran"
+    );
+    assert_eq!(
+        publications, collections,
+        "every resumed pass publishes: {publications} of {collections}"
+    );
+    assert!(
+        driver.inner.coordinator.registry().edges().next().is_some(),
+        "the resumed snapshot must find the provider"
+    );
+    assert!(
+        !driver
+            .inner
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "cgroup scope transaction incomplete"
+                && gap.reason.contains("shared work allowance exhausted")),
+        "no stale exhaustion verdict survives the converged snapshot: {:?}",
+        driver.inner.coordinator.registry().gaps()
+    );
+    assert!(
+        driver
+            .inner
+            .coordinator
+            .live_scan_progress_gap()
+            .is_none(),
+        "the converged snapshot shows no in-progress gap"
+    );
+}
+
 #[test]
 fn cgroup_runtime_published_targets_extend_after_scoped_commit_then_receipt_commit() {
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();

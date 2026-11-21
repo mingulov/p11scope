@@ -1759,7 +1759,17 @@ Limits that matter in pods:
   ("Returned errors" are calls that returned an error, never observer
   failures.) With `-v`, each provider line pairs its machine instance
   label in parentheses; rows no provider can be proved for read under
-  `unknown keys` instead. With `-v`, objects created from templates
+  `unknown keys` instead. Counts are provider-side entry executions,
+  not caller-issued calls: when a provider runs crypto re-entrantly
+  inside another call, the observer counts each real execution. For
+  example, NSS softoken runs an internal single-part sign+verify
+  self-test inside `C_GenerateKeyPair` for EC keys, so one
+  caller-issued EC sign and verify can show two completions each;
+  that is the provider's own activity, not an overcount. Re-entrant
+  same-session activity inside a creation also fences that creation's
+  outputs (same-session overlap), so later uses of such keys report
+  `unbound`: the operations stay counted with their mechanism detail
+  and only the key identity stays unknown. With `-v`, objects created from templates
   beyond eight slots are counted on their own line (`  template
   truncated (first 8 attributes captured) (N objects)`); `--json`
   carries the same reason on each unseen metadata field. Templates

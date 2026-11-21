@@ -1164,10 +1164,10 @@ class JournalMarkerInventoryTests(unittest.TestCase):
 
     def test_journal_wide_variant_accepts_frozen_inventory(self):
         self.quiet(checker.validate_inventory, "journal-wide", checker.JOURNAL_WIDE_MAPS,
-                   checker.JOURNAL_PROGRAMS, self.journal_symbols())
+                   checker.JOURNAL_WIDE_PROGRAMS, self.journal_symbols())
         with self.assertRaisesRegex(RuntimeError, "lacks required marker symbols"):
             checker.validate_inventory("journal-wide", checker.JOURNAL_WIDE_MAPS,
-                                       checker.JOURNAL_PROGRAMS,
+                                       checker.JOURNAL_WIDE_PROGRAMS,
                                        self.journal_symbols(missing={"JOURNAL_MARKER_CTL"}))
 
     def test_journal_width_mismatch_refused(self):

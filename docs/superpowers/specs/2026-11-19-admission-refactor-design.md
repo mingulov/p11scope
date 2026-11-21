@@ -411,16 +411,19 @@ test ideas live on in the owners' tables (§9).
 - Lane-3 `order_scan_pids_fresh_first` + `truncated_member_pids`
   tiering → becomes the cursor (§4.2; twins adopted).
 - All `debug:` / `P11SCOPE_FIX1_EVLOG` commits on lane 4 → never ported.
-- Substring classifiers (`names_transient_pin_failure`,
-  `scan_pins_waited_only_*`, `names_capture_budget_stop` as
+- Substring classifiers (`scan_pins_waited_only_*` as
   retry/terminal deciders) → deciders for the handle class only:
   the typed outcome files the handle-class waits
   (`HandleExhaustion`/`ReserveStop`/`BudgetStop`) under the fixed
   wait subject and every other `Wait` cause under its own subject,
   so the classifiers recognise exactly the defer-whole shape and a
   future `Wait` cause that should defer whole must file there too
-  (pinned by the wait-subject split twin). (String matching may
-  otherwise survive inside gap rendering only.)
+  (pinned by the wait-subject split twin). The budget-stop
+  classifier (`names_capture_budget_stop`, matching the work,
+  clock, I/O and window causes) is the separate role: it still
+  serves the ending-at-scan-start policy, which keeps capture-wide
+  budget stops instead of excusing them as process exits. (String
+  matching may otherwise survive inside gap rendering only.)
 
 ## 9. Test plan (per owner, RED first on c2a180a71)
 

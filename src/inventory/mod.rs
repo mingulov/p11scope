@@ -2459,16 +2459,20 @@ impl InventorySelection {
     }
 }
 
-/// One pass's resume position: the user-visible progress totals
-/// plus the summed sweep frontiers (snapshot indices, words). The
-/// totals name the gap; the frontiers let the snapshot rule see
-/// intra-object sweep advance that completes no object and decodes
-/// no new table. Both are `None` exactly when no cursor is
-/// unfinished.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// One pass's resume position: committed per-cursor progress over the
+/// carried bundle — every cursor's work identity (process generation,
+/// file pin, executable image) with its layout-bound frontiers.
+/// `None` exactly when no cursor is unfinished. The snapshot rule
+/// compares same-key, same-layout progress only, so churn never reads
+/// as advance.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CgroupResumePosition {
-    progress: Option<(usize, usize, usize)>,
-    fingerprint: Option<(u64, u64)>,
+    cursors: Option<
+        BTreeMap<
+            crate::discovery::scan_pass::DecodeCursorKey,
+            crate::discovery::scan_pass::CommittedCursorProgress,
+        >,
+    >,
 }
 
 struct CgroupDriverState {
@@ -2483,6 +2487,9 @@ struct CgroupDriverState {
     last_outcome: Option<crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome>,
     last_resume: CgroupResumePosition,
     prev_resume: CgroupResumePosition,
+    /// Whether the snapshot's one settle pass was granted: once spent,
+    /// later convergences end the snapshot instead of settling again.
+    settle_granted: bool,
 }
 
 impl CgroupDriverState {
@@ -2504,42 +2511,49 @@ impl CgroupDriverState {
             last_outcome: None,
             last_resume: CgroupResumePosition::default(),
             prev_resume: CgroupResumePosition::default(),
+            settle_granted: false,
         })
     }
 
     /// Whether the last pass left unfinished decode progress that
-    /// advanced since the previous pass: more objects finished,
-    /// more tables decoded, or further sweep frontiers. An
-    /// unchanged position means a full fresh allowance moved
-    /// nothing, so the snapshot stops and reports the live
-    /// in-progress gap honestly instead of spinning. The first
-    /// unfinished pass always resumes (no previous position to
-    /// stall against). Reached-object growth alone never resumes:
-    /// genuine discovery always sweeps, decodes or completes with
-    /// it, while growth without any of those is churn, not
-    /// progress.
+    /// advanced since the previous pass: some cursor present in both
+    /// passes under the same layout (generation, pin, mappings) reached
+    /// a further lexicographic sweep position, decoded more tables, or
+    /// completed. New, removed or relaid-out cursors are churn, never
+    /// progress: an unchanged or churned position means the fresh
+    /// allowance moved no committed work forward, so the snapshot stops
+    /// and reports the live in-progress gap honestly instead of
+    /// spinning. The first unfinished pass always resumes (no previous
+    /// position to stall against).
     fn resume_advancing(&self) -> bool {
-        let (Some(last), Some(last_fp)) = (self.last_resume.progress, self.last_resume.fingerprint)
-        else {
+        let Some(last) = &self.last_resume.cursors else {
             return false;
         };
-        let (Some(prev), Some(prev_fp)) = (self.prev_resume.progress, self.prev_resume.fingerprint)
-        else {
+        let Some(prev) = &self.prev_resume.cursors else {
             return true;
         };
-        last.0 > prev.0 || last.2 > prev.2 || last_fp.0 > prev_fp.0 || last_fp.1 > prev_fp.1
+        last.iter().any(|(key, last_p)| {
+            prev.get(key).is_some_and(|prev_p| {
+                last_p.layout == prev_p.layout
+                    && (last_p.sweep_position() > prev_p.sweep_position()
+                        || last_p.tables_decoded > prev_p.tables_decoded
+                        || (!prev_p.complete && last_p.complete))
+            })
+        })
     }
 
-    /// Whether the snapshot owes a settle pass: the last pass left
+    /// Whether the snapshot owes its one settle pass: the last pass left
     /// no unfinished decode progress, but the transaction still
     /// stopped on the work allowance — a scan that converged with
     /// no budget left to bind and publish. The settle pass re-emits
     /// the completed decode at ~zero work with a fresh allowance,
-    /// so the bind runs. One settle retry only: two consecutive
-    /// no-progress passes end the snapshot honestly instead of
+    /// so the bind runs. The grant is explicit and single-use: once
+    /// spent, later convergences end the snapshot honestly instead of
     /// spinning on a bind that never fits.
     fn settle_pending(&self, passes: u64) -> bool {
-        self.last_resume.progress.is_none() && (self.prev_resume.progress.is_some() || passes == 1)
+        self.last_resume.cursors.is_none()
+            && !self.settle_granted
+            && (self.prev_resume.cursors.is_some() || passes == 1)
     }
 }
 
@@ -7212,14 +7226,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         Ok(PassCommitProgress::Published)
     }
 
-    fn snapshot_resume_pending(&self) -> bool {
+    fn snapshot_resume_pending(&mut self) -> bool {
         // Snapshots only: a duration run past its deadline still ends.
         // A stop anywhere above already broke the loop; the control
         // check keeps this predicate from reviving one.
         if self.deadline.is_some() || self.stop_requested {
             return false;
         }
-        let Some(cgroup) = &self.cgroup else {
+        let passes = self.coordinator.passes();
+        let Some(cgroup) = &mut self.cgroup else {
             return false;
         };
         if cgroup.control.check().is_err() {
@@ -7228,16 +7243,28 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // Only a work stop resumes: unfinished, advancing decode
         // progress continues the scan, and a converged scan with no
         // budget left to bind gets one settle pass. Every other
-        // outcome keeps its single snapshot.
-        cgroup.last_outcome
+        // outcome keeps its single snapshot. The settle grant is
+        // recorded here, where it is issued, so a later convergence
+        // after churn cannot settle again.
+        let work_stop = cgroup.last_outcome
             == Some(
                 crate::inspect_system::inventory_cgroup::ScopedCollectionOutcome::Incomplete(
                     crate::inspect_system::inventory_cgroup::ScopedCollectionGap::Membership(
                         crate::scope::inventory_cgroup::CgroupIncomplete::WorkLimit,
                     ),
                 ),
-            )
-            && (cgroup.resume_advancing() || cgroup.settle_pending(self.coordinator.passes()))
+            );
+        if !work_stop {
+            return false;
+        }
+        if cgroup.resume_advancing() {
+            return true;
+        }
+        if cgroup.settle_pending(passes) {
+            cgroup.settle_granted = true;
+            return true;
+        }
+        false
     }
 
     fn finish_pass(&mut self, report: &mut PassReport) -> Result<()> {
@@ -7247,10 +7274,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             })?;
             let warning = completion.driver_warning();
             cgroup.continuation = Some(completion.state);
-            cgroup.prev_resume = cgroup.last_resume;
+            cgroup.prev_resume = std::mem::take(&mut cgroup.last_resume);
             cgroup.last_resume = CgroupResumePosition {
-                progress: completion.progress,
-                fingerprint: completion.progress_fingerprint,
+                cursors: completion.progress_cursors,
             };
             cgroup.last_outcome = Some(completion.outcome);
             report.scan_callers = completion.scan_callers;
@@ -31111,6 +31137,7 @@ mod seal_readiness_tests {
             last_outcome: None,
             last_resume: CgroupResumePosition::default(),
             prev_resume: CgroupResumePosition::default(),
+            settle_granted: false,
         });
         let root = tempfile::tempdir().expect("cgroup root");
         driver.seal_scope = Scope::Cgroup {

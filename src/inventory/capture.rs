@@ -2381,8 +2381,9 @@ pub(crate) trait PassDriver<Pin> {
     /// one pass allowance converges instead of publishing partial.
     /// The cgroup driver answers only without a run deadline (a
     /// duration run past its deadline still ends); every other
-    /// driver says no and keeps the single snapshot pass.
-    fn snapshot_resume_pending(&self) -> bool {
+    /// driver says no and keeps the single snapshot pass. `&mut`
+    /// because granting the one settle pass records the grant.
+    fn snapshot_resume_pending(&mut self) -> bool {
         false
     }
     /// Service optional jobs with the sole retained native capture. The loop

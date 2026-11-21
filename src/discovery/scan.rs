@@ -1204,27 +1204,30 @@ impl RetainedFileFacts {
         !self.decode_cursors.is_empty()
     }
 
-    /// `(frontier snapshots, frontier words)` summed over the whole
-    /// carried bundle: how far every object's table and interface
-    /// sweeps reached. `None` exactly when [`scan_progress_totals`]
-    /// is `None` (no unfinished cursor). The snapshot resume rule
-    /// advances on any strict increase here (or in completed objects
-    /// or decoded tables), so intra-object sweep advance that
-    /// completes no object and decodes no new table still counts as
-    /// progress instead of stalling the snapshot.
-    pub(crate) fn scan_frontier_totals(&self) -> Option<(u64, u64)> {
+    /// Committed per-cursor progress over the whole carried bundle, for
+    /// the snapshot resume decision: every cursor's work identity with
+    /// its layout-bound frontiers. `None` exactly when
+    /// [`scan_progress_totals`](Self::scan_progress_totals) is `None`
+    /// (no unfinished cursor). The resume rule compares same-key,
+    /// same-layout progress only, so churn (new, removed or relaid-out
+    /// cursors) never reads as advance, while intra-object sweep
+    /// advance that completes no object and decodes no new table still
+    /// counts as progress instead of stalling the snapshot.
+    pub(crate) fn scan_cursor_progress(
+        &self,
+    ) -> Option<BTreeMap<DecodeCursorKey, super::scan_pass::CommittedCursorProgress>> {
         self.scan_progress_totals()?;
-        let mut snapshots = 0u64;
-        let mut words = 0u64;
-        for cursor in self.decode_cursors.values() {
-            snapshots = snapshots
-                .saturating_add(cursor.tables.snapshot as u64)
-                .saturating_add(cursor.interfaces.snapshot as u64);
-            words = words
-                .saturating_add(cursor.tables.word)
-                .saturating_add(cursor.interfaces.word);
-        }
-        Some((snapshots, words))
+        Some(
+            self.decode_cursors
+                .iter()
+                .map(|(key, cursor)| {
+                    (
+                        key.clone(),
+                        super::scan_pass::CommittedCursorProgress::of(cursor),
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// `(done, total, tables)` over the whole carried bundle: completed

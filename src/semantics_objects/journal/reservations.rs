@@ -2966,8 +2966,8 @@ mod tests {
     /// counts lines with a head/link read outside the gate. `heads[`
     /// subsumes `key_heads[`/`id_heads[` and also catches a real
     /// aliased read (`let heads = &self.key_heads; ... heads[b]`);
-    /// writes (`] =`) are allowed (splices perform no read); comment
-    /// lines are skipped.
+    /// plain writes (`] =`, not `] ==`) are allowed (splices perform
+    /// no read); comment lines are skipped.
     fn count_direct_reads(body: &str) -> usize {
         let mut direct_reads = 0;
         for line in body.lines() {
@@ -2978,7 +2978,16 @@ mod tests {
             for marker in ["heads[", ".next["] {
                 if let Some(at) = line.find(marker) {
                     let after = &line[at + marker.len()..];
-                    if after.find("] =").is_none() {
+                    // A splice assignment (`heads[b] = node`) writes
+                    // without reading; an equality comparison
+                    // (`heads[b] == node`) starts with the same three
+                    // bytes but reads, so only a `=` not followed by
+                    // a second `=` exempts the line.
+                    let is_write = match after.find("] =") {
+                        None => false,
+                        Some(pos) => !after[pos + 3..].starts_with('='),
+                    };
+                    if !is_write {
                         direct_reads += 1;
                     }
                 }
@@ -3051,6 +3060,28 @@ mod tests {
             count_direct_reads(aliased),
             2,
             "a real aliased head load is still a direct read"
+        );
+        let compared = r#"
+    fn chain_unlink_step(&mut self) {
+        let same = std::hint::black_box(heads[bucket] == successor);
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(compared),
+            1,
+            "an equality comparison still reads the head"
+        );
+        let assigned = r#"
+    fn chain_unlink_step(&mut self) {
+        heads[bucket] = successor;
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(assigned),
+            0,
+            "a splice write performs no read"
         );
     }
 

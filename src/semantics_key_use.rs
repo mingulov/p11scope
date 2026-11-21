@@ -3031,6 +3031,12 @@ pub(crate) struct KeyUseReducer {
     /// (N1c): flushed at the next shared contact, C4-style. Bounded
     /// by the shared census — each pend holds a live shared ticket.
     pending_shared_releases: Vec<u64>,
+    /// Test-only budgeted-absorb read counter: one per merged
+    /// preserved-summary row plus one for the evidence fold, bumped
+    /// alongside the gate debit so per-poll `reads <= spent`
+    /// assertions observe real fold work.
+    #[cfg(test)]
+    test_absorb_reads: std::cell::Cell<usize>,
 }
 
 impl std::fmt::Debug for KeyUseReducer {
@@ -3064,7 +3070,30 @@ impl KeyUseReducer {
             inferred: BTreeMap::new(),
             parked: BTreeMap::new(),
             key_sizes: true,
+            #[cfg(test)]
+            test_absorb_reads: std::cell::Cell::new(0),
         }
+    }
+
+    /// Test-only read of the budgeted-absorb read counter.
+    #[cfg(test)]
+    pub(crate) fn test_absorb_reads_for_test(&self) -> usize {
+        self.test_absorb_reads.get()
+    }
+
+    /// Test-only reset of the budgeted-absorb read counter.
+    #[cfg(test)]
+    pub(crate) fn reset_test_absorb_reads_for_test(&self) {
+        self.test_absorb_reads.set(0);
+    }
+
+    /// Test-only bump of the budgeted-absorb read counter: one per
+    /// merged row plus one for the evidence fold, alongside the
+    /// gate debit.
+    #[cfg(test)]
+    pub(crate) fn bump_absorb_read_for_test(&self) {
+        self.test_absorb_reads
+            .set(self.test_absorb_reads.get() + 1);
     }
 
     /// Admit (`true`) or drop (`false`, `size_inference_off`)
@@ -3132,46 +3161,37 @@ impl KeyUseReducer {
         self.unknown[index].active = self.unknown[index].active.saturating_add(1);
     }
 
-    /// Merge a fully-closed preservation reducer's unknown summaries
-    /// and evidence (bulk-disposal preservation): fixed unknown
-    /// counters add (never refuse, never re-partition), ever-live
-    /// ORs (N9), by-number detail pairs add under the same
-    /// per-bucket cap (overflow terminals join the refusal count),
-    /// evidence counts add. The preserved reducer holds no opens,
-    /// refused opens, proved aggregates (receipt-less by
-    /// construction) or pended releases — anything left would be a
-    /// pairing leak across the loss boundary.
-    pub(crate) fn absorb_preserved(&mut self, other: KeyUseReducer) {
-        debug_assert!(other.open.is_empty() && other.refused.is_empty());
-        debug_assert!(other.aggregates.is_empty());
-        debug_assert!(other.pending_shared_releases.is_empty());
-        for (slot, add) in self.unknown.iter_mut().zip(other.unknown.iter()) {
-            debug_assert_eq!(add.active, 0, "preservation closes every open");
-            slot.completed = slot.completed.saturating_add(add.completed);
-            slot.failed = slot.failed.saturating_add(add.failed);
-            slot.cancelled = slot.cancelled.saturating_add(add.cancelled);
-            slot.unknown = slot.unknown.saturating_add(add.unknown);
-            slot.active = slot.active.saturating_add(add.active);
-        }
-        for (live, add) in self
-            .unknown_ever_live
-            .iter_mut()
-            .zip(other.unknown_ever_live.iter())
-        {
-            *live |= add;
-        }
-        for (slot, add) in self.unknown.iter_mut().zip(other.unknown.iter()) {
-            let len = usize::from(add.mech_len);
-            for (id, terminals) in add.mechs[..len].iter() {
-                if !slot.merge_mechanism(*id, *terminals) {
-                    self.evidence.unknown_mechanism_refused = self
-                        .evidence
-                        .unknown_mechanism_refused
-                        .saturating_add(*terminals);
-                }
+    /// Merge one preserved unknown-summary row: fixed counters add
+    /// (never refuse, never re-partition), ever-live ORs (N9), and
+    /// by-number detail pairs add under the same per-bucket cap
+    /// (overflow terminals join the refusal count). Shared by the
+    /// synchronous absorb and the resumable budgeted absorb so the
+    /// two cannot drift.
+    fn absorb_bucket(&mut self, index: usize, add: &UnknownCounters, add_live: bool) {
+        debug_assert_eq!(add.active, 0, "preservation closes every open");
+        let slot = &mut self.unknown[index];
+        slot.completed = slot.completed.saturating_add(add.completed);
+        slot.failed = slot.failed.saturating_add(add.failed);
+        slot.cancelled = slot.cancelled.saturating_add(add.cancelled);
+        slot.unknown = slot.unknown.saturating_add(add.unknown);
+        slot.active = slot.active.saturating_add(add.active);
+        let len = usize::from(add.mech_len);
+        for (id, terminals) in add.mechs[..len].iter() {
+            if !slot.merge_mechanism(*id, *terminals) {
+                self.evidence.unknown_mechanism_refused = self
+                    .evidence
+                    .unknown_mechanism_refused
+                    .saturating_add(*terminals);
             }
         }
-        let (mine, theirs) = (&mut self.evidence, other.evidence);
+        self.unknown_ever_live[index] |= add_live;
+    }
+
+    /// Fold preserved evidence counts. Shared by the synchronous
+    /// absorb and the resumable budgeted absorb so the two cannot
+    /// drift.
+    fn absorb_evidence_counts(&mut self, theirs: &KeyUseEvidence) {
+        let mine = &mut self.evidence;
         mine.unknown_key_rows = mine
             .unknown_key_rows
             .saturating_add(theirs.unknown_key_rows);
@@ -3194,6 +3214,25 @@ impl KeyUseReducer {
         mine.unknown_mechanism_refused = mine
             .unknown_mechanism_refused
             .saturating_add(theirs.unknown_mechanism_refused);
+    }
+
+    /// Merge a fully-closed preservation reducer's unknown summaries
+    /// and evidence (bulk-disposal preservation): fixed unknown
+    /// counters add (never refuse, never re-partition), ever-live
+    /// ORs (N9), by-number detail pairs add under the same
+    /// per-bucket cap (overflow terminals join the refusal count),
+    /// evidence counts add. The preserved reducer holds no opens,
+    /// refused opens, proved aggregates (receipt-less by
+    /// construction) or pended releases — anything left would be a
+    /// pairing leak across the loss boundary.
+    pub(crate) fn absorb_preserved(&mut self, other: KeyUseReducer) {
+        debug_assert!(other.open.is_empty() && other.refused.is_empty());
+        debug_assert!(other.aggregates.is_empty());
+        debug_assert!(other.pending_shared_releases.is_empty());
+        for (index, add) in other.unknown.iter().enumerate() {
+            self.absorb_bucket(index, add, other.unknown_ever_live[index]);
+        }
+        self.absorb_evidence_counts(&other.evidence);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -4545,6 +4584,74 @@ fn classify_head_charged(
     Some(throwaway.would_retire_scope(facts))
 }
 
+/// Resumable cursor for the final preserved-summary absorb: merges
+/// a fully-closed preservation reducer's fixed unknown summaries
+/// into the shared reducer one row per leaf through the shared gate
+/// (one fused row merge per step, like one slot snapshot per sweep
+/// visit), then folds evidence once. Shares the row and evidence
+/// merge helpers with the synchronous absorb so the two cannot
+/// drift.
+struct PreservedAbsorbCursor {
+    other_unknown: [UnknownCounters; UNKNOWN_BUCKETS],
+    other_ever_live: [bool; UNKNOWN_BUCKETS],
+    other_evidence: KeyUseEvidence,
+    next: usize,
+    evidence_done: bool,
+}
+
+impl PreservedAbsorbCursor {
+    fn new(other: KeyUseReducer) -> Self {
+        debug_assert!(other.open.is_empty() && other.refused.is_empty());
+        debug_assert!(other.aggregates.is_empty());
+        debug_assert!(other.pending_shared_releases.is_empty());
+        Self {
+            other_unknown: other.unknown,
+            other_ever_live: other.unknown_ever_live,
+            other_evidence: other.evidence,
+            next: 0,
+            evidence_done: false,
+        }
+    }
+
+    /// Drive one absorb step through the shared pre-debit `gate`:
+    /// one fixed-summary row per leaf, then the evidence fold once.
+    /// Returns whether the absorb completed; false yields with the
+    /// row index retained, resuming on fresh credit.
+    fn poll(
+        &mut self,
+        keyuse: &mut KeyUseReducer,
+        gate: &mut crate::semantics_objects::journal::LeafBudget,
+    ) -> bool {
+        loop {
+            if self.next >= UNKNOWN_BUCKETS {
+                if self.evidence_done {
+                    return true;
+                }
+                if !gate.try_charge() {
+                    return false;
+                }
+                #[cfg(test)]
+                keyuse.bump_absorb_read_for_test();
+                keyuse.absorb_evidence_counts(&self.other_evidence);
+                self.evidence_done = true;
+                return true;
+            }
+            if !gate.try_charge() {
+                return false;
+            }
+            #[cfg(test)]
+            keyuse.bump_absorb_read_for_test();
+            let index = self.next;
+            keyuse.absorb_bucket(
+                index,
+                &self.other_unknown[index],
+                self.other_ever_live[index],
+            );
+            self.next = index + 1;
+        }
+    }
+}
+
 /// One captured `Started` effect awaiting its budgeted mint: the
 /// admission (duplicate check, resolution, budget check) already ran
 /// synchronously; the mint cursor walks and commits through the
@@ -4577,8 +4684,9 @@ struct PendingStartDrain {
 /// machine pop + terminal, pending/detached drop, or open unbind)
 /// with fallback association releases queued FIFO and drained through
 /// the same gate (one leaf per chain read), preserving terminal
-/// reasons and effect order until the per-feed results merge once.
-/// At most one leaf per unit.
+/// reasons and effect order until the per-feed results merge once
+/// through the resumable absorb (one row per leaf, then the evidence
+/// fold). At most one leaf per unit.
 /// Worst-case leaves for one non-retiring staged head's atomic
 /// reduction (pop + synchronous edge observe + effect capture +
 /// key-use admit): 1 pop plus a blanket margin for the O(1)
@@ -4643,6 +4751,11 @@ pub(crate) struct FeedDisposalCursor {
     assoc_queue: VecDeque<u64>,
     assoc_release: Option<crate::semantics_objects::journal::LedgerReleaseCursor>,
     finalize_started: bool,
+    /// Resumable final preserved-summary absorb (one row per leaf,
+    /// then the evidence fold): set once the finalization
+    /// invalidation and association releases complete, driven
+    /// through the shared gate until the feed finalizes.
+    preserved_absorb: Option<PreservedAbsorbCursor>,
     finalized: bool,
 }
 
@@ -4667,6 +4780,7 @@ impl FeedDisposalCursor {
             assoc_queue: VecDeque::with_capacity(crate::semantics_edge::MAX_EDGE_ACTIVE_OPS),
             assoc_release: None,
             finalize_started: false,
+            preserved_absorb: None,
             finalized: !is_joint,
         }
     }
@@ -4777,6 +4891,21 @@ impl FeedDisposalCursor {
                     return false;
                 }
                 self.invalidate = None;
+                continue;
+            }
+            if self.preserved_absorb.is_some() {
+                if !self.is_joint {
+                    self.preserved_absorb = None;
+                    continue;
+                }
+                let absorb = self
+                    .preserved_absorb
+                    .as_mut()
+                    .expect("absorb retained");
+                if !absorb.poll(keyuse, gate) {
+                    return false;
+                }
+                self.preserved_absorb = None;
                 continue;
             }
             if self.head_retire_all.is_some() {
@@ -4951,12 +5080,19 @@ impl FeedDisposalCursor {
                         debug_assert!(self.pending_start.is_none());
                         debug_assert!(self.pending_effects.is_empty());
                         debug_assert!(self.pending_lease.is_none());
-                        let preserved = self.preserved.take().expect("joint finalizes once");
                         // The throwaway stays (resourceless, drained: drop timing
                         // is unobservable) so post-finalize read accounting keeps
                         // its counter; the cursor drop frees it with the void.
                         assert!(self.throwaway.is_some(), "joint finalizes once");
-                        keyuse.absorb_preserved(preserved);
+                        if self.preserved_absorb.is_none() && self.preserved.is_some() {
+                            let preserved = self.preserved.take().expect("joint finalizes once");
+                            self.preserved_absorb =
+                                Some(PreservedAbsorbCursor::new(preserved));
+                        }
+                        if self.preserved_absorb.is_some() {
+                            continue;
+                        }
+                        debug_assert!(self.preserved.is_none());
                         self.finalized = true;
                         return true;
                     }
@@ -5641,8 +5777,8 @@ mod disposal_tests {
     /// Drive one feed disposal to completion with `budget`-unit
     /// polls, asserting `reads <= spent <= budget` every poll over ALL
     /// unified counters (reservation leaves + slot visits on both
-    /// ledgers, staged-queue peeks/pops, throwaway edge reads).
-    /// Returns (polls, total spent, total reads).
+    /// ledgers, staged-queue peeks/pops, throwaway edge reads, final
+    /// absorb rows). Returns (polls, total spent, total reads).
     fn drive_disposal_checked(
         cursor: &mut FeedDisposalCursor,
         feed: &mut JointStaging,
@@ -5661,6 +5797,7 @@ mod disposal_tests {
             fallback.reset_test_slot_visits_for_test();
             feed.reset_test_feed_reads_for_test();
             cursor.reset_throwaway_edge_reads_for_test();
+            keyuse.reset_test_absorb_reads_for_test();
             let mut gate = LeafBudget::new(budget);
             let done = cursor.poll(feed, ledger, Some(&mut *fallback), keyuse, &mut gate);
             let spent = gate.spent();
@@ -5669,7 +5806,8 @@ mod disposal_tests {
                 + fallback.test_leaf_reads_for_test()
                 + fallback.test_slot_visits_for_test()
                 + feed.test_feed_reads_for_test()
-                + cursor.throwaway_edge_reads_for_test();
+                + cursor.throwaway_edge_reads_for_test()
+                + keyuse.test_absorb_reads_for_test();
             assert!(
                 spent <= budget,
                 "{tag} poll {polls} spent {spent} above {budget}"
@@ -6220,6 +6358,62 @@ mod disposal_tests {
         );
         assert_eq!(fallback.census(), 0, "{tag}: no assoc minted");
         assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
+    }
+
+    /// The final preserved-summary absorb debits its fold across
+    /// polls: one leaf per fixed-summary row plus one for the
+    /// evidence fold (139 absorbs), every poll inside its debit.
+    #[test]
+    fn feed_disposal_final_absorb_debits_across_polls() {
+        let tag = "final-absorb";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(43);
+        feed.stage(
+            init_call("C_SignInit", 4008, 0x000d, 100),
+            origin("C_SignInit", 4008, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let mut polls = 0usize;
+        let mut total_absorb = 0usize;
+        loop {
+            keyuse.reset_test_absorb_reads_for_test();
+            let mut gate = LeafBudget::new(64);
+            let done = cursor.poll(
+                &mut feed,
+                &mut ledger,
+                Some(&mut fallback),
+                &mut keyuse,
+                &mut gate,
+            );
+            assert!(gate.spent() <= 64, "{tag} poll {polls} spent above 64");
+            total_absorb += keyuse.test_absorb_reads_for_test();
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "{tag}: the disposal must complete");
+        }
+        assert!(polls > 3, "{tag}: the absorb spans several credits");
+        assert_eq!(
+            total_absorb,
+            UNKNOWN_BUCKETS + 1,
+            "{tag}: one leaf per summary row plus the evidence fold"
+        );
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the truncated open closes Unknown"
+        );
     }
 
     /// A pool-full fallback mint refuses the open without consuming

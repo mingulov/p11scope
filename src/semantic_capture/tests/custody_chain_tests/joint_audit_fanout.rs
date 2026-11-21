@@ -2826,19 +2826,28 @@ fn joint_machine_finish_without_landed_row_publishes() {
             }
         }
     }
-    // The quiet finish measured 14 polls before the fresh-pull guard;
-    // the guard adds at most one pull and the post-publish phase one
-    // budgeted pass per loss poll, so 18 keeps one slack.
-    const QUIET_FINISH_POLL_BOUND: usize = 18;
+    // The quiet finish is an exact, derived count, not a tuned bound:
+    // the base finish takes 14 polls, the fresh-pull guard one more
+    // pull, and the post-publish phase (Phase::PublishedLossPoll) one
+    // budgeted pass per loss lookup it makes: the EVENTS ring loss,
+    // the length-stash insert loss and the length-stash mismatch loss.
+    // A one-action poll buys at most one lookup, so each lookup costs
+    // one poll.
+    const QUIET_FINISH_BASE_POLLS: usize = 14;
+    const FRESH_PULL_GUARD_POLLS: usize = 1;
+    const POST_PUBLISH_LOSS_LOOKUPS: usize = 3;
+    const QUIET_FINISH_POLL_BOUND: usize =
+        QUIET_FINISH_BASE_POLLS + FRESH_PULL_GUARD_POLLS + POST_PUBLISH_LOSS_LOOKUPS;
     eprintln!("finish_quiet polls={polls}");
     assert!(published, "the quiet finish publishes within its bound");
     assert!(
         saw_stop_ready,
         "the quiet finish still takes the empty stop shortcut"
     );
-    assert!(
-        polls <= QUIET_FINISH_POLL_BOUND,
-        "the quiet finish costs at most one extra pull: {polls} polls"
+    assert_eq!(
+        polls, QUIET_FINISH_POLL_BOUND,
+        "the quiet finish costs its base polls, one guard pull and one \
+         pass per post-publish loss lookup"
     );
     assert_eq!(fixture.scene.drain.source_mut().remaining(), 0);
     assert_eq!(

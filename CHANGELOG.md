@@ -65,6 +65,14 @@ versioned separately and are opaque, exact dispatch keys.
   readings are never captured; without a clean uretprobe-hazard
   safety assessment the run leaves usage entries only with a named
   gap. Versions 1–7 stay frozen.
+- Standard post-quantum mechanism ids infer their family on
+  `--key-operations` rows: ML-KEM and ML-DSA operations (the
+  standard ids served by PQC-capable providers such as kryoptic,
+  plus SLH-DSA) label from the mechanism id, while ML-KEM
+  encapsulate/decapsulate lengths size the parameter set under
+  `--key-sizes` (ML-KEM-768 from a 1088-octet ciphertext, as in
+  the Firefox example in the operator's guide). NSS vendor PQC
+  ids are covered by the next item.
 - NSS vendor post-quantum key exchange on `--key-operations` rows
   (section version 9): the journal lane publishes the 53 listed
   vendor mechanism ids by number (previously withheld), so Firefox
@@ -110,6 +118,13 @@ versioned separately and are opaque, exact dispatch keys.
   aggregate. Inventory text names folded departed callers per module:
   a `departed use:` summary row counts the folded callers, entries
   and edges (plus any identities or mechanisms past the row bound).
+- Retired counting coverage is disclosed instead of silently
+  narrowing the capture: when an attached counting slot retires
+  mid-capture (a `run` member exits, a scope detaches), the
+  affected records carry a `coverage_retired` unobserved window
+  and `evidence.coverage_retired_slots` counts the retired slots.
+  Run-tree retire windows attribute to the member that actually
+  retired.
 
 ### Fixed
 
@@ -254,6 +269,42 @@ versioned separately and are opaque, exact dispatch keys.
 - A run's repeated gaps fold into counted aggregates, so gap
   volume stays flat on long captures while every loss keeps its
   name and exact count.
+
+### Known limitations
+
+- Firefox RSA client-certificate rows can be lost: a Firefox run
+  that presents an RSA client certificate can lose those per-key
+  rows while call counts stay exact. A fix is planned for 0.8.0.
+- On a busy host, per-key coverage stays low after an audit void:
+  the lane continues past a transient interruption at the audit
+  step (up to 32 per rolling 2 minutes), but callers already
+  running then keep exact call counts and lose per-key rows for
+  the rest of the run, with no re-entry — so a void early in a
+  long run leaves most of it without per-key rows for those
+  callers. Re-entry after a void is planned for 0.8.x. Workaround:
+  rerun the capture or narrow the scope (`--pid`).
+- Inventory memory still grows slowly with process churn (about
+  3 MiB/h on a busy host), even though exited callers now fold
+  into exact per-module aggregates and retained callers plateau:
+  the run-wide unbound-image census, the ever-enumerated set and
+  other saturating structures keep climbing toward their caps. A
+  bound on the remainder is planned for 0.8.0.
+- Getter-only manifests stay `PARTIAL` (see 0.7.1): the window
+  before the run-time table attaches is always named, and names
+  are not layout-proved.
+- Of the earlier remaining limits, the late-provider admission
+  delay is fixed in 0.7.2 (late providers attach promptly under
+  churn) and the RSS-growth bound is partially shipped (retained
+  callers plateau, see above); silent stderr diagnostics in three
+  cases and exact per-call rows above 6,250 key operations/s
+  still wait for their 0.9 fixes.
+- `run` member stops can still surface one `EINTR` (see 0.7.1);
+  unproven mid-scan exits still file skips with exact counts; a
+  mid-load plan rebuild can still lose first calls in its replace
+  window (fix planned for 0.8.0); `run` with many short-lived
+  children can still rarely miss seconds of calls (fix planned
+  for 0.8.0); stub-pool manifests still cover one getter-call
+  order.
 
 ## [0.7.1] - 2026-11-17
 

@@ -50188,6 +50188,27 @@ fn system_scope_build_driver(dir: &Path) -> PathBuf {
     driver
 }
 
+/// Build the statically linked E06 parker: a libc-free `_start` looping
+/// the nanosleep syscall, so the child parks with no `.so` maps at all.
+/// Built with the same host `gcc` the other C fixtures require
+/// (`-nostdlib`, no static libc needed), failing loudly like them.
+fn e06_build_static_sleeper(dir: &Path) -> PathBuf {
+    let sleeper = dir.join("e06-static-sleeper");
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-nostdlib", "-static", "-o"])
+            .arg(&sleeper)
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/e06-static-sleeper.S")
+            )
+            .status()
+            .unwrap()
+            .success()
+    );
+    sleeper
+}
+
 /// A native child with one provider dlopened, held until the guard drops.
 /// `reap` kills and blocks in `wait`: the returned status — never PID
 /// disappearance alone — proves this owned generation ended.
@@ -54575,10 +54596,18 @@ fn e06_cgroup_args(
 const E06_SETTLE_POLLS: usize = 1000;
 
 fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
+    e06_spawn_sleeps_with(Path::new("sleep"), count)
+}
+
+/// Spawn `count` parked children from an explicit executable (the shared
+/// helper above resolves `sleep` via `PATH`): identical readiness and
+/// shape convergence, so tests can substitute a controlled parker. The
+/// `infinity` argument parks `sleep`; the static parker ignores argv.
+fn e06_spawn_sleeps_with(exe: &Path, count: usize) -> Vec<SystemScopeChildGuard> {
     let guards: Vec<SystemScopeChildGuard> = (0..count)
         .map(|_| {
             SystemScopeChildGuard::new(
-                std::process::Command::new("sleep")
+                std::process::Command::new(exe)
                     .arg("infinity")
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
@@ -54748,6 +54777,37 @@ fn e06_spawned_sleeps_share_one_settled_provider_shape() {
         );
     }
     for child in &mut sleeps {
+        child.reap().unwrap();
+    }
+}
+
+/// The shared sleeper helper accepts a statically linked child: a parked
+/// parker with no `.so` maps at all is a usable provider-free process
+/// (twin: the settled-shape helper still requires a dynamic layout for
+/// its shape assertions). Spawns two to cover the sibling path as well.
+#[test]
+fn e06_spawn_sleeps_accepts_statically_linked_child() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let sleeper = e06_build_static_sleeper(dir.path());
+    let mut children = e06_spawn_sleeps_with(&sleeper, 2);
+    assert_eq!(children.len(), 2);
+    for guard in &children {
+        let pid = guard.pid();
+        let bytes = std::fs::read(format!("/proc/{pid}/maps")).expect("readable maps");
+        let maps = parse_maps(&bytes).expect("parseable maps");
+        assert!(
+            !maps
+                .iter()
+                .any(|mapping| crate::discovery::scan::is_provider_mapping(mapping)),
+            "static child {pid} maps no provider shape"
+        );
+        assert!(
+            maps.iter()
+                .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0),
+            "static child {pid} keeps a file-backed executable mapping"
+        );
+    }
+    for child in &mut children {
         child.reap().unwrap();
     }
 }

@@ -55,6 +55,14 @@ const SSL3_KEY_MATERIAL: u64 = 0x372;
 const ECDSA: u64 = 0x1041;
 const CKM_CHACHA20: u64 = 0x1226;
 
+/// Distinct native threads for the overlap twins (controller ruling
+/// v080-nss-ec-double R2): same-thread strict nesting is
+/// provider-internal re-entry; cross-thread overlap stays
+/// conservative. Far from reference cuts, which double as default
+/// threads.
+const THREAD_A: u64 = 0x7A11_CE01;
+const THREAD_B: u64 = 0x7A11_CE02;
+
 const CKA_CLASS: u64 = 0x0000;
 const CKA_TOKEN: u64 = 0x0001;
 const CKA_KEY_TYPE: u64 = 0x0100;
@@ -109,6 +117,10 @@ struct Call {
     requested: [Option<AttributeList>; 2],
     mechanism: MechanismEvidence,
     scope: SlotScope,
+    /// Explicit native thread, or `None` for the begin cut as the
+    /// thread: distinct cuts never nest, so unproven overlap stays
+    /// conservative unless a twin opts in explicitly.
+    thread: Option<u64>,
 }
 
 fn call(function: &'static str) -> Call {
@@ -119,6 +131,7 @@ fn call(function: &'static str) -> Call {
         requested: [None, None],
         mechanism: MechanismEvidence::NotCaptured,
         scope: SlotScope::Unknown,
+        thread: None,
     }
 }
 
@@ -145,6 +158,10 @@ impl Call {
     }
     fn scope(mut self, scope: SlotScope) -> Self {
         self.scope = scope;
+        self
+    }
+    fn thread(mut self, thread: u64) -> Self {
+        self.thread = Some(thread);
         self
     }
 }
@@ -186,6 +203,9 @@ struct Done {
     session_out: HandleInput<SessionHandle>,
     found: FindResult,
     attributes: Option<AttributeList>,
+    /// Explicit return thread, or `None` for the begin's thread (the
+    /// call stayed on its entry thread).
+    thread: Option<u64>,
 }
 
 fn rv(value: CkRv) -> Done {
@@ -196,6 +216,7 @@ fn rv(value: CkRv) -> Done {
         session_out: HandleInput::Absent,
         found: FindResult::NotCaptured,
         attributes: None,
+        thread: None,
     }
 }
 
@@ -229,13 +250,18 @@ impl Done {
         self.attributes = Some(list);
         self
     }
+    fn thread(mut self, thread: u64) -> Self {
+        self.thread = Some(thread);
+        self
+    }
 }
 
-/// The reference producer's bookkeeping for one domain: begin cut and
-/// delivered completion cut per logical call (key = begin cut).
+/// The reference producer's bookkeeping for one domain: begin cut,
+/// delivered completion cut and begin thread per logical call (key =
+/// begin cut).
 #[derive(Default)]
 struct Book {
-    calls: BTreeMap<u64, (CallToken, Option<u64>)>,
+    calls: BTreeMap<u64, (CallToken, Option<u64>, u64)>,
     bootstrap: Option<u64>,
 }
 
@@ -300,13 +326,15 @@ impl Hist {
             entry_mechanism: call.mechanism,
             scope: call.scope,
             entry_output: OutputEvidence::NotCaptured,
+            thread: call.thread.unwrap_or(cut),
         }
     }
 
     fn try_begin_in(&mut self, dom: usize, cut: u64, call: Call) -> Result<CallToken, ObjectGap> {
         let origin = self.origin(dom, cut, &call);
+        let thread = origin.thread;
         let token = self.model.begin(origin, &mut self.ledger)?;
-        self.domains[dom].1.calls.insert(cut, (token, None));
+        self.domains[dom].1.calls.insert(cut, (token, None, thread));
         Ok(token)
     }
 
@@ -322,9 +350,13 @@ impl Hist {
     }
 
     fn done_in(&mut self, dom: usize, token: CallToken, cut: u64, done: Done) -> ObjectEffects {
-        for (known, completion) in self.domains[dom].1.calls.values_mut() {
-            if *known == token && completion.is_none() {
-                *completion = Some(cut);
+        let mut begin_thread = None;
+        for (known, completion, thread) in self.domains[dom].1.calls.values_mut() {
+            if *known == token {
+                begin_thread = Some(*thread);
+                if completion.is_none() {
+                    *completion = Some(cut);
+                }
             }
         }
         let fact = CompletedFact {
@@ -336,6 +368,9 @@ impl Hist {
             session_out: done.session_out,
             found: done.found,
             attributes: done.attributes,
+            // The return stays on the begin's thread unless the
+            // completion names another one (unprovable migration).
+            thread: done.thread.or(begin_thread).unwrap_or(cut),
         };
         self.model.complete(token, fact, &mut self.ledger)
     }
@@ -362,7 +397,7 @@ impl Hist {
         let open: Vec<CallKey> = book
             .calls
             .iter()
-            .filter(|(begin, (_, completion))| {
+            .filter(|(begin, (_, completion, _))| {
                 **begin <= frontier && completion.is_none_or(|end| end > frontier)
             })
             .map(|(begin, _)| CallKey::reference(*begin))
@@ -2025,10 +2060,23 @@ fn s2s3_concurrent_session_contract_separate_sessions_settle() {
 
 #[test]
 fn s2s3_concurrent_session_contract_same_session_overlap_is_uncertain() {
+    // Controller ruling v080-nss-ec-double R2 (2026-11-21): this pin
+    // keeps the conservative contract for CROSS-THREAD (hence
+    // unprovable) same-session overlap — the nested call runs on
+    // another thread, so re-entry is unprovable and both creations
+    // stay fenced under the generic gap, never the precise internal
+    // one. The same-thread twin
+    // (s2s3_provider_internal_same_thread_nesting_binds) proves the
+    // provider-internal re-entry exemption.
     let mut h = Hist::qualified();
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
-    let a = h.begin(3, create(SA));
-    let b = h.run(4, call("C_GenerateKey").on(SA), 5, ok().result(0, H2));
+    let a = h.begin(3, create(SA).thread(THREAD_A));
+    let b = h.run(
+        4,
+        call("C_GenerateKey").on(SA).thread(THREAD_B),
+        5,
+        ok().result(0, H2),
+    );
     h.done(a, 6, ok().result(0, H1));
     let effects = h.settle(6);
     assert_eq!(
@@ -2039,6 +2087,111 @@ fn s2s3_concurrent_session_contract_same_session_overlap_is_uncertain() {
     assert_eq!(created(&effects, b, 0), None);
     assert_eq!(unresolved(&effects, a), Some(ObjectGap::SameSessionOverlap));
     assert_eq!(unresolved(&effects, b), Some(ObjectGap::SameSessionOverlap));
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved {
+                reason: ObjectGap::ProviderInternal,
+                ..
+            }
+        )),
+        "cross-thread overlap names no internal gap"
+    );
+    assert!(h.project().objects.is_empty());
+}
+
+#[test]
+fn s2s3_provider_internal_same_thread_nesting_binds() {
+    // Controller ruling v080-nss-ec-double R2 (2026-11-21), positive
+    // twin: a call starting and ending on one thread strictly inside
+    // another open call on the same session is provider-internal
+    // re-entry (the NSS softoken EC-keygen pairwise self-test
+    // shape). The outer creation's outputs bind; the caller's later
+    // uses bind to the created key; the inner call keeps its
+    // conservative join (its key birth is the in-flight outer call)
+    // under the precise internal gap.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        4,
+        sign_init(SA, H1)
+            .thread(THREAD_A)
+            .mech(MechanismEvidence::Value(ECDSA)),
+        5,
+        ok().mech(MechanismEvidence::Value(ECDSA)),
+    );
+    h.done(outer, 6, ok().result(0, H1).result(1, H2));
+    let effects = h.settle(6);
+    let public = created(&effects, outer, 0).expect("outer public binds");
+    let private = created(&effects, outer, 1).expect("outer private binds");
+    assert_ne!(public, private, "pair halves are distinct views");
+    assert_eq!(
+        unresolved(&effects, inner),
+        Some(ObjectGap::ProviderInternal),
+        "the inner join stays conservative under the precise gap"
+    );
+    assert_eq!(
+        unresolved(&effects, outer),
+        None,
+        "the outer call binds with no gap at all"
+    );
+    // The caller's later use binds to the created key: no tombstone
+    // was laid on the outer outputs.
+    let use_ = h.run(
+        7,
+        sign_init(SA, H1).mech(MechanismEvidence::Value(ECDSA)),
+        8,
+        ok().mech(MechanismEvidence::Value(ECDSA)),
+    );
+    let effects = h.settle(8);
+    assert_eq!(unresolved(&effects, use_), None, "the later use binds");
+    assert!(
+        effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Referenced { call, object, .. }
+                if *call == use_ && *object == public
+        )),
+        "the later use references the created public key"
+    );
+}
+
+#[test]
+fn s2s3_provider_internal_migrated_return_stays_uncertain() {
+    // Controller ruling v080-nss-ec-double R2: the re-entry proof
+    // needs the SAME thread at both ends — a nested call returning
+    // on another thread is unprovable migration, so both calls keep
+    // the conservative gap and nothing binds.
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        4,
+        sign_init(SA, H1).thread(THREAD_A),
+        5,
+        ok().thread(THREAD_B),
+    );
+    h.done(outer, 6, ok().result(0, H1).result(1, H2));
+    let effects = h.settle(6);
+    assert_eq!(created(&effects, outer, 0), None);
+    assert_eq!(
+        unresolved(&effects, outer),
+        Some(ObjectGap::SameSessionOverlap)
+    );
+    assert_eq!(
+        unresolved(&effects, inner),
+        Some(ObjectGap::SameSessionOverlap)
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved {
+                reason: ObjectGap::ProviderInternal,
+                ..
+            }
+        )),
+        "a migrated return names no internal gap"
+    );
     assert!(h.project().objects.is_empty());
 }
 
@@ -3063,6 +3216,10 @@ fn scale_origin(
         entry_mechanism: MechanismEvidence::NotCaptured,
         scope: SlotScope::Unknown,
         entry_output: OutputEvidence::NotCaptured,
+        // Conservative reference default: the fact's own cut as the
+        // thread, so begin/end never match and nesting stays
+        // unprovable (today's behavior).
+        thread: cut,
     }
 }
 
@@ -3076,6 +3233,7 @@ fn scale_created(cut: u64, raw: u64) -> CompletedFact {
         session_out: HandleInput::Absent,
         found: FindResult::NotCaptured,
         attributes: None,
+        thread: cut,
     }
 }
 
@@ -3303,6 +3461,7 @@ fn s2s3_bounded_state_and_redaction_sentinel_canaries() {
         session_out: HandleInput::Value(sess(SB)),
         found: FindResult::handles(&[obj(H1), obj(H2)]),
         attributes: None,
+        thread: 12,
     };
     for form in [
         format!("{effects:?}"),
@@ -3790,7 +3949,7 @@ fn s2s3_stale_origin_and_dependency_fences_lost_outcome_releases_ticket() {
         LostOutcome::Ticket(stuck, RefCut::reference(5)),
         &mut h.ledger,
     );
-    for (_, completion) in h.domains[0].1.calls.values_mut() {
+    for (_, completion, _) in h.domains[0].1.calls.values_mut() {
         if completion.is_none() {
             *completion = Some(5);
         }
@@ -3924,6 +4083,7 @@ fn churn(limits: ObjectLimits, cycles: u64) -> (ObjectSemantics, Vec<ObjectId>, 
         entry_mechanism: MechanismEvidence::NotCaptured,
         scope,
         entry_output: OutputEvidence::NotCaptured,
+        thread: cut,
     };
     let completed =
         |cut: u64, result: ResultSlot, session_out: HandleInput<SessionHandle>| CompletedFact {
@@ -3935,6 +4095,7 @@ fn churn(limits: ObjectLimits, cycles: u64) -> (ObjectSemantics, Vec<ObjectId>, 
             session_out,
             found: FindResult::NotCaptured,
             attributes: None,
+            thread: cut,
         };
     let prefix = |cut: u64, bootstrap: Option<u64>| {
         CompleteInputPrefix::reference(
@@ -4139,6 +4300,7 @@ fn short_lived(
             entry_mechanism: MechanismEvidence::NotCaptured,
             scope,
             entry_output: OutputEvidence::NotCaptured,
+            thread: cut,
         };
     let completed = |cut: u64, result: ResultSlot, session_out| CompletedFact {
         cut: RefCut::reference(cut),
@@ -4149,6 +4311,7 @@ fn short_lived(
         session_out,
         found: FindResult::NotCaptured,
         attributes: None,
+        thread: cut,
     };
     let sa = HandleInput::Value(sess(SA));
     let open = model
@@ -4249,6 +4412,7 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
                     entry_mechanism: MechanismEvidence::NotCaptured,
                     scope: SlotScope::Unknown,
                     entry_output: OutputEvidence::NotCaptured,
+                    thread: 50,
                 },
                 &mut *ledger,
             )

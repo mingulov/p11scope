@@ -4261,6 +4261,7 @@ mod tests {
             entry_mechanism: MechanismEvidence::NotCaptured,
             scope: SlotScope::Unknown,
             entry_output: OutputEvidence::NotCaptured,
+            thread: 1,
         };
         let token = model
             .begin(origin, adapter.ledger_mut())
@@ -4320,6 +4321,7 @@ mod tests {
                 entry_mechanism: MechanismEvidence::NotCaptured,
                 scope: SlotScope::Unknown,
                 entry_output: OutputEvidence::NotCaptured,
+                thread: 1,
             };
             model
                 .begin(origin, adapter.ledger_mut())

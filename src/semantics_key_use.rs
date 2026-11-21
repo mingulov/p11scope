@@ -1068,6 +1068,7 @@ impl JointStaging {
         // complete a binding this seal just unproved.
         let completion =
             KeyUseReducer::completion_evidence_for_effects(&seal.effects.effects, &settled[0]);
+        let internal = KeyUseReducer::is_provider_internal(&seal.effects.effects, &settled[0]);
         let outcome = {
             let mut tee = KeyUseTee {
                 outer: sink,
@@ -1082,6 +1083,7 @@ impl JointStaging {
                 &head.origin,
                 &receipts,
                 &completion,
+                internal,
                 &mut tee,
             ) {
                 Ok(refused) => {
@@ -1200,6 +1202,7 @@ impl JointStaging {
                 self.redeemed = self.redeemed.saturating_add(1);
                 let receipts = keyuse.receipts_for_effects(effects, call, head.position);
                 let completion = KeyUseReducer::completion_evidence_for_effects(effects, call);
+                let internal = KeyUseReducer::is_provider_internal(effects, call);
                 let early_release = head.resource_origin.is_none() && !ledger.has_reserver();
                 if early_release {
                     ledger.release(head.position, head.charged_bytes());
@@ -1218,6 +1221,7 @@ impl JointStaging {
                         &head.origin,
                         &receipts,
                         &completion,
+                        internal,
                         &mut tee,
                     ) {
                         Ok(count) => {
@@ -1398,6 +1402,9 @@ impl JointStaging {
                     &head.origin,
                     &[],
                     &crate::keymeta::CompletionEvidence::NONE,
+                    // Seal-less fallback replay: no gap evidence,
+                    // so internal stays unproven (conservative).
+                    false,
                     &mut tee,
                 ) {
                     Ok(count) => {
@@ -1865,6 +1872,9 @@ impl JointStaging {
                     &head.origin,
                     &[],
                     &crate::keymeta::CompletionEvidence::NONE,
+                    // Seal-less fallback replay: no gap evidence,
+                    // so internal stays unproven (conservative).
+                    false,
                     &mut tee,
                 ) {
                     Ok(head_refused) => {
@@ -1944,6 +1954,27 @@ pub(crate) fn unbound_reason_for(category: &str) -> &'static str {
         "not_applicable"
     } else {
         "unbound"
+    }
+}
+
+/// The frozen unknown-key reason for a provider-internal re-entrant
+/// call's terminal (controller ruling v080-nss-ec-double R2,
+/// 2026-11-21): the call started and ended on one thread strictly
+/// inside another open call on the same session (the known instance
+/// is the NSS softoken EC-keygen pairwise self-test), so its key
+/// birth is the still-in-flight outer call and no receipt binds it.
+/// A named unknown row, never a dropped terminal.
+pub(crate) const PROVIDER_INTERNAL_REASON: &str = "provider_internal";
+
+/// The frozen unknown-key reason for a receipt-less terminal:
+/// provider-internal re-entry names itself whatever the category
+/// (the re-entry explains the missing receipt, subsuming the
+/// category default); everything else keeps [`unbound_reason_for`].
+pub(crate) fn unknown_reason_for(category: &str, internal: bool) -> &'static str {
+    if internal {
+        PROVIDER_INTERNAL_REASON
+    } else {
+        unbound_reason_for(category)
     }
 }
 
@@ -2236,22 +2267,23 @@ pub(crate) const UNKNOWN_CATEGORIES: [&str; 23] = [
     "unknown",
 ];
 
-/// The fixed unknown-summary reason vocabulary (H9 §82). Mirrors
-/// the frozen contract table; the schema contract test pins them
-/// equal.
-pub(crate) const UNKNOWN_REASONS: [&str; 6] = [
+/// The fixed unknown-summary reason vocabulary (H9 §82 plus the
+/// R2 provider-internal re-entry reason). Mirrors the frozen
+/// contract table; the schema contract test pins them equal.
+pub(crate) const UNKNOWN_REASONS: [&str; 7] = [
     "unbound",
     "key_join_lost",
     "metadata_unknown",
     "metadata_conflicting",
     "role_unavailable",
     "not_applicable",
+    PROVIDER_INTERNAL_REASON,
 ];
 
 /// Fixed unknown summaries: every category × reason pair exists, so
-/// terminal increments never allocate. Index `category * 6 + reason`
+/// terminal increments never allocate. Index `category * 7 + reason`
 /// in the tables above.
-pub(crate) const UNKNOWN_BUCKETS: usize = 23 * 6;
+pub(crate) const UNKNOWN_BUCKETS: usize = 23 * 7;
 
 /// The fixed-summary index for one (category, reason) pair. Total:
 /// S1 categories and reducer reasons always land in-vocabulary (a
@@ -2272,7 +2304,7 @@ fn unknown_index(category: &str, reason: &str) -> usize {
         .iter()
         .position(|known| *known == reason)
         .unwrap_or_else(|| {
-            debug_assert!(false, "unknown reasons stay within the frozen 6");
+            debug_assert!(false, "unknown reasons stay within the frozen 7");
             UNKNOWN_REASONS
                 .iter()
                 .position(|known| *known == "unbound")
@@ -2802,6 +2834,10 @@ pub(crate) struct OpenKeyUse {
     /// Whether any receipt bound (receipt-less opens close to the
     /// unknown-key summary with explicit evidence — never loss).
     bound: bool,
+    /// Whether the starting call is provider-internal re-entry
+    /// (seal evidence, fixed at start): its receipt-less terminal
+    /// routes to the `provider_internal` unknown row.
+    internal: bool,
     /// The open's prospective-association ticket plus which ledger
     /// minted it (N1c): ends release to the minting ledger, or pend
     /// a shared release when the shared ledger is absent (C4-style).
@@ -2816,6 +2852,9 @@ pub(crate) struct RefusedOpen {
     pub instance: RegistryInstanceId,
     pub category: &'static str,
     pub started_ts_ns: u64,
+    /// Whether the refused start is provider-internal re-entry:
+    /// its terminal keeps the `provider_internal` route.
+    pub internal: bool,
 }
 
 /// The key-use reducer (H9): joins the operation-effect stream to
@@ -3069,6 +3108,7 @@ impl KeyUseReducer {
                 mechanism,
                 key_receipt,
                 origin,
+                internal,
             } => {
                 let key = (instance, *id);
                 if self.open.contains_key(&key) || self.refused.contains_key(&key) {
@@ -3084,7 +3124,7 @@ impl KeyUseReducer {
                 let (slots, len) = Self::resolve(instance, category, receipts);
                 let resolved = &slots[..len];
                 if !self.admits(resolved) {
-                    self.refuse(key, instance, category, origin.ts_ns);
+                    self.refuse(key, instance, category, origin.ts_ns, *internal);
                     return;
                 }
                 // One shared reservation owner (N1c): the prospective
@@ -3097,7 +3137,7 @@ impl KeyUseReducer {
                 let target = shared.as_deref_mut().or(fallback.as_deref_mut());
                 let Some(ledger) = target else {
                     debug_assert!(false, "keyassoc mint needs a ledger");
-                    self.refuse(key, instance, category, origin.ts_ns);
+                    self.refuse(key, instance, category, origin.ts_ns, *internal);
                     return;
                 };
                 let assoc_bytes = size_of::<OpenKeyUse>() as u64
@@ -3108,7 +3148,7 @@ impl KeyUseReducer {
                 ) {
                     Ok(ticket) => ticket,
                     Err(_) => {
-                        self.refuse(key, instance, category, origin.ts_ns);
+                        self.refuse(key, instance, category, origin.ts_ns, *internal);
                         return;
                     }
                 };
@@ -3140,7 +3180,7 @@ impl KeyUseReducer {
                 if receipts.is_empty() {
                     // A receipt-less open is live unknown-key S1:
                     // active now, outcome at close.
-                    let slot = unknown_index(category, unbound_reason_for(category));
+                    let slot = unknown_index(category, unknown_reason_for(category, *internal));
                     self.unknown_activate(slot);
                 }
                 // Touched proved buckets forward-fill their parks.
@@ -3158,6 +3198,7 @@ impl KeyUseReducer {
                         started_ts_ns: origin.ts_ns,
                         associations,
                         bound: !receipts.is_empty(),
+                        internal: *internal,
                         ticket,
                         ticket_shared,
                     },
@@ -3211,8 +3252,10 @@ impl KeyUseReducer {
                     // A refused start's terminal: S1 owns the
                     // outcome; the key side preserves it in the
                     // fixed unknown summary — never a positive row.
-                    let slot =
-                        unknown_index(refused.category, unbound_reason_for(refused.category));
+                    let slot = unknown_index(
+                        refused.category,
+                        unknown_reason_for(refused.category, refused.internal),
+                    );
                     self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
                     self.unknown_add(slot, *outcome);
                     self.evidence.refused_terminals =
@@ -3231,6 +3274,7 @@ impl KeyUseReducer {
                 key_receipts,
                 length,
                 fresh_view,
+                internal,
                 ..
             } => {
                 let receipts =
@@ -3241,7 +3285,7 @@ impl KeyUseReducer {
                     // A refused direct's terminal outcome (directs
                     // complete atomically) preserves into the fixed
                     // unknown summary — never a positive row.
-                    let slot = unknown_index(category, unbound_reason_for(category));
+                    let slot = unknown_index(category, unknown_reason_for(category, *internal));
                     self.unknown_add(slot, OperationOutcome::Completed);
                     self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
                     self.evidence.partial = true;
@@ -3252,7 +3296,7 @@ impl KeyUseReducer {
                 if receipts.is_empty() {
                     self.evidence.unknown_key_rows =
                         self.evidence.unknown_key_rows.saturating_add(1);
-                    let slot = unknown_index(category, unbound_reason_for(category));
+                    let slot = unknown_index(category, unknown_reason_for(category, *internal));
                     self.unknown_add(slot, OperationOutcome::Completed);
                     return;
                 }
@@ -3278,7 +3322,7 @@ impl KeyUseReducer {
                     // Secondary-only direct: the proved secondary
                     // associations stand above while the missing
                     // primary's terminal partitions unknown.
-                    let slot = unknown_index(category, unbound_reason_for(category));
+                    let slot = unknown_index(category, unknown_reason_for(category, *internal));
                     self.unknown_add(slot, OperationOutcome::Completed);
                 }
                 // Atomic completion attributes family and size per
@@ -3633,7 +3677,10 @@ impl KeyUseReducer {
     fn close_open(&mut self, open: OpenKeyUse, outcome: OperationOutcome) {
         if !open.bound {
             self.evidence.unknown_key_rows = self.evidence.unknown_key_rows.saturating_add(1);
-            let slot = unknown_index(open.category, unbound_reason_for(open.category));
+            let slot = unknown_index(
+                open.category,
+                unknown_reason_for(open.category, open.internal),
+            );
             self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
             self.unknown_add(slot, outcome);
             return;
@@ -3675,7 +3722,10 @@ impl KeyUseReducer {
             // secondary associations stand above while the missing
             // primary's terminal partitions unknown (never a
             // promotion of the secondary).
-            let slot = unknown_index(open.category, unbound_reason_for(open.category));
+            let slot = unknown_index(
+                open.category,
+                unknown_reason_for(open.category, open.internal),
+            );
             self.unknown_add(slot, outcome);
         }
     }
@@ -3690,6 +3740,7 @@ impl KeyUseReducer {
         instance: RegistryInstanceId,
         category: &'static str,
         started_ts_ns: u64,
+        internal: bool,
     ) {
         self.refused.insert(
             key,
@@ -3697,9 +3748,10 @@ impl KeyUseReducer {
                 instance,
                 category,
                 started_ts_ns,
+                internal,
             },
         );
-        let slot = unknown_index(category, unbound_reason_for(category));
+        let slot = unknown_index(category, unknown_reason_for(category, internal));
         self.unknown_activate(slot);
         self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
         self.evidence.partial = true;
@@ -3886,6 +3938,21 @@ impl KeyUseReducer {
         position: u64,
     ) -> Vec<KeyReceipt> {
         self.receipts_for_effects(&seal.effects.effects, settled, position)
+    }
+
+    /// Whether the settled call is provider-internal re-entry: the
+    /// model left exactly this ticket unresolved under the precise
+    /// `ProviderInternal` gap. Ticket-qualified like the receipts
+    /// below — never another call's gap.
+    pub(crate) fn is_provider_internal(effects: &[ObjectEffect], settled: &SealedCall) -> bool {
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                ObjectEffect::Unresolved { call, reason }
+                    if *call == settled.ticket
+                        && *reason == crate::semantics_objects::ObjectGap::ProviderInternal
+            )
+        })
     }
 
     /// This replay's completion evidence (keymeta §9): the settled

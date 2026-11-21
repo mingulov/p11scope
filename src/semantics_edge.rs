@@ -345,6 +345,10 @@ impl EffectOrigin {
 /// `Started` carries the machine's fixed key receipt (`None` for
 /// S1Only or unassociated starts); `DirectCompleted` carries the
 /// call's positional receipts (at most two); `Ended` joins by id.
+/// `internal` names a provider-internal re-entrant call (seal
+/// evidence, fixed at the call that starts the machine or the
+/// direct); the reducer routes its receipt-less terminal to the
+/// `provider_internal` unknown row instead of `unbound`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OperationEffect {
     Started {
@@ -353,6 +357,7 @@ pub(crate) enum OperationEffect {
         mechanism: Option<u64>,
         key_receipt: Option<KeyReceipt>,
         origin: EffectOrigin,
+        internal: bool,
     },
     Ended {
         id: OperationId,
@@ -380,6 +385,7 @@ pub(crate) enum OperationEffect {
         /// (the unwrap U1 park, §5.4); `None` unless the seal proved
         /// exactly one created view for this call.
         fresh_view: Option<u64>,
+        internal: bool,
     },
 }
 
@@ -1089,7 +1095,7 @@ impl EdgeSemantics {
         origin: &EffectOrigin,
         sink: &mut S,
     ) -> u64 {
-        self.observe_inner(call, origin, &[], &CompletionEvidence::NONE, sink)
+        self.observe_inner(call, origin, &[], &CompletionEvidence::NONE, false, sink)
     }
 
     /// Joint replay (H9): the same single pass, plus this call's
@@ -1108,7 +1114,7 @@ impl EdgeSemantics {
         keys: &[KeyReceipt],
         sink: &mut S,
     ) -> u64 {
-        self.observe_inner(call, origin, keys, &CompletionEvidence::NONE, sink)
+        self.observe_inner(call, origin, keys, &CompletionEvidence::NONE, false, sink)
     }
 
     /// Joint replay with H3 resource reservation (N14): prepares the
@@ -1119,21 +1125,26 @@ impl EdgeSemantics {
     /// un-replayable payload as history. Reducers without a pool
     /// (unit-test defaults; production registry reducers always
     /// carry one) replay unresourced.
+    /// `internal` is seal evidence that this call is
+    /// provider-internal re-entry: it rides the `Started` /
+    /// `DirectCompleted` the call emits (async paths emit no start
+    /// of their own, so they take none).
     pub(crate) fn observe_joint_with_resources<S: OperationSink>(
         &mut self,
         call: &SemanticCall,
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
         completion: &CompletionEvidence,
+        internal: bool,
         sink: &mut S,
     ) -> Result<u64, SemanticResourceRefusal> {
         if self.resource_owner.is_none() {
-            return Ok(self.observe_inner(call, origin, keys, completion, sink));
+            return Ok(self.observe_inner(call, origin, keys, completion, internal, sink));
         }
         let prepared = self.prepare_resource_transition(call)?;
         assert!(self.resource_transition.is_none());
         self.resource_transition = Some(prepared);
-        let refused = self.observe_inner(call, origin, keys, completion, sink);
+        let refused = self.observe_inner(call, origin, keys, completion, internal, sink);
         drop(self.resource_transition.take());
         Ok(refused)
     }
@@ -1144,6 +1155,7 @@ impl EdgeSemantics {
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
         completion: &CompletionEvidence,
+        internal: bool,
         sink: &mut S,
     ) -> u64 {
         let dropped_before = self.dropped;
@@ -1162,7 +1174,7 @@ impl EdgeSemantics {
         } else if call.rv == CkRv::PENDING.0 {
             self.queue_pending(call, sink);
         } else {
-            self.apply_completed(call, &descriptor, origin, keys, completion, sink);
+            self.apply_completed(call, &descriptor, origin, keys, completion, internal, sink);
         }
         self.dropped.saturating_sub(dropped_before)
     }
@@ -1226,6 +1238,7 @@ impl EdgeSemantics {
     /// carry (the consumed call, or the original for async replay).
     /// `keys` are this call's positional key receipts for the
     /// machines and direct operations it starts (Joint only).
+    #[allow(clippy::too_many_arguments)] // Completed-call context: call/descriptor/origin/keys/completion/internal plus sink.
     fn apply_completed<S: OperationSink>(
         &mut self,
         call: &SemanticCall,
@@ -1233,6 +1246,7 @@ impl EdgeSemantics {
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
         completion: &CompletionEvidence,
+        internal: bool,
         sink: &mut S,
     ) {
         if descriptor.transition == transition::INITIALIZE || descriptor.direct != direct::NONE {
@@ -1243,11 +1257,11 @@ impl EdgeSemantics {
         }
         self.apply_lifecycle(call, descriptor, origin, sink);
         if descriptor.transition == transition::INITIALIZE {
-            self.apply_init(call, descriptor, origin, keys, sink);
+            self.apply_init(call, descriptor, origin, keys, internal, sink);
         } else if descriptor.direct == direct::NONE && descriptor.operations != 0 {
             self.apply_operations(call, descriptor, origin, completion, sink);
         } else if descriptor.direct != direct::NONE {
-            self.apply_direct(call, descriptor, origin, keys, completion, sink);
+            self.apply_direct(call, descriptor, origin, keys, completion, internal, sink);
         }
     }
 
@@ -1606,6 +1620,7 @@ impl EdgeSemantics {
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
+        internal: bool,
         sink: &mut S,
     ) {
         if call.rv != CkRv::OK.0 || call.session == SESSION_NONE {
@@ -1626,6 +1641,7 @@ impl EdgeSemantics {
                         Some(call.mechanism),
                         key,
                         origin,
+                        internal,
                         sink,
                     );
                 }
@@ -1645,10 +1661,10 @@ impl EdgeSemantics {
                 capture::MECHANISM_NULL => {
                     self.evidence.semantic_capture_failures =
                         self.evidence.semantic_capture_failures.saturating_add(1);
-                    self.start_machine(call.session, bit, name, None, key, origin, sink);
+                    self.start_machine(call.session, bit, name, None, key, origin, internal, sink);
                 }
                 _ => {
-                    self.start_machine(call.session, bit, name, None, key, origin, sink);
+                    self.start_machine(call.session, bit, name, None, key, origin, internal, sink);
                 }
             }
         }
@@ -1664,7 +1680,7 @@ impl EdgeSemantics {
     /// wrapping or recycling an identity. `key_receipt` fixes the
     /// machine's receipt for its life (`None` for S1Only/unassociated
     /// starts).
-    #[allow(clippy::too_many_arguments)] // Exact machine identity: session/bit/category/mechanism/receipt plus origin/sink.
+    #[allow(clippy::too_many_arguments)] // Exact machine identity: session/bit/category/mechanism/receipt plus origin/internal/sink.
     fn start_machine<S: OperationSink>(
         &mut self,
         session: u64,
@@ -1673,6 +1689,7 @@ impl EdgeSemantics {
         mechanism: Option<u64>,
         key_receipt: Option<KeyReceipt>,
         origin: &EffectOrigin,
+        internal: bool,
         sink: &mut S,
     ) {
         let key = (session, bit);
@@ -1740,6 +1757,7 @@ impl EdgeSemantics {
                 mechanism,
                 key_receipt: stored,
                 origin: origin.clone(),
+                internal,
             });
         }
     }
@@ -1823,6 +1841,7 @@ impl EdgeSemantics {
     /// call emits nothing. The identity draws from the same checked
     /// source as machines: on exhaustion the definite in-call
     /// completion still counts, but no effect is emitted.
+    #[allow(clippy::too_many_arguments)] // Direct-call context: call/descriptor/origin/keys/completion/internal plus sink.
     fn apply_direct<S: OperationSink>(
         &mut self,
         call: &SemanticCall,
@@ -1830,6 +1849,7 @@ impl EdgeSemantics {
         origin: &EffectOrigin,
         keys: &[KeyReceipt],
         completion: &CompletionEvidence,
+        internal: bool,
         sink: &mut S,
     ) {
         if call.rv != CkRv::OK.0 {
@@ -1870,6 +1890,7 @@ impl EdgeSemantics {
                 // ride through.
                 length,
                 fresh_view: completion.fresh_view,
+                internal,
             });
         }
     }
@@ -2369,6 +2390,10 @@ impl EdgeSemantics {
             effect_origin,
             &[],
             &CompletionEvidence::NONE,
+            // Async replay carries no seal evidence either: the
+            // original call never completes in the model, so no
+            // marker can exist and internal stays false.
+            false,
             sink,
         );
     }

@@ -113,6 +113,7 @@ fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
                 category,
                 mechanism,
                 origin,
+                internal,
                 ..
             } => OperationEffect::Started {
                 id: *id,
@@ -120,6 +121,7 @@ fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
                 mechanism: *mechanism,
                 key_receipt: None,
                 origin: origin.clone(),
+                internal: *internal,
             },
             OperationEffect::Ended {
                 id,
@@ -146,6 +148,7 @@ fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
                 origin,
                 length,
                 fresh_view,
+                internal,
                 ..
             } => OperationEffect::DirectCompleted {
                 id: *id,
@@ -155,6 +158,7 @@ fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
                 origin: origin.clone(),
                 length: *length,
                 fresh_view: *fresh_view,
+                internal: *internal,
             },
         })
         .collect()
@@ -854,7 +858,23 @@ fn attest_and_ingest(scene: &mut JointScene, call: &ShapedS1) {
 /// One explicit paired native/Event input before routed admission.
 fn admit_call_input(scene: &mut JointScene, call: &ShapedS1) -> AdmittedInstanceCall {
     scene.admission_sequence = scene.admission_sequence.max(scene.sequence) + 1;
-    let begin = begin_for_call(scene, call, scene.admission_sequence);
+    admit_call_input_with_sequence(scene, call, scene.thread, scene.admission_sequence)
+}
+
+/// One paired input with an explicit journal (thread, sequence)
+/// (nested twins): production H0 admits in END order while journal
+/// sequences run in BEGIN order, so nested twins admit inner-first
+/// with begin-order sequences on the chosen threads.
+fn admit_call_input_with_sequence(
+    scene: &mut JointScene,
+    call: &ShapedS1,
+    thread: u64,
+    sequence: u64,
+) -> AdmittedInstanceCall {
+    let saved = scene.thread;
+    scene.thread = thread;
+    scene.admission_sequence = scene.admission_sequence.max(sequence);
+    let begin = begin_for_call(scene, call, sequence);
     let end = end_for_call(&begin, call);
     let record = decode_journal_record(&end, &scene.descriptors).expect("paired END decodes");
     let p11scope_ebpf_common::object_journal::JournalRecord::End(end) = record else {
@@ -864,6 +884,7 @@ fn admit_call_input(scene: &mut JointScene, call: &ShapedS1) -> AdmittedInstance
         .fixture
         .admit_original_event(call.name, end.payload_base().event);
     scene.paired_begins.insert(admitted.h0_ordinal(), begin);
+    scene.thread = saved;
     admitted
 }
 
@@ -1114,9 +1135,16 @@ fn end_with_length_trailer(end: &[u8; 632], name: &str, value: u64) -> Vec<u8> {
 
 /// Ingest the paired call's native records in their original order.
 fn ingest_call(scene: &mut JointScene, call: &ShapedS1, position: u64) {
-    let begin = scene
+    ingest_begin_for_position(scene, call, position);
+    ingest_end_for_position(scene, call, position);
+}
+
+/// Ingest one admitted call's BEGIN only (nested twins): the paired
+/// bytes stay retained for the later END ingest.
+fn ingest_begin_for_position(scene: &mut JointScene, call: &ShapedS1, position: u64) {
+    let begin = *scene
         .paired_begins
-        .remove(&position)
+        .get(&position)
         .expect("original paired BEGIN for this exact H0 admission");
     let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) =
         decode_journal_record(&begin, &scene.descriptors).expect("paired BEGIN")
@@ -1134,6 +1162,15 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1, position: u64) {
         "{} begin admits",
         call.name
     );
+}
+
+/// Ingest one admitted call's END only (nested twins): consumes the
+/// paired BEGIN retained by the begin ingest.
+fn ingest_end_for_position(scene: &mut JointScene, call: &ShapedS1, position: u64) {
+    let begin = scene
+        .paired_begins
+        .remove(&position)
+        .expect("retained paired BEGIN for this exact H0 admission");
     let base = end_for_call(&begin, call);
     let extended;
     let end: &[u8] = match call.length_value {
@@ -1356,6 +1393,366 @@ fn key_operation_single_feed_exactly_once() {
         staging2.stage(older, origin, 1, scene.adapter.ledger_mut()),
         Err(StagingRefusal::ReplayRefused)
     );
+}
+
+/// Controller ruling v080-nss-ec-double R2 (2026-11-21),
+/// production-path positive twin: real journal bytes with one native
+/// thread throughout — a sign self-test (`C_SignInit` + `C_Sign`)
+/// strictly inside an open `C_GenerateKeyPair` on the same session is
+/// provider-internal re-entry. The keygen outputs bind (no
+/// tombstone), the self-test joins stay conservative under the
+/// precise internal gap, the helper reads that gap back for the H9
+/// terminal route, and the caller's later sign binds to the created
+/// key. Row-level routing of the internal terminal is pinned by
+/// `key_operation_provider_internal_terminal_routes`.
+#[test]
+fn key_operation_provider_internal_same_thread_nesting_binds() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap};
+    const PUBLIC: u64 = 0xD2D2_D2D2_D2D2_D2D2;
+    const PRIVATE: u64 = 0xD3D3_D3D3_D3D3_D3D3;
+    let mut scene = JointScene::new();
+
+    // Open the session first: production sessions are live long
+    // before any keygen. (Without this, the first-ending nested
+    // call would mint the session and the outer would strand on
+    // StaleOrigin instead of reaching interference.)
+    let mut open = ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0);
+    open.session = Some(SESSION);
+    let admitted = admit_call_input(&mut scene, &open);
+    scene.adapter.attest_key(&admitted).expect("open attests");
+    ingest_call(&mut scene, &open, admitted.h0_ordinal());
+    let opened = scene.seal().expect("open quantum seals");
+    assert!(
+        opened
+            .effects
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+        "the session opens first"
+    );
+
+    let mut pair = ShapedS1::shaped("C_GenerateKeyPair", CkRv::OK.0, 0, 0);
+    pair.pair_results = Some((PUBLIC, PRIVATE));
+    let mut selftest_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    selftest_init.input0 = Some((PUBLIC, 1));
+    let selftest_sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // Admit in END order (production H0) with begin-order journal
+    // sequences, all on thread 1.
+    let admitted = admit_call_input_with_sequence(&mut scene, &selftest_init, 1, 3);
+    scene.adapter.attest_key(&admitted).expect("init attests");
+    let init_pos = admitted.h0_ordinal();
+    let admitted = admit_call_input_with_sequence(&mut scene, &selftest_sign, 1, 4);
+    scene.adapter.attest_key(&admitted).expect("sign attests");
+    let sign_pos = admitted.h0_ordinal();
+    let admitted = admit_call_input_with_sequence(&mut scene, &pair, 1, 2);
+    scene.adapter.attest_key(&admitted).expect("pair attests");
+    let pair_pos = admitted.h0_ordinal();
+
+    // Ingest in wire order, then one seal: the settlement watermark
+    // holds every nested end until the outer call completes, so all
+    // model effects land here in cut order.
+    ingest_begin_for_position(&mut scene, &pair, pair_pos);
+    ingest_begin_for_position(&mut scene, &selftest_init, init_pos);
+    ingest_end_for_position(&mut scene, &selftest_init, init_pos);
+    ingest_begin_for_position(&mut scene, &selftest_sign, sign_pos);
+    ingest_end_for_position(&mut scene, &selftest_sign, sign_pos);
+    ingest_end_for_position(&mut scene, &pair, pair_pos);
+    let sealed = scene.seal().expect("nested quantum seals");
+    let settled_for = |name: &str| {
+        let fid = crate::kinds::function_id(name).unwrap();
+        sealed
+            .prefix
+            .settled()
+            .iter()
+            .find(|settled| settled.function == fid)
+            .expect("nested call settled")
+    };
+    let outer = settled_for("C_GenerateKeyPair");
+    let init = settled_for("C_SignInit");
+
+    // The keygen bound both outputs with no gap of its own.
+    let mut public = None;
+    let mut created = 0u32;
+    for effect in &sealed.effects.effects {
+        if let ObjectEffect::Created {
+            call, slot, object, ..
+        } = effect
+            && *call == outer.ticket
+        {
+            created += 1;
+            if *slot == 0 {
+                public = Some(*object);
+            }
+        }
+    }
+    assert_eq!(created, 2, "both keygen outputs bind");
+    let public = public.expect("the public half minted slot 0");
+    assert!(
+        !sealed.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved { call, .. } if *call == outer.ticket
+        )),
+        "the keygen binds with no gap at all"
+    );
+    assert!(
+        !crate::semantics_key_use::KeyUseReducer::is_provider_internal(
+            &sealed.effects.effects,
+            outer
+        ),
+        "the keygen reads back caller-issued"
+    );
+
+    // The self-test init keeps its conservative join under the
+    // precise gap, which H9 reads back for the terminal route. (The
+    // bare single-part sign is model-Neutral: ordering only, never
+    // an object effect — its S1 terminal joins the init's open.)
+    assert!(
+        sealed.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Unresolved { call, reason }
+                if *call == init.ticket && *reason == ObjectGap::ProviderInternal
+        )),
+        "the self-test join stays conservative under the precise gap"
+    );
+    assert!(
+        crate::semantics_key_use::KeyUseReducer::is_provider_internal(
+            &sealed.effects.effects,
+            init
+        ),
+        "H9 reads the internal gap for the terminal route"
+    );
+
+    // The caller's later sign binds to the created public key: no
+    // tombstone was laid on the outer outputs.
+    let mut use_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    use_init.input0 = Some((PUBLIC, 1));
+    let admitted = admit_call_input(&mut scene, &use_init);
+    scene.adapter.attest_key(&admitted).expect("use attests");
+    ingest_call(&mut scene, &use_init, admitted.h0_ordinal());
+    let used = scene.seal().expect("use quantum seals");
+    let use_id = crate::kinds::function_id("C_SignInit").unwrap();
+    let use_ticket = used
+        .prefix
+        .settled()
+        .iter()
+        .find(|settled| settled.function == use_id)
+        .expect("use settled")
+        .ticket;
+    assert!(
+        used.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Referenced { call, object, .. }
+                if *call == use_ticket && *object == public
+        )),
+        "the later use references the created public key"
+    );
+
+    // Projection gaps: the one precise internal join (the bare
+    // sign is model-Neutral and counts none), no generic overlap,
+    // no tombstone breakage.
+    let projection = scene.model.project();
+    assert_eq!(projection.objects.len(), 2);
+    assert_eq!(projection.gap(ObjectGap::ProviderInternal), 1);
+    assert_eq!(projection.gap(ObjectGap::SameSessionOverlap), 0);
+    assert_eq!(projection.gap(ObjectGap::DependencyBroken), 0);
+}
+
+/// Controller ruling v080-nss-ec-double R2: H9 routes an internal
+/// call's receipt-less terminal to the named `provider_internal`
+/// unknown row (v9 section), while an ordinary receipt-less terminal
+/// keeps `unbound`. Driven through the real edge and reducer into a
+/// committed section.
+#[test]
+fn key_operation_provider_internal_terminal_routes() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::keymeta::CompletionEvidence;
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
+    let mut assoc_ledger = StagingLedger::new();
+    let replay = |edge: &mut EdgeSemantics,
+                  sink: &mut Vec<OperationEffect>,
+                  call: &SemanticCall,
+                  internal: bool| {
+        let origin = EffectOrigin::from(call);
+        edge.observe_joint_with_resources(
+            call,
+            &origin,
+            &[],
+            &CompletionEvidence::NONE,
+            internal,
+            sink,
+        )
+        .expect("replay fits");
+    };
+    // Internal sign: receipt-less start and end on the internal route.
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    replay(&mut edge, &mut sink, &c, true);
+    let c = op("C_Sign", 7, 200);
+    replay(&mut edge, &mut sink, &c, true);
+    // Ordinary receipt-less verify (control).
+    let c = init("C_VerifyInit", 7, RSA_PKCS, 300);
+    replay(&mut edge, &mut sink, &c, false);
+    let c = op("C_Verify", 7, 400);
+    replay(&mut edge, &mut sink, &c, false);
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
+    }
+    let scene = JointScene::new();
+    let staging = JointStaging::select_s1_only();
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let internal: Vec<_> = committed
+        .unknown_key_operations
+        .iter()
+        .filter(|row| {
+            row.category == "sign"
+                && row.reason == crate::semantics_key_use::PROVIDER_INTERNAL_REASON
+        })
+        .collect();
+    assert_eq!(internal.len(), 1, "exactly one internal sign row");
+    assert_eq!(
+        (
+            internal[0].completed,
+            internal[0].failed,
+            internal[0].cancelled,
+            internal[0].unknown,
+            internal[0].active,
+        ),
+        (1, 0, 0, 0, 0),
+        "the internal terminal counts exactly once"
+    );
+    assert!(
+        committed.unknown_key_operations.iter().any(|row| {
+            row.category == "verify" && row.reason == "unbound" && row.completed == 1
+        }),
+        "the control terminal keeps unbound"
+    );
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        crate::key_operation_projection::OBSERVATIONS_VERSION_V9,
+        "the internal row promotes its section to v9"
+    );
+    let rendered = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(rendered["version"], 9);
+    assert!(
+        rendered["unknown_key_operations"]
+            .as_array()
+            .expect("unknown rows render")
+            .iter()
+            .any(|row| row["category"] == "sign" && row["reason"] == "provider_internal"),
+        "the rendered section names the internal row"
+    );
+}
+
+/// A rowless internal gap still promotes its section to v9: a nested
+/// call with no key-operation terminal (a non-key use inside another
+/// call) names the gap without any unknown row.
+#[test]
+fn key_operation_provider_internal_gap_promotes_v9() {
+    use crate::key_operation_projection::{
+        GapRow, OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V9, ObjectObservations,
+        observations_version,
+    };
+    let mut bare = ObjectObservations::unavailable(1, "journal_unavailable");
+    assert_eq!(observations_version(&bare), OBSERVATIONS_VERSION);
+    bare.gaps.push(GapRow {
+        subject: "model",
+        reason: crate::semantics_key_use::PROVIDER_INTERNAL_REASON,
+        repeats: 1,
+    });
+    assert_eq!(observations_version(&bare), OBSERVATIONS_VERSION_V9);
+}
+
+/// Controller ruling v080-nss-ec-double R2 (2026-11-21),
+/// production-path negative twin: the same nested shape across two
+/// native threads is unprovable re-entry, so the conservative
+/// `SameSessionOverlap` fencing stands on both calls, nothing binds,
+/// and the precise internal gap is never named.
+#[test]
+fn key_operation_provider_internal_cross_thread_overlap_stays_uncertain() {
+    const PUBLIC: u64 = 0xD2D2_D2D2_D2D2_D2D2;
+    const PRIVATE: u64 = 0xD3D3_D3D3_D3D3_D3D3;
+    let mut scene = JointScene::new();
+
+    // Open the session first so both nested calls resolve it live.
+    let mut open = ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0);
+    open.session = Some(SESSION);
+    let admitted = admit_call_input(&mut scene, &open);
+    scene.adapter.attest_key(&admitted).expect("open attests");
+    ingest_call(&mut scene, &open, admitted.h0_ordinal());
+    scene.seal().expect("open quantum seals");
+
+    let mut pair = ShapedS1::shaped("C_GenerateKeyPair", CkRv::OK.0, 0, 0);
+    pair.pair_results = Some((PUBLIC, PRIVATE));
+    let mut nested = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    nested.input0 = Some((PUBLIC, 1));
+
+    // Admit in begin order with per-thread journal sequences: the
+    // outer keygen on thread 1, the nested init on thread 2.
+    let outer_admitted = admit_call_input_with_sequence(&mut scene, &pair, 1, 2);
+    scene
+        .adapter
+        .attest_key(&outer_admitted)
+        .expect("outer attests");
+    let outer_pos = outer_admitted.h0_ordinal();
+    let inner_admitted = admit_call_input_with_sequence(&mut scene, &nested, 2, 1);
+    scene
+        .adapter
+        .attest_key(&inner_admitted)
+        .expect("inner attests");
+    let inner_pos = inner_admitted.h0_ordinal();
+
+    // Ingest in wire order: outer BEGIN, nested BEGIN/END, outer END.
+    ingest_begin_for_position(&mut scene, &pair, outer_pos);
+    ingest_begin_for_position(&mut scene, &nested, inner_pos);
+    ingest_end_for_position(&mut scene, &nested, inner_pos);
+    ingest_end_for_position(&mut scene, &pair, outer_pos);
+    let sealed = scene.seal().expect("nested quantum seals");
+
+    // Both nested calls stay fenced with no objects.
+    let pair_id = crate::kinds::function_id("C_GenerateKeyPair").unwrap();
+    let init_id = crate::kinds::function_id("C_SignInit").unwrap();
+    let nested: Vec<_> = sealed
+        .prefix
+        .settled()
+        .iter()
+        .filter(|settled| settled.function == pair_id || settled.function == init_id)
+        .collect();
+    assert_eq!(nested.len(), 2, "both nested calls settled");
+    for settled in nested {
+        let ticket = settled.ticket;
+        assert!(
+            sealed.effects.effects.iter().any(|effect| matches!(
+                effect,
+                crate::semantics_objects::ObjectEffect::Unresolved {
+                    call,
+                    reason: crate::semantics_objects::ObjectGap::SameSessionOverlap,
+                } if *call == ticket
+            )),
+            "cross-thread overlap stays conservative"
+        );
+    }
+    assert!(
+        !sealed.effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Unresolved {
+                reason: crate::semantics_objects::ObjectGap::ProviderInternal,
+                ..
+            }
+        )),
+        "cross-thread overlap names no internal gap"
+    );
+    assert!(
+        !sealed.effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Created { .. }
+        )),
+        "nothing binds across the unprovable overlap"
+    );
+    assert!(scene.model.project().objects.is_empty());
 }
 
 /// G11/H9-§1: proof-only refusal falls back once through ordinary S1
@@ -7546,6 +7943,7 @@ fn key_operation_n1c_shared_owner_unsettled_census() {
         entry_mechanism: crate::semantics_objects::MechanismEvidence::NotCaptured,
         scope: crate::semantics_objects::SlotScope::Unknown,
         entry_output: crate::semantics_objects::OutputEvidence::NotCaptured,
+        thread: 1,
     };
     assert_eq!(
         scene.model.begin(model_origin, scene.adapter.ledger_mut()),
@@ -8804,7 +9202,7 @@ fn key_operation_schema_contract() {
     // and publication index the same buckets.
     assert_eq!(UNKNOWN_CATEGORIES.as_slice(), CATEGORY_LABELS.as_slice());
     assert_eq!(REDUCER_REASONS.as_slice(), UNKNOWN_REASONS.as_slice());
-    assert_eq!(UNKNOWN_BUCKETS, 23 * 6);
+    assert_eq!(UNKNOWN_BUCKETS, 23 * 7);
     assert_eq!(enums("/$defs/role/enum"), table(&ROLE_LABELS));
     assert!(
         ROLE_LABELS.contains(&crate::key_operation_projection::SECONDARY_ROLE),
@@ -8921,6 +9319,7 @@ fn key_operation_schema_contract() {
         crate::semantics_objects::ObjectGap::PairDuplicate,
         crate::semantics_objects::ObjectGap::NullMechanismCancel,
         crate::semantics_objects::ObjectGap::SameSessionOverlap,
+        crate::semantics_objects::ObjectGap::ProviderInternal,
         crate::semantics_objects::ObjectGap::OverlapUncertain,
         crate::semantics_objects::ObjectGap::OutputCollision,
         crate::semantics_objects::ObjectGap::StaleOrigin,
@@ -8955,14 +9354,14 @@ fn key_operation_schema_contract() {
         crate::semantics_objects::ObjectGap::UnknownDomain,
         crate::semantics_objects::ObjectGap::DomainPruned,
     ];
-    assert_eq!(gaps.len(), 51, "every model gap enumerated");
+    assert_eq!(gaps.len(), 52, "every model gap enumerated");
     let mut mapped: Vec<&str> = gaps.iter().map(|gap| gap_label(*gap)).collect();
     mapped.sort_unstable();
     mapped.dedup();
-    assert_eq!(mapped.len(), 51, "gap labels are distinct");
+    assert_eq!(mapped.len(), 52, "gap labels are distinct");
     assert!(mapped.iter().all(|label| GAP_REASONS.contains(label)));
     assert!(GAP_REASONS.contains(&"pruned_object_referenced"));
-    assert_eq!(GAP_REASONS.len(), 52);
+    assert_eq!(GAP_REASONS.len(), 53);
 
     let roles = [
         (KeyRole::OperationKey, "key"),
@@ -10180,6 +10579,7 @@ fn key_operation_kem_conflict_and_attribution_twins() {
                 origin,
                 length,
                 fresh_view,
+                internal,
             } => {
                 let mut receipts = key_receipts.clone();
                 assert_eq!(receipts.len(), 1);
@@ -10192,6 +10592,7 @@ fn key_operation_kem_conflict_and_attribution_twins() {
                     origin: origin.clone(),
                     length: *length,
                     fresh_view: *fresh_view,
+                    internal: *internal,
                 }
             }
             other => panic!("expected DirectCompleted, got {other:?}"),
@@ -10317,6 +10718,7 @@ fn key_operation_kem_supported_label_attribution_twins() {
                     origin,
                     length,
                     fresh_view,
+                    internal,
                 } => {
                     let mut receipts = key_receipts.clone();
                     assert_eq!(receipts.len(), 1);
@@ -10333,6 +10735,7 @@ fn key_operation_kem_supported_label_attribution_twins() {
                         origin: origin.clone(),
                         length: *length,
                         fresh_view: *fresh_view,
+                        internal: *internal,
                     }
                 }
                 other => panic!("expected DirectCompleted, got {other:?}"),
@@ -11733,6 +12136,7 @@ fn key_operation_kem_stale_input_is_never_replaced() {
         entry_mechanism: MechanismEvidence::Value(0x17),
         scope,
         entry_output: crate::semantics_objects::OutputEvidence::NonNull,
+        thread: cut,
     };
     let completed = |cut: u64, results| CompletedFact {
         cut: RefCut::reference(cut),
@@ -11743,6 +12147,7 @@ fn key_operation_kem_stale_input_is_never_replaced() {
         session_out: HandleInput::Value(session),
         found: crate::semantics_objects::FindResult::NotCaptured,
         attributes: None,
+        thread: cut,
     };
     let create = crate::kinds::function_id("C_CreateObject").unwrap();
     let destroy = crate::kinds::function_id("C_DestroyObject").unwrap();
@@ -28428,6 +28833,7 @@ impl KeymetaCtx {
                 &origin,
                 receipts,
                 &CompletionEvidence::NONE,
+                false,
                 &mut self.sink,
             )
             .expect("unresourced replay");
@@ -28441,6 +28847,7 @@ impl KeymetaCtx {
                 mechanism,
                 key_receipts,
                 origin,
+                internal,
                 ..
             } => OperationEffect::DirectCompleted {
                 id: *id,
@@ -28450,6 +28857,7 @@ impl KeymetaCtx {
                 origin: origin.clone(),
                 length,
                 fresh_view,
+                internal: *internal,
             },
             other => panic!("expected DirectCompleted, got {other:?}"),
         };
@@ -29665,6 +30073,7 @@ fn keymeta_park_refused_counts_gap_without_partial() {
                 length: Some(LengthOutcome::Value(32)),
                 fresh_view: Some(view.as_u64()),
             },
+            false,
             &mut sink,
         )
         .expect("replay");
@@ -30949,6 +31358,7 @@ fn keymeta_edge_corroboration_slot() {
             length: Some(LengthOutcome::Value(64)),
             fresh_view: None,
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -30963,6 +31373,7 @@ fn keymeta_edge_corroboration_slot() {
             length: Some(LengthOutcome::Value(64)),
             fresh_view: None,
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -31002,6 +31413,7 @@ fn keymeta_edge_query_value_drops() {
             length: Some(LengthOutcome::Value(999)),
             fresh_view: None,
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -31016,6 +31428,7 @@ fn keymeta_edge_query_value_drops() {
             length: Some(LengthOutcome::Value(64)),
             fresh_view: None,
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -31052,6 +31465,7 @@ fn keymeta_edge_failed_terminal_carries_no_length() {
             length: Some(LengthOutcome::Value(64)),
             fresh_view: None,
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -31088,6 +31502,7 @@ fn keymeta_edge_direct_carries_completion() {
             length: Some(LengthOutcome::Value(256)),
             fresh_view: Some(999),
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -31113,6 +31528,7 @@ fn keymeta_edge_direct_carries_completion() {
             length: Some(LengthOutcome::Value(256)),
             fresh_view: None,
         },
+        false,
         &mut sink,
     )
     .expect("replay");
@@ -31141,6 +31557,7 @@ fn keymeta_edge_direct_query_drops_length() {
                 length: Some(LengthOutcome::Value(256)),
                 fresh_view: Some(999),
             },
+            false,
             &mut sink,
         )
         .expect("replay");
@@ -31183,6 +31600,7 @@ fn keymeta_direct_query_never_sizes() {
                 length: Some(LengthOutcome::Value(256)),
                 fresh_view: None,
             },
+            false,
             &mut ctx.sink,
         )
         .expect("replay");
@@ -31600,6 +32018,82 @@ fn key_operation_schema_v7_pins_inferred_keys() {
         12,
         "twelve PQC parameter sets"
     );
+}
+
+/// The v9 schema pins the provider-internal contract: version
+/// constant 9, the seven-member unknown-reason enum (the frozen six
+/// plus `provider_internal`), the gap enum plus the precise
+/// internal gap, and otherwise v7-identical shapes. The v7 file
+/// stays frozen and forbids the new reason.
+#[test]
+fn key_operation_schema_v9_pins_provider_internal_reason() {
+    use crate::key_operation_projection::contract::UNKNOWN_REASONS;
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(root.join(name)).expect("schema file reads"))
+            .expect("schema parses")
+    };
+    let v7 = read("docs/schema/inventory-v1-object-observations-v7.schema.json");
+    let v9 = read("docs/schema/inventory-v1-object-observations-v9.schema.json");
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let table =
+        |keys: &[&str]| -> Vec<String> { sorted(keys.iter().map(|key| key.to_string()).collect()) };
+    let values = |schema: &serde_json::Value, pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+        )
+    };
+    assert_eq!(v9["properties"]["version"]["const"], 9);
+    assert_eq!(
+        values(&v9, "/$defs/unknown_reason/enum"),
+        table(&UNKNOWN_REASONS),
+        "v9 carries the full seven-member reason enum"
+    );
+    assert!(values(&v9, "/$defs/unknown_reason/enum").contains(&"provider_internal".to_string()));
+    assert!(
+        !values(&v7, "/$defs/unknown_reason/enum").contains(&"provider_internal".to_string()),
+        "v7 stays frozen without the new reason"
+    );
+    // The gap vocabulary gains the precise internal gap and
+    // nothing else.
+    let mut v7_gaps = values(&v7, "/$defs/gap_reason/enum");
+    v7_gaps.push("provider_internal".to_string());
+    v7_gaps.sort();
+    assert_eq!(
+        values(&v9, "/$defs/gap_reason/enum"),
+        v7_gaps,
+        "v9 gaps are v7 gaps plus the internal gap"
+    );
+    // Every other vocabulary and required-key list is v7-identical.
+    for pointer in [
+        "/required",
+        "/$defs/key_row/required",
+        "/$defs/unknown_row/required",
+        "/$defs/object_row/required",
+        "/$defs/session_row/required",
+        "/$defs/gap_row/required",
+        "/$defs/category/enum",
+        "/$defs/role/enum",
+        "/$defs/unit/enum",
+        "/$defs/metadata_label/enum",
+    ] {
+        assert_eq!(
+            v9.pointer(pointer),
+            v7.pointer(pointer),
+            "v9 keeps the v7 shape at {pointer}"
+        );
+    }
 }
 
 /// The v7 size-detail linkage is closed: `detail`/`conflict_detail`
@@ -32990,6 +33484,7 @@ fn keymeta_rowless_park_refusal_promotes_to_v7() {
                 length: Some(LengthOutcome::Value(32)),
                 fresh_view: Some(view.as_u64()),
             },
+            false,
             &mut sink,
         )
         .expect("replay");
@@ -33155,6 +33650,7 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
                 length: Some(LengthOutcome::Value(32)),
                 fresh_view: Some(view.as_u64()),
             },
+            false,
             &mut sink,
         )
         .expect("replay");

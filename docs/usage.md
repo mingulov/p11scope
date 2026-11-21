@@ -1765,11 +1765,17 @@ Limits that matter in pods:
   example, NSS softoken runs an internal single-part sign+verify
   self-test inside `C_GenerateKeyPair` for EC keys, so one
   caller-issued EC sign and verify can show two completions each;
-  that is the provider's own activity, not an overcount. Re-entrant
-  same-session activity inside a creation also fences that creation's
-  outputs (same-session overlap), so later uses of such keys report
-  `unbound`: the operations stay counted with their mechanism detail
-  and only the key identity stays unknown. With `-v`, objects created from templates
+  that is the provider's own activity, not an overcount. A call that
+  starts and ends on one thread strictly inside another open call on
+  the same session is classified provider-internal re-entry: the
+  outer creation's outputs still bind (so the caller's later uses
+  bind to the created key), while the inner call's own terminal is
+  reported on the named `provider_internal` unknown row instead of
+  `unbound` (with `-v` beside the tallies, and as the row's `reason`
+  in `--json`, section version 9). Cross-thread or otherwise
+  unprovable same-session overlap keeps the conservative shape: the
+  fenced creation's outputs stay unknown and later uses report
+  `unbound`. With `-v`, objects created from templates
   beyond eight slots are counted on their own line (`  template
   truncated (first 8 attributes captured) (N objects)`); `--json`
   carries the same reason on each unseen metadata field. Templates

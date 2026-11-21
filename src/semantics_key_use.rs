@@ -3579,12 +3579,12 @@ impl KeyUseReducer {
         if let Some(refused) = self.refused.remove(&key) {
             let slot = unknown_index(refused.category, unbound_reason_for(refused.category));
             self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
-            self.unknown_add(slot, *outcome);
+            self.unknown_add(slot, *outcome, refused.mechanism);
             self.evidence.refused_terminals = self.evidence.refused_terminals.saturating_add(1);
             return;
         }
         self.evidence.orphan_ends = self.evidence.orphan_ends.saturating_add(1);
-        self.unknown_add(unknown_index("unknown", "unbound"), *outcome);
+        self.unknown_add(unknown_index("unknown", "unbound"), *outcome, None);
     }
 
     /// Admit one captured `Started` effect for the budgeted drain,
@@ -3620,20 +3620,20 @@ impl KeyUseReducer {
         let (slots, len) = Self::resolve(instance, category, receipts);
         let resolved = &slots[..len];
         if !self.admits(resolved) {
-            self.refuse(key, instance, category, started_ts_ns);
+            self.refuse(key, instance, category, started_ts_ns, mechanism);
             return None;
         }
         let assoc_bytes =
             size_of::<OpenKeyUse>() as u64 + (resolved.len() * size_of::<OpenAssoc>()) as u64;
         let Some(ledger) = fallback else {
             debug_assert!(false, "keyassoc mint needs a ledger");
-            self.refuse(key, instance, category, started_ts_ns);
+            self.refuse(key, instance, category, started_ts_ns, mechanism);
             return None;
         };
         let mint = match ledger.start_keyassoc_mint(assoc_bytes) {
             Ok(mint) => mint,
             Err(_) => {
-                self.refuse(key, instance, category, started_ts_ns);
+                self.refuse(key, instance, category, started_ts_ns, mechanism);
                 return None;
             }
         };
@@ -4591,7 +4591,7 @@ fn classify_head_charged(
 /// merge helpers with the synchronous absorb so the two cannot
 /// drift.
 struct PreservedAbsorbCursor {
-    other_unknown: [UnknownCounters; UNKNOWN_BUCKETS],
+    other_unknown: Box<[UnknownCounters; UNKNOWN_BUCKETS]>,
     other_ever_live: [bool; UNKNOWN_BUCKETS],
     other_evidence: KeyUseEvidence,
     next: usize,
@@ -5234,6 +5234,7 @@ impl FeedDisposalCursor {
                                 start.instance,
                                 start.category,
                                 start.started_ts_ns,
+                                start.mechanism,
                             ),
                         }
                     }

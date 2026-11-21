@@ -2228,8 +2228,7 @@ impl UnknownCounters {
             self.mechs[self.mechs_len as usize] = (id, 1);
             self.mechs_len += 1;
         } else {
-            self.further_mechanism_terminals =
-                self.further_mechanism_terminals.saturating_add(1);
+            self.further_mechanism_terminals = self.further_mechanism_terminals.saturating_add(1);
         }
     }
 
@@ -2251,9 +2250,8 @@ impl UnknownCounters {
                     self.mechs[self.mechs_len as usize] = (*id, *count);
                     self.mechs_len += 1;
                 } else {
-                    self.further_mechanism_terminals = self
-                        .further_mechanism_terminals
-                        .saturating_add(*count);
+                    self.further_mechanism_terminals =
+                        self.further_mechanism_terminals.saturating_add(*count);
                 }
             }
         }
@@ -3023,12 +3021,7 @@ impl KeyUseReducer {
     /// Mark one fixed unknown summary ever-live and add a terminal
     /// outcome (N9), recording the terminal's mechanism id when one
     /// is known (controller ruling fix2, F3).
-    fn unknown_add(
-        &mut self,
-        index: usize,
-        outcome: OperationOutcome,
-        mechanism: Option<u64>,
-    ) {
+    fn unknown_add(&mut self, index: usize, outcome: OperationOutcome, mechanism: Option<u64>) {
         self.unknown_ever_live[index] = true;
         self.unknown[index].add(outcome);
         if let Some(id) = mechanism {

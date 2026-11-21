@@ -1289,7 +1289,11 @@ mod tests {
     // Exhaustive §4.2 classification: (id, CKM name, expected family).
     // Generated from the reviewed assignment; names reviewed vs spec §4.2.
     const CATALOG_EXPECTED: &[(u64, &str, Option<KeyFamily>)] = &[
-        (0x00000000, "CKM_RSA_PKCS_KEY_PAIR_GEN", Some(KeyFamily::Rsa)),
+        (
+            0x00000000,
+            "CKM_RSA_PKCS_KEY_PAIR_GEN",
+            Some(KeyFamily::Rsa),
+        ),
         (0x00000001, "CKM_RSA_PKCS", Some(KeyFamily::Rsa)),
         (0x00000002, "CKM_RSA_9796", Some(KeyFamily::Rsa)),
         (0x00000003, "CKM_RSA_X_509", Some(KeyFamily::Rsa)),
@@ -1299,12 +1303,20 @@ mod tests {
         (0x00000007, "CKM_RIPEMD128_RSA_PKCS", Some(KeyFamily::Rsa)),
         (0x00000008, "CKM_RIPEMD160_RSA_PKCS", Some(KeyFamily::Rsa)),
         (0x00000009, "CKM_RSA_PKCS_OAEP", Some(KeyFamily::Rsa)),
-        (0x0000000a, "CKM_RSA_X9_31_KEY_PAIR_GEN", Some(KeyFamily::Rsa)),
+        (
+            0x0000000a,
+            "CKM_RSA_X9_31_KEY_PAIR_GEN",
+            Some(KeyFamily::Rsa),
+        ),
         (0x0000000b, "CKM_RSA_X9_31", Some(KeyFamily::Rsa)),
         (0x0000000c, "CKM_SHA1_RSA_X9_31", Some(KeyFamily::Rsa)),
         (0x0000000d, "CKM_RSA_PKCS_PSS", Some(KeyFamily::Rsa)),
         (0x0000000e, "CKM_SHA1_RSA_PKCS_PSS", Some(KeyFamily::Rsa)),
-        (0x0000000f, "CKM_ML_KEM_KEY_PAIR_GEN", Some(KeyFamily::MlKem)),
+        (
+            0x0000000f,
+            "CKM_ML_KEM_KEY_PAIR_GEN",
+            Some(KeyFamily::MlKem),
+        ),
         (0x00000010, "CKM_DSA_KEY_PAIR_GEN", Some(KeyFamily::Dsa)),
         (0x00000011, "CKM_DSA", Some(KeyFamily::Dsa)),
         (0x00000012, "CKM_DSA_SHA1", Some(KeyFamily::Dsa)),
@@ -1317,7 +1329,11 @@ mod tests {
         (0x00000019, "CKM_DSA_SHA3_256", Some(KeyFamily::Dsa)),
         (0x0000001a, "CKM_DSA_SHA3_384", Some(KeyFamily::Dsa)),
         (0x0000001b, "CKM_DSA_SHA3_512", Some(KeyFamily::Dsa)),
-        (0x0000001c, "CKM_ML_DSA_KEY_PAIR_GEN", Some(KeyFamily::MlDsa)),
+        (
+            0x0000001c,
+            "CKM_ML_DSA_KEY_PAIR_GEN",
+            Some(KeyFamily::MlDsa),
+        ),
         (0x0000001d, "CKM_ML_DSA", Some(KeyFamily::MlDsa)),
         (0x0000001f, "CKM_HASH_ML_DSA", Some(KeyFamily::MlDsa)),
         (0x00000020, "CKM_DH_PKCS_KEY_PAIR_GEN", Some(KeyFamily::Dh)),
@@ -1356,7 +1372,11 @@ mod tests {
             "CKM_HASH_ML_DSA_SHAKE256",
             Some(KeyFamily::MlDsa),
         ),
-        (0x0000002d, "CKM_SLH_DSA_KEY_PAIR_GEN", Some(KeyFamily::SlhDsa)),
+        (
+            0x0000002d,
+            "CKM_SLH_DSA_KEY_PAIR_GEN",
+            Some(KeyFamily::SlhDsa),
+        ),
         (0x0000002e, "CKM_SLH_DSA", Some(KeyFamily::SlhDsa)),
         (0x00000030, "CKM_X9_42_DH_KEY_PAIR_GEN", Some(KeyFamily::Dh)),
         (0x00000031, "CKM_X9_42_DH_DERIVE", Some(KeyFamily::Dh)),
@@ -2011,7 +2031,11 @@ mod tests {
         (0x00001052, "CKM_ECMQV_DERIVE", Some(KeyFamily::Ec)),
         (0x00001053, "CKM_ECDH_AES_KEY_WRAP", Some(KeyFamily::Ec)),
         (0x00001054, "CKM_RSA_AES_KEY_WRAP", Some(KeyFamily::Rsa)),
-        (0x00001055, "CKM_EC_EDWARDS_KEY_PAIR_GEN", Some(KeyFamily::Eddsa)),
+        (
+            0x00001055,
+            "CKM_EC_EDWARDS_KEY_PAIR_GEN",
+            Some(KeyFamily::Eddsa),
+        ),
         (0x00001056, "CKM_EC_MONTGOMERY_KEY_PAIR_GEN", None),
         (0x00001057, "CKM_EDDSA", Some(KeyFamily::Eddsa)),
         (0x00001060, "CKM_JUNIPER_KEY_GEN", None),
@@ -2078,7 +2102,11 @@ mod tests {
         (0x00001226, "CKM_CHACHA20", Some(KeyFamily::Chacha20)),
         (0x00001227, "CKM_POLY1305_KEY_GEN", None),
         (0x00001228, "CKM_POLY1305", Some(KeyFamily::Poly1305)),
-        (0x0000140b, "CKM_EC_KEY_PAIR_GEN_W_EXTRA_BITS", Some(KeyFamily::Ec)),
+        (
+            0x0000140b,
+            "CKM_EC_KEY_PAIR_GEN_W_EXTRA_BITS",
+            Some(KeyFamily::Ec),
+        ),
         (0x00002000, "CKM_DSA_PARAMETER_GEN", None),
         (0x00002001, "CKM_DH_PKCS_PARAMETER_GEN", None),
         (0x00002002, "CKM_X9_42_DH_PARAMETER_GEN", None),
@@ -2278,8 +2306,8 @@ mod tests {
         for id in [
             0x8000_0000u64,
             0xCE53_43A9,
-            0xCE53_437D,      // CKM_NSS_KYBER_KEY_PAIR_GEN (Kyber is not ML-KEM)
-            0xCE53_437F,      // CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN (vendor rule)
+            0xCE53_437D, // CKM_NSS_KYBER_KEY_PAIR_GEN (Kyber is not ML-KEM)
+            0xCE53_437F, // CKM_NSS_ECDHE_NO_PAIRWISE_CHECK_KEY_PAIR_GEN (vendor rule)
             u64::MAX,
             0x0000_0500,      // CKM_CMS_SIG
             0x0000_03B0,      // CKM_PKCS5_PBKD2
@@ -2328,7 +2356,10 @@ mod tests {
         const NSS_ML_KEM: u64 = 0xCE53_4381;
         const NSS_ML_KEM_KEY_PAIR_GEN: u64 = 0xCE53_4380;
         assert_eq!(infer_family(NSS_ML_KEM), Some(KeyFamily::MlKem));
-        assert_eq!(infer_family(NSS_ML_KEM_KEY_PAIR_GEN), Some(KeyFamily::MlKem));
+        assert_eq!(
+            infer_family(NSS_ML_KEM_KEY_PAIR_GEN),
+            Some(KeyFamily::MlKem)
+        );
     }
 
     /// Controller ruling fix2 (2026-11-21, keygen-family
@@ -2368,8 +2399,8 @@ mod tests {
         use EvidenceTag::*;
         for mechanism in [
             0x0000_0000u64, // RSA keygen under a signature length
-            0x0000_000f,   // ML-KEM keygen under a ciphertext length
-            0xCE53_4380,   // NSS vendor ML-KEM keygen
+            0x0000_000f,    // ML-KEM keygen under a ciphertext length
+            0xCE53_4380,    // NSS vendor ML-KEM keygen
         ] {
             let tag = if mechanism == 0x0000_0000 {
                 SignOutput

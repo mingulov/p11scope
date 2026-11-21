@@ -5231,10 +5231,7 @@ mod tests {
     fn creation_mechanism_value_keeps_generations_in_namespace() {
         use super::{CreationFamily, MechanismEvidence, creation_mechanism_value};
         assert_eq!(
-            creation_mechanism_value(
-                CreationFamily::GeneratePair,
-                MechanismEvidence::Value(0x0f)
-            ),
+            creation_mechanism_value(CreationFamily::GeneratePair, MechanismEvidence::Value(0x0f)),
             Some(0x0f)
         );
         assert_eq!(

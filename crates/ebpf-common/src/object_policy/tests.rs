@@ -210,10 +210,10 @@ fn s2s3_nss_vendor_key_types_map_or_refuse() {
         "CKK_NSS_CHACHA20 normalizes to CKK_CHACHA20"
     );
     for refused in [
-        0xCE53_4351u64, // CKK_NSS_PKCS8 (no standard meaning)
-        0xCE53_4352,   // CKK_NSS_JPAKE_ROUND1 (no standard meaning)
-        0xCE53_4353,   // CKK_NSS_JPAKE_ROUND2 (no standard meaning)
-        0xCE53_4355,   // CKK_NSS_KYBER (Kyber is not ML-KEM)
+        0xCE53_4351u64,          // CKK_NSS_PKCS8 (no standard meaning)
+        0xCE53_4352,             // CKK_NSS_JPAKE_ROUND1 (no standard meaning)
+        0xCE53_4353,             // CKK_NSS_JPAKE_ROUND2 (no standard meaning)
+        0xCE53_4355,             // CKK_NSS_KYBER (Kyber is not ML-KEM)
         0xCE53_4354 | (1 << 32), // hostile-width alias of CKK_NSS_CHACHA20
     ] {
         assert_eq!(

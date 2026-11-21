@@ -9709,6 +9709,124 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
     );
 }
 
+/// Joint re-entry end to end through the machine: a healthy Joint feed,
+/// a break void (posed native refusal plus re-arm), then continued
+/// calls. The machine Births phase drains the reseed queue, re-arms the
+/// image, births afresh at the fence through production minting, and the
+/// feed reseeds: per-key tracking resumes and the voided window stays
+/// counted beside it.
+#[test]
+fn joint_machine_break_void_then_new_sessions_rebind() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_CreateObject", 2);
+    fixture.published_labeled("healthy", None);
+    let reduced_healthy = fixture.reduced_for(0);
+    assert!(
+        reduced_healthy > 0,
+        "healthy calls reduce Joint before the void"
+    );
+    // Applied quantum (the fence needs staged history): drive to
+    // applied, then refuse.
+    fixture.scene.push(pid, 0, "C_CreateObject", 3);
+    fixture.reach_phase("Audited");
+    let mut applied = false;
+    for _ in 0..64 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => break,
+            Ok(JointServiceProgress::Pending) => {}
+            Err(reason) => panic!("the healthy commit must not refuse: {reason:?}"),
+        }
+        if fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_publication_applied()
+        {
+            applied = true;
+            break;
+        }
+    }
+    assert!(applied, "the fenced quantum applies before the refusal");
+    fixture.native.fail_native_once = Some(SemanticRefusal::Unavailable);
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed native refusal latches the running machine"
+    );
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "a running Audited refusal with its frame re-arms"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Idle");
+    assert!(
+        fixture.machine.begin_commit(false).is_ok(),
+        "the re-armed lane accepts the next commit"
+    );
+    let feed_mode = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .expect("the provider keeps its feed")
+            .feed
+            .mode()
+    };
+    fixture.scene.push(pid, 0, "C_CreateObject", 4);
+    fixture.published_labeled("voided", None);
+    assert_eq!(
+        feed_mode(&fixture),
+        crate::semantics_key_use::FeedMode::S1Only,
+        "the void ends the Joint segment"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "no Joint feed certifies past the void"
+    );
+    // Continued calls rebirth through the machine Births phase and the
+    // feed reseeds onto the fresh receipt: tracking resumes.
+    fixture.scene.push(pid, 0, "C_CreateObject", 5);
+    fixture.published_labeled("rebirth", None);
+    fixture.scene.push(pid, 0, "C_SignInit", 6);
+    fixture.published_labeled("rebound", None);
+    assert_eq!(
+        feed_mode(&fixture),
+        crate::semantics_key_use::FeedMode::Joint,
+        "continued calls reseed the feed back to Joint"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        1,
+        "one Joint feed tracks again"
+    );
+    assert!(
+        fixture.reduced_for(0) > reduced_healthy,
+        "re-entered calls reduce Joint again"
+    );
+}
+
 /// Scope-round I2 twin: the below-fence resume refusal discloses one
 /// counted per-feed reason — the first clean-point call after the void
 /// stages `joint_resume_deferred_below_fence`, and a second probe does

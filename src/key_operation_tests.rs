@@ -22632,6 +22632,407 @@ fn key_operation_reseed_after_fenced_h3_loss_succeeds() {
     }
 }
 
+/// A voided feed reseeds onto a fresh incarnation's domain too: the new
+/// receipt names the same image with a strictly newer cut at/above the
+/// fence, starting a new Joint segment while the closed segment stays
+/// counted. Another image, a cut at/below the old cut, or below the
+/// fence refuses (never the wrong key, never voided history).
+#[test]
+fn key_operation_reseed_onto_new_domain_incarnation() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    assert_eq!(bootstrap.birth_cut(), 0);
+    // A sibling key for the same image (the fresh instance or
+    // incarnation): bound before any seal, so no sole-key conversion
+    // blocks it yet.
+    let mut other = AttestationFixture::new(ImageIdentity {
+        task_cookie: COOKIE,
+        exec_id: EXEC,
+    });
+    let sibling = scene
+        .adapter
+        .attest_key(&other.admit_function("C_CreateObject"))
+        .expect("sibling binds beside the unconverted key");
+    let generation = bootstrap.closure_generation();
+    assert_ne!(
+        BootstrapReceipt::scripted(sibling, BirthKind::AttachObserved, 0, generation).domain(),
+        bootstrap.domain(),
+        "the sibling tracks its own domain"
+    );
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::FaultChanged,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(2);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the void ends the segment: {outcome:?}"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    assert_eq!(staging.segment_fence_for_test(), Some(2));
+    // Guards first (all refuse without mutating): another image, a cut
+    // at the old cut, and a cut below the fence.
+    let mut foreign_fixture = AttestationFixture::new(ImageIdentity {
+        task_cookie: COOKIE + 1,
+        exec_id: EXEC,
+    });
+    let foreign = scene
+        .adapter
+        .attest_key(&foreign_fixture.admit_function("C_CreateObject"))
+        .expect("foreign image binds its own key");
+    for (proof, cut, why) in [
+        (foreign, 3u64, "another image never reseeds this feed"),
+        (sibling, 0u64, "a cut at the old cut is no progress"),
+        (
+            sibling,
+            1u64,
+            "a cut below the fence would certify voided history",
+        ),
+    ] {
+        let receipt = BootstrapReceipt::scripted(proof, BirthKind::AttachObserved, cut, generation);
+        assert!(!staging.reselect_joint(&receipt), "{why}");
+    }
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    let fresh = BootstrapReceipt::scripted(sibling, BirthKind::AttachObserved, 2, generation);
+    assert!(
+        staging.reselect_joint(&fresh),
+        "a fresh incarnation at the fence reseeds"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    assert_eq!(staging.selected_receipt(), Some(&fresh));
+    assert!(!staging.degraded_loss());
+    assert!(!staging.fell_back());
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(staging.staged_len(), 1, "new calls stage Joint again");
+}
+
+/// Joint re-entry keeps old handles unknown: after a void fences the
+/// tracked history and re-presented voided bytes taint the image, a
+/// fresh birth at the fence lifts the quarantine and a new segment
+/// tracks new sessions. Signs on the pre-void session/key land on
+/// unknown-key rows, never on new keys; signs on post-void sessions
+/// with a re-learned key table attribute.
+#[test]
+fn key_operation_reentry_old_handles_stay_unknown() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_objects::journal::JournalContradiction;
+
+    const OLD_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const NEW_KEY: u64 = 0xB2B2_B2B2_B2B2_B2B2;
+    const OLD_SESSION: u64 = 7;
+    const NEW_SESSION: u64 = 8;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    // Healthy: the old session opens on first use, creates and learns
+    // the old key, and signs attributed.
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(OLD_SESSION);
+    create.result = Some(OLD_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        input0: Some((OLD_KEY, 1)),
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let old_row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the healthy sign attributes");
+    assert_eq!(old_row.completed, 1);
+    assert!(
+        committed.unknown_key_operations.is_empty(),
+        "no unknown rows while healthy: {:?}",
+        committed.unknown_key_operations
+    );
+
+    // Stage one more call (stays open across the void), saving its
+    // exact BEGIN bytes for the post-void re-presentation below.
+    let pending = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    let (_, position) = attest_and_stage(&mut scene, &mut staging, &pending);
+    let wiped_begin = scene
+        .paired_begins
+        .get(&position)
+        .cloned()
+        .expect("the staged call pairs its BEGIN");
+    ingest_call(&mut scene, &pending, position);
+
+    // The void: the seal-time fault cell moved (native fault twin).
+    // Its real failure delivers to the feed, which ends fenced.
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the void ends the segment: {outcome:?}"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+
+    // Re-presented voided history contradicts the retained floors and
+    // taints the image through the production path.
+    assert_eq!(
+        scene.ingest(&wiped_begin),
+        JournalDisposition::Contradiction(JournalContradiction::SequenceRegression),
+        "re-presented voided history contradicts"
+    );
+
+    // A fresh birth at the fence lifts the quarantine and reseeds.
+    let grant = SessionBirthGrant::scripted(
+        scene.proof,
+        BirthKind::AbsenceAppearance,
+        fence,
+        scene.fixture.attachment().generation(),
+    );
+    let fresh = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fenced taint lifts");
+    assert!(staging.reselect_joint(&fresh), "the fresh birth reseeds");
+
+    // The new session opens on first use, re-learns the key table (a
+    // new creation plus fresh attribute reads) and signs attributed,
+    // driven under the fresh receipt at the post-void epoch.
+    let drive_reentered = |scene: &mut JointScene,
+                           staging: &mut JointStaging,
+                           joint: &mut EdgeSemantics,
+                           keyuse: &mut KeyUseReducer,
+                           sink: &mut Vec<OperationEffect>,
+                           call: &ShapedS1,
+                           receipt: &BootstrapReceipt| {
+        prepare_call(scene, staging, call);
+        scene.install_closure();
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = JournalAuditReceipt::scripted(
+            8,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.fixture.h0_allocated_below() - 1),
+            scene.fixture.attachment().generation(),
+        );
+        let evidence = SessionBirthEvidence::scripted_for_receipt(receipt);
+        let cell = SteadyFaultCell(8);
+        let mut births = ScriptedBirthSource::once(evidence);
+        let success = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &audit,
+                receipt,
+                frontier,
+                &mut births,
+                &cell,
+            )
+            .expect("re-entered seals flow");
+        let (outcome, refused) = staging.apply_seal(
+            &success,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            joint,
+            keyuse,
+            instance,
+            sink,
+            None,
+        );
+        assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
+        assert_eq!(refused, 0);
+    };
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(NEW_SESSION);
+    create.result = Some(NEW_KEY);
+    drive_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+        &fresh,
+    );
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        input0: Some((NEW_KEY, 1)),
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.session = Some(NEW_SESSION);
+    drive_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+        &fresh,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(NEW_SESSION);
+    init.input0 = Some((NEW_KEY, 1));
+    drive_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+        &fresh,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(NEW_SESSION);
+    drive_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+        &fresh,
+    );
+
+    // A sign on the pre-void session/key after re-entry: unknown, never
+    // attributed to any key.
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    drive_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+        &fresh,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    drive_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+        &fresh,
+    );
+
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let unknown: Vec<_> = committed
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .collect();
+    assert_eq!(
+        unknown.iter().map(|row| row.completed).sum::<u64>(),
+        1,
+        "the old-handle sign lands unknown-key, never attributed: {:?}",
+        committed.unknown_key_operations
+    );
+    let attributed: u64 = committed
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(
+        attributed, 2,
+        "healthy plus re-entered signs attribute: {:?}",
+        committed.key_operations
+    );
+}
+
 /// A fault-voided feed reseeds too: fault changes never resume onto the
 /// old receipt (no clean point on the fenced segment), but a fresh birth
 /// at the fence starts a new Joint segment. Only a new birth recovers.

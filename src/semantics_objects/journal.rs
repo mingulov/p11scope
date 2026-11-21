@@ -24837,6 +24837,374 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_void_fenced_sibling_binds_and_tracks() {
+        // Joint re-entry (sibling incarnation): a fault void fences a
+        // live registered key without dooming it. A fresh instance for
+        // the same image (a re-offered birth after a take failure, or a
+        // stall re-observation) names a new key. The old sibling's
+        // converted history sits entirely below the void fence, so the
+        // new sibling binds past it, births at the fence, and tracks
+        // new sessions; the old key's below-fence receipt keeps
+        // refusing.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("voided key")
+                .refused,
+            "a neutral void dooms nothing"
+        );
+        let fence = scene.adapter.consumed_through;
+        let mut other = AttestationFixture::new(image_default());
+        let sibling = scene
+            .adapter
+            .attest_key(&other.admit())
+            .expect("a sibling binds past a void-fenced sibling");
+        assert_ne!(sibling.key, proof.key, "the fresh instance names a new key");
+        let grant = SessionBirthGrant::scripted(
+            sibling,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let second = begin_bytes(1, 2, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let success = scene
+            .seal_at(&rebirth, 8)
+            .expect("the sibling tracks new sessions past the void");
+        assert_eq!(
+            success.prefix.settled().len(),
+            1,
+            "the post-void creation settles on the sibling"
+        );
+        assert_eq!(
+            success.prefix.domain(),
+            sibling.domain(),
+            "the sibling seals its own domain"
+        );
+        let stale = scene
+            .seal_at(&bootstrap, 8)
+            .expect_err("the below-fence receipt keeps refusing");
+        assert_eq!(stale.gap, JournalGap::BootstrapMismatch);
+    }
+
+    #[test]
+    fn object_journal_fenced_taint_evidence_lifts_for_fresh_birth() {
+        // Joint re-entry (taint quarantine): history re-presented
+        // after a void contradicts the voided window (the floors still
+        // hold the wiped sequences), which taints the image through
+        // the production contradiction path. The taint evidence sits
+        // inside the fenced window, so a fresh birth at the fence
+        // lifts the quarantine and tracks; a taint rooted past the
+        // fence still refuses.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let staged = begin_bytes(1, 2, create, 0);
+        scene.ingest(&staged);
+        scene.ingest(&end_bytes(&staged, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        assert_eq!(
+            scene.ingest(&staged),
+            JournalDisposition::Contradiction(JournalContradiction::SequenceRegression),
+            "re-presented voided history contradicts the retained floors"
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "the contradiction taints the image"
+        );
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fenced taint lifts");
+        scene.attest();
+        let fresh = begin_bytes(1, 3, create, 0);
+        scene.ingest(&fresh);
+        scene.ingest(&end_bytes(&fresh, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        scene
+            .seal_at(&rebirth, 8)
+            .expect("fresh history seals past the lifted taint");
+        // A taint rooted past the fence never lifts: the same scene
+        // duplicates a fresh invocation and the next birth refuses.
+        let genuine = begin_bytes(1, 9, create, 0);
+        scene.ingest(&genuine);
+        assert_eq!(
+            scene.ingest(&genuine),
+            JournalDisposition::Contradiction(JournalContradiction::DuplicateBegin),
+            "a fresh duplicate is genuine evidence"
+        );
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            scene.adapter.consumed_through,
+            scene.closure_generation(),
+        );
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &grant),
+            Err(BirthRefusal::ImageTainted),
+            "fresh taint evidence keeps refusing"
+        );
+    }
+
+    #[test]
+    fn object_journal_void_fenced_dead_binding_mints_fresh_incarnation() {
+        // Joint re-entry (incarnation): a void dooms the tracked key
+        // (a staged abandonment with corroborated negative evidence).
+        // The doom stands: the old proof keeps refusing and its model
+        // domain stays retired. The same binding (the continuing
+        // process) mints a fresh incarnation key instead, which births
+        // at the fence and tracks new sessions in its own domain.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 2, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("voided key")
+                .refused,
+            "the void dooms the key on negative evidence"
+        );
+        let fence = scene.adapter.consumed_through;
+        let admitted = scene
+            .fixture
+            .admit_session_function(SESSION, "C_CreateObject");
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("a dead fenced binding rebinds");
+        assert_ne!(
+            reborn.key, proof.key,
+            "re-entry mints a fresh incarnation, never the doomed key"
+        );
+        assert_ne!(
+            reborn.domain(),
+            proof.domain(),
+            "the incarnation tracks its own model domain"
+        );
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let second = begin_bytes(1, 3, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        let success = scene
+            .seal_at(&rebirth, 8)
+            .expect("the incarnation tracks new sessions past the void");
+        assert_eq!(success.prefix.settled().len(), 1);
+        assert_eq!(success.prefix.domain(), reborn.domain());
+        let stale = scene
+            .seal_at(&bootstrap, 8)
+            .expect_err("the doomed proof keeps refusing");
+        assert_eq!(stale.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_void_storm_stays_bounded_and_recovers() {
+        // Joint re-entry under a void storm: repeated fault voids,
+        // one dooming the tracked key mid-storm, complete inline with
+        // no accumulation (no pending rejection, bounded keys, empty
+        // claims) and the run recovers afterwards through a fresh
+        // incarnation. Incarnations grow with dooms, never with voids.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let mut epoch = 7u64;
+        for round in 0..10 {
+            let thread = 10 + round as u64;
+            if round == 5 {
+                let getattr = function_id("C_GetAttributeValue");
+                let outer = begin_bytes(thread, 1, getattr, 0);
+                scene.ingest(&outer);
+                assert_eq!(
+                    scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+                    JournalDisposition::ReturnObserved
+                );
+                let abandon = abandon_bytes(thread, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+                assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+            } else {
+                let staged = begin_bytes(thread, 1, create, 0);
+                scene.ingest(&staged);
+                scene.ingest(&end_bytes(&staged, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+            }
+            let frontier = scene.adapter.consumed_frontier();
+            let faulted = JournalAuditReceipt::scripted(
+                epoch,
+                epoch + 1,
+                None,
+                0,
+                H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+                scene.closure_generation(),
+            );
+            let failure = scene
+                .seal_explicit(
+                    &faulted,
+                    &bootstrap,
+                    frontier,
+                    SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                )
+                .expect_err("storm void voids");
+            assert_eq!(failure.gap, JournalGap::FaultChanged);
+            epoch += 1;
+            assert!(
+                scene.adapter.rejection_active.is_none() && scene.adapter.scoped_recovery.is_none(),
+                "void {round} leaves no pending rejection"
+            );
+        }
+        assert!(
+            scene.adapter.keys.len() <= 3,
+            "keys stay bounded across the storm: {}",
+            scene.adapter.keys.len()
+        );
+        assert_eq!(
+            scene.adapter.claim_counts, 0,
+            "storm voids leave no queued claims"
+        );
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("storm key")
+                .refused,
+            "the mid-storm doom stuck"
+        );
+        let fence = scene.adapter.consumed_through;
+        let admitted = scene
+            .fixture
+            .admit_session_function(SESSION, "C_CreateObject");
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("a dead fenced binding rebinds after the storm");
+        assert_ne!(reborn.key, proof.key);
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let staged = begin_bytes(7, 1, create, 0);
+        scene.ingest(&staged);
+        scene.ingest(&end_bytes(&staged, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 80));
+        scene
+            .seal_at(&rebirth, epoch)
+            .expect("the run recovers after the storm");
+    }
+
+    #[test]
     fn seal_abandoned_getattributes_disposes_per_call_and_key_continues() {
         // Fix7: an exit-time unbounded abandonment of an effect-free
         // GetAttributes read disposes per-call with a named loss gap

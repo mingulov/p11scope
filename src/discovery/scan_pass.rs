@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! One per-pass budget owner for every scope and mode (admission owner 2).
 //!
 //! Every scope charges work and I/O through [`ScanPassOwner`], and every

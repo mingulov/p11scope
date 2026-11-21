@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 276,
+  "default_floor": 277,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -11,6 +11,7 @@
     "attach::identity_iter::tests::anchor_maps_validate_real_handles",
     "attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none",
     "attach::identity_iter::tests::functional_probe_passes_in_nested_pid_namespace",
+    "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
     "attach::identity_iter::tests::whole_system_run_covers_all_children",
     "attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm",
     "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed",

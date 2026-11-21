@@ -1199,6 +1199,10 @@ pub(crate) struct EdgeRetireCursor {
     /// Retained detached visit (charged next lookup + staged value /
     /// open decision).
     pending_detached: Option<DetachedVisit>,
+    /// Retained slot-open visit (session + owner): held across
+    /// yields so a refused removal charge never re-reads or skips
+    /// the unbind.
+    pending_open: Option<(u64, u64)>,
 }
 
 /// One scanned active machine with its end/skip decision (`None`
@@ -2743,6 +2747,7 @@ impl EdgeSemantics {
             pending_active: None,
             pending_pending: None,
             pending_detached: None,
+            pending_open: None,
         }
     }
 
@@ -2915,6 +2920,11 @@ impl EdgeSemantics {
                         }
                     };
                     if doomed {
+                        if !budget.try_charge() {
+                            return false;
+                        }
+                        #[cfg(test)]
+                        self.bump_edge_read_for_test();
                         self.pending.remove(&next);
                         cursor.changed = true;
                     }
@@ -3018,12 +3028,22 @@ impl EdgeSemantics {
                         DetachedVisitStage::Ready { action } => {
                             match action {
                                 RetireDetachedAction::Float => {
+                                    if !budget.try_charge() {
+                                        return false;
+                                    }
+                                    #[cfg(test)]
+                                    self.bump_edge_read_for_test();
                                     if let Some(id) = self.detached.get_mut(&visit.next) {
                                         id.owner = None;
                                         cursor.changed = true;
                                     }
                                 }
                                 RetireDetachedAction::Drop => {
+                                    if !budget.try_charge() {
+                                        return false;
+                                    }
+                                    #[cfg(test)]
+                                    self.bump_edge_read_for_test();
                                     self.detached.remove(&visit.next);
                                     cursor.changed = true;
                                 }
@@ -3140,19 +3160,29 @@ impl EdgeSemantics {
                             cursor.phase = EdgeRetirePhase::Done;
                             continue;
                         }
-                        if !budget.try_charge() {
-                            return false;
+                        if cursor.pending_open.is_none() {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            let Some(next) = self.retire_next_open(cursor) else {
+                                cursor.phase = EdgeRetirePhase::Done;
+                                continue;
+                            };
+                            cursor.pending_open = Some(next);
                         }
-                        let Some((session, owner)) = self.retire_next_open(cursor) else {
-                            cursor.phase = EdgeRetirePhase::Done;
-                            continue;
-                        };
-                        cursor.open_done_upto = Some(session);
+                        let (session, owner) = cursor.pending_open.expect("visit retained");
                         if owner == slot {
+                            if !budget.try_charge() {
+                                return false;
+                            }
+                            #[cfg(test)]
+                            self.bump_edge_read_for_test();
                             self.open.remove(&session);
                             self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
                             cursor.changed = true;
                         }
+                        cursor.open_done_upto = Some(session);
+                        cursor.pending_open = None;
                         if budget.remaining() == 0 {
                             return false;
                         }
@@ -5412,5 +5442,126 @@ mod tests {
         );
         assert!(effects.is_empty());
         assert_eq!(edge.evidence.unmatched_closes, 1);
+    }
+
+    /// Retire mutations debit their keyed lookup: a Slot CLOSE_ALL
+    /// retire over one doomed pending, one floated detached id and
+    /// one removed open debits exactly two empty active scans plus
+    /// visit + decision + removal + terminal per mutated phase
+    /// (14 units, 14 reads).
+    #[test]
+    fn budgeted_retire_mutations_debit_their_lookup() {
+        use crate::semantics_objects::journal::LeafBudget;
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 7, CkRv::OK.0, 90));
+        let slot = edge.open.get(&7).copied().expect("session 7 open");
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 7, 100);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 110);
+        get_id.target_function = sign_id;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
+        let mut pending_unowned = op("C_Sign", 8, 120);
+        pending_unowned.rv = CkRv::PENDING.0;
+        edge.observe(&pending_unowned);
+        assert_eq!(edge.active.len(), 0);
+        assert_eq!(edge.pending.len(), 1);
+        assert_eq!(edge.detached.len(), 1);
+        assert_eq!(edge.open.len(), 1);
+        let origin = EffectOrigin {
+            function: "C_CloseAllSessions".into(),
+            session: 7,
+            ts_ns: 130,
+        };
+        let mut cursor = edge.start_budgeted_retire(
+            EdgeRetireScope::Slot {
+                slot,
+                close_all: true,
+            },
+            &origin,
+        );
+        let mut effects = Vec::new();
+        edge.reset_test_edge_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        assert!(
+            edge.poll_retire_step(&mut cursor, &mut effects, &mut gate),
+            "the small retire completes in one credit"
+        );
+        assert_eq!(
+            gate.spent(),
+            14,
+            "two empty active scans + visit/decision/removal/terminal per mutated phase"
+        );
+        assert_eq!(
+            edge.test_edge_reads_for_test(),
+            14,
+            "every charged lookup reads exactly once"
+        );
+        assert!(effects.is_empty(), "no machine terminals here");
+        assert_eq!(edge.pending.len(), 0, "the doomed pending drops");
+        assert_eq!(edge.detached.len(), 1, "the owned id floats");
+        assert!(
+            edge.detached.values().all(|id| id.owner.is_none()),
+            "floating clears the owner"
+        );
+        assert_eq!(edge.open.len(), 0, "the owned open unbinds");
+    }
+
+    /// A Selected retire drops (not floats) its matching detached
+    /// id, and the drop debits its keyed lookup: one empty active
+    /// scan plus one empty pending scan plus visit + value + drop.
+    #[test]
+    fn budgeted_retire_detached_drop_debits_its_lookup() {
+        use crate::semantics_objects::journal::LeafBudget;
+        // Session-cancel flag selecting the SIGN operation (mirrors
+        // the private CKF_SIGN in `semantics`).
+        const CKF_SIGN: u64 = 0x0000_0800;
+        let mut edge = EdgeSemantics::default();
+        edge.observe(&call("C_OpenSession", 2, CkRv::OK.0, 90));
+        let sign_id = crate::kinds::function_id("C_Sign").unwrap();
+        let mut pending = op("C_Sign", 2, 100);
+        pending.rv = CkRv::PENDING.0;
+        edge.observe(&pending);
+        let mut get_id = call("C_AsyncGetID", 2, CkRv::OK.0, 110);
+        get_id.target_function = sign_id;
+        get_id.async_value = 42;
+        edge.observe(&get_id);
+        assert_eq!(edge.active.len(), 0);
+        assert_eq!(edge.pending.len(), 0);
+        assert_eq!(edge.detached.len(), 1);
+        let origin = EffectOrigin {
+            function: "C_SessionCancel".into(),
+            session: 2,
+            ts_ns: 120,
+        };
+        let mut cursor = edge.start_budgeted_retire(
+            EdgeRetireScope::Selected {
+                session: 2,
+                flags: CKF_SIGN,
+                ambiguous: false,
+            },
+            &origin,
+        );
+        let mut effects = Vec::new();
+        edge.reset_test_edge_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        assert!(
+            edge.poll_retire_step(&mut cursor, &mut effects, &mut gate),
+            "the small retire completes in one credit"
+        );
+        assert_eq!(
+            gate.spent(),
+            5,
+            "empty active + empty pending scans plus visit/value/drop"
+        );
+        assert_eq!(
+            edge.test_edge_reads_for_test(),
+            5,
+            "every charged lookup reads exactly once"
+        );
+        assert!(effects.is_empty(), "detached drops are silent");
+        assert_eq!(edge.detached.len(), 0, "the matching id drops");
     }
 }

@@ -231,6 +231,20 @@ LINKED_KEY_SIZES_RSA_BEL_TEXT = LINKED_KEY_SIZES_TEXT.replace(
     "RSA 2048 (from signature length)\n",
     "RSA 2048 (from signature length)\x07\n", 1)
 
+#: The healthy --key-sizes transcript whose classified RSA per-key
+#: row carries trailing printable text: the fragment check still
+#: matches, but the complete proof must refuse.
+LINKED_KEY_SIZES_RSA_PRINTABLE_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "RSA 2048 (from signature length)\n",
+    "RSA 2048 (from signature length) INVALID\n", 1)
+
+#: The healthy --key-sizes transcript whose classified RSA per-key
+#: row carries a metadata label with a space: the producer's
+#: vocabulary uses underscores, so the complete proof must refuse.
+LINKED_KEY_SIZES_RSA_METADATA_SPACE_TEXT = LINKED_KEY_SIZES_TEXT.replace(
+    "key row 1 object 9 sign key (rsa_2048):",
+    "key row 1 object 9 sign key (rsa 2048):", 1)
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -383,6 +397,8 @@ class JournalGateTests(unittest.TestCase):
             "linked-key-sizes-activity-mangled": key_sizes_rows(),
             "linked-key-sizes-summary-bel": key_sizes_rows(),
             "linked-key-sizes-rsa-bel": key_sizes_rows(),
+            "linked-key-sizes-rsa-printable": key_sizes_rows(),
+            "linked-key-sizes-rsa-metadata-space": key_sizes_rows(),
             "linked-unlatched": rows,
             "linked-idle": rows,
             "linked-oldline": rows,
@@ -405,6 +421,8 @@ class JournalGateTests(unittest.TestCase):
             "refusal-515": [],
             "refusal-515-loaded": rows,
             "refusal-515-timeout": [],
+            "refusal-515-fragment": [],
+            "refused-noseal-fragment": [row for row in rows if row["btf_id"] == 48],
             "refused-noseal-loaded": rows,
         }))
         (self.work / "texts.json").write_text(json.dumps({
@@ -462,6 +480,10 @@ class JournalGateTests(unittest.TestCase):
                 "rc": 0, "text": LINKED_KEY_SIZES_SUMMARY_BEL_TEXT},
             "linked-key-sizes-rsa-bel": {
                 "rc": 0, "text": LINKED_KEY_SIZES_RSA_BEL_TEXT},
+            "linked-key-sizes-rsa-printable": {
+                "rc": 0, "text": LINKED_KEY_SIZES_RSA_PRINTABLE_TEXT},
+            "linked-key-sizes-rsa-metadata-space": {
+                "rc": 0, "text": LINKED_KEY_SIZES_RSA_METADATA_SPACE_TEXT},
             "linked-unlatched": {"rc": 0, "text": LINKED_UNLATCHED_TEXT},
             "linked-idle": {"rc": 0, "text": IDLE_TEXT},
             # The stop line before it carried a `lost` term: the gate
@@ -531,6 +553,12 @@ class JournalGateTests(unittest.TestCase):
                 "p11scope: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness\n"},
+            "refusal-515-fragment": {"rc": 1, "text":
+                "unrelated diagnostic: live capture unavailable: test\n"},
+            "refused-noseal-fragment": {"rc": 0, "text":
+                "unrelated diagnostic: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object\n"},
         }))
         tool = self.bin / "tool"
         tool.write_text("#!" + sys.executable + "\n" + TOOL_SOURCE)
@@ -1316,6 +1344,38 @@ class JournalGateTests(unittest.TestCase):
         self.assertFalse(row["pass"])
         self.assertEqual(row["qualification"], "failed")
 
+    def test_key_sizes_run_with_rsa_printable_suffix_fails(self):
+        # A classified RSA per-key row with trailing printable text
+        # still contains the fragment, but the complete proof must
+        # refuse: the classified-size item ends at the newline.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-rsa-printable",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no classified RSA-2048 size under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
+    def test_key_sizes_run_with_rsa_metadata_space_fails(self):
+        # A classified RSA per-key row whose metadata label carries a
+        # space is outside the producer's underscore vocabulary: the
+        # complete proof must refuse.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(KERNEL, mode="linked-key-sizes-rsa-metadata-space",
+                                    budgets=budgets,
+                                    object_name="journal-gate1",
+                                    key_sizes="1")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("no classified RSA-2048 size under --key-sizes",
+                      result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+
     def test_unknown_object_is_a_harness_error(self):
         result, out = self.run_gate(KERNEL, object_name="detailed")
         self.assertEqual(result.returncode, 2, result.stdout)
@@ -1529,6 +1589,32 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "failed")
         self.assertIn("unreadable or corrupt", row["detail"])
         self.assertIn("although the build omits the object", row["detail"])
+
+    def test_refusal_control_with_fragment_refusal_fails(self):
+        # Pre-Multi fragment: an unrelated diagnostic carrying only
+        # the refusal substring is not the full emitted refusal
+        # diagnostic, so the control must fail.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515-fragment")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("finite live-capture refusal missing", row["detail"])
+
+    def test_omitted_build_with_fragment_refusal_fails(self):
+        # Omitted-build fragment: an unrelated diagnostic carrying
+        # only the refusal substring is not the full emitted refusal
+        # diagnostic, so the control must fail.
+        result, out = self.run_gate(
+            KERNEL, mode="refused-noseal-fragment",
+            expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("exact journal-pair-unavailable-in-build refusal missing",
+                      row["detail"])
 
     def test_observer_timeout_fails(self):
         result, out = self.run_gate(KERNEL, mode="timeout")

@@ -1080,6 +1080,80 @@ mod tests {
         );
     }
 
+    /// Owner 3c twin: the stale-record fence holds on the
+    /// remove-then-reuse path too. A slot freed by `remove()` is a
+    /// retired life exactly like a tombstoned one, so its recycled
+    /// incarnation stamps a fresh start and refuses the old life's
+    /// in-flight records at the hit boundary. Mirrors the
+    /// tombstoned-path twin with the removal inserted.
+    #[test]
+    fn loader_removed_slot_reuse_rejects_stale_records_at_the_hit_boundary() {
+        let mut registry = LoaderRegistry::default();
+        for _ in 0..MAX_LOADER_CONTEXTS {
+            let id = prepare(&mut registry, spec(None));
+            registry.mark_attached(id).unwrap();
+        }
+        let first = LoaderContextId(1);
+        let stale_ts = hit_ts(&registry, first, 20);
+        registry
+            .validate_hit(
+                first.case_id(),
+                ProcessViewId(7),
+                PinnedObjectId(9),
+                &mapping(),
+                0x4000_0100,
+                stale_ts,
+            )
+            .unwrap();
+        registry.tombstone(first).unwrap();
+        registry.remove(first).unwrap();
+        // Reuse the removed slot under pressure: the new
+        // incarnation stamps wall time, provably after the first
+        // life's small fixture clock.
+        let reused = prepare(&mut registry, spec(None));
+        assert_eq!(reused.get(), first.get());
+        assert!(
+            registry
+                .context(reused)
+                .unwrap()
+                .incarnation_start_ns
+                .is_some(),
+            "a recycled removed slot must stamp its new incarnation"
+        );
+        registry.mark_attached(reused).unwrap();
+        // The old incarnation's last record arrives after the reuse:
+        // its clock predates the new incarnation, so it refuses.
+        assert!(
+            registry
+                .validate_hit(
+                    reused.case_id(),
+                    ProcessViewId(7),
+                    PinnedObjectId(9),
+                    &mapping(),
+                    0x4000_0100,
+                    stale_ts,
+                )
+                .is_err(),
+            "a stale record must not validate against the new incarnation"
+        );
+        assert_eq!(registry.context(reused).unwrap().earliest_hit_ns, None);
+        // The new incarnation's own records validate and set its clock.
+        registry
+            .validate_hit(
+                reused.case_id(),
+                ProcessViewId(7),
+                PinnedObjectId(9),
+                &mapping(),
+                0x4000_0100,
+                hit_ts(&registry, reused, 40),
+            )
+            .unwrap();
+        assert_eq!(
+            registry.context(reused).unwrap().earliest_hit_ns,
+            Some(hit_ts(&registry, reused, 40))
+        );
+    }
+
     /// Owner 3c: the 257th arm succeeds once any slot retires (the
     /// registry recycles; only 256 live contexts exhaust it).
     /// Demonstrated through the real seam: 256 attached arms, one

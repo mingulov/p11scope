@@ -38762,6 +38762,64 @@ int main(void) {
             "use row could bind"
         ));
     }
+
+    /// A walk-bound pass (tight cgroup walk allowance, roomy scan
+    /// window) converges across resumed passes: the sweep that stops
+    /// mid-table stages the legacy prefix, and the next pass's
+    /// use-time proof accepts the full re-decode as an extension of
+    /// that prefix instead of dropping the cursor into a fresh
+    /// rescan every pass (a resume livelock under tight recurring
+    /// budgets). The provider is found, and the terminal keeps no
+    /// stale exhaustion verdict or in-progress gap.
+    #[test]
+    fn tight_walk_allowance_converges_across_resumed_passes() {
+        const WALK_UNITS: usize = 5000;
+        const PASS_CAP: usize = 10;
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let mut state = CgroupWalkState::default();
+        let mut converged = false;
+        for pass in 0..PASS_CAP {
+            let taken = std::mem::take(&mut state);
+            let limits = CgroupWalkLimits {
+                work_units: WALK_UNITS,
+                ..CgroupWalkLimits::default()
+            };
+            let collection = coordinator
+                .cgroup_collector(taken, limits, CollectionControl::new(None), None)
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(
+                    collection,
+                    crate::discovery::caller_registry::now_ns(),
+                )
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            let progress = completion.progress;
+            state = completion.state;
+            if progress.is_none() {
+                converged = true;
+                break;
+            }
+        }
+        assert!(
+            converged,
+            "walk-bound passes must converge within {PASS_CAP} passes"
+        );
+        assert!(
+            coordinator.registry().edges().next().is_some(),
+            "the resumed passes must find the provider"
+        );
+        assert!(
+            !has_terminal_work_exhaustion(&coordinator),
+            "no stale exhaustion verdict survives the converged passes: {:?}",
+            coordinator.registry().gaps()
+        );
+        assert!(
+            coordinator.live_scan_progress_gap().is_none(),
+            "the converged terminal shows no in-progress gap"
+        );
+    }
 }
 
 #[cfg(test)]

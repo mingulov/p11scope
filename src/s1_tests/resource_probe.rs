@@ -905,10 +905,12 @@ fn native_semantic_resource_final_types_pinned() {
     // +16 (run-wide unbound fold): the retained pid Vec becomes the
     // bounded exe-group Vec (24 B for 24 B) plus the two folded
     // overflow counters (2 x 8 B).
+    // +24 (oldest-pid carrier past the group bound): the global
+    // oldest-five Vec the concise callers line renders from (1 x 24 B).
     pin!(
         crate::inventory_present::Presentation,
         1384 + size_of::<crate::inventory_present::PresentationRenderIndex>()
-            + 5 * size_of::<Vec<u8>>()
+            + 6 * size_of::<Vec<u8>>()
             + 2 * size_of::<u64>()
             // a2 re-arm rate: joint_audit_subjects
             + size_of::<

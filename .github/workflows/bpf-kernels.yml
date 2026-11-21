@@ -778,6 +778,11 @@ jobs:
             ${{ github.workspace }}/bpf-load-gate1-out/vng-${{ matrix.kernel }}.log
             ${{ github.workspace }}/bpf-load-gate1-journal/table-${{ matrix.kernel }}.txt
             ${{ github.workspace }}/bpf-load-gate1-journal/out/results.jsonl
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/vng-journal-*.log
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/journal-v*.txt
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/journal-probe-*.jsonl
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/journal-report-*.txt
+            ${{ github.workspace }}/bpf-load-gate1-journal/out/workload-*.log
           if-no-files-found: error
           retention-days: 7
   # Kernel-sensitive lib cells in guests: PID-scope tiers, PID-filter

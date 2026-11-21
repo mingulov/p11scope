@@ -153,44 +153,117 @@ class ReportError(RuntimeError):
     pass
 
 
+def _unique_keys(pairs):
+    """JSON object hook: a repeated key is a corrupt record, never last-wins."""
+    document = {}
+    for key, value in pairs:
+        if key in document:
+            raise ValueError(f"duplicate key {key!r}")
+        document[key] = value
+    return document
+
+
+def _is_count(value):
+    return type(value) is int and value >= 0
+
+
+def parse_probe_stream(data):
+    """The one probe-stream grammar: (load rows, problems).
+
+    Every gate that reads verifier-stats probe output uses this parser,
+    so no gate counts a record another gate rejects. The stream is
+    LF-framed records written by scripts/native/verifier-stats-probe.c:
+    ``load`` rows, ``probe-error`` rows and one final ``probe-summary``.
+    Each record must be printable ASCII, one JSON object with unique
+    keys and a known ``record`` kind; a load row must carry the typed
+    fields checked_load gates. Each line is judged on its own: a bad
+    line is a named problem and is never counted as a load, while the
+    valid load rows around it are still returned, so a corrupt suffix
+    cannot erase loads that independently validated. The stream as a
+    whole is complete only with exactly one summary, as the final
+    record, counting every load and error record, with no write
+    failure or overflow, and a final newline. An empty ``problems``
+    list is the only valid stream.
+    """
+    problems = []
+    loads = []
+    summaries = []
+    counted = 0
+    lines = data.split(b"\n")
+    if lines[-1] == b"":
+        lines.pop()
+    elif lines:
+        problems.append(f"line {len(lines)}: final record has no newline (truncated)")
+    if not lines:
+        problems.append("empty input, no probe rows")
+    for number, raw in enumerate(lines, 1):
+        if not raw:
+            problems.append(f"line {number}: blank record")
+            continue
+        if any(byte < 0x20 or byte > 0x7e for byte in raw):
+            problems.append(f"line {number}: byte outside printable ASCII")
+            continue
+        try:
+            row = json.loads(raw.decode("ascii"), object_pairs_hook=_unique_keys)
+        except (ValueError, RecursionError) as error:
+            problems.append(f"line {number}: invalid JSON ({str(error)[:80]})")
+            continue
+        if type(row) is not dict or type(row.get("record")) is not str:
+            problems.append(f"line {number}: not a probe record object")
+            continue
+        kind = row["record"]
+        if kind == "load":
+            counted += 1
+            try:
+                checked_load(row)
+            except ReportError as error:
+                problems.append(f"line {number}: {error}")
+                continue
+            loads.append(row)
+        elif kind == "probe-error":
+            counted += 1
+            reason = row.get("reason")
+            problems.append(f"line {number}: probe error "
+                            f"({reason if type(reason) is str else 'no reason'})")
+        elif kind == "probe-summary":
+            summaries.append((number, row))
+        else:
+            problems.append(f"line {number}: unknown record {kind[:40]!r}")
+    if not summaries:
+        if lines:
+            problems.append("no probe summary, the run never finished")
+    elif len(summaries) > 1:
+        problems.append(f"{len(summaries)} probe summaries, expected one")
+    else:
+        number, summary = summaries[0]
+        if number != len(lines):
+            problems.append(f"line {number}: probe summary is not the final record")
+        if not (_is_count(summary.get("records"))
+                and _is_count(summary.get("write_failures"))
+                and type(summary.get("overflow")) is bool):
+            problems.append(f"line {number}: probe summary fields are not typed counts")
+        elif summary["records"] != counted:
+            problems.append(f"summary counts {summary['records']} rows, "
+                            f"file holds {counted}")
+        elif summary["write_failures"] != 0 or summary["overflow"] is not False:
+            problems.append("probe output failed (write failures or overflow)")
+    return loads, problems
+
+
+def read_probe_file(path):
+    """(load rows, problems) for one probe file; unreadable is a problem."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError as error:
+        return [], [f"cannot read input ({error})"]
+    return parse_probe_stream(data)
+
+
 def read_jsonl(path):
     """Raw probe rows. Raises ReportError; never invents a row."""
-    try:
-        text = Path(path).read_text(encoding="ascii")
-    except (OSError, UnicodeError) as error:
-        raise ReportError(f"{path}: cannot read input ({error})")
-    lines = text.splitlines()
-    if not lines:
-        raise ReportError(f"{path}: empty input, no probe rows")
-    rows = []
-    for number, line in enumerate(lines, 1):
-        if not line.strip():
-            raise ReportError(f"{path}: blank line {number}")
-        try:
-            row = json.loads(line)
-        except ValueError as error:
-            raise ReportError(f"{path}: invalid JSON on line {number} ({error})")
-        if type(row) is not dict or type(row.get("record")) is not str:
-            raise ReportError(f"{path}: invalid record on line {number}")
-        rows.append(row)
-    loads = [row for row in rows if row["record"] == "load"]
-    summaries = [row for row in rows if row["record"] == "probe-summary"]
-    for row in rows:
-        if row["record"] == "probe-error":
-            raise ReportError(f"{path}: probe error ({row.get('reason')})")
-        if row["record"] not in ("load", "probe-summary"):
-            raise ReportError(f"{path}: unknown record {row['record']!r}")
-    if not summaries:
-        raise ReportError(f"{path}: no probe summary, the run never finished")
-    if len(summaries) > 1:
-        raise ReportError(f"{path}: {len(summaries)} probe summaries, expected one")
-    summary = summaries[0]
-    counted = len(loads) + sum(1 for row in rows if row["record"] == "probe-error")
-    if summary.get("records") != counted:
-        raise ReportError(
-            f"{path}: summary counts {summary.get('records')} rows, file holds {counted}")
-    if summary.get("write_failures") != 0 or summary.get("overflow") is not False:
-        raise ReportError(f"{path}: probe output failed (summary {summary!r})")
+    loads, problems = read_probe_file(path)
+    if problems:
+        raise ReportError(f"{path}: {problems[0]}")
     return loads
 
 

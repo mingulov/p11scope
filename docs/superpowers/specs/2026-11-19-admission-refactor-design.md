@@ -481,21 +481,34 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   run follow-up passes while same-cursor progress advances, plus
   one settle pass — plus three-route classification). No allowance
   is sized to fit any provider: any app size converges over several
-  passes. One owner decides termination: the driver's
-  `SnapshotResumeLedger`, which observes every decided pass with
-  every carried cursor (completed ones included). It keeps covered
-  ground per (work identity, layout) pair — the furthest
-  lexicographic sweep position, the most decoded tables and
-  completion — never evicted and capped at the cursor bound. A
-  WorkLimit pass is granted only by the single initial grant, the
-  single settle grant, or a strict rise of an admitted pair's
-  covered ground; a completed pair is never passed again. Each
-  pair's ground is bounded by its layout and the pair set is
-  finite, so a recurring layout, a restart behind a frontier, an
-  alternating return to covered ground, a disappearance or a
-  restart after completion stalls instead of re-earning a pass;
-  arrivals seed without granting. When nothing rises, the snapshot
-  stops and the live in-progress gap names the work left.
+  passes. Two owners split the termination decision. The cursor
+  store's `ResumeHistory` (scan_pass) keeps covered ground per
+  (work identity, layout) pair — the furthest lexicographic sweep
+  position, the most decoded tables and completion — and is updated
+  where each cursor is recorded, inside the credited scan
+  (`O(log n)` per record); publication reads an `O(1)`
+  `ResumeObservation` (unfinished, risen past covered ground, history
+  refusals), and the cursor totals are kept incrementally, so no
+  foreground step revisits the carried cursors. The driver's
+  `SnapshotResumeLedger` grants a WorkLimit pass only for the single
+  initial grant, the single settle grant, or a pass whose progress
+  rose past an admitted pair's covered ground; a completed pair is
+  never passed again. A rise marks its pair protected; protected pairs
+  are never evicted and each pair's ground is bounded by its layout,
+  so rises are finite and the snapshot terminates. At the
+  8,192-pair bound, new unfinished work evicts the oldest unprotected
+  completed pair (one that arrived complete and can never rise), so
+  completed-only history never starves advancing work; when every
+  pair is protected or still unfinished, the record is refused,
+  counted and named (`scan resume history full`, a protected concise
+  row). The boundary: more than 8,192 objects that each earned a
+  resumed pass or still scan. A recurring layout, a restart behind a
+  frontier, an alternating return to covered ground, a disappearance
+  or a restart after completion stalls instead of re-earning a pass;
+  arrivals seed without granting. A collection discarded in worker
+  custody loses the bundle and its history with it (pre-existing
+  posture: the next pass re-scans fresh). When nothing rises, the
+  snapshot stops and the live in-progress gap names the work left.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

@@ -145,10 +145,11 @@ pub(crate) struct SweepFrontier {
     pub(crate) word: u64,
 }
 
-/// How many committed-progress summaries (each a fingerprint hash) this
-/// thread computed: the publication-cost seam for the resume twins.
 #[cfg(test)]
 thread_local! {
+    /// How many committed-progress summaries (each a fingerprint hash)
+    /// this thread computed: the publication-cost seam for the resume
+    /// twins.
     pub(crate) static PROGRESS_SUMMARIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -358,13 +359,240 @@ pub(crate) fn cursor_key_matches_object(
         && key.file.inode == inode
 }
 
+/// Subject of the named resume-history capacity refusal.
+pub(crate) const SCAN_RESUME_HISTORY_FULL_SUBJECT: &str = "scan resume history full";
+
+/// Render the capacity refusal: `refused` records of unfinished work
+/// the snapshot resume history could not admit.
+pub(crate) fn scan_resume_history_full_reason(refused: u64) -> String {
+    format!(
+        "{refused} unfinished object cursor record(s) could not join the snapshot resume history \
+         ({MAX_DECODE_CURSORS} tracked objects each already earned a resumed pass or still \
+         scan); their further progress cannot earn another pass, and the work left stays in \
+         the in-progress gap"
+    )
+}
+
+/// Covered ground of one (work identity, layout) pair in the resume
+/// history: the furthest lexicographic sweep position, the most decoded
+/// tables and completion, each only rising. `protected` marks a pair
+/// whose progress once rose past its covered ground — the only kind of
+/// observation that earns a pass; it is never evicted. `seq` orders
+/// admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CoveredFrontier {
+    sweep: (usize, u64, usize, u64),
+    tables_decoded: usize,
+    complete: bool,
+    protected: bool,
+    seq: u64,
+}
+
+impl CoveredFrontier {
+    /// Whether `progress` reaches past this covered ground. A completed
+    /// sweep is never passed: a restart under the same identity and
+    /// layout re-scans ground an earlier pass already finished.
+    fn passed_by(&self, progress: &CommittedCursorProgress) -> bool {
+        !self.complete
+            && (progress.sweep_position() > self.sweep
+                || progress.tables_decoded > self.tables_decoded
+                || progress.complete)
+    }
+
+    fn raise(&mut self, progress: &CommittedCursorProgress) {
+        self.sweep = self.sweep.max(progress.sweep_position());
+        self.tables_decoded = self.tables_decoded.max(progress.tables_decoded);
+        self.complete |= progress.complete;
+    }
+}
+
+/// The snapshot resume history: the single owner of whether committed
+/// decode progress is new ground. Updated where each cursor is recorded
+/// (inside the credited scan, `O(log n)` per record), never by a
+/// foreground pass over the carried cursors; publication reads the
+/// per-pass [`ResumeObservation`] in `O(1)`.
+///
+/// Termination: a pass's progress earns another pass only when a record
+/// rises past the covered ground of an admitted pair, and that rise marks
+/// the pair protected. Protected pairs are never evicted and each pair's
+/// ground is bounded by its layout, so rises — and the passes they earn —
+/// are finite. Pairs are keyed by layout as well as identity, so a layout
+/// change never overwrites another layout's ground; a revisited layout, a
+/// restart behind a frontier or after completion, a disappearance or an
+/// alternation all compare against everything covered before.
+///
+/// Capacity: at [`MAX_DECODE_CURSORS`] pairs, admitting new unfinished
+/// work evicts the oldest *unprotected completed* pair — one that arrived
+/// complete and never earned a pass, so it can never rise and dropping it
+/// costs no termination protection. Completed-only history therefore
+/// never starves advancing work. When every pair is protected or still
+/// unfinished, the unfinished record is refused, counted and named
+/// ([`SCAN_RESUME_HISTORY_FULL_SUBJECT`]); a complete arrival at capacity
+/// is simply not tracked (it can never earn a pass).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ResumeHistory {
+    covered: BTreeMap<(DecodeCursorKey, u64), CoveredFrontier>,
+    /// Unprotected completed pairs by admission order: the only
+    /// eviction candidates.
+    evictable: BTreeMap<u64, (DecodeCursorKey, u64)>,
+    next_seq: u64,
+    /// Some record this pass rose past covered ground.
+    raised: bool,
+    /// Unfinished records refused at capacity, over the run.
+    refused: u64,
+}
+
+impl ResumeHistory {
+    /// Start one pass: rises are per pass.
+    pub(crate) fn begin_pass(&mut self) {
+        self.raised = false;
+    }
+
+    /// Fold one recorded cursor's committed progress into the history.
+    pub(crate) fn record(&mut self, key: &DecodeCursorKey, progress: &CommittedCursorProgress) {
+        let pair = (key.clone(), progress.layout);
+        if let Some(covered) = self.covered.get_mut(&pair) {
+            if covered.passed_by(progress) {
+                self.raised = true;
+                if !covered.protected {
+                    covered.protected = true;
+                    self.evictable.remove(&covered.seq);
+                }
+            }
+            covered.raise(progress);
+            return;
+        }
+        if self.covered.len() >= MAX_DECODE_CURSORS {
+            if progress.complete {
+                return;
+            }
+            let Some((_, victim)) = self.evictable.pop_first() else {
+                self.refused = self.refused.saturating_add(1);
+                return;
+            };
+            self.covered.remove(&victim);
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        if progress.complete {
+            self.evictable.insert(seq, pair.clone());
+        }
+        self.covered.insert(
+            pair,
+            CoveredFrontier {
+                sweep: progress.sweep_position(),
+                tables_decoded: progress.tables_decoded,
+                complete: progress.complete,
+                protected: false,
+                seq,
+            },
+        );
+    }
+
+    /// Whether some record this pass rose past covered ground.
+    pub(crate) fn raised(&self) -> bool {
+        self.raised
+    }
+
+    /// Unfinished records refused at capacity over the run.
+    pub(crate) fn refused(&self) -> u64 {
+        self.refused
+    }
+
+    /// Tracked pairs (bounded by [`MAX_DECODE_CURSORS`]).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.covered.len()
+    }
+}
+
+/// One accepted pass's resume summary, read in `O(1)` at publication:
+/// whether unfinished cursors remain, whether the pass's progress rose
+/// past covered ground, and the run's capacity refusals.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResumeObservation {
+    pub(crate) unfinished: bool,
+    pub(crate) raised: bool,
+    pub(crate) history_refused: u64,
+}
+
+/// The carried decode cursors with their incrementally kept totals and
+/// the resume history: the single owner of cursor-map mutation. Reads go
+/// through `Deref`; every insert and removal goes through the store, so
+/// the `(done, total, tables)` totals and the history never need a pass
+/// over the map.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DecodeCursorStore {
+    cursors: BTreeMap<DecodeCursorKey, DecodeCursor>,
+    done: usize,
+    tables: usize,
+    history: ResumeHistory,
+}
+
+impl std::ops::Deref for DecodeCursorStore {
+    type Target = BTreeMap<DecodeCursorKey, DecodeCursor>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cursors
+    }
+}
+
+impl DecodeCursorStore {
+    fn count_out(&mut self, cursor: &DecodeCursor) {
+        self.done -= usize::from(cursor.complete);
+        self.tables -= cursor.cached_tables.len();
+    }
+
+    fn count_in(&mut self, cursor: &DecodeCursor) {
+        self.done += usize::from(cursor.complete);
+        self.tables += cursor.cached_tables.len();
+    }
+
+    /// Store one recorded cursor and fold its committed progress into
+    /// the resume history.
+    fn insert(&mut self, key: DecodeCursorKey, cursor: DecodeCursor) {
+        self.history
+            .record(&key, &CommittedCursorProgress::of(&cursor));
+        self.count_in(&cursor);
+        if let Some(old) = self.cursors.insert(key, cursor) {
+            self.count_out(&old);
+        }
+    }
+
+    fn remove(&mut self, key: &DecodeCursorKey) -> Option<DecodeCursor> {
+        let old = self.cursors.remove(key)?;
+        self.count_out(&old);
+        Some(old)
+    }
+
+    fn begin_pass(&mut self) {
+        self.history.begin_pass();
+    }
+
+    /// `(done, total, tables)` over the store; `None` when no cursor is
+    /// unfinished. `O(1)`.
+    pub(crate) fn progress_totals(&self) -> Option<(usize, usize, usize)> {
+        let total = self.cursors.len();
+        (self.done < total).then_some((self.done, total, self.tables))
+    }
+
+    /// This pass's resume summary. `O(1)`.
+    pub(crate) fn resume_observation(&self) -> ResumeObservation {
+        ResumeObservation {
+            unfinished: self.done < self.cursors.len(),
+            raised: self.history.raised(),
+            history_refused: self.history.refused(),
+        }
+    }
+}
+
 /// Resumable per-object decode state: the cursor store plus the
 /// per-pass probe cache. The shared retained-byte accounting stays on
 /// the budget (one ceiling across file facts and cursors); the owner
 /// takes it as a parameter wherever admission or eviction moves it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecodeResume {
-    cursors: BTreeMap<DecodeCursorKey, DecodeCursor>,
+    cursors: DecodeCursorStore,
     liveness: BTreeMap<(u32, u64), bool>,
     /// Process-liveness probes performed for reclamation. Tests only.
     #[cfg(test)]
@@ -767,17 +995,15 @@ impl ScanPassOwner {
 
     /// Take every decode cursor for the carried bundle, leaving none.
     /// The shared byte counter moves with the budget's own take.
-    pub(crate) fn take_decode_cursors(&mut self) -> BTreeMap<DecodeCursorKey, DecodeCursor> {
+    pub(crate) fn take_decode_cursors(&mut self) -> DecodeCursorStore {
         std::mem::take(&mut self.decode.cursors)
     }
 
     /// Install carried decode cursors into a fresh pass, arming resume:
     /// the collector that installs is a multi-pass inventory pass, so
     /// progress it makes this pass must carry a cursor for the next one.
-    pub(crate) fn install_decode_cursors(
-        &mut self,
-        cursors: BTreeMap<DecodeCursorKey, DecodeCursor>,
-    ) {
+    pub(crate) fn install_decode_cursors(&mut self, mut cursors: DecodeCursorStore) {
+        cursors.begin_pass();
         self.decode.cursors = cursors;
         self.decode.resume_armed = true;
     }
@@ -938,7 +1164,7 @@ impl ScanPassOwner {
         if entries_after > MAX_DECODE_CURSORS || bytes_after > limit {
             return false;
         }
-        let fits = |cursors: &BTreeMap<DecodeCursorKey, DecodeCursor>, held: u64| {
+        let fits = |cursors: &DecodeCursorStore, held: u64| {
             (old_bytes.is_some() || cursors.len() < MAX_DECODE_CURSORS)
                 && held
                     .saturating_sub(old_bytes.unwrap_or(0))
@@ -1210,7 +1436,7 @@ impl ScanPassOwner {
         let mut done = 0usize;
         let mut total = 0usize;
         let mut tables = 0usize;
-        for (key, cursor) in &self.decode.cursors {
+        for (key, cursor) in self.decode.cursors.iter() {
             if key.pid != pid || key.start_time != start_time {
                 continue;
             }
@@ -1352,7 +1578,7 @@ impl ScanPassOwner {
             return;
         }
         let mut oldest: BTreeMap<u32, u64> = BTreeMap::new();
-        for (key, cursor) in &self.decode.cursors {
+        for (key, cursor) in self.decode.cursors.iter() {
             if cursor.complete {
                 continue;
             }

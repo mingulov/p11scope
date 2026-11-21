@@ -1125,7 +1125,7 @@ pub(crate) struct RetainedFileFacts {
     /// objects re-emit their cached tables at ~zero work while they
     /// validate unchanged. Keyed by file identity plus the target
     /// generation; anything else misses and scans fresh.
-    decode_cursors: BTreeMap<DecodeCursorKey, DecodeCursor>,
+    decode_cursors: super::scan_pass::DecodeCursorStore,
     retained_cache_bytes: u64,
     /// Keys the producing pass looked up or inserted. A later pass that
     /// has not reached one of these entries yet must not reclaim it ahead
@@ -1204,50 +1204,22 @@ impl RetainedFileFacts {
         !self.decode_cursors.is_empty()
     }
 
-    /// Committed per-cursor progress over the whole carried bundle, for
-    /// the snapshot resume ledger: every carried cursor's work identity
-    /// with its layout-bound frontiers, completed cursors included (empty
-    /// only when no cursor is carried). Whether any cursor is unfinished
-    /// is read from the same entries, so completed progress stays in the
-    /// decided history across settlement instead of vanishing behind a
-    /// `None`.
-    pub(crate) fn scan_cursor_progress(
-        &self,
-    ) -> BTreeMap<DecodeCursorKey, super::scan_pass::CommittedCursorProgress> {
-        self.decode_cursors
-            .iter()
-            .map(|(key, cursor)| {
-                (
-                    key.clone(),
-                    super::scan_pass::CommittedCursorProgress::of(cursor),
-                )
-            })
-            .collect()
+    /// This pass's snapshot resume summary, kept by the cursor store
+    /// where each cursor was recorded: whether any cursor is unfinished,
+    /// whether the pass's progress rose past covered ground, and the
+    /// run's history capacity refusals. `O(1)`: publication never
+    /// revisits the carried cursors.
+    pub(crate) fn resume_observation(&self) -> super::scan_pass::ResumeObservation {
+        self.decode_cursors.resume_observation()
     }
 
     /// `(done, total, tables)` over the whole carried bundle: completed
     /// objects, cursor-known objects, and cached tables decoded so far.
     /// `None` when no cursor is unfinished (no live in-progress gap to
-    /// name). Totals only — per-view wording stays with the scan.
+    /// name). Totals only — per-view wording stays with the scan. `O(1)`:
+    /// the store keeps the totals incrementally.
     pub(crate) fn scan_progress_totals(&self) -> Option<(usize, usize, usize)> {
-        let total = self.decode_cursors.len();
-        if total == 0 {
-            return None;
-        }
-        let done = self
-            .decode_cursors
-            .values()
-            .filter(|cursor| cursor.complete)
-            .count();
-        if done == total {
-            return None;
-        }
-        let tables = self
-            .decode_cursors
-            .values()
-            .map(|cursor| cursor.cached_tables.len())
-            .sum();
-        Some((done, total, tables))
+        self.decode_cursors.progress_totals()
     }
 }
 

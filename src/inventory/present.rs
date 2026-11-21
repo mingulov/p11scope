@@ -1080,6 +1080,11 @@ impl Presentation {
         if let Some(gap) = coordinator.live_scan_progress_gap() {
             gaps.push(gap);
         }
+        // Unfinished work the snapshot resume history could not admit
+        // is named with its count (run-wide, protected in concise text).
+        if let Some(gap) = coordinator.live_scan_history_gap() {
+            gaps.push(gap);
+        }
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let dropped_pairs = coordinator.pruned_pair_totals();
@@ -3274,25 +3279,48 @@ enum ConciseUnit<'a> {
     Group(&'a RankedGapGroup),
 }
 
-/// The single concise ordering owner: the folded ceiling rows, in
-/// first-encounter order, are interval boundaries. Each ordinary group
-/// belongs to the interval holding its first folded row (so a group
-/// with rows on both sides of a ceiling reads once, where it first
-/// appeared) and keeps the existing rank only within that interval.
-/// The merged sequence is interval 0's groups, ceiling 0, interval 1's
-/// groups, ceiling 1, …; the caller caps it as one list. `ranked` is
-/// already in rank order and the interval sort is stable.
+/// Whether a concise group is protected from the shared cap: the
+/// run-wide count-explaining subjects (the capture failure among them)
+/// and the terminal scan rows (the live in-progress row and the resume
+/// history capacity refusal). One owner for the protected set.
+fn is_protected_concise_subject(subject: &str) -> bool {
+    count_explaining_rank(subject).is_some()
+        || subject == crate::discovery::scan_pass::SCAN_IN_PROGRESS_SUBJECT
+        || subject == crate::discovery::scan_pass::SCAN_RESUME_HISTORY_FULL_SUBJECT
+}
+
+/// The single concise ordering owner. Protected groups (see
+/// [`is_protected_concise_subject`]) read first, in rank order: the
+/// first tier, so a run-wide or terminal reason never falls under the
+/// cap. Then the folded ceiling rows, in first-encounter order, are
+/// interval boundaries for every other group: each belongs to the
+/// interval holding its first folded row (so a group with rows on both
+/// sides of a ceiling reads once, where it first appeared) and keeps the
+/// existing rank only within that interval. The merged sequence is the
+/// protected tier, interval 0's groups, ceiling 0, interval 1's groups,
+/// ceiling 1, …; the caller caps it as one list (never below the
+/// protected tier). `ranked` is already in rank order and every sort
+/// here is stable.
 fn concise_interval_order<'a>(
     ceiling: &[(usize, &'a GapView)],
     ranked: &'a [RankedGapGroup],
-) -> Vec<ConciseUnit<'a>> {
+) -> (usize, Vec<ConciseUnit<'a>>) {
     let interval = |first: usize| ceiling.partition_point(|(index, _)| *index < first);
-    let mut groups: Vec<(usize, &'a RankedGapGroup)> = ranked
+    let (protected, ordinary): (Vec<&'a RankedGapGroup>, Vec<&'a RankedGapGroup>) = ranked
         .iter()
+        .partition(|group| is_protected_concise_subject(&group.0.0));
+    let mut groups: Vec<(usize, &'a RankedGapGroup)> = ordinary
+        .into_iter()
         .map(|group| (interval(group.1.2), group))
         .collect();
     groups.sort_by_key(|(interval, _)| *interval);
-    let mut merged = Vec::with_capacity(ceiling.len().saturating_add(groups.len()));
+    let reserved = protected.len();
+    let mut merged = Vec::with_capacity(
+        reserved
+            .saturating_add(ceiling.len())
+            .saturating_add(groups.len()),
+    );
+    merged.extend(protected.into_iter().map(ConciseUnit::Group));
     let mut groups = groups.into_iter().peekable();
     for (boundary, (_, row)) in ceiling.iter().enumerate() {
         while let Some((_, group)) = groups.next_if(|(interval, _)| *interval <= boundary) {
@@ -3301,7 +3329,7 @@ fn concise_interval_order<'a>(
         merged.push(ConciseUnit::Ceiling(row));
     }
     merged.extend(groups.map(|(_, group)| ConciseUnit::Group(group)));
-    merged
+    (reserved, merged)
 }
 
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
@@ -3564,9 +3592,9 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             .then_with(|| left.0.cmp(&right.0))
     });
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
-    let merged = concise_interval_order(&ceiling, &ranked);
+    let (reserved, merged) = concise_interval_order(&ceiling, &ranked);
     let units = merged.len();
-    let shown = units.min(GAP_GROUPS_SHOWN);
+    let shown = units.min(GAP_GROUPS_SHOWN.max(reserved));
     for unit in &merged[..shown] {
         lines.push(match unit {
             ConciseUnit::Ceiling(row) => ceiling_fold_line(row),

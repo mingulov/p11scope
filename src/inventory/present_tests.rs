@@ -8026,7 +8026,11 @@ fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
                     Some("  and 1 more group (--json has every item)"),
                     "{terminal}/{early}: the cap folds one ordinary unit: {snapshot}"
                 );
-                assert_eq!(block.len(), 21, "{terminal}/{early}: twenty lines plus the remainder");
+                assert_eq!(
+                    block.len(),
+                    21,
+                    "{terminal}/{early}: twenty lines plus the remainder"
+                );
             }
         }
     }
@@ -8054,10 +8058,22 @@ fn ceiling_projection_folds_the_pin_time_work_wrapper() {
     };
     let (mut harness, _caller) = single_caller_harness("present-pin-wrapper-projection", 1);
     let rows = [
-        ("/usr/lib/libprovider.so", pin_stop(2000, WORK_CEILING_REASON), 2),
-        ("/usr/lib/libcollect.so", pin_stop(2000, COLLECTION_STOP_REASON), 1),
+        (
+            "/usr/lib/libprovider.so",
+            pin_stop(2000, WORK_CEILING_REASON),
+            2,
+        ),
+        (
+            "/usr/lib/libcollect.so",
+            pin_stop(2000, COLLECTION_STOP_REASON),
+            1,
+        ),
         ("/usr/lib/libio.so", pin_stop(2000, IO_CEILING_REASON), 1),
-        ("/usr/lib/libforeign.so", pin_stop(2001, WORK_CEILING_REASON), 1),
+        (
+            "/usr/lib/libforeign.so",
+            pin_stop(2001, WORK_CEILING_REASON),
+            1,
+        ),
     ];
     for (subject, reason, times) in &rows {
         for _ in 0..*times {

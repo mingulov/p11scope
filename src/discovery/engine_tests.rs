@@ -92695,6 +92695,56 @@ fn member_stop_unverified_member_resumes_at_the_bound() {
     let _ = child.wait();
 }
 
+/// Waits until `pid` is a zombie (dead but unreaped by this test).
+fn wait_zombie_for_test(pid: u32) {
+    for _ in 0..500 {
+        if let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat"))
+            && let Some(close) = stat.iter().rposition(|byte| *byte == b')')
+            && stat.get(close + 2) == Some(&b'Z')
+        {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    panic!("member {pid} never became a zombie");
+}
+
+/// A member that died with its row still pending (killed before the
+/// intake serviced it, unreaped) ran nothing after its stopping mapping
+/// was recorded: the row withdraws silently like a reaped member, with
+/// no first-use gap (nothing could have run unobserved) and no staging.
+#[test]
+fn member_stop_dead_member_with_a_pending_row_withdraws_silently() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        !files_the_first_use_row(&engine),
+        "a dead member owes no first-use gap"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        io.withdrawn,
+        vec![pid],
+        "the withdrawal is recorded"
+    );
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted"
+    );
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        0,
+        "nothing stages for a dead member"
+    );
+    let _ = child.wait();
+}
+
 /// Twin: at the bound, a tgid whose process was born after the row's
 /// stop is another process (the member exited and its number was
 /// reused): its row is withdrawn and it is never signalled.

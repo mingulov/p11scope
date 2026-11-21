@@ -6997,6 +6997,7 @@ mod disposal_tests {
                                         started.instance,
                                         started.category,
                                         started.started_ts_ns,
+                                        started.mechanism,
                                     );
                                     break;
                                 }

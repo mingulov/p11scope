@@ -26606,6 +26606,95 @@ impl Engine {
         detached
     }
 
+    /// Faults a view's manifest-getter objects' readable non-executable
+    /// mappings into its page tables before the getter hooks attach. The
+    /// hooks' BPF reads are nofault: they fail (`-EFAULT`, counted as
+    /// `discovery_read_failures`) on provider-table pages the target never
+    /// touched, even though the same bytes validate fine moments later
+    /// through the faulting `/proc/<pid>/mem` read. Faulting them here
+    /// closes that first-touch race. Best-effort and silent: any failure
+    /// (exited view, unreadable maps or memory, exhausted budget) simply
+    /// leaves the normal gap path to report honestly.
+    fn prefault_manifest_getter_data(
+        &mut self,
+        view: ProcessViewId,
+        sites: &[(PinnedObjectId, u64, String)],
+    ) {
+        let mut objects = BTreeSet::new();
+        for (object, _, _) in sites {
+            objects.insert(*object);
+        }
+        if objects.is_empty() {
+            return;
+        }
+        let Some(position) = self
+            .views
+            .iter()
+            .position(|candidate| candidate.id() == view)
+        else {
+            return;
+        };
+        let Ok(maps) = Self::read_maps(&self.views[position], &mut self.budget) else {
+            return;
+        };
+        let mut ranges = Vec::new();
+        for mapping in &maps {
+            if mapping.permissions[0] != b'r'
+                || mapping.permissions[2] == b'x'
+                || mapping.inode == 0
+                || mapping.end <= mapping.start
+            {
+                continue;
+            }
+            let key = ObjectKey::of(mapping);
+            let owned = objects.iter().any(|object| {
+                self.pinned.object_matches_key(
+                    *object,
+                    key.device.major,
+                    key.device.minor,
+                    key.inode,
+                )
+            });
+            if owned {
+                ranges.push((mapping.start, mapping.end));
+            }
+        }
+        if ranges.is_empty() {
+            return;
+        }
+        let mem = self.views[position].with_filesystem(&mut self.budget, |filesystem, _| {
+            Ok(filesystem.open_memory())
+        });
+        let Ok(mem) = mem.map_err(|_| ()).and_then(|inner| inner.map_err(|_| ())) else {
+            return;
+        };
+        let mut operation_bytes = 0u64;
+        let mut chunk = [0u8; 65536];
+        for (start, end) in ranges {
+            let mut addr = start;
+            while addr < end {
+                let len = (end - addr).min(chunk.len() as u64) as usize;
+                if self.budget.allowed_io(operation_bytes, len) < len {
+                    return;
+                }
+                match mem.read_at(&mut chunk[..len], addr) {
+                    Ok(read) => {
+                        self.budget.record_io(read);
+                        operation_bytes = operation_bytes.saturating_add(read as u64);
+                        if read != len {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+                let Some(next) = addr.checked_add(len as u64) else {
+                    break;
+                };
+                addr = next;
+            }
+        }
+    }
+
     fn attach_manifest_getters_unsettled(
         &mut self,
         view: ProcessViewId,
@@ -26660,6 +26749,7 @@ impl Engine {
                 return (false, false, false, false);
             }
         };
+        self.prefault_manifest_getter_data(view, &sites);
         let pinned = self.pinned.clone();
         let mut collected = CollectedExportWork {
             dynamic: Vec::new(),

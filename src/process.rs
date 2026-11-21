@@ -434,7 +434,7 @@ pub(crate) fn mountinfo_reads_for_test() -> u64 {
 
 /// Opens and reads one retained view's mount table, charged to `budget`. The
 /// table fd is returned open: it stays pollable for later changes.
-fn read_view_mountinfo(
+pub(crate) fn read_view_mountinfo(
     pid: u32,
     budget: &mut CaptureWorkBudget,
     open: impl FnOnce() -> io::Result<std::fs::File>,

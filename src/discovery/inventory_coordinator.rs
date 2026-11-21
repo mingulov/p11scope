@@ -3482,6 +3482,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.queue_reseed_for_awaiting_feeds()
     }
 
+    /// Note one stuck pass on reseeded feeds (see the registry:
+    /// streaks degrade with a cooldown and a counted gap).
+    pub(crate) fn note_reseeded_stuck_passes(
+        &mut self,
+        ids: &[crate::discovery::caller_registry::instance_input::RegistryInstanceId],
+        now_ns: u64,
+    ) {
+        self.registry.note_reseeded_stuck_passes(ids, now_ns)
+    }
+
+    /// Tick one quantum off every feed's stuck-degrade cooldown.
+    pub(crate) fn tick_reseed_cooldowns(&mut self) {
+        self.registry.tick_reseed_cooldowns()
+    }
+
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     #[allow(dead_code)] // Consumed by T12c.

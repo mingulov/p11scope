@@ -1956,6 +1956,12 @@ impl LiveJointMachine {
         } else {
             coordinator.discard_proven_stuck_session(&proven_stuck)
         };
+        // Reseeded-segment liveness: a reseed arm that stages into
+        // stuck audits degrades back to S1 after a short streak
+        // (with a cooldown and a counted gap) instead of spending
+        // the re-arm bound until the lane stops. Pristine feeds
+        // never take part.
+        coordinator.note_reseeded_stuck_passes(&stuck_feeds, now);
         // A refusal at Auditing came before the audit ran: the machine
         // still holds the ingested quantum, and the coordinator its
         // untaken H3 disposition. Take that slot exactly as the audit
@@ -4189,6 +4195,7 @@ impl LiveJointMachine {
                 // fence. Images the lane cannot re-arm (unknown,
                 // retired, or a shell lane with no capture) stay
                 // S1Only with their deferred gap already disclosed.
+                coordinator.tick_reseed_cooldowns();
                 coordinator.queue_reseed_for_awaiting_feeds();
                 for image in coordinator.drain_joint_reseed_queue() {
                     coordinator

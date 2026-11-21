@@ -2486,6 +2486,47 @@ impl CallerRegistry {
         self.queue_reseed_where(|record| record.feed.reseed_eligible())
     }
 
+    /// Note one stuck pass on reseeded feeds (the commit lane re-armed
+    /// with their staged calls unsettled): a feed whose streak
+    /// degrades drops to S1 with a cooldown and one counted
+    /// `joint_reentry_stuck_degraded` gap, so one reseed can never
+    /// wedge the lane by itself. Pristine feeds never take part.
+    /// The machine calls this from its re-arm path with the stuck
+    /// session's feed ids and the re-arm clock.
+    pub(crate) fn note_reseeded_stuck_passes(&mut self, ids: &[RegistryInstanceId], now_ns: u64) {
+        for id in ids {
+            let Some(record) = self.instance_state.records.get(id) else {
+                continue;
+            };
+            let caller = record.caller;
+            let Some(semantics) = self.instance_state.semantics.get_mut(id) else {
+                continue;
+            };
+            let module = semantics.module;
+            if !semantics.feed.note_reseeded_stuck_pass(now_ns) {
+                continue;
+            }
+            self.joint_feeds = self.joint_feeds.saturating_sub(1);
+            self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                caller: Some(caller),
+                module: Some(module),
+                pid: None,
+                subject: crate::inventory_present::JOINT_REENTRY_SUBJECT.into(),
+                reason: "joint_reentry_stuck_degraded".into(),
+                budget: None,
+            });
+        }
+    }
+
+    /// Tick one quantum off every feed's stuck-degrade cooldown. The
+    /// machine calls this every Births phase beside the reseed queue
+    /// scan; the scan itself is bounded by the registry limit.
+    pub(crate) fn tick_reseed_cooldowns(&mut self) {
+        for record in self.instance_state.semantics.values_mut() {
+            record.feed.tick_reseed_cooldown();
+        }
+    }
+
     fn queue_reseed_where(
         &mut self,
         mut eligible: impl FnMut(&InstanceSemanticRecord) -> bool,

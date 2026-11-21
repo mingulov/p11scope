@@ -352,7 +352,43 @@ pub(crate) struct JointStaging {
     /// first, so one segment's worth is ever pended: bounded by
     /// [`JOINT_STAGING_CAPACITY`].
     pending_releases: Vec<(Option<crate::attach::capture::NativeDomainId>, u64, u64)>,
+    /// True while the current Joint segment is a reseed arm
+    /// ([`Self::try_reselect_joint`]): only reseeded segments take
+    /// part in the stuck liveness backstop below. Set on reseed,
+    /// cleared when the segment ends or degrades.
+    reseeded_segment: bool,
+    /// Consecutive stuck passes (within
+    /// [`RESEED_STUCK_STREAK_GAP_NS`]) on the current reseeded
+    /// segment; the streak degrades at
+    /// [`RESEED_STUCK_DEGRADE_STREAK`]. Meaningful only while
+    /// `reseeded_segment` holds.
+    reseeded_stuck_streak: u8,
+    /// The last stuck pass's clock (ns), for streak chaining.
+    reseeded_last_stuck_ns: u64,
+    /// Quanta left before this feed may reseed again after a stuck
+    /// degrade; ticked once per quantum by
+    /// [`Self::tick_reseed_cooldown`]. Zero means no cooldown.
+    reseeded_cooldown: u32,
 }
+
+/// Stuck passes at most this far apart (ns) chain into one streak;
+/// a longer gap (two healthy passes at least) breaks it. Passes run
+/// ~2 s, so scattered stuck passes across healthy work never
+/// accumulate while a sustained wedge chains.
+pub(crate) const RESEED_STUCK_STREAK_GAP_NS: u64 = 5_000_000_000;
+
+/// Consecutive stuck passes that degrade a reseeded segment back to
+/// S1 (see [`JointStaging::note_reseeded_stuck_pass`]).
+pub(crate) const RESEED_STUCK_DEGRADE_STREAK: u8 = 4;
+
+/// Quanta a stuck-degraded feed waits before it may reseed again.
+/// Worst-case re-arm duty per stuck episode is
+/// `RESEED_STUCK_DEGRADE_STREAK / (RESEED_STUCK_DEGRADE_STREAK +
+/// RESEED_COOLDOWN_PASSES)` = 4/24 of passes, about 9 re-arms per
+/// 120 s — far under the lane-stop bound (32 per 120 s), so one
+/// reseed can never wedge the lane by itself; the cooldown also
+/// lets back-pressured pools drain before the retry re-arms.
+pub(crate) const RESEED_COOLDOWN_PASSES: u32 = 20;
 
 impl std::fmt::Debug for JointStaging {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -422,6 +458,10 @@ impl JointStaging {
             segment_fence: None,
             resume_deferral_disclosed: None,
             pending_releases: Vec::new(),
+            reseeded_segment: false,
+            reseeded_stuck_streak: 0,
+            reseeded_last_stuck_ns: 0,
+            reseeded_cooldown: 0,
         }
     }
 
@@ -601,16 +641,52 @@ impl JointStaging {
 
     /// Whether this degraded feed may reseed onto a fresh receipt: it
     /// ended a Joint segment (fallback or loss, fenced or not), still
-    /// holds its old receipt, drained its staging, and never tripped
-    /// the watchdog. The fresh receipt itself (same incarnation, cut
-    /// above the old cut and at/above the recorded fence) is checked
-    /// at [`Self::reselect_joint`]; this gate needs no receipt.
+    /// holds its old receipt, drained its staging, never tripped the
+    /// watchdog, and serves no stuck-degrade cooldown. The fresh
+    /// receipt itself (same incarnation, cut above the old cut and
+    /// at/above the recorded fence) is checked at
+    /// [`Self::reselect_joint`]; this gate needs no receipt.
     pub(crate) fn reseed_eligible(&self) -> bool {
         self.mode == FeedMode::S1Only
             && self.selected_receipt.is_some()
             && self.degraded_window.is_some()
             && self.staged.is_empty()
             && !self.watchdog_tripped
+            && self.reseeded_cooldown == 0
+    }
+
+    /// Note one stuck pass on a reseeded segment (the commit lane
+    /// re-armed with this feed's staged calls unsettled): streaks
+    /// within [`RESEED_STUCK_STREAK_GAP_NS`] chain, longer gaps
+    /// restart at one. At [`RESEED_STUCK_DEGRADE_STREAK`] the
+    /// segment degrades to S1 (loss, non-resumable: its proof made
+    /// no progress) with a [`RESEED_COOLDOWN_PASSES`]-quantum
+    /// cooldown, and the caller names the degrade. Pristine feeds
+    /// never take part. Returns whether this note degraded.
+    pub(crate) fn note_reseeded_stuck_pass(&mut self, now_ns: u64) -> bool {
+        if !self.reseeded_segment {
+            return false;
+        }
+        if self.reseeded_stuck_streak > 0 && now_ns == self.reseeded_last_stuck_ns {
+            return false;
+        }
+        if now_ns.saturating_sub(self.reseeded_last_stuck_ns) <= RESEED_STUCK_STREAK_GAP_NS {
+            self.reseeded_stuck_streak = self.reseeded_stuck_streak.saturating_add(1);
+        } else {
+            self.reseeded_stuck_streak = 1;
+        }
+        self.reseeded_last_stuck_ns = now_ns;
+        if self.reseeded_stuck_streak < RESEED_STUCK_DEGRADE_STREAK {
+            return false;
+        }
+        self.close_segment(true, false, None);
+        self.reseeded_cooldown = RESEED_COOLDOWN_PASSES;
+        true
+    }
+
+    /// Tick one quantum off the stuck-degrade cooldown, if any.
+    pub(crate) fn tick_reseed_cooldown(&mut self) {
+        self.reseeded_cooldown = self.reseeded_cooldown.saturating_sub(1);
     }
 
     /// Reseed a voided feed onto a fresh birth receipt at or above its
@@ -685,6 +761,8 @@ impl JointStaging {
         self.degraded_loss = false;
         self.fell_back = false;
         self.history_disposed_baseline = self.history_disposed;
+        self.reseeded_segment = true;
+        self.reseeded_stuck_streak = 0;
         Ok(())
     }
 
@@ -765,6 +843,8 @@ impl JointStaging {
             self.segment_resumable = false;
             self.degraded_window = Some(DegradedWindow::Watchdog);
         }
+        self.reseeded_segment = false;
+        self.reseeded_stuck_streak = 0;
         was_joint
     }
 
@@ -809,6 +889,8 @@ impl JointStaging {
     fn close_segment(&mut self, loss: bool, resumable: bool, fence: Option<u64>) {
         self.mode = FeedMode::S1Only;
         self.segment_resumable = resumable;
+        self.reseeded_segment = false;
+        self.reseeded_stuck_streak = 0;
         self.record_fence(fence);
         if loss {
             self.degraded_loss = true;

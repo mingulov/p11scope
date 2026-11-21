@@ -6889,9 +6889,12 @@ fn bracket_budget_exhaustion(reason: &str) -> bool {
 /// bracket: every [`bracket_budget_exhaustion`] reason EXCEPT the work
 /// ceiling. A work-starved bracket clears (fail-closed, the v0.7.0
 /// contract): the work budget is gone, so its modules' pins cannot
-/// succeed, and publishing them only feeds the fail-closed key
-/// rejection until the capture stops counting under a newcomer flood
-/// (the v0.7.1 regression). Keeps for other starvations are unchanged.
+/// succeed, and publishing one named skip per unprovable module would
+/// be noise next to the bracket row — so the bracket clears, stages
+/// its resume cursor, and the next pass re-decodes with a renewed
+/// allowance (deferred, not lost). Keeps for other starvations are
+/// unchanged. The data-always scoping of this clear still needs an
+/// explicit owner ruling on record (see the round report).
 fn bracket_keep_exhaustion(reason: &str) -> bool {
     bracket_budget_exhaustion(reason) && reason != WORK_CEILING_REASON
 }

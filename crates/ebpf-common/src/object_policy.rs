@@ -102,13 +102,19 @@ pub const fn valid_safe_attribute_length(
 /// but never form key labels); KeyType accepts every assigned standard
 /// `CKK_*` (`0x00..=0x05 | 0x10..=0x4b` per OASIS PKCS #11 3.2, including
 /// DES/DES3/HMAC/DSA/DH and HSS/XMSS — establishment only, labels stay
-/// with the label arms); the one attested vendor key type
+/// with the label arms); the attested NSS vendor key-type spellings
+/// (controller ruling fix2, documented as vendor-specific, not
+/// standard) normalize to their standard meanings where one exists:
 /// `CKK_NSS_ML_KEM` (`0xCE53_4356`, NSS `lib/util/pkcs11n.h`
 /// `CKK_NSS + 6`, read back from vendor-keygen'd keys on real softoken)
-/// normalizes to its standard meaning `CKK_ML_KEM` (0x49) so vendor-
-/// spelled keys label exactly like standard ones — same de-facto NSS
-/// block reliance the display table already takes, full-width match,
-/// no truncation; ValueLen accepts `1..=4096` (0 stays refused: SoftHSM
+/// to `CKK_ML_KEM` (0x49), and `CKK_NSS_CHACHA20` (`0xCE53_4354`,
+/// `CKK_NSS + 4`, which predates standard `CKK_CHACHA20`) to
+/// `CKK_CHACHA20` (0x33), so vendor-spelled keys establish exactly
+/// like standard ones — same de-facto NSS block reliance the display
+/// table already takes, full-width match, no truncation. The other
+/// `CKK_NSS_*` spellings (PKCS8 `+ 1`, JPAKE round keys `+ 2`/`+ 3`,
+/// legacy KYBER `+ 5`) have no standard meaning and stay refused
+/// with the named reason; ValueLen accepts `1..=4096` (0 stays refused: SoftHSM
 /// reports 0 for unwrapped keys, which is provider-unknown, never a
 /// size); ModulusBits accepts `256..=16384` (512/1536 measured live on
 /// all RSA providers). Non-listed sizes label through the existing
@@ -120,10 +126,11 @@ pub const fn valid_safe_attribute_length(
 #[inline(always)]
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
-        // The attested vendor spelling normalizes to its standard
-        // meaning first; its number overlaps no standard arm (see the
-        // closed-set test), so order carries no aliasing risk.
+        // The attested vendor spellings normalize to their standard
+        // meanings first; their numbers overlap no standard arm (see
+        // the closed-set test), so order carries no aliasing risk.
         (SafeAttributeKind::KeyType, 0xCE53_4356) => Some(0x49),
+        (SafeAttributeKind::KeyType, 0xCE53_4354) => Some(0x33),
         (SafeAttributeKind::Class, 0..=11)
         | (SafeAttributeKind::KeyType, 0x00..=0x05 | 0x10..=0x4b)
         | (SafeAttributeKind::Token, 0 | 1)

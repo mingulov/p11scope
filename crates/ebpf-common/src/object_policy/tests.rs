@@ -194,6 +194,36 @@ fn s2s3_safe_attribute_sets_are_closed() {
     }
 }
 
+// Controller ruling fix2 (2026-11-21, NSS vendor key types): the NSS
+// vendor key-type spellings (`CKK_NSS + 1..6`, NSS
+// `lib/util/pkcs11n.h`) map only where a standard meaning exists —
+// `CKK_NSS_CHACHA20` (0xCE53_4354) normalizes to `CKK_CHACHA20`
+// (0x33), documented as a vendor-specific spelling, not a standard
+// id. `CKK_NSS_ML_KEM` keeps its fix1 mapping (above); PKCS8, the
+// JPAKE round keys and legacy KYBER have no standard meaning and
+// stay refused with the named reason (Kyber is not ML-KEM).
+#[test]
+fn s2s3_nss_vendor_key_types_map_or_refuse() {
+    assert_eq!(
+        classify_attribute_scalar(SafeAttributeKind::KeyType, 0xCE53_4354),
+        Some(0x33),
+        "CKK_NSS_CHACHA20 normalizes to CKK_CHACHA20"
+    );
+    for refused in [
+        0xCE53_4351u64, // CKK_NSS_PKCS8 (no standard meaning)
+        0xCE53_4352,   // CKK_NSS_JPAKE_ROUND1 (no standard meaning)
+        0xCE53_4353,   // CKK_NSS_JPAKE_ROUND2 (no standard meaning)
+        0xCE53_4355,   // CKK_NSS_KYBER (Kyber is not ML-KEM)
+        0xCE53_4354 | (1 << 32), // hostile-width alias of CKK_NSS_CHACHA20
+    ] {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, refused),
+            None,
+            "vendor key type {refused:#x} refused"
+        );
+    }
+}
+
 // Mutation caught: a key-type vocabulary drifting from the OASIS PKCS #11
 // 3.2 numbers, including the pinned pkcs11-types misnumbering that puts
 // Edwards/Montgomery at 0x3a/0x3b (those are BLAKE2b HMAC per OASIS and

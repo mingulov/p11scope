@@ -2449,6 +2449,20 @@ mod tests {
         );
     }
 
+    /// Controller ruling fix2 (NSS vendor key types): the
+    /// vendor-spelled ChaCha20 key type establishes the ChaCha20
+    /// kind (via the policy's `0xCE53_4354` → `0x33`
+    /// normalization) and stays compatible with ChaCha20
+    /// inference — establishment only, no label arm.
+    #[test]
+    fn nss_vendor_chacha20_key_type_establishes_kind() {
+        let kind = established_type_kind(0x33).expect("CKK_CHACHA20 establishes");
+        assert_eq!(kind, EstablishedKind::Chacha20);
+        assert!(families_compatible(KeyFamily::Chacha20, 0x1226, kind));
+        assert!(families_compatible(KeyFamily::Chacha20, 0x4021, kind));
+        assert!(!families_compatible(KeyFamily::Aes, 0x1082, kind));
+    }
+
     /// Family value/display spellings (§10.2 enum + §10.3 fragments).
     #[test]
     fn family_spellings() {

@@ -110,6 +110,17 @@ no gap: those hooks detect provider publication, they count no calls.
 `--pid` captures arm before the `capturing:` line and have no such
 window.
 
+### DRAFT-pending-cutoff: a loaded host can rarely leave a transient lossy gap unclassified
+
+On a host with ambient process activity, a system-scope capture can
+rarely report a lossy gap whose cause set matches none of the
+classified arms (seen three times in CI across host and guest
+kernels: a short-lived process burst or event-loss blip inside the
+window is suspected, and the exact cause set was unrecoverable). A
+cause-finding lane is in flight; if it misses the cut the fix is
+planned for 0.8.1. Companion CI-only test-order flakes are tracked
+for 0.8.1 test hardening with no user-visible effect established.
+
 ### A leader exit retires sessions even while other threads live
 
 The observer learns of an exit from the leader thread, so a process
@@ -173,7 +184,9 @@ exact counts and named causes, never silently dropped.
 
 Avoid it with `--prearm-module PATH`, `run`, or a narrower
 `--pid`/`--cgroup` scope. A newcomer-priority scheduling fix is
-planned for 0.8.0.
+planned for 0.8.0. DRAFT-pending-cutoff: the scheduling fix lane
+is still in flight; if it misses the cut the fix is planned for
+0.8.1.
 
 ### Manifest captures at very large endpoint counts shed calls in v0.7.0 (fixed in v0.7.1)
 
@@ -232,6 +245,15 @@ accounted saturating structures (unbound-image census +1.03 MiB/h
 toward its cap, ever-enumerated set +0.18 MiB/h), not caller or edge
 retention, which stay flat. A 5000-exited-callers-with-calls lifetime
 twin holds 0 refusals with a flat census past the budget.
+
+DRAFT-pending-cutoff: a 2-hour busy-host soak still measures about
++2.6–3.0 MiB/h of steady inventory Private growth under churn
+(3,585 forks/h), about one retained entry per churn fork: the
+run-wide unbound-image census (+1.04 MiB/h toward its cap), the
+ever-enumerated set (+0.20 MiB/h), pair tombstones drained only at
+stop (+0.16 MiB/h), uncounted presentation vectors (~+0.33 MiB/h),
+and a residual ~+0.7–1.2 MiB/h still unattributed. A bounding lane
+is in flight; if it misses the cut the fix is planned for 0.8.1.
 
 ### Short-lived processes never scanned
 
@@ -639,6 +661,13 @@ activity. The broad inventory keeps running to the end of the
 window with exact counts and no lost calls. Workaround: rerun the
 capture, or narrow the scope (`--pid`).
 
+DRAFT-pending-cutoff: one audit void can still end per-key rows
+for a long-lived caller for the rest of the run — the image stays
+sealed or tainted with no re-entry — so busy-host per-key coverage
+is roughly time-to-first-void over run length (44% and 18% in two
+20-minute soaks). A re-entry fix lane is in flight; if it misses
+the cut the fix is planned for 0.8.1.
+
 ### A call caught mid-flight by a tracking interruption can lose its per-key detail
 
 When tracking hits a transient interruption, a call that was waiting
@@ -899,6 +928,8 @@ On several kernels (seen on 6.6 and 7.3.1), a `p11scope run` capture
 with many short-lived child processes can rarely (about 1 in 15–30
 runs in our tests) miss a few seconds of calls without recording a
 gap row for the interval. A fix is planned for 0.8.0.
+DRAFT-pending-cutoff: the gapless-replace fix lane is still in
+flight; if it misses the cut the fix is planned for 0.8.1.
 
 ### Stub-pool provider manifests cover one getter-call order
 
@@ -1809,7 +1840,10 @@ a query).
 - An independent event reader for sustained 10,000 key
   operations per second with exact per-call rows (0.9).
 - Relaxed creation-template curves and parameter sets for all key
-  types (0.8.0).
+  types (0.8.0; DRAFT-pending-cutoff: the relaxed-template lane is
+  still in flight, 0.8.1 if it misses the cut).
+- Codebase modularization (architecture waves, crate splits, shared
+  gap renderer) (0.8.2).
 - Narrower count-only windows at high key-operation rates (a later release).
 - A kernel-side witness for library loads after the main thread
   exits (a later release).

@@ -462,11 +462,22 @@ pub(crate) struct GapView {
     pub repeats: u64,
 }
 
-/// Fold one internal gap reason to its finite public row, if it is a
-/// repeated-noise family member. Stubbed until the fold lands.
-#[cfg(test)]
-pub(crate) fn fold_scan_ceiling_reason(_reason: &str) -> Option<&'static str> {
-    None
+/// Folded public reason for repeated scan work-ceiling stops: one
+/// pass's allowance tripped mid-scan (bare or wrapped in a scan
+/// refusal). Finite, caller-free, and true per event — unlike the
+/// internal "were not scanned" wording, which goes stale once a
+/// resumed pass completes the work.
+pub(crate) const SCAN_BUDGET_EXHAUSTED_REASON: &str = "scan budget exhausted";
+
+/// Fold one internal gap reason to its finite public row, if it
+/// names a scan work-ceiling stop: the bare ceiling sentence or the
+/// same sentence wrapped in a scan refusal, whatever subject filed
+/// it. Near misses (deadline, clock and I/O ceilings, bare
+/// prefixes, unrelated reasons) never fold.
+pub(crate) fn fold_scan_ceiling_reason(reason: &str) -> Option<&'static str> {
+    reason
+        .contains(crate::discovery::scan::WORK_CEILING_REASON)
+        .then_some(SCAN_BUDGET_EXHAUSTED_REASON)
 }
 
 /// Shared allocation charges and actual owned-state counts at publication.
@@ -1012,14 +1023,23 @@ impl Presentation {
             .gaps()
             .iter()
             .zip(registry.gap_repeats())
-            .map(|(gap, &repeats)| GapView {
-                caller: gap.caller,
-                module: gap.module,
-                pid: gap.pid,
-                subject: gap.subject.clone(),
-                reason: gap.reason.clone(),
-                budget: gap.budget,
-                repeats,
+            .map(|(gap, &repeats)| {
+                // Repeated-noise families project to their finite
+                // public reason here, so text, JSON and the dashboard
+                // agree; every record keeps its row, attribution and
+                // repeats — folding renames rows, never drops them.
+                let reason = fold_scan_ceiling_reason(&gap.reason)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| gap.reason.clone());
+                GapView {
+                    caller: gap.caller,
+                    module: gap.module,
+                    pid: gap.pid,
+                    subject: gap.subject.clone(),
+                    reason,
+                    budget: gap.budget,
+                    repeats,
+                }
             })
             .collect();
         let object_observations = coordinator.registry().joint_observations(passes);
@@ -5347,6 +5367,23 @@ fn render_snapshot_inner(
             );
         }
     }
+    // Folded noise families render as one named counted line per
+    // (subject, reason) with the summed repeats: a slow host files
+    // one ceiling trip per pass per caller, and the operator needs
+    // the total, not ninety lines. The folded line lands where its
+    // first row stood, so order is preserved; JSON keeps every
+    // record. (Budget rows never fold.)
+    let mut folded_totals: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    for gap in &presentation.gaps {
+        if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
+            let total = folded_totals
+                .entry((gap.subject.as_str(), gap.reason.as_str()))
+                .or_insert(0);
+            *total = total.saturating_add(gap.repeats);
+        }
+    }
+    let mut folded_emitted: std::collections::BTreeSet<(&str, &str)> =
+        std::collections::BTreeSet::new();
     // Every row renders on its own line below; no size wording
     // remains to fold.
     for gap in &presentation.gaps {
@@ -5377,6 +5414,23 @@ fn render_snapshot_inner(
                 || gap.reason.strip_prefix("joint_unretained_").is_some()
                 || gap.reason.strip_prefix("joint_unclaimable_").is_some())
             && gap.repeats > 1;
+        // A folded noise row counts its whole family once, at its
+        // first row; later rows of the family render nothing. A lone
+        // folded row renders bare, like any other single row.
+        let (repeats, folded_family) =
+            if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
+                let key = (gap.subject.as_str(), gap.reason.as_str());
+                if !folded_emitted.insert(key) {
+                    continue;
+                }
+                (
+                    folded_totals.get(&key).copied().unwrap_or(gap.repeats),
+                    true,
+                )
+            } else {
+                (gap.repeats, false)
+            };
+        let merged_folded = folded_family && repeats > 1;
         match gap.budget {
             Some(refusal) => {
                 let _ = writeln!(
@@ -5385,8 +5439,8 @@ fn render_snapshot_inner(
                     refusal.resource, refusal.limit, refusal.requested,
                 );
             }
-            None if merged_rearms || merged_retained_s1 => {
-                let _ = writeln!(out, "gap [{subject}] {reason} ({} times)", gap.repeats);
+            None if merged_rearms || merged_retained_s1 || merged_folded => {
+                let _ = writeln!(out, "gap [{subject}] {reason} ({} times)", repeats);
             }
             None => {
                 let _ = writeln!(out, "gap [{subject}] {reason}");

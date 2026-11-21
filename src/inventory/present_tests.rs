@@ -7468,7 +7468,9 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
     let wordings = [
         WORK_CEILING_REASON.to_string(),
         format!("memory scan refused: final mapping validation unavailable: {WORK_CEILING_REASON}"),
-        format!("memory scan refused: process generation changed during acquisition: {WORK_CEILING_REASON}"),
+        format!(
+            "memory scan refused: process generation changed during acquisition: {WORK_CEILING_REASON}"
+        ),
     ];
     for index in 0u32..30 {
         harness
@@ -7510,12 +7512,22 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
         .collect();
     assert_eq!(
         folded,
-        ["gap [capture discovery] scan budget exhausted (30 times)"],
+        ["  30 x capture discovery - scan budget exhausted"],
         "thirty ceiling trips fold into one exact counted row: {snapshot}"
     );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let folded_verbose: Vec<&str> = verbose
+        .lines()
+        .filter(|line| line.contains("scan budget exhausted"))
+        .collect();
+    assert_eq!(
+        folded_verbose,
+        ["gap [capture discovery] scan budget exhausted (30 times)"],
+        "verbose folds the same family the same way: {verbose}"
+    );
     assert!(
-        snapshot.contains("gap [process identity checked from /proc (PID and start time), not by the kernel (exact image authority unavailable)] no BPF image identity"),
-        "unrelated rows still render on their own line: {snapshot}"
+        verbose.contains("gap [process identity checked from /proc (PID and start time), not by the kernel (exact image authority unavailable)] no BPF image identity"),
+        "unrelated rows still render on their own line: {verbose}"
     );
     let out = crate::inventory::render_json_from_presentation(&presentation);
     let kept = out["gaps"].as_array().unwrap();

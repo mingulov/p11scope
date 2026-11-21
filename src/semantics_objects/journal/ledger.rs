@@ -312,6 +312,16 @@ impl StagingLedger {
         MAX_UNSETTLED_STAGED.saturating_sub(self.census())
     }
 
+    /// Test-only free-list length: listed vacancies plus live census
+    /// always cover the table. A refused mint must leave this
+    /// unchanged (no slot lost on the refusal path).
+    #[cfg(test)]
+    pub(crate) fn free_list_len_for_test(&self) -> usize {
+        self.table
+            .as_ref()
+            .map_or(0, |table| table.free_list_len_for_test())
+    }
+
     fn key(value: u64) -> RoleKey {
         RoleKey {
             namespace: 0,
@@ -745,18 +755,24 @@ impl StagingLedger {
                         .checked_add(OWNED_ALLOCATION_PADDING)
                         .ok_or(LedgerRefusal::Full);
                     let Ok(lease_bytes) = lease_bytes else {
+                        table.free_restore(slot);
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     };
                     let charge = match &self.reserver {
                         Some(reserver) => match reserver.reserve(lease_bytes) {
                             Ok(lease) => Some(lease),
-                            Err(_) => return MintStepOutcome::Done(Err(LedgerRefusal::Full)),
+                            Err(_) => {
+                                table.free_restore(slot);
+                                return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                            }
                         },
                         None => None,
                     };
                     // The slot stays popped across the reserve above:
                     // nothing else runs between, so the pop cannot go
-                    // stale. (A `Full` pop returned before reserving.)
+                    // stale, and every refusal path above restores the
+                    // exact vacancy. (A `Full` pop returned before
+                    // reserving.)
                     let Some(table) = self.table.as_mut() else {
                         drop(charge);
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
@@ -1181,5 +1197,53 @@ mod tests {
         assert_eq!(table.reservation(Role::H8Open, StagingLedger::key(4)), None);
         drop(ledger);
         assert_eq!(pool.snapshot().charged_bytes, baseline);
+    }
+
+    /// A refused budgeted mint must not consume a vacancy: 4,096
+    /// exact-fit pool refusals leave census zero and all vacancies
+    /// usable, and the recovered pool mints the original ticket
+    /// sequence without a sync-replay panic.
+    #[test]
+    fn refused_mint_restores_free_slot_across_storm() {
+        let pool = SemanticResourcePool::default();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        assert_eq!(fallback.census(), 0);
+        assert_eq!(
+            fallback.free_list_len_for_test(),
+            MAX_UNSETTLED_STAGED,
+            "a fresh table lists every vacancy"
+        );
+        pool.reference_set_limit(pool.snapshot().charged_bytes);
+        let bytes = 16u64;
+        for _ in 0..MAX_UNSETTLED_STAGED {
+            let mut cursor = fallback
+                .start_keyassoc_mint(bytes)
+                .expect("admission passes; the pool refuses at commit");
+            loop {
+                let mut gate = LeafBudget::new(64);
+                match fallback.mint_step(&mut cursor, &mut gate) {
+                    MintStepOutcome::Yield => continue,
+                    MintStepOutcome::Done(Err(_)) => break,
+                    MintStepOutcome::Done(Ok(_)) => {
+                        panic!("an exact-fit pool must refuse the mint")
+                    }
+                }
+            }
+            assert_eq!(fallback.census(), 0, "a refusal mints nothing");
+        }
+        assert_eq!(fallback.census(), 0);
+        assert_eq!(
+            fallback.free_list_len_for_test(),
+            MAX_UNSETTLED_STAGED,
+            "repeated refusals must not exhaust the free list"
+        );
+        pool.reference_set_limit(usize::MAX);
+        for ticket in 1..=MAX_UNSETTLED_STAGED as u64 {
+            let minted = fallback.mint_keyassoc(bytes).unwrap();
+            assert_eq!(minted, ticket, "the original ticket sequence survives");
+        }
+        assert_eq!(fallback.census(), MAX_UNSETTLED_STAGED);
+        assert_eq!(fallback.free_list_len_for_test(), 0);
     }
 }

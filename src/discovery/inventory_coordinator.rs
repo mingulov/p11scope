@@ -38821,6 +38821,70 @@ int main(void) {
             "the converged scan shows no live in-progress gap"
         );
     }
+
+    /// Terminal history across resumed walk-bound passes: an early
+    /// pass's in-progress projection never persists as a stale row
+    /// (the live gap names current progress instead), and each
+    /// work-stopped pass without resumable progress records its
+    /// exhaustion verdict exactly once.
+    #[test]
+    fn walk_bound_terminal_history_has_no_stale_progress_and_single_verdicts() {
+        const WALK_UNITS: usize = 8000;
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let mut state = CgroupWalkState::default();
+        let mut unfinished_first = false;
+        for _ in 0..3 {
+            let taken = std::mem::take(&mut state);
+            let limits = CgroupWalkLimits {
+                work_units: WALK_UNITS,
+                ..CgroupWalkLimits::default()
+            };
+            let collection = coordinator
+                .cgroup_collector(taken, limits, CollectionControl::new(None), None)
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(
+                    collection,
+                    crate::discovery::caller_registry::now_ns(),
+                )
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            if coordinator.passes() == 1 {
+                unfinished_first = completion.progress.is_some();
+            }
+            state = completion.state;
+        }
+        assert!(
+            unfinished_first,
+            "the first pass must stop with resumable progress (setup pin)"
+        );
+        assert!(
+            coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "scan_in_progress"),
+            "no stale in-progress row survives in terminal history: {:?}",
+            coordinator.registry().gaps()
+        );
+        let exhaustion: Vec<(u64, &str)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .zip(coordinator.registry().gap_repeats().iter())
+            .filter(|(gap, _)| {
+                gap.subject == "cgroup scope transaction incomplete"
+                    && gap.reason.contains("shared work allowance exhausted")
+            })
+            .map(|(gap, repeats)| (*repeats, gap.reason.as_str()))
+            .collect();
+        assert_eq!(
+            exhaustion,
+            [(2, "cgroup collection shared work allowance exhausted")],
+            "each of the two stalled passes records its verdict exactly once: {exhaustion:?}"
+        );
+    }
 }
 
 #[cfg(test)]

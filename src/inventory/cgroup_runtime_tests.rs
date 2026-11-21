@@ -1161,6 +1161,17 @@ fn cgroup_runtime_snapshot_resumes_across_passes_until_converged() {
         driver.inner.coordinator.registry().gaps()
     );
     assert!(
+        !driver
+            .inner
+            .coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "scan_in_progress"),
+        "no stale in-progress row survives in terminal history: {:?}",
+        driver.inner.coordinator.registry().gaps()
+    );
+    assert!(
         driver.inner.coordinator.live_scan_progress_gap().is_none(),
         "the converged snapshot shows no in-progress gap"
     );

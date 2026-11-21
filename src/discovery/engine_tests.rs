@@ -16443,7 +16443,7 @@ fn churned_workers_share_one_file_proof_and_count_calls_with_named_gaps() {
 /// names exact counts without naming any pid.
 #[test]
 fn retained_views_survive_ordinary_rotation_passes() {
-    let mut children = e06_spawn_sleeps(5);
+    let mut children = e06_spawn_settled_sleeps(5);
     let mut pids: Vec<_> = children.iter().map(SystemScopeChildGuard::pid).collect();
     pids.sort_unstable();
     let dir = tempfile::tempdir().expect("a scope directory");
@@ -16794,7 +16794,7 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
 /// that rotation has since moved on from.)
 #[test]
 fn reconcile_cursor_advances_incrementally_and_wraps() {
-    let mut children = e06_spawn_sleeps(5);
+    let mut children = e06_spawn_settled_sleeps(5);
     let mut pids: Vec<_> = children.iter().map(SystemScopeChildGuard::pid).collect();
     pids.sort_unstable();
     let dir = tempfile::tempdir().expect("a scope directory");
@@ -54589,21 +54589,42 @@ fn e06_cgroup_args(
     }
 }
 
-/// Settle/convergence poll budget for [`e06_spawn_sleeps`]: 1000 polls at
-/// 5 ms (5 s). The per-child readiness loop and the global shape tail
-/// share one budget so a sibling descheduled after settling cannot time
-/// out the tail while the per-child window would still have waited.
+/// Settle/convergence poll budget for the E06 sleeper helpers: 1000 polls
+/// at 5 ms (5 s). The per-child readiness loop and the settled helper's
+/// global shape tail share one budget so a sibling descheduled after
+/// settling cannot time out the tail while the per-child window would
+/// still have waited.
 const E06_SETTLE_POLLS: usize = 1000;
 
+/// Spawn `count` parked `sleep infinity` children for provider-free tests:
+/// each child has exec'd and is parked (blocked in nanosleep, or showing
+/// stable executable maps when `/proc/<pid>/wchan` is unavailable/zero on
+/// restricted kernels). Makes no provider-shape assumption: a statically
+/// linked sleeper (no `.so` maps at all) is accepted. Tests that assert on
+/// capped single-shape selection must use [`e06_spawn_settled_sleeps`].
 fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
-    e06_spawn_sleeps_with(Path::new("sleep"), count)
+    e06_spawn_sleepers(Path::new("sleep"), count, false)
 }
 
 /// Spawn `count` parked children from an explicit executable (the shared
-/// helper above resolves `sleep` via `PATH`): identical readiness and
-/// shape convergence, so tests can substitute a controlled parker. The
-/// `infinity` argument parks `sleep`; the static parker ignores argv.
+/// helper above resolves `sleep` via `PATH`): identical plain readiness,
+/// so tests can substitute a controlled parker. The `infinity` argument
+/// parks `sleep`; the static parker ignores argv.
 fn e06_spawn_sleeps_with(exe: &Path, count: usize) -> Vec<SystemScopeChildGuard> {
+    e06_spawn_sleepers(exe, count, false)
+}
+
+/// Spawn `count` parked `sleep infinity` children with one settled provider
+/// shape: plain readiness plus the global convergence tail, so capped
+/// selection sees a single group and admits the lowest pid. Requires a
+/// dynamically linked `sleep` (a static binary maps no `.so` shape to
+/// converge on), failing loudly otherwise; only the shape-asserting tests
+/// use this helper.
+fn e06_spawn_settled_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
+    e06_spawn_sleepers(Path::new("sleep"), count, true)
+}
+
+fn e06_spawn_sleepers(exe: &Path, count: usize, settled: bool) -> Vec<SystemScopeChildGuard> {
     let guards: Vec<SystemScopeChildGuard> = (0..count)
         .map(|_| {
             SystemScopeChildGuard::new(
@@ -54618,22 +54639,22 @@ fn e06_spawn_sleeps_with(exe: &Path, count: usize) -> Vec<SystemScopeChildGuard>
             )
         })
         .collect();
-    // Readiness: wait until every child has exec'd `sleep` and finished
-    // dynamic-linker startup (blocked in nanosleep, or fallback to valid maps
-    // when /proc/<pid>/wchan is unavailable/zero on restricted kernels), so
-    // neither maps snapshots nor 30s walls race under heavy parallel load.
-    // The fallback requires a settled provider shape (no `/etc/ld.so.cache`
-    // transient, non-empty `.so` set, stable across polls): settling on a
-    // partial snapshot admits a singleton that rarity orders before the
-    // settled group. The global tail then waits for all siblings to share
-    // one shape, so capped selection always sees a single group.
+    // Readiness: wait until every child has exec'd and parked (blocked in
+    // nanosleep, or fallback to stable executable maps when
+    // /proc/<pid>/wchan is unavailable/zero on restricted kernels), so
+    // neither maps snapshots nor engine scans race a mid-exec child under
+    // heavy parallel load. The fallback checks executable maps only, never
+    // a provider shape: settling on a partial snapshot is harmless here
+    // because provider-free tests admit no sibling by shape. When `settled`
+    // is set, the global tail below additionally waits for all siblings to
+    // share one settled shape, so capped selection sees a single group.
     let self_exe = std::env::current_exe().unwrap();
     for guard in &guards {
         let pid = guard.pid();
         let exe = format!("/proc/{pid}/exe");
         let wchan = format!("/proc/{pid}/wchan");
         let maps_path = format!("/proc/{pid}/maps");
-        let mut settled = false;
+        let mut ready = false;
         for _ in 0..E06_SETTLE_POLLS {
             if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
                 let sleeping = std::fs::read_to_string(&wchan)
@@ -54643,7 +54664,7 @@ fn e06_spawn_sleeps_with(exe: &Path, count: usize) -> Vec<SystemScopeChildGuard>
                     .as_deref()
                     .is_some_and(|text| text.contains("nanosleep"))
                 {
-                    settled = true;
+                    ready = true;
                     break;
                 }
                 if matches!(sleeping.as_deref(), None | Some("" | "0"))
@@ -54653,24 +54674,29 @@ fn e06_spawn_sleeps_with(exe: &Path, count: usize) -> Vec<SystemScopeChildGuard>
                         .iter()
                         .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
                     && MapIndex::new(&maps).is_ok()
-                    && let Some(shape) = e06_settled_shape(&maps)
                 {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     if let Ok(stable_bytes) = std::fs::read(&maps_path)
                         && let Ok(stable_maps) = parse_maps(&stable_bytes)
-                        && e06_settled_shape(&stable_maps).as_ref() == Some(&shape)
+                        && stable_maps.iter().any(|mapping| {
+                            mapping.permissions[2] == b'x' && mapping.inode != 0
+                        })
+                        && MapIndex::new(&stable_maps).is_ok()
                     {
-                        settled = true;
+                        ready = true;
                         break;
                     }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(settled, "sleep child {pid} never settled");
+        assert!(ready, "sleep child {pid} never became ready");
     }
-    // Global shape convergence: per-child settling can still leave siblings
-    // on different snapshots (one settled while another was descheduled
+    if !settled {
+        return guards;
+    }
+    // Global shape convergence: per-child readiness can still leave siblings
+    // on different snapshots (one parked while another was descheduled
     // mid-startup). Wait until every sibling maps the same provider shape.
     for _ in 0..E06_SETTLE_POLLS {
         let mut shapes: Vec<BTreeSet<ObjectKey>> = Vec::new();
@@ -54715,13 +54741,13 @@ fn e06_spawn_sleeps_with(exe: &Path, count: usize) -> Vec<SystemScopeChildGuard>
     );
 }
 
-/// Settled provider shape for [`e06_spawn_sleeps`] readiness: `Some` only
-/// when the maps carry a non-empty `.so` set with no `/etc/ld.so.cache`
-/// transient (mapped by `ld` during startup; its ".so" substring makes it a
-/// shape member whose singleton rarity-orders before the settled group).
-/// Assumes `sleep` is dynamically linked: a static binary mapping no
-/// `.so` at all never settles (`None` forever), failing loudly at the
-/// readiness assert rather than testing an unmapped path.
+/// Settled provider shape for [`e06_spawn_settled_sleeps`] readiness:
+/// `Some` only when the maps carry a non-empty `.so` set with no
+/// `/etc/ld.so.cache` transient (mapped by `ld` during startup; its ".so"
+/// substring makes it a shape member whose singleton rarity-orders before
+/// the settled group). Assumes `sleep` is dynamically linked: a static
+/// binary mapping no `.so` at all never settles (`None` forever), failing
+/// loudly at the convergence assert rather than testing an unmapped path.
 fn e06_settled_shape(maps: &[MapEntry]) -> Option<BTreeSet<ObjectKey>> {
     if maps.iter().any(|mapping| {
         mapping.raw_path.as_ref().is_some_and(|path| {
@@ -54739,15 +54765,16 @@ fn e06_settled_shape(maps: &[MapEntry]) -> Option<BTreeSet<ObjectKey>> {
     (!shape.is_empty()).then_some(shape)
 }
 
-/// `e06_spawn_sleeps` readiness: every child has finished dynamic-linker
-/// startup — identical provider shapes (the same `.so` key set, no
-/// `/etc/ld.so.cache` transient) — so a capped selection sees one shape and
-/// admits the lowest pid. A child settled mid-startup (wchan "0" with a
-/// partial maps snapshot) forms a singleton that rarity orders before the
-/// settled group, breaking lowest-pid-prefix assertions downstream.
+/// `e06_spawn_settled_sleeps` readiness: every child has finished
+/// dynamic-linker startup — identical provider shapes (the same `.so`
+/// key set, no `/etc/ld.so.cache` transient) — so a capped selection
+/// sees one shape and admits the lowest pid. A child settled mid-startup
+/// (wchan "0" with a partial maps snapshot) forms a singleton that rarity
+/// orders before the settled group, breaking lowest-pid assertions
+/// downstream.
 #[test]
 fn e06_spawned_sleeps_share_one_settled_provider_shape() {
-    let mut sleeps = e06_spawn_sleeps(5);
+    let mut sleeps = e06_spawn_settled_sleeps(5);
     let mut shapes: Vec<BTreeSet<ObjectKey>> = Vec::new();
     for guard in &sleeps {
         let pid = guard.pid();

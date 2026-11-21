@@ -1020,11 +1020,7 @@ fn gcc_fixture(
 ) -> PathBuf {
     let bin = dir.join(out);
     let mut cmd = std::process::Command::new("gcc");
-    cmd.args(args)
-        .arg("-o")
-        .arg(&bin)
-        .args(sources)
-        .args(libs);
+    cmd.args(args).arg("-o").arg(&bin).args(sources).args(libs);
     assert!(
         cmd.status().unwrap().success(),
         "gcc failed for {out}: {cmd:?}"
@@ -1095,11 +1091,7 @@ fn big_data_cgroup_scene(
             assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
         },
     );
-    std::fs::write(
-        dir.path().join("cgroup.procs"),
-        format!("{}\n", child.id()),
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
     let mut coordinator = InventoryCoordinator::new(
         crate::scope::cgroup(dir.path()).unwrap(),
         HookRegistry::builtin(),
@@ -1336,9 +1328,7 @@ fn cgroup_snapshot_settle_grant_is_single_use_across_churn() {
 /// stops and every other outcome keep the single snapshot.
 #[test]
 fn cgroup_snapshot_resume_rule_answers_posed_states() {
-    use crate::inspect_system::inventory_cgroup::{
-        ScopedCollectionGap, ScopedCollectionOutcome,
-    };
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
     use crate::scope::inventory_cgroup::CgroupIncomplete;
     let work_limit = || {
         ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
@@ -1508,17 +1498,14 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
     );
     driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(ScopedCollectionOutcome::Complete);
     assert!(!driver.inner.snapshot_resume_pending());
-    driver.inner.cgroup.as_mut().unwrap().last_outcome =
-        Some(ScopedCollectionOutcome::Incomplete(
-            ScopedCollectionGap::ScanIncomplete,
-        ));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(ScopedCollectionOutcome::Incomplete(
+        ScopedCollectionGap::ScanIncomplete,
+    ));
     assert!(!driver.inner.snapshot_resume_pending());
     // Duration runs, stops and a latched control never resume.
     driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit());
     assert!(driver.inner.snapshot_resume_pending());
-    driver.inner.deadline = Some(
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
-    );
+    driver.inner.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     assert!(!driver.inner.snapshot_resume_pending());
     driver.inner.deadline = None;
     driver.inner.stop_requested = true;

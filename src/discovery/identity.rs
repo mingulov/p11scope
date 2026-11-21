@@ -16027,6 +16027,57 @@ mod tests {
         assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
     }
 
+    /// A fresh scan that proved a collision internally routes it as
+    /// one: two contradictory proven inputs under one key reject the
+    /// fresh set, and absorbing that set still refuses the key even
+    /// though a plain pin is retained — the same routing as a
+    /// collision that met across the absorb. The fresh scan's own
+    /// ambiguity skip reports the gap; the absorb files no second
+    /// one.
+    #[test]
+    fn absorbing_a_fresh_internal_collision_rejects_despite_a_retained_plain_pin() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut retained = image_pins(&[(key, "aaaaaaaa", 1)]);
+        assert_eq!(retained.pinned().count(), 1);
+        let mut one = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut one, &backing_file(&dir, "one.so"));
+        let mut two = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut two, &backing_file(&dir, "two.so"));
+        two.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+        let mut fresh = PinnedObjects::empty();
+        assert!(fresh.absorb(one).is_empty());
+        let fresh_skips = fresh.absorb(two);
+        assert!(fresh.rejects(key), "the fresh scan proved the collision");
+        assert_eq!(fresh.pinned().count(), 0);
+        assert!(
+            fresh_skips
+                .iter()
+                .any(|skip| skip.reason.contains("physical identity is ambiguous")),
+            "the fresh scan reports its proven gap: {fresh_skips:?}"
+        );
+        let skipped = retained.absorb(fresh);
+        assert_eq!(
+            retained.pinned().count(),
+            0,
+            "a proven collision refuses the key despite the retained plain pin"
+        );
+        assert!(retained.rejects(key));
+        assert!(
+            !retained.sweep_match_keys().contains_key(&key),
+            "the ambiguous group never emits as a unique raw-key match"
+        );
+        assert!(
+            skipped
+                .iter()
+                .all(|skip| !skip.reason.contains("physical identity is ambiguous")),
+            "no second ambiguity skip for the carried collision: {skipped:?}"
+        );
+    }
+
     #[test]
     fn reproof_accepts_fresh_pins_of_unchanged_files() {
         let key = ObjectKey {

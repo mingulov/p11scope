@@ -132,7 +132,14 @@ pub(crate) struct LoaderContext {
     /// so a retired incarnation's in-flight records can never
     /// validate against (or corrupt the clock of) the slot's new
     /// incarnation. First incarnations (`None`) predate no records
-    /// and take every timestamp the other checks admit.
+    /// and take every timestamp the other checks admit. Two known
+    /// windows, both open: the stamp reads `CLOCK_MONOTONIC` while
+    /// records carry BPF kernel ktime, which diverge under a time
+    /// namespace with a nonzero monotonic offset (the exit/clock
+    /// comparability guard in `attach::clock_origins_comparable`
+    /// is not consulted here); and the stamp is taken at preflight
+    /// but installed at prepare, so a hook firing between the two
+    /// with matching identity validates against the new life.
     pub(crate) incarnation_start_ns: Option<u64>,
 }
 
@@ -242,13 +249,13 @@ impl LoaderRegistry {
         let cookie = encode_loader_cookie(id.get(), state_delta)?;
         // Reusing a retired slot stamps the new incarnation so the hit
         // boundary can refuse the old life's in-flight records; first
-        // incarnations predate no records. Without a readable clock a
-        // reuse cannot be stamped, so staleness would be unverifiable:
+        // incarnations predate no records. Every slot below the
+        // high-water mark is a prior life — removed (`None`) no less
+        // than tombstoned — while fresh ids land exactly on it, so
+        // the mark itself is the reuse test. Without a readable clock
+        // a reuse cannot be stamped, so staleness would be unverifiable:
         // fail closed instead of arming an unprovable slot.
-        let reusing_retired = matches!(
-            &self.contexts[index],
-            Some(context) if context.state == LoaderContextState::Tombstoned
-        );
+        let reusing_retired = index < self.high_water;
         let incarnation_start_ns = if reusing_retired {
             Some(monotonic_ns().ok_or_else(|| {
                 "monotonic clock read failed; the loader incarnation cannot be stamped".to_string()

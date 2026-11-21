@@ -22148,9 +22148,7 @@ fn joint_birth_refused_claim_discloses_retained_s1() {
     frame.bind_targets(&ports).unwrap();
     frame
         .finish_frame(&mut ports)
-        .unwrap_or_else(|(_, reason)| {
-            panic!("the absorbed quantum finishes clean: {reason:?}")
-        });
+        .unwrap_or_else(|(_, reason)| panic!("the absorbed quantum finishes clean: {reason:?}"));
     // No void runs, so the open call keeps its H8Open custody through
     // the finish instead of releasing it in a void wipe.
     assert_eq!(

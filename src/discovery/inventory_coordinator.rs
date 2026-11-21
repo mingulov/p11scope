@@ -38843,10 +38843,7 @@ int main(void) {
                 .cgroup_collector(taken, limits, CollectionControl::new(None), None)
                 .unwrap()();
             coordinator
-                .apply_cgroup_collection(
-                    collection,
-                    crate::discovery::caller_registry::now_ns(),
-                )
+                .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
                 .unwrap();
             coordinator.commit_batch(false).unwrap();
             let completion = coordinator.take_cgroup_completion().unwrap();

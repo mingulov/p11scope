@@ -17046,6 +17046,74 @@ mod tests {
         }
     }
 
+    /// The wait-subject split: only the handle-class waits
+    /// (`HandleExhaustion`, `ReserveStop`, `BudgetStop`) file under
+    /// the fixed wait subject the defer-whole classifiers recognise;
+    /// every other `Wait` cause files under its own path subject, so
+    /// a work-ceiling (or I/O, deadline, clock, table/interface
+    /// window) wait never defers a scan whole. A future `Wait`
+    /// cause that should defer whole must file under the wait
+    /// subject too — this table fails until it does.
+    #[test]
+    fn wait_causes_split_the_wait_subject_by_handle_class() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let raw = image_pins(&[(key, "aaaaaaaa", 1)])
+            .by_id
+            .pop_first()
+            .unwrap()
+            .1
+            .raw;
+        for cause in [
+            WaitCause::HandleExhaustion,
+            WaitCause::ReserveStop,
+            WaitCause::BudgetStop,
+            WaitCause::IoCeiling,
+            WaitCause::WorkCeiling,
+            WaitCause::Deadline,
+            WaitCause::ClockUnavailable,
+            WaitCause::TableWindowCeiling,
+            WaitCause::InterfaceWindowCeiling,
+        ] {
+            let mut pinned = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            record_scanned_candidate(
+                &mut pinned,
+                ProcessViewId(0),
+                raw.clone(),
+                Err(PinOutcome::Wait {
+                    cause,
+                    retry: RetryOwner::ViewRescan,
+                    reason: "wait for the next pass".to_string(),
+                }),
+                &mut skipped,
+                true,
+            );
+            assert_eq!(skipped.len(), 1, "{cause:?} files exactly one skip");
+            let handle_class = matches!(
+                cause,
+                WaitCause::HandleExhaustion | WaitCause::ReserveStop | WaitCause::BudgetStop
+            );
+            if handle_class {
+                assert_eq!(
+                    skipped[0].subject, PIN_WAIT_SUBJECT,
+                    "{cause:?} must file the defer-whole wait subject"
+                );
+            } else {
+                assert_eq!(
+                    skipped[0].subject, raw.path,
+                    "{cause:?} must not file the defer-whole wait subject"
+                );
+            }
+            assert!(
+                !pinned.rejects(key),
+                "{cause:?} never rejects the key"
+            );
+        }
+    }
+
     #[test]
     /// Controller ruling 11:38 (1): unavailable observations never
     /// reject, so a repeated unavailable member emits no ambiguity

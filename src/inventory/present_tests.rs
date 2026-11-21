@@ -8336,6 +8336,65 @@ fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
     }
 }
 
+/// The protected tier outgrows the cap rather than fold: twenty-two
+/// distinct run-wide capture failures all read, and only the ordinary
+/// group behind them folds into the remainder.
+#[test]
+fn concise_protected_tier_is_never_capped() {
+    let (mut harness, _caller) = single_caller_harness("present-protected-tier", 1);
+    for index in 0..22u32 {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "inventory capture failed".into(),
+                reason: format!("backend failure {index:02}"),
+                budget: None,
+            });
+    }
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(5000),
+            subject: "obj-ordinary".into(),
+            reason: "ordinary reason".into(),
+            budget: None,
+        });
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot = render_snapshot(&presentation);
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == "gaps: 23")
+        .unwrap_or_else(|| panic!("missing gaps header: {snapshot}"));
+    let block: Vec<&str> = lines[at + 1..]
+        .iter()
+        .copied()
+        .take_while(|line| line.starts_with("  "))
+        .collect();
+    assert_eq!(
+        block
+            .iter()
+            .filter(|line| line.contains("inventory capture failed"))
+            .count(),
+        22,
+        "every protected group reads: {snapshot}"
+    );
+    assert_eq!(
+        block.last().copied(),
+        Some("  and 1 more group (--json has every item)"),
+        "only the ordinary group folds: {snapshot}"
+    );
+}
+
 /// The presentation projection folds the real pin-time work wrapper:
 /// the producer's `cannot read pid <pid>'s mount table: <work stop>`
 /// row projects to `scan budget exhausted` with its attribution and

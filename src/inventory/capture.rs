@@ -2375,6 +2375,16 @@ pub(crate) trait PassDriver<Pin> {
     fn finish_pass(&mut self, _report: &mut PassReport) -> Result<()> {
         Ok(())
     }
+    /// Whether a snapshot (no deadline) owes another pass after the
+    /// last completion: the cgroup driver says yes while decode
+    /// progress is unfinished and advancing, so a member larger than
+    /// one pass allowance converges instead of publishing partial.
+    /// The cgroup driver answers only without a run deadline (a
+    /// duration run past its deadline still ends); every other
+    /// driver says no and keeps the single snapshot pass.
+    fn snapshot_resume_pending(&self) -> bool {
+        false
+    }
     /// Service optional jobs with the sole retained native capture. The loop
     /// calls this after ring service and before the display tick. Absent native
     /// capture stays explicit; callers cannot create a second query owner.
@@ -3717,7 +3727,7 @@ where
                     stop_latched = true;
                     break;
                 }
-                if passes > 0 && clock.ending() {
+                if passes > 0 && clock.ending() && !driver.snapshot_resume_pending() {
                     break;
                 }
                 // A granted recovery rescan counts once its pass really starts.

@@ -174,6 +174,12 @@ pub(crate) struct CgroupCompletion {
     /// into a continuation instead of a terminal exhaustion verdict.
     /// `None` once converged (or when no scan ever ran).
     pub(crate) progress: Option<(usize, usize, usize)>,
+    /// Summed sweep frontiers beside [`progress`](Self::progress):
+    /// the snapshot resume rule advances on any strict increase in
+    /// completed objects, decoded tables or frontiers, so
+    /// intra-object sweep advance counts as progress. `None`
+    /// exactly when `progress` is `None`.
+    pub(crate) progress_fingerprint: Option<(u64, u64)>,
 }
 
 impl CgroupCompletion {
@@ -5298,6 +5304,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             admitted: 0,
             scan_callers: 0,
             progress: None,
+            progress_fingerprint: None,
         });
     }
 
@@ -12981,6 +12988,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 admitted: completion.admitted,
                 scan_callers: completion.scan_callers,
                 progress: self.cgroup_file_facts.scan_progress_totals(),
+                progress_fingerprint: self.cgroup_file_facts.scan_frontier_totals(),
             });
             // A cgroup-scope capture opens the same native lane, so its
             // pass seam releases departed native state exactly like the

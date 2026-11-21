@@ -1202,6 +1202,31 @@ impl RetainedFileFacts {
         !self.decode_cursors.is_empty()
     }
 
+    /// `(frontier snapshots, frontier words)` summed over the whole
+    /// carried bundle: how far every object's table and interface
+    /// sweeps reached. `None` exactly when [`scan_progress_totals`]
+    /// is `None` (no unfinished cursor). The snapshot resume rule
+    /// advances on any strict increase here (or in completed objects
+    /// or decoded tables), so intra-object sweep advance that
+    /// completes no object and decodes no new table still counts as
+    /// progress instead of stalling the snapshot.
+    pub(crate) fn scan_frontier_totals(&self) -> Option<(u64, u64)> {
+        if self.scan_progress_totals().is_none() {
+            return None;
+        }
+        let mut snapshots = 0u64;
+        let mut words = 0u64;
+        for cursor in self.decode_cursors.values() {
+            snapshots = snapshots
+                .saturating_add(cursor.tables.snapshot as u64)
+                .saturating_add(cursor.interfaces.snapshot as u64);
+            words = words
+                .saturating_add(cursor.tables.word)
+                .saturating_add(cursor.interfaces.word);
+        }
+        Some((snapshots, words))
+    }
+
     /// `(done, total, tables)` over the whole carried bundle: completed
     /// objects, cursor-known objects, and cached tables decoded so far.
     /// `None` when no cursor is unfinished (no live in-progress gap to

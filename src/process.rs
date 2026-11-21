@@ -443,7 +443,7 @@ pub(crate) fn read_view_mountinfo(
     #[cfg(test)]
     MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
     let text = read_mountinfo(&table, budget)
-        .map_err(|error| format!("cannot read pid {pid}'s mount table: {error}"))?;
+        .map_err(|error| crate::discovery::scan::mount_table_read_reason(pid, &error))?;
     Ok((table, text))
 }
 

@@ -358,6 +358,122 @@ fn zombie_group_with_live_survivor_prepares_through_member() {
     );
 }
 
+/// The zombie group image is independent of sibling tests: a temp
+/// provider mapping alive in this process at spawn time, then unmapped
+/// and deleted between the two maps reads (exactly what a concurrent
+/// test's tempdir teardown does in the shared lib-test process), must
+/// not disturb the strict like-for-like equality — the group image
+/// never inherits sibling mappings. A sibling churn thread maps and
+/// deletes temp providers across the fixture window for the concurrent
+/// shape. Both reads must also positively exclude the sibling temp
+/// image (not merely agree with each other).
+#[test]
+fn zombie_group_maps_independent_of_sibling_temp_unmap() {
+    // A sibling temp provider, mapped in this process before the spawn.
+    let dir = tempfile::tempdir().expect("sibling tempdir creates");
+    let so_path = dir.path().join("provider.so");
+    std::fs::write(&so_path, vec![0x7fu8; 4096]).expect("sibling provider writes");
+    let needle: Vec<u8> = std::fs::canonicalize(&so_path)
+        .expect("sibling provider canonicalizes")
+        .into_os_string()
+        .into_encoded_bytes();
+    let file = std::fs::File::open(&so_path).expect("sibling provider opens");
+    // SAFETY: a private read-only mapping of the held sibling bytes.
+    let at = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(at, libc::MAP_FAILED, "sibling provider maps");
+    // Concurrent shape: a sibling thread mapping and deleting temp
+    // providers across the fixture window (bounded and infallible, so a
+    // failure here breaks the loop instead of hanging the join).
+    let churn_dir = tempfile::tempdir().expect("churn tempdir creates");
+    let churn = std::thread::spawn(move || {
+        for round in 0..2000u32 {
+            let path = churn_dir.path().join(format!("churn-{round}.so"));
+            if std::fs::write(&path, [0x5cu8; 4096]).is_err() {
+                break;
+            }
+            let Ok(churn_file) = std::fs::File::open(&path) else {
+                break;
+            };
+            // SAFETY: a private read-only mapping of the held churn bytes.
+            let mapped = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE,
+                    churn_file.as_raw_fd(),
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                break;
+            }
+            // SAFETY: exactly the mapping above.
+            if unsafe { libc::munmap(mapped, 4096) } != 0 {
+                break;
+            }
+            drop(churn_file);
+            if std::fs::remove_file(&path).is_err() {
+                break;
+            }
+        }
+    });
+    // The same strict comparison as the custody twin.
+    let group = ZombieLeaderGroup::spawn();
+    wait_leader_zombie(group.tgid);
+    assert_lone_survivor(&group);
+    let mut io = OsConfirmIo::default();
+    let mut budget = CaptureWorkBudget::default();
+    let prepared = prepare_confirmation(&mut io, group.tgid, &BTreeSet::new(), &mut budget, None)
+        .expect("a zombie group with a live survivor prepares");
+    assert!(
+        !prepared.entries.is_empty(),
+        "survivor maps, not empty leader maps"
+    );
+    // Sibling teardown between the two reads: unmap and delete the temp
+    // provider, exactly like a concurrent test dropping its tempdir.
+    // SAFETY: exactly the sibling mapping above.
+    assert_eq!(
+        unsafe { libc::munmap(at, 4096) },
+        0,
+        "sibling provider unmaps"
+    );
+    drop(file);
+    std::fs::remove_file(&so_path).expect("sibling provider deletes");
+    let maps_file =
+        std::fs::File::open(format!("/proc/{}/task/{}/maps", group.tgid, group.survivor))
+            .expect("survivor maps open");
+    let mut reread_budget = CaptureWorkBudget::default();
+    let expect = crate::discovery::scan::read_maps_or_refuse(
+        maps_file,
+        &mut reread_budget,
+        crate::attach::monotonic_ns,
+    )
+    .expect("survivor maps read");
+    churn.join().expect("churn thread joins");
+    // Strict equality — never weakened — and the positive pin: the
+    // sibling temp image appears in NEITHER read.
+    assert_eq!(prepared.entries, expect);
+    for (side, entries) in [("prepared", &prepared.entries), ("reread", &expect)] {
+        assert!(
+            !entries.iter().any(|entry| entry
+                .raw_path
+                .as_ref()
+                .is_some_and(|path| path.windows(needle.len()).any(|window| window == needle))),
+            "sibling temp image leaks into the {side} read"
+        );
+    }
+}
+
 /// The member's original is the confirm pin's own pidfd (duplicated),
 /// never a fresh numeric reopen: both fds name the same open file
 /// description (`kcmp KCMP_FILE`). A numeric reopen would name the same

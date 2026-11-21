@@ -7807,7 +7807,7 @@ impl CallerRegistry {
             .iter()
             .map(|(cookie, pid)| (*cookie, pid.first_call_ns, pid.pid_host))
             .collect();
-        order.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+        order.sort_by_key(|a| (a.1, a.2));
         let victims = order.len() - UNBOUND_RETAINED_MAX;
         for (cookie, _, _) in order.into_iter().take(victims) {
             let Some(pid) = self.unidentified_images.remove(&cookie) else {

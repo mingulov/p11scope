@@ -4120,14 +4120,12 @@ fn render_ranked_exe_groups(
             if group.calls == 1 { "" } else { "s" },
         ));
     }
-    if let Some((images, calls)) = overflow {
-        if images > 0 {
-            parts.push(format!(
-                "{images} more image{} past the exe-group bound ({calls} call{})",
-                if images == 1 { "" } else { "s" },
-                if calls == 1 { "" } else { "s" },
-            ));
-        }
+    if let Some((images, calls)) = overflow.filter(|(images, _)| *images > 0) {
+        parts.push(format!(
+            "{images} more image{} past the exe-group bound ({calls} call{})",
+            if images == 1 { "" } else { "s" },
+            if calls == 1 { "" } else { "s" },
+        ));
     }
     let hidden = groups
         .iter()
@@ -4193,7 +4191,7 @@ fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<
                 calls,
                 first_ns,
                 images: u64::try_from(members.len()).unwrap_or(u64::MAX),
-                sample: members.iter().copied().collect(),
+                sample: members.to_vec(),
                 ambiguous: richest.map(|pid| pid.exe.identity_candidates.as_slice()),
             }
         })

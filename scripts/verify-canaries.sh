@@ -308,7 +308,11 @@ echo "journal object check skipped: prebuilt inputs carry no journal ELF"
 else
 set -- "$WORK"/default-build/release/build/p11scope-*/out/journal-v1/p11scope-ebpf-journal-v1
 [ "$#" -eq 1 ] && [ -f "$1" ] || { echo "journal BPF object is not unique"; exit 1; }
+if [ "$CAPTURE_MODE" = p0 ]; then
+python3 -I scripts/check-bpf-map-defs.py --inventory journal-wide-p0 "$1"
+else
 python3 -I scripts/check-bpf-map-defs.py --inventory journal-wide "$1"
+fi
 fi
 
 refuse_lane_destinations() {

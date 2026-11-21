@@ -1180,6 +1180,26 @@ class JournalMarkerInventoryTests(unittest.TestCase):
                               self.journal_symbols())
         self.assertIn("STATS.max_entries: object=2112 frozen=512", reason)
 
+    def test_journal_wide_p0_variant_accepts_frozen_inventory(self):
+        self.quiet(checker.validate_inventory, "journal-wide-p0", checker.JOURNAL_WIDE_MAPS,
+                   checker.JOURNAL_PROGRAMS, self.journal_symbols())
+        with self.assertRaisesRegex(RuntimeError, "lacks required marker symbols"):
+            checker.validate_inventory("journal-wide-p0", checker.JOURNAL_WIDE_MAPS,
+                                       checker.JOURNAL_PROGRAMS,
+                                       self.journal_symbols(missing={"JOURNAL_MARKER_CTL"}))
+
+    def test_journal_wide_p0_variant_refuses_full_programs(self):
+        reason = self.refused(checker.validate_inventory, "journal-wide-p0",
+                              checker.JOURNAL_WIDE_MAPS, checker.JOURNAL_WIDE_PROGRAMS,
+                              self.journal_symbols())
+        self.assertIn("program added: p11_entry_journal_length", reason)
+        self.assertIn("program added: p11_return_journal_length", reason)
+        reason = self.refused(checker.validate_inventory, "journal-wide",
+                              checker.JOURNAL_WIDE_MAPS, checker.JOURNAL_PROGRAMS,
+                              self.journal_symbols())
+        self.assertIn("program removed: p11_entry_journal_length", reason)
+        self.assertIn("program removed: p11_return_journal_length", reason)
+
     def marker_fixture(self, name):
         source = Path(self.temp.name) / f"{name}.c"
         obj = Path(self.temp.name) / f"{name}.o"

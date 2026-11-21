@@ -2477,7 +2477,8 @@ fn object_journal_slot_maps_match_detailed_profile() {
 /// Journal/marker inventory policy: the pure-policy
 /// `JournalMarkerInventoryTests` cases (marker presence, wide
 /// requirement, variant forbids, journal accept/refusals, wide
-/// journal accept/width refusals) and the six
+/// journal accept/width refusals, wide-P0 accept/FULL-program
+/// refusals) and the six
 /// `PolicyInventoryVariantTests` cases (default/wide/mixed policy
 /// accepts, cross-width and unknown-variant refusals, CLI
 /// unknown-variant refusal) run here by name on every flavor,
@@ -2497,6 +2498,8 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
             "JournalMarkerInventoryTests.test_journal_variant_refuses_inventory_map_and_drift",
             "JournalMarkerInventoryTests.test_journal_wide_variant_accepts_frozen_inventory",
             "JournalMarkerInventoryTests.test_journal_width_mismatch_refused",
+            "JournalMarkerInventoryTests.test_journal_wide_p0_variant_accepts_frozen_inventory",
+            "JournalMarkerInventoryTests.test_journal_wide_p0_variant_refuses_full_programs",
             "PolicyInventoryVariantTests.test_default_policy_accepts",
             "PolicyInventoryVariantTests.test_wide_policy_accepts",
             "PolicyInventoryVariantTests.test_mixed_p0_policy_accepts",
@@ -2515,7 +2518,7 @@ fn object_journal_variant_inventory_policy_cases_are_driven() {
         output.status.success(),
         "journal variant inventory: {report}"
     );
-    assert!(report.contains("Ran 14 tests"), "zero selection: {report}");
+    assert!(report.contains("Ran 16 tests"), "zero selection: {report}");
     assert!(report.contains("\nOK\n"), "skipped journal proof: {report}");
 }
 

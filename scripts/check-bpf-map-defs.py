@@ -2097,7 +2097,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
         raise RuntimeError(f"unknown object variant {variant!r}")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
-    journal = variant in ("journal", "journal-wide")
+    journal = variant in ("journal", "journal-wide", "journal-wide-p0")
     elf = Elf(Path(path).read_bytes())
     records, sections = elf_records(path)
     if records != elf.records or {name: index for name, index in sections.items() if index} != elf.indices:
@@ -2484,6 +2484,11 @@ FROZEN_INVENTORY = {
     "wide": (WIDE_MARKER_MAPS, SAFE_PROGRAMS),
     "journal": (JOURNAL_MAPS, JOURNAL_PROGRAMS),
     "journal-wide": (JOURNAL_WIDE_MAPS, JOURNAL_WIDE_PROGRAMS),
+    # The canary P0 flavor keeps default features (wide maps, EVIDENCE_START
+    # included) while stub-object-attributes compiles the length twins out,
+    # so its journal object carries the base program pair. The official P0
+    # narrow journal instead validates as "journal".
+    "journal-wide-p0": (JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS),
 }
 
 
@@ -2506,6 +2511,7 @@ FROZEN_SYMBOLS = {
     "wide": (False, False, False, 0, 0, 0),
     "journal": (False, False, False, 0, 0, 0),
     "journal-wide": (False, False, False, 0, 0, 0),
+    "journal-wide-p0": (False, False, False, 0, 0, 0),
 }
 
 
@@ -2535,7 +2541,7 @@ def validate_inventory(variant, maps, programs, symbols):
         raise RuntimeError(f"{variant} program inventory differs")
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
-    journal = variant in ("journal", "journal-wide")
+    journal = variant in ("journal", "journal-wide", "journal-wide-p0")
     if journal:
         # The exact map comparison above already excludes every map the
         # journal must not carry, including inventory-only maps; here
@@ -2714,6 +2720,10 @@ def self_test():
                        {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
                                                                "p11_instance_exec_birth",
                                                                "p11_instance_scope_gap"})
+    validate_inventory("journal-wide-p0", JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS,
+                       {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
+                                                               "p11_instance_exec_birth",
+                                                               "p11_instance_scope_gap"})
 
     def rejected(check, *arguments):
         if check is validate_inventory:
@@ -2721,7 +2731,7 @@ def self_test():
             extra = base_helpers
             if prefix[0] in ("default", "wide"):
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
-            elif prefix[0] in ("journal", "journal-wide"):
+            elif prefix[0] in ("journal", "journal-wide", "journal-wide-p0"):
                 extra |= REQUIRED_GLOBAL_MARKER_HELPERS | {"JOURNAL_MARKER_CTL"}
             arguments = (*prefix, symbols | extra)
         errors = io.StringIO()
@@ -2860,6 +2870,18 @@ def self_test():
         "SLOT_FILE.max_entries: object=2112 frozen=512",
         "STATS.max_entries: object=2112 frozen=512",
     ]
+    # The P0 wide journal is its own freeze: FULL programs are refused on
+    # the P0 variant and P0 programs on the FULL variant, naming the twins.
+    assert rejected(validate_inventory, "journal-wide-p0", JOURNAL_WIDE_MAPS, JOURNAL_WIDE_PROGRAMS,
+                    {"p11_entry_journal"}) == [
+        "program added: p11_entry_journal_length",
+        "program added: p11_return_journal_length",
+    ]
+    assert rejected(validate_inventory, "journal-wide", JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS,
+                    {"p11_entry_journal"}) == [
+        "program removed: p11_entry_journal_length",
+        "program removed: p11_return_journal_length",
+    ]
     # A one-field drift names exactly that field, nothing else (the W3 CONFIG
     # shape: same maps, one max_entries apart).
     frozen = SAFE_MAPS["CONFIG"]["max_entries"]
@@ -2992,7 +3014,7 @@ def usage():
         f"usage: {sys.argv[0]} BPF_ELF MAP=MAX_ENTRIES [...] | "
         "--inventory VARIANT BPF_ELF (default, default-no-marker, diagnostic, "
         "inventory[-small-discovery], inventory-callers[-small-discovery], "
-        "wide, wide-default, wide-diagnostic, journal, journal-wide) | "
+        "wide, wide-default, wide-diagnostic, journal, journal-wide, journal-wide-p0) | "
         "--policy-inventory [--safe-variant VARIANT] [--unsafe-variant VARIANT] "
         "DEFAULT_ELF DIAGNOSTIC_ELF | --json BPF_ELF | --self-test"
     )

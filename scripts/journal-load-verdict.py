@@ -217,7 +217,9 @@ _DOING = ("(preparing p11scope's self-probe|loading p11scope's BPF programs"
           "|attaching p11scope's probes)")
 _OPERATION = ("(prepare p11scope's self-probe|load p11scope's BPF programs"
               "|attach p11scope's probes)")
-_ERRNO = r"( \([A-Z][A-Za-z0-9 ,.'/-]{0,80}\))?"
+# The errno name as strerror renders it: every Linux name starts with a
+# capital or `.` (ELIBBAD) and may carry `:` (ETOOMANYREFS).
+_ERRNO = r"( \([A-Z.][A-Za-z0-9 ,.:'/-]{0,80}\))?"
 _SCAN_TAIL = re.escape(
     "; run 'p11scope doctor' for host readiness, or use 'p11scope inventory "
     "--capture scan' or 'p11scope inspect --pid N' for a scan without capture.")
@@ -289,7 +291,6 @@ class ObserverText:
         self.key_refusal = Candidates()
         self.live_refusal = Candidates()
         self.key_rows = Candidates()
-        self.omitted_reason_lines = []
         lowered = data.lower()
         self.crashed = any(marker in lowered for marker in CRASH_MARKERS)
         for raw in self.lines:
@@ -307,8 +308,6 @@ class ObserverText:
                 self.key_summary.add(raw)
             elif raw.startswith(KEY_ROW_LABEL.encode()):
                 self.key_rows.add(raw)
-            if OMITTED_BUILD_REASON.encode() in raw:
-                self.omitted_reason_lines.append(raw)
 
     def first_refusal(self):
         """The first key-operations refusal or omitted-build line, cut."""
@@ -514,8 +513,10 @@ def load_verdict(args, rc, text, probe, workload):
         pair = PAIR + (LENGTH_PAIR if args.key_sizes == "1" else ())
         loaded = probe.object_roots_loaded(args.object)
         if not all(root in loaded for root in pair):
-            if any(root in loaded for root in pair):
-                reasons.append("journal pair incomplete (one root missing)")
+            missing = sum(1 for root in pair if root not in loaded)
+            if missing < len(pair):
+                reasons.append(f"journal pair incomplete ({missing} of "
+                               f"{len(pair)} roots missing)")
             else:
                 reasons.append("journal pair missing from probe rows")
     budgets = None

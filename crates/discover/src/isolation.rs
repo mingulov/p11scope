@@ -168,6 +168,10 @@ const SYS_FSOPEN: u32 = 430;
 const SYS_FSMOUNT: u32 = 432;
 const SYS_PTRACE: u32 = 101;
 const SYS_PROCESS_VM_WRITEV: u32 = 311;
+// process_vm_readv reads another process's memory and pidfd_getfd steals
+// its descriptors: ptrace-equivalent without ptrace.
+const SYS_PROCESS_VM_READV: u32 = 310;
+const SYS_PIDFD_GETFD: u32 = 438;
 const SYS_BPF: u32 = 321;
 const SYS_PERF_EVENT_OPEN: u32 = 298;
 const SYS_USERFAULTFD: u32 = 323;
@@ -244,6 +248,8 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_FSMOUNT,
     SYS_PTRACE,
     SYS_PROCESS_VM_WRITEV,
+    SYS_PROCESS_VM_READV,
+    SYS_PIDFD_GETFD,
     SYS_BPF,
     SYS_PERF_EVENT_OPEN,
     SYS_USERFAULTFD,
@@ -1160,6 +1166,12 @@ mod tests {
                 libc::SYS_process_vm_writev,
                 "process_vm_writev",
             ),
+            (
+                SYS_PROCESS_VM_READV,
+                libc::SYS_process_vm_readv,
+                "process_vm_readv",
+            ),
+            (SYS_PIDFD_GETFD, libc::SYS_pidfd_getfd, "pidfd_getfd"),
             (SYS_BPF, libc::SYS_bpf, "bpf"),
             (
                 SYS_PERF_EVENT_OPEN,
@@ -1290,8 +1302,12 @@ mod tests {
         // steals its descriptors: ptrace-equivalent without ptrace. Each
         // number is keyed to libc, like the denylist table above.
         for (nr, want, name) in [
-            (310u32, libc::SYS_process_vm_readv, "process_vm_readv"),
-            (438u32, libc::SYS_pidfd_getfd, "pidfd_getfd"),
+            (
+                SYS_PROCESS_VM_READV,
+                libc::SYS_process_vm_readv,
+                "process_vm_readv",
+            ),
+            (SYS_PIDFD_GETFD, libc::SYS_pidfd_getfd, "pidfd_getfd"),
         ] {
             assert_eq!(nr, want as u32, "wrong number for {name}");
             assert_eq!(

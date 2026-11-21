@@ -797,8 +797,11 @@ can read, inherits your environment (including any tokens) and
 supplementary groups, and may signal your processes or lower their
 priority; terminal stdio ioctls other than
 `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX` datagram `sendto`
-without `connect`. Ioctls of filesystems outside the listed types
-still pass until a later allowlist lands.
+without `connect`. Cross-process memory stays readable through
+`/proc/<pid>/mem` for same-uid dumpable processes; only the direct
+`ptrace`, `process_vm` and `pidfd_getfd` calls are denied. Ioctls of
+filesystems outside the listed types still pass until a later allowlist
+lands.
 
 Provider entry points are hooked through five built-ins
 (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,

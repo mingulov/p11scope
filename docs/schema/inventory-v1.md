@@ -1265,17 +1265,17 @@ contracts are
 [inventory-v1-object-observations-v9.schema.json](inventory-v1-object-observations-v9.schema.json)
 (section version 9; version 8 is taken by the separate Task 7
 provider section under the shared allocator); consumers must reject
-unknown section versions,
-never guess. JSON, JSONL and the dashboard render from this one
+unknown section versions, never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 9 iff unknown-row mechanism detail
-  is present — any unknown row with a non-empty `mechanisms`
-  breakdown, or the `unknown_mechanism_rows_refused` gap — else 7
-  iff inferred key content is
+- `version` follows the content: 9 iff v9 content is present —
+  any unknown row with a non-empty `mechanisms` breakdown or naming
+  `same_thread_nested`, or a v9-only gap (the
+  `unknown_mechanism_rows_refused` gap, or a model gap naming
+  `same_thread_nested`) — else 7 iff inferred key content is
   present — any key row whose `inferred_family` or `inferred_size`
   status is not `unknown`, or with any inference completions — else
   6 iff new-site content is present —
@@ -1304,7 +1304,8 @@ never imply S1 loss.
   frozen; version 1 never carries KEM labels and neither 1 nor 2
   carries `unattributed`; versions 4, 5, 6, 7 and 9 always carry
   `unattributed` (possibly empty), and versions 5, 6, 7 and 9 always
-  carry the seven-key metadata blocks. A feed that fell back or lost
+  carry the seven-key metadata blocks. Version 9 proved rows always
+  carry the inferred keys (like v7), even without inferred content. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
   (`{reason, count}`, finite reasons, frozen order); retained
@@ -1451,7 +1452,15 @@ never imply S1 loss.
   park was refused past the park budget (capacity only;
   above-bound lengths park nothing and never count here;
   inference-side; rows intact, coverage populated; versions 1–6
-  never carry it). Plain AES-KW (`CKM_AES_KEY_WRAP`) wrap outputs
+  never carry it). Version 9 adds the `same_thread_nested`
+  unknown-key and gap reasons: a call that started and ended on one
+  thread strictly inside another open call on the same session (the
+  known instance is the NSS softoken EC-keygen pairwise self-test;
+  a same-thread nested call from an application signal handler or a
+  provider callback nests too, so the issuer is never proven). The
+  outer call's outputs bind; the inner call's terminal routes to the
+  named unknown row and never binds to a key (versions 1–7 never
+  carry the reason). Plain AES-KW (`CKM_AES_KEY_WRAP`) wrap outputs
   and fresh-view unwrap inputs infer wrapped-key material L−8
   through 8191 material octets (L 8..=8199), about the wrapped
   key. On a proved wrapped-key row a larger observed value

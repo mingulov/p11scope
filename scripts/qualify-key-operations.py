@@ -71,8 +71,12 @@ OBSERVATIONS_VERSION_V4 = 4
 OBSERVATIONS_VERSION_V5 = 5
 OBSERVATIONS_VERSION_V6 = 6
 OBSERVATIONS_VERSION_V7 = 7
-# Version 8 is taken by the separate Task 7 provider section under the
-# shared allocator; object_observations skips from 7 to 9.
+# H9 section v9 (unknown-row mechanism detail, same-thread nested
+# re-entry): v7 vocabulary plus the mechanisms key on unknown-key
+# rows, the unknown_mechanism_rows_refused gap, and the
+# same_thread_nested unknown-key and gap reasons. Version 8 is taken
+# by the separate Task 7 provider section under the shared
+# allocator, so H9 skips from 7 to 9.
 OBSERVATIONS_VERSION_V9 = 9
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
@@ -173,14 +177,15 @@ ROLES = ("key", "wrapping_key", "wrapped_object", "unwrapping_key", "base_key", 
 ROLES_V2 = ROLES[:5] + ("encapsulation_key", "decapsulation_key", "other")
 UNITS = ("operations", "message_contexts")
 UNKNOWN_REASONS = ("unbound", "key_join_lost", "metadata_unknown", "metadata_conflicting",
-                   "role_unavailable", "not_applicable")
+                   "role_unavailable", "not_applicable", "same_thread_nested")
 GAP_SUBJECTS = ("model", "key_operation")
 GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction",
                "stale_prefix", "closed_frontier", "duplicate_call", "duplicate_completion",
                "stale_token", "fenced_completion", "malformed_fact", "unsupported_function",
                "domain_ended", "result_protocol_unavailable", "pending_result_unavailable",
                "output_unreadable", "pair_duplicate", "null_mechanism_cancel",
-               "same_session_overlap", "overlap_uncertain", "output_collision", "stale_origin",
+               "same_session_overlap", "same_thread_nested", "overlap_uncertain",
+               "output_collision", "stale_origin",
                "dependency_broken", "unproven_input", "unproven_session", "metadata_uncertain",
                "destroy_alias", "close_uncertain", "close_all_uncertain", "logout_uncertain",
                "session_closed", "invalid_handle", "ambiguous_outcome", "session_contradiction",
@@ -192,8 +197,14 @@ GAP_REASONS = ("bootstrap_unproven", "bootstrap_refused", "prefix_contradiction"
                "unknown_mechanism_rows_refused")
 # v7-only gap reasons: refused below v7, never silently dropped.
 V7_ONLY_GAPS = ("corroboration_mismatch", "wrapped_park_refused")
-# v9-only gap reasons: refused below v9, never silently dropped.
-V9_ONLY_GAPS = ("unknown_mechanism_rows_refused",)
+# v9-only reasons: refused below v9, never silently dropped. The nested
+# machine string names both the unknown-key reason and the model gap.
+V9_ONLY_UNKNOWN = ("same_thread_nested",)
+V9_ONLY_GAPS = ("unknown_mechanism_rows_refused", "same_thread_nested")
+# Paired (subject, reason) rows that prove v9 gap content: the refused
+# mechanism detail rides key_operation, the nested gap rides model.
+V9_ONLY_GAP_ROWS = (("key_operation", "unknown_mechanism_rows_refused"),
+                    ("model", "same_thread_nested"))
 
 SECTION_KEYS = {"version", "revision", "status", "reason", "sessions", "objects",
                 "key_operations", "unknown_key_operations", "gaps", "budgets"}
@@ -752,6 +763,8 @@ def _check_unknown_row(row, version):
           else UNKNOWN_ROW_KEYS)
     category = _label(row["category"], CATEGORIES, "operation category")
     reason = _label(row["reason"], UNKNOWN_REASONS, "unknown-key reason")
+    if version < OBSERVATIONS_VERSION_V9 and reason in V9_ONLY_UNKNOWN:
+        raise OracleRefusal(f"v9-only unknown reason in v{version} section")
     unit = _label(row["unit"], UNITS, "operation unit")
     counters = {name: row[name] for name in
                 ("completed", "failed", "cancelled", "unknown", "active")}
@@ -925,17 +938,20 @@ def check_section(section):
 
 
 def _require_v9_content(section):
-    """A v9 section carries a non-empty mechanisms breakdown on some
-    unknown row, or a valid published v9-only gap (gap-driven v9,
-    rows or rowless). The gaps passed `_check_gaps` before this runs,
-    so a listed v9-only reason is already well-formed."""
+    """A v9 section carries v9-only content: a non-empty mechanisms
+    breakdown or the same-thread-nested reason on some unknown row,
+    or a valid published v9-only gap (gap-driven v9, rows or
+    rowless). The rows and gaps passed their checks before this
+    runs, so a listed v9-only reason is already well-formed. v9
+    needs no v7 content: proved rows carry the inferred keys (blank
+    when unknown) either way."""
     for row in section["unknown_key_operations"]:
-        if row["mechanisms"]:
+        if row["mechanisms"] or row["reason"] in V9_ONLY_UNKNOWN:
             return
     for row in section["gaps"]["rows"]:
-        if row["subject"] == "key_operation" and row["reason"] in V9_ONLY_GAPS:
+        if (row["subject"], row["reason"]) in V9_ONLY_GAP_ROWS:
             return
-    _require(False, "v9 section without unknown mechanism content")
+    _require(False, "v9 section without v9 content")
 
 
 def _require_v7_content(section):

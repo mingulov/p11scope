@@ -351,7 +351,7 @@ struct PendingCall {
     /// Native thread identity at entry (from the origin fact;
     /// internal correlation only, never rendered). Together with
     /// the completion's return thread it proves same-thread nesting
-    /// for provider-internal re-entry.
+    /// for same-thread nested re-entry.
     begin_thread: u64,
     function: u32,
     kind: CallKind,
@@ -2058,6 +2058,22 @@ impl ModelState {
         let Some(inner_completion) = inner.completion.as_ref() else {
             return false;
         };
+        // Defense in depth (R3, RVS review idea): a zero pid or tid
+        // half never nests. Unreachable in production — the journal
+        // refuses zero halves at admission — but the model proof then
+        // stands alone instead of relying on an admission-layer
+        // invariant two files away.
+        let live = |thread: u64| thread as u32 != 0 && thread >> 32 != 0;
+        if !live(inner.begin_thread)
+            || !live(inner_completion.end_thread)
+            || !live(outer.begin_thread)
+            || outer
+                .completion
+                .as_ref()
+                .is_some_and(|outer_completion| !live(outer_completion.end_thread))
+        {
+            return false;
+        }
         if inner.begin <= outer.begin {
             return false;
         }
@@ -2102,13 +2118,13 @@ impl ModelState {
             return (None, false);
         };
         // Controller ruling v080-nss-ec-double R2 (2026-11-21):
-        // provider-internal re-entry names its own gap before any
+        // same-thread nested re-entry names its own gap before any
         // other overlap is considered, so the classification never
         // depends on pair order. A call strictly inside another open
         // non-neutral call on the same session and thread keeps its
         // conservative join (its key birth is the in-flight outer
         // call) under the precise reason; H9 routes its terminal to
-        // the `provider_internal` unknown row. The metadata flag is
+        // the `same_thread_nested` unknown row. The metadata flag is
         // unread downstream whenever interference is `Some` (every
         // consumer early-returns on the gap), so `false` is exact.
         let nested = self.domain_calls(x.domain).into_iter().any(|token_y| {
@@ -2119,7 +2135,7 @@ impl ModelState {
             !y.fenced && y.kind != CallKind::Neutral && Self::strictly_nested_same_thread(x, y)
         });
         if nested {
-            return (Some(ObjectGap::ProviderInternal), false);
+            return (Some(ObjectGap::SameThreadNested), false);
         }
         let x_scope = self.session_scope(x.snapshot.session);
         let x_views: Vec<&ViewRecord> = x
@@ -2159,14 +2175,16 @@ impl ModelState {
                 && a == b
             {
                 // Controller ruling v080-nss-ec-double R2
-                // (2026-11-21): a same-thread strictly-nested inner
-                // call is provider-internal re-entry — part of this
-                // call's own execution, not interference with its
-                // joins — so the outer call ignores it and its
+                // (2026-11-21; renamed neutral in R3): a same-thread
+                // strictly-nested inner call runs entirely inside
+                // this call on one thread — no concurrent
+                // interleaving with this call's joins from another
+                // thread — so the outer call ignores it and its
                 // outputs bind. (The inner call itself returned
-                // `ProviderInternal` from the pre-scan above.)
-                // Cross-thread or otherwise unprovable overlap keeps
-                // the conservative gap.
+                // `SameThreadNested` from the pre-scan above; its
+                // issuer is never proven and its terminal never
+                // binds a key.) Cross-thread or otherwise unprovable
+                // overlap keeps the conservative gap.
                 if Self::strictly_nested_same_thread(y, x) {
                     continue;
                 }

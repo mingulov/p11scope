@@ -15,9 +15,12 @@ drives the whole gate through fake guests.
 
 import importlib.util
 import json
+import os
 import re
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -125,7 +128,10 @@ class ProbeStreamTests(unittest.TestCase):
         "non-object record": stream(PAIR_ROWS, extra=b"[]\n"),
         "record kind not a string": stream(PAIR_ROWS, extra=b'{"record": 1}\n'),
         "invalid JSON": stream(PAIR_ROWS, extra=b"{not json}\n"),
-        "nested past the recursion limit": stream(
+        # Python 3.14's iterative scanner decodes this row (then it is
+        # not a record object); older interpreters raise RecursionError.
+        # test_recursion_error_is_a_row_problem pins that arm directly.
+        "deeply nested non-object": stream(
             PAIR_ROWS, extra=b"[" * 100000 + b"0" + b"]" * 100000 + b"\n"),
         "non-ASCII byte": stream(PAIR_ROWS, extra=b"\xff\n"),
         "NUL inside a row": HEALTHY.replace(b'"pid"', b'\x00"pid"', 1),
@@ -143,7 +149,7 @@ class ProbeStreamTests(unittest.TestCase):
 
     def test_row_local_corruption_keeps_validated_loads(self):
         # One bad line never erases the independently valid load rows.
-        for name in ("nested past the recursion limit", "non-ASCII byte",
+        for name in ("deeply nested non-object", "non-ASCII byte",
                      "invalid JSON", "non-object record", "probe error",
                      "unknown kind"):
             with self.subTest(name):
@@ -153,6 +159,25 @@ class ProbeStreamTests(unittest.TestCase):
                                  {"p11_entry_journal", "p11_return_journal",
                                   "p11_image_query"})
 
+    def test_recursion_error_is_a_row_problem(self):
+        # A decoder RecursionError (older Pythons on deep nesting) is a
+        # named row problem like any decode error, never an exception
+        # that erases the validated loads around it.
+        real = json.loads
+        poison = b'{"record": "load", "poison": true}'
+
+        def loads(text, **kwargs):
+            if text == poison.decode():
+                raise RecursionError("maximum recursion depth exceeded")
+            return real(text, **kwargs)
+
+        with mock.patch.object(report.json, "loads", side_effect=loads):
+            loads_out, problems = report.parse_probe_stream(
+                stream(PAIR_ROWS, extra=poison + b"\n"))
+        self.assertEqual(len(loads_out), 3)
+        self.assertTrue(any("invalid JSON" in problem and "recursion" in problem
+                            for problem in problems), problems)
+
     def test_rejected_rows_are_never_counted_as_loads(self):
         loads, problems = report.parse_probe_stream(
             self.MALFORMED["incomplete load row"])
@@ -161,8 +186,6 @@ class ProbeStreamTests(unittest.TestCase):
 
     def test_report_reader_uses_the_same_grammar(self):
         # read_jsonl refuses exactly the streams the parser refuses.
-        tmp = Path(self.id().replace(".", "_"))
-        import tempfile
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "probe.jsonl"
             for name, data in self.MALFORMED.items():
@@ -172,7 +195,6 @@ class ProbeStreamTests(unittest.TestCase):
                         report.read_jsonl(path)
             path.write_bytes(HEALTHY)
             self.assertEqual(len(report.read_jsonl(path)), 3)
-        del tmp
 
 
 def guest_log(*, observer_rc="0", leg_rc="0", release="6.6.157-test",
@@ -446,6 +468,30 @@ class RefusalFormTests(unittest.TestCase):
         self.assertIsNone(verdict.live_refusal_form(
             "p11scope: inventory --system: live capture unavailable: "
             "unrelated diagnostic for a scan without capture."))
+
+    def test_superstring_of_a_form_is_not_a_form(self):
+        observed = ("p11scope: inventory --system: live capture did not start: "
+                    "attaching p11scope's probes failed (Invalid argument); run "
+                    "'p11scope doctor' for host readiness, or use 'p11scope "
+                    "inventory --capture scan' or 'p11scope inspect --pid N' for "
+                    "a scan without capture.")
+        self.assertIsNotNone(verdict.live_refusal_form(observed))
+        for twin in (observed + " extra", "x" + observed, observed + observed):
+            with self.subTest(twin[:30]):
+                self.assertIsNone(verdict.live_refusal_form(twin))
+
+    def test_every_errno_name_fits_the_refusal_form(self):
+        # Each Linux strerror name renders inside the producer's
+        # ` (Name)` errno position (src/attach/multi_host.rs errno_name).
+        for errno in range(1, 134):
+            name = os.strerror(errno)
+            with self.subTest(errno=errno, name=name):
+                line = ("p11scope: inventory --system: live capture did not "
+                        f"start: loading p11scope's BPF programs failed ({name}); "
+                        "run 'p11scope doctor' for host readiness, or use "
+                        "'p11scope inventory --capture scan' or 'p11scope "
+                        "inspect --pid N' for a scan without capture.")
+                self.assertEqual(verdict.live_refusal_form(line), "did not start")
 
     def test_observed_guest_refusal_is_a_form(self):
         # The exact line 6.1.188 and 5.15.221 guests printed for the

@@ -2067,20 +2067,14 @@ fn unknown_keys_tallies(
     u64,
 )> {
     use std::collections::{BTreeMap, BTreeSet};
-    let mut categories: BTreeMap<&str, (u64, u64, u64, &str, BTreeSet<&str>, BTreeMap<u64, u64>, u64)> =
-        BTreeMap::new();
+    let mut categories: BTreeMap<
+        &str,
+        (u64, u64, u64, &str, BTreeSet<&str>, BTreeMap<u64, u64>, u64),
+    > = BTreeMap::new();
     for row in &observations.unknown_key_operations {
-        let slot = categories.entry(row.category).or_insert_with(|| {
-            (
-                0,
-                0,
-                0,
-                row.unit,
-                BTreeSet::new(),
-                BTreeMap::new(),
-                0,
-            )
-        });
+        let slot = categories
+            .entry(row.category)
+            .or_insert_with(|| (0, 0, 0, row.unit, BTreeSet::new(), BTreeMap::new(), 0));
         slot.0 = slot.0.saturating_add(row.completed);
         slot.1 = slot.1.saturating_add(row.failed);
         slot.2 = slot.2.saturating_add(row.active);
@@ -2091,9 +2085,7 @@ fn unknown_keys_tallies(
                 .and_modify(|count| *count = count.saturating_add(entry.count))
                 .or_insert(entry.count);
         }
-        slot.6 = slot
-            .6
-            .saturating_add(row.further_mechanism_terminals);
+        slot.6 = slot.6.saturating_add(row.further_mechanism_terminals);
     }
     categories
         .into_iter()
@@ -2221,6 +2213,30 @@ fn render_parenthetical(partition: &InferredPartition) -> Option<String> {
         segments.push(format!("unknown: {}", partition.unknown));
     }
     Some(format!(" ({})", segments.join("; ")))
+}
+
+/// One `-v` unknown-row mechanism line, or nothing for rows
+/// without mechanism content (controller ruling fix2, F3). The
+/// tally-line suffix truncates at the frozen 100-char cap, so rows
+/// whose ids would not fit there read in full here.
+fn unknown_mechs_detail(row: &crate::key_operation_projection::UnknownAggRow) -> Option<String> {
+    if row.mechanisms.is_empty() && row.further_mechanism_terminals == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = row
+        .mechanisms
+        .iter()
+        .map(|entry| format!("0x{:x}: {}", entry.id, entry.count))
+        .collect();
+    if row.further_mechanism_terminals > 0 {
+        parts.push(format!("+{} unlisted", row.further_mechanism_terminals));
+    }
+    Some(format!(
+        "  unknown row {} ({}): mechs {}",
+        row.category,
+        row.reason,
+        parts.join(", ")
+    ))
 }
 
 /// One `-v` per-row inference line, or nothing for fully blank rows.
@@ -4906,6 +4922,26 @@ fn render_snapshot_inner(
                     let _ = writeln!(out, "  and 1 more key row (not shown)");
                 } else if hidden > 1 {
                     let _ = writeln!(out, "  and {hidden} more key rows (not shown)");
+                }
+                // Verbose unknown-row mechanism detail (rows with
+                // mechanism content), bounded the same way.
+                let mut shown = 0usize;
+                let mut hidden = 0usize;
+                for row in &observations.unknown_key_operations {
+                    let Some(line) = unknown_mechs_detail(row) else {
+                        continue;
+                    };
+                    if shown < KEY_DETAIL_ROWS_SHOWN {
+                        let _ = writeln!(out, "{line}");
+                        shown += 1;
+                    } else {
+                        hidden += 1;
+                    }
+                }
+                if hidden == 1 {
+                    let _ = writeln!(out, "  and 1 more unknown row (not shown)");
+                } else if hidden > 1 {
+                    let _ = writeln!(out, "  and {hidden} more unknown rows (not shown)");
                 }
             }
             // F16 (7.05 PQC): the PQC spotlight names proved uses per

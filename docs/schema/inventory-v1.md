@@ -1260,14 +1260,19 @@ contracts are
 (section version 7) and
 [inventory-v1-object-observations-v9.schema.json](inventory-v1-object-observations-v9.schema.json)
 (section version 9; version 8 is the Task 7 provider section under
-the shared allocator); consumers must reject unknown section versions,
+the shared allocator) and
+[inventory-v1-object-observations-v10.schema.json](inventory-v1-object-observations-v10.schema.json)
+(section version 10); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 9 iff relaxed-dialect content is
+- `version` follows the content: 10 iff unknown-row mechanism
+  content is present — an unknown row with a non-empty
+  `mechanisms` array or a nonzero
+  `further_mechanism_terminals` — else 9 iff relaxed-dialect content is
   present — a relaxed label or curve name, class 5..=11, a key
   type outside the v7 thirteen, a value length outside
   12/16/24/32/48, or modulus bits outside the five listed sizes
@@ -1296,12 +1301,12 @@ never imply S1 loss.
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
-  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5, 6 and 7 are
+  otherwise byte-stable 1. Versions 1, 2, 3, 4, 5, 6, 7 and 9 are
   frozen; version 1 never carries KEM labels and neither 1 nor 2
-  carries `unattributed`; versions 4, 5, 6, 7 and 9 always carry
-  `unattributed` (possibly empty), and versions 5, 6, 7 and 9 always
-  carry the seven-key metadata blocks. Like version 7, version 9
-  carries the inferred keys on every proved row. A feed that fell back or lost
+  carries `unattributed`; versions 4, 5, 6, 7, 9 and 10 always carry
+  `unattributed` (possibly empty), and versions 5, 6, 7, 9 and 10 always
+  carry the seven-key metadata blocks. Like version 7, versions 9 and 10
+  carry the inferred keys on every proved row. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
   (`{reason, count}`, finite reasons, frozen order); the section is
@@ -1325,15 +1330,15 @@ never imply S1 loss.
   token inventory.
 - `requested`/`established` each hold the fixed metadata slots —
   six at section versions 1–4 (`class`, `key_type`, `token`,
-  `value_len`, `modulus_bits`, `ec_params`), seven at versions 5–9
+  `value_len`, `modulus_bits`, `ec_params`), seven at versions 5–10
   (plus `parameter_set`) — every slot `{status, value}` with
   `status` one of `unknown`, `value`, `conflict` or `invalidated`,
-  plus `source` at versions 6–9 (`query`, `creation_success` or null:
+  plus `source` at versions 6–10 (`query`, `creation_success` or null:
   how the field was established — a provider attribute-result read
   or a successful creation return promoting its own finite
   template; an established `value` always carries `query` or
   `creation_success`, while requested blocks and every non-`value`
-  status carry null), plus `reason` at versions 6–9 (one of four
+  status carry null), plus `reason` at versions 6–10 (one of four
   closed reasons or null: `template truncated (first 8 attributes
   captured)` on unknown fields never seen on a truncated template,
   `template value outside approved finite set` on kinds seen with an
@@ -1346,18 +1351,19 @@ never imply S1 loss.
   on a partly-read template; null for every other field, and null
   on every field of a query-only view).
   A `value` carries the accepted numeric code or null: class 0-4
-  (0–11 at version 9),
-  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at versions 6–9;
-  73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–9; every
-  assigned standard `CKK_*` at version 9, with the attested
-  `CKK_NSS_ML_KEM` vendor spelling normalizing to 73 at capture;
+  (0–11 at versions 9–10),
+  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (66 for HKDF at versions 6–10;
+  73, 74, 75 for ML-KEM, ML-DSA, SLH-DSA at versions 5–10; every
+  assigned standard `CKK_*` at versions 9–10, with the attested
+  `CKK_NSS_ML_KEM` vendor spelling normalizing to 73 and the attested
+  `CKK_NSS_CHACHA20` vendor spelling normalizing to 51 at capture;
   OASIS numbers), token 0 or 1, value length 12, 16, 24, 32 or 48 bytes
-  (16/24/32 at versions 1–5; 1..=4096 at version 9), modulus bits 1024, 2048, 3072,
-  4096 or 8192 (256..=16384 at version 9), the curve name (`secp256r1`, `secp384r1`,
+  (16/24/32 at versions 1–5; 1..=4096 at versions 9–10), modulus bits 1024, 2048, 3072,
+  4096 or 8192 (256..=16384 at versions 9–10), the curve name (`secp256r1`, `secp384r1`,
   `secp521r1`, plus `x25519`, `x448`, `ed25519`, `ed448` at
-  versions 6–9, plus `secp256k1`, `brainpoolp256r1`,
-  `brainpoolp384r1` at version 9) or null, and the parameter-set code 1..=12 at
-  versions 5–9. Labels are presentation names; JSON carries numeric
+  versions 6–10, plus `secp256k1`, `brainpoolp256r1`,
+  `brainpoolp384r1` at versions 9–10) or null, and the parameter-set code 1..=12 at
+  versions 5–10. Labels are presentation names; JSON carries numeric
   codes. Since version 6, a successful creation return promotes its
   own observed finite template cells to established (requested
   `CKA_TOKEN` still never establishes; unknown/conflict shapes still
@@ -1373,7 +1379,7 @@ never imply S1 loss.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
   `malformed`, `excluded`), distinct from current validity, over
-  the six metadata fields (seven at section versions 5–9).
+  the six metadata fields (seven at section versions 5–10).
 - `label` is the combined key label from established facts of the same
   view only (`rsa_1024`, `rsa_2048`, `rsa_3072`, `rsa_4096`,
   `rsa_other`, `aes_128`, `aes_192`, `aes_256`, `aes_other`,
@@ -1475,7 +1481,12 @@ never imply S1 loss.
   subsequent row.
 - `unknown_key_operations[]` (sorted by category and reason) holds
   capture-wide unknown-key summaries without `started` (starts are
-  never fabricated into the unknown bucket).
+  never fabricated into the unknown bucket). At section version 10
+  each row also carries `mechanisms` (at most eight `{id, count}`
+  pairs in first-seen order, possibly empty: the full-width numeric
+  mechanism ids of the row's terminals with per-id terminal counts)
+  and, only when nonzero, `further_mechanism_terminals` (terminals
+  whose ids fell past the eight listed).
 - `gaps` (`{rows[{subject, reason, repeats}], suppressed}`) and
   `budgets` (`key_rows`/`object_rows`/`unknown_rows` occupancy,
   measured `encoded_bytes`, pool `allocation_refused`/`refusal_reason`)

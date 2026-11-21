@@ -10,7 +10,8 @@ requires, per leg: the workload's exact known counts and FIPS lengths;
 the four PQC mechanism rows with exact call counts; twelve per-key rows
 whose metadata label, inferred family and (sizes leg) inferred parameter
 set name the exact set; six generate_key_pair completions and no other
-unknown row; and the verbose text showing family + parameter set on
+unknown row, with the keygen mechanism ids (15x3, 28x3) on that row;
+and the verbose text showing family + parameter set on
 every PQC key row plus the `pqc keys:` spotlight with all six sets.
 Anything missing fails: no skip counts as a pass.
 
@@ -172,6 +173,14 @@ def check_key_rows(fail, leg, inv, sizes):
                 or row.get("completed") != 6
                 or row.get("reason") != "not_applicable"):
             fail.add(leg, f"unknown row {row!r}, want 6 not_applicable keygens")
+        mechs = {(entry.get("id"), entry.get("count"))
+                 for entry in row.get("mechanisms", [])}
+        if mechs != {(15, 3), (28, 3)}:
+            fail.add(leg, f"unknown row mechanisms={mechs!r}, "
+                          "want {(15, 3), (28, 3)}")
+        if row.get("further_mechanism_terminals", 0) != 0:
+            fail.add(leg, f"unknown row further_mechanism_terminals="
+                          f"{row.get('further_mechanism_terminals')!r}, want 0")
 
 
 def check_text(fail, leg, text_path, sizes):

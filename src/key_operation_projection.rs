@@ -1622,9 +1622,10 @@ fn has_v7_gap_content(observations: &ObjectObservations) -> bool {
 /// v10 content: an unknown row carrying mechanism ids or
 /// overflow terminals.
 fn has_unknown_mechanism_content(observations: &ObjectObservations) -> bool {
-    observations.unknown_key_operations.iter().any(|row| {
-        !row.mechanisms.is_empty() || row.further_mechanism_terminals > 0
-    })
+    observations
+        .unknown_key_operations
+        .iter()
+        .any(|row| !row.mechanisms.is_empty() || row.further_mechanism_terminals > 0)
 }
 
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {

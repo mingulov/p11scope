@@ -27121,6 +27121,123 @@ fn key_operation_schema_v9_pins_relaxed_metadata_contract() {
     }
 }
 
+/// Controller ruling fix2 (F3): the v10 schema pins the unknown-row
+/// mechanism contract — the section version constant (10), the nine
+/// required unknown-row keys (the frozen eight plus `mechanisms`),
+/// the optional `further_mechanism_terminals` overflow count, the
+/// two-key `{id, count}` entries capped at eight, and u64 bounds on
+/// every numeric. The renderer agrees key for key.
+#[test]
+fn key_operation_schema_v10_pins_unknown_mechanism_contract() {
+    use crate::key_operation_projection::contract::{
+        UNKNOWN_MECH_ROW_KEYS, UNKNOWN_ROW_KEYS, UNKNOWN_ROW_KEYS_V10,
+    };
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V10, UnknownAggRow, UnknownMechRow, unknown_row_json,
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v10.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let table =
+        |keys: &[&str]| -> Vec<String> { sorted(keys.iter().map(|key| key.to_string()).collect()) };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 10);
+    assert_eq!(OBSERVATIONS_VERSION_V10, 10);
+    assert_eq!(UNKNOWN_ROW_KEYS.len(), 8, "frozen v1-v9 row keys");
+    assert_eq!(
+        required("/$defs/unknown_row/required"),
+        table(&UNKNOWN_ROW_KEYS_V10),
+        "v10 unknown rows require the frozen eight plus mechanisms"
+    );
+    assert_eq!(
+        UNKNOWN_MECH_ROW_KEYS.to_vec(),
+        vec!["id", "count"],
+        "mechanism entries carry exactly id and count"
+    );
+    let mechs = schema
+        .pointer("/$defs/unknown_row/properties/mechanisms")
+        .expect("mechanisms property");
+    assert_eq!(mechs.pointer("/maxItems").and_then(|v| v.as_u64()), Some(8));
+    assert_eq!(
+        mechs
+            .pointer("/items/required")
+            .and_then(|v| v.as_array())
+            .map(|keys| keys
+                .iter()
+                .filter_map(|key| key.as_str().map(str::to_string))
+                .collect::<Vec<_>>()),
+        Some(vec!["id".to_string(), "count".to_string()]),
+        "mechanism entries require id and count"
+    );
+    assert!(
+        schema
+            .pointer("/$defs/unknown_row/properties/further_mechanism_terminals")
+            .is_some(),
+        "the overflow count is a known (optional) key"
+    );
+    // The renderer agrees: v10 rows carry the nine keys plus the
+    // overflow count when nonzero; below v10 the frozen eight.
+    let row = UnknownAggRow {
+        category: "generate_key_pair",
+        reason: "not_applicable",
+        unit: "operations",
+        completed: 6,
+        failed: 0,
+        cancelled: 0,
+        unknown: 0,
+        active: 0,
+        mechanisms: vec![
+            UnknownMechRow { id: 15, count: 3 },
+            UnknownMechRow { id: 28, count: 3 },
+        ],
+        further_mechanism_terminals: 0,
+    };
+    let rendered = unknown_row_json(&row, OBSERVATIONS_VERSION_V10);
+    let mut keys: Vec<String> = rendered.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, table(&UNKNOWN_ROW_KEYS_V10));
+    assert_eq!(
+        rendered["mechanisms"],
+        serde_json::json!([{"id": 15, "count": 3}, {"id": 28, "count": 3}])
+    );
+    assert!(rendered.get("further_mechanism_terminals").is_none());
+    let overflow = UnknownAggRow {
+        further_mechanism_terminals: 2,
+        ..row.clone()
+    };
+    let rendered = unknown_row_json(&overflow, OBSERVATIONS_VERSION_V10);
+    assert_eq!(rendered["further_mechanism_terminals"], 2);
+    let rendered = unknown_row_json(&overflow, 9);
+    let mut keys: Vec<String> = rendered.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        table(&UNKNOWN_ROW_KEYS),
+        "v9 rows keep the frozen eight"
+    );
+}
+
 /// R2 new-site: the section version follows the content. A scene
 /// whose HKDF key is created in-window (complete finite template, no
 /// query) renders v7 (promotion plus inference) with the HKDF label
@@ -28765,7 +28882,14 @@ fn key_operation_creation_family_seeds_row_without_key_type() {
         init_capture(),
     );
     pair.pair_results = Some((PUBLIC_KEY, PRIVATE_KEY));
-    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &pair);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &pair,
+    );
     // Use the public half under a mechanism that names no family.
     let sign_init = ShapedS1 {
         input0: Some((PUBLIC_KEY, 1)),

@@ -72,6 +72,7 @@ OBSERVATIONS_VERSION_V5 = 5
 OBSERVATIONS_VERSION_V6 = 6
 OBSERVATIONS_VERSION_V7 = 7
 OBSERVATIONS_VERSION_V9 = 9
+OBSERVATIONS_VERSION_V10 = 10
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -250,6 +251,9 @@ PQC_SETS = ("ml_kem_512", "ml_kem_768", "ml_kem_1024", "ml_dsa_44", "ml_dsa_65",
             "slh_dsa_192f", "slh_dsa_256s", "slh_dsa_256f")
 UNKNOWN_ROW_KEYS = {"category", "reason", "unit", "completed", "failed", "cancelled",
                     "unknown", "active"}
+UNKNOWN_ROW_KEYS_V10 = UNKNOWN_ROW_KEYS | {"mechanisms"}
+UNKNOWN_MECH_ROW_KEYS = {"id", "count"}
+UNKNOWN_MECHS_PER_ROW = 8
 GAP_ROW_KEYS = {"subject", "reason", "repeats"}
 BUDGET_KEYS = {"key_rows", "object_rows", "unknown_rows", "encoded_bytes",
                "allocation_refused", "refusal_reason"}
@@ -759,14 +763,34 @@ def _check_key_row(row, objects, roles, labels=METADATA_LABELS, version=1):
     return category, counters
 
 
-def _check_unknown_row(row):
-    _keys(row, UNKNOWN_ROW_KEYS)
+def _check_unknown_row(row, version):
+    if version >= OBSERVATIONS_VERSION_V10:
+        allowed = UNKNOWN_ROW_KEYS_V10 | {"further_mechanism_terminals"}
+        _require(set(row) >= UNKNOWN_ROW_KEYS_V10
+                 and set(row) <= allowed, "unexpected unknown row keys")
+    else:
+        _keys(row, UNKNOWN_ROW_KEYS)
     category = _label(row["category"], CATEGORIES, "operation category")
     reason = _label(row["reason"], UNKNOWN_REASONS, "unknown-key reason")
     unit = _label(row["unit"], UNITS, "operation unit")
     counters = {name: row[name] for name in
                 ("completed", "failed", "cancelled", "unknown", "active")}
     _require(all(_u64(value) for value in counters.values()), "invalid unknown row counters")
+    if version >= OBSERVATIONS_VERSION_V10:
+        mechs = row["mechanisms"]
+        _require(type(mechs) is list and len(mechs) <= UNKNOWN_MECHS_PER_ROW,
+                 "invalid unknown row mechanisms")
+        seen = set()
+        for entry in mechs:
+            _keys(entry, UNKNOWN_MECH_ROW_KEYS)
+            _require(_u64(entry["id"]) and _u64(entry["count"]),
+                     "invalid unknown row mechanism entry")
+            _require(entry["id"] not in seen, "duplicate unknown row mechanism id")
+            seen.add(entry["id"])
+        if "further_mechanism_terminals" in row:
+            _require(_u64(row["further_mechanism_terminals"])
+                     and row["further_mechanism_terminals"] > 0,
+                     "further count renders only when nonzero")
     return category, reason, unit, counters
 
 
@@ -841,13 +865,15 @@ def check_section(section):
     _keys(section, SECTION_KEYS_V3
           if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
                          OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
-                         OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9)
+                         OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9,
+                         OBSERVATIONS_VERSION_V10)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
                              OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
                              OBSERVATIONS_VERSION_V5, OBSERVATIONS_VERSION_V6,
-                             OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9),
+                             OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V9,
+                             OBSERVATIONS_VERSION_V10),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
@@ -913,7 +939,7 @@ def check_section(section):
     unknown = []
     _require(type(section["unknown_key_operations"]) is list, "unexpected fields")
     for row in section["unknown_key_operations"]:
-        unknown.append(_check_unknown_row(row))
+        unknown.append(_check_unknown_row(row, version))
     pairs = [(category, reason) for category, reason, _, _ in unknown]
     _require(len(set(pairs)) == len(pairs), "duplicate unknown row")
     _require(sorted(pairs) == pairs, "unknown rows out of order")
@@ -928,6 +954,8 @@ def check_section(section):
         _require_v7_content(section)
     if version == OBSERVATIONS_VERSION_V9:
         _require_v9_content(section)
+    if version == OBSERVATIONS_VERSION_V10:
+        _require_v10_content(section)
     return {"status": status, "reason": reason, "rows": list(tallies.values()),
             "unknown": unknown, "gaps": gaps, "unattributed": unattributed}
 
@@ -979,6 +1007,17 @@ def _require_v9_content(section):
                                                "brainpoolp384r1"):
                 return
     _require(False, "v9 section without relaxed content")
+
+
+def _require_v10_content(section):
+    """A v10 section carries unknown-row mechanism content: a
+    non-empty mechanisms array or a nonzero further count on some
+    unknown row. v10 carries v9 shapes (checked above) but earns
+    its version from mechanism content, not relaxed values."""
+    for row in section["unknown_key_operations"]:
+        if row["mechanisms"] or row.get("further_mechanism_terminals", 0) > 0:
+            return
+    _require(False, "v10 section without unknown-row mechanism content")
 
 
 def _require_v6_content(section, keys):

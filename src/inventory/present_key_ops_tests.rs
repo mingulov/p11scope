@@ -2222,6 +2222,73 @@ fn key_ops_unknown_bucket_reads_unknown_keys_lines() {
     );
 }
 
+/// Controller ruling fix2 (F3): verbose `unknown keys` lines name
+/// the merged mechanism ids beside the machine reasons, by count
+/// then id; concise lines stay bare. Long suffixes truncate at the
+/// frozen 100-char tally cap with the tally itself intact.
+#[test]
+fn key_ops_unknown_bucket_names_mechanism_ids_verbose_only() {
+    use crate::key_operation_projection::UnknownMechRow;
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    let mut row = unknown_row("sign", 3, 0, 1, "operations");
+    row.mechanisms = vec![UnknownMechRow { id: 0xf, count: 3 }];
+    observations.unknown_key_operations.push(row);
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block[1], "  unknown keys: sign 3 completed, 0 returned errors, 1 active operations",
+        "concise stays bare:\n{concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(
+        block[1],
+        "  unknown keys: sign 3 completed, 0 returned errors, 1 active operations (unbound; mechs 0xf: 3)",
+        "verbose names merged ids:\n{verbose}"
+    );
+    // Overflow: eight listed ids plus both trailers still cap at
+    // 100 chars with the tally prefix intact (JSON carries the
+    // full ids; -v is bounded display).
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    let mut row = unknown_row("generate_key_pair", 6, 0, 0, "operations");
+    row.reason = "not_applicable";
+    row.mechanisms = (15..23).map(|id| UnknownMechRow { id, count: 1 }).collect();
+    row.further_mechanism_terminals = 2;
+    observations.unknown_key_operations.push(row);
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert!(
+        block[1].len() <= 100,
+        "verbose unknown line caps at 100 chars:\n{verbose}"
+    );
+    assert!(
+        block[1].starts_with(
+            "  unknown keys: generate_key_pair 6 completed, 0 returned errors, 0 active operations (not_appli"
+        ),
+        "tally stays intact under truncation:\n{verbose}"
+    );
+    assert!(
+        block.iter().any(|line| line == &"  unknown row generate_key_pair (not_applicable): mechs 0xf: 1, 0x10: 1, 0x11: 1, 0x12: 1, 0x13: 1, 0x14: 1, 0x15: 1, 0x16: 1, +2 unlisted"),
+        "full ids read on the detail line:\n{verbose}"
+    );
+}
+
 /// A very long provider file name truncates to keep the provider line
 /// at most 100 chars; the tally itself is never truncated.
 #[test]

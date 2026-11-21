@@ -881,6 +881,33 @@ class ObservedRsaTests(unittest.TestCase):
                              + ("secp256k1", "brainpoolp256r1",
                                 "brainpoolp384r1"))
 
+    def test_oracle_v10_tables_match_v10_schema(self):
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v10.schema.json",
+                  encoding="utf-8") as stream:
+            schema = json.load(stream)
+        defs = schema["$defs"]
+        with self.subTest("version const"):
+            self.assertEqual(schema["properties"]["version"]["const"], 10)
+            self.assertEqual(ORACLE.OBSERVATIONS_VERSION_V10, 10)
+        with self.subTest("UNKNOWN_ROW_KEYS_V10"):
+            self.assertEqual(set(ORACLE.UNKNOWN_ROW_KEYS_V10),
+                             set(defs["unknown_row"]["required"]))
+            self.assertEqual(ORACLE.UNKNOWN_ROW_KEYS_V10,
+                             ORACLE.UNKNOWN_ROW_KEYS | {"mechanisms"})
+        with self.subTest("UNKNOWN_MECH_ROW_KEYS"):
+            items = defs["unknown_row"]["properties"]["mechanisms"]["items"]
+            self.assertEqual(set(ORACLE.UNKNOWN_MECH_ROW_KEYS),
+                             set(items["required"]))
+            self.assertEqual(defs["unknown_row"]["properties"]
+                             ["mechanisms"]["maxItems"],
+                             ORACLE.UNKNOWN_MECHS_PER_ROW)
+        with self.subTest("further count optional"):
+            self.assertNotIn("further_mechanism_terminals",
+                             defs["unknown_row"]["required"])
+            self.assertIn("further_mechanism_terminals",
+                          defs["unknown_row"]["properties"])
+
     def test_h9_v5_section_checks_structurally(self):
         # v5 shape with the cell's RSA key rows: the PQC content rides
         # the object views (key_type 74, parameter_set 2, ml_dsa_65
@@ -960,8 +987,10 @@ class ObservedRsaTests(unittest.TestCase):
                 ORACLE.check_section(mutated)
         with self.subTest("unknown versions refused"):
             # 9 joins the shape-refused (v9 rows carry inferred keys
-            # like v7; this v5-shaped section lacks them).
-            for version in (0, 7, 9, 99):
+            # like v7; this v5-shaped section lacks them), as does
+            # 10 (v10 additionally requires mechanisms on unknown
+            # rows).
+            for version in (0, 7, 9, 10, 99):
                 mutated = copy.deepcopy(section)
                 mutated["version"] = version
                 with self.assertRaises(ORACLE.OracleRefusal):
@@ -1063,6 +1092,80 @@ class ObservedRsaTests(unittest.TestCase):
                 "suppressed": 0}
             facts = ORACLE.check_section(mutated)
             self.assertEqual(len(facts["gaps"]["rows"]), 2)
+
+    def test_h9_v10_section_checks_structurally(self):
+        # v10 shape: the v7 object/key upgrades plus unknown rows
+        # carrying mechanism ids. The mechanisms array is required
+        # (possibly empty); the further count renders only when
+        # nonzero; the version is earned by mechanism content.
+        section = observed("clean.json")
+        section["version"] = 10
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for name, block in (("requested", row["requested"]),
+                                ("established", row["established"])):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None, "source": None,
+                                          "reason": None}
+                for cell_name, cell in block.items():
+                    if cell_name == "parameter_set":
+                        continue
+                    if name == "established" and cell["status"] == "value":
+                        cell["source"] = "query"
+                    else:
+                        cell["source"] = None
+                    cell["reason"] = None
+            row["queries"]["parameter_set"] = "not_queried"
+        for row in section["key_operations"]:
+            row["inferred_family"] = {"status": "inferred", "value": "rsa",
+                                      "completions": 1}
+            row["inferred_size"] = {
+                "status": "inferred",
+                "detail": {"kind": "rsa", "size_class": 2048,
+                           "modulus_bytes": 256,
+                           "evidence": "sign_output"},
+                "completions": 1}
+        section["unknown_key_operations"] = [{
+            "category": "generate_key_pair", "reason": "not_applicable",
+            "unit": "operations", "completed": 6, "failed": 0,
+            "cancelled": 0, "unknown": 0, "active": 0,
+            "mechanisms": [{"id": 15, "count": 3},
+                           {"id": 28, "count": 3}]}]
+        section["budgets"]["unknown_rows"]["occupied"] = 1
+        with self.subTest("v10 shape checks"):
+            facts = ORACLE.check_section(copy.deepcopy(section))
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["unknown"]), 1)
+        with self.subTest("missing mechanisms refused"):
+            mutated = copy.deepcopy(section)
+            del mutated["unknown_key_operations"][0]["mechanisms"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("malformed mechanism entry refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"][0] = {
+                "id": 15}
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("duplicate mechanism id refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"].append(
+                {"id": 15, "count": 1})
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("zero further count refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0][
+                "further_mechanism_terminals"] = 0
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v10 without mechanism content refused"):
+            mutated = copy.deepcopy(section)
+            mutated["unknown_key_operations"][0]["mechanisms"] = []
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "v10 section without unknown-row "
+                                        "mechanism content"):
+                ORACLE.check_section(mutated)
 
     def test_h9_v7_size_detail_closed_variants(self):
         # Closed per-kind variants (§10.2): the shared specimen table

@@ -33,6 +33,12 @@ struct vm_area_struct___p11ms {
     unsigned long vm_flags;
     struct file___p11ms *vm_file;
 } MS_BTF;
+struct signal_struct___p11ms {
+    int nr_threads;
+} MS_BTF;
+struct task_struct___p11ms {
+    struct signal_struct___p11ms *signal;
+} MS_BTF;
 
 struct {
     MS_UINT(type, MS_MAP_ARRAY);
@@ -78,6 +84,7 @@ static u64 (*ms_pid_tgid)(void) = (void *)14;
 static long (*ms_under_cgroup)(void *map, u32 index) = (void *)37;
 static long (*ms_send_signal)(u32 sig) = (void *)109;
 static long (*ms_probe_read_kernel)(void *dst, u32 size, const void *src) = (void *)113;
+static struct task_struct___p11ms *(*ms_current_task)(void) = (void *)158;
 
 #define MS_READ(dst, src) \
     ms_probe_read_kernel(&(dst), sizeof(dst), __builtin_preserve_access_index(&(src)))
@@ -150,6 +157,19 @@ int p11_member_map_stop(u64 *ctx)
         return 0;
     }
     stop.hook_ts_ns = ms_ktime_ns();
+    /* The thread-group size at the stop: userspace withdraws a dead
+     * member silently only from a single-threaded stop, because a
+     * sibling may run userspace code after the stopping mapping while
+     * the group stop propagates to it. An unreadable count stays 0,
+     * which userspace treats as doubt (it keeps the gap). */
+    {
+        struct task_struct___p11ms *task = ms_current_task();
+        struct signal_struct___p11ms *sig = (void *)0;
+        int threads = 0;
+        if (task && !MS_READ(sig, task->signal) && sig && !MS_READ(threads, sig->nr_threads) &&
+            threads > 0)
+            stop.nr_threads = (u32)threads;
+    }
     rc = ms_map_update(&MS_STOPS, &tgid, &stop, MS_NOEXIST);
     if (rc == -MS_EEXIST)
         return 0;

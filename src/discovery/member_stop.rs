@@ -109,6 +109,12 @@ pub(crate) struct HeldMember {
     /// for this member: the hold ends when all of them are attached.
     providers: Vec<(u64, u64)>,
     since_ns: u64,
+    /// Whether the row's stop was single-threaded (for a forced resume
+    /// after the row is out of reach).
+    single_at_stop: bool,
+    /// Whether the intake already counted this member departed (a corpse
+    /// with staged providers): the hold's end must not count it again.
+    departed_counted: bool,
 }
 
 /// Engine-side state of the first-map stop.
@@ -333,12 +339,51 @@ fn member_group_dead(tgid: u32) -> bool {
 }
 
 /// Whether `tgid` died with its row pending (reaped, or an unreaped
-/// corpse): it ran nothing after its stopping mapping was recorded, so
-/// no provider call could have run unobserved and the row withdraws
-/// silently. A refused kernel signal is still disclosed separately
-/// through the refusal counters: only the intake's own gap is silent.
+/// corpse whose every task is a zombie). Liveness only: whether the row
+/// then withdraws silently is [`silent_corpse_withdrawal`]'s question.
 fn member_died_with_row_pending(tgid: u32) -> bool {
     process_gone(tgid) || member_group_dead(tgid)
+}
+
+/// Whether a dead member's row withdraws silently (`None`), or keeps its
+/// first-use gap (the cause to file).
+///
+/// Silence needs all three: the row's stop was single-threaded, the dead
+/// occupant is the stopped generation, and the group is dead now (the
+/// caller checked). A stopped single thread runs no userspace instruction
+/// after its stopping mapping — the stop lands on its return-to-userspace
+/// path — and it cannot clone while stopped, so nothing of that member
+/// ran unobserved. Every other shape keeps the gap, the safe direction:
+///
+/// * a sibling thread of a multi-threaded member keeps running in
+///   userspace until the group stop propagates to it (routine
+///   millisecond-scale on a loaded host when the mapping thread blocks
+///   in-kernel), and a mapping it makes while the row pends takes the
+///   hook's EEXIST path: no signal, no count, no row. Withdrawing
+///   without the maps snapshot would miss a provider it mapped and
+///   called in that window, a real learned-file gap;
+/// * a number reused since the stop names another process, whose own
+///   mappings fell into the stale row's EEXIST shadow and ran
+///   unprotected; only a start time that precedes the stop proves the
+///   occupant is the stopped generation (the start is floored to a clock
+///   tick, so a reuse within one tick of the stop is not told apart).
+///
+/// An unreadable thread count (zero), start time, stamp or clock is doubt
+/// and keeps the gap. A refused kernel signal is still disclosed
+/// separately through the refusal counters: only the intake's own gap is
+/// ever silent.
+fn silent_corpse_withdrawal(
+    single_at_stop: bool,
+    occupant_start: Option<u64>,
+    stop_ns: u64,
+) -> Option<&'static str> {
+    if !single_at_stop {
+        return Some("a sibling thread may have run after its stopping mapping");
+    }
+    if occupant_start.and_then(|start| born_before_stop(start, stop_ns)) != Some(true) {
+        return Some("its process number may have been reused since its stop");
+    }
+    None
 }
 
 /// Sends `SIGCONT` to a process number (no pidfd could be opened).
@@ -653,6 +698,8 @@ impl Engine {
                 files: Vec::new(),
                 providers: vec![(u64::MAX, u64::MAX)],
                 since_ns,
+                single_at_stop: true,
+                departed_counted: false,
             },
         );
     }
@@ -772,21 +819,26 @@ impl Engine {
                 // Alive but not pinnable now (descriptor or /proc
                 // pressure): the row stays for a later pass, within the
                 // bound.
-                self.retry_or_force(io, tgid, since_ns, now_ns, &error);
+                self.retry_or_force(io, tgid, since_ns, now_ns, &error, stop.nr_threads == 1);
                 return false;
             }
         };
         if member_died_with_row_pending(tgid) {
-            // Dead with its row still pending: the stop landed before
-            // its next userspace instruction, so it ran nothing after
-            // its stopping mapping was recorded and no provider call
-            // could have run unobserved. Withdrawing silently like a
-            // reaped member; the resume is a no-op to the dead, and
-            // short-lived-descendant retirement stays disclosed through
-            // the frames' own descendant gaps.
+            // Dead with its row still pending. Silence needs the
+            // single-threaded stop of its own generation (a sibling may
+            // have run after the stopping mapping, and a reused number
+            // names another process); any doubt keeps the first-use gap.
+            // Every withdrawn corpse is counted in `departed` (visible
+            // on the `-v` stats line); never-admitted corpses are also
+            // counted in their frames' descendant gaps.
+            let doubt =
+                silent_corpse_withdrawal(stop.nr_threads == 1, pin.start_time(), stop.hook_ts_ns);
             let _ = io.withdraw(tgid);
             let _ = pin.send_signal(libc::SIGCONT);
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
+            if let Some(why) = doubt {
+                self.note_first_use_gap(tgid, why);
+            }
             return false;
         }
         match io.is_run_member(&pin) {
@@ -805,7 +857,14 @@ impl Engine {
                     }
                     self.note_first_use_gap(tgid, "it left the run tree while stopped");
                 } else {
-                    self.retry_or_force(io, tgid, since_ns, now_ns, "no signal authority");
+                    self.retry_or_force(
+                        io,
+                        tgid,
+                        since_ns,
+                        now_ns,
+                        "no signal authority",
+                        stop.nr_threads == 1,
+                    );
                 }
                 return false;
             }
@@ -825,6 +884,7 @@ impl Engine {
                     since_ns,
                     now_ns,
                     &format!("membership unverified: {error}"),
+                    stop.nr_threads == 1,
                 );
                 return false;
             }
@@ -864,13 +924,22 @@ impl Engine {
             Ok(proven) => proven,
             Err(error) => {
                 if member_died_with_row_pending(tgid) {
-                    // Died between the intake check and this read: same
-                    // silent withdrawal as above, not an unreadable live
-                    // member.
+                    // Died between the intake check and this read: the
+                    // same gated withdrawal as above, not an unreadable
+                    // live member (a corpse counts departed, never
+                    // unreadable).
+                    let doubt = silent_corpse_withdrawal(
+                        stop.nr_threads == 1,
+                        pin.start_time(),
+                        stop.hook_ts_ns,
+                    );
                     let _ = io.withdraw(tgid);
                     let _ = pin.send_signal(libc::SIGCONT);
                     self.member_stops.stats.departed =
                         self.member_stops.stats.departed.saturating_add(1);
+                    if let Some(why) = doubt {
+                        self.note_first_use_gap(tgid, why);
+                    }
                     return false;
                 }
                 self.member_stops.stats.unreadable =
@@ -878,7 +947,7 @@ impl Engine {
                 if crate::run::capture_diagnostics_on() {
                     eprintln!("p11scope: stopped run member {tgid} unreadable: {error}; resumed");
                 }
-                self.resume_or_force(io, &pin, since_ns, now_ns);
+                self.resume_or_force(io, &pin, since_ns, now_ns, stop.nr_threads == 1);
                 // Nothing about its stopping file is proven: it may be a
                 // provider whose first calls now run unwatched.
                 self.note_first_use_gap(tgid, "its maps were unreadable");
@@ -907,16 +976,29 @@ impl Engine {
         let stopping_proven = cleared.contains(&stop.file)
             || self.member_stops.cleared.contains(&stop.file)
             || providers.iter().any(|(key, _)| *key == stop.file);
+        // Whether this intake already counted the member departed: a hold
+        // inserted below for such a corpse must not count it again when
+        // the hold ends (in this pass's resolve, at a watchdog loss, or
+        // at capture end).
+        let mut departed_counted = false;
         if !stopping_proven {
-            // A corpse makes no more calls: counting it departed
-            // instead of naming a gap for calls it can no longer make.
-            // Proving, staging and clearing below still run on whatever
-            // the read snapshot carried (the row still withdraws through
-            // the resume/hold path), so a provider it mapped still
-            // attaches for later mappers.
+            // A corpse counts departed; silence needs the
+            // single-threaded stop of its own generation, and any doubt
+            // keeps the first-use gap. Proving, staging and clearing
+            // below still run on whatever the read snapshot carried (the
+            // row still withdraws through the resume/hold path), so a
+            // provider it mapped still attaches for later mappers.
             if member_died_with_row_pending(tgid) {
                 self.member_stops.stats.departed =
                     self.member_stops.stats.departed.saturating_add(1);
+                departed_counted = true;
+                if let Some(why) = silent_corpse_withdrawal(
+                    stop.nr_threads == 1,
+                    pin.start_time(),
+                    stop.hook_ts_ns,
+                ) {
+                    self.note_first_use_gap(tgid, why);
+                }
             } else {
                 self.member_stops.stats.unproven_resumes =
                     self.member_stops.stats.unproven_resumes.saturating_add(1);
@@ -924,7 +1006,7 @@ impl Engine {
             }
         }
         if providers.is_empty() {
-            self.resume_or_force(io, &pin, since_ns, now_ns);
+            self.resume_or_force(io, &pin, since_ns, now_ns, stop.nr_threads == 1);
             return false;
         }
         let mut files = Vec::new();
@@ -954,7 +1036,7 @@ impl Engine {
             for key in &files {
                 self.clear_member_file(io, *key);
             }
-            self.resume_or_force(io, &pin, since_ns, now_ns);
+            self.resume_or_force(io, &pin, since_ns, now_ns, stop.nr_threads == 1);
             self.note_unattached_resume(tgid);
             return true;
         }
@@ -967,6 +1049,8 @@ impl Engine {
                 files,
                 providers: identities,
                 since_ns,
+                single_at_stop: stop.nr_threads == 1,
+                departed_counted,
             },
         );
         true
@@ -1189,6 +1273,7 @@ impl Engine {
         pin: &crate::process::PidPin,
         since_ns: u64,
         now_ns: u64,
+        single_at_stop: bool,
     ) {
         if !Self::resume_member(io, pin) {
             self.retry_or_force(
@@ -1197,6 +1282,7 @@ impl Engine {
                 since_ns,
                 now_ns,
                 "no signal authority for the resume",
+                single_at_stop,
             );
         }
     }
@@ -1210,9 +1296,10 @@ impl Engine {
         since_ns: u64,
         now_ns: u64,
         why: &str,
+        single_at_stop: bool,
     ) {
         if now_ns.saturating_sub(since_ns) >= MEMBER_STOP_HOLD_NS {
-            self.force_resume(io, tgid, since_ns, why);
+            self.force_resume(io, tgid, since_ns, why, single_at_stop);
         } else {
             self.keep_for_retry(tgid, since_ns, why);
         }
@@ -1233,21 +1320,36 @@ impl Engine {
     /// without one is the number signalled. (`PidPin::open` reads the
     /// start time just before it opens the pidfd: a reuse inside those
     /// microseconds would need a full pid wrap, and is not told apart.)
-    fn force_resume(&mut self, io: &mut dyn MemberStopIo, tgid: u32, stop_ns: u64, why: &str) {
+    fn force_resume(
+        &mut self,
+        io: &mut dyn MemberStopIo,
+        tgid: u32,
+        stop_ns: u64,
+        why: &str,
+        single_at_stop: bool,
+    ) {
         if process_gone(tgid) {
             let _ = io.withdraw(tgid);
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
             return;
         }
         if member_group_dead(tgid) {
-            // Dead with its row still pending at the bound: it ran
-            // nothing after its stopping mapping was recorded, so no
-            // provider call could have run unobserved. Withdrawing
-            // silently like a reaped member, without signalling: no
-            // pin names it here, and a number signal could resume a
-            // stranger reusing the number.
+            // Dead with its row still pending at the bound. Silence
+            // needs the single-threaded stop of its own generation (the
+            // start time is read fresh: no pin names the corpse here);
+            // any doubt keeps the first-use gap. Either way nothing is
+            // signalled: a number signal could resume a stranger reusing
+            // the number.
+            let doubt = silent_corpse_withdrawal(
+                single_at_stop,
+                crate::process::process_start_time(tgid).ok(),
+                stop_ns,
+            );
             let _ = io.withdraw(tgid);
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
+            if let Some(why) = doubt {
+                self.note_first_use_gap(tgid, why);
+            }
             return;
         }
         let pin = self
@@ -1415,12 +1517,20 @@ impl Engine {
             }
             if departed {
                 let _ = io.withdraw(tgid);
-                self.member_stops.stats.departed =
-                    self.member_stops.stats.departed.saturating_add(1);
+                if !member.departed_counted {
+                    self.member_stops.stats.departed =
+                        self.member_stops.stats.departed.saturating_add(1);
+                }
                 continue;
             }
             if !Self::resume_member(io, &member.pin) {
-                self.force_resume(io, tgid, member.since_ns, "watchdog lost");
+                self.force_resume(
+                    io,
+                    tgid,
+                    member.since_ns,
+                    "watchdog lost",
+                    member.single_at_stop,
+                );
                 continue;
             }
             if attached {
@@ -1481,7 +1591,7 @@ impl Engine {
         let now_ns = now_ns.unwrap_or(0);
         for (tgid, stop) in pending {
             let since_ns = stop_since(&stop, owed.get(&tgid).copied(), now_ns);
-            self.resume_pending_after_guard_loss(io, tgid, since_ns);
+            self.resume_pending_after_guard_loss(io, tgid, since_ns, &stop);
         }
     }
 
@@ -1490,6 +1600,7 @@ impl Engine {
         io: &mut dyn MemberStopIo,
         tgid: u32,
         since_ns: u64,
+        stop: &MemberStop,
     ) {
         let pin = match self.open_member_pin(tgid) {
             Ok(pin) => pin,
@@ -1500,18 +1611,29 @@ impl Engine {
                 return;
             }
             Err(_) => {
-                self.force_resume(io, tgid, since_ns, "watchdog lost; not pinnable");
+                self.force_resume(
+                    io,
+                    tgid,
+                    since_ns,
+                    "watchdog lost; not pinnable",
+                    stop.nr_threads == 1,
+                );
                 return;
             }
         };
         if member_died_with_row_pending(tgid) {
             // Dead with its row still pending when the guard was lost:
-            // it ran nothing after its stopping mapping was recorded,
-            // so no provider call could have run unobserved. The live
-            // members below keep their loud drain.
+            // silence needs the single-threaded stop of its own
+            // generation, and any doubt keeps the first-use gap. The
+            // live members below keep their loud drain.
+            let doubt =
+                silent_corpse_withdrawal(stop.nr_threads == 1, pin.start_time(), stop.hook_ts_ns);
             let _ = io.withdraw(tgid);
             let _ = pin.send_signal(libc::SIGCONT);
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
+            if let Some(why) = doubt {
+                self.note_first_use_gap(tgid, why);
+            }
             return;
         }
         let moved_out = match io.is_run_member(&pin) {
@@ -1524,13 +1646,25 @@ impl Engine {
                 return;
             }
             Err(_) => {
-                self.force_resume(io, tgid, since_ns, "watchdog lost; membership unverified");
+                self.force_resume(
+                    io,
+                    tgid,
+                    since_ns,
+                    "watchdog lost; membership unverified",
+                    stop.nr_threads == 1,
+                );
                 return;
             }
         };
         self.settle_member(&pin);
         if !Self::resume_member(io, &pin) {
-            self.force_resume(io, tgid, since_ns, "watchdog lost; no signal authority");
+            self.force_resume(
+                io,
+                tgid,
+                since_ns,
+                "watchdog lost; no signal authority",
+                stop.nr_threads == 1,
+            );
             return;
         }
         // Its stopping file was never proven: the named gap.
@@ -1578,8 +1712,12 @@ impl Engine {
                     }
                 }
                 let _ = io.withdraw(tgid);
-                self.member_stops.stats.departed =
-                    self.member_stops.stats.departed.saturating_add(1);
+                // A corpse the intake already counted keeps its single
+                // count: one departure, however the hold ends.
+                if !held.departed_counted {
+                    self.member_stops.stats.departed =
+                        self.member_stops.stats.departed.saturating_add(1);
+                }
                 continue;
             }
             // Attached, refused or expired: a refused or expired end files
@@ -1677,6 +1815,13 @@ impl Engine {
         // member's stop completed before its intake read its maps.
         let held = std::mem::take(&mut self.member_stops.held);
         for (_, member) in held {
+            // A held member that died waiting counts its departure like
+            // the drain's; one the intake already counted keeps its
+            // single count, and a live one is no departure.
+            if !member.departed_counted && member.pin.original_exited().unwrap_or(false) {
+                self.member_stops.stats.departed =
+                    self.member_stops.stats.departed.saturating_add(1);
+            }
             Self::resume_member(io, &member.pin);
         }
         self.resume_pending_at_release(io);
@@ -1738,9 +1883,12 @@ impl Engine {
             let Ok(pin) = crate::process::PidPin::open(tgid) else {
                 // Gone: nothing is stopped, and a row left behind would
                 // make the hooks' release hand a normal end to the
-                // watchdog's sweep.
+                // watchdog's sweep. The departure counts like the
+                // drain's.
                 if process_gone(tgid) {
                     let _ = io.withdraw(tgid);
+                    self.member_stops.stats.departed =
+                        self.member_stops.stats.departed.saturating_add(1);
                 }
                 continue;
             };

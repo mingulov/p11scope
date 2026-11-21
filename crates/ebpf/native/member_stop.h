@@ -3,7 +3,7 @@
 /* Run-tree first-map stop. Standalone object loaded only by an owned,
  * pause-armed `run` on its cgroup scope. The hook reads kernel VMA/file
  * metadata only (VM_EXEC, the mapping's range, the file's inode number
- * and superblock device):
+ * and superblock device) plus the current thread-group's size:
  * no syscall argument, user address, path, payload or memory content is
  * read or emitted. Shared by the BPF build and the userspace mirror in
  * `src/attach/member_stop.rs`, which pins every layout below. */

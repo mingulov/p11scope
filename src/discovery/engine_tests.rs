@@ -92714,10 +92714,12 @@ fn wait_zombie_for_test(pid: u32) {
     panic!("member {pid} never became a zombie");
 }
 
-/// A member that died with its row still pending (killed before the
-/// intake serviced it, unreaped) ran nothing after its stopping mapping
-/// was recorded: the row withdraws silently like a reaped member, with
-/// no first-use gap (nothing could have run unobserved) and no staging.
+/// A single-threaded member that died with its row still pending
+/// (killed before the intake serviced it, unreaped) ran nothing after
+/// its stopping mapping was recorded: the stop landed on its only
+/// thread's return-to-userspace path, which cannot clone while stopped.
+/// The row withdraws silently like a reaped member, with no first-use
+/// gap (nothing could have run unobserved) and no staging.
 #[test]
 fn member_stop_dead_member_with_a_pending_row_withdraws_silently() {
     let mut io = ScriptedMemberStops::default();
@@ -93064,21 +93066,23 @@ fn member_stop_mid_intake_death_with_unreadable_maps_withdraws_silently() {
 }
 
 /// The intake's unproven-file re-check is the silencer when death lands
-/// between the pre-check and the proof: alive at the pre-check, a corpse
-/// with an empty maps snapshot after. (The mountinfo override keeps the
-/// zombie's unreadable mount namespace from routing to the unreadable
-/// re-check instead.)
+/// between the snapshot read and the re-check: alive at the pre-check
+/// and through the maps read and proof, a corpse at site 3. (The kill
+/// fires on the first file clearance, after the snapshot was proven; a
+/// kill before the maps read would route to the unreadable re-check
+/// instead, since a zombie's maps read fails.)
 #[test]
 fn member_stop_mid_intake_death_with_unproven_file_withdraws_silently() {
     let mut inner = ScriptedMemberStops::default();
     let (mut child, pid, stop_ns) = stopped_member_with_row(&mut inner);
-    let mut io = KillingMemberStops::for_membership(inner, pid);
+    let mut io = KillingMemberStops::for_clear(inner, pid);
     let mut engine = member_stop_engine();
-    engine.member_stops.fuse_devs = Some(BTreeSet::new());
-    engine.member_stops.overlay_devs = Some(BTreeSet::new());
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
-    assert!(io.killed, "the kill seam fired after the pre-check");
+    assert!(
+        io.killed,
+        "the kill seam fired between the snapshot and site 3"
+    );
     assert!(
         !files_the_first_use_row(&engine),
         "no gap for a corpse with an unproven file"

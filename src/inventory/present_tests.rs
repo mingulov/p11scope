@@ -7459,7 +7459,10 @@ fn provider_line_with_two_docker_containers_reads_multiple_origins() {
 /// record: thirty per-pid ceiling trips — bare and wrapped wordings,
 /// which the registry cannot merge — render as a single
 /// `scan budget exhausted` line with the summed count, and an
-/// unrelated row still renders on its own line. Driven through the
+/// unrelated row still renders on its own line. A no-table
+/// diagnosis whose module path contains the ceiling sentence keeps
+/// its diagnosed reason and discovery command on every surface:
+/// producer-unrelated text never joins the fold. Driven through the
 /// real registry-to-presentation path, like the slow-host shape.
 #[test]
 fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
@@ -7496,12 +7499,25 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
             reason: "no BPF image identity".into(),
             budget: None,
         });
+    let tricky_path = format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so");
+    let tricky_reason = crate::discovery::scan::no_table_found_reason(&tricky_path, false);
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(2000),
+            subject: tricky_path.clone(),
+            reason: tricky_reason.clone(),
+            budget: None,
+        });
     harness.commit();
     let document = harness.render();
     let presentation = capture_for(&harness, &document);
     assert_eq!(
         presentation.gaps.len(),
-        31,
+        32,
         "every trip projects its own row: {:?}",
         presentation.gaps.len()
     );
@@ -7529,9 +7545,13 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
         verbose.contains("gap [process identity checked from /proc (PID and start time), not by the kernel (exact image authority unavailable)] no BPF image identity"),
         "unrelated rows still render on their own line: {verbose}"
     );
+    assert!(
+        verbose.contains(&tricky_reason),
+        "the no-table diagnosis keeps its reason and discovery command in text: {verbose}"
+    );
     let out = crate::inventory::render_json_from_presentation(&presentation);
     let kept = out["gaps"].as_array().unwrap();
-    assert_eq!(kept.len(), 31, "JSON keeps every record: {kept:?}");
+    assert_eq!(kept.len(), 32, "JSON keeps every record: {kept:?}");
     assert_eq!(
         kept.iter()
             .filter(|gap| gap["reason"] == "scan budget exhausted")
@@ -7539,12 +7559,140 @@ fn snapshot_folds_repeated_ceiling_stops_into_one_counted_row() {
         30,
         "every ceiling trip keeps its renamed record: {kept:?}"
     );
+    let tricky_json = kept
+        .iter()
+        .find(|gap| gap["subject"] == tricky_path.as_str())
+        .expect("the no-table record keeps its row");
+    assert_eq!(
+        tricky_json["reason"],
+        tricky_reason.as_str(),
+        "JSON keeps the diagnosed reason, never the folded one: {kept:?}"
+    );
+}
+
+/// The ceiling fold sums repeats per subject at the first row's
+/// position on both snapshot text renderers, and a lone trip
+/// renders bare: two rows carrying repeats 3 and 2 fold into one
+/// counted line with the exact total 5 (never the row count 2), a
+/// singleton renders without any count marker, and interleaved
+/// unrelated rows keep their own lines without reordering the
+/// fold. JSON and the unfolded presentation list keep every
+/// record with its identity and repeats.
+#[test]
+fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    let (mut harness, _caller) = single_caller_harness("present-ceiling-fold-repeats", 1);
+    let record =
+        |harness: &mut Harness, pid: Option<u32>, subject: &str, reason: &str, times: usize| {
+            for _ in 0..times {
+                harness
+                    .coordinator_mut()
+                    .registry_mut()
+                    .record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid,
+                        subject: subject.into(),
+                        reason: reason.into(),
+                        budget: None,
+                    });
+            }
+        };
+    record(&mut harness, None, "unrelated-a", "unrelated reason a", 1);
+    record(
+        &mut harness,
+        Some(2000),
+        "libother.so",
+        WORK_CEILING_REASON,
+        1,
+    );
+    record(&mut harness, None, "unrelated-b", "unrelated reason b", 1);
+    record(
+        &mut harness,
+        Some(1000),
+        "capture discovery",
+        WORK_CEILING_REASON,
+        3,
+    );
+    let wrapped =
+        format!("memory scan refused: final mapping validation unavailable: {WORK_CEILING_REASON}");
+    record(&mut harness, Some(1001), "capture discovery", &wrapped, 2);
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(
+        presentation.gaps.len(),
+        5,
+        "every distinct row projects: {:?}",
+        presentation.gaps.len()
+    );
+    assert_eq!(
+        presentation
+            .gaps
+            .iter()
+            .map(|gap| gap.repeats)
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 3, 2],
+        "the unfolded list keeps every record with its repeats"
+    );
+    let snapshot = render_snapshot(&presentation);
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == "gaps: 5")
+        .expect("the concise block headers the exact row count");
+    assert_eq!(
+        &lines[at..at + 5],
+        &[
+            "gaps: 5",
+            "  libother.so - scan budget exhausted",
+            "  5 x capture discovery - scan budget exhausted",
+            "  1 x unrelated-a - unrelated reason a",
+            "  1 x unrelated-b - unrelated reason b",
+        ],
+        "concise sums repeats per subject in encounter order with a bare singleton: {snapshot}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let gap_lines: Vec<&str> = verbose
+        .lines()
+        .filter(|line| line.starts_with("gap ["))
+        .collect();
+    assert_eq!(
+        gap_lines,
+        [
+            "gap [unrelated-a] unrelated reason a",
+            "gap [libother.so] scan budget exhausted",
+            "gap [unrelated-b] unrelated reason b",
+            "gap [capture discovery] scan budget exhausted (5 times)",
+        ],
+        "verbose folds the same family at its first row: {verbose}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let kept = out["gaps"].as_array().unwrap();
+    assert_eq!(kept.len(), 5, "JSON keeps every record: {kept:?}");
+    assert_eq!(
+        kept.iter()
+            .map(|gap| gap["repeats"].as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 1, 1, 3, 2],
+        "JSON keeps every record's repeats: {kept:?}"
+    );
+    assert_eq!(
+        kept.iter()
+            .filter(|gap| gap["reason"] == "scan budget exhausted")
+            .count(),
+        3,
+        "every ceiling trip keeps its renamed record: {kept:?}"
+    );
 }
 
 /// The ceiling fold maps the exact internal wordings only: the bare
 /// work-ceiling sentence and its scan-refusal wrappings fold;
 /// near misses (the deadline twin, a bare prefix, unrelated
-/// reasons) never fold.
+/// reasons) never fold. A no-table diagnosis whose module path
+/// happens to contain the ceiling sentence never folds either:
+/// the path is producer-unrelated text, and folding would lose
+/// the diagnosis and the discovery command.
 #[test]
 fn ceiling_fold_maps_exact_wordings_only() {
     use crate::discovery::scan::WORK_CEILING_REASON;
@@ -7557,6 +7705,12 @@ fn ceiling_fold_maps_exact_wordings_only() {
     assert_eq!(
         fold_scan_ceiling_reason(
             "memory scan refused: process generation changed during acquisition: capture discovery work ceiling reached; remaining provider bytes were not scanned"
+        ),
+        Some("scan budget exhausted")
+    );
+    assert_eq!(
+        fold_scan_ceiling_reason(
+            "memory scan refused: initial mapping validation unavailable: capture discovery work ceiling reached; remaining provider bytes were not scanned"
         ),
         Some("scan budget exhausted")
     );
@@ -7575,4 +7729,15 @@ fn ceiling_fold_maps_exact_wordings_only() {
         None
     );
     assert_eq!(fold_scan_ceiling_reason("some unrelated reason"), None);
+    for hinted in [false, true] {
+        let reason = crate::discovery::scan::no_table_found_reason(
+            &format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so"),
+            hinted,
+        );
+        assert_eq!(
+            fold_scan_ceiling_reason(&reason),
+            None,
+            "producer-unrelated path text must not fold: {reason}"
+        );
+    }
 }

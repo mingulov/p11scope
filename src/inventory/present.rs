@@ -470,14 +470,41 @@ pub(crate) struct GapView {
 pub(crate) const SCAN_BUDGET_EXHAUSTED_REASON: &str = "scan budget exhausted";
 
 /// Fold one internal gap reason to its finite public row, if it
-/// names a scan work-ceiling stop: the bare ceiling sentence or the
-/// same sentence wrapped in a scan refusal, whatever subject filed
-/// it. Near misses (deadline, clock and I/O ceilings, bare
-/// prefixes, unrelated reasons) never fold.
+/// names a scan work-ceiling stop: the exact bare ceiling sentence
+/// or the exact producer-owned scan-refusal wrappings, whatever
+/// subject filed it. Near misses (deadline, clock and I/O ceilings,
+/// bare prefixes, unrelated reasons) never fold — and neither does
+/// producer-unrelated text that merely contains the sentence, such
+/// as a module pathname inside a diagnosis.
 pub(crate) fn fold_scan_ceiling_reason(reason: &str) -> Option<&'static str> {
-    reason
-        .contains(crate::discovery::scan::WORK_CEILING_REASON)
-        .then_some(SCAN_BUDGET_EXHAUSTED_REASON)
+    crate::discovery::scan::is_work_ceiling_stop(reason).then_some(SCAN_BUDGET_EXHAUSTED_REASON)
+}
+
+/// Aggregate just the scan-budget ceiling family by subject with the
+/// summed repeats at the first row's position; every other gap passes
+/// through untouched in encounter order. Both snapshot text renderers
+/// format this folded list; JSON and the dashboard keep every record.
+/// Budget rows never fold.
+fn fold_ceiling_for_text(gaps: &[GapView]) -> Vec<GapView> {
+    let mut index: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+    let mut rows: Vec<GapView> = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
+            let key = (gap.subject.as_str(), gap.reason.as_str());
+            match index.get(&key) {
+                Some(&fold_at) => {
+                    rows[fold_at].repeats = rows[fold_at].repeats.saturating_add(gap.repeats);
+                }
+                None => {
+                    index.insert(key, rows.len());
+                    rows.push(gap.clone());
+                }
+            }
+        } else {
+            rows.push(gap.clone());
+        }
+    }
+    rows
 }
 
 /// Shared allocation charges and actual owned-state counts at publication.
@@ -2804,7 +2831,19 @@ fn ellipsize_words_to(text: &str, max_chars: usize) -> String {
 /// on a word boundary, never mid-word. Only a reason overflowing on
 /// its own truncates the whole line, likewise on a word boundary.
 fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
-    let head = format!("  {count} x ");
+    gap_line_with_head(&format!("  {count} x "), subject, reason)
+}
+
+/// One bare concise singleton line: `  {subject} - {reason}`, without
+/// any count marker. Same truncation policy as [`gap_group_line`].
+fn gap_single_line(subject: &str, reason: &str) -> String {
+    gap_line_with_head("  ", subject, reason)
+}
+
+/// One concise line with a caller-supplied head: the shared
+/// subject/reason truncation behind [`gap_group_line`] and
+/// [`gap_single_line`].
+fn gap_line_with_head(head: &str, subject: &str, reason: &str) -> String {
     let tail = format!(" - {reason}");
     let fixed = head.chars().count() + tail.chars().count();
     if subject.chars().count() + fixed <= SUMMARY_LINE_MAX_CHARS {
@@ -3226,7 +3265,24 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// A replaced row naming an admitted (or was-admitted) provider file
 /// never folds: it keeps its own named row. Verbose and JSON keep
 /// every row.
+/// Scan-budget ceiling trips fold before grouping: one line per
+/// subject with the exact summed repeats, in first-encounter order,
+/// ahead of the ranked ordinary groups; a lone trip renders bare.
 fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<String> {
+    // The scan-budget ceiling family folds before grouping: one line per
+    // subject with the summed repeats, in first-encounter order, ahead of
+    // the ranked ordinary groups. A lone trip renders bare. Everything
+    // below groups the ordinary rows only.
+    let folded = fold_ceiling_for_text(gaps);
+    let mut ceiling: Vec<&GapView> = Vec::new();
+    let mut ordinary: Vec<&GapView> = Vec::new();
+    for gap in &folded {
+        if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
+            ceiling.push(gap);
+        } else {
+            ordinary.push(gap);
+        }
+    }
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
     // Deferred-attach fold: the stop-time summaries append while the
@@ -3236,7 +3292,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     // the summary suppressed) still reads on its own, never hidden.
     let folded_by_scope: std::collections::BTreeMap<DeferralFoldScope, &str> = {
         let mut map = std::collections::BTreeMap::new();
-        for gap in gaps.iter() {
+        for gap in ordinary.iter().copied() {
             if gap.subject
                 == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
                 && crate::discovery::engine::inventory_coordinator::is_deferral_folded_reason(
@@ -3267,7 +3323,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     let mut replaced: Vec<&GapView> = Vec::new();
     let mut maps: Vec<&GapView> = Vec::new();
     let mut rest: Vec<&GapView> = Vec::new();
-    for gap in gaps.iter() {
+    for gap in ordinary.iter().copied() {
         if is_concise_redundant_per_key_off_gap(gap) {
             continue;
         }
@@ -3391,7 +3447,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         entry.0 += maps.len();
         entry.1 = false;
     }
-    if groups.is_empty() {
+    if groups.is_empty() && ceiling.is_empty() {
         return Vec::new();
     }
     let mut ranked: Vec<((String, String), (usize, bool))> = groups.into_iter().collect();
@@ -3406,10 +3462,35 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             .then_with(|| left.0.cmp(&right.0))
     });
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
-    for ((subject, reason), (count, _)) in ranked.iter().take(GAP_GROUPS_SHOWN) {
-        lines.push(gap_group_line(*count, subject, reason));
+    let mut shown = 0usize;
+    for row in &ceiling {
+        if shown >= GAP_GROUPS_SHOWN {
+            break;
+        }
+        let subject = escape_controls(gap_plain_subject(&row.subject, &row.reason)).into_owned();
+        let reason = escape_controls(gap_plain_reason(&row.subject, &row.reason)).into_owned();
+        if row.repeats == 1 {
+            lines.push(gap_single_line(&subject, &reason));
+        } else {
+            lines.push(gap_group_line(
+                usize::try_from(row.repeats).unwrap_or(usize::MAX),
+                &subject,
+                &reason,
+            ));
+        }
+        shown += 1;
     }
-    let rest = ranked.len().saturating_sub(GAP_GROUPS_SHOWN);
+    for ((subject, reason), (count, _)) in ranked.iter() {
+        if shown >= GAP_GROUPS_SHOWN {
+            break;
+        }
+        lines.push(gap_group_line(*count, subject, reason));
+        shown += 1;
+    }
+    let rest = ceiling
+        .len()
+        .saturating_add(ranked.len())
+        .saturating_sub(shown);
     if rest == 1 {
         lines.push("  and 1 more group (--json has every item)".to_string());
     } else if rest > 1 {
@@ -5368,25 +5449,15 @@ fn render_snapshot_inner(
         }
     }
     // Folded noise families render as one named counted line per
-    // (subject, reason) with the summed repeats: a slow host files
-    // one ceiling trip per pass per caller, and the operator needs
-    // the total, not ninety lines. The folded line lands where its
-    // first row stood, so order is preserved; JSON keeps every
-    // record. (Budget rows never fold.)
-    let mut folded_totals: BTreeMap<(&str, &str), u64> = BTreeMap::new();
-    for gap in &presentation.gaps {
-        if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
-            let total = folded_totals
-                .entry((gap.subject.as_str(), gap.reason.as_str()))
-                .or_insert(0);
-            *total = total.saturating_add(gap.repeats);
-        }
-    }
-    let mut folded_emitted: std::collections::BTreeSet<(&str, &str)> =
-        std::collections::BTreeSet::new();
+    // subject with the summed repeats: a slow host files one ceiling
+    // trip per pass per caller, and the operator needs the total, not
+    // ninety lines. The shared fold lands each line where its first
+    // row stood, so order is preserved; JSON keeps every record.
+    // (Budget rows never fold.)
+    let folded = fold_ceiling_for_text(&presentation.gaps);
     // Every row renders on its own line below; no size wording
     // remains to fold.
-    for gap in &presentation.gaps {
+    for gap in &folded {
         // Subjects and reasons carry target-controlled strings (paths,
         // error text): escaped like every other snapshot field (DR-11).
         // Known machine subjects/reasons render in plain words with the
@@ -5415,21 +5486,11 @@ fn render_snapshot_inner(
                 || gap.reason.strip_prefix("joint_unclaimable_").is_some())
             && gap.repeats > 1;
         // A folded noise row counts its whole family once, at its
-        // first row; later rows of the family render nothing. A lone
-        // folded row renders bare, like any other single row.
-        let (repeats, folded_family) =
-            if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
-                let key = (gap.subject.as_str(), gap.reason.as_str());
-                if !folded_emitted.insert(key) {
-                    continue;
-                }
-                (
-                    folded_totals.get(&key).copied().unwrap_or(gap.repeats),
-                    true,
-                )
-            } else {
-                (gap.repeats, false)
-            };
+        // first row; a lone folded row renders bare, like any other
+        // single row. The shared fold above already summed each
+        // family, so every row here renders exactly once.
+        let folded_family = gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON;
+        let repeats = gap.repeats;
         let merged_folded = folded_family && repeats > 1;
         match gap.budget {
             Some(refusal) => {

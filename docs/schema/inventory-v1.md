@@ -998,18 +998,20 @@ and never proves an app identity. See the app identity rows of
   or path) in the `reason`, so different modules stay distinct gaps. The first
   occurrence keeps its position in `gaps[]`.
   Repeated scan work-ceiling stops project to the single finite
-  reason `scan budget exhausted` (bare stops and stops wrapped in
-  scan refusals alike, whatever subject filed them): one pass's
-  allowance tripped mid-scan, true per event even when a resumed
-  pass completes the work afterward. Every trip keeps its own
-  `gaps[]` record with its attribution and `repeats`; the snapshot
-  text folds same-subject rows into one counted line
-  (`gap [subject] scan budget exhausted (N times)`) at the first
-  row's position, with the exact summed total, so a slow host that
-  files one trip per pass per caller reads as one line instead of
-  dozens. A lone trip renders bare. The dashboard lists the renamed
-  rows unfolded (its per-row navigation keeps each trip's
-  attribution).
+  reason `scan budget exhausted` (the exact bare wording and the
+  exact producer-owned scan-refusal wrappings alike, whatever subject
+  filed them): one pass's allowance tripped mid-scan, true per event
+  even when a resumed pass completes the work afterward.
+  Producer-unrelated text that merely contains the stop sentence
+  (such as a module pathname inside a diagnosis) never projects.
+  Every trip keeps its own `gaps[]` record with its attribution and
+  `repeats`; the snapshot text folds same-subject rows into one
+  counted line (`gap [subject] scan budget exhausted (N times)`)
+  at the first row's position, with the exact summed total, so a
+  slow host that files one trip per pass per caller reads as one
+  line instead of dozens. A lone trip renders bare. The dashboard
+  lists the renamed rows unfolded (its per-row navigation keeps each
+  trip's attribution).
   A gap that records a budget refusal carries `budget` with the
   `resource`, its `limit`, and the `requested` occupancy; every other
   gap carries `budget: null`. Run-lifetime admission refusals name the

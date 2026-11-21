@@ -1274,9 +1274,8 @@ fn continued_view_gap(
     start_time: Option<u64>,
 ) -> Option<(String, String)> {
     let gap = budget.view_in_progress_gap(pid, start_time)?;
-    skipped.retain(|skip| {
-        !(skip.reason.contains(WORK_CEILING_REASON) || skip.reason.contains(COLLECTION_STOP_REASON))
-    });
+    skipped
+        .retain(|skip| !(is_work_ceiling_stop(&skip.reason) || is_collection_stop(&skip.reason)));
     Some(gap)
 }
 
@@ -7990,6 +7989,54 @@ const INITIAL_MAPS_UNAVAILABLE_REASON: &str =
     "memory scan refused: initial mapping validation unavailable";
 const SCAN_GENERATION_CHANGED_REASON: &str =
     "memory scan refused: process generation changed during acquisition";
+
+/// Whether `reason` is a genuine scan work-ceiling stop: the exact bare
+/// sentence or the exact producer-owned refusal wrappings (initial/final
+/// mapping validation, generation change) with the exact stop detail.
+/// Never a substring match: producer advice embeds shell-quoted module
+/// pathnames, and a path containing the sentence must not classify as
+/// a budget stop.
+pub(crate) fn is_work_ceiling_stop(reason: &str) -> bool {
+    is_stop_with_provenance(
+        reason,
+        WORK_CEILING_REASON,
+        &[
+            INITIAL_MAPS_UNAVAILABLE_REASON,
+            FINAL_MAPS_UNAVAILABLE_REASON,
+            SCAN_GENERATION_CHANGED_REASON,
+        ],
+    )
+}
+
+/// Whether `reason` is a genuine collection-stop signal with the same
+/// provenance rule as [`is_work_ceiling_stop`]: the exact bare sentence
+/// or the exact producer-owned refusal wrappings.
+pub(crate) fn is_collection_stop(reason: &str) -> bool {
+    is_stop_with_provenance(
+        reason,
+        COLLECTION_STOP_REASON,
+        &[
+            INITIAL_MAPS_UNAVAILABLE_REASON,
+            FINAL_MAPS_UNAVAILABLE_REASON,
+            SCAN_GENERATION_CHANGED_REASON,
+        ],
+    )
+}
+
+/// Exact provenance match for one budget-stop sentence: the bare wording
+/// or `{refusal prefix}: {sentence}` for a producer-owned refusal
+/// prefix. Anything else — including producer-unrelated text that
+/// merely contains the sentence — never matches.
+fn is_stop_with_provenance(reason: &str, stop: &str, prefixes: &[&str]) -> bool {
+    if reason == stop {
+        return true;
+    }
+    prefixes.iter().any(|prefix| {
+        reason
+            .strip_prefix(prefix)
+            .is_some_and(|tail| tail.strip_prefix(": ").is_some_and(|detail| detail == stop))
+    })
+}
 
 /// All provider mappings establish inventory authority. They also cover every
 /// searched data snapshot (even empty ones), complete interface descriptors, and
@@ -22888,12 +22935,23 @@ int main(int argc, char **argv) {
     }
 
     /// End-of-view continuation naming: while the view holds
-    /// unfinished cursors, raw pass-budget stops (plain and composed)
-    /// drop and the in-progress gap names the continuation; without
+    /// unfinished cursors, genuine pass-budget stops (the exact bare
+    /// wordings and the exact producer-owned refusal wrappings) drop
+    /// and the in-progress gap names the continuation; without
     /// unfinished cursors — none, another view's, or only completed —
     /// every gap stays verbatim, so a stall keeps its exact raw wording.
+    /// A no-table diagnosis whose module path contains the ceiling
+    /// sentence, and any other non-producer wrapping of a stop
+    /// sentence, is producer-unrelated text, never a raw stop: both
+    /// stay verbatim even while unfinished.
     #[test]
     fn continued_view_gap_drops_raw_stops_only_while_unfinished() {
+        let tricky_path = format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so");
+        let tricky = no_table_found_reason(&tricky_path, false);
+        let wrapped_work = format!("{FINAL_MAPS_UNAVAILABLE_REASON}: {WORK_CEILING_REASON}");
+        let wrapped_collection =
+            format!("{INITIAL_MAPS_UNAVAILABLE_REASON}: {COLLECTION_STOP_REASON}");
+        let generic_wrapping = format!("prefix: {WORK_CEILING_REASON}");
         let skips = || {
             vec![
                 Skipped {
@@ -22902,7 +22960,23 @@ int main(int argc, char **argv) {
                 },
                 Skipped {
                     subject: "m".into(),
-                    reason: format!("prefix: {COLLECTION_STOP_REASON}"),
+                    reason: wrapped_work.clone(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: COLLECTION_STOP_REASON.into(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: wrapped_collection.clone(),
+                },
+                Skipped {
+                    subject: tricky_path.clone(),
+                    reason: tricky.clone(),
+                },
+                Skipped {
+                    subject: "m".into(),
+                    reason: generic_wrapping.clone(),
                 },
                 Skipped {
                     subject: "m".into(),
@@ -22924,18 +22998,22 @@ int main(int argc, char **argv) {
                 .iter()
                 .map(|skip| skip.reason.as_str())
                 .collect::<Vec<_>>(),
-            vec!["unrelated refusal"],
-            "raw pass-budget stops drop while unfinished"
+            vec![
+                tricky.as_str(),
+                generic_wrapping.as_str(),
+                "unrelated refusal"
+            ],
+            "genuine stops drop while unfinished, unrelated text stays"
         );
         // Negative: no cursors, everything stays verbatim.
         let bare = CaptureWorkBudget::default();
         let mut skipped = skips();
         assert_eq!(continued_view_gap(&mut skipped, &bare, 7, Some(9)), None);
-        assert_eq!(skipped.len(), 3, "a stall keeps its exact raw wording");
+        assert_eq!(skipped.len(), 7, "a stall keeps its exact raw wording");
         // Negative: unfinished cursors in another view do not filter.
         let mut skipped = skips();
         assert_eq!(continued_view_gap(&mut skipped, &budget, 8, Some(9)), None);
-        assert_eq!(skipped.len(), 3);
+        assert_eq!(skipped.len(), 7);
         // Negative: only completed cursors do not filter.
         let mut done =
             CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
@@ -22943,7 +23021,7 @@ int main(int argc, char **argv) {
         assert!(done.record_decode_cursor(key, cursor));
         let mut skipped = skips();
         assert_eq!(continued_view_gap(&mut skipped, &done, 7, Some(9)), None);
-        assert_eq!(skipped.len(), 3);
+        assert_eq!(skipped.len(), 7);
     }
 
     /// Cursor reclamation under a tight byte ceiling: dead generations

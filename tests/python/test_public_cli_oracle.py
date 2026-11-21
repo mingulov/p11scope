@@ -1072,6 +1072,23 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_pure_multi_deferral_fails_in_strict_mode(self):
+        # The exit arm's `any(exit)` conjunct keeps a pure
+        # multi-deferral shape failing strict: ok_quiet covers exactly
+        # one deferral, so two bare deferrals with no exit row are not
+        # the exit-ambient shape and still fail.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
     def test_exit_ambient_with_other_class_fails_in_strict_mode(self):
         # Exit skips bundled with any further observation class are
         # not the exit-ambient shape: a descendant gap alongside still
@@ -1488,6 +1505,109 @@ class RunnerNoiseTests(unittest.TestCase):
                 {"name": "counting coverage",
                  "reason": "counting probes were retired mid-capture; "
                            "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 39
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
+    def test_coverage_retired_exit_passes_in_strict_mode(self):
+        # Exit composition (fedora host rep26, 2026-11-21): the fixed
+        # R1 disclosure plus one folded mid-flight exit qualifies
+        # strict with exact counts. Shape mirrors the loop failure
+        # (lossy [skipped, coverage_retired_slots], [R1, exit] skips
+        # in this order, slots=68, gaps=0, exact 64000/64000): the
+        # gap-fold renamed the quiet row the coverage-quiet pin
+        # accepted, and the exit row must be counted and disclosed,
+        # never silent.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-exit-ambient-gap")
+        self.assertIn("mid_flight_exits=1", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_coverage_retired_exit_reversed_passes_in_strict_mode(self):
+        # Skip order is not load-bearing: the same pair in reverse
+        # order qualifies strict too, with the same exit disclosure.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-exit-ambient-gap")
+        self.assertIn("mid_flight_exits=1", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_coverage_retired_exit_passes_when_allowed(self):
+        # The exit composition qualifies relaxed too: the flagged host
+        # leg keeps the runner-noise qualification and names the exit
+        # count, exactly like the r2 relaxed exit-disclosure rule.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("mid_flight_exits=1", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_coverage_retired_exit_with_sibling_reason_fails(self):
+        # The exit composition names exactly one folded reason: the R1
+        # row plus a sibling fold (scan-budget stop) stays a new shape
+        # and still fails, strict and relaxed alike.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "scan budget exhausted"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
+            d["evidence"]["coverage_retired_slots"] = 68
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True,
+                                         want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_coverage_retired_exit_with_count_mismatch_fails(self):
+        # The exit composition never waives exact owned counts: the
+        # disclosed pair with a 39/40 deficit still fails.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "counting coverage",
+                 "reason": "counting probes were retired mid-capture; "
+                           "calls in the retire window were not observed"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"}]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped", "coverage_retired_slots"]}
             d["evidence"]["coverage_retired_slots"] = 68

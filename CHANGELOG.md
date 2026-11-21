@@ -83,6 +83,7 @@ versioned separately and are opaque, exact dispatch keys.
 - More providers' creation templates yield curves and parameter
   sets for every key type, so fewer new-key fields stay unknown;
   unknowns keep their named reasons.
+- The tested kernel matrix moves from Linux 7.4-rc2 to 7.4-rc3.
 
 ### Changed
 

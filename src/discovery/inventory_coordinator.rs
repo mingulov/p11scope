@@ -38848,10 +38848,12 @@ int main(void) {
     /// unfinished cursors, so the terminal shows no in-progress gap —
     /// never the old stashed counts as a pending resume. While the worker
     /// owns the bundle, the stash still serves the live gap (the in-flight
-    /// ownership positive below).
+    /// ownership positive below). Routed through the accepted-return
+    /// custody path with the coordinator-issued fence and root, so a
+    /// revert to the guarded stash call turns this RED.
     #[test]
     fn accepted_empty_bundle_return_clears_the_stashed_scan_progress() {
-        let mut coordinator = coordinator();
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
         // One unfinished cursor, like a sole hinted object mid-scan.
         let file = std::fs::File::open("/bin/sh").unwrap();
         let key = crate::discovery::scan_pass::DecodeCursorKey {
@@ -38888,17 +38890,26 @@ int main(void) {
             .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
         assert!(budget.record_decode_cursor(key, cursor));
         coordinator.cgroup_file_facts = budget.take_retained_file_facts();
-        // The take path stashes while the bundle leaves for the worker.
-        coordinator.stash_scan_progress();
-        let _taken = std::mem::take(&mut coordinator.cgroup_file_facts);
+        // The issue path stashes while the bundle leaves for the worker.
+        let collect = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap();
         assert!(
             coordinator.live_scan_progress_gap().is_some(),
             "the stash serves the live gap while the worker owns the bundle"
         );
-        // The worker returns an empty bundle (the sole object unmapped).
-        // The accepted return replaces the stash, clearing it.
-        coordinator.cgroup_file_facts = crate::discovery::scan::RetainedFileFacts::default();
-        coordinator.replace_scan_progress_stash();
+        let mut collection = collect();
+        // The worker observed the sole object unmap and returns an empty
+        // bundle: drain what the live scene scanned to that shape.
+        let _drained = collection.take_retained_file_facts();
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
         assert!(
             coordinator.live_scan_progress_gap().is_none(),
             "an accepted empty return leaves no stale in-progress gap"

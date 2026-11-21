@@ -269,11 +269,20 @@ if name=='vng':
         fixed=[]
         for line in lines:
             if mangle=='work-ready-bare' and line.startswith(b'guest-work-ready='): line=b'guest-work-ready='
+            elif mangle=='work-ready-subpath' and line.startswith(b'guest-work-ready='): line=line+b'/unexpected'
             elif mangle=='token-ok-suffix' and line==b'guest-stage=token-ok': line=b'guest-stage=token-okEXTRA'
             elif mangle=='workload-ready-bel' and line==b'guest-stage=workload-ready': line=b'guest-stage=workload-ready\x07'
             elif mangle=='release-suffix' and line.startswith(b'guest-release='): line=line+b'=unexpected'
             elif mangle=='journal-rc-suffix' and line.startswith(b'journal-rc='): line=line+b'=unexpected'
             fixed.append(line)
+        if mangle=='journal-rc-append-corrupt':
+            extra=b'journal-rc=0=unexpected'
+            if fixed and fixed[-1]==b'': fixed.insert(len(fixed)-1,extra)
+            else: fixed.append(extra)
+        elif mangle=='token-failed-append-malformed':
+            extra=b'guest-stage=token-failedEXTRA'
+            if fixed and fixed[-1]==b'': fixed.insert(len(fixed)-1,extra)
+            else: fixed.append(extra)
         sys.stdout.buffer.write(b'\n'.join(fixed))
         sys.stdout.buffer.flush()
         sys.stderr.buffer.write(done.stderr)
@@ -395,6 +404,7 @@ class JournalGateTests(unittest.TestCase):
             "crash": rows,
             "refusal-515": [],
             "refusal-515-loaded": rows,
+            "refusal-515-timeout": [],
             "refused-noseal-loaded": rows,
         }))
         (self.work / "texts.json").write_text(json.dumps({
@@ -514,6 +524,10 @@ class JournalGateTests(unittest.TestCase):
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness\n"},
             "refusal-515-loaded": {"rc": 1, "text":
+                "p11scope: live capture unavailable: loading p11scope's BPF "
+                "programs is not supported on this host; run 'p11scope doctor' "
+                "for host readiness\n"},
+            "refusal-515-timeout": {"rc": 124, "text":
                 "p11scope: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
                 "for host readiness\n"},
@@ -1197,6 +1211,51 @@ class JournalGateTests(unittest.TestCase):
         self.assertFalse(row["pass"])
         self.assertNotEqual(row["qualification"], "qualified")
 
+    def test_key_sizes_run_with_duplicate_journal_rc_fails(self):
+        # A healthy exit line plus a corrupt terminal duplicate must
+        # refuse as infrastructure: the older well-shaped record
+        # cannot stand in for the corrupt terminal line.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "journal-rc-append-corrupt"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest exit", row["detail"])
+
+    def test_key_sizes_run_with_malformed_token_failure_fails(self):
+        # A malformed token-failure stage beside healthy positives
+        # must refuse as infrastructure: it is a corrupt stage
+        # record, not an ignored line.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "token-failed-append-malformed"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest stage", row["detail"])
+
+    def test_key_sizes_run_with_work_ready_subpath_fails(self):
+        # A work-ready TMPDIR with a subpath is not the emitted
+        # mktemp basename shape: the complete proof must refuse as
+        # infrastructure.
+        budgets = self.owned_key_sizes_budgets()
+        result, out = self.run_gate(
+            KERNEL, mode="linked-key-sizes", budgets=budgets,
+            object_name="journal-gate1", key_sizes="1",
+            extra={"FAKE_VNG_MANGLE": "work-ready-subpath"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "nonqualifying")
+        self.assertIn("guest work area never readied", row["detail"])
+
     def test_key_sizes_run_with_seal_nul_fails(self):
         # A seal line with NUL after the marker still contains the
         # fragment, but the complete proof must refuse.
@@ -1442,6 +1501,18 @@ class JournalGateTests(unittest.TestCase):
         self.assertEqual(row["qualification"], "failed")
         self.assertIn("unreadable or corrupt", row["detail"])
         self.assertIn("journal pair loaded", row["detail"])
+
+    def test_refusal_control_with_timeout_rc_fails(self):
+        # Pre-Multi timeout: the finite refusal text with the
+        # observer's timeout exit is not the finite refusal exit, so
+        # the control must fail naming the timeout.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515-timeout")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("timed out", row["detail"])
 
     def test_omitted_build_with_nonobject_suffix_retains_loads(self):
         # Omitted-build non-object suffix: loaded rows plus a valid

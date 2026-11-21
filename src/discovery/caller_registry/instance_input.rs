@@ -3146,6 +3146,15 @@ impl CallerRegistry {
             }
             if let Some((id, current)) = cursor.current.as_mut() {
                 let id = *id;
+                if !gate.try_charge() {
+                    self.staged_disposal = Some(cursor);
+                    let spent = gate.spent();
+                    debug_assert!(spent <= budget);
+                    return (false, spent);
+                }
+                #[cfg(test)]
+                self.test_disposal_reads
+                    .set(self.test_disposal_reads.get() + 1);
                 let Some(record) = self.instance_state.semantics.get_mut(&id) else {
                     cursor.current = None;
                     cursor.done_upto = Some(id);
@@ -3188,31 +3197,34 @@ impl CallerRegistry {
             #[cfg(test)]
             self.test_disposal_reads
                 .set(self.test_disposal_reads.get() + 1);
-            let next_id = {
+            // The ordered selection and the record borrow are one
+            // visit: the mutable range yields the next record's
+            // staged length and mode directly under the granted unit
+            // (length and mode are field reads on the held record,
+            // not further keyed lookups), so no second lookup runs
+            // uncharged.
+            let next = {
                 use std::ops::Bound::{Excluded, Unbounded};
-                let map = &self.instance_state.semantics;
+                let map = &mut self.instance_state.semantics;
                 match cursor.done_upto {
-                    None => map.keys().next().copied(),
-                    Some(done) => map
-                        .range((Excluded(done), Unbounded))
-                        .next()
-                        .map(|(id, _)| *id),
+                    None => map.iter_mut().next().map(|(id, record)| {
+                        (*id, record.feed.staged_len(), record.feed.mode())
+                    }),
+                    Some(done) => map.range_mut((Excluded(done), Unbounded)).next().map(
+                        |(id, record)| (*id, record.feed.staged_len(), record.feed.mode()),
+                    ),
                 }
             };
-            let Some(next_id) = next_id else {
+            let Some((next_id, staged_len, mode)) = next else {
                 let spent = gate.spent();
                 debug_assert!(spent <= budget);
                 return (true, spent);
             };
-            let Some(record) = self.instance_state.semantics.get_mut(&next_id) else {
-                cursor.done_upto = Some(next_id);
-                continue;
-            };
-            if record.feed.staged_len() == 0 {
+            if staged_len == 0 {
                 cursor.done_upto = Some(next_id);
                 continue;
             }
-            let is_joint = record.feed.mode() == FeedMode::Joint;
+            let is_joint = mode == FeedMode::Joint;
             cursor.current = Some((
                 next_id,
                 crate::semantics_key_use::FeedDisposalCursor::new(next_id, is_joint),
@@ -7361,6 +7373,52 @@ mod staged_disposal_gate_tests {
             (spent, reads),
             (2, 2),
             "the feed visit and the terminal empty lookup each charge first"
+        );
+    }
+
+    /// A non-empty feed's resume lookup charges like its selection:
+    /// one 64-unit poll over two staged Bounded heads performs
+    /// exactly the ordered selection visit plus the current-record
+    /// visit (two Bounded pops alone need 112 units, so the feed
+    /// cannot finish inline and no third visit runs).
+    #[test]
+    fn staged_disposal_current_resume_consumes_its_unit() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(2);
+        let mut record = empty_record(id);
+        record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+        for (position, session) in [(1u64, 6001u64), (2, 6002)] {
+            let facts = crate::semantics_edge::SemanticCall {
+                function: "C_SignInit".into(),
+                session,
+                mechanism: 0x000d,
+                capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ts_ns: 100 * position,
+                ..crate::semantics_edge::SemanticCall::default()
+            };
+            let origin = crate::semantics_edge::EffectOrigin {
+                function: "C_SignInit".into(),
+                session,
+                ts_ns: 100 * position,
+            };
+            record
+                .feed
+                .stage(facts, origin, position, &mut ledger)
+                .unwrap();
+        }
+        registry.instance_state.semantics.insert(id, record);
+        registry.start_staged_disposal();
+        let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+        let reads = registry.test_disposal_reads_for_test();
+        assert!(!done, "two Bounded heads span several credits");
+        assert_eq!(spent, 64, "the first credit is fully consumed");
+        assert_eq!(
+            reads, 2,
+            "the ordered selection and the current-record resume each charge first"
         );
     }
 }

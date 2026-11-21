@@ -450,6 +450,16 @@ impl JointStaging {
         staging
     }
 
+    /// Test-only Joint feed without a selection receipt: the disposal
+    /// twins' feed shape for registry-seam tests outside this module
+    /// (disposal drains staged heads without consulting receipts).
+    #[cfg(test)]
+    pub(crate) fn select_joint_for_test() -> Self {
+        let mut staging = Self::select_s1_only();
+        staging.mode = FeedMode::Joint;
+        staging
+    }
+
     /// The original selection remains retained even after a feed degrades.
     /// A later broad loss may still invalidate this incarnation's history.
     pub(crate) fn selected_receipt(&self) -> Option<&BootstrapReceipt> {
@@ -5057,9 +5067,7 @@ mod disposal_tests {
     }
 
     fn joint_feed() -> JointStaging {
-        let mut feed = JointStaging::select_s1_only();
-        feed.mode = FeedMode::Joint;
-        feed
+        JointStaging::select_joint_for_test()
     }
 
     fn unknown_sums(keyuse: &KeyUseReducer) -> [u64; 4] {

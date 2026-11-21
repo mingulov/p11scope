@@ -13890,10 +13890,11 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
     }
     assert_eq!(
         (first_spent, first_reads),
-        (Some(64), Some(61)),
-        "two feed visits plus one charged peek plus 61 unlink leaves \
-         fill the first 64-unit credit (fix round 5: the peek reads \
-         after its grant, displacing one unlink leaf; ruling requested)"
+        (Some(64), Some(60)),
+        "two ordered feed visits plus one charged current-record resume \
+         plus one charged peek plus 60 unlink leaves fill the first \
+         64-unit credit (the resume lookup charges before it reads, \
+         displacing one unlink leaf; ruling requested)"
     );
     assert!(
         disposal_polls > 1,

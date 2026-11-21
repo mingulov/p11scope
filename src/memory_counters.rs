@@ -65,6 +65,9 @@ pub(crate) const HEAP_R11_ROW: usize = 96;
 /// Folded unidentified-image group: exe path/candidates plus the
 /// oldest-pid sample (five pids with their exe strings).
 pub(crate) const HEAP_UNBOUND_FOLD: usize = 2048;
+/// Re-witness ring entry: the fold-key group path string (cloned
+/// from the folded image's exe) plus map/queue shells.
+pub(crate) const HEAP_UNBOUND_FOLD_RING: usize = 256;
 
 /// One counter row: entry count and estimated bytes. Serializes as a
 /// compact `[len, bytes]` pair: at budget caps the object form needs
@@ -169,6 +172,7 @@ pub(crate) struct RegistryLens {
     pub unbound_images: CounterRow,
     pub unbound_module_images: CounterRow,
     pub unbound_folded: CounterRow,
+    pub unbound_fold_ring: CounterRow,
     pub departed_identities: CounterRow,
     pub departed_mechs: CounterRow,
     pub edge: EdgeLens,
@@ -405,6 +409,7 @@ pub(crate) struct MemorySnapshot {
     r2_registry_unbound_images: Option<CounterRow>,
     r2_registry_unbound_module_images: Option<CounterRow>,
     r2_registry_unbound_folded: Option<CounterRow>,
+    r2_registry_unbound_fold_ring: Option<CounterRow>,
     r2_registry_departed_identities: Option<CounterRow>,
     r2_registry_departed_mechs: Option<CounterRow>,
     r3_edge_open: Option<CounterRow>,
@@ -588,6 +593,7 @@ impl MemorySnapshot {
             r2_registry_unbound_images: None,
             r2_registry_unbound_module_images: None,
             r2_registry_unbound_folded: None,
+            r2_registry_unbound_fold_ring: None,
             r2_registry_departed_identities: None,
             r2_registry_departed_mechs: None,
             r3_edge_open: None,
@@ -699,6 +705,7 @@ impl MemorySnapshot {
             r2_registry_unbound_images: Some(lens.registry.unbound_images),
             r2_registry_unbound_module_images: Some(lens.registry.unbound_module_images),
             r2_registry_unbound_folded: Some(lens.registry.unbound_folded),
+            r2_registry_unbound_fold_ring: Some(lens.registry.unbound_fold_ring),
             r2_registry_departed_identities: Some(lens.registry.departed_identities),
             r2_registry_departed_mechs: Some(lens.registry.departed_mechs),
             r3_edge_open: Some(lens.registry.edge.open),
@@ -1077,6 +1084,7 @@ mod tests {
                 unbound_images: row(37),
                 unbound_module_images: row(38),
                 unbound_folded: row(51),
+                unbound_fold_ring: row(52),
                 departed_identities: row(49),
                 departed_mechs: row(50),
                 edge: EdgeLens {
@@ -1252,6 +1260,13 @@ mod tests {
                 .expect("unbound folded")
                 .len,
             51
+        );
+        assert_eq!(
+            inventory
+                .r2_registry_unbound_fold_ring
+                .expect("unbound fold ring")
+                .len,
+            52
         );
         assert!(profile.r1_native_exec_exe.is_none());
         assert!(trace.r1_native_pair_targets.is_none());
@@ -1453,6 +1468,10 @@ mod tests {
                 unbound_folded: cap(
                     crate::discovery::caller_registry::UNBOUND_FOLD_GROUPS_MAX,
                     2304,
+                ),
+                unbound_fold_ring: cap(
+                    crate::discovery::caller_registry::UNBOUND_FOLD_RING_MAX,
+                    400,
                 ),
                 departed_identities: cap(DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL, 280),
                 departed_mechs: cap(

@@ -643,6 +643,11 @@ pub(crate) struct Presentation {
     /// totals, never one entry per churn fork. Pids are historical
     /// host/init-namespace numbers, never re-read through `/proc`.
     pub unbound_exe_groups: Vec<crate::discovery::caller_registry::UnboundExeGroup>,
+    /// Global oldest run-wide images (oldest first, at most five):
+    /// the concise callers line names these — the true oldest even
+    /// past the group bound, where the kept groups' union would
+    /// miss older pids drained with quiet groups.
+    pub unbound_oldest_pids: Vec<crate::discovery::caller_registry::UnboundPid>,
     /// Folded images past the group bound: counted, never named.
     pub unbound_fold_overflow_images: u64,
     /// Their folded call lower bound: counted with the images.
@@ -1072,6 +1077,7 @@ impl Presentation {
             identity_unavailable_refused: coordinator.identity_unavailable_refused(),
             identity_budget_exhausted: coordinator.identity_budget_exhausted(),
             unbound_exe_groups: unbound_summary.groups,
+            unbound_oldest_pids: unbound_summary.oldest,
             unbound_fold_overflow_images: unbound_summary.overflow_images,
             unbound_fold_overflow_calls: unbound_summary.overflow_calls,
             unbound_pids_dropped: registry.unidentified_pids_dropped(),
@@ -4714,14 +4720,11 @@ fn render_snapshot_inner(
             // Part C: up to five historical host pids after the
             // clause, always with the historical qualifier; the rest
             // (unshown collected plus saturation-dropped) count as
-            // more. Each group's sample holds its oldest five, so the
-            // union holds the global oldest five exactly.
-            let mut oldest: Vec<&UnboundPid> = presentation
-                .unbound_exe_groups
-                .iter()
-                .flat_map(|group| group.sample.iter())
-                .collect();
-            oldest.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
+            // more. The registry carries the global oldest five
+            // (taken before the group-bound drain), so this names
+            // the true oldest even past the bound — the kept
+            // groups' union alone would miss drained older pids.
+            let oldest: &[UnboundPid] = &presentation.unbound_oldest_pids;
             let pids = if oldest.is_empty() {
                 String::new()
             } else {

@@ -234,11 +234,17 @@ retention, which stay flat. Follow-up bounding folds those per-pass
 growers the same way: the run-wide unbound-image census keeps a
 512-image recent window with exact per-exe aggregates, enumeration
 memory keeps the latest pass, and pair tombstones drain past two
-prune graces — all with exact totals — so the soak slope flattens
-past warm-up instead of climbing toward the caps (which stay as
-backstops). A 5000-exited-callers-with-calls lifetime twin holds
-0 refusals with a flat census past the budget. That soak ran the
-glibc observer; the shipped static musl build has not been measured.
+prune graces — all with exact totals — so the per-pass growers
+flatten past warm-up instead of climbing toward the caps (which
+stay as backstops). The overall steady-state MiB/h slope is pending
+a quiet-host leg; a re-witnessed folded image refreshes its
+aggregate (or the counted overflow past the re-witness window)
+instead of counting twice, and a late EXEC inside that window still
+resolves the per-module verdict while the run-wide aggregate keeps
+the honest unknown. A 5000-exited-callers-with-calls lifetime twin
+holds 0 refusals with a flat census past the budget. That soak ran
+the glibc observer; the shipped static musl build has not been
+measured.
 
 ### Short-lived processes never scanned
 

@@ -290,6 +290,57 @@ pub(crate) fn process_gone(tgid: u32) -> bool {
     )
 }
 
+/// Whether every task of `tgid` is dead (zombie `Z` or dead `X`/`x`):
+/// nothing of the member can run code again.
+///
+/// The leader's `/proc` stat decides the common live case with one read;
+/// only a dead leader pays the full task enumeration, because a dead
+/// leader with live siblings still runs code. Any read or parse doubt
+/// answers live (the intake then keeps today's gap behavior): silence is
+/// only for proven death. An empty task set (reaped between the reads)
+/// is dead: no task can run.
+fn member_group_dead(tgid: u32) -> bool {
+    fn is_dead(state: u8) -> bool {
+        matches!(state, b'Z' | b'X' | b'x')
+    }
+    let leader = match std::fs::read(format!("/proc/{tgid}/stat")) {
+        Ok(stat) => stat,
+        Err(_) => return false,
+    };
+    match crate::discovery::pause::parse_task_state(&leader) {
+        Some(state) if is_dead(state) => {}
+        _ => return false,
+    }
+    let entries = match std::fs::read_dir(format!("/proc/{tgid}/task")) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return false,
+        };
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(_) => return false,
+        };
+        match crate::discovery::pause::parse_task_state(&stat) {
+            Some(state) if is_dead(state) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether `tgid` died with its row pending (reaped, or an unreaped
+/// corpse): it ran nothing after its stopping mapping was recorded, so
+/// no provider call could have run unobserved and the row withdraws
+/// silently. A refused kernel signal is still disclosed separately
+/// through the refusal counters: only the intake's own gap is silent.
+fn member_died_with_row_pending(tgid: u32) -> bool {
+    process_gone(tgid) || member_group_dead(tgid)
+}
+
 /// Sends `SIGCONT` to a process number (no pidfd could be opened).
 fn signal_by_number(tgid: u32) -> std::io::Result<()> {
     let pid = i32::try_from(tgid).map_err(|_| std::io::Error::from_raw_os_error(libc::ESRCH))?;
@@ -725,6 +776,19 @@ impl Engine {
                 return false;
             }
         };
+        if member_died_with_row_pending(tgid) {
+            // Dead with its row still pending: the stop landed before
+            // its next userspace instruction, so it ran nothing after
+            // its stopping mapping was recorded and no provider call
+            // could have run unobserved. Withdrawing silently like a
+            // reaped member; the resume is a no-op to the dead, and
+            // short-lived-descendant retirement stays disclosed through
+            // the frames' own descendant gaps.
+            let _ = io.withdraw(tgid);
+            let _ = pin.send_signal(libc::SIGCONT);
+            self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
+            return false;
+        }
         match io.is_run_member(&pin) {
             Ok(true) => {}
             Ok(false) if stopped_member_moved_out(&pin, since_ns) => {
@@ -799,6 +863,16 @@ impl Engine {
         let ((cleared, providers), fuse_rows) = match rows {
             Ok(proven) => proven,
             Err(error) => {
+                if member_died_with_row_pending(tgid) {
+                    // Died between the intake check and this read: same
+                    // silent withdrawal as above, not an unreadable live
+                    // member.
+                    let _ = io.withdraw(tgid);
+                    let _ = pin.send_signal(libc::SIGCONT);
+                    self.member_stops.stats.departed =
+                        self.member_stops.stats.departed.saturating_add(1);
+                    return false;
+                }
                 self.member_stops.stats.unreadable =
                     self.member_stops.stats.unreadable.saturating_add(1);
                 if crate::run::capture_diagnostics_on() {
@@ -834,9 +908,20 @@ impl Engine {
             || self.member_stops.cleared.contains(&stop.file)
             || providers.iter().any(|(key, _)| *key == stop.file);
         if !stopping_proven {
-            self.member_stops.stats.unproven_resumes =
-                self.member_stops.stats.unproven_resumes.saturating_add(1);
-            self.note_first_use_gap(tgid, "its stopping file was not proven");
+            // A corpse makes no more calls: counting it departed
+            // instead of naming a gap for calls it can no longer make.
+            // Proving, staging and clearing below still run on whatever
+            // the read snapshot carried (the row still withdraws through
+            // the resume/hold path), so a provider it mapped still
+            // attaches for later mappers.
+            if member_died_with_row_pending(tgid) {
+                self.member_stops.stats.departed =
+                    self.member_stops.stats.departed.saturating_add(1);
+            } else {
+                self.member_stops.stats.unproven_resumes =
+                    self.member_stops.stats.unproven_resumes.saturating_add(1);
+                self.note_first_use_gap(tgid, "its stopping file was not proven");
+            }
         }
         if providers.is_empty() {
             self.resume_or_force(io, &pin, since_ns, now_ns);
@@ -1154,6 +1239,17 @@ impl Engine {
             self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
             return;
         }
+        if member_group_dead(tgid) {
+            // Dead with its row still pending at the bound: it ran
+            // nothing after its stopping mapping was recorded, so no
+            // provider call could have run unobserved. Withdrawing
+            // silently like a reaped member, without signalling: no
+            // pin names it here, and a number signal could resume a
+            // stranger reusing the number.
+            let _ = io.withdraw(tgid);
+            self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
+            return;
+        }
         let pin = self
             .open_member_pin(tgid)
             .ok()
@@ -1408,6 +1504,16 @@ impl Engine {
                 return;
             }
         };
+        if member_died_with_row_pending(tgid) {
+            // Dead with its row still pending when the guard was lost:
+            // it ran nothing after its stopping mapping was recorded,
+            // so no provider call could have run unobserved. The live
+            // members below keep their loud drain.
+            let _ = io.withdraw(tgid);
+            let _ = pin.send_signal(libc::SIGCONT);
+            self.member_stops.stats.departed = self.member_stops.stats.departed.saturating_add(1);
+            return;
+        }
         let moved_out = match io.is_run_member(&pin) {
             Ok(true) => false,
             Ok(false) if stopped_member_moved_out(&pin, since_ns) => true,
@@ -1661,6 +1767,37 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dead-group check: a live process is not dead, an unreaped
+    /// zombie child is, and an unmapped pid answers live (doubt keeps
+    /// the row and today's gap behavior).
+    #[test]
+    fn member_group_dead_pins_live_zombie_and_missing() {
+        assert!(!member_group_dead(std::process::id()), "live self");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.kill();
+        let mut zombie = false;
+        for _ in 0..500 {
+            if let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat"))
+                && crate::discovery::pause::parse_task_state(&stat) == Some(b'Z')
+            {
+                zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(zombie, "the killed child never became a zombie");
+        assert!(member_group_dead(pid), "an unreaped zombie is dead");
+        let _ = child.wait();
+        assert!(
+            !member_group_dead(u32::MAX - 1),
+            "an unmapped pid answers live"
+        );
+    }
 
     #[test]
     fn fuse_devices_come_from_mountinfo() {

@@ -92699,8 +92699,7 @@ fn member_stop_unverified_member_resumes_at_the_bound() {
 fn wait_zombie_for_test(pid: u32) {
     for _ in 0..500 {
         if let Ok(stat) = std::fs::read(format!("/proc/{pid}/stat"))
-            && let Some(close) = stat.iter().rposition(|byte| *byte == b')')
-            && stat.get(close + 2) == Some(&b'Z')
+            && crate::discovery::pause::parse_task_state(&stat) == Some(b'Z')
         {
             return;
         }
@@ -92727,11 +92726,7 @@ fn member_stop_dead_member_with_a_pending_row_withdraws_silently() {
         "a dead member owes no first-use gap"
     );
     assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
-    assert_eq!(
-        io.withdrawn,
-        vec![pid],
-        "the withdrawal is recorded"
-    );
+    assert_eq!(io.withdrawn, vec![pid], "the withdrawal is recorded");
     assert_eq!(
         engine.member_stop_stats_for_test().departed,
         1,
@@ -92741,6 +92736,90 @@ fn member_stop_dead_member_with_a_pending_row_withdraws_silently() {
         engine.learned_staged_files_for_test(),
         0,
         "nothing stages for a dead member"
+    );
+    let _ = child.wait();
+}
+
+/// Twin: a corpse whose maps read fails (reaped between the intake
+/// check and the read, or unreadable zombie maps) takes the same silent
+/// path: the read failure must not resurrect the gap for the dead. (The
+/// live twin `member_stop_unreadable_maps_resume_files_the_first_use_row`
+/// still names the gap.)
+#[test]
+fn member_stop_dead_member_with_unreadable_maps_withdraws_silently() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    engine.member_stops.maps_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no gap for unreadable corpse maps"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted"
+    );
+    let _ = child.wait();
+}
+
+/// Twin: a corpse reaching the bound (here: unpinnable and dead)
+/// withdraws silently instead of forcing a resume with the named gap.
+/// (The live twin `member_stop_unpinnable_member_resumes_at_the_bound`
+/// still names the gap.)
+#[test]
+fn member_stop_bound_withdraws_a_dead_member_silently() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, stop_ns) = stopped_member_with_row(&mut io);
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    engine.member_stops.pin_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(
+        &mut io,
+        &mut session,
+        Some(stop_ns + super::member_stop::MEMBER_STOP_HOLD_NS),
+    );
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no gap for a dead member at the bound"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted"
+    );
+    let _ = child.wait();
+}
+
+/// Twin: the guard-loss drain withdraws a corpse silently; only live
+/// members keep the loud watchdog-loss gap.
+#[test]
+fn member_stop_guard_loss_drain_withdraws_a_dead_member_silently() {
+    let mut io = ScriptedMemberStops::default();
+    let (mut child, pid, _stop_ns) = stopped_member_with_row(&mut io);
+    io.guard_lost = true;
+    let _ = child.kill();
+    wait_zombie_for_test(pid);
+    let mut engine = member_stop_engine();
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, crate::attach::monotonic_ns());
+    assert!(
+        !files_the_first_use_row(&engine),
+        "no gap for a dead member in the guard-loss drain"
+    );
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(
+        engine.member_stop_stats_for_test().departed,
+        1,
+        "the departure is counted"
     );
     let _ = child.wait();
 }

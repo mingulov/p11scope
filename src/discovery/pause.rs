@@ -3238,7 +3238,7 @@ pub(crate) fn read_task_states(pid: u32) -> Result<BTreeMap<u32, u8>, String> {
     }
 }
 
-fn parse_task_state(stat: &[u8]) -> Option<u8> {
+pub(crate) fn parse_task_state(stat: &[u8]) -> Option<u8> {
     let close = stat.iter().rposition(|byte| *byte == b')')?;
     (stat.get(close + 1) == Some(&b' '))
         .then(|| stat.get(close + 2).copied())

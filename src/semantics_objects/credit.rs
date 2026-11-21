@@ -1,3 +1,5 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! Debit-before-read credit for the bounded recovery cursors.
 //!
 //! A recovery cursor ([`super::recovery_cursor`]) never holds the journal

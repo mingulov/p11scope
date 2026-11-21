@@ -27,8 +27,9 @@ use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
     CallerRegistry, ExeIdentity, ExeResolution, ImageAuthority, JointPublicationPending,
     LauncherAncestor, LauncherGap, LauncherOrigin, MappingState, ModuleId, ModuleLifecycle,
-    ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnboundPid, UnknownReason,
-    UseCoverage, collapse_launcher_chain, module_init,
+    ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnboundExe, UnboundExeGroup,
+    UnboundExeGroupKey, UnboundPid, UnknownReason, UseCoverage, collapse_launcher_chain,
+    module_init,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
@@ -635,10 +636,17 @@ pub(crate) struct Presentation {
     pub identity_unavailable_refused: u64,
     /// Whether the identity ticket budget spent itself.
     pub identity_budget_exhausted: bool,
-    /// Every collected run-wide host pid, oldest first call first
-    /// (Part C): one entry per unidentified image. Historical
+    /// Merged run-wide exe groups, busiest first: every collected
+    /// image in exactly one group (Part C), with exact image and call
+    /// totals plus the oldest-pid sample per group. Bounded by the
+    /// registry's group bound — the live view retains this plus exact
+    /// totals, never one entry per churn fork. Pids are historical
     /// host/init-namespace numbers, never re-read through `/proc`.
-    pub unbound_pids: Vec<crate::discovery::caller_registry::UnboundPid>,
+    pub unbound_exe_groups: Vec<crate::discovery::caller_registry::UnboundExeGroup>,
+    /// Folded images past the group bound: counted, never named.
+    pub unbound_fold_overflow_images: u64,
+    /// Their folded call lower bound: counted with the images.
+    pub unbound_fold_overflow_calls: u64,
     /// Distinct images (with their host pids) the run-wide bound
     /// turned away, saturating.
     pub unbound_pids_dropped: u64,
@@ -1024,6 +1032,7 @@ impl Presentation {
         let limits = registry.limits();
         let (observed_edges, saturated_edges) = registry.counter_census();
         let dropped_pairs = coordinator.pruned_pair_totals();
+        let unbound_summary = registry.unidentified_exe_summary();
         let departed = registry.departed_totals();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
         let (excluded_modules, unmatched_excludes) = coordinator.excluded_snapshot();
@@ -1062,7 +1071,9 @@ impl Presentation {
             unbound_images_saturated: registry.unidentified_images_saturated(),
             identity_unavailable_refused: coordinator.identity_unavailable_refused(),
             identity_budget_exhausted: coordinator.identity_budget_exhausted(),
-            unbound_pids: registry.unidentified_pids(),
+            unbound_exe_groups: unbound_summary.groups,
+            unbound_fold_overflow_images: unbound_summary.overflow_images,
+            unbound_fold_overflow_calls: unbound_summary.overflow_calls,
             unbound_pids_dropped: registry.unidentified_pids_dropped(),
             caller_metadata: coordinator.metadata_frame(),
             callers,
@@ -4002,11 +4013,142 @@ fn exe_source_label(resolution: ExeResolution) -> &'static str {
     }
 }
 
-/// The concise executable line: unidentified caller images grouped
-/// by executable with call counts and pids, busiest group first.
-/// Resolved groups read by basename (full path when basenames
-/// collide on the line); unknown groups read their reason. Up to
-/// five groups and five pids per group; the rest counts.
+/// One exe group ready to render: the shared shape behind the
+/// pid-slice line and the merged-summary line.
+struct RankedExeGroup<'a> {
+    /// Resolved path when the group keys by path (basename
+    /// collision needs it); `None` for unknown groups.
+    path: Option<&'a str>,
+    /// Representative executable (unknown-group label source).
+    exe: &'a UnboundExe,
+    calls: u64,
+    first_ns: u64,
+    /// Exact image count (the member-list length on the pid-slice
+    /// path, the folded total on the merged path).
+    images: u64,
+    /// Oldest-first pid sample (every member on the pid-slice path,
+    /// the five oldest on the merged path).
+    sample: Vec<&'a UnboundPid>,
+    /// Richest identity-candidate list, if any member is ambiguous.
+    ambiguous: Option<&'a [String]>,
+}
+
+/// The concise executable line from ranked groups: busiest five with
+/// call counts and oldest pids, the rest counted. `overflow` names
+/// folded images past the group bound (merged path only); `dropped`
+/// counts saturation-dropped images. `None` when there is nothing
+/// to name.
+fn render_ranked_exe_groups(
+    mut groups: Vec<RankedExeGroup<'_>>,
+    dropped: u64,
+    overflow: Option<(u64, u64)>,
+) -> Option<String> {
+    if groups.is_empty() {
+        return None;
+    }
+    groups.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.first_ns.cmp(&b.first_ns)));
+    // Basenames shared by two groups on this line read by full path.
+    let mut basenames: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for group in &groups {
+        if let Some(path) = group.path {
+            let basename = path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path);
+            *basenames.entry(basename).or_default() += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    for group in groups.iter().take(5) {
+        let name = match group.path {
+            Some(path) => {
+                let basename = path
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(path);
+                let display = if basenames.get(basename).is_some_and(|count| *count > 1) {
+                    path
+                } else {
+                    basename
+                };
+                escape_controls(display).into_owned()
+            }
+            None => unknown_exe_label(group.exe),
+        };
+        // An ambiguous image keeps its name first; the marker lists
+        // the candidates' full paths beside it -- the richest list in
+        // the group when members disagree, the first two with the
+        // rest counted. Counts never change.
+        let name = match group.ambiguous {
+            Some(candidates) => {
+                let shown: Vec<String> = candidates
+                    .iter()
+                    .take(2)
+                    .map(|candidate| escape_controls(candidate).into_owned())
+                    .collect();
+                let more = candidates.len().saturating_sub(shown.len());
+                if more > 0 {
+                    format!("{name} (ambiguous: {} (+{more} more))", shown.join(", "))
+                } else {
+                    format!("{name} (ambiguous: {})", shown.join(", "))
+                }
+            }
+            None => name,
+        };
+        let mut members = group.sample.clone();
+        members.sort_by(|a, b| {
+            a.first_call_ns
+                .cmp(&b.first_call_ns)
+                .then(a.pid_host.cmp(&b.pid_host))
+        });
+        let shown: Vec<String> = members
+            .iter()
+            .take(5)
+            .map(|pid| pid.pid_host.to_string())
+            .collect();
+        let pids_more = group.images.saturating_sub(shown.len() as u64);
+        let pids_text = if group.images == 1 {
+            format!("host pid {}", shown.join(", "))
+        } else if pids_more > 0 {
+            format!("host pids {} (+{pids_more} more)", shown.join(", "))
+        } else {
+            format!("host pids {}", shown.join(", "))
+        };
+        parts.push(format!(
+            "{name} ({} call{}, {pids_text})",
+            group.calls,
+            if group.calls == 1 { "" } else { "s" },
+        ));
+    }
+    if let Some((images, calls)) = overflow {
+        if images > 0 {
+            parts.push(format!(
+                "{images} more image{} past the exe-group bound ({calls} call{})",
+                if images == 1 { "" } else { "s" },
+                if calls == 1 { "" } else { "s" },
+            ));
+        }
+    }
+    let hidden = groups
+        .iter()
+        .skip(5)
+        .fold(0u64, |hidden, group| hidden.saturating_add(group.images));
+    let more = hidden.saturating_add(dropped);
+    let mut line = format!("unidentified executables: {}", parts.join("; "));
+    if more > 0 {
+        line.push_str(&format!(" (+{more} more)"));
+    }
+    Some(line)
+}
+
+/// The concise executable line (pid-slice path): unidentified caller
+/// images grouped by executable with call counts and pids, busiest
+/// group first. Resolved groups read by basename (full path when
+/// basenames collide on the line); unknown groups read their reason.
+/// Up to five groups and five pids per group; the rest counts.
+/// Test-facing (the grouping twins pin it); production renders
+/// merged summaries through [`render_merged_exe_groups`].
+#[cfg_attr(not(test), allow(dead_code))]
 fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<String> {
     if pids.is_empty() {
         return None;
@@ -4025,13 +4167,7 @@ fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<
         };
         members.entry(key).or_default().push(pid);
     }
-    struct Group<'a> {
-        key: GroupKey<'a>,
-        members: Vec<&'a UnboundPid>,
-        calls: u64,
-        first_ns: u64,
-    }
-    let mut groups: Vec<Group<'_>> = members
+    let groups: Vec<RankedExeGroup<'_>> = members
         .into_iter()
         .map(|(key, members)| {
             let calls = members
@@ -4042,109 +4178,60 @@ fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<
                 .map(|pid| pid.first_call_ns)
                 .min()
                 .unwrap_or(u64::MAX);
-            Group {
-                key,
-                members,
+            let richest = members
+                .iter()
+                .copied()
+                .filter(|pid| pid.exe.identity_candidates.len() > 1)
+                .max_by_key(|pid| pid.exe.identity_candidates.len());
+            let (path, exe) = match key {
+                GroupKey::Path(path) => (Some(path), &members[0].exe),
+                GroupKey::Unknown(..) => (None, &members[0].exe),
+            };
+            RankedExeGroup {
+                path,
+                exe,
                 calls,
                 first_ns,
+                images: u64::try_from(members.len()).unwrap_or(u64::MAX),
+                sample: members.iter().copied().collect(),
+                ambiguous: richest.map(|pid| pid.exe.identity_candidates.as_slice()),
             }
         })
         .collect();
-    groups.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.first_ns.cmp(&b.first_ns)));
-    // Basenames shared by two groups on this line read by full path.
-    let mut basenames: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for group in &groups {
-        if let GroupKey::Path(path) = group.key {
-            let basename = path
-                .rsplit('/')
-                .find(|part| !part.is_empty())
-                .unwrap_or(path);
-            *basenames.entry(basename).or_default() += 1;
-        }
+    render_ranked_exe_groups(groups, dropped, None)
+}
+
+/// The concise executable line (merged-summary path): folded and
+/// retained images grouped alike, with the counted overflow past the
+/// group bound trailing the busiest groups.
+fn render_merged_exe_groups(
+    groups: &[UnboundExeGroup],
+    overflow_images: u64,
+    overflow_calls: u64,
+    dropped: u64,
+) -> Option<String> {
+    if groups.is_empty() {
+        return None;
     }
-    let mut parts = Vec::new();
-    for group in groups.iter().take(5) {
-        let name = match group.key {
-            GroupKey::Path(path) => {
-                let basename = path
-                    .rsplit('/')
-                    .find(|part| !part.is_empty())
-                    .unwrap_or(path);
-                let display = if basenames.get(basename).is_some_and(|count| *count > 1) {
-                    path
-                } else {
-                    basename
-                };
-                escape_controls(display).into_owned()
+    let ranked: Vec<RankedExeGroup<'_>> = groups
+        .iter()
+        .map(|group| {
+            let path = match &group.key {
+                UnboundExeGroupKey::Path(path) => Some(path.as_str()),
+                UnboundExeGroupKey::Unknown(..) => None,
+            };
+            RankedExeGroup {
+                path,
+                exe: &group.exe,
+                calls: group.calls,
+                first_ns: group.first_ns,
+                images: group.images,
+                sample: group.sample.iter().collect(),
+                ambiguous: group.ambiguous.as_deref(),
             }
-            GroupKey::Unknown(..) => unknown_exe_label(&group.members[0].exe),
-        };
-        // An ambiguous image keeps its name first; the marker lists
-        // the candidates' full paths beside it -- the richest list in
-        // the group when members disagree, the first two with the
-        // rest counted. Counts never change.
-        let richest = group
-            .members
-            .iter()
-            .copied()
-            .filter(|pid| pid.exe.identity_candidates.len() > 1)
-            .max_by_key(|pid| pid.exe.identity_candidates.len());
-        let name = match richest {
-            Some(pid) => {
-                let shown: Vec<String> = pid
-                    .exe
-                    .identity_candidates
-                    .iter()
-                    .take(2)
-                    .map(|candidate| escape_controls(candidate).into_owned())
-                    .collect();
-                let more = pid
-                    .exe
-                    .identity_candidates
-                    .len()
-                    .saturating_sub(shown.len());
-                if more > 0 {
-                    format!("{name} (ambiguous: {} (+{more} more))", shown.join(", "))
-                } else {
-                    format!("{name} (ambiguous: {})", shown.join(", "))
-                }
-            }
-            None => name,
-        };
-        let mut members = group.members.clone();
-        members.sort_by(|a, b| {
-            a.first_call_ns
-                .cmp(&b.first_call_ns)
-                .then(a.pid_host.cmp(&b.pid_host))
-        });
-        let shown: Vec<String> = members
-            .iter()
-            .take(5)
-            .map(|pid| pid.pid_host.to_string())
-            .collect();
-        let pids_more = members.len().saturating_sub(shown.len());
-        let pids_text = if members.len() == 1 {
-            format!("host pid {}", shown.join(", "))
-        } else if pids_more > 0 {
-            format!("host pids {} (+{pids_more} more)", shown.join(", "))
-        } else {
-            format!("host pids {}", shown.join(", "))
-        };
-        parts.push(format!(
-            "{name} ({} call{}, {pids_text})",
-            group.calls,
-            if group.calls == 1 { "" } else { "s" },
-        ));
-    }
-    let hidden: usize = groups.iter().skip(5).map(|group| group.members.len()).sum();
-    let more = u64::try_from(hidden)
-        .unwrap_or(u64::MAX)
-        .saturating_add(dropped);
-    let mut line = format!("unidentified executables: {}", parts.join("; "));
-    if more > 0 {
-        line.push_str(&format!(" (+{more} more)"));
-    }
-    Some(line)
+        })
+        .collect();
+    render_ranked_exe_groups(ranked, dropped, Some((overflow_images, overflow_calls)))
 }
 
 fn render_concise_edges(out: &mut String, presentation: &Presentation) {
@@ -4629,18 +4716,24 @@ fn render_snapshot_inner(
             // Part C: up to five historical host pids after the
             // clause, always with the historical qualifier; the rest
             // (unshown collected plus saturation-dropped) count as
-            // more. Empty only for test-direct rows without images.
-            let pids = if presentation.unbound_pids.is_empty() {
+            // more. Each group's sample holds its oldest five, so the
+            // union holds the global oldest five exactly.
+            let mut oldest: Vec<&UnboundPid> = presentation
+                .unbound_exe_groups
+                .iter()
+                .flat_map(|group| group.sample.iter())
+                .collect();
+            oldest.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
+            let pids = if oldest.is_empty() {
                 String::new()
             } else {
-                let shown: Vec<String> = presentation
-                    .unbound_pids
+                let shown: Vec<String> = oldest
                     .iter()
                     .take(5)
                     .map(|pid| pid.pid_host.to_string())
                     .collect();
-                let more = u64::try_from(presentation.unbound_pids.len())
-                    .unwrap_or(u64::MAX)
+                let more = presentation
+                    .unbound_images
                     .saturating_sub(shown.len() as u64)
                     .saturating_add(presentation.unbound_pids_dropped);
                 if more > 0 {
@@ -4674,8 +4767,10 @@ fn render_snapshot_inner(
                 }
             );
             // The same images grouped by executable with call counts.
-            if let Some(line) = render_unidentified_executables(
-                &presentation.unbound_pids,
+            if let Some(line) = render_merged_exe_groups(
+                &presentation.unbound_exe_groups,
+                presentation.unbound_fold_overflow_images,
+                presentation.unbound_fold_overflow_calls,
                 presentation.unbound_pids_dropped,
             ) {
                 let _ = writeln!(out, "{line}");

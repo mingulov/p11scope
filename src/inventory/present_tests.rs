@@ -9,7 +9,8 @@ use super::*;
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, CallerId, CallerLifecycle, CoverageNote, DepartedIdentity,
     DepartedUse, ExeIdentity, ExeResolution, ImageAuthority, ModuleInfo, ModuleKey, RegistryGap,
-    RegistryLimits, UnboundExe, UnboundPid, UnknownReason, UseCoverage,
+    RegistryLimits, UnboundExe, UnboundExeGroup, UnboundExeGroupKey, UnboundPid, UnknownReason,
+    UseCoverage,
 };
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory::{render_json, render_text};
@@ -6411,6 +6412,155 @@ fn concise_ambiguous_marker_uses_richest_member_when_members_disagree() {
     assert_eq!(
         line,
         "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b/tool (+1 more)) (3 calls, host pids 9, 10)"
+    );
+}
+
+fn resolved_exe(path: &str) -> UnboundExe {
+    UnboundExe {
+        dev: 8,
+        ino: 99,
+        path: Some(path.to_string()),
+        resolution: ExeResolution::SystemIndex,
+        identity_candidates: vec![path.to_string()],
+    }
+}
+
+fn exe_group(
+    path: &str,
+    images: u64,
+    calls: u64,
+    first_ns: u64,
+    sample: Vec<UnboundPid>,
+    ambiguous: Option<Vec<String>>,
+) -> UnboundExeGroup {
+    UnboundExeGroup {
+        key: UnboundExeGroupKey::Path(path.to_string()),
+        exe: resolved_exe(path),
+        images,
+        calls,
+        first_ns,
+        sample,
+        ambiguous,
+    }
+}
+
+/// The merged line ranks busiest first with exact per-group and
+/// hidden counts: singular/plural pid nouns, per-group more-counts,
+/// and hidden-plus-dropped in the trailing more.
+#[test]
+fn merged_exe_groups_rank_busiest_first_with_exact_more_counts() {
+    let groups = vec![
+        exe_group(
+            "/bin/a",
+            10,
+            100,
+            1000,
+            (1..=5)
+                .map(|pid| unbound_image(pid, 1000 + pid as u64, 20, resolved_exe("/bin/a")))
+                .collect(),
+            None,
+        ),
+        exe_group(
+            "/bin/b",
+            3,
+            90,
+            900,
+            [6, 7, 8]
+                .into_iter()
+                .map(|pid| unbound_image(pid, 900 + pid as u64, 30, resolved_exe("/bin/b")))
+                .collect(),
+            None,
+        ),
+        exe_group(
+            "/bin/c",
+            1,
+            80,
+            800,
+            vec![unbound_image(9, 800, 80, resolved_exe("/bin/c"))],
+            None,
+        ),
+        exe_group(
+            "/bin/d",
+            2,
+            70,
+            700,
+            [10, 11]
+                .into_iter()
+                .map(|pid| unbound_image(pid, 700 + pid as u64, 35, resolved_exe("/bin/d")))
+                .collect(),
+            None,
+        ),
+        exe_group(
+            "/bin/e",
+            6,
+            60,
+            600,
+            (12..=16)
+                .map(|pid| unbound_image(pid, 600 + pid as u64, 10, resolved_exe("/bin/e")))
+                .collect(),
+            None,
+        ),
+        exe_group(
+            "/bin/f",
+            2,
+            50,
+            500,
+            [17, 18]
+                .into_iter()
+                .map(|pid| unbound_image(pid, 500 + pid as u64, 25, resolved_exe("/bin/f")))
+                .collect(),
+            None,
+        ),
+    ];
+    let line = render_merged_exe_groups(&groups, 0, 0, 1).expect("six groups");
+    assert_eq!(
+        line,
+        "unidentified executables: a (100 calls, host pids 1, 2, 3, 4, 5 (+5 more)); b (90 calls, host pids 6, 7, 8); c (80 calls, host pid 9); d (70 calls, host pids 10, 11); e (60 calls, host pids 12, 13, 14, 15, 16 (+1 more)) (+3 more)"
+    );
+}
+
+/// Folded images past the group bound read as a named trailing row
+/// with their call bound — counted, never silent and never folded
+/// into the hidden more-count.
+#[test]
+fn merged_exe_groups_name_the_group_bound_overflow() {
+    let groups = vec![exe_group(
+        "/bin/a",
+        2,
+        4,
+        1000,
+        [1, 2]
+            .into_iter()
+            .map(|pid| unbound_image(pid, 1000 + pid as u64, 2, resolved_exe("/bin/a")))
+            .collect(),
+        None,
+    )];
+    let line = render_merged_exe_groups(&groups, 3, 7, 0).expect("one group");
+    assert_eq!(
+        line,
+        "unidentified executables: a (4 calls, host pids 1, 2); 3 more images past the exe-group bound (7 calls)"
+    );
+}
+
+/// The merged line keeps the ambiguity marker: the richest
+/// candidate list beside the kept name, byte-identical to the
+/// pid-slice line.
+#[test]
+fn merged_exe_groups_keep_the_ambiguity_marker() {
+    let exe = ambiguous_exe("/snap/a/tool", &["/snap/a/tool", "/snap/b/tool"]);
+    let group = UnboundExeGroup {
+        key: UnboundExeGroupKey::Path("/snap/a/tool".to_string()),
+        exe: exe.clone(),
+        images: 1,
+        calls: 1,
+        first_ns: 210,
+        sample: vec![unbound_image(9, 210, 1, exe)],
+        ambiguous: Some(vec!["/snap/a/tool".to_string(), "/snap/b/tool".to_string()]),
+    };
+    let line = render_merged_exe_groups(&[group], 0, 0, 0).expect("one group");
+    assert_eq!(
+        line,
+        "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b/tool) (1 call, host pid 9)"
     );
 }
 

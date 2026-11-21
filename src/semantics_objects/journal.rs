@@ -16384,7 +16384,11 @@ pub(crate) mod tests {
             )
             .expect_err("in-bracket move voids");
         assert_eq!(failure.gap, JournalGap::FaultChanged);
-        assert_eq!(split(&scene), (1, 0, 1), "the in-bracket move voids as chain");
+        assert_eq!(
+            split(&scene),
+            (1, 0, 1),
+            "the in-bracket move voids as chain"
+        );
         assert_eq!(absorbed(&scene), (1, 1), "the void absorbs nothing");
         assert_eq!(scene.adapter.last_fault, Some(10));
         // A regressed seal-time cell voids as reread without moving

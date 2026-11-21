@@ -5801,9 +5801,10 @@ mod disposal_tests {
             }
             assert!(polls < 4096, "{tag}: the disposal must complete");
         }
-        // One SIGN bit per PENDING: route lookup + origin capture, no
-        // scan at exactly the bound (256 <= MAX_EDGE_PENDING), then
-        // the finalize invalidation pops all 256 pendings.
+        // One SIGN bit per PENDING: route lookup + origin capture +
+        // insert, no scan at exactly the bound (256 <=
+        // MAX_EDGE_PENDING), then the finalize invalidation pops all
+        // 256 pendings.
         assert_eq!(
             crate::semantics_edge::MAX_EDGE_PENDING,
             256,
@@ -5811,8 +5812,8 @@ mod disposal_tests {
         );
         assert_eq!(
             edge_reads,
-            256 * 2 + 256,
-            "{tag}: 256 admissions x (route + capture) + 256 finalize pops"
+            256 * 3 + 256,
+            "{tag}: 256 admissions x (route + capture + insert) + 256 finalize pops"
         );
         assert_eq!(feed.staged_len(), 0, "{tag}");
         assert_eq!(feed.history_disposed(), 258, "{tag}");
@@ -5893,14 +5894,15 @@ mod disposal_tests {
             }
             assert!(polls < 4096, "{tag}: the disposal must complete");
         }
-        // 257 admissions x (route + capture) + one 257-record oldest
-        // scan + the evicted origin's liveness check + its
-        // visit + terminal + the finalize invalidation popping the 256
-        // survivors: exactly one eviction.
+        // 257 admissions x (route + capture + insert) + one
+        // 257-record oldest scan + the victim removal + the evicted
+        // origin's liveness check + its visit + terminal + the
+        // finalize invalidation popping the 256 survivors: exactly
+        // one eviction.
         assert_eq!(
             edge_reads,
-            257 * 2 + 257 + 1 + 2 + 256,
-            "{tag}: one 257-visit scan, one Unknown end, 256 finalize pops"
+            257 * 3 + 257 + 1 + 1 + 2 + 256,
+            "{tag}: one 257-visit scan, one victim removal, one Unknown end, 256 finalize pops"
         );
         assert!(polls > 6, "{tag}: the scan spans several credits");
         assert_eq!(feed.staged_len(), 0, "{tag}");

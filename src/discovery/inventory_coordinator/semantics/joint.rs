@@ -2276,6 +2276,55 @@ mod tests {
         );
     }
 
+    /// Re-offer outcomes count beside their gaps: an armed re-offer
+    /// (the lane evicted and re-minted) and an exhausted one (the
+    /// original refusal lands final) each increment exactly once.
+    /// The pair explains at a glance whether deferred births retry
+    /// or strand.
+    #[test]
+    fn birth_reoffer_outcomes_count_armed_and_exhausted() {
+        use crate::attach::Scope;
+        use crate::discovery::caller_registry::OsProcessSource;
+        use crate::discovery::hooks::HookRegistry;
+
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let image = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        };
+        coordinator.note_birth_reoffer_armed();
+        assert_eq!(
+            coordinator.joint_birth_funnel().reoffer_armed,
+            1,
+            "an armed re-offer counts"
+        );
+        assert_eq!(
+            coordinator.joint_birth_funnel().reoffer_exhausted,
+            0,
+            "nothing exhausted yet"
+        );
+        coordinator.disclose_birth_reoffer_exhausted(&BirthReoffer {
+            caller: None,
+            image,
+            file: 3,
+            reason: "joint_birth_no_admission".into(),
+        });
+        let funnel = coordinator.joint_birth_funnel();
+        assert_eq!(
+            (funnel.reoffer_armed, funnel.reoffer_exhausted),
+            (1, 1),
+            "an exhausted re-offer counts beside its final gap"
+        );
+    }
+
     /// Marks-counter pin: the staging disposition's diagnostic
     /// counter counts only dispositions whose `consume_for` reports
     /// a committed mark. A released-tainted disposition consumes

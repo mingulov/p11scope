@@ -3231,12 +3231,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// beside the ring loss: a rise stages the named loss gap with
     /// exact counts; the first failed read stages one "loss
     /// unknown" gap. Without `--key-sizes` the counters stay zero,
-    /// so the lane stays quiet.
+    /// so the lane stays quiet. An undisclosed split insert rise
+    /// waiting in the lane joins the tuple read here, so a terminal
+    /// hold after an interrupted slice keeps it.
     pub(crate) fn poll_and_disclose_length_stash_loss(
         &mut self,
         lane: &mut crate::inventory_semantics::AttestedSemanticLane,
     ) {
+        let pending = lane.take_pending_stash_insert_delta();
         let (insert, mismatch) = lane.poll_length_stash_loss();
+        let insert = match (pending, insert) {
+            (None, None) => None,
+            (pending, insert) => Some(pending.unwrap_or(0).saturating_add(insert.unwrap_or(0))),
+        };
         self.disclose_retained_length_stash_loss(lane, insert, mismatch);
     }
 

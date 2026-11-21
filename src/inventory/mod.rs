@@ -23509,13 +23509,23 @@ mod tests {
             (3, 1),
             "the held summary keeps the undisclosed insert delta"
         );
-        let gaps: Vec<_> = coordinator
+        let staged: Vec<_> = coordinator
+            .registry()
+            .staged_scope_gaps_for_test()
+            .into_iter()
+            .filter(|(subject, _)| subject == "key sizes lost some lengths")
+            .collect();
+        let published = coordinator
             .registry()
             .gaps()
             .iter()
             .filter(|gap| gap.subject == "key sizes lost some lengths")
-            .collect();
-        assert_eq!(gaps.len(), 1, "one named gap covers both counters");
+            .count();
+        assert_eq!(
+            staged.len() + published,
+            1,
+            "one named gap covers both counters"
+        );
     }
 
     #[test]
@@ -23562,20 +23572,32 @@ mod tests {
             (3, 1),
             "the held summary keeps the insert delta across the failure"
         );
-        let named = coordinator
+        let staged = coordinator.registry().staged_scope_gaps_for_test();
+        let named_staged = staged
+            .iter()
+            .filter(|(subject, _)| subject == "key sizes lost some lengths")
+            .count();
+        let unknown_staged = staged
+            .iter()
+            .filter(|(subject, _)| subject == "key sizes loss unknown")
+            .count();
+        let named_published = coordinator
             .registry()
             .gaps()
             .iter()
             .filter(|gap| gap.subject == "key sizes lost some lengths")
             .count();
-        let unknown = coordinator
+        let unknown_published = coordinator
             .registry()
             .gaps()
             .iter()
             .filter(|gap| gap.subject == "key sizes loss unknown")
             .count();
         assert_eq!(
-            (named, unknown),
+            (
+                named_staged + named_published,
+                unknown_staged + unknown_published
+            ),
             (1, 1),
             "one named gap plus one unknown gap"
         );

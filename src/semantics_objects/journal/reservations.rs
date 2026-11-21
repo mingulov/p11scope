@@ -763,6 +763,15 @@ impl<C> ReservationTable<C> {
         self.test_leaf_reads.set(0);
     }
 
+    /// Test-only add to the unified budgeted-leaf counter: the ledger
+    /// commit charges its two index-link head reads through the gate
+    /// and reports both here alongside the debit.
+    #[cfg(test)]
+    pub(super) fn add_test_leaf_reads_for_test(&self, leaves: usize) {
+        self.test_leaf_reads
+            .set(self.test_leaf_reads.get() + leaves);
+    }
+
     /// Test-only read of the sync-walk counter.
     #[cfg(test)]
     pub(super) fn test_preflight_reads_for_test(&self) -> usize {

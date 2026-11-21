@@ -6418,10 +6418,14 @@ mod disposal_tests {
     /// Budgeted Started drain matches the synchronous Started arm
     /// exactly (same rows, unknowns, evidence, refusals, custody):
     /// random starts incl. duplicates, pool-full mints and churned
-    /// buckets, sync vs capture + 1-unit budgeted drain, over 50
+    /// buckets, sync vs capture + 3-unit budgeted drain, over 50
     /// seeds. Guards the duplicated Started arm against drift. The
     /// disposal only ever drains receipt-less starts (its throwaway
     /// observes without receipts); the drain mirrors the full arm.
+    /// Three units is the smallest drainable granule: the walk
+    /// advances one leaf per unit, but the atomic commit needs its
+    /// pop plus both index-link head reads together (a short grant
+    /// restores the slot and retries idempotently).
     #[test]
     fn started_drain_matches_synchronous_observe() {
         use crate::semantics_edge::OperationId;
@@ -6505,7 +6509,7 @@ mod disposal_tests {
                         };
                         let mut iters = 0;
                         loop {
-                            let mut gate = LeafBudget::new(1);
+                            let mut gate = LeafBudget::new(3);
                             match fallback.mint_step(&mut started.mint, &mut gate) {
                                 MintStepOutcome::Yield => {
                                     iters += 1;

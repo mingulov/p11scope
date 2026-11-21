@@ -1213,9 +1213,7 @@ impl RetainedFileFacts {
     /// completes no object and decodes no new table still counts as
     /// progress instead of stalling the snapshot.
     pub(crate) fn scan_frontier_totals(&self) -> Option<(u64, u64)> {
-        if self.scan_progress_totals().is_none() {
-            return None;
-        }
+        self.scan_progress_totals()?;
         let mut snapshots = 0u64;
         let mut words = 0u64;
         for cursor in self.decode_cursors.values() {

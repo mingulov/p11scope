@@ -799,7 +799,10 @@ priority; terminal stdio ioctls other than
 `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX` datagram `sendto`
 without `connect`. Cross-process memory stays readable through
 `/proc/<pid>/mem` for same-uid dumpable processes; only the direct
-`ptrace`, `process_vm` and `pidfd_getfd` calls are denied. Ioctls of
+`ptrace`, `process_vm` and `pidfd_getfd` calls are denied, and
+cross-process `/proc/<pid>/fd`, `/proc/<pid>/environ` and
+`/proc/<pid>/maps` opens are refused by the Landlock rules.
+World-readable entries such as `/proc/<pid>/cmdline` stay visible. Ioctls of
 filesystems outside the listed types still pass until a later allowlist
 lands.
 

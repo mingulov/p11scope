@@ -3447,7 +3447,8 @@ fn table_prefix_compatible(cached: &ScannedTable, fresh: &ScannedTable) -> bool 
 
 /// Re-prove one cached table against current memory for complete
 /// replay: the table's full declared extent is re-read (charged) and
-/// re-decoded under the sweep's rules, and must equal the cached row.
+/// re-decoded under the sweep's rules, and must equal the cached row
+/// or extend its legacy prefix (see [`table_extent_matches`]).
 /// Identity alone cannot see a same-path exec or a writable-byte
 /// mutation under an unchanged layout, so any short read, decode
 /// mismatch, refusal or stop fails the whole replay into a fresh

@@ -3235,6 +3235,31 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
 /// module, pid) a per-receipt row shares with its summary.
 type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 
+/// First folded index over indexed rows (`usize::MAX` when empty; no
+/// emitted group is ever empty, so this only types the fold).
+fn first_folded_index(rows: &[(usize, &GapView)]) -> usize {
+    rows.iter()
+        .map(|(index, _)| *index)
+        .min()
+        .unwrap_or(usize::MAX)
+}
+
+/// One folded ceiling row's concise line: bare for a lone trip, counted
+/// with the exact summed repeats otherwise.
+fn ceiling_fold_line(row: &GapView) -> String {
+    let subject = escape_controls(gap_plain_subject(&row.subject, &row.reason)).into_owned();
+    let reason = escape_controls(gap_plain_reason(&row.subject, &row.reason)).into_owned();
+    if row.repeats == 1 {
+        gap_single_line(&subject, &reason)
+    } else {
+        gap_group_line(
+            usize::try_from(row.repeats).unwrap_or(usize::MAX),
+            &subject,
+            &reason,
+        )
+    }
+}
+
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
 /// line per plain subject/reason group, up to [`GAP_GROUPS_SHOWN`]
 /// groups; beyond that one fold line names the remainder. Plain words
@@ -3266,24 +3291,29 @@ type DeferralFoldScope = (Option<CallerId>, Option<ModuleId>, Option<u32>);
 /// never folds: it keeps its own named row. Verbose and JSON keep
 /// every row.
 /// Scan-budget ceiling trips fold before grouping: one line per
-/// subject with the exact summed repeats, in first-encounter order,
-/// ahead of the ranked ordinary groups; a lone trip renders bare.
+/// subject with the exact summed repeats, each anchored to its first
+/// encounter among the ranked ordinary groups; a lone trip renders
+/// bare.
 fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<String> {
     // The scan-budget ceiling family folds before grouping: one line per
-    // subject with the summed repeats, in first-encounter order, ahead of
-    // the ranked ordinary groups. A lone trip renders bare. Everything
-    // below groups the ordinary rows only.
+    // subject with the summed repeats. Ordinary rows group and rank
+    // under the existing policy; each folded ceiling row then inserts
+    // at its first encounter — ahead of the first ranked group whose
+    // rows all come later — under the same shared cap. Everything
+    // below groups the ordinary rows only, keeping each group's first
+    // folded index for the insertion.
     let folded = fold_ceiling_for_text(gaps);
-    let mut ceiling: Vec<&GapView> = Vec::new();
-    let mut ordinary: Vec<&GapView> = Vec::new();
-    for gap in &folded {
+    let mut ceiling: Vec<(usize, &GapView)> = Vec::new();
+    let mut ordinary: Vec<(usize, &GapView)> = Vec::new();
+    for (index, gap) in folded.iter().enumerate() {
         if gap.budget.is_none() && gap.reason == SCAN_BUDGET_EXHAUSTED_REASON {
-            ceiling.push(gap);
+            ceiling.push((index, gap));
         } else {
-            ordinary.push(gap);
+            ordinary.push((index, gap));
         }
     }
-    let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
+    // Each ordinary group keeps (count, scope-only, first folded index).
+    let mut groups: std::collections::BTreeMap<(String, String), (usize, bool, usize)> =
         std::collections::BTreeMap::new();
     // Deferred-attach fold: the stop-time summaries append while the
     // per-receipt rows stay, so concise groups each covered
@@ -3292,7 +3322,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     // the summary suppressed) still reads on its own, never hidden.
     let folded_by_scope: std::collections::BTreeMap<DeferralFoldScope, &str> = {
         let mut map = std::collections::BTreeMap::new();
-        for gap in ordinary.iter().copied() {
+        for (_, gap) in ordinary.iter().copied() {
             if gap.subject
                 == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
                 && crate::discovery::engine::inventory_coordinator::is_deferral_folded_reason(
@@ -3312,18 +3342,18 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     // target-root suffix) fold by stored reason — one counted line per
     // distinct reason naming its root — and size-cap and precondition
     // refusals keep their per-object subject/reason rows below.
-    let mut unreachable: Vec<&GapView> = Vec::new();
-    let mut foreign: std::collections::BTreeMap<&str, Vec<&GapView>> =
+    let mut unreachable: Vec<(usize, &GapView)> = Vec::new();
+    let mut foreign: std::collections::BTreeMap<&str, Vec<(usize, &GapView)>> =
         std::collections::BTreeMap::new();
     // Same-kind scope folds: per-pass kernel-thread absence notes
     // (one row per pass, each carrying its pass examination count)
     // fold into one counted line with the summed total below. Only
     // exact producer wordings fold; anything else groups verbatim.
-    let mut kthreads: Vec<&GapView> = Vec::new();
-    let mut replaced: Vec<&GapView> = Vec::new();
-    let mut maps: Vec<&GapView> = Vec::new();
-    let mut rest: Vec<&GapView> = Vec::new();
-    for gap in ordinary.iter().copied() {
+    let mut kthreads: Vec<(usize, &GapView)> = Vec::new();
+    let mut replaced: Vec<(usize, &GapView)> = Vec::new();
+    let mut maps: Vec<(usize, &GapView)> = Vec::new();
+    let mut rest: Vec<(usize, &GapView)> = Vec::new();
+    for (index, gap) in ordinary.iter().copied() {
         if is_concise_redundant_per_key_off_gap(gap) {
             continue;
         }
@@ -3333,17 +3363,20 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             && gap_plain_subject(&gap.subject, &gap.reason) == "kernel threads"
             && kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason)).is_some()
         {
-            kthreads.push(gap);
+            kthreads.push((index, gap));
         } else if is_unreachable_process_reason(&gap.reason) {
-            unreachable.push(gap);
+            unreachable.push((index, gap));
         } else if is_foreign_root_reason(&gap.reason) {
-            foreign.entry(gap.reason.as_str()).or_default().push(gap);
+            foreign
+                .entry(gap.reason.as_str())
+                .or_default()
+                .push((index, gap));
         } else if is_replaced_file_gap(&gap.reason) {
-            replaced.push(gap);
+            replaced.push((index, gap));
         } else if maps_attribution_object_count(&gap.subject, &gap.reason).is_some() {
-            maps.push(gap);
+            maps.push((index, gap));
         } else {
-            rest.push(gap);
+            rest.push((index, gap));
         }
     }
     // A replaced provider file never folds into the family's count:
@@ -3353,24 +3386,26 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     // rows: the replaced fold serves floods (more distinct files
     // than the threshold), and a lone maps row keeps its own reason.
     let providers = admitted_provider_file_names(modules);
-    let mut folded: Vec<&GapView> = Vec::with_capacity(replaced.len());
-    for gap in replaced {
+    let mut folded: Vec<(usize, &GapView)> = Vec::with_capacity(replaced.len());
+    for (index, gap) in replaced {
         if providers.contains(replaced_subject_file_name(gap.subject.as_str())) {
-            rest.push(gap);
+            rest.push((index, gap));
         } else {
-            folded.push(gap);
+            folded.push((index, gap));
         }
     }
     let mut replaced = folded;
-    let replaced_files: std::collections::BTreeSet<&str> =
-        replaced.iter().map(|gap| gap.subject.as_str()).collect();
+    let replaced_files: std::collections::BTreeSet<&str> = replaced
+        .iter()
+        .map(|(_, gap)| gap.subject.as_str())
+        .collect();
     if replaced_files.len() <= REPLACED_FAMILY_FOLD_FILES {
         rest.append(&mut replaced);
     }
     if maps.len() <= 1 {
         rest.append(&mut maps);
     }
-    for gap in rest {
+    for (index, gap) in rest {
         let mut reason_text = gap.reason.as_str();
         if gap.subject == crate::discovery::engine::inventory_coordinator::DEFERRED_ATTACH_SUBJECT
             && crate::discovery::engine::inventory_coordinator::is_deferral_receipt_reason(
@@ -3383,19 +3418,26 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         let subject = escape_controls(gap_plain_subject(&gap.subject, reason_text)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.subject, reason_text)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
-        let entry = groups.entry((subject, reason)).or_insert((0, true));
+        let entry = groups
+            .entry((subject, reason))
+            .or_insert((0, true, usize::MAX));
         entry.0 += 1;
         entry.1 = entry.1 && scope;
+        entry.2 = entry.2.min(index);
     }
     for (stored, group) in &foreign {
-        let (subject, reason) = foreign_fold_display(stored, group);
+        let rows: Vec<&GapView> = group.iter().map(|(_, gap)| *gap).collect();
+        let (subject, reason) = foreign_fold_display(stored, &rows);
         let subject = escape_controls(&subject).into_owned();
         let reason = escape_controls(&reason).into_owned();
         // Foreign-root rows always name an object, so the group is never
         // a scope group.
-        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        let entry = groups
+            .entry((subject, reason))
+            .or_insert((0, false, usize::MAX));
         entry.0 += group.len();
         entry.1 = false;
+        entry.2 = entry.2.min(first_folded_index(group));
     }
     if !kthreads.is_empty() {
         // The examination total sums every folded row's count times
@@ -3404,53 +3446,68 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
         // count, like every other group; all members are scope
         // rows, so a fresh key reads as a scope group.
         let mut total = 0u64;
-        for gap in &kthreads {
+        for (_, gap) in &kthreads {
             if let Some(count) =
                 kernel_thread_absence_count(gap_plain_reason(&gap.subject, &gap.reason))
             {
                 total = total.saturating_add(count.saturating_mul(gap.repeats));
             }
         }
-        let single_window = kthreads.len() == 1 && kthreads[0].repeats == 1;
+        let single_window = kthreads.len() == 1 && kthreads[0].1.repeats == 1;
         let subject = escape_controls("kernel threads").into_owned();
         let reason = escape_controls(&kernel_thread_fold_reason(total, single_window)).into_owned();
-        let entry = groups.entry((subject, reason)).or_insert((0, true));
+        let entry = groups
+            .entry((subject, reason))
+            .or_insert((0, true, usize::MAX));
         entry.0 += kthreads.len();
+        entry.2 = entry.2.min(first_folded_index(&kthreads));
     }
     if !unreachable.is_empty() {
-        let (subject, reason) = unreachable_fold_display(&unreachable);
+        let rows: Vec<&GapView> = unreachable.iter().map(|(_, gap)| *gap).collect();
+        let (subject, reason) = unreachable_fold_display(&rows);
         let subject = escape_controls(&subject).into_owned();
         let reason = escape_controls(&reason).into_owned();
         // Unreachable-process rows always name an object, so the family
         // is never a scope group.
-        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        let entry = groups
+            .entry((subject, reason))
+            .or_insert((0, false, usize::MAX));
         entry.0 += unreachable.len();
         entry.1 = false;
+        entry.2 = entry.2.min(first_folded_index(&unreachable));
     }
     if !replaced.is_empty() {
-        let (subject, reason) = replaced_fold_display(&replaced);
+        let rows: Vec<&GapView> = replaced.iter().map(|(_, gap)| *gap).collect();
+        let (subject, reason) = replaced_fold_display(&rows);
         let subject = escape_controls(&subject).into_owned();
         let reason = escape_controls(&reason).into_owned();
         // Replaced-file rows always name an object, so the family is
         // never a scope group.
-        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        let entry = groups
+            .entry((subject, reason))
+            .or_insert((0, false, usize::MAX));
         entry.0 += replaced.len();
         entry.1 = false;
+        entry.2 = entry.2.min(first_folded_index(&replaced));
     }
     if !maps.is_empty() {
-        let (subject, reason) = maps_fold_display(&maps);
+        let rows: Vec<&GapView> = maps.iter().map(|(_, gap)| *gap).collect();
+        let (subject, reason) = maps_fold_display(&rows);
         let subject = escape_controls(&subject).into_owned();
         let reason = escape_controls(&reason).into_owned();
         // Maps-attribution rows always name a process, so the family
         // is never a scope group.
-        let entry = groups.entry((subject, reason)).or_insert((0, false));
+        let entry = groups
+            .entry((subject, reason))
+            .or_insert((0, false, usize::MAX));
         entry.0 += maps.len();
         entry.1 = false;
+        entry.2 = entry.2.min(first_folded_index(&maps));
     }
     if groups.is_empty() && ceiling.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<((String, String), (usize, bool))> = groups.into_iter().collect();
+    let mut ranked: Vec<((String, String), (usize, bool, usize))> = groups.into_iter().collect();
     ranked.sort_by(|left, right| {
         // `Option` orders `None` below every `Some`, so a missing
         // rank maps to last place explicitly.
@@ -3463,34 +3520,31 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     });
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
     let mut shown = 0usize;
-    for row in &ceiling {
-        if shown >= GAP_GROUPS_SHOWN {
-            break;
+    let units = ceiling.len().saturating_add(ranked.len());
+    let mut ceiling = ceiling.into_iter().peekable();
+    for ((subject, reason), (count, _, first)) in ranked.iter() {
+        while ceiling.peek().is_some_and(|(index, _)| index < first) {
+            if shown >= GAP_GROUPS_SHOWN {
+                break;
+            }
+            let (_, row) = ceiling.next().expect("a peeked ceiling row");
+            lines.push(ceiling_fold_line(row));
+            shown += 1;
         }
-        let subject = escape_controls(gap_plain_subject(&row.subject, &row.reason)).into_owned();
-        let reason = escape_controls(gap_plain_reason(&row.subject, &row.reason)).into_owned();
-        if row.repeats == 1 {
-            lines.push(gap_single_line(&subject, &reason));
-        } else {
-            lines.push(gap_group_line(
-                usize::try_from(row.repeats).unwrap_or(usize::MAX),
-                &subject,
-                &reason,
-            ));
-        }
-        shown += 1;
-    }
-    for ((subject, reason), (count, _)) in ranked.iter() {
         if shown >= GAP_GROUPS_SHOWN {
             break;
         }
         lines.push(gap_group_line(*count, subject, reason));
         shown += 1;
     }
-    let rest = ceiling
-        .len()
-        .saturating_add(ranked.len())
-        .saturating_sub(shown);
+    for (_, row) in ceiling {
+        if shown >= GAP_GROUPS_SHOWN {
+            break;
+        }
+        lines.push(ceiling_fold_line(row));
+        shown += 1;
+    }
+    let rest = units.saturating_sub(shown);
     if rest == 1 {
         lines.push("  and 1 more group (--json has every item)".to_string());
     } else if rest > 1 {

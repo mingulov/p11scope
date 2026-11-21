@@ -7645,12 +7645,12 @@ fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
         &lines[at..at + 5],
         &[
             "gaps: 5",
-            "  libother.so - scan budget exhausted",
-            "  5 x capture discovery - scan budget exhausted",
             "  1 x unrelated-a - unrelated reason a",
+            "  libother.so - scan budget exhausted",
             "  1 x unrelated-b - unrelated reason b",
+            "  5 x capture discovery - scan budget exhausted",
         ],
-        "concise sums repeats per subject in encounter order with a bare singleton: {snapshot}"
+        "concise anchors each folded ceiling row to its first encounter: {snapshot}"
     );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let gap_lines: Vec<&str> = verbose
@@ -7683,6 +7683,77 @@ fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
             .count(),
         3,
         "every ceiling trip keeps its renamed record: {kept:?}"
+    );
+    // The shared cap covers the merged order: nineteen ordinary groups
+    // plus two interleaved ceiling rows show twenty lines, then the
+    // one-line remainder. The ceiling rows stay anchored instead of
+    // jumping ahead and crowding ordinary groups out.
+    let (mut capped, _caller) = single_caller_harness("present-ceiling-fold-cap", 1);
+    let ordinary = |harness: &mut Harness, index: usize| {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("ord-{index:02}"),
+                reason: format!("reason {index:02}"),
+                budget: None,
+            });
+    };
+    let ceiling = |harness: &mut Harness, subject: &str, times: usize| {
+        for _ in 0..times {
+            harness
+                .coordinator_mut()
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(1000),
+                    subject: subject.into(),
+                    reason: WORK_CEILING_REASON.into(),
+                    budget: None,
+                });
+        }
+    };
+    ceiling(&mut capped, "ceil-first.so", 1);
+    for index in 0..10 {
+        ordinary(&mut capped, index);
+    }
+    ceiling(&mut capped, "ceil-mid.so", 2);
+    for index in 10..19 {
+        ordinary(&mut capped, index);
+    }
+    capped.commit();
+    let capped_document = capped.render();
+    let capped_presentation = capture_for(&capped, &capped_document);
+    let capped_snapshot = render_snapshot(&capped_presentation);
+    let capped_lines: Vec<&str> = capped_snapshot.lines().collect();
+    let capped_at = capped_lines
+        .iter()
+        .position(|line| *line == "gaps: 21")
+        .expect("the capped block headers the exact row count");
+    let mut expected = vec![
+        "gaps: 21".to_string(),
+        "  ceil-first.so - scan budget exhausted".to_string(),
+    ];
+    for index in 0..10 {
+        expected.push(format!("  1 x ord-{index:02} - reason {index:02}"));
+    }
+    expected.push("  2 x ceil-mid.so - scan budget exhausted".to_string());
+    for index in 10..18 {
+        expected.push(format!("  1 x ord-{index:02} - reason {index:02}"));
+    }
+    expected.push("  and 1 more group (--json has every item)".to_string());
+    assert_eq!(
+        &capped_lines[capped_at..capped_at + expected.len()],
+        expected
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice(),
+        "the merged order shares the cap with anchored ceiling rows: {capped_snapshot}"
     );
 }
 

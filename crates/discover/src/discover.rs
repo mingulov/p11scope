@@ -2376,6 +2376,106 @@ mod tests {
     }
 
     #[test]
+    fn interface_name_outside_provider_mappings_is_refused() {
+        let memory = ProcessMemory::open().unwrap();
+        // A hostile provider can point pInterfaceName at any readable
+        // mapping; the stack buffer below stands in for environment
+        // memory (the helper retains its environment). Readable with an
+        // in-mapping NUL is not enough: only provider bytes may publish.
+        let stack_name = b"HOSTILE_STACK_NAME\0";
+        let name = read_name_at(&memory, stack_name.as_ptr() as usize);
+        assert!(
+            name.raw.is_none(),
+            "out-of-provider bytes were published: {name:?}"
+        );
+        assert!(
+            name.error.is_some(),
+            "an out-of-provider pointer needs a recorded refusal: {name:?}"
+        );
+    }
+
+    /// A real address-bearing header failure, proving the probes below
+    /// strip something genuine rather than passing on an empty echo.
+    fn address_bearing_header_error(memory: &ProcessMemory) -> String {
+        let header = read_version(memory, 0x1000).unwrap_err();
+        assert!(
+            header.contains("0x"),
+            "the probe needs a real address-bearing failure: {header}"
+        );
+        header
+    }
+
+    fn assert_walk_detail_has_no_address(detail: &str) {
+        assert!(
+            !detail.contains("0x") && !detail.contains("pread"),
+            "walk detail leaks a read address: {detail}"
+        );
+    }
+
+    #[test]
+    fn surface_walk_function_detail_carries_no_address() {
+        let memory = ProcessMemory::open().unwrap();
+        // An unmapped table base reads like a torn provider table: every
+        // word fails. The diagnostic must keep fixed text plus the ordinal
+        // count, never the helper's raw pread address.
+        let legacy = Surface::LegacyFunctionList {
+            version: cryptoki_sys::CK_VERSION {
+                major: 2,
+                minor: 40,
+            },
+        };
+        let snapshot = snapshot_table(&memory, 0x1000, inventory_tables(legacy));
+        assert!(
+            snapshot.values.is_empty(),
+            "the unmapped base must read nothing"
+        );
+        let WalkOutcome::Unreadable { detail } = &snapshot.walk else {
+            panic!(
+                "an unreadable table must stay unreadable: {:?}",
+                snapshot.walk
+            );
+        };
+        assert_walk_detail_has_no_address(detail);
+    }
+
+    #[test]
+    fn surface_walk_header_detail_carries_no_address() {
+        let memory = ProcessMemory::open().unwrap();
+        // The version-header arm echoes a real header read failure.
+        let header = address_bearing_header_error(&memory);
+        let snapshot = inventory_snapshot(&memory, 0x1000, Err(header.as_str()));
+        let WalkOutcome::Unreadable { detail } = &snapshot.walk else {
+            panic!(
+                "an unreadable header must stay unreadable: {:?}",
+                snapshot.walk
+            );
+        };
+        assert_walk_detail_has_no_address(detail);
+    }
+
+    #[test]
+    fn walked_table_header_detail_carries_no_address() {
+        let memory = ProcessMemory::open().unwrap();
+        // A readable table with an unreadable header keeps its words; only
+        // the header echo can carry an address.
+        let header = address_bearing_header_error(&memory);
+        let words = [0usize; 104];
+        let snapshot = inventory_snapshot(&memory, words.as_ptr() as usize, Err(header.as_str()));
+        assert_eq!(
+            snapshot.values.len(),
+            68,
+            "the legacy walk keeps its complete words"
+        );
+        let WalkOutcome::Unreadable { detail } = &snapshot.walk else {
+            panic!(
+                "an unreadable header must stay unreadable: {:?}",
+                snapshot.walk
+            );
+        };
+        assert_walk_detail_has_no_address(detail);
+    }
+
+    #[test]
     fn interface_name_read_is_capped_at_64_bytes() {
         let memory = ProcessMemory::open().unwrap();
         let overlong = vec![b'x'; 256];

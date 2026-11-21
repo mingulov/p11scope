@@ -1283,6 +1283,26 @@ mod tests {
     }
 
     #[test]
+    fn ptrace_equivalent_remote_access_syscalls_evaluate_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // process_vm_readv reads another process's memory and pidfd_getfd
+        // steals its descriptors: ptrace-equivalent without ptrace. Each
+        // number is keyed to libc, like the denylist table above.
+        for (nr, want, name) in [
+            (310u32, libc::SYS_process_vm_readv, "process_vm_readv"),
+            (438u32, libc::SYS_pidfd_getfd, "pidfd_getfd"),
+        ] {
+            assert_eq!(nr, want as u32, "wrong number for {name}");
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0, 0),
+                denied,
+                "{name} escapes the fence"
+            );
+        }
+    }
+
+    #[test]
     fn a_foreign_arch_gets_enosys() {
         let insns = FilterBuilder::new().build().unwrap();
         let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;

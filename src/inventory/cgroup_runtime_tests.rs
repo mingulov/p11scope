@@ -1228,8 +1228,7 @@ fn resume_progress(
     }
 }
 
-/// One posed resume position, mirroring production: every carried
-/// cursor, completed ones included.
+/// One posed resume position: every cursor recorded in one pass.
 type PosedResumePosition = std::collections::BTreeMap<
     crate::discovery::scan_pass::DecodeCursorKey,
     crate::discovery::scan_pass::CommittedCursorProgress,
@@ -1245,10 +1244,27 @@ fn resume_position(
     entries.into_iter().collect()
 }
 
-/// Pose one decision on a driver: a fresh ledger whose whole decided
-/// history is `prev`, then the real observation of `last`, so
-/// single-step poses read like an adjacent rule while the decision
-/// runs the real ledger. The spent settle grant carries over.
+/// Record one posed pass into the ledger's posed history exactly like
+/// the cursor store (begin the pass, record every cursor), then hand the
+/// ledger the pass's observation exactly like `finish_pass`.
+fn observe_posed(driver: &mut ClassicDriver<'_>, position: &PosedResumePosition) {
+    let ledger = &mut driver.cgroup.as_mut().unwrap().resume;
+    ledger.posed.begin_pass();
+    for (key, progress) in position {
+        ledger.posed.record(key, progress);
+    }
+    let observation = crate::discovery::scan_pass::ResumeObservation {
+        unfinished: position.values().any(|progress| !progress.complete),
+        raised: ledger.posed.raised(),
+        history_refused: ledger.posed.refused(),
+    };
+    ledger.observe(observation);
+}
+
+/// Pose one decision on a driver: a fresh history and ledger whose whole
+/// decided history is `prev`, then the real observation of `last`, so
+/// single-step poses read like an adjacent rule while the decision runs
+/// the real history. The spent settle grant carries over.
 fn pose_resume(
     driver: &mut ClassicDriver<'_>,
     last: PosedResumePosition,
@@ -1260,15 +1276,15 @@ fn pose_resume(
         settle_granted,
         ..SnapshotResumeLedger::default()
     };
-    cgroup.resume.observe(&prev);
-    cgroup.resume.observe(&last);
+    observe_posed(driver, &prev);
+    observe_posed(driver, &last);
 }
 
-/// Observe one pass position exactly like `finish_pass`, then decide:
-/// the multi-pass twins drive sequences through this so every
-/// decision reads the real retained history.
+/// Record and observe one pass position, then decide: the multi-pass
+/// twins drive sequences through this so every decision reads the real
+/// retained history.
 fn pass_resume(driver: &mut ClassicDriver<'_>, last: PosedResumePosition) -> bool {
-    driver.cgroup.as_mut().unwrap().resume.observe(&last);
+    observe_posed(driver, &last);
     driver.snapshot_resume_pending()
 }
 
@@ -1749,7 +1765,9 @@ fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
     driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
     let fixed = resume_key(7, 9, 11);
     let newcomer = resume_key(7, 9, 12);
-    let completed: Vec<_> = (0..128u64).map(|index| resume_key(8, 9, 1000 + index)).collect();
+    let completed: Vec<_> = (0..128u64)
+        .map(|index| resume_key(8, 9, 1000 + index))
+        .collect();
     let mut last_completed = Vec::new();
     for round in 0..64u64 {
         let mut entries = vec![(
@@ -1758,7 +1776,12 @@ fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
         )];
         last_completed = completed
             .iter()
-            .map(|key| (key.clone(), resume_progress(5000 + round, (2, 0), (2, 0), 1, true)))
+            .map(|key| {
+                (
+                    key.clone(),
+                    resume_progress(5000 + round, (2, 0), (2, 0), 1, true),
+                )
+            })
             .collect();
         entries.extend(last_completed.iter().cloned());
         assert!(
@@ -1780,6 +1803,11 @@ fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
         entries.extend(last_completed.iter().cloned());
         resume_position(entries)
     };
+    assert_eq!(
+        driver.inner.cgroup.as_ref().unwrap().resume.posed.len(),
+        crate::discovery::scan_pass::MAX_DECODE_CURSORS,
+        "the completed-only churn genuinely fills the history"
+    );
     assert!(
         !pass_resume(&mut driver.inner, with(900)),
         "the newcomer's arrival is not an advance"
@@ -1814,6 +1842,43 @@ fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
     assert!(
         pass_resume(&mut driver.inner, fresh(950)),
         "the newcomer's strict rise resumes after the all-complete history"
+    );
+    // Capacity refusal control: a history full of unfinished work can
+    // evict nothing; the newcomer is refused, counted and named, and its
+    // progress earns no pass.
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let busy = |word: u64| -> Vec<_> {
+        (0..crate::discovery::scan_pass::MAX_DECODE_CURSORS as u64)
+            .map(|index| {
+                (
+                    resume_key(9, 9, 100_000 + index),
+                    resume_progress(100, (0, word), (0, 0), 1, false),
+                )
+            })
+            .collect()
+    };
+    assert!(pass_resume(&mut driver.inner, resume_position(busy(10))));
+    let crowded = |word: u64| {
+        let mut entries = busy(10);
+        entries.push((
+            newcomer.clone(),
+            resume_progress(100, (0, word), (0, 0), 4, false),
+        ));
+        resume_position(entries)
+    };
+    assert!(!pass_resume(&mut driver.inner, crowded(900)));
+    assert!(
+        !pass_resume(&mut driver.inner, crowded(950)),
+        "an unadmitted pair's progress earns no pass"
+    );
+    let resume = &driver.inner.cgroup.as_ref().unwrap().resume;
+    assert_eq!(resume.posed.refused(), 2, "each refused record is counted");
+    assert!(
+        crate::discovery::scan_pass::scan_resume_history_full_reason(resume.posed.refused())
+            .starts_with("2 unfinished object cursor record(s)"),
+        "the refusal is named with its count"
     );
 }
 

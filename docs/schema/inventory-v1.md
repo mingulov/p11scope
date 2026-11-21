@@ -1023,10 +1023,13 @@ and never proves an app identity. See the app identity rows of
   at the first row's position, with the exact summed total, so a
   slow host that files one trip per pass per caller reads as one
   line instead of dozens. A lone trip renders bare. Concise text
-  treats the folded rows as anchors: each ordinary group reads in
-  the interval between anchors that holds its first row and is
-  ranked only within that interval, and one cap covers the merged
-  lines. The dashboard
+  reads protected rows first — the run-wide count-explaining
+  subjects (such as `inventory capture failed`), the terminal
+  `scan_in_progress` row and `scan resume history full` — and never
+  folds them under the cap. Every other row treats the folded
+  ceiling rows as anchors: each ordinary group reads in the interval
+  between anchors that holds its first row and is ranked only within
+  that interval, and one cap covers the merged lines. The dashboard
   lists the renamed rows unfolded (its per-row navigation keeps each
   trip's attribution).
   A gap that records a budget refusal carries `budget` with the

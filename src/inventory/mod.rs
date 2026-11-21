@@ -2525,117 +2525,57 @@ impl InventorySelection {
     }
 }
 
-/// Covered ground of one admitted (work identity, layout) pair: the
-/// furthest lexicographic sweep position, the most decoded tables and
-/// whether any observed pass completed it. Each component only rises.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CoveredFrontier {
-    sweep: (usize, u64, usize, u64),
-    tables_decoded: usize,
-    complete: bool,
-}
-
-impl CoveredFrontier {
-    fn of(progress: &crate::discovery::scan_pass::CommittedCursorProgress) -> Self {
-        Self {
-            sweep: progress.sweep_position(),
-            tables_decoded: progress.tables_decoded,
-            complete: progress.complete,
-        }
-    }
-
-    /// Whether `progress` reaches past this covered ground. A completed
-    /// sweep is never passed: a restart under the same identity and
-    /// layout re-scans ground an earlier pass already finished.
-    fn passed_by(&self, progress: &crate::discovery::scan_pass::CommittedCursorProgress) -> bool {
-        !self.complete
-            && (progress.sweep_position() > self.sweep
-                || progress.tables_decoded > self.tables_decoded
-                || progress.complete)
-    }
-
-    fn raise(&mut self, progress: &crate::discovery::scan_pass::CommittedCursorProgress) {
-        self.sweep = self.sweep.max(progress.sweep_position());
-        self.tables_decoded = self.tables_decoded.max(progress.tables_decoded);
-        self.complete |= progress.complete;
-    }
-}
-
-/// The snapshot's single resume-termination owner. `finish_pass`
-/// observes every decided pass once, with every carried cursor —
-/// completed ones included — so the ledger holds the whole decided
-/// history; the resume and settle decisions only read it.
+/// The snapshot's resume grants: the single decider of whether a WorkLimit
+/// pass runs again. It reads one `O(1)` [`ResumeObservation`] per accepted
+/// pass; the covered ground itself is the cursor store's
+/// [`ResumeHistory`], updated where each cursor is recorded inside the
+/// credited scan, so publication and `finish_pass` never revisit cursors.
 ///
-/// Termination: a WorkLimit pass is granted only by (a) the one
-/// initial grant, spent by the first observation with unfinished work;
-/// (b) the one settle grant; or (c) an observation that strictly
-/// raises the covered ground of an already admitted (identity, layout)
-/// pair. Pairs are keyed by layout as well as identity, so a layout
-/// change never overwrites another layout's covered ground, and they
-/// are never evicted: a revisited layout, a restart behind a frontier,
-/// a temporary disappearance or a restart after completion compares
-/// against everything covered before. Admission is capped at the
-/// carried cursor bound and each pair's covered ground is bounded by
-/// its layout, so (c) holds only finitely often. Arrival (a new pair)
-/// seeds without granting. Work left by a stall stays the named
+/// Termination: a WorkLimit pass is granted only by (a) the one initial
+/// grant, spent by the first observation with unfinished work; (b) the
+/// one settle grant; or (c) an observation whose progress rose past the
+/// covered ground of an admitted (identity, layout) pair — finitely many,
+/// see [`ResumeHistory`]. Work left by a stall stays the named
 /// in-progress gap.
+///
+/// [`ResumeObservation`]: crate::discovery::scan_pass::ResumeObservation
+/// [`ResumeHistory`]: crate::discovery::scan_pass::ResumeHistory
 #[derive(Debug, Default)]
 struct SnapshotResumeLedger {
-    covered: BTreeMap<(crate::discovery::scan_pass::DecodeCursorKey, u64), CoveredFrontier>,
     /// The last observed pass left unfinished cursors.
     unfinished: bool,
     /// The observed pass before it left unfinished cursors.
     prev_unfinished: bool,
-    /// The last observation earns a resume: it raised an admitted
-    /// pair's covered ground or spent the initial grant.
+    /// The last observation earns a resume: it rose past covered ground
+    /// or spent the initial grant.
     advanced: bool,
     /// The initial unfinished grant was spent.
     initial_granted: bool,
     /// The one settle pass was granted: once spent, later convergences
     /// end the snapshot instead of settling again.
     settle_granted: bool,
+    /// The posed twins' resume history, standing in for the cursor
+    /// store's (production keeps it beside the cursors).
+    #[cfg(test)]
+    posed: crate::discovery::scan_pass::ResumeHistory,
 }
 
 impl SnapshotResumeLedger {
-    /// Observe one decided pass — every carried cursor's committed
-    /// progress: decide whether it advanced, then fold it into the
-    /// covered ground.
-    fn observe(
-        &mut self,
-        cursors: &BTreeMap<
-            crate::discovery::scan_pass::DecodeCursorKey,
-            crate::discovery::scan_pass::CommittedCursorProgress,
-        >,
-    ) {
-        let unfinished = cursors.values().any(|progress| !progress.complete);
-        let mut raised = false;
-        for (key, progress) in cursors {
-            let pair = (key.clone(), progress.layout);
-            match self.covered.get_mut(&pair) {
-                Some(covered) => {
-                    raised |= covered.passed_by(progress);
-                    covered.raise(progress);
-                }
-                None => {
-                    if self.covered.len() < crate::discovery::scan_pass::MAX_DECODE_CURSORS {
-                        self.covered.insert(pair, CoveredFrontier::of(progress));
-                    }
-                }
-            }
-        }
+    /// Observe one accepted pass's resume summary.
+    fn observe(&mut self, observation: crate::discovery::scan_pass::ResumeObservation) {
+        let unfinished = observation.unfinished;
         let initial = unfinished && !self.initial_granted;
         self.initial_granted |= unfinished;
         self.prev_unfinished = self.unfinished;
         self.unfinished = unfinished;
-        self.advanced = unfinished && (raised || initial);
+        self.advanced = unfinished && (observation.raised || initial);
     }
 
     /// Whether the last pass left unfinished decode progress that earns
-    /// another pass: past the covered ground of an admitted (identity,
-    /// layout) pair, or the first unfinished pass. When nothing moves
-    /// past covered ground the fresh allowance moved no committed work
-    /// forward, so the snapshot stops and reports the live in-progress
-    /// gap honestly instead of spinning.
+    /// another pass: past covered ground, or the first unfinished pass.
+    /// When nothing moves past covered ground the fresh allowance moved
+    /// no committed work forward, so the snapshot stops and reports the
+    /// live in-progress gap honestly instead of spinning.
     fn advancing(&self) -> bool {
         self.advanced
     }
@@ -7615,7 +7555,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             })?;
             let warning = completion.driver_warning();
             cgroup.continuation = Some(completion.state);
-            cgroup.resume.observe(&completion.progress_cursors);
+            cgroup.resume.observe(completion.resume);
             cgroup.last_outcome = Some(completion.outcome);
             report.scan_callers = completion.scan_callers;
             if let Some(warning) = warning {

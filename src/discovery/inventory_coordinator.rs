@@ -176,15 +176,12 @@ pub(crate) struct CgroupCompletion {
     /// into a continuation instead of a terminal exhaustion verdict.
     /// `None` once converged (or when no scan ever ran).
     pub(crate) progress: Option<(usize, usize, usize)>,
-    /// Committed per-cursor progress beside [`progress`](Self::progress):
-    /// every carried cursor, completed ones included, for the snapshot
-    /// resume ledger, which advances only past the covered ground of a
-    /// same-identity, same-layout pair, so churn never resumes while
-    /// intra-object sweep advance counts as progress.
-    pub(crate) progress_cursors: BTreeMap<
-        crate::discovery::scan_pass::DecodeCursorKey,
-        crate::discovery::scan_pass::CommittedCursorProgress,
-    >,
+    /// The accepted pass's resume summary beside
+    /// [`progress`](Self::progress), read in `O(1)` from the cursor
+    /// store's history (kept where each cursor was recorded): unfinished
+    /// work, whether progress rose past covered ground, and capacity
+    /// refusals.
+    pub(crate) resume: crate::discovery::scan_pass::ResumeObservation,
 }
 
 impl CgroupCompletion {
@@ -5593,6 +5590,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
     }
 
+    /// The named resume-history capacity refusal for the terminal view:
+    /// unfinished work the snapshot resume history could not admit is
+    /// counted and named, never dropped silently. `None` when nothing was
+    /// refused (or the bundle is in worker custody).
+    pub(crate) fn live_scan_history_gap(&self) -> Option<crate::inventory_present::GapView> {
+        let refused = self.cgroup_file_facts.resume_observation().history_refused;
+        (refused > 0).then(|| crate::inventory_present::GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: crate::discovery::scan_pass::SCAN_RESUME_HISTORY_FULL_SUBJECT.to_string(),
+            reason: crate::discovery::scan_pass::scan_resume_history_full_reason(refused),
+            budget: None,
+            repeats: 1,
+        })
+    }
+
     pub(crate) fn cgroup_collector_observed(
         &mut self,
         state: CgroupWalkState,
@@ -5754,7 +5768,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             admitted: 0,
             scan_callers: 0,
             progress: None,
-            progress_cursors: BTreeMap::new(),
+            resume: crate::discovery::scan_pass::ResumeObservation::default(),
         });
     }
 
@@ -14705,7 +14719,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 admitted: completion.admitted,
                 scan_callers: completion.scan_callers,
                 progress: self.cgroup_file_facts.scan_progress_totals(),
-                progress_cursors: self.cgroup_file_facts.scan_cursor_progress(),
+                resume: self.cgroup_file_facts.resume_observation(),
             });
             // A cgroup-scope capture opens the same native lane, so its
             // pass seam releases departed native state exactly like the
@@ -45999,12 +46013,14 @@ int main(void) {
             };
             let cursor = crate::discovery::scan_pass::DecodeCursor {
                 fingerprint: (0..4u64)
-                    .map(|slot| crate::discovery::scan_pass::MappingFingerprintEntry {
-                        start: slot << 12,
-                        end: (slot + 1) << 12,
-                        file_offset: 0,
-                        permissions: *b"r--p",
-                    })
+                    .map(
+                        |slot| crate::discovery::scan_pass::MappingFingerprintEntry {
+                            start: slot << 12,
+                            end: (slot + 1) << 12,
+                            file_offset: 0,
+                            permissions: *b"r--p",
+                        },
+                    )
                     .collect(),
                 tables: crate::discovery::scan_pass::SweepFrontier {
                     snapshot: 4,
@@ -46045,10 +46061,17 @@ int main(void) {
             after - before,
             0,
             "publication must not re-summarize the {} carried cursors",
-            coordinator.cgroup_file_facts.decode_cursors_for_test().len()
+            coordinator
+                .cgroup_file_facts
+                .decode_cursors_for_test()
+                .len()
         );
         assert!(
-            coordinator.cgroup_file_facts.decode_cursors_for_test().len() >= 65,
+            coordinator
+                .cgroup_file_facts
+                .decode_cursors_for_test()
+                .len()
+                >= 65,
             "the completed cursors stay carried"
         );
     }

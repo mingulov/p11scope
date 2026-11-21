@@ -86,35 +86,45 @@ ones).
 /// One pin attempt's authoritative outcome. Produced only by the
 /// identity owner (`pin_scanned_object` and the manifest/pre-arm
 /// constructors); consumed by every binder, queue and gap renderer.
+/// Success is `Ok(entry)` and records the view's ownership; the
+/// `Err` side is the three-way outcome below.
 pub(crate) enum PinOutcome {
-    /// The view proved this file. Carries the view-owned proof the
-    /// binder consumes (raw + entry id). Physical sharing is fine:
-    /// two views proving the same raw each own the same tuple.
-    Proven { raw: RawObjectInstance, id: PinnedObjectId },
     /// Nothing was proven about the file for this view (death,
     /// unreadable identity, inconclusive probe). Per-view missing
     /// evidence: files a named skip, never a key rejection.
-    Unproven { cause: UnprovenCause },
+    Unproven { cause: UnprovenCause, reason: String },
     /// Retryable stop with a named retry owner. Files a named
     /// in-progress gap and parks the exact work on that owner's
     /// queue (§5). Never a key rejection.
-    Wait { cause: WaitCause, retry: RetryOwner },
+    Wait { cause: WaitCause, retry: RetryOwner, reason: String },
     /// The view died mid-pin. Missing evidence, not a suspicious
     /// file (lane-4 `Gone` idea, typed). Files a named skip.
-    Gone { evidence: ExitEvidence },
-    /// Two different files proven under one raw key. The ONLY
-    /// outcome that inserts `rejected_keys`. Carries the collision
-    /// proof so absorb can replay it unconditionally (§3.4).
-    Collision { key: ObjectKey, proof: CollisionProof },
+    Gone { evidence: ExitEvidence, reason: String },
 }
 ```
 
-`UnprovenCause`, `WaitCause`, `RetryOwner`, `ExitEvidence` and
-`CollisionProof` are closed enums, not strings. Today's `PinFailure`
+`UnprovenCause`, `WaitCause`, `RetryOwner` and `ExitEvidence` are
+closed enums, not strings. Today's `PinFailure`
 (`identity.rs:9816`: `Refused(String)` vs handle-only `Wait`) becomes
-this five-way outcome; every `From<String>`/`From<&str>` catch-all
-that silently maps unknown failures to refusal is deleted — each
-failure site names its cause or the code does not compile.
+this outcome; every `From<String>`/`From<&str>` catch-all that
+silently maps unknown failures to refusal is deleted — each failure
+site names its cause or the code does not compile.
+
+As-built shape (deviation from the five-way draft recorded here, not
+in an appendix): success rides `Ok(entry)` rather than a `Proven`
+variant, and proven collisions ride the `proven_collision_keys`
+marker set on `PinnedObjects` rather than a `Collision` variant
+carrying a `CollisionProof`. The behavioural contract is unchanged:
+only `Ok` inserts (recording per-view ownership), every `Err` arm
+files a named skip with no key rejection, and only the two
+proven-collision insert paths (forgery, group rejection) mark
+`proven_collision_keys` and reject the key. Absorb replays marked
+keys only (§3.4). The marker-set half is induction-checked, not
+type-checked: `reapply_rejected_keys` (planning scratches only)
+and the conservative-copy path hold unproven rejections without
+the marker, so no global `rejected_keys ⊆ proven_collision_keys`
+assert holds — the replay sites take their keys from
+`proven_collision_keys`, never from `rejected_keys`.
 
 ### 3.2 Per-view proof at one resolver
 
@@ -127,18 +137,29 @@ named proof skip. All production resolvers funnel through it:
 - manifest fallback matching (`scanned_replacement`, `scan_view`,
   `retarget_to_pins`, `scanned_targets_without`),
 - `alias_scanned_module_under` (hearsay ownership for
-  `RUN_LEARNED_VIEW_ID` becomes a named, twin-covered exception or is
-  re-proved — no silent aggregate write),
-- `scanned_rebind::resolve_normalized` (staged; if it goes live it
-  goes through the same gate).
+  `RUN_LEARNED_VIEW_ID` is the one named exception: run-persistent
+  learned tables persist their bindable identity under the reserved
+  owner so a proving view's later retirement prunes only its own
+  rows — no silent aggregate write outside this call),
+- `scanned_rebind::resolve_normalized` (LIVE at the stop-time
+  conservative-plan rebind over sealed inputs — the draft's
+  "(staged)" is wrong — and still resolving through the aggregate
+  map without the per-view fence: known gap, pending the
+  tier-2 authority disposition on whether sealed inputs can carry
+  rows whose views never proved their raws; the funnel design is
+  sketched in the r6 report).
 
-Ownership stops being a side table written in ~10 places and becomes
-a value the pin produces (`Proven`) and the binder consumes. Fixture
-ownership follows production: fixtures that insert entries without
-`raw_ownership` are updated to record what production records (the
-fix6 B1b question is settled by the owner rule — the refactor IS the
-fix, so fixtures move with the invariant; no fixture edit changes an
-assertion's meaning, only its staging).
+Ownership stays a side table (`raw_ownership`, written at pin time
+and merged at absorb) with the fence enforced once at
+`id_for_scanned` — the draft's "stops being a side table" is
+corrected: the pin produces `Ok(entry)` and the recorder files the
+ownership beside the insert, rather than the ownership travelling
+as a produced value. Fixture ownership follows production:
+fixtures that insert entries without `raw_ownership` are updated to
+record what production records (the fix6 B1b question is settled by
+the owner rule — the refactor IS the fix, so fixtures move with the
+invariant; no fixture edit changes an assertion's meaning, only its
+staging).
 
 ### 3.3 What changes behaviourally
 
@@ -157,15 +178,22 @@ assertion's meaning, only its staging).
 
 ### 3.4 Absorb
 
-`absorb` replays `Collision` evidence unconditionally (with the same
-entry-removing routing refusal as a cross-partition collision) and
-propagates the marker; `Unproven`/`Wait`/`Gone` evidence never
-creates or replays a key rejection; `Proven` entries merge by the
-existing physical-identity predicate. This closes L1-1 (the
-lane-introduced `absorbing_carried_rejection_spares_the_proven_pre`
-failure), L1-2/lane-2 F4 (collision suppression by the kept-pin
-guard) and fix3 F1 (fresh key rejection dropped, then merge binds
-through the peer) in one place.
+`absorb` replays `proven_collision_keys` markers unconditionally
+(with the same entry-removing routing refusal as a
+cross-partition collision) and propagates the marker set;
+`Unproven`/`Wait`/`Gone` evidence never creates or replays a key
+rejection; `Ok` entries merge by the existing physical-identity
+predicate. This closes L1-1 (the lane-introduced
+`absorbing_carried_rejection_spares_the_proven_pre` failure),
+L1-2/lane-2 F4 (collision suppression by the kept-pin guard) and
+fix3 F1 (fresh key rejection dropped, then merge binds through the
+peer) in one place. The replay takes its keys from
+`proven_collision_keys`, never from `rejected_keys`: only the two
+proven-collision insert paths mark the set, so induction over all
+`rejected_keys` insert sites (production inserts at absorb replay,
+forgery, group rejection, reapply-on-scratch and the
+conservative-copy path) keeps unproven observations out of every
+replay.
 
 ## 4. Owner 2 — per-pass budget: one ScanPassOwner, resume cursor
 
@@ -373,8 +401,11 @@ test ideas live on in the owners' tables (§9).
 - Lane-2 `AbsorbOutcome::slot_matches` + `note_setup_endpoints(plan,
   absorbed)` two-route form → replaced by three-route classification
   (§6).
-- Lane-2 `proven_collision_keys` marker set → replaced by
-  `CollisionProof` carried in the outcome (§3.1, §3.4).
+- Lane-2 `proven_collision_keys` marker set → KEPT as the
+  absorb-replay marker (§3.1, §3.4): the draft's "`CollisionProof`
+  carried in the outcome" did not ship; the set marks exactly the
+  forgery/group-rejection keys and absorb replays marked keys
+  only.
 - Lane-3 `scan_generation_matches_caller` fail-open waiver + stale-held
   waiver → dead; unknown fails closed (§6).
 - Lane-3 `order_scan_pids_fresh_first` + `truncated_member_pids`
@@ -382,8 +413,14 @@ test ideas live on in the owners' tables (§9).
 - All `debug:` / `P11SCOPE_FIX1_EVLOG` commits on lane 4 → never ported.
 - Substring classifiers (`names_transient_pin_failure`,
   `scan_pins_waited_only_*`, `names_capture_budget_stop` as
-  retry/terminal deciders) → dead as deciders; the typed outcome
-  decides. (String matching may survive inside gap rendering only.)
+  retry/terminal deciders) → deciders for the handle class only:
+  the typed outcome files the handle-class waits
+  (`HandleExhaustion`/`ReserveStop`/`BudgetStop`) under the fixed
+  wait subject and every other `Wait` cause under its own subject,
+  so the classifiers recognise exactly the defer-whole shape and a
+  future `Wait` cause that should defer whole must file there too
+  (pinned by the wait-subject split twin). (String matching may
+  otherwise survive inside gap rendering only.)
 
 ## 9. Test plan (per owner, RED first on c2a180a71)
 
@@ -436,7 +473,11 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
 - Admission 500/1000 newcomers: owners 2+4 (cursor + owed re-sight).
 - Run-tree waves ×50 on vng 6.12: owners 1+3, remainder per §6.
 - Inventory `--cgroup` finds a large provider (haskoki cell):
-  owners 1+4 (strict bind + three-route classification).
+  owners 1+2+4 (strict bind, per-pass 1M allowance with walk
+  continuation and decode-cursor resume across passes — snapshots
+  run follow-up passes until the cursors drain — plus three-route
+  classification). No allowance is sized to fit any provider: any
+  app size converges over several passes.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

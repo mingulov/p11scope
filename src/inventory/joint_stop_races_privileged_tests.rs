@@ -464,12 +464,15 @@ fn start_joint_lane(
         .subset
         .context("the conversion subset prepares")?;
     let scope = Scope::System;
+    // The wedge needs Joint births, which need the linked journal
+    // session; `None` would seal S1 and every case would preclude below.
+    let journal = crate::attach::journal::JournalSpec { key_sizes: false };
     let mut lane = crate::inventory_semantics::AttestedSemanticLane::start_live(
         attach_subset,
         convert_subset,
         &scope,
         crate::attach::BackendSelection::Auto,
-        None,
+        Some(&journal),
     )
     .map_err(|refusal| anyhow::anyhow!("live lane attaches: {refusal}"))?;
     ensure!(lane.is_live(), "the lane owns its live session");
@@ -1379,17 +1382,14 @@ fn run_stop_offset(
         }
     }
     eprintln!("JOINT_STOP {tag}: prep={prep:?} done; stopping in {offset_ms} ms");
-    // The wedge needs Joint births, which need the journal build: only a
-    // session whose loaded object carries both journal roots seals linked.
-    // Default builds stage S1 directly and can never wedge (the full
-    // matrix passes pre-fix on S1), so running on would be a dry pass.
-    // Fail loudly with the branch tag instead.
+    // The wedge needs Joint births, which need the linked journal
+    // session: only a session whose loaded object carries both journal
+    // roots seals linked. An S1 seal can never wedge (the full matrix
+    // passes pre-fix on S1), so running on would be a dry pass. Fail
+    // loudly with the branch tag instead.
     if !matches!(joint_branch(&coordinator), JointBranch::Linked) {
         eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
-        anyhow::bail!(
-            "{tag}: no joint feeds: the wedge needs a journal-build libtest \
-             (P11SCOPE_JOURNAL=1 P11SCOPE_BIRTH_MARKER=1); not attempted"
-        );
+        anyhow::bail!("{tag}: no joint feeds from the linked session; not attempted");
     }
     eprintln!("P11SCOPE_CELL_BRANCH={tag}:linked");
     std::thread::sleep(Duration::from_millis(offset_ms));
@@ -1644,10 +1644,10 @@ fn run_stop_offset(
 /// reach Published, then WoundDown; the at-Q tick publishes the stashed
 /// calls; a latched machine names its code in both the abandon gap and
 /// the run error; and a finish that abandons with resolved calls still
-/// in the lane stash counts them or gaps them, never silently. Run the
-/// journal flavor (`P11SCOPE_JOURNAL=1 P11SCOPE_BIRTH_MARKER=1`):
-/// default builds seal S1 and fail loudly with the s1-precluded branch
-/// tag instead of passing dry.
+/// in the lane stash counts them or gaps them, never silently. The lane
+/// requests the production journal session (builds that omit the
+/// journal object refuse at lane start); an S1 seal fails loudly with
+/// the s1-precluded branch tag instead of passing dry.
 /// `WP7_STOP_PREPS` / `WP7_STOP_OFFSETS` (comma-separated indices,
 /// default all) narrow the matrix for exploration.
 #[test]
@@ -1812,4 +1812,27 @@ fn run_stop_case(
         "offset {offset_ms}: the finish must reach Published then WoundDown: {outcome}"
     );
     Ok(())
+}
+
+/// The stop cell must evaluate on the linked journal session: pin the
+/// journal request in `start_joint_lane`, so a revert to `None` (which
+/// would seal S1 and preclude every case) fails here instead of
+/// passing dry anywhere.
+#[test]
+fn joint_lane_requests_the_linked_journal_session() {
+    let body = include_str!("joint_stop_races_privileged_tests.rs")
+        .split_once("fn start_joint_lane(")
+        .expect("the joint lane starter keeps its name")
+        .1
+        .split_once("\n}\n")
+        .expect("top-level fns close at column 0")
+        .0;
+    assert!(
+        body.contains("JournalSpec { key_sizes: false }"),
+        "the lane builds a journal spec: {body}"
+    );
+    assert!(
+        body.contains("Some(&journal)"),
+        "the lane requests the linked session: {body}"
+    );
 }

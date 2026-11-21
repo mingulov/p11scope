@@ -370,6 +370,28 @@ impl std::fmt::Debug for JointStaging {
     }
 }
 
+/// Why a reseed receipt cannot start a new Joint segment (see
+/// [`JointStaging::try_reselect_joint`]): the caller names the actual
+/// blocker instead of dropping the birth silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReselectRefusal {
+    /// No ended segment to reseed (no receipt, not degraded, still
+    /// staging, or watchdog-tripped).
+    NoSegment,
+    /// Another feed's receipt (wrong key, never this feed).
+    ForeignReceipt,
+    /// The ended segment's proof is destroyed (a fallback the base
+    /// marks non-resumable: tainted, ended, stopped, invalidated,
+    /// mismatched): the same proof could never audit again, so
+    /// arming it would stage into a stuck session. Only a
+    /// superseding fresh incarnation (new proof) may reseed.
+    SegmentUnresumable,
+    /// No cut progress over the old receipt.
+    NoProgress,
+    /// Below the recorded void fence (would certify voided history).
+    BelowFence,
+}
+
 impl JointStaging {
     /// Select S1Only at registration: no receipt, no staging, no
     /// bootstrap-wait queue. Permanent once the instance has returned
@@ -604,31 +626,55 @@ impl JointStaging {
     /// (fallback or loss), drained its staging, and never tripped may
     /// reseed — and never onto a foreign receipt (wrong-key), a cut
     /// at/below the old cut (no progress), or a cut below the recorded
-    /// fence (would certify voided history). A clean reseed clears the
-    /// loss/fallback latches and baselines disposed history like
-    /// [`Self::resume_joint`]: the closed segment stays counted, new
-    /// disposal latches again. Returns whether the mode changed.
+    /// fence (would certify voided history). A proof-destroyed segment
+    /// (fallback plus non-resumable) never reseeds onto the same proof:
+    /// its seals would fall back forever, so the armed segment could
+    /// never audit and would stage into a stuck session until the lane
+    /// stops; loss endings (even fault-epoch loss, whose fresh receipt
+    /// carries the new epoch) and transient ordered fallbacks still
+    /// reseed, as does any superseding fresh incarnation. A clean
+    /// reseed clears the loss/fallback latches and baselines disposed
+    /// history like [`Self::resume_joint`]: the closed segment stays
+    /// counted, new disposal latches again. Returns whether the mode
+    /// changed.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reselect_joint(
         &mut self,
         receipt: &crate::semantics_objects::journal::BootstrapReceipt,
     ) -> bool {
+        self.try_reselect_joint(receipt).is_ok()
+    }
+
+    /// [`Self::reselect_joint`] with the refusal cause for gap naming.
+    pub(crate) fn try_reselect_joint(
+        &mut self,
+        receipt: &crate::semantics_objects::journal::BootstrapReceipt,
+    ) -> Result<(), ReselectRefusal> {
         let Some(old) = self.selected_receipt.as_ref() else {
-            return false;
+            return Err(ReselectRefusal::NoSegment);
         };
         if !self.reseed_eligible() {
-            return false;
+            return Err(ReselectRefusal::NoSegment);
         }
-        if receipt.domain() != old.domain() && !receipt.proof().reseed_supersedes(&old.proof()) {
-            return false;
+        let same_domain = receipt.domain() == old.domain();
+        let superseding = !same_domain && receipt.proof().reseed_supersedes(&old.proof());
+        if !same_domain && !superseding {
+            return Err(ReselectRefusal::ForeignReceipt);
+        }
+        if !superseding
+            && matches!(self.degraded_window, Some(DegradedWindow::Fallback))
+            && !self.segment_resumable
+        {
+            return Err(ReselectRefusal::SegmentUnresumable);
         }
         if receipt.birth_cut() <= old.birth_cut() {
-            return false;
+            return Err(ReselectRefusal::NoProgress);
         }
         if self
             .segment_fence
             .is_some_and(|fence| receipt.birth_cut() < fence)
         {
-            return false;
+            return Err(ReselectRefusal::BelowFence);
         }
         self.mode = FeedMode::Joint;
         self.selected_receipt = Some(*receipt);
@@ -639,7 +685,7 @@ impl JointStaging {
         self.degraded_loss = false;
         self.fell_back = false;
         self.history_disposed_baseline = self.history_disposed;
-        true
+        Ok(())
     }
 
     /// Calls replayed through the one reducer (seal or fallback).

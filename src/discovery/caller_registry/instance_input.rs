@@ -3474,41 +3474,58 @@ impl CallerRegistry {
                         self.joint_accounting = true;
                     } else if self.joint_reseed_eligible(&input.key) {
                         // A voided feed reseeds onto the fresh receipt.
-                        if self
+                        let reseed = self
                             .instance_state
                             .semantics
                             .get_mut(&id)
                             .expect("retained edge")
                             .feed
-                            .reselect_joint(&grant.receipt)
-                        {
-                            self.joint_feeds = self.joint_feeds.saturating_add(1);
-                            self.joint_accounting = true;
-                            // The voided window stays counted beside
-                            // this recovery: one row per reseed.
-                            self.record_gap(crate::discovery::caller_registry::RegistryGap {
-                                caller: Some(input.caller),
-                                module: Some(module),
-                                pid: None,
-                                subject: crate::inventory_present::JOINT_REENTRY_SUBJECT.into(),
-                                reason: crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
-                                    .into(),
-                                budget: None,
-                            });
-                        } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only
-                        {
-                            // The fresh receipt names another incarnation,
-                            // a below-fence cut, or no progress: it cannot
-                            // reseed this feed, so name the mismatch.
-                            self.record_gap(crate::discovery::caller_registry::RegistryGap {
-                                caller: Some(input.caller),
-                                module: Some(module),
-                                pid: None,
-                                subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
-                                    .into(),
-                                reason: "joint_birth_original_mismatch".into(),
-                                budget: None,
-                            });
+                            .try_reselect_joint(&grant.receipt);
+                        match reseed {
+                            Ok(()) => {
+                                self.joint_feeds = self.joint_feeds.saturating_add(1);
+                                self.joint_accounting = true;
+                                // The voided window stays counted beside
+                                // this recovery: one row per reseed.
+                                self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                                    caller: Some(input.caller),
+                                    module: Some(module),
+                                    pid: None,
+                                    subject: crate::inventory_present::JOINT_REENTRY_SUBJECT.into(),
+                                    reason:
+                                        crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
+                                            .into(),
+                                    budget: None,
+                                });
+                            }
+                            Err(refusal)
+                                if self.instance_state.semantics[&id].feed.mode()
+                                    == FeedMode::S1Only =>
+                            {
+                                // The fresh receipt names another
+                                // incarnation, a below-fence cut, or no
+                                // progress — or the ended segment's proof
+                                // is destroyed (a tainted fallback the base
+                                // marks non-resumable): it cannot reseed
+                                // this feed, so name the actual blocker.
+                                let reason = match refusal {
+                                    crate::semantics_key_use::ReselectRefusal::SegmentUnresumable => {
+                                        "joint_birth_segment_unresumable"
+                                    }
+                                    _ => "joint_birth_original_mismatch",
+                                };
+                                self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                                    caller: Some(input.caller),
+                                    module: Some(module),
+                                    pid: None,
+                                    subject:
+                                        crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                                            .into(),
+                                    reason: reason.into(),
+                                    budget: None,
+                                });
+                            }
+                            Err(_) => {}
                         }
                     } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only {
                         // The validated birth cannot select Joint: the

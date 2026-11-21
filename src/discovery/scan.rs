@@ -3372,7 +3372,15 @@ fn reread_table_extent(
 }
 
 /// Whether re-decoding `extent` (re-read from current memory) under the
-/// sweep's rules yields exactly `table`.
+/// sweep's rules yields exactly `table` — or extends a cached legacy
+/// prefix to its full decode. A sweep that stops mid-table stages the
+/// `known_prefix` row; the proof re-reads the full declared extent, so
+/// strict equality would fail the genuine extension into a fresh
+/// rescan every pass (a resume livelock under tight recurring
+/// budgets). Extension is progress, not a change: every cached row
+/// must re-decode identically at the head of the fresh row, so a
+/// same-path exec or a writable-byte mutation under an unchanged
+/// layout still fails. A shorter or divergent fresh row still fails.
 fn table_extent_matches(
     layout: LinuxLayout,
     table: &ScannedTable,
@@ -3392,9 +3400,24 @@ fn table_extent_matches(
             strict_tail: true,
         },
     ) {
-        Ok(Some((fresh, _))) => fresh == *table,
+        Ok(Some((fresh, _))) => fresh == *table || table_prefix_compatible(table, &fresh),
         _ => false,
     }
+}
+
+/// Whether the cached row is a strict `known_prefix` of the fresh
+/// decode: same version, address and file offset, and every cached
+/// entry, null hole and unpinned record re-decoded identically at
+/// the head of the fresh row. Publication flags stay ignored like
+/// in `PartialEq` (monotonic observation, not identity).
+fn table_prefix_compatible(cached: &ScannedTable, fresh: &ScannedTable) -> bool {
+    cached.walk == "known_prefix"
+        && cached.version == fresh.version
+        && cached.address == fresh.address
+        && cached.file_offset == fresh.file_offset
+        && fresh.entries.starts_with(&cached.entries)
+        && fresh.null_entries.starts_with(&cached.null_entries)
+        && fresh.unpinned.starts_with(&cached.unpinned)
 }
 
 /// Re-prove one cached table against current memory for complete

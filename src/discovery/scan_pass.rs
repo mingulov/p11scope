@@ -16,8 +16,8 @@
 use super::scan::{
     ActiveInventoryWindow, BudgetDomain, COLLECTION_STOP_REASON, CollectionWork,
     DEFAULT_WORK_CEILING, DiscoveryPolicy, INTERFACE_WINDOW_CEILING_REASON, IO_CEILING_REASON,
-    InspectedFileKey, InventoryWindowLimits, SCAN_CLOCK_REASON,
-    SCAN_DEADLINE_REASON, ScanCheckpoint, ScanLimits, ScannedEntry, ScannedInterface, ScannedTable,
+    InspectedFileKey, InventoryWindowLimits, SCAN_CLOCK_REASON, SCAN_DEADLINE_REASON,
+    ScanCheckpoint, ScanLimits, ScannedEntry, ScannedInterface, ScannedTable,
     TABLE_WINDOW_CEILING_REASON, WORK_CEILING_REASON, WindowId, WindowReceipt, WindowToken,
 };
 use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};

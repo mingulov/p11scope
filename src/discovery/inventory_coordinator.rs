@@ -20764,8 +20764,7 @@ pub(crate) mod tests {
         // Thread the real walk continuation across passes, like the
         // driver threads it: every pass resumes where the last stopped.
         let mut state = CgroupWalkState::default();
-        let (first, _) =
-            continued_cgroup_pass(&mut scene, &mut state, CgroupWalkLimits::default());
+        let (first, _) = continued_cgroup_pass(&mut scene, &mut state, CgroupWalkLimits::default());
         assert!(
             first
                 .gaps
@@ -20807,9 +20806,7 @@ pub(crate) mod tests {
             "the resumed passes must converge to a clean view within {PASS_CAP} passes"
         );
         assert!(
-            modules
-                .iter()
-                .any(|path| path.contains("scoped-provider")),
+            modules.iter().any(|path| path.contains("scoped-provider")),
             "the resumed passes must reach the provider placed after the large-data objects: {modules:?}"
         );
         assert!(
@@ -38798,10 +38795,7 @@ int main(void) {
                 .cgroup_collector(taken, limits, CollectionControl::new(None), None)
                 .unwrap()();
             coordinator
-                .apply_cgroup_collection(
-                    collection,
-                    crate::discovery::caller_registry::now_ns(),
-                )
+                .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
                 .unwrap();
             coordinator.commit_batch(false).unwrap();
             let completion = coordinator.take_cgroup_completion().unwrap();

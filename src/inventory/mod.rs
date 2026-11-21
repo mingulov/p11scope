@@ -2519,13 +2519,11 @@ impl CgroupDriverState {
     /// it, while growth without any of those is churn, not
     /// progress.
     fn resume_advancing(&self) -> bool {
-        let (Some(last), Some(last_fp)) =
-            (self.last_resume.progress, self.last_resume.fingerprint)
+        let (Some(last), Some(last_fp)) = (self.last_resume.progress, self.last_resume.fingerprint)
         else {
             return false;
         };
-        let (Some(prev), Some(prev_fp)) =
-            (self.prev_resume.progress, self.prev_resume.fingerprint)
+        let (Some(prev), Some(prev_fp)) = (self.prev_resume.progress, self.prev_resume.fingerprint)
         else {
             return true;
         };
@@ -2541,8 +2539,7 @@ impl CgroupDriverState {
     /// no-progress passes end the snapshot honestly instead of
     /// spinning on a bind that never fits.
     fn settle_pending(&self, passes: u64) -> bool {
-        self.last_resume.progress.is_none()
-            && (self.prev_resume.progress.is_some() || passes == 1)
+        self.last_resume.progress.is_none() && (self.prev_resume.progress.is_some() || passes == 1)
     }
 }
 
@@ -7240,8 +7237,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     ),
                 ),
             )
-            && (cgroup.resume_advancing()
-                || cgroup.settle_pending(self.coordinator.passes()))
+            && (cgroup.resume_advancing() || cgroup.settle_pending(self.coordinator.passes()))
     }
 
     fn finish_pass(&mut self, report: &mut PassReport) -> Result<()> {

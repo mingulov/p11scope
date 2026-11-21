@@ -1021,11 +1021,7 @@ fn gcc_fixture(
 ) -> PathBuf {
     let bin = dir.join(out);
     let mut cmd = std::process::Command::new("gcc");
-    cmd.args(args)
-        .arg("-o")
-        .arg(&bin)
-        .args(sources)
-        .args(libs);
+    cmd.args(args).arg("-o").arg(&bin).args(sources).args(libs);
     assert!(
         cmd.status().unwrap().success(),
         "gcc failed for {out}: {cmd:?}"
@@ -1096,11 +1092,7 @@ fn big_data_cgroup_scene(
             assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
         },
     );
-    std::fs::write(
-        dir.path().join("cgroup.procs"),
-        format!("{}\n", child.id()),
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
     let mut coordinator = InventoryCoordinator::new(
         crate::scope::cgroup(dir.path()).unwrap(),
         HookRegistry::builtin(),
@@ -1169,11 +1161,7 @@ fn cgroup_runtime_snapshot_resumes_across_passes_until_converged() {
         driver.inner.coordinator.registry().gaps()
     );
     assert!(
-        driver
-            .inner
-            .coordinator
-            .live_scan_progress_gap()
-            .is_none(),
+        driver.inner.coordinator.live_scan_progress_gap().is_none(),
         "the converged snapshot shows no in-progress gap"
     );
 }
@@ -1186,9 +1174,7 @@ fn cgroup_runtime_snapshot_resumes_across_passes_until_converged() {
 /// every other outcome keep the single snapshot.
 #[test]
 fn cgroup_snapshot_resume_rule_answers_posed_states() {
-    use crate::inspect_system::inventory_cgroup::{
-        ScopedCollectionGap, ScopedCollectionOutcome,
-    };
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
     use crate::scope::inventory_cgroup::CgroupIncomplete;
     let work_limit = || {
         ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
@@ -1211,12 +1197,10 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
     driver.inner.cgroup.as_mut().unwrap().prev_resume = position(None, None);
     assert!(!driver.inner.snapshot_resume_pending());
     // The first unfinished pass always resumes.
-    driver.inner.cgroup.as_mut().unwrap().last_resume =
-        position(Some((0, 1, 4)), Some((0, 360)));
+    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 360)));
     assert!(driver.inner.snapshot_resume_pending());
     // Each advance coordinate resumes on its own.
-    driver.inner.cgroup.as_mut().unwrap().prev_resume =
-        position(Some((0, 1, 4)), Some((0, 360)));
+    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(Some((0, 1, 4)), Some((0, 360)));
     for (progress, fingerprint) in [
         (Some((1, 1, 4)), Some((0, 360))),
         (Some((0, 1, 5)), Some((0, 360))),
@@ -1231,24 +1215,20 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
     }
     // An unchanged position stalls: a full fresh allowance moved
     // nothing, so the snapshot ends honestly.
-    driver.inner.cgroup.as_mut().unwrap().last_resume =
-        position(Some((0, 1, 4)), Some((0, 360)));
+    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 360)));
     assert!(!driver.inner.snapshot_resume_pending());
     // Reached-object growth alone never resumes: genuine discovery
     // sweeps, decodes or completes with it, while growth without
     // any of those is churn, not progress.
-    driver.inner.cgroup.as_mut().unwrap().last_resume =
-        position(Some((0, 2, 4)), Some((0, 360)));
+    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 2, 4)), Some((0, 360)));
     assert!(!driver.inner.snapshot_resume_pending());
     // A regressed position (dropped cursor, fresh restart behind
     // the old frontier) never resumes either.
-    driver.inner.cgroup.as_mut().unwrap().last_resume =
-        position(Some((0, 1, 4)), Some((0, 359)));
+    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 359)));
     assert!(!driver.inner.snapshot_resume_pending());
     // A converged scan with no bind budget gets one settle pass.
     driver.inner.cgroup.as_mut().unwrap().last_resume = position(None, None);
-    driver.inner.cgroup.as_mut().unwrap().prev_resume =
-        position(Some((0, 1, 4)), Some((0, 360)));
+    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(Some((0, 1, 4)), Some((0, 360)));
     assert!(driver.inner.snapshot_resume_pending());
     // Two consecutive no-progress passes end the snapshot: the
     // settle retry is spent.
@@ -1262,23 +1242,18 @@ fn cgroup_snapshot_resume_rule_answers_posed_states() {
     // Only a work stop resumes: a complete transaction and any
     // other incomplete outcome keep the single snapshot, even
     // with unfinished progress posed.
-    driver.inner.cgroup.as_mut().unwrap().last_resume =
-        position(Some((0, 1, 4)), Some((0, 361)));
-    driver.inner.cgroup.as_mut().unwrap().prev_resume =
-        position(Some((0, 1, 4)), Some((0, 360)));
+    driver.inner.cgroup.as_mut().unwrap().last_resume = position(Some((0, 1, 4)), Some((0, 361)));
+    driver.inner.cgroup.as_mut().unwrap().prev_resume = position(Some((0, 1, 4)), Some((0, 360)));
     driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(ScopedCollectionOutcome::Complete);
     assert!(!driver.inner.snapshot_resume_pending());
-    driver.inner.cgroup.as_mut().unwrap().last_outcome =
-        Some(ScopedCollectionOutcome::Incomplete(
-            ScopedCollectionGap::ScanIncomplete,
-        ));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(ScopedCollectionOutcome::Incomplete(
+        ScopedCollectionGap::ScanIncomplete,
+    ));
     assert!(!driver.inner.snapshot_resume_pending());
     // Duration runs, stops and a latched control never resume.
     driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit());
     assert!(driver.inner.snapshot_resume_pending());
-    driver.inner.deadline = Some(
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
-    );
+    driver.inner.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
     assert!(!driver.inner.snapshot_resume_pending());
     driver.inner.deadline = None;
     driver.inner.stop_requested = true;

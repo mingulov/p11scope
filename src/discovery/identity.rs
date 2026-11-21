@@ -17158,10 +17158,7 @@ mod tests {
                     "{cause:?} must not file the defer-whole wait subject"
                 );
             }
-            assert!(
-                !pinned.rejects(key),
-                "{cause:?} never rejects the key"
-            );
+            assert!(!pinned.rejects(key), "{cause:?} never rejects the key");
         }
     }
 

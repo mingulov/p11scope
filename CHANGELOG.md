@@ -45,11 +45,17 @@ versioned separately and are opaque, exact dispatch keys.
   both modes, sizes infer from operation lengths with the new
   `--key-sizes` opt-in (needs `--key-operations`, off by default;
   without it every size reads unknown and no length word is
-  acquired). On a kernel that refuses only the length programs, the
-  run keeps key operations and records a `key sizes unavailable`
-  gap. Text gains parenthetical tallies plus `-v` per-row
-  lines, CBOM qualification counts inferred use without reading
-  inferred facts, and versions 1–6 stay frozen and byte-stable.
+  acquired). Familiar size classes read plainly (`RSA 2048`,
+  `EC P-256`), and post-quantum key exchange and signatures are
+  covered: ML-KEM parameter sets size from ciphertext lengths
+  (`ML-KEM-512/768/1024`) and ML-DSA
+  parameter sets from signature lengths (`ML-DSA-44/65/87`), with
+  families inferred from the mechanism in both cases. On a kernel
+  that refuses only the length programs, the run keeps key
+  operations and records a `key sizes unavailable` gap. Text gains
+  parenthetical tallies plus `-v` per-row lines, CBOM qualification
+  counts inferred use without reading inferred facts, and
+  versions 1–6 stay frozen and byte-stable.
 - Provider, token and mechanism facts on inventory runs with the new
   `--provider-info` opt-in (section version 8; standalone, off by
   default; needs `--capture auto` or `native` and a FULL build).
@@ -80,8 +86,9 @@ versioned separately and are opaque, exact dispatch keys.
   per-row lines; mechanism-less terminals keep no entry and row
   counters stay exact. Version 8 is taken by the separate Task 7
   provider section; versions 1–7 stay frozen and byte-stable.
-- More providers' creation templates yield curves and parameter
-  sets for every key type, so fewer new-key fields stay unknown;
+- DRAFT-pending-cutoff (relaxed creation-template lane): more
+  providers' creation templates yield curves and parameter sets
+  for every key type, so fewer new-key fields stay unknown;
   unknowns keep their named reasons.
 
 ### Changed
@@ -239,18 +246,18 @@ versioned separately and are opaque, exact dispatch keys.
   rows in text beside a one-line coverage note, instead of
   `unavailable` with no rows. Completions with no mechanism
   name family `unknown` with the `no mechanism` reason.
-- Late providers attach promptly under process churn: newcomer
-  admission keeps up with floods (501/501 admitted at 500
-  newcomers, 1001/1001 at 1,000, 0 rejected), so a provider
-  first loaded after capture start no longer attaches late or
-  never — measured before at 0 of 309,861 joined calls. An
-  overloaded pass defers work with a named unfinished row
-  instead of dropping it.
-- High-rate key operations lose no records to the reservation
-  table: lookups and allocation stay indexed at any occupancy,
-  removing the 13.8–19.1% record loss measured at 5,000 calls/s
-  over 4 endpoints (0 in 3/3 fixed cells). The 4096 bound is
-  unchanged.
+- DRAFT-pending-cutoff (admission-refactor lane): late providers
+  attach promptly under process churn: newcomer admission keeps
+  up with floods (501/501 admitted at 500 newcomers, 1001/1001
+  at 1,000, 0 rejected), so a provider first loaded after capture
+  start no longer attaches late or never — measured before at 0
+  of 309,861 joined calls. An overloaded pass defers work with a
+  named unfinished row instead of dropping it.
+- DRAFT-pending-cutoff (reservation-index lane): high-rate key
+  operations lose no records to the reservation table: lookups
+  and allocation stay indexed at any occupancy, removing the
+  13.8–19.1% record loss measured at 5,000 calls/s over 4
+  endpoints (0 in 3/3 fixed cells). The 4096 bound is unchanged.
 - A run's repeated gaps fold into counted aggregates, so gap
   volume stays flat on long captures while every loss keeps its
   name and exact count.

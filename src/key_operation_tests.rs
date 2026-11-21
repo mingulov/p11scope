@@ -1474,7 +1474,7 @@ fn key_operation_fallback_and_history_loss() {
         Err(StagingRefusal::NotJoint)
     );
 
-    // --- Real loss: the seal-time fault cell moved (native fault). ---
+    // --- Real loss: the seal-time fault cell regressed (native fault). ---
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -1503,7 +1503,7 @@ fn key_operation_fallback_and_history_loss() {
     assert_eq!(refused, 0);
     assert_eq!(joint.started(), 1);
     assert!(joint.has_live_operations());
-    // Two more staged, then the fault moves under the seal.
+    // Two more staged, then the fault cell regresses under the seal.
     for call in [
         ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
         ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
@@ -1511,8 +1511,8 @@ fn key_operation_fallback_and_history_loss() {
         prepare_call(&mut scene, &mut staging, &call);
     }
     let failure = scene
-        .seal_with_fault(7, 8)
-        .expect_err("moved fault voids the seal");
+        .seal_with_fault(7, 6)
+        .expect_err("regressed fault cell voids the seal");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, refused) = staging.apply_algorithm_failure_for_test(
@@ -6724,7 +6724,7 @@ fn key_operation_c2_foreign_namespace_failure_preserves_live_history() {
     let mut foreign_staging = JointStaging::select_joint(Some(&receipt));
     prepare_call(&mut foreign, &mut foreign_staging, &init);
     let failure = foreign
-        .seal_with_fault(7, 8)
+        .seal_with_fault(7, 6)
         .expect_err("the foreign adapter really observes native loss");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
@@ -6813,7 +6813,7 @@ fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
         let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
         if loss {
             let failure = foreign
-                .seal_with_fault(7, 8)
+                .seal_with_fault(7, 6)
                 .expect_err("genuine foreign loss");
             assert_eq!(
                 own.registry.deliver_joint_algorithm_failure_for_test(
@@ -16921,8 +16921,8 @@ fn key_operation_joint_failure_delivery_retains_projection() {
     ingest_call(&mut guarded.scene, &shape, position);
     let failure = guarded
         .scene
-        .seal_with_fault(7, 8)
-        .expect_err("moved fault voids the seal");
+        .seal_with_fault(7, 6)
+        .expect_err("regressed fault cell voids the seal");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(

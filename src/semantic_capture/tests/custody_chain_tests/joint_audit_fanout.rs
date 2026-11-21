@@ -9378,8 +9378,8 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
             .coordinator
             .registry()
             .joint_feeds(),
-        0,
-        "the pre-break key never resumes Joint; its calls stay S1"
+        1,
+        "the follow-up call rebirths Joint above the void fence; earlier calls stay S1"
     );
     // The void itself is named too, not only the break quantum's seal:
     // its own fenced loss (consumed history fenced, staged custody
@@ -9826,26 +9826,30 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
         .joint_capture()
         .adapter()
         .joint_void_diagnosis();
-    assert_eq!(diagnosis.void_audit, 1, "the seal-time move voids once");
+    assert_eq!(diagnosis.void_audit, 0, "the seal-time move absorbs");
     assert_eq!(
-        diagnosis.audit_fault_changed_reread, 1,
-        "the seal-path re-read counts as reread"
+        diagnosis.audit_fault_absorbed_reread, 1,
+        "the seal-path re-read absorbs as reread"
     );
     assert_eq!(
-        diagnosis.voids_ended_joint_feed, 1,
-        "one void ending two Joint feeds counts one ending"
+        diagnosis.voids_ended_joint_feed, 0,
+        "the absorb ends no Joint feed"
     );
     assert!(
-        fixture.feeds().iter().all(|feed| feed.degraded),
-        "the void ended every Joint feed"
+        fixture
+            .feeds()
+            .iter()
+            .all(|feed| !feed.degraded && !feed.fallback),
+        "the absorb leaves every Joint feed clean"
     );
-    // Second round on the same fixture: the feeds are already S1Only, so
-    // the next void ends none. The finisher below is ingress-agnostic: it
-    // drives any failure-carrying frame (here an ingested collection void)
+    // Second round on the same fixture: regress the cell below the
+    // absorbed pin, so the move denies the absorb and voids. The
+    // finisher below is ingress-agnostic: it drives any
+    // failure-carrying frame (here an ingested collection void)
     // through delivery to completion. The call reuses an endpoint the
     // fixture was built with, at a fresh sequence.
     fixture.push_two("C_SignInit", 2);
-    fault.epoch.set(2);
+    fault.epoch.set(0);
     let round = fixture.audited(2, 2, &fault);
     finish_disposed_negative_frame(&mut fixture, round, &fault);
     let diagnosis = fixture
@@ -9856,18 +9860,18 @@ fn joint_audit_void_ending_joint_feeds_counts_once_per_void() {
         .joint_capture()
         .adapter()
         .joint_void_diagnosis();
-    assert_eq!(diagnosis.void_audit, 2, "the chain move voids again");
+    assert_eq!(diagnosis.void_audit, 1, "the regressed move voids");
     assert_eq!(
         diagnosis.audit_fault_changed_chain, 1,
-        "the between-collection move counts as chain"
+        "the regressed move counts as chain"
     );
     assert_eq!(
-        diagnosis.audit_fault_changed_reread, 1,
-        "the earlier reread void keeps its bucket"
+        diagnosis.audit_fault_changed_reread, 0,
+        "no reread void; the seal-time move absorbed"
     );
     assert_eq!(
         diagnosis.voids_ended_joint_feed, 1,
-        "a void ending no Joint feed counts no new ending"
+        "one void ending two Joint feeds counts one ending"
     );
     // Third scene: a broad but fenceless ending (fault saturation stops
     // the adapter without voiding) ends Joint feeds yet counts no
@@ -10146,7 +10150,8 @@ fn joint_audit_void_on_idle_feed_records_fence_and_defers_next_call() {
 /// gap for its sub-cause (`joint_void_<subcause>_history_loss`), like
 /// ingest-break voids do — staged exactly once by the voiding
 /// completion, scope-wide (the next apply publishes it; the I2 twin
-/// proves staged gaps publish end to end).
+/// proves staged gaps publish end to end). A forward move absorbs
+/// with no gap; the regressed second round voids and discloses it.
 #[test]
 fn joint_audit_void_discloses_counted_subcause_gap() {
     let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
@@ -10165,6 +10170,31 @@ fn joint_audit_void_discloses_counted_subcause_gap() {
         .registry()
         .published_revision();
     fixture.complete_publication(&mut frame, &fault, old_revision);
+    let staged = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test();
+    assert!(
+        staged
+            .iter()
+            .all(|gap| gap.reason != "joint_void_fault_changed_history_loss"),
+        "the absorbed move stages no void gap: {staged:?}"
+    );
+    // Second round: regress the cell below the absorbed pin, so the
+    // move denies the absorb and voids, disclosing its gap once.
+    fixture.push_two("C_SignInit", 2);
+    fault.epoch.set(0);
+    let round = fixture.audited(2, 2, &fault);
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .disclose_audit_void_gaps();
     let staged = fixture
         .scene
         .real
@@ -10191,9 +10221,11 @@ fn joint_audit_void_discloses_counted_subcause_gap() {
     );
 }
 
-/// Scope-round fence twin: a void that lands on an already-S1Only feed
-/// records its fence too (running maximum) — the second void raises
-/// every feed's recorded fence even though no feed ever left S1Only.
+/// Scope-round fence twin: the first move absorbs and fences nothing;
+/// the regressed second round voids and fences every feed; a void that
+/// lands on an already-S1Only feed records its fence too (running
+/// maximum) — the third void raises every feed's recorded fence even
+/// though no feed ever left S1Only.
 #[test]
 fn joint_s1only_feed_records_later_void_fence() {
     let (mut fixture, original) = CanonicalFanoutScene::first_publication_with_functions(
@@ -10226,20 +10258,28 @@ fn joint_s1only_feed_records_later_void_fence() {
     let first = fences(&fixture);
     assert_eq!(first.len(), 2, "two feeds behind one provider");
     assert!(
-        first.iter().all(|fence| fence.is_some()),
-        "the first void fenced every feed: {first:?}"
+        first.iter().all(|fence| fence.is_none()),
+        "the absorbed move fenced no feed: {first:?}"
     );
     fixture.push_two("C_SignInit", 2);
-    fault.epoch.set(2);
+    fault.epoch.set(0);
     let round = fixture.audited(2, 2, &fault);
     finish_disposed_negative_frame(&mut fixture, round, &fault);
     let second = fences(&fixture);
     assert!(
-        second
+        second.iter().all(|fence| fence.is_some()),
+        "the regressed void fenced every feed: {second:?}"
+    );
+    fixture.push_two("C_SignInit", 3);
+    let round = fixture.audited(2, 2, &fault);
+    finish_disposed_negative_frame(&mut fixture, round, &fault);
+    let third = fences(&fixture);
+    assert!(
+        third
             .iter()
-            .zip(first.iter())
+            .zip(second.iter())
             .all(|(later, earlier)| later > earlier),
-        "the S1Only void raises every recorded fence: {first:?} -> {second:?}"
+        "the S1Only void raises every recorded fence: {second:?} -> {third:?}"
     );
 }
 
@@ -10274,15 +10314,16 @@ fn joint_nonresumable_void_records_no_below_fence_deferral() {
             .coordinator
             .registry()
             .joint_feeds(),
-        0,
-        "the FaultChanged void ended every Joint feed"
+        2,
+        "the absorbed move ends no Joint feed"
     );
-    // Second round: clean-point calls refuse below the fence on a
-    // segment that can never resume. A third round flushes anything
-    // the second round's commit staged into the published set, so
-    // silence below is the scope gate, not an unapplied staging.
+    // Second round: regress below the absorbed pin so the move voids;
+    // clean-point calls refuse below the fence on a segment that can
+    // never resume. A third round flushes anything the second round's
+    // commit staged into the published set, so silence below is the
+    // scope gate, not an unapplied staging.
     fixture.push_two("C_SignInit", 2);
-    fault.epoch.set(2);
+    fault.epoch.set(0);
     let round = fixture.audited(2, 2, &fault);
     finish_disposed_negative_frame(&mut fixture, round, &fault);
     fixture.push_two("C_SignInit", 3);
@@ -21032,7 +21073,7 @@ fn joint_machine_empty_disposition_requires_actual_quiet_original() {
                 saw_empty = true;
             }
             if let Some((gap, _, _, _, _)) = fixture.machine.diagnostic_audit_for_test() {
-                assert_eq!(gap, native_loss.then_some(JournalGap::FaultChanged));
+                assert_eq!(gap, None, "the native move absorbs; no audit gap");
                 saw_fault |= gap == Some(JournalGap::FaultChanged);
             }
             if progress == crate::inventory_semantics::JointServiceProgress::Published {
@@ -21041,26 +21082,28 @@ fn joint_machine_empty_disposition_requires_actual_quiet_original() {
             }
         }
         assert!(saw_empty && published);
-        assert_eq!(saw_fault, native_loss);
+        assert!(!saw_fault, "no audit gap in either arm");
         assert_eq!(fixture.reduced(), reduced);
         let coordinator = &fixture.scene.real.scene.coordinator;
+        if native_loss {
+            let diagnosis = coordinator.joint_capture().adapter().joint_void_diagnosis();
+            assert_eq!(
+                (
+                    diagnosis.audit_fault_absorbed_chain,
+                    diagnosis.audit_fault_absorbed_reread,
+                    diagnosis.void_audit
+                ),
+                (0, 1, 0),
+                "the moved cell absorbs as reread without voiding"
+            );
+        }
         assert_eq!(coordinator.registry().published_revision(), revision + 1);
         assert_eq!(coordinator.reference_h3_audit_state(), (h3.0 + 1, false));
         let after = coordinator.joint_capture().model().project();
-        if native_loss {
-            assert_ne!(
-                after, before,
-                "actual native loss still invalidates the retained live object"
-            );
-            assert!(
-                after
-                    .objects
-                    .iter()
-                    .all(|object| object.lifetime != Lifetime::Live)
-            );
-        } else {
-            assert_eq!(after, before);
-        }
+        assert_eq!(
+            after, before,
+            "the absorb invalidates nothing; the retained live object stands"
+        );
         assert_eq!(
             coordinator
                 .joint_capture()
@@ -21867,14 +21910,11 @@ fn joint_birth_first_refused_claim_blocks_later_same_key_original() {
         claims.as_slice(),
         [(1, Err(AttestationRefusal::ClaimsExhausted)), (2, Ok(_))]
     ));
-    assert_eq!(
-        coordinator
-            .joint_capture()
-            .adapter()
-            .invocation_claims_for_test()
-            .0,
-        1
-    );
+    let invocation = coordinator
+        .joint_capture()
+        .adapter()
+        .invocation_claims_for_test();
+    assert_eq!(invocation.0, 1);
     let roles = coordinator.joint_capture().ledger().roles_for_test();
     let mut births = RetainedJointBirths::new();
     let result = coordinator
@@ -21937,22 +21977,39 @@ fn joint_birth_first_refused_claim_blocks_later_same_key_original() {
     let mut frame = coordinator
         .audit_ingested_quantum(ingested, &scene.producers, &attached, &fault)
         .unwrap_or_else(|(_, reason)| panic!("original disclosed fault: {reason:?}"));
+    assert!(
+        frame.failure_for_test().is_none(),
+        "the disclosed fault absorbs; no failure is recorded"
+    );
+    let diagnosis = coordinator.joint_capture().adapter().joint_void_diagnosis();
     assert_eq!(
-        frame.failure_for_test().unwrap().gap,
-        crate::semantics_objects::journal::JournalGap::FaultChanged
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        (0, 1, 0),
+        "the disclosed move absorbs as reread without voiding"
     );
     let mut ports = coordinator.joint_frame_ports(&scene.producers).unwrap();
     frame.bind_targets(&ports).unwrap();
-    frame
-        .finish_frame(&mut ports)
-        .unwrap_or_else(|(_, reason)| {
-            panic!("actual negative finishes both originals: {reason:?}")
-        });
+    if frame.finish_frame(&mut ports).is_err() {
+        panic!("the absorbed quantum finishes clean");
+    }
+    // No void runs, so the open call keeps its H8Open custody through
+    // the finish instead of releasing it in a void wipe.
     assert_eq!(
         coordinator.joint_capture().ledger().roles_for_test()[..4],
-        [0, 0, 0, 0]
+        [0, 1, 0, 0]
     );
-    scene.assert_claims(&[]);
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        invocation,
+        "the absorb preserves the refused claim's owned original"
+    );
 }
 
 /// The staged retained-S1 birth disclosures, in stage order.
@@ -22092,13 +22149,22 @@ fn joint_birth_refused_claim_discloses_retained_s1() {
     frame
         .finish_frame(&mut ports)
         .unwrap_or_else(|(_, reason)| {
-            panic!("actual negative finishes both originals: {reason:?}")
+            panic!("the absorbed quantum finishes clean: {reason:?}")
         });
+    // No void runs, so the open call keeps its H8Open custody through
+    // the finish instead of releasing it in a void wipe.
     assert_eq!(
         coordinator.joint_capture().ledger().roles_for_test()[..4],
-        [0, 0, 0, 0]
+        [0, 1, 0, 0]
     );
-    scene.assert_claims(&[]);
+    assert_eq!(
+        coordinator
+            .joint_capture()
+            .adapter()
+            .invocation_claims_for_test(),
+        claims,
+        "the absorb preserves the refused claim's owned original"
+    );
 }
 
 #[test]
@@ -23695,7 +23761,7 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
     let fault = FrameFault::clean();
     for sequence in [3, 4, 5] {
         let original_s1 = fixture.s1_counts(first.id());
-        assert_eq!(original_s1.4, usize::from(sequence < 5));
+        assert_eq!(original_s1.4, 1);
         if sequence >= 4 {
             assert!(
                 fixture
@@ -23765,11 +23831,19 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
             .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
             .unwrap();
         let before = fixture.s1_counts(first.id());
-        assert_eq!(
-            (before.3, before.4),
-            (original_s1.3, original_s1.4),
-            "sequence {sequence}: ordinary publication must preserve the original S1 operation"
-        );
+        if sequence == 5 {
+            assert_eq!(
+                (before.3, before.4),
+                (original_s1.3 + 1, 0),
+                "sequence 5: fresh actual loss ends the original S1 operation at publication"
+            );
+        } else {
+            assert_eq!(
+                (before.3, before.4),
+                (original_s1.3, original_s1.4),
+                "sequence {sequence}: ordinary publication must preserve the original S1 operation"
+            );
+        }
         if sequence == 4 {
             fault.epoch.set(1); // Actual later read, after this original collection.
         }
@@ -23800,26 +23874,28 @@ fn joint_raw_disposition_reaches_retained_s1only_history() {
                     ..
                 }
             ));
+        } else if sequence == 4 {
+            // The later fault read absorbs (reread site): no new loss,
+            // so the original proof-only refusal keeps Fallback.
+            assert_eq!(audited.disposition(), SealFailureDisposition::Fallback);
+            assert!(
+                !frame
+                    .original_failures_for_test()
+                    .any(|failure| failure.gap == JournalGap::FaultChanged),
+                "the absorbed move voids nothing"
+            );
         } else {
             assert_eq!(audited.disposition(), SealFailureDisposition::HistoryLoss);
-            if sequence == 4 {
-                assert!(
-                    frame
-                        .original_failures_for_test()
-                        .any(|failure| failure.gap == JournalGap::FaultChanged)
-                );
-            }
         }
         finish_disposed_negative_frame(&mut fixture, frame, &fault);
         let after = fixture.s1_counts(first.id());
         assert_eq!(
-            after.3,
-            before.3 + u64::from(sequence == 4),
-            "sequence {sequence}: only actual history loss ends the original S1 call, once"
+            after.3, before.3,
+            "sequence {sequence}: the frame ends nothing twice"
         );
         assert_eq!(
             after.4,
-            if sequence == 3 { before.4 } else { 0 },
+            if sequence == 5 { 0 } else { before.4 },
             "proof-only refusal preserves active S1; actual loss ends it"
         );
     }
@@ -24551,8 +24627,8 @@ fn joint_physical_tail_precedes_claims_and_one_audit() {
         .expect("actual original physical loss");
     assert_eq!(
         failure.gap,
-        crate::semantics_objects::journal::JournalGap::FaultChanged,
-        "the physical cut raised the same actual native fault cell after raw collection"
+        crate::semantics_objects::journal::JournalGap::H3Loss,
+        "the physical cut is H3 loss; the independent H3 gap wins over the moved fault cell"
     );
     for object in &before.objects {
         assert!(failure.effects.effects.iter().any(|effect| matches!(effect,
@@ -24886,12 +24962,22 @@ fn joint_second_domain_fault_is_invisible_until_fanout() {
     let history = coordinator.joint_capture().model().project();
     assert_eq!(
         history.object(grown.objects[0].id).unwrap().lifetime,
-        Lifetime::Retired(ObjectGap::OutcomeLost)
+        Lifetime::Live,
+        "the absorbed move retires nothing"
     );
     let feeds = fixture.feeds();
-    assert_eq!(feeds.iter().map(|feed| feed.reduced).sum::<u64>(), 1);
-    assert_eq!(feeds.iter().map(|feed| feed.disposed).sum::<u64>(), 1);
-    assert!(feeds.iter().all(|feed| feed.degraded && feed.staged == 0));
+    assert_eq!(
+        feeds.iter().map(|feed| feed.reduced).sum::<u64>(),
+        2,
+        "both domains reduce; the absorbed fault disturbs neither"
+    );
+    assert_eq!(feeds.iter().map(|feed| feed.disposed).sum::<u64>(), 0);
+    assert!(
+        feeds
+            .iter()
+            .all(|feed| !feed.fallback && !feed.degraded && feed.staged == 0),
+        "the absorb leaves every feed Joint with nothing staged"
+    );
     assert!(Presentation::try_capture(coordinator, "system", 1, 3, 1).is_ok());
     fixture.scene.assert_claims(&[]);
     assert_eq!(
@@ -26007,11 +26093,28 @@ fn joint_commit_io_shares_capture_and_fresh_native_reads() {
         assert!(reads.get().0 != 0 && reads.get().1 != 0);
         if move_fault {
             assert!(fault_moved);
-            assert!(fixture.feeds().iter().all(|feed| feed.degraded));
+            // The re-read observes the move and absorbs it: feeds stay
+            // Joint with reduced work, objects stay live, no void.
+            let diagnosis = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .joint_void_diagnosis();
             assert_eq!(
-                fixture.feeds().iter().map(|feed| feed.reduced).sum::<u64>(),
-                1
+                (
+                    diagnosis.audit_fault_absorbed_chain,
+                    diagnosis.audit_fault_absorbed_reread,
+                    diagnosis.void_audit
+                ),
+                (0, 1, 0),
+                "the re-read absorbs the moved cell as reread"
             );
+            assert!(fixture.feeds().iter().all(|feed| {
+                feed.reduced == 1 && feed.staged == 0 && !feed.degraded && !feed.fallback
+            }));
             assert!(
                 fixture
                     .scene
@@ -26023,7 +26126,7 @@ fn joint_commit_io_shares_capture_and_fresh_native_reads() {
                     .project()
                     .objects
                     .iter()
-                    .all(|object| object.lifetime != Lifetime::Live)
+                    .all(|object| object.lifetime == Lifetime::Live)
             );
         } else {
             assert!(fixture.feeds().iter().all(|feed| {
@@ -26916,7 +27019,7 @@ fn joint_original_loss_fans_out_before_ack() {
 }
 
 #[test]
-fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
+fn joint_later_fault_precharges_newly_sealed_objects_before_mutation() {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let before = fixture
         .scene
@@ -27065,15 +27168,27 @@ fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
             Ok(QuantumSealProgress::DeliveryReady)
         );
     }
-    let failure = frame.failure_for_test().unwrap();
-    assert_eq!(
-        failure.gap,
-        crate::semantics_objects::journal::JournalGap::FaultChanged
+    assert!(
+        frame.failure_for_test().is_none(),
+        "the later fault absorbs; no failure is recorded"
     );
-    for object in &grown.objects {
-        assert!(failure.effects.effects.iter().any(|effect| matches!(effect, ObjectEffect::Retired { object: id, reason: ObjectGap::OutcomeLost } if *id == object.id)), "late failure includes original and newly-created live views");
-    }
-    let effects = failure.effects.clone();
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        (0, 1, 0),
+        "the later fault absorbs as reread without voiding"
+    );
     {
         let mut ports = fixture
             .scene
@@ -27084,21 +27199,26 @@ fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
             .unwrap();
         assert_eq!(
             frame.deliver_next(&mut ports),
-            Ok(QuantumSealProgress::LocalPending)
+            Ok(QuantumSealProgress::Complete)
         );
         assert_eq!(
             frame.seal_next(&mut ports, &mut NoFrameBirths, &fault),
-            Ok(QuantumSealProgress::DeliveryReady)
+            Ok(QuantumSealProgress::Complete)
         );
         assert_eq!(
             frame.deliver_next(&mut ports),
             Ok(QuantumSealProgress::Complete)
         );
     }
-    assert_eq!(frame.failure_for_test().unwrap().effects, effects);
+    assert!(frame.failure_for_test().is_none());
     drop(births);
     let feeds = fixture.feeds();
-    assert!(feeds.iter().all(|feed| feed.degraded && feed.staged == 0));
+    assert!(
+        feeds
+            .iter()
+            .all(|feed| !feed.fallback && !feed.degraded && feed.staged == 0),
+        "the absorb leaves both feeds Joint with nothing staged"
+    );
     assert_eq!(
         feeds
             .iter()
@@ -27106,7 +27226,7 @@ fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
             .unwrap()
             .reduced,
         2,
-        "already delivered success is not replayed while its original loss fans out"
+        "already delivered success stands with nothing to replay or dispose"
     );
     assert_eq!(
         feeds
@@ -27114,7 +27234,7 @@ fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
             .find(|feed| feed.id == targets[1].id())
             .unwrap()
             .disposed,
-        1
+        0
     );
     let mut ports = fixture
         .scene
@@ -27125,7 +27245,7 @@ fn joint_later_loss_precharges_newly_sealed_objects_before_mutation() {
         .unwrap();
     frame
         .finish_frame(&mut ports)
-        .unwrap_or_else(|(_, reason)| panic!("original later loss delivered to both: {reason:?}"));
+        .unwrap_or_else(|(_, reason)| panic!("absorbed quantum finishes for both: {reason:?}"));
 }
 
 #[test]
@@ -27298,10 +27418,11 @@ fn joint_frame_preflight_keeps_targets_and_birth_selection_on_retry() {
 
 /// A parked retry keeps a genuine later history loss: the frame
 /// retries one contended take with both feeds staged, parks exactly
-/// one consumer, then observes a real fault move. The next seal
-/// records the fault loss and delivery must serve the original loss
-/// route (invalidation plus counted disposal), not the parked
-/// fallback override; the sibling stays pending, then completes.
+/// one consumer, absorbs a real fault move to pin the baseline, then
+/// observes the regressed cell. The next seal records the fault loss
+/// and delivery must serve the original loss route (invalidation plus
+/// counted disposal), not the parked fallback override; the sibling
+/// stays pending, then completes.
 #[test]
 fn joint_parked_retry_keeps_genuine_fault_loss() {
     use crate::semantics_objects::journal::JournalGap;
@@ -27310,6 +27431,9 @@ fn joint_parked_retry_keeps_genuine_fault_loss() {
     fixture.push_two("C_SignInit", 2);
     let fault = FrameFault::clean();
     let mut frame = fixture.audited(2, 2, &fault);
+    // Absorb a forward move first to pin the baseline past zero; the
+    // regressed cell below then denies the absorb and voids.
+    fault.epoch.set(1);
     let h0 = fixture.scene.real.h0.clone();
     let mut takes = FailTakeOnce {
         inner: NativeFrameBirths {
@@ -27376,7 +27500,7 @@ fn joint_parked_retry_keeps_genuine_fault_loss() {
     );
     let parked_id = states.iter().find(|state| state.3).unwrap().0;
     let sibling_id = states.iter().find(|state| !state.3).unwrap().0;
-    fault.epoch.set(1);
+    fault.epoch.set(0);
     let mut takes = FailTakeOnce {
         inner: NativeFrameBirths {
             h0: &h0,
@@ -29212,11 +29336,11 @@ fn joint_pending_h3_continuation_cannot_forgive_native_fault() {
     let original = q1.failure_for_test().unwrap();
     assert_eq!(
         original.gap,
-        crate::semantics_objects::journal::JournalGap::FaultChanged
+        crate::semantics_objects::journal::JournalGap::H3Pending
     );
     assert!(
-        !original.effects.effects.is_empty(),
-        "the same two original live objects must produce actual loss effects"
+        original.effects.effects.is_empty(),
+        "pending refuses without loss effects"
     );
     let effects = original.effects.clone();
     let roles = fixture
@@ -29238,17 +29362,28 @@ fn joint_pending_h3_continuation_cannot_forgive_native_fault() {
         q1.bind_targets(&ports).unwrap();
         assert_eq!(
             q1.defer_pending_h3(&mut ports, &fixture.scene.real.lane),
-            Ok(QuantumSealProgress::LocalPending)
+            Ok(QuantumSealProgress::AwaitFutureInput)
         );
         assert_eq!(q1.failure_for_test().unwrap().effects, effects);
-        let (same, reason) = q1
+        if q1
             .finish_pending_h3(&mut ports, &fixture.scene.real.lane)
-            .err()
-            .expect("a real pending owner never changes an original fault into Future");
-        assert_eq!(reason, RawQuantumRefusal::H3Undisposed);
-        q1 = same;
+            .is_err()
+        {
+            panic!("an owned pending continuation finishes past the carried fault");
+        }
     }
-    assert_eq!(q1.failure_for_test().unwrap().effects, effects);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(0),
+        "the reread pending carries no pin advance"
+    );
     assert_eq!(
         fixture
             .scene
@@ -30283,9 +30418,38 @@ fn joint_first_pending_h3_pins_native_baseline_before_next_fault() {
         &fixture.attached,
         &ChangedFault,
     );
+    assert!(
+        q2.failure_for_test().is_none(),
+        "the next fault absorbs; no failure is recorded"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
     assert_eq!(
-        q2.failure_for_test().unwrap().gap,
-        crate::semantics_objects::journal::JournalGap::FaultChanged
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        (1, 0, 0),
+        "the next fault absorbs as chain without voiding"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .fault_baseline_for_test(),
+        Some(1),
+        "the absorb pins the native baseline"
     );
 }
 
@@ -30749,12 +30913,28 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
             Some(0),
             "claiming and staging never forgive the original native prefix"
         );
-        let before_audit = fixture.feeds();
         let mut q2 = acquire(&mut fixture.scene, ingested, &fixture.attached, &fault);
         if changed_fault {
+            assert!(
+                q2.failure_for_test().is_none(),
+                "the changed fault absorbs instead of voiding q2"
+            );
+            let diagnosis = fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .joint_void_diagnosis();
             assert_eq!(
-                q2.failure_for_test().unwrap().gap,
-                crate::semantics_objects::journal::JournalGap::FaultChanged
+                (
+                    diagnosis.audit_fault_absorbed_chain,
+                    diagnosis.audit_fault_absorbed_reread,
+                    diagnosis.void_audit
+                ),
+                (1, 0, 0),
+                "the changed fault absorbs as chain without voiding"
             );
             assert!(fixture.births.is_empty());
             assert_eq!(
@@ -30768,7 +30948,6 @@ fn joint_zero_head_pending_h3_requires_original_continuation_and_keeps_fault_pre
                     .count(),
                 0
             );
-            assert_eq!(fixture.feeds(), before_audit);
             assert_eq!(
                 fixture
                     .scene
@@ -32090,7 +32269,9 @@ fn drive_frame_counting_rows(
 /// retires no more than one credit, every frame service poll (one
 /// 64-unit credit shared by seal and delivery, as the coordinator runs it)
 /// retires at most its credit, more than one poll is needed, and the
-/// delivered failure still carries every row's retirement.
+/// delivered failure still carries every row's retirement. A forward
+/// move absorbs first to pin the baseline; the regressed re-audit
+/// denies the absorb, then voids with the full credit bounds.
 #[test]
 fn joint_audit_void_rejection_never_exceeds_one_credit_per_poll() {
     const ROWS: usize = 97;
@@ -32109,6 +32290,31 @@ fn joint_audit_void_rejection_never_exceeds_one_credit_per_poll() {
     fixture.scene.push(pid, 0, "C_SignInit", 2);
     let fault = FrameFault::clean();
     fault.epoch.set(1);
+    let absorbed = fixture.audited(1, 1, &fault);
+    assert!(
+        absorbed.failure_for_test().is_none(),
+        "the forward move absorbs; no failure is recorded"
+    );
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        (1, 0, 0),
+        "the forward move absorbs as chain without voiding"
+    );
+    drop(absorbed);
+    fault.epoch.set(0);
+    fixture.scene.push(pid, 0, "C_SignInit", 3);
     let before = retired_rows(&fixture);
     let mut frame = fixture.audited(1, 1, &fault);
     let at_audit = retired_rows(&fixture) - before;
@@ -33685,18 +33891,41 @@ fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMome
     if loss_moment != SiblingLossMoment::None {
         assert_eq!(
             failures.len(),
-            2,
-            "one bulk sibling result and the actual audit result"
+            1,
+            "only the bulk sibling result; the audit move absorbs"
         );
-        assert!(
-            failures
-                .iter()
-                .any(|failure| failure.gap == JournalGap::FaultChanged)
-        );
+        let diagnosis = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .joint_void_diagnosis();
+        assert_eq!(diagnosis.void_audit, 0, "the absorb voids nothing");
+        if loss_moment == SiblingLossMoment::BeforeProofRefusal {
+            assert_eq!(
+                (
+                    diagnosis.audit_fault_absorbed_chain,
+                    diagnosis.audit_fault_absorbed_reread
+                ),
+                (1, 0),
+                "the between-collection move absorbs as chain"
+            );
+        } else {
+            assert_eq!(
+                (
+                    diagnosis.audit_fault_absorbed_chain,
+                    diagnosis.audit_fault_absorbed_reread
+                ),
+                (0, 1),
+                "the seal-time move absorbs as reread"
+            );
+        }
         assert_eq!(
             failure.gap,
-            JournalGap::FaultChanged,
-            "a proof-only first reason cannot certify clean fallback across actual loss"
+            JournalGap::ImageTainted,
+            "the absorbed audit leaves the proof-only refusal standing"
         );
     }
     assert!(
@@ -33756,18 +33985,19 @@ fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMome
         );
         if loss_moment != SiblingLossMoment::None {
             assert!(
-                feed.degraded && !feed.fallback,
-                "actual loss dominates proof refusal in either order"
+                feed.fallback && !feed.degraded,
+                "the absorbed move falls back clean under proof refusal"
             );
             assert_eq!(
-                feed.reduced, original.reduced,
-                "no clean S1 fallback after native loss"
+                feed.reduced,
+                original.reduced + 3,
+                "fallback replays the three staged calls"
             );
-            assert_eq!(feed.disposed - original.disposed, 3);
+            assert_eq!(feed.disposed - original.disposed, 0);
             assert_eq!(
                 fixture.s1_counts(target.id()),
-                (2, 1, 0, 1, 0),
-                "both original loss buffers end the one existing operation exactly once"
+                (5, 2, 1, 0, 0),
+                "fallback replays the three staged calls with no loss markers"
             );
         }
     }
@@ -33799,7 +34029,7 @@ fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMome
             .aggregates()
             .values()
             .all(|counters| counters.completed == 0 && counters.active == 0),
-        "neither colliding provider receives completed object proof after disclosed loss"
+        "neither colliding provider receives completed object proof under proof refusal"
     );
     let roles = fixture
         .scene
@@ -34295,11 +34525,13 @@ fn key_operation_s1only_sibling_raw_reaches_terminal() {
     }
 }
 
-/// A real moved native prefix is loss regardless of whether its collection
-/// predates the ImageSealed refusal or it moves after that genuine refusal.
+/// A real moved native prefix absorbs regardless of whether its collection
+/// predates the ImageSealed refusal or it moves after that genuine refusal:
+/// the between-collection move absorbs as chain, the seal-time move as
+/// reread, and fallback completes under the proof refusal in both orders.
 /// Both original causes/effect buffers remain owned; neither manufactures H3.
 #[test]
-fn key_operation_s1only_sibling_mixed_loss_overrides_proof_refusal() {
+fn key_operation_s1only_sibling_mixed_move_absorbs_under_proof_refusal() {
     for sibling_first in [false, true] {
         for moment in [
             SiblingLossMoment::BeforeProofRefusal,
@@ -34710,11 +34942,9 @@ fn key_operation_s1only_sibling_pending_h3_reaches_next_frame() {
             .commit_batch_with_semantics(false, Some(&mut fixture.scene.real.lane))
             .unwrap();
         let mut q2 = acquire(&mut fixture.scene, ingested, &fixture.attached, &fault);
-        if arm == 1 {
-            assert_eq!(q2.failure_for_test().unwrap().gap, JournalGap::FaultChanged);
-        } else {
-            assert!(q2.failure_for_test().is_none());
-        }
+        // Arm 1's native move absorbs (no failure); arms 0 and 2 never
+        // fault q2.
+        assert!(q2.failure_for_test().is_none());
         {
             let ports = fixture
                 .scene
@@ -34733,6 +34963,9 @@ fn key_operation_s1only_sibling_pending_h3_reaches_next_frame() {
             .unwrap();
         let a_before = feeds.iter().find(|feed| feed.id == a.id()).unwrap();
         assert_eq!(a_after.staged, 0);
+        // Arm 1's absorbed fault leaves no frame failure, but without
+        // arm 0's retained birth the feed still degrades through the
+        // pending path, exactly like arm 2.
         if arm == 0 {
             assert!(a_after.fallback && !a_after.degraded);
             assert_eq!(a_after.reduced - a_before.reduced, 1);
@@ -34766,7 +34999,7 @@ fn key_operation_s1only_sibling_pending_h3_reaches_next_frame() {
     }
 }
 
-fn fallback_history_then_later_loss(next_frame: bool) {
+fn fallback_history_then_later_fault(next_frame: bool) {
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     fixture.push_two("C_SignInit", 2);
     let fault = FrameFault::clean();
@@ -34848,17 +35081,31 @@ fn fallback_history_then_later_loss(next_frame: bool) {
             Ok(QuantumSealProgress::DeliveryReady)
         );
         assert!(
-            births.seen.is_empty(),
-            "actual moved fault refuses before birth"
+            !births.seen.is_empty(),
+            "the absorbed move lets the seal reach birth"
         );
     }
-    let failure = frame.failure_for_test().unwrap();
-    assert_eq!(
-        failure.gap,
-        crate::semantics_objects::journal::JournalGap::FaultChanged
+    assert!(
+        frame.failure_for_test().is_none(),
+        "the later fault absorbs; no failure is recorded"
     );
-    assert!(failure.affects_domain(first.bootstrap().domain()));
-    assert!(!failure.effects.effects.is_empty());
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        if next_frame { (1, 0, 0) } else { (0, 1, 0) },
+        "the later fault absorbs without voiding (chain in a new frame, reread mid-frame)"
+    );
     let mut foreign = CanonicalFanoutScene::prior_sealed();
     let before = fixture.feeds();
     let mut remaining = 1;
@@ -34899,15 +35146,15 @@ fn fallback_history_then_later_loss(next_frame: bool) {
     }
     assert_eq!(
         fixture.s1_counts(first.id()),
-        (2, 1, 0, 1, 0),
-        "S1Only gates positive replay, never authenticated affecting loss"
+        (2, 1, 0, 0, 1),
+        "the absorb keeps S1Only history loss-free with the live operation active"
     );
     let after = fixture
         .feeds()
         .into_iter()
         .find(|feed| feed.id == first.id())
         .unwrap();
-    assert!(after.degraded);
+    assert!(after.fallback && !after.degraded);
     assert_eq!(
         (after.reduced, after.disposed, after.staged),
         (fallback.reduced, fallback.disposed, 0)
@@ -34923,7 +35170,7 @@ fn fallback_history_then_later_loss(next_frame: bool) {
         Some(crate::semantics_key_use::FeedMode::S1Only)
     );
     assert!(
-        !fixture
+        fixture
             .scene
             .real
             .scene
@@ -34932,12 +35179,16 @@ fn fallback_history_then_later_loss(next_frame: bool) {
             .keyuse_for_test()
             .open()
             .keys()
-            .any(|(id, _)| *id == first.id())
+            .any(|(id, _)| *id == first.id()),
+        "the absorb invalidates nothing; the keyuse stays open"
     );
     for feed in fixture.feeds() {
         let prior = initial.iter().find(|old| old.id == feed.id).unwrap();
         if feed.id != first.id() {
-            assert!(feed.degraded);
+            assert!(
+                !feed.degraded && !feed.fallback,
+                "the absorb leaves other feeds Joint and clean"
+            );
             assert_eq!(
                 feed.reduced - prior.reduced + feed.disposed - prior.disposed,
                 1
@@ -34981,13 +35232,13 @@ fn fallback_history_then_later_loss(next_frame: bool) {
 }
 
 #[test]
-fn key_operation_joint_fallback_then_same_frame_loss_invalidates_once() {
-    fallback_history_then_later_loss(false);
+fn key_operation_joint_fallback_then_same_frame_move_absorbs_without_invalidation() {
+    fallback_history_then_later_fault(false);
 }
 
 #[test]
-fn key_operation_s1only_history_next_frame_loss_invalidates_once() {
-    fallback_history_then_later_loss(true);
+fn key_operation_s1only_history_next_frame_move_absorbs_without_invalidation() {
+    fallback_history_then_later_fault(true);
 }
 
 /// A genuine S1Only C may have an exact successful key claim without a Joint

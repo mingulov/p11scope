@@ -16253,9 +16253,11 @@ pub(crate) mod tests {
 
         // The FaultChanged site split: a move the collection audit sees
         // (within one collection or between two) counts as chain, while a
-        // move only the seal-time re-read sees counts as reread. The
-        // seal-path re-read shape (baseline pinned, audit clean, cell moved)
-        // is pinned end-to-end by the fanout twin; here the audit-time
+        // move only the seal-time re-read sees counts as reread. Clean
+        // moves absorb (no void); only denied moves (in-bracket,
+        // regressed) void and count the void split. The seal-path
+        // re-read shape (baseline pinned, audit clean, cell moved) is
+        // pinned end-to-end by the fanout twin; here the audit-time
         // re-read plus both chain shapes land through real seals.
         fn split(scene: &Scene) -> (u64, u64, u64) {
             let after = scene.adapter.joint_void_diagnosis();
@@ -16263,6 +16265,12 @@ pub(crate) mod tests {
                 after.audit_fault_changed_chain,
                 after.audit_fault_changed_reread,
                 after.void_audit,
+            )
+        }
+        fn absorbed(scene: &Scene) -> (u64, u64) {
+            (
+                scene.adapter.audit_fault_absorbed_chain,
+                scene.adapter.audit_fault_absorbed_reread,
             )
         }
         let mut scene = Scene::new(image_default());
@@ -16289,13 +16297,14 @@ pub(crate) mod tests {
                 frontier,
                 SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
-            .expect_err("between-collection move voids");
-        assert_eq!(failure.gap, JournalGap::FaultChanged);
+            .expect_err("between-collection move waits past its absorb");
+        assert_eq!(failure.gap, JournalGap::BoundNotReady);
         assert_eq!(
-            split(&scene),
-            (1, 0, 1),
-            "the between-collection move counts as chain"
+            absorbed(&scene),
+            (1, 0),
+            "the between-collection move absorbs as chain"
         );
+        assert_eq!(split(&scene), (0, 0, 0), "the absorb voids nothing");
         // Audit-time re-read on the pinned baseline: the collection is clean
         // but the seal-time cell already moved.
         assert_eq!(scene.adapter.last_fault, Some(8));
@@ -16316,28 +16325,16 @@ pub(crate) mod tests {
                 )),
                 &moved,
             )
-            .expect_err("seal-time move voids");
-        assert_eq!(failure.gap, JournalGap::FaultChanged);
-        let after = scene.adapter.joint_void_diagnosis();
+            .expect_err("seal-time move waits past its absorb");
+        assert_eq!(failure.gap, JournalGap::BoundNotReady);
         assert_eq!(
-            split(&scene),
-            (1, 1, 2),
-            "the seal-time move counts as reread beside the chain void"
+            absorbed(&scene),
+            (1, 1),
+            "the seal-time move absorbs as reread beside the chain absorb"
         );
-        assert_eq!(
-            after.audit_fault_changed_chain
-                + after.audit_fault_changed_reread
-                + after.audit_h3_loss
-                + after.audit_discarded
-                + after.audit_malformed
-                + after.audit_counter_unprovable
-                + after.audit_fault_unreadable
-                + after.audit_resource_unavailable,
-            after.void_audit,
-            "the split buckets sum to the audit-void total"
-        );
+        assert_eq!(split(&scene), (0, 0, 0), "the absorb voids nothing");
         // Audit-time re-read on a fresh baseline: no pinned epoch, same
-        // bucket.
+        // absorb bucket, and the fresh key converts past it.
         let mut fresh = Scene::new(image_default());
         let proof = fresh.attest();
         let begin = begin_bytes(1, 1, create, 0);
@@ -16347,7 +16344,7 @@ pub(crate) mod tests {
         let frontier = fresh.adapter.consumed_frontier();
         let audit = fresh.audit();
         let moved = ScriptedFaultCell::steady(8);
-        let failure = fresh
+        fresh
             .adapter
             .seal(
                 &mut fresh.model,
@@ -16359,12 +16356,82 @@ pub(crate) mod tests {
                 )),
                 &moved,
             )
-            .expect_err("seal-time move voids on a fresh baseline");
+            .expect("seal-time move absorbs and converts on a fresh baseline");
+        assert_eq!(
+            absorbed(&fresh),
+            (0, 1),
+            "the fresh-baseline re-read absorbs as reread, not chain"
+        );
+        assert_eq!(split(&fresh), (0, 0, 0), "the absorb voids nothing");
+        assert_eq!(fresh.adapter.last_fault, Some(8));
+        // Denied moves still void and count the void split: an
+        // in-bracket move voids as chain.
+        let frontier = scene.adapter.consumed_frontier();
+        let bracket = JournalAuditReceipt::scripted(
+            9,
+            10,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &bracket,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("in-bracket move voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert_eq!(split(&scene), (1, 0, 1), "the in-bracket move voids as chain");
+        assert_eq!(absorbed(&scene), (1, 1), "the void absorbs nothing");
+        assert_eq!(scene.adapter.last_fault, Some(10));
+        // A regressed seal-time cell voids as reread without moving
+        // the pin back.
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = JournalAuditReceipt::scripted(
+            10,
+            10,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let regressed = ScriptedFaultCell::steady(9);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &audit,
+                &bootstrap,
+                frontier,
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
+                &regressed,
+            )
+            .expect_err("regressed cell voids");
         assert_eq!(failure.gap, JournalGap::FaultChanged);
         assert_eq!(
-            split(&fresh),
-            (0, 1, 1),
-            "the fresh-baseline re-read counts as reread, not chain"
+            split(&scene),
+            (1, 1, 2),
+            "the regressed move voids as reread beside the chain void"
+        );
+        assert_eq!(absorbed(&scene), (1, 1), "the void absorbs nothing");
+        assert_eq!(scene.adapter.last_fault, Some(10));
+        let after = scene.adapter.joint_void_diagnosis();
+        assert_eq!(
+            after.audit_fault_changed_chain
+                + after.audit_fault_changed_reread
+                + after.audit_h3_loss
+                + after.audit_discarded
+                + after.audit_malformed
+                + after.audit_counter_unprovable
+                + after.audit_fault_unreadable
+                + after.audit_resource_unavailable,
+            after.void_audit,
+            "the split buckets sum to the audit-void total"
         );
     }
 
@@ -19158,32 +19225,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn object_journal_void_wiped_destroy_end_still_taints() {
-        // A state-changing BEGIN wiped by a void is never
-        // expected-absent: excusing its END would let a destroy that
-        // outlived the wipe disappear from the object model, so a
-        // later bind of the reused handle could name the destroyed
-        // key. The straddling END still taints (fail closed).
-        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
-        let mut scene = Scene::new(image_default());
-        let destroy = function_id("C_DestroyObject");
-        let mut begin = begin_bytes(1, 1, destroy, 0);
-        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
-        begin[126] = 1;
-        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
-        scene.adapter.void_staged();
-        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 50);
-        assert_eq!(
-            scene.ingest(&end),
-            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
-        );
-        assert!(
-            scene.adapter.image_refused((COOKIE, EXEC)),
-            "a void-wiped destroy terminal still taints"
-        );
-    }
-
-    #[test]
     fn object_journal_lifted_image_destroy_end_still_taints() {
         // A destroy dropped by a shed-taint must not ride the lift:
         // the lift clears the taint but purges non-neutral absences,
@@ -19210,32 +19251,6 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.image_refused((COOKIE, EXEC)),
             "a lifted-image destroy terminal still taints"
-        );
-    }
-
-    #[test]
-    fn object_journal_void_wiped_destroy_abandon_still_taints() {
-        // ABANDON half of the void-wipe destroy twin: abandons carry no
-        // return, so the arrival consumes the excuse unchecked — only
-        // the record-time void filter keeps a void-wiped destroy from
-        // being excused. The return-probe reason is deliberate: the
-        // call ran, so its state change outlived the wipe.
-        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
-        let mut scene = Scene::new(image_default());
-        let destroy = function_id("C_DestroyObject");
-        let mut begin = begin_bytes(1, 1, destroy, 0);
-        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
-        begin[126] = 1;
-        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
-        scene.adapter.void_staged();
-        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
-        assert_eq!(
-            scene.ingest(&abandon),
-            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
-        );
-        assert!(
-            scene.adapter.image_refused((COOKIE, EXEC)),
-            "a void-wiped destroy abandon still taints"
         );
     }
 
@@ -19604,33 +19619,6 @@ pub(crate) mod tests {
         assert!(
             scene.adapter.image_refused((COOKIE, EXEC)),
             "a lifted refused-destroy abandon still taints"
-        );
-    }
-
-    #[test]
-    fn object_journal_void_wiped_bad_return_end_still_taints() {
-        // The function alone is not enough: a void-wiped neutral call
-        // whose END reports a handle/session failure may have cleared
-        // or closed what a later call reuses, so it still taints like
-        // the unclaimable-original disposal it mirrors (Ok, Partial
-        // and plain Failed alone are excused).
-        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
-        let mut scene = Scene::new(image_default());
-        let sign_init = function_id("C_SignInit");
-        let mut begin = begin_bytes(1, 1, sign_init, 0);
-        put_u64(&mut begin, 88, 0x9090_9090_9090_9090);
-        begin[126] = 1;
-        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
-        scene.adapter.void_staged();
-        let rv = pkcs11_types::CkRv::OBJECT_HANDLE_INVALID.0;
-        let end = end_bytes(&begin, OBJECT_ACTION_ACCESS, rv, ENTRY_NS + 50);
-        assert_eq!(
-            scene.ingest(&end),
-            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin)
-        );
-        assert!(
-            scene.adapter.image_refused((COOKIE, EXEC)),
-            "a void-wiped bad-return terminal still taints"
         );
     }
 
@@ -30499,7 +30487,10 @@ pub(crate) mod tests {
     fn object_journal_fault_continuity_chains_across_collections() {
         // C6: the checked fault chains cumulatively, not just within one
         // collection. A fault that moves between collections (7,7 then
-        // 8,8) voids; the baseline catches up and later seals pass.
+        // 8,8) no longer voids: the audit absorbs the move (pin 8,
+        // chain site), then the seal waits for the new history's
+        // attribution (fail closed, no void). A repeat seal still
+        // waits on a clean audit: the pin holds with no new absorb.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
@@ -30530,50 +30521,39 @@ pub(crate) mod tests {
                 frontier,
                 SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
-            .expect_err("inter-collection fault move voids");
-        assert_eq!(failure.gap, JournalGap::FaultChanged);
+            .expect_err("inter-collection fault move waits for attribution");
+        assert_eq!(failure.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            crate::semantics_objects::journal::SealWait::AttributionPending
+        );
         assert_eq!(scene.adapter.last_fault, Some(8));
-        // The baseline caught up: new history above the fence seals
-        // under the fresh epoch. The void cleared admission claims:
-        // re-attest for the new history.
-        let fence = scene.adapter.consumed_through;
-        scene.attest();
-        let third = begin_bytes(1, 3, create, 0);
-        scene.ingest(&third);
-        scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
-        let grant = SessionBirthGrant::scripted(
-            proof,
-            BirthKind::AbsenceAppearance,
-            fence,
-            scene.closure_generation(),
-        );
-        let resume =
-            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
-        let frontier = scene.adapter.consumed_frontier();
-        let fresh = JournalAuditReceipt::scripted(
-            8,
-            8,
-            None,
-            0,
-            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            scene.closure_generation(),
-        );
-        let recovered = scene
+        assert_eq!(scene.adapter.audit_fault_absorbed_chain, 1);
+        assert_eq!(scene.adapter.audit_fault_absorbed_reread, 0);
+        assert_eq!(scene.adapter.void_audit, 0);
+        // A repeat seal still waits for the same attribution on a
+        // clean audit: the pin holds, nothing voids, and no new
+        // absorb counts.
+        let repeat = scene
             .seal_explicit(
-                &fresh,
-                &resume,
+                &moved,
+                &bootstrap,
                 frontier,
-                SessionBirthEvidence::scripted_for_receipt(&resume),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
-            .expect("post-void history seals");
-        assert_eq!(recovered.prefix.settled().len(), 1);
+            .expect_err("repeat seal still waits for attribution");
+        assert_eq!(repeat.gap, JournalGap::BoundNotReady);
+        assert_eq!(scene.adapter.last_fault, Some(8));
+        assert_eq!(scene.adapter.audit_fault_absorbed_chain, 1);
+        assert_eq!(scene.adapter.audit_fault_absorbed_reread, 0);
+        assert_eq!(scene.adapter.void_audit, 0);
     }
 
     #[test]
     fn object_journal_seal_rereads_fault_at_seal_time() {
         // C6: the seal re-reads the native fault cell at seal time. A
-        // clean collection pair that moved before the seal voids; the
-        // fresh reading becomes the new baseline.
+        // clean collection pair that moved before the seal absorbs;
+        // the fresh reading becomes the new baseline.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
@@ -30586,7 +30566,7 @@ pub(crate) mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let moved = ScriptedFaultCell::steady(8);
-        let failure = scene
+        scene
             .adapter
             .seal(
                 &mut scene.model,
@@ -30598,8 +30578,8 @@ pub(crate) mod tests {
                 )),
                 &moved,
             )
-            .expect_err("seal-time fault move voids");
-        assert_eq!(failure.gap, JournalGap::FaultChanged);
+            .expect("seal-time fault move absorbs");
+        assert_eq!(scene.adapter.audit_fault_absorbed_reread, 1);
         assert_eq!(scene.adapter.last_fault, Some(8));
         // The fresh baseline holds: the old epoch no longer chains.
         let stale = scene

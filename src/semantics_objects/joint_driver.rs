@@ -3689,22 +3689,23 @@ mod tests {
     }
 
     #[test]
-    fn joint_resource_void_wiped_destroy_end_refuses_collection() {
-        // Collection seam: a void-wiped destroy END on a clean image is
-        // not derived-absent (the void filter skips state-changing
-        // calls), so the collection refuses — presence here is the
-        // whole rule, with no function gate to fall back on.
+    fn joint_resource_void_wiped_wrong_descriptor_end_refuses_collection() {
+        // Collection seam: a void-wiped BEGIN releases its call, so a
+        // matching late END disposes — but a descriptor-bearing END
+        // for another function is independent mismatch evidence, and
+        // the collection refuses it instead of disposing.
         use crate::semantics_objects::journal::tests::{
             COOKIE, ENTRY_NS, EXEC, begin_bytes, end_bytes, function_id,
         };
-        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_DESTROY;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
         let rows = publish_object_descriptors();
         let events = EventsDomain::test_standin(0xf1a0);
         let retained = producers(&events);
         let mut begin = begin_bytes(1, 1, function_id("C_DestroyObject"), 0);
         begin[88..96].copy_from_slice(&0x9090_9090_9090_9090u64.to_le_bytes());
         begin[126] = 1;
-        let end = end_bytes(&begin, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 100);
+        let foreign = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+        let end = end_bytes(&foreign, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 100);
         let pool = SemanticResourcePool::default();
         let mut adapter = resource_adapter(&pool);
         let fault = SteadyFault(Cell::new(None));
@@ -3748,7 +3749,7 @@ mod tests {
         .unwrap();
         assert!(
             terminal.resource_refused,
-            "a void-wiped destroy END must refuse the collection"
+            "a wrong-descriptor END after a wipe must refuse the collection"
         );
     }
 

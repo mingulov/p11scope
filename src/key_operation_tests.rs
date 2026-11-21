@@ -14612,6 +14612,19 @@ fn key_operation_unknown_mechanism_ids_merge_on_absorb() {
     assert_eq!(live[0].further_mechanism_terminals, 0);
 }
 
+/// The reducer value stays small: scenes hold it by value on
+/// test-thread stacks that already run near the 2 MiB limit, so
+/// the 138 unknown counters ride the heap (boxed). Without the
+/// box the F3 ids overflow the stack in the KEM adapter test.
+#[test]
+fn key_operation_reducer_value_stays_stack_small() {
+    assert!(
+        std::mem::size_of::<KeyUseReducer>() < 2048,
+        "reducer value {} bytes: keep the unknown array boxed",
+        std::mem::size_of::<KeyUseReducer>()
+    );
+}
+
 /// Controller ruling fix2 (T0 KEM template reads, Gap 4): a KEM
 /// output template establishes its non-secret facts on the fresh
 /// key — class, key type and value length promote with

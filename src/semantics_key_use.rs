@@ -2915,7 +2915,11 @@ pub(crate) struct KeyUseReducer {
     open: BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse>,
     refused: BTreeMap<(RegistryInstanceId, OperationId), RefusedOpen>,
     aggregates: BTreeMap<AggKey, AggCounters>,
-    unknown: [UnknownCounters; UNKNOWN_BUCKETS],
+    /// Boxed: 138 counters ride the heap, not the reducer value.
+    /// Scenes hold the reducer by value on test-thread stacks that
+    /// already run near the 2 MiB limit; the F3 mechanism ids would
+    /// otherwise overflow them (the KEM adapter test pins this).
+    unknown: Box<[UnknownCounters; UNKNOWN_BUCKETS]>,
     /// Fixed unknown summaries ever live (N9): once a summary row
     /// emits, its zero-active replacement emits forever after, so the
     /// cumulative consumer never keeps stale activity. Fixed 138
@@ -2967,7 +2971,7 @@ impl KeyUseReducer {
             open: BTreeMap::new(),
             refused: BTreeMap::new(),
             aggregates: BTreeMap::new(),
-            unknown: [UnknownCounters::default(); UNKNOWN_BUCKETS],
+            unknown: Box::new([UnknownCounters::default(); UNKNOWN_BUCKETS]),
             unknown_ever_live: [false; UNKNOWN_BUCKETS],
             capacity,
             evidence: KeyUseEvidence::default(),

@@ -5851,13 +5851,15 @@ fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
         let revision = event["revision"].as_u64().unwrap_or(u64::MAX);
         // Per-event H9 version authority: absent means v1 (pre-6.07c
         // producers emit v1 rows only); unknown versions refuse,
-        // never guessed from labels or the final section. v5-v7 add
-        // no roles or creations, so the v2 tables still validate.
+        // never guessed from labels or the final section. v5-v7, v9
+        // and v10 add no roles or creations, so the v2 tables still
+        // validate. (8 is the Task 7 provider section under the
+        // shared allocator, never an object-observations row.)
         let version = event
             .get("version")
             .map_or(1, |v| v.as_u64().unwrap_or(u64::MAX));
         assert!(
-            (1..=7).contains(&version),
+            (1..=7).contains(&version) || version == 9 || version == 10,
             "H9 row version {version} refused"
         );
         let (roles, creations): (&[&str], &[&str]) = if version >= 2 {
@@ -6373,6 +6375,7 @@ fn key_operation_one_projection_three_consumers() {
     presentation.object_observations = r2.clone();
     let document = render_json_from_presentation(&presentation);
     let section = &document["object_observations"];
+    assert_eq!(section["version"], 10, "r2 trips v10 on the lost terminal's id");
 
     // Changed rows re-emit; unchanged rows persist client-side.
     let path = dir.path().join("events.jsonl");
@@ -6382,10 +6385,11 @@ fn key_operation_one_projection_three_consumers() {
     let before = emitter.tracked();
     let delta = emitter.emit(&mut writer, &r2, 2_000).unwrap();
     assert_eq!(delta.deferred, 0);
-    assert_eq!(
-        delta.emitted, 3,
-        "only the sign row, the new lost summary and the destroyed object row re-emit"
-    );
+    // F3: r2 trips v10 (the lost terminal carries its mechanism
+    // id), so the three pre-existing unknown rows re-render with
+    // the v10 `mechanisms` key and re-emit beside the sign row,
+    // the new lost summary and the destroyed object row.
+    assert_eq!(delta.emitted, 6, "three changed rows plus three v10 re-renders");
     assert_eq!(
         emitter.tracked(),
         before + 1,
@@ -12644,12 +12648,15 @@ fn key_operation_h9_v2_dispatches_on_kem_content() {
 /// reconstruction dispatches role/creation vocabularies per event
 /// and refuses unknown versions. Creation-only and role-only KEM
 /// states and rotation all ride real rendering and reconstruction
-/// (v7: every scene trips inference).
+/// (r1 stays v7 with no unknown terminals; the KEM scenes trip
+/// v10 past r1: their unknown terminals carry mechanism ids).
 #[test]
 fn key_operation_kem_jsonl_version_dispatch() {
     use crate::discovery::engine::inventory_coordinator::PassReport;
     use crate::inventory_events::{KeyOperationEmitter, pass_payload};
-    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V7, object_observations_json};
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V10, OBSERVATIONS_VERSION_V7, object_observations_json,
+    };
     fn row_versions(lines: &[serde_json::Value]) -> Vec<u64> {
         lines
             .iter()
@@ -12825,8 +12832,10 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "creation-only: no KEM role row"
     );
     let section = object_observations_json(&r2);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
-    assert_eq!(marker_version(&r2), 7);
+    // F3: the KEM direct completion lands unknown with its
+    // mechanism id, so the section trips v10 past r1's v7.
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V10);
+    assert_eq!(marker_version(&r2), 10);
     let v2path = dir.path().join("v7delta.jsonl");
     let mut writer = EventWriter::create(&v2path, 1 << 20, 5).unwrap();
     loop {
@@ -12839,8 +12848,8 @@ fn key_operation_kem_jsonl_version_dispatch() {
     let r2delta = read_stream(dir.path(), "v7delta.jsonl");
     assert!(!r2delta.is_empty(), "the transition emits new rows");
     assert!(
-        row_versions(&r2delta).iter().all(|v| *v == 7),
-        "new rows bind v7"
+        row_versions(&r2delta).iter().all(|v| *v == 10),
+        "new rows bind v10"
     );
     assert!(
         row_keys(&v7lines).is_disjoint(&row_keys(&r2delta)),
@@ -12867,7 +12876,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
     );
     let r3 = commit(3, &[&staging], &scene.model.project(), &keyuse);
     let section = object_observations_json(&r3);
-    assert_eq!(section["version"], OBSERVATIONS_VERSION_V7);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V10);
     let v3path = dir.path().join("v3delta.jsonl");
     let mut writer = EventWriter::create(&v3path, 1 << 20, 5).unwrap();
     loop {
@@ -12879,8 +12888,8 @@ fn key_operation_kem_jsonl_version_dispatch() {
     drop(writer);
     let r3delta = read_stream(dir.path(), "v3delta.jsonl");
     assert!(
-        row_versions(&r3delta).iter().all(|v| *v == 7),
-        "later rows bind v7"
+        row_versions(&r3delta).iter().all(|v| *v == 10),
+        "later rows bind v10"
     );
     let before = &row_keys(&v7lines) | &row_keys(&r2delta);
     let r3keys = row_keys(&r3delta);
@@ -12897,10 +12906,10 @@ fn key_operation_kem_jsonl_version_dispatch() {
         if line["kind"] == "object_observed"
             && reemitted.contains(&format!("o:{}", line["event"]["row"]["object"]))
         {
-            assert_eq!(line["event"]["version"], 7, "re-emits bind current v7");
+            assert_eq!(line["event"]["version"], 10, "re-emits bind current v10");
             assert_eq!(
                 line["event"]["row"]["creation"], "create",
-                "creation vocabulary stays valid under v7"
+                "creation vocabulary stays valid under v10"
             );
         }
     }
@@ -12992,9 +13001,11 @@ fn key_operation_kem_jsonl_version_dispatch() {
         "role-only rows bind v7"
     );
     assert_reconstructed_eq_json(&reconstruct(&role_lines), &section, true);
-    // Unknown versions refuse without guessing.
+    // Unknown versions refuse without guessing (8 is the Task 7
+    // provider section, never an object-observations row).
     for bad in [
         serde_json::json!(0),
+        serde_json::json!(8),
         serde_json::json!(99),
         serde_json::json!("2"),
         serde_json::Value::Null,
@@ -13033,12 +13044,17 @@ fn key_operation_kem_jsonl_version_dispatch() {
     assert!(spin.rotations() > 0, "rotation exercised");
     drop(spin);
     let spun = read_stream(dir.path(), "spin.jsonl");
+    let mut saw_versions = std::collections::BTreeSet::new();
     for line in &spun {
         if line["kind"] == "object_observed" || line["kind"] == "key_operations_observed" {
             let version = line["event"]["version"].as_u64().unwrap_or(u64::MAX);
-            assert!(version == 7, "known version survives");
+            assert!(version == 7 || version == 10, "known version survives");
+            saw_versions.insert(version);
         }
     }
+    // r1 streams v7, the KEM revisions stream v10: rotation keeps
+    // both generations' versions intact.
+    assert_eq!(saw_versions, std::collections::BTreeSet::from([7, 10]));
     assert!(
         spun.iter().any(|line| line["kind"] == "rotated"),
         "rotation marker present"
@@ -23098,7 +23114,10 @@ fn key_operation_partial_publication_counts_unattributed() {
         "the replayed calls count once as not attributed"
     );
     let fell_json = object_observations_json(&fell);
-    assert_eq!(fell_json["version"], 3);
+    // F3: the fell scene's unknown terminals carry mechanism ids,
+    // so the section trips v10; the unattributed counts below are
+    // the test's subject and still pin exactly.
+    assert_eq!(fell_json["version"], 10);
     assert_eq!(
         fell_json["unattributed"],
         serde_json::json!([{"reason": "proof_refused_fallback", "count": 3}])
@@ -27645,7 +27664,7 @@ fn key_operation_newsite_curve_name_triggers_v6_without_label() {
 fn key_operation_newsite_requested_conflict_triggers_v6_without_source() {
     use crate::key_operation_projection::producer::commit;
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V6, object_observations_json, observations_version,
+        OBSERVATIONS_VERSION_V10, object_observations_json, observations_version,
     };
     use crate::semantics_key_use::KeyUseReducer;
     let mut scene = JointScene::new();
@@ -27689,9 +27708,12 @@ fn key_operation_newsite_requested_conflict_triggers_v6_without_source() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
-    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V6);
+    // F3: the sign completion lands unknown with its mechanism id,
+    // so the section trips v10; the newsite conflict still renders
+    // with its v6 shapes below.
+    assert_eq!(observations_version(&committed), OBSERVATIONS_VERSION_V10);
     let section = object_observations_json(&committed);
-    assert_eq!(section["version"], 6);
+    assert_eq!(section["version"], 10);
     assert_eq!(
         section["objects"][0]["requested"]["value_len"]["status"], "conflict",
         "the duplicating sizes conflict in the requested block"
@@ -33318,10 +33340,12 @@ fn keymeta_rowless_park_refusal_promotes_to_v7() {
         .expect("the refusal publishes as a named gap");
     assert_eq!(gap.subject, "key_operation");
     assert_eq!(gap.repeats, 1);
+    // F3: the scene's unknown terminals carry mechanism ids, so
+    // the v7 gap content rides a v10 section.
     assert_eq!(
         crate::key_operation_projection::observations_version(&committed),
-        7,
-        "a v7-only gap promotes its section to v7"
+        10,
+        "a v7 gap promotes its section past v7 with mechanism content"
     );
 }
 
@@ -33491,13 +33515,15 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
         .expect("the refusal publishes as a named gap");
     assert_eq!(gap.subject, "key_operation");
     assert_eq!(gap.repeats, 1);
+    // F3: the scene's unknown terminals carry mechanism ids, so
+    // the v7 gap content rides a v10 section.
     assert_eq!(
         crate::key_operation_projection::observations_version(&committed),
-        7,
-        "a v7-only gap promotes its section to v7"
+        10,
+        "a v7 gap promotes its section past v7 with mechanism content"
     );
     let section = crate::key_operation_projection::object_observations_json(&committed);
-    assert_eq!(section["version"], 7);
+    assert_eq!(section["version"], 10);
     let rendered = &section["key_operations"][0];
     let mut keys: Vec<String> = rendered
         .as_object()

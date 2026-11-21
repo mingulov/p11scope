@@ -628,6 +628,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         } = completion;
         self.state = state;
         CgroupCompletion {
@@ -637,6 +638,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         }
     }
 }
@@ -1469,6 +1471,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         } = completion;
         self.state = state;
         let completion = CgroupCompletion {
@@ -1478,6 +1481,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         };
         (
             completion,
@@ -1538,6 +1542,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         } = completion;
         self.state = state;
         CgroupCompletion {
@@ -1547,6 +1552,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         }
     }
 
@@ -1578,6 +1584,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         } = completion;
         self.state = state;
         CgroupCompletion {
@@ -1587,6 +1594,7 @@ impl ScopedNativeScene {
             admitted,
             scan_callers,
             progress,
+            progress_fingerprint,
         }
     }
 

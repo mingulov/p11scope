@@ -7824,7 +7824,9 @@ fn member_continuation_filter_keeps_no_table_diagnosis() {
     let mut gaps = member_gaps();
     crate::inspect_system::retain_member_gaps_while_unfinished(&mut gaps, &budget, 2000, Some(9));
     assert_eq!(
-        gaps.iter().map(|gap| gap.subject.as_str()).collect::<Vec<_>>(),
+        gaps.iter()
+            .map(|gap| gap.subject.as_str())
+            .collect::<Vec<_>>(),
         vec![tricky_path.as_str(), "unrelated-a"],
         "the genuine stops drop but the diagnosis and the control stay: {gaps:?}"
     );

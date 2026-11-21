@@ -256,9 +256,9 @@ INTEGRATION_ENTRY = {
 }
 
 # The src/ live-kernel cells and their campaign lists: the nonleader anchor
-# stays a static skip, while the btrfs zombie parity cell runs in the
-# btrfs group. Pinned literally so a dropped curation fails here.
-SRC_LIVE_KERNEL_SKIP_EXPECTED = [
+# runs in the default campaign, while the btrfs zombie parity cell runs
+# in the btrfs group. Pinned literally so a dropped curation fails here.
+SRC_LIVE_KERNEL_DEFAULT_EXPECTED = [
     "attach::identity_iter::tests::privileged_identity_nonleader_anchor_installs_nothing",
 ]
 
@@ -1027,11 +1027,12 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("all 1 inventoried site(s) match", result.stdout)
 
-    def test_src_live_kernel_cells_are_skip_curated(self):
+    def test_src_live_kernel_cells_are_campaign_curated(self):
         lists = CHECKER_MOD["runner_lists"](str(RUNNER))
-        for name in SRC_LIVE_KERNEL_SKIP_EXPECTED:
+        for name in SRC_LIVE_KERNEL_DEFAULT_EXPECTED:
             with self.subTest(name=name):
-                self.assertIn(name, lists["SKIP_TESTS"])
+                self.assertIn(name, lists["DEFAULT_TESTS"])
+                self.assertNotIn(name, lists["SKIP_TESTS"])
         for name in SRC_LIVE_KERNEL_BTRFS_EXPECTED:
             with self.subTest(name=name):
                 self.assertIn(name, lists["BTRFS_TESTS"])
@@ -1931,13 +1932,13 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=275",
+            "DEFAULT_TESTS=276",
             "ALTERNATIVE_TESTS=2",
-            "LONG_TESTS=17",
+            "LONG_TESTS=18",
             "BTRFS_TESTS=18",
             "OVERLAY_TESTS=14",
             "EXPECTED_FAILURE_TESTS=3",
-            "SKIP_TESTS=37",
+            "SKIP_TESTS=35",
             "COUNTER_FIXTURE_TESTS=27",
             "WRAP_FIXTURE_TESTS=7",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",

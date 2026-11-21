@@ -885,6 +885,26 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0
         and type(evidence.get("coverage_retired_slots", 0)) is int
         and evidence.get("coverage_retired_slots", 0) == 68)
+    # Exit composition 2026-11-21 (fedora host rep26): the same fixed
+    # R1 disclosure plus one folded mid-flight exit. The gap-fold
+    # feature projects an ambient short-lived exit that races discovery
+    # to EXIT_MID_FLIGHT_SKIP instead of the generic quiet row the arm
+    # above accepts; the workload stays fully observed (exact
+    # 64000/64000 on rep26 with zero loss) and the exit row is counted
+    # and disclosed, never silent. Either skip order qualifies; the
+    # cause pair is unchanged. Accepted strict and relaxed alike (the
+    # host twin is the same shape); a sibling fold, a further row, gap
+    # or cause stays a new shape.
+    ok_coverage_retired_exit = (
+        cell == "mt-system"
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped", "coverage_retired_slots"]
+        and (skip_entries == [EXIT_MID_FLIGHT_SKIP, COVERAGE_RETIRED_SKIP]
+             or skip_entries == [COVERAGE_RETIRED_SKIP, EXIT_MID_FLIGHT_SKIP])
+        and evidence.get("modules_skipped") == []
+        and evidence.get("pid_descendant_gaps", 0) == 0
+        and type(evidence.get("coverage_retired_slots", 0)) is int
+        and evidence.get("coverage_retired_slots", 0) == 68)
     # Ambient-burst lane, evidence-only: count cover is not proof, so
     # the census join annotates the failure detail below and never
     # accepts a cell (a real gap-for-gap join needs per-gap identity
@@ -938,7 +958,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
                 or ok_exit_ambient or ok_loader_quiet or ok_coverage_retired
-                or ok_coverage_retired_noise or ok_coverage_retired_quiet,
+                or ok_coverage_retired_noise or ok_coverage_retired_quiet
+                or ok_coverage_retired_exit,
                 "lossy or unknown observation gap class")
     elif gap66:
         ok_gap = (observation.get("status") == "lossy" and
@@ -952,7 +973,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         if burst_note is not None:
             gap_detail += "; " + burst_note
         require(ok_exact or ok_ambient or ok_quiet or ok_exit_ambient or ok_lone_gap
-                or ok_loader_quiet or ok_coverage_retired or ok_coverage_retired_quiet,
+                or ok_loader_quiet or ok_coverage_retired or ok_coverage_retired_quiet
+                or ok_coverage_retired_exit,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")
@@ -967,13 +989,14 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
-    # ok_ambient, ok_quiet, ok_exit_ambient, ok_lone_gap or ok_loader_quiet:
-    # any other cause set failed already, so the flags (not re-spelled
-    # causes) decide the qualification. Metrics evidence carries no gaps
-    # keys, which read as zero below; profile-cgroup/run cells carry them
-    # and must read 0.
+    # ok_ambient, ok_quiet, ok_exit_ambient, ok_coverage_retired_exit,
+    # ok_lone_gap or ok_loader_quiet (the pure coverage-retired shapes
+    # qualify plain below): any other cause set failed already, so the
+    # flags (not re-spelled causes) decide the qualification. Metrics
+    # evidence carries no gaps keys, which read as zero below;
+    # profile-cgroup/run cells carry them and must read 0.
     ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet))
-    exit_ambient = (not relaxed and ok_exit_ambient)
+    exit_ambient = (not relaxed and (ok_exit_ambient or ok_coverage_retired_exit))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps

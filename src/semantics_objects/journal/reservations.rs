@@ -703,6 +703,19 @@ impl<C> ReservationTable<C> {
         *head = at as u16;
     }
 
+    /// Restore one popped slot to the intrusive free list after a
+    /// refused commit: the pop's head advance is undone exactly (no
+    /// yield or table mutation may run between the pop and this
+    /// call, so the head is unchanged and the push restores it). A
+    /// write only: no chain-dependent read, no gate charge.
+    pub(super) fn free_restore(&mut self, at: usize) {
+        debug_assert!(
+            self.slots[at].operation.is_none(),
+            "only a popped vacancy restores"
+        );
+        Self::free_push(&mut self.free_head, &mut self.slots, at);
+    }
+
     pub(super) fn census(&self) -> usize {
         self.live
     }

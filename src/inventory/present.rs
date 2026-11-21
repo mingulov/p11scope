@@ -3264,6 +3264,43 @@ fn ceiling_fold_line(row: &GapView) -> String {
     }
 }
 
+/// One concise line unit: a folded ceiling row or a ranked ordinary
+/// group.
+enum ConciseUnit<'a> {
+    Ceiling(&'a GapView),
+    Group(&'a ((String, String), OrdinaryGapGroup)),
+}
+
+/// The single concise ordering owner: the folded ceiling rows, in
+/// first-encounter order, are interval boundaries. Each ordinary group
+/// belongs to the interval holding its first folded row (so a group
+/// with rows on both sides of a ceiling reads once, where it first
+/// appeared) and keeps the existing rank only within that interval.
+/// The merged sequence is interval 0's groups, ceiling 0, interval 1's
+/// groups, ceiling 1, …; the caller caps it as one list. `ranked` is
+/// already in rank order and the interval sort is stable.
+fn concise_interval_order<'a>(
+    ceiling: &[(usize, &'a GapView)],
+    ranked: &'a [((String, String), OrdinaryGapGroup)],
+) -> Vec<ConciseUnit<'a>> {
+    let interval = |first: usize| ceiling.partition_point(|(index, _)| *index < first);
+    let mut groups: Vec<(usize, &'a ((String, String), OrdinaryGapGroup))> = ranked
+        .iter()
+        .map(|group| (interval(group.1.2), group))
+        .collect();
+    groups.sort_by_key(|(interval, _)| *interval);
+    let mut merged = Vec::with_capacity(ceiling.len().saturating_add(groups.len()));
+    let mut groups = groups.into_iter().peekable();
+    for (boundary, (_, row)) in ceiling.iter().enumerate() {
+        while let Some((_, group)) = groups.next_if(|(interval, _)| *interval <= boundary) {
+            merged.push(ConciseUnit::Group(group));
+        }
+        merged.push(ConciseUnit::Ceiling(row));
+    }
+    merged.extend(groups.map(|(_, group)| ConciseUnit::Group(group)));
+    merged
+}
+
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
 /// line per plain subject/reason group, up to [`GAP_GROUPS_SHOWN`]
 /// groups; beyond that one fold line names the remainder. Plain words
@@ -3295,17 +3332,17 @@ fn ceiling_fold_line(row: &GapView) -> String {
 /// never folds: it keeps its own named row. Verbose and JSON keep
 /// every row.
 /// Scan-budget ceiling trips fold before grouping: one line per
-/// subject with the exact summed repeats, each anchored to its first
-/// encounter among the ranked ordinary groups; a lone trip renders
-/// bare.
+/// subject with the exact summed repeats, each anchored at its first
+/// encounter; ordinary groups rank within the interval between two
+/// anchors (see [`concise_interval_order`]); a lone trip renders bare.
 fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<String> {
     // The scan-budget ceiling family folds before grouping: one line per
     // subject with the summed repeats. Ordinary rows group and rank
-    // under the existing policy; each folded ceiling row then inserts
-    // at its first encounter — ahead of the first ranked group whose
-    // rows all come later — under the same shared cap. Everything
-    // below groups the ordinary rows only, keeping each group's first
-    // folded index for the insertion.
+    // under the existing policy; `concise_interval_order` then places
+    // each group in the interval of its first folded row between the
+    // ceiling anchors, under the same shared cap. Everything below
+    // groups the ordinary rows only, keeping each group's first folded
+    // index for the placement.
     let folded = fold_ceiling_for_text(gaps);
     let mut ceiling: Vec<(usize, &GapView)> = Vec::new();
     let mut ordinary: Vec<(usize, &GapView)> = Vec::new();
@@ -3524,30 +3561,16 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
             .then_with(|| left.0.cmp(&right.0))
     });
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
-    let mut shown = 0usize;
-    let units = ceiling.len().saturating_add(ranked.len());
-    let mut ceiling = ceiling.into_iter().peekable();
-    for ((subject, reason), (count, _, first)) in ranked.iter() {
-        while ceiling.peek().is_some_and(|(index, _)| index < first) {
-            if shown >= GAP_GROUPS_SHOWN {
-                break;
+    let merged = concise_interval_order(&ceiling, &ranked);
+    let units = merged.len();
+    let shown = units.min(GAP_GROUPS_SHOWN);
+    for unit in &merged[..shown] {
+        lines.push(match unit {
+            ConciseUnit::Ceiling(row) => ceiling_fold_line(row),
+            ConciseUnit::Group(((subject, reason), (count, _, _))) => {
+                gap_group_line(*count, subject, reason)
             }
-            let (_, row) = ceiling.next().expect("a peeked ceiling row");
-            lines.push(ceiling_fold_line(row));
-            shown += 1;
-        }
-        if shown >= GAP_GROUPS_SHOWN {
-            break;
-        }
-        lines.push(gap_group_line(*count, subject, reason));
-        shown += 1;
-    }
-    for (_, row) in ceiling {
-        if shown >= GAP_GROUPS_SHOWN {
-            break;
-        }
-        lines.push(ceiling_fold_line(row));
-        shown += 1;
+        });
     }
     let rest = units.saturating_sub(shown);
     if rest == 1 {

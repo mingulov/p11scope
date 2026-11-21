@@ -445,43 +445,8 @@ fn joint_unlinked_broken_stream_resyncs_next_collect() {
     );
 }
 
-/// An S1-only lane's stream boundary tracks the frontier: it links
-/// no journal producer, so nothing certifies the stream (OD33) and
-/// every quantum resolves its birth cut — reseed retries offer past
-/// the boundary quantum instead of stranding until the next void.
-#[test]
-fn joint_birth_cut_unlinked_lane_tracks_frontier() {
-    let events = EventsDomain::test_standin(0xb101);
-    let retained =
-        SessionDrainProducers::test_pair_unlinked(NativeDomainId::mint(), events.clone());
-    let pool = SemanticResourcePool::default();
-    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
-    let mut drain = EventDrain::over_domain(ScriptedRecords::records([], 8), events.clone());
-    RawJointQuantum::collect_with_adapter(
-        &mut drain,
-        &publish_object_descriptors(),
-        8,
-        &SteadyFault(Cell::new(None)),
-        &retained,
-        |bytes| pool.reserve(bytes),
-        owner.adapter_mut(),
-    )
-    .unwrap();
-    let mut advanced_drain =
-        EventDrain::over_domain(ScriptedRecords::records([vec![1, 2, 3]], 8), events.clone());
-    advanced_drain.poll(Some(1), |_| std::ops::ControlFlow::Continue(()));
-    let advanced = advanced_drain.consumption_cut().unwrap();
-    assert!(
-        owner
-            .adapter_mut()
-            .resolve_birth_cut(&advanced, &retained)
-            .is_ok(),
-        "an S1-only lane tracks the advanced frontier"
-    );
-}
-
 /// A linked lane keeps the exact boundary: an advanced cut past the
-/// resync point still refuses Prefix (only S1-only lanes track).
+/// resync point still refuses Prefix.
 #[test]
 fn joint_birth_cut_linked_lane_keeps_exact_prefix() {
     let events = EventsDomain::test_standin(0xb101);

@@ -69,6 +69,13 @@
 # load: the finite live-capture refusal with no loaded
 # journal row is a pass for that cell; a load or a crash is FAIL.
 #
+# Every verdict comes from scripts/journal-load-verdict.py, which holds
+# one strict record grammar per input (guest status records, probe
+# stream, observer proof lines). The probe stream is parsed by the
+# verifier report's own parser, so no gate counts a row the report
+# rejects; a missing, malformed, repeated, reordered or contradictory
+# record refuses with a named reason.
+#
 # Writes OUTDIR/results.jsonl, one row per kernel:
 # {"cell": "journal-load-<kernel>", "pass": bool,
 #  "qualification": "qualified"|"failed"|"nonqualifying", "detail": str}.
@@ -163,6 +170,7 @@ if [ $# -eq 0 ]; then
 fi
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPORT="$SCRIPT_DIR/bpf-load-report.py"
+VERDICT="$SCRIPT_DIR/journal-load-verdict.py"
 SELECTOR="$SCRIPT_DIR/release-matrix-contract.py"
 WORKLOAD_SRC="$SCRIPT_DIR/../tests/fixtures/public-cli/inventory-ledger.c"
 if [ -z "$BUDGETS" ] && [ -f "$SCRIPT_DIR/../tests/bpf-verifier-budgets.json" ]; then
@@ -174,6 +182,7 @@ fi
 [ -f "$MANIFEST" ] || { echo "manifest not found: $MANIFEST" >&2; exit 2; }
 [ -d "$OUTDIR" ] || { echo "output dir not found: $OUTDIR" >&2; exit 2; }
 [ -f "$REPORT" ] || { echo "report script not found: $REPORT" >&2; exit 2; }
+[ -f "$VERDICT" ] || { echo "verdict helper not found: $VERDICT" >&2; exit 2; }
 [ -f "$WORKLOAD_SRC" ] || { echo "workload source not found: $WORKLOAD_SRC" >&2; exit 2; }
 # Guest release match, shared with the kernels driver: sourced from
 # one file, never copied per driver.
@@ -211,35 +220,7 @@ if [ -n "$BUDGETS" ]; then
     # a silent unbudgeted pass: require the same shape the report
     # requires before any guest runs. This sits past the
     # prerequisite checks so a missing tool still reports 77 first.
-    if ! BUDGETS_ERROR=$(python3 - "$BUDGETS" 2>&1 <<'PY'
-import json,sys
-path = sys.argv[1]
-try:
-    document = json.loads(open(path, encoding="ascii").read())
-except (OSError, UnicodeError, ValueError) as error:
-    print(f"cannot read budgets ({error})")
-    sys.exit(1)
-if type(document) is not dict or type(document.get("programs")) is not dict:
-    print("budgets need a programs mapping")
-    sys.exit(1)
-limit = document.get("limit", 1000000)
-headroom = document.get("min_headroom_percent", 5.0)
-if type(limit) is not int or limit <= 0:
-    print(f"bad budgets limit {limit!r}")
-    sys.exit(1)
-if type(headroom) not in (int, float) or not 0 < headroom < 100:
-    print(f"bad min_headroom_percent {headroom!r}")
-    sys.exit(1)
-for root, per_kernel in document["programs"].items():
-    if type(per_kernel) is not dict:
-        print(f"bad budgets entry for {root!r}")
-        sys.exit(1)
-    for kernel, budget in per_kernel.items():
-        if type(budget) is not int or budget <= 0:
-            print(f"bad budget for {root} on {kernel}")
-            sys.exit(1)
-PY
-); then
+    if ! BUDGETS_ERROR=$(python3 -I "$VERDICT" budgets "$BUDGETS" 2>&1); then
         echo "budgets invalid: $BUDGETS: $BUDGETS_ERROR" >&2
         exit 2
     fi
@@ -265,11 +246,7 @@ q() {
 
 # One results.jsonl row. $1=cell $2=pass(1/0) $3=qualification $4=detail.
 emit_row() {
-    python3 - "$1" "$2" "$3" "$4" <<'PY' >>"$OUTDIR/results.jsonl"
-import json,sys
-print(json.dumps({"cell": sys.argv[1], "pass": sys.argv[2] == "1",
-                  "qualification": sys.argv[3], "detail": sys.argv[4]}))
-PY
+    python3 -I "$VERDICT" row "$1" "$2" "$3" "$4" >>"$OUTDIR/results.jsonl"
 }
 
 FAILED=0
@@ -441,15 +418,6 @@ infra_fail() {
     FAILED=1
 }
 
-REASONS=""
-add_reason() {
-    if [ -z "$REASONS" ]; then
-        REASONS="$1"
-    else
-        REASONS="$REASONS; $1"
-    fi
-}
-
 for KERNEL in "$@"; do
     echo "## kernel $KERNEL"
     case "$KERNEL" in
@@ -475,404 +443,72 @@ for KERNEL in "$@"; do
         infra_fail "vng run failed or timed out"
         continue
     fi
-    # Guest status records are identified by label, then the intended
-    # singleton is validated before use: a missing, corrupt or
-    # contradictory record refuses as infrastructure, never falls
-    # back to an older well-shaped line.
-    J_RC_LABELS=$(grep -ac '^journal-rc=' "$VNG_LOG" || true)
-    J_RC_GOOD=$(grep -acE '^journal-rc=[0-9]+$' "$VNG_LOG" || true)
-    if [ "$J_RC_LABELS" != 1 ] || [ "$J_RC_GOOD" != 1 ]; then
-        infra_fail "guest exit line missing, corrupt or contradictory"
+    # Every verdict below comes from scripts/journal-load-verdict.py,
+    # which owns one strict record grammar per input: the guest status
+    # records here, then the probe stream (the verifier report's own
+    # parser) and the observer proof lines. A missing, corrupt,
+    # repeated, reordered or contradictory record refuses with a named
+    # reason, never falls back to an older well-shaped line.
+    GUEST_OUT=""
+    if ! GUEST_OUT=$(python3 -I "$VERDICT" guest --kernel "$KERNEL" "$VNG_LOG"); then
+        infra_fail "guest status unreadable (verdict helper failed)"
         continue
     fi
     # The boot-config staging line is printed but not gated: vng's
     # console capture demonstrably garbles it (a bare `-generic` tail
     # was observed on 6.6/6.12) while the leg runs fine. The
-    # guest-work-ready line is the stronger gate: guest-env.sh prints
+    # guest-work-ready record is the stronger gate: guest-env.sh prints
     # it strictly after successful boot staging, loop mount and tmp
     # checks, and every staging failure returns before it.
-    grep -E '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
-    WORK_READY_LABELS=$(grep -ac '^guest-work-ready=' "$VNG_LOG" || true)
-    WORK_READY_GOOD=$(grep -acE '^guest-work-ready=ext4 uid-mode=0:700 TMPDIR=/var/tmp/p11scope-bpf\.[A-Za-z0-9_]{6,}$' "$VNG_LOG" || true)
-    if [ "$WORK_READY_LABELS" != 1 ] || [ "$WORK_READY_GOOD" != 1 ]; then
-        infra_fail "guest work area never readied"
-        continue
-    fi
-    GUEST_RELEASE_LABELS=$(grep -ac '^guest-release=' "$VNG_LOG" || true)
-    GUEST_RELEASE_GOOD=$(grep -acE '^guest-release=[^=[:space:][:cntrl:]]+$' "$VNG_LOG" || true)
-    if [ "$GUEST_RELEASE_LABELS" != 1 ] || [ "$GUEST_RELEASE_GOOD" != 1 ]; then
-        infra_fail "guest release line missing, corrupt or contradictory (expected $KERNEL)"
-        continue
-    fi
-    GUEST_RELEASE=$(grep -aE '^guest-release=[^=[:space:][:cntrl:]]+$' "$VNG_LOG" | cut -d= -f2)
+    grep -aE '^(staged-boot-config|boot-config-present)-' "$VNG_LOG" | tail -1
+    TAB=$(printf '\t')
+    case "$GUEST_OUT" in
+        "ok$TAB"*) ;;
+        "infra$TAB"*)
+            infra_fail "${GUEST_OUT#infra"$TAB"}"
+            continue
+            ;;
+        *)
+            infra_fail "guest status unreadable (verdict helper output)"
+            continue
+            ;;
+    esac
+    GUEST_REST=${GUEST_OUT#ok"$TAB"}
+    J_RC=${GUEST_REST%%"$TAB"*}
+    GUEST_RELEASE=${GUEST_REST#*"$TAB"}
     if release_ok "$KERNEL" "$GUEST_RELEASE"; then
         echo "# guest release $GUEST_RELEASE (expected $KERNEL)"
     else
         infra_fail "guest booted $GUEST_RELEASE, expected $KERNEL"
         continue
     fi
-    # Stage records: any label that is not a known exact form is
-    # corrupt, and any kind appearing twice is contradictory; both
-    # refuse before the vetoes and positives below.
-    if grep -a '^guest-stage=' "$VNG_LOG" | grep -aqEv '^guest-stage=(token-ok|token-failed|workload-ready|workload-not-ready|observer-rc=[0-9]+)$'; then
-        infra_fail "guest stage record corrupt"
-        continue
-    fi
-    TOKEN_STAGES=$(grep -acE '^guest-stage=token-(ok|failed)$' "$VNG_LOG" || true)
-    WORKLOAD_STAGES=$(grep -acE '^guest-stage=workload-(ready|not-ready)$' "$VNG_LOG" || true)
-    OBSERVER_STAGES=$(grep -acE '^guest-stage=observer-rc=[0-9]+$' "$VNG_LOG" || true)
-    if [ "$TOKEN_STAGES" -gt 1 ] || [ "$WORKLOAD_STAGES" -gt 1 ] || [ "$OBSERVER_STAGES" -gt 1 ]; then
-        infra_fail "guest stage records contradictory"
-        continue
-    fi
-    if grep -aEq '^guest-stage=token-failed$' "$VNG_LOG"; then
-        infra_fail "guest SoftHSM token setup failed"
-        continue
-    fi
-    if grep -aEq '^guest-stage=workload-not-ready$' "$VNG_LOG"; then
-        infra_fail "guest workload never readied"
-        continue
-    fi
-    if ! grep -aEq '^guest-stage=token-ok$' "$VNG_LOG" \
-        || ! grep -aEq '^guest-stage=workload-ready$' "$VNG_LOG"; then
-        infra_fail "guest stages never ran"
-        continue
-    fi
-    J_RC=$(grep -aE '^journal-rc=[0-9]+$' "$VNG_LOG" | cut -d= -f2)
     echo "# journal rc=$J_RC"
-    # Both journal roots loaded, from the raw probe rows (the report
-    # below gates counts, but only budgets gate presence, so the pair
-    # is checked explicitly for the unbudgeted kernels too). The third
-    # field is the probe parse status (1 valid, 0 unreadable or
-    # corrupt): a malformed row must refuse qualification, never
-    # erase confirmed loads into a valid no-load claim. Each
-    # LF-framed row decodes and validates separately, so one bad row
-    # keeps the roots from the valid load rows; the completeness
-    # rules (one summary, exact counts, clean write) mirror the
-    # report reader, and parse validity stays separate from load
-    # evidence.
-    PAIR_OUT="0 0 0"
-    if [ -f "$J_PROBE" ]; then
-        PAIR_OUT=$(python3 - "$J_PROBE" "$KEY_SIZES" <<'PY'
-import json,sys
-pair = ("p11_entry_journal", "p11_return_journal")
-if len(sys.argv) > 2 and sys.argv[2] == "1":
-    pair = pair + ("p11_entry_journal_length", "p11_return_journal_length")
-loaded = set()
-parse_ok = 1
-load_count = 0
-error_count = 0
-summaries = []
-try:
-    with open(sys.argv[1], "rb") as stream:
-        data = stream.read()
-except OSError:
-    print("0 0 0")
-    sys.exit(0)
-rows = data.split(b"\n")
-if rows and rows[-1] == b"":
-    rows.pop()
-if not rows:
-    parse_ok = 0
-for raw in rows:
-    try:
-        text = raw.decode("ascii")
-    except ValueError:
-        parse_ok = 0
-        continue
-    if not text.strip():
-        parse_ok = 0
-        continue
-    try:
-        row = json.loads(text)
-    except ValueError:
-        parse_ok = 0
-        continue
-    if type(row) is not dict or type(row.get("record")) is not str:
-        parse_ok = 0
-        continue
-    kind = row["record"]
-    if kind == "load":
-        load_count += 1
-        root = row.get("root")
-        if type(root) is not str or not root:
-            parse_ok = 0
-            continue
-        if row.get("loaded") is True:
-            loaded.add(root)
-        elif row.get("loaded") is not False:
-            parse_ok = 0
-    elif kind == "probe-summary":
-        summaries.append(row)
-    elif kind == "probe-error":
-        error_count += 1
-        parse_ok = 0
-    else:
-        parse_ok = 0
-if len(summaries) != 1:
-    parse_ok = 0
-else:
-    summary = summaries[0]
-    if summary.get("records") != load_count + error_count:
-        parse_ok = 0
-    if summary.get("write_failures") != 0 or summary.get("overflow") is not False:
-        parse_ok = 0
-print(("1" if all(root in loaded for root in pair) else "0"),
-      ("1" if any(root in loaded for root in pair) else "0"),
-      parse_ok)
-PY
-) || PAIR_OUT="0 0 0"
-    fi
-    PAIR_OK=${PAIR_OUT%% *}
-    PAIR_REST=${PAIR_OUT#* }
-    PAIR_ANY=${PAIR_REST%% *}
-    PROBE_OK=${PAIR_REST##* }
+    # Refusal controls: pre-Multi kernels refuse live capture (finite
+    # refusal, rc 1, no journal loads); --expect-journal 0 builds
+    # refuse with journal-pair-unavailable-in-build and retry to rc 0.
+    # Load kernels: both journal roots (and the length pair under
+    # --key-sizes) loaded within the object's BTF groups, the
+    # per-program report passes, and the observer text proves the
+    # linked lane sealed and live.
     if [ "$CONTROL" = 1 ]; then
-        # Refusal control: the finite pre-Multi refusal, no loaded
-        # journal row, no crash. A load or a crash is FAIL.
-        REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -aEq '^p11scope: live capture (needs [[:print:]]+|refused: [[:print:]]+|unavailable: [[:print:]]+|did not start: [[:print:]]+) for a scan without capture\.$' "$J_TXT"; then
-            add_reason "finite live-capture refusal missing"
-        fi
-        case "$J_RC" in
-            1) ;;
-            124) add_reason "observer timed out past its backstop (rc=124), not a finite refusal" ;;
-            129|130|131|132|133|134|135|136|137|138|139|140|141|142|143)
-                add_reason "observer signaled (rc=$J_RC), not a finite refusal" ;;
-            *) add_reason "observer exited rc=$J_RC, want 1 (finite refusal)" ;;
-        esac
-        if [ "$PROBE_OK" != 1 ]; then
-            add_reason "probe rows unreadable or corrupt"
-        fi
-        if [ "$PAIR_ANY" = 1 ]; then
-            add_reason "journal pair loaded on a pre-Multi kernel"
-        fi
-        if [ ! -f "$J_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
-            add_reason "observer crashed or left no log"
-        fi
-        if [ -z "$REASONS" ]; then
-            echo "# control $KERNEL: PASS (refused live-capture)"
-            emit_row "journal-load-$KERNEL" 1 qualified \
-                "refused live-capture; no journal loads; rc=$J_RC"
-        else
-            echo "# control $KERNEL: FAIL ($REASONS)"
-            emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
-            FAILED=1
-        fi
-        continue
+        MODE=control
+    elif [ "$EXPECT_JOURNAL" = 0 ]; then
+        MODE=omitted
+    else
+        MODE=load
     fi
-    if [ "$EXPECT_JOURNAL" = 0 ]; then
-        # Omitted-build refusal control: the same linked command must
-        # refuse with the exact finite reason, run its ordinary retry
-        # to rc 0, load no journal roots and crash nothing. A load, a
-        # different outcome or a crash is FAIL. (SMALL builds omit the
-        # object; release builds carry it.)
-        REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -aEq '^p11scope: key operations unavailable: journal-pair-unavailable-in-build: this build omits the production journal object; broad inventory continues with S1 mechanisms and API results$' "$J_TXT"; then
-            add_reason "exact journal-pair-unavailable-in-build refusal missing"
-        fi
-        case "$J_RC" in
-            0) ;;
-            *) add_reason "observer exited rc=$J_RC, want 0" ;;
-        esac
-        if [ "$PROBE_OK" != 1 ]; then
-            add_reason "probe rows unreadable or corrupt"
-        fi
-        if [ "$PAIR_ANY" = 1 ]; then
-            add_reason "journal pair loaded although the build omits the object"
-        fi
-        if [ ! -f "$J_TXT" ] || grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
-            add_reason "observer crashed or left no log"
-        fi
-        if [ -z "$REASONS" ]; then
-            echo "# omitted $KERNEL: PASS (refused journal-pair-unavailable-in-build; no journal loads; rc=$J_RC)"
-            emit_row "journal-load-$KERNEL" 1 qualified \
-                "refused journal-pair-unavailable-in-build; no journal loads; rc=$J_RC"
-        else
-            echo "# omitted $KERNEL: FAIL ($REASONS)"
-            emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
-            FAILED=1
-        fi
-        continue
-    fi
-    # Load gate: the observer ran to its duration, reported the linked
-    # lane started, and both journal roots loaded with verifier stats.
-    REASONS=""
-    case "$J_RC" in
+    VERDICT_RC=0
+    python3 -I "$VERDICT" verdict --mode "$MODE" --kernel "$KERNEL" \
+        --object "$OBJECT" --key-sizes "$KEY_SIZES" --rc "$J_RC" \
+        --text "$J_TXT" --probe "$J_PROBE" --workload "$J_WL" \
+        --budgets "$BUDGETS" \
+        --observer-sha256 "$OBSERVER_SHA" --report-out "$J_REPORT" \
+        --results "$OUTDIR/results.jsonl" || VERDICT_RC=$?
+    case "$VERDICT_RC" in
         0) ;;
-        124) add_reason "observer timed out past its backstop" ;;
-        *) add_reason "observer exited rc=$J_RC" ;;
+        10) FAILED=1 ;;
+        *) infra_fail "verdict helper failed (rc=$VERDICT_RC)" ;;
     esac
-    if [ ! -f "$J_TXT" ]; then
-        add_reason "observer left no log"
-    elif grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
-        add_reason "observer crashed"
-    fi
-    # Linked proof: the seal line plus no journal-start refusal
-    # diagnostic means the linked start succeeded (start_semantic_lane
-    # prints "p11scope: key operations unavailable: ..." on exactly the
-    # refused-linked arm before its ordinary retry, and prints the seal
-    # line only for a sealed lane), and joined calls prove the lane is
-    # live. The diagnostic prefix matters: verbose per-process gap
-    # detail also names the condition ("Joint key operations
-    # unavailable"), so the bare phrase would refuse a live lane. The
-    # key-operations display latch (bootstrap_unavailable) does not
-    # complete in production runs at this base, so the display state
-    # is recorded in the row, never gated.
-    # Both refusal shapes: the stderr diagnostic from a runtime journal
-    # refusal (with an ordinary retry behind it), and the bare finite
-    # reason from a build that rejects --key-operations up front.
-    if [ -f "$J_TXT" ] && grep -Eq 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
-        REFUSAL=$(grep -E 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
-        add_reason "linked lane refused: $REFUSAL"
-    elif [ ! -f "$J_TXT" ] || ! grep -aEq '^p11scope: semantic lane ready; mechanisms and API results are recorded from now on \(key operations: (recorded only with --key-operations|recorded|unavailable)\)$' "$J_TXT"; then
-        add_reason "semantic lane never sealed"
-    elif ! grep -aEq '^p11scope: semantic calls: collected [0-9]+, joined [1-9][0-9]*, shed [0-9]+, lost [0-9]+, bindings [1-9][0-9]*, refused [0-9]+, hook misses [0-9]+, eras [0-9]+, instances [0-9]+$' "$J_TXT"; then
-        add_reason "linked lane idle (no joined calls)"
-    fi
-    # Size-path proof under --key-sizes: the workload RSA-signs every
-    # iteration, so key rows must render and one -v per-key sign row
-    # must carry the exact classified-size fragment (proving lengths
-    # joined through the 648-byte decode into key rows; a bare token
-    # elsewhere, such as a provider tally, proves nothing), and one
-    # exact terminal retained-decoder record must read zero
-    # malformed records (a decode regression would strand every
-    # sized call there). Both decoder fields are evaluated on that
-    # single record only: a zero, flag or `unknown` on any other
-    # line proves nothing. The audit-void split stays for
-    # explaining the selected cause; only the raw decoder total
-    # proves the invariant, and an absent, duplicate, malformed or
-    # unprovable count refuses. The candidate count anchors on the
-    # label alone, so a bare label or a record missing the space
-    # after it still counts as a candidate instead of vanishing.
-    # All three matches run in text mode (-a) with identical
-    # newline-delimited record boundaries: without it GNU grep's
-    # binary handling lets the `$` anchor match at a NUL, so a
-    # canonical zero followed by NUL and trailing bytes would
-    # qualify as the exact record. With -a a NUL is ordinary line
-    # data and any byte outside the exact grammar (NUL, other
-    # control bytes, trailing data) refuses as unprovable.
-    if [ "$KEY_SIZES" = 1 ] && [ -f "$J_TXT" ]; then
-        if ! grep -aEq '^key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+ (populated|partial|stale|unavailable); [0-9]+ sessions?$' "$J_TXT"; then
-            add_reason "key rows never rendered under --key-sizes"
-        elif ! grep -aEq '^  key row i[0-9]+ object [0-9]+ sign key \((rsa_1024|rsa_2048|rsa_3072|rsa_4096|rsa_other|aes_128|aes_192|aes_256|aes_other|ec_p256|ec_p384|ec_p521|x25519|x448|ed25519|ed448|hkdf_96|hkdf_128|hkdf_192|hkdf_256|hkdf_384|hkdf_other|generic_96|generic_128|generic_192|generic_256|generic_384|generic_other|ml_dsa_44|ml_dsa_65|ml_dsa_87|ml_kem_512|ml_kem_768|ml_kem_1024|slh_dsa_sha2_128s|slh_dsa_shake_128s|slh_dsa_sha2_128f|slh_dsa_shake_128f|slh_dsa_sha2_192s|slh_dsa_shake_192s|slh_dsa_sha2_192f|slh_dsa_shake_192f|slh_dsa_sha2_256s|slh_dsa_shake_256s|slh_dsa_sha2_256f|slh_dsa_shake_256f|unknown)\): probably RSA \(from mechanism\); RSA 2048 \(from signature length\)$' "$J_TXT"; then
-            add_reason "no classified RSA-2048 size under --key-sizes"
-        fi
-        DECODER_LINES=$(grep -ac '^p11scope: joint decoder:' "$J_TXT" || true)
-        if [ "$DECODER_LINES" != 1 ]; then
-            add_reason "raw malformed count absent or unprovable under --key-sizes"
-        elif grep -aEq '^p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0$' "$J_TXT"; then
-            : # the single provable terminal zero
-        elif grep -aEq '^p11scope: joint decoder: raw_malformed=[1-9][0-9]* raw_malformed_unprovable=0$' "$J_TXT"; then
-            add_reason "malformed journal records under --key-sizes"
-        else
-            add_reason "raw malformed count absent or unprovable under --key-sizes"
-        fi
-    fi
-    OBSERVED="unknown"
-    if [ -f "$J_TXT" ]; then
-        if grep -q 'key operations: not available.*bootstrap_unavailable' "$J_TXT"; then
-            OBSERVED="bootstrap_unavailable"
-        elif grep -q 'key operations: rev ' "$J_TXT"; then
-            OBSERVED="populated"
-        elif grep -Eq 'not reported by this version|journal_unavailable' "$J_TXT"; then
-            OBSERVED="journal_unavailable"
-        fi
-    fi
-    if [ ! -f "$J_PROBE" ]; then
-        add_reason "no probe rows (probe file missing)"
-    else
-        if [ "$PROBE_OK" != 1 ]; then
-            add_reason "probe rows unreadable or corrupt"
-        fi
-        if [ "$PAIR_OK" != 1 ]; then
-            if [ "$PAIR_ANY" = 1 ]; then
-                add_reason "journal pair incomplete (one root missing)"
-            else
-                add_reason "journal pair missing from probe rows"
-            fi
-        fi
-    fi
-    LEDGERS=0
-    if [ -f "$J_WL" ]; then
-        LEDGERS=$(grep -c '^LEDGER ' "$J_WL" || true)
-    fi
-    # Score the journal object from its own BTF groups: budgeted when
-    # the budgets file carries $OBJECT/ keys for this kernel, else
-    # loaded + stats + 5% headroom.
-    BUDGETED="unbudgeted"
-    USE_BUDGETS=0
-    if [ -n "$BUDGETS" ]; then
-        if [ "$(python3 - "$BUDGETS" "$KERNEL" "$OBJECT" <<'PY'
-import json,sys
-document = json.load(open(sys.argv[1], encoding="ascii"))
-print("yes" if any(name.startswith(sys.argv[3] + "/") and sys.argv[2] in cells
-                   for name, cells in document.get("programs", {}).items())
-      else "no")
-PY
-)" = "yes" ]; then
-            USE_BUDGETS=1
-            BUDGETED="budgeted"
-        fi
-    fi
-    REPORT_RC=0
-    if [ "$USE_BUDGETS" = 1 ]; then
-        python3 -I "$REPORT" --budgets "$BUDGETS" --object "$OBJECT" --kernel "$KERNEL" \
-            --observer-sha256 "$OBSERVER_SHA" "$J_PROBE" >"$J_REPORT" 2>&1 || REPORT_RC=$?
-    else
-        python3 -I "$REPORT" --object "$OBJECT" --kernel "$KERNEL" \
-            --observer-sha256 "$OBSERVER_SHA" "$J_PROBE" >"$J_REPORT" 2>&1 || REPORT_RC=$?
-    fi
-    cat "$J_REPORT"
-    BITS=$(python3 - "$J_REPORT" "$OBJECT" <<'PY'
-import sys
-count, best_proc, best_root, best_head, failed = 0, -1, "-", 101.0, None
-try:
-    lines = open(sys.argv[1], encoding="ascii").read().splitlines()
-except OSError:
-    lines = []
-for line in lines:
-    parts = line.split()
-    if len(parts) < 8 or not parts[1].startswith(sys.argv[2] + "/"):
-        continue
-    count += 1
-    try:
-        proc, head = int(parts[2]), float(parts[4])
-    except ValueError:
-        continue
-    if proc > best_proc:
-        best_proc, best_root = proc, parts[1]
-    if head < best_head:
-        best_head = head
-    if parts[6] == "FAIL" and failed is None:
-        failed = parts[1] + ": " + " ".join(parts[7:])
-print(count, best_proc, best_root,
-      ("%.2f" % best_head) if best_head <= 100 else "-")
-print(failed if failed is not None else "-")
-PY
-)
-    BITS1=$(printf '%s\n' "$BITS" | sed -n '1p')
-    BITS_FAIL=$(printf '%s\n' "$BITS" | sed -n '2p')
-    BITS_REST=$BITS1
-    BITS_COUNT=${BITS_REST%% *}; BITS_REST=${BITS_REST#* }
-    BITS_PROC=${BITS_REST%% *}; BITS_REST=${BITS_REST#* }
-    BITS_ROOT=${BITS_REST%% *}; BITS_HEAD=${BITS_REST##* }
-    if [ "$REPORT_RC" != 0 ]; then
-        if [ "$BITS_FAIL" != "-" ]; then
-            add_reason "verifier report FAIL ($BITS_FAIL)"
-        else
-            add_reason "verifier report FAIL"
-        fi
-    fi
-    if [ -z "$REASONS" ]; then
-        DETAIL="linked sealed live; observations=$OBSERVED; $BITS_COUNT journal rows; max $BITS_PROC $BITS_ROOT; min headroom $BITS_HEAD%; $LEDGERS workload LEDGERs; $BUDGETED"
-        echo "# load $KERNEL: PASS ($DETAIL)"
-        emit_row "journal-load-$KERNEL" 1 qualified "$DETAIL"
-    else
-        echo "# load $KERNEL: FAIL ($REASONS)"
-        emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
-        FAILED=1
-    fi
 done
 
 if [ "$FAILED" -ne 0 ]; then

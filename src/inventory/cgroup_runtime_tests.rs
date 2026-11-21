@@ -1715,6 +1715,95 @@ fn cgroup_snapshot_resume_refuses_recurring_layout_cycles() {
     }
 }
 
+/// Completed-only history never starves live work: completed objects
+/// that arrive complete under fresh layouts (they never needed a
+/// continuation) fill the history for 64 passes while one cursor
+/// advances; a newcomer then joins with only 130 cursors carried and
+/// advances under a stable layout and identity, so its rise must earn
+/// the next pass. The all-complete control fills the history in one
+/// converged pass (its settle), then a newcomer resumes through the
+/// initial grant and its strict rise still resumes.
+#[test]
+fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    // Layout churn of completed-only objects over 64 passes.
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let fixed = resume_key(7, 9, 11);
+    let newcomer = resume_key(7, 9, 12);
+    let completed: Vec<_> = (0..128u64).map(|index| resume_key(8, 9, 1000 + index)).collect();
+    let mut last_completed = Vec::new();
+    for round in 0..64u64 {
+        let mut entries = vec![(
+            fixed.clone(),
+            resume_progress(100, (0, 100 + round), (0, 0), 4, false),
+        )];
+        last_completed = completed
+            .iter()
+            .map(|key| (key.clone(), resume_progress(5000 + round, (2, 0), (2, 0), 1, true)))
+            .collect();
+        entries.extend(last_completed.iter().cloned());
+        assert!(
+            pass_resume(&mut driver.inner, resume_position(entries)),
+            "round {round}: the fixed cursor's advance resumes"
+        );
+    }
+    let with = |word: u64| {
+        let mut entries = vec![
+            (
+                fixed.clone(),
+                resume_progress(100, (0, 163), (0, 0), 4, false),
+            ),
+            (
+                newcomer.clone(),
+                resume_progress(100, (0, word), (0, 0), 4, false),
+            ),
+        ];
+        entries.extend(last_completed.iter().cloned());
+        resume_position(entries)
+    };
+    assert!(
+        !pass_resume(&mut driver.inner, with(900)),
+        "the newcomer's arrival is not an advance"
+    );
+    assert!(
+        pass_resume(&mut driver.inner, with(950)),
+        "the newcomer's strict rise earns the next pass despite the full history"
+    );
+    // All-complete control: one converged pass fills the history.
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let full: Vec<_> = (0..crate::discovery::scan_pass::MAX_DECODE_CURSORS as u64)
+        .map(|index| {
+            (
+                resume_key(9, 9, 100_000 + index),
+                resume_progress(100, (2, 0), (2, 0), 1, true),
+            )
+        })
+        .collect();
+    let _ = pass_resume(&mut driver.inner, resume_position(full));
+    let fresh = |word: u64| {
+        resume_position(vec![(
+            newcomer.clone(),
+            resume_progress(100, (0, word), (0, 0), 4, false),
+        )])
+    };
+    assert!(
+        pass_resume(&mut driver.inner, fresh(900)),
+        "the first unfinished pass resumes"
+    );
+    assert!(
+        pass_resume(&mut driver.inner, fresh(950)),
+        "the newcomer's strict rise resumes after the all-complete history"
+    );
+}
+
 /// A completed sweep stays covered across the settle pass: a cursor
 /// that completes (granting the one settle pass) and then restarts
 /// under the same identity and layout — a re-proof invalidation —

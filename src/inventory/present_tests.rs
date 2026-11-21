@@ -7902,6 +7902,207 @@ fn concise_ceiling_anchors_rank_ordinary_groups_within_their_interval() {
     );
 }
 
+/// The concise cap never hides run-wide or terminal rows: nineteen early
+/// per-object groups, one ceiling, then a late run-wide row (the capture
+/// failure, or the terminal in-progress row the coordinator names for
+/// unfinished cursors) still read under the shared cap, with the
+/// remainder count covering what the cap folded. At eighteen early
+/// groups everything fits.
+#[test]
+fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    let unfinished_facts = || {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let key = crate::discovery::scan_pass::DecodeCursorKey {
+            pid: 2000,
+            start_time: 9,
+            file: crate::discovery::scan::InspectedFileKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 11,
+                pin: crate::discovery::identity::pin_of(&file).unwrap(),
+                fd_dev: 7,
+            },
+            exec: None,
+        };
+        let cursor = crate::discovery::scan_pass::DecodeCursor {
+            fingerprint: Vec::new(),
+            tables: crate::discovery::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            interfaces: crate::discovery::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            anchors: None,
+            cached_tables: Vec::new(),
+            cached_interfaces: Vec::new(),
+            unlinked: Vec::new(),
+            targets: Vec::new(),
+            complete: false,
+            validated: false,
+            seq: 0,
+        };
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(key, cursor));
+        budget.take_retained_file_facts()
+    };
+    for terminal in ["capture failed", "in progress"] {
+        for early in [18usize, 19] {
+            let (mut harness, _caller) = single_caller_harness("present-protected-cap", 1);
+            for index in 0..early {
+                harness
+                    .coordinator_mut()
+                    .registry_mut()
+                    .record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: Some(5000 + u32::try_from(index).unwrap()),
+                        subject: format!("obj-{index:02}"),
+                        reason: format!("reason {index:02}"),
+                        budget: None,
+                    });
+            }
+            harness
+                .coordinator_mut()
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(1000),
+                    subject: "libceil.so".into(),
+                    reason: WORK_CEILING_REASON.into(),
+                    budget: None,
+                });
+            let needle = if terminal == "capture failed" {
+                harness
+                    .coordinator_mut()
+                    .registry_mut()
+                    .record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: None,
+                        subject: "inventory capture failed".into(),
+                        reason: "the capture backend failed".into(),
+                        budget: None,
+                    });
+                "inventory capture failed"
+            } else {
+                harness
+                    .coordinator_mut()
+                    .set_cgroup_file_facts_for_test(unfinished_facts());
+                "scan in progress: 0 of 1 objects finished"
+            };
+            harness.commit();
+            let document = harness.render();
+            let presentation = capture_for(&harness, &document);
+            let snapshot = render_snapshot(&presentation);
+            let lines: Vec<&str> = snapshot.lines().collect();
+            let header = format!("gaps: {}", early + 2);
+            let at = lines
+                .iter()
+                .position(|line| *line == header)
+                .unwrap_or_else(|| panic!("{terminal}/{early}: missing {header}: {snapshot}"));
+            let block: Vec<&str> = lines[at + 1..]
+                .iter()
+                .copied()
+                .take_while(|line| line.starts_with("  "))
+                .collect();
+            assert!(
+                block.iter().any(|line| line.contains(needle)),
+                "{terminal}/{early}: the protected row survives the cap: {snapshot}"
+            );
+            let remainder = block
+                .iter()
+                .filter(|line| line.contains("more group"))
+                .count();
+            if early == 18 {
+                assert_eq!(remainder, 0, "{terminal}/{early}: all fit: {snapshot}");
+                assert_eq!(block.len(), early + 2, "{terminal}/{early}: {snapshot}");
+            } else {
+                assert_eq!(
+                    block.last().copied(),
+                    Some("  and 1 more group (--json has every item)"),
+                    "{terminal}/{early}: the cap folds one ordinary unit: {snapshot}"
+                );
+                assert_eq!(block.len(), 21, "{terminal}/{early}: twenty lines plus the remainder");
+            }
+        }
+    }
+}
+
+/// The presentation projection folds the real pin-time work wrapper:
+/// the producer's `cannot read pid <pid>'s mount table: <work stop>`
+/// row projects to `scan budget exhausted` with its attribution and
+/// repeats in JSON, like the bare and scan-refusal shapes. Collection
+/// and I/O stops met while pinning stay ordinary rows. The projection
+/// is pid-agnostic by contract: a genuine wrapper for another pid on
+/// the row still folds (only the member continuation filter binds the
+/// member's pid).
+#[test]
+fn ceiling_projection_folds_the_pin_time_work_wrapper() {
+    use crate::discovery::scan::{COLLECTION_STOP_REASON, IO_CEILING_REASON, WORK_CEILING_REASON};
+    let pin_stop = |pid: u32, stop: &'static str| {
+        let mut stopped = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        stopped.pass_owner().set_scan_stop(stop);
+        crate::process::read_view_mountinfo(pid, &mut stopped, || {
+            std::fs::File::open("/proc/self/mountinfo")
+        })
+        .expect_err("a latched stop refuses the mount-table read")
+    };
+    let (mut harness, _caller) = single_caller_harness("present-pin-wrapper-projection", 1);
+    let rows = [
+        ("/usr/lib/libprovider.so", pin_stop(2000, WORK_CEILING_REASON), 2),
+        ("/usr/lib/libcollect.so", pin_stop(2000, COLLECTION_STOP_REASON), 1),
+        ("/usr/lib/libio.so", pin_stop(2000, IO_CEILING_REASON), 1),
+        ("/usr/lib/libforeign.so", pin_stop(2001, WORK_CEILING_REASON), 1),
+    ];
+    for (subject, reason, times) in &rows {
+        for _ in 0..*times {
+            harness
+                .coordinator_mut()
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: Some(2000),
+                    subject: (*subject).into(),
+                    reason: reason.clone(),
+                    budget: None,
+                });
+        }
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let gaps = out["gaps"].as_array().unwrap();
+    let row = |subject: &str| {
+        gaps.iter()
+            .find(|gap| gap["subject"] == subject)
+            .unwrap_or_else(|| panic!("missing {subject}: {gaps:?}"))
+            .clone()
+    };
+    let own = row("/usr/lib/libprovider.so");
+    assert_eq!(own["reason"], "scan budget exhausted", "{own:?}");
+    assert_eq!(own["pid"], serde_json::json!(2000), "{own:?}");
+    assert_eq!(own["repeats"], serde_json::json!(2), "{own:?}");
+    for (subject, reason, _) in &rows[1..3] {
+        assert_eq!(
+            row(subject)["reason"],
+            reason.as_str(),
+            "non-work pin stops stay ordinary: {gaps:?}"
+        );
+    }
+    assert_eq!(
+        row("/usr/lib/libforeign.so")["reason"],
+        "scan budget exhausted",
+        "the projection folds any genuine work wrapper: {gaps:?}"
+    );
+}
+
 /// The member filter drops the pin's own wrapped stops: the real
 /// mount-table producer wraps a budget stop met while pinning as
 /// `cannot read pid <pid>'s mount table: <stop>`, and that row is a

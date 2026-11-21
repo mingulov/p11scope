@@ -145,6 +145,13 @@ pub(crate) struct SweepFrontier {
     pub(crate) word: u64,
 }
 
+/// How many committed-progress summaries (each a fingerprint hash) this
+/// thread computed: the publication-cost seam for the resume twins.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PROGRESS_SUMMARIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Committed per-cursor progress for the snapshot resume decision: the
 /// layout the frontiers were recorded under, both sweep frontiers, the
 /// decoded-table count and completion. Same cursor key plus same layout
@@ -168,6 +175,8 @@ pub(crate) struct CommittedCursorProgress {
 impl CommittedCursorProgress {
     /// Summarize one carried cursor's committed progress.
     pub(crate) fn of(cursor: &DecodeCursor) -> Self {
+        #[cfg(test)]
+        PROGRESS_SUMMARIES.with(|count| count.set(count.get() + 1));
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         cursor.fingerprint.hash(&mut hasher);

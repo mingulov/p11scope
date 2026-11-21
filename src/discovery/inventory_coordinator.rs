@@ -5312,6 +5312,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.engine.scope.clone()
     }
 
+    /// Install a carried scan bundle directly (presentation twins of the
+    /// terminal in-progress row).
+    #[cfg(test)]
+    pub(crate) fn set_cgroup_file_facts_for_test(
+        &mut self,
+        facts: crate::discovery::scan::RetainedFileFacts,
+    ) {
+        self.cgroup_file_facts = facts;
+    }
+
     /// Pose one cgroup completion for a driver `finish_pass` twin: the
     /// transaction outcome posed, nothing admitted or scanned.
     #[cfg(test)]
@@ -38911,6 +38921,87 @@ int main(void) {
         assert!(
             coordinator.live_scan_progress_gap().is_none(),
             "an accepted empty return leaves no stale in-progress gap"
+        );
+    }
+
+    /// Publication summarizes resume progress without revisiting the
+    /// carried cursors: with more than 64 completed cursors carried, the
+    /// foreground commit and completion hand-off compute no per-cursor
+    /// progress summary (no fingerprint hash, no map rebuild). Committed
+    /// progress is accounted where each cursor is recorded, inside the
+    /// credited scan; publication reads O(1) totals. The fake pids are
+    /// outside the cgroup, so the pass leaves them untouched.
+    #[test]
+    fn cgroup_publication_summarizes_resume_progress_without_visiting_cursors() {
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        for index in 0..65u32 {
+            let key = crate::discovery::scan_pass::DecodeCursorKey {
+                pid: 3_900_000 + index,
+                start_time: 9,
+                file: crate::discovery::scan::InspectedFileKey {
+                    device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                    inode: 11,
+                    pin: crate::discovery::identity::pin_of(&file).unwrap(),
+                    fd_dev: 7,
+                },
+                exec: None,
+            };
+            let cursor = crate::discovery::scan_pass::DecodeCursor {
+                fingerprint: (0..4u64)
+                    .map(|slot| crate::discovery::scan_pass::MappingFingerprintEntry {
+                        start: slot << 12,
+                        end: (slot + 1) << 12,
+                        file_offset: 0,
+                        permissions: *b"r--p",
+                    })
+                    .collect(),
+                tables: crate::discovery::scan_pass::SweepFrontier {
+                    snapshot: 4,
+                    word: 0,
+                },
+                interfaces: crate::discovery::scan_pass::SweepFrontier {
+                    snapshot: 4,
+                    word: 0,
+                },
+                anchors: None,
+                cached_tables: Vec::new(),
+                cached_interfaces: Vec::new(),
+                unlinked: Vec::new(),
+                targets: Vec::new(),
+                complete: true,
+                validated: true,
+                seq: u64::from(index),
+            };
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        let before = crate::discovery::scan_pass::PROGRESS_SUMMARIES.with(std::cell::Cell::get);
+        coordinator.commit_batch(false).unwrap();
+        let _completion = coordinator.take_cgroup_completion().unwrap();
+        let after = crate::discovery::scan_pass::PROGRESS_SUMMARIES.with(std::cell::Cell::get);
+        assert_eq!(
+            after - before,
+            0,
+            "publication must not re-summarize the {} carried cursors",
+            coordinator.cgroup_file_facts.decode_cursors_for_test().len()
+        );
+        assert!(
+            coordinator.cgroup_file_facts.decode_cursors_for_test().len() >= 65,
+            "the completed cursors stay carried"
         );
     }
 

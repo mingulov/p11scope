@@ -2054,23 +2054,34 @@ fn key_provider_groups(
     out
 }
 
+/// One unknown-key category tally: the counters row, the sorted
+/// machine reasons, the merged mechanism ids (counts add per id)
+/// and the overflow terminals.
+type UnknownCategoryTally = (
+    KeyOpTally,
+    Vec<&'static str>,
+    std::collections::BTreeMap<u64, u64>,
+    u64,
+);
+
 /// Capture-wide unknown-key rows grouped by category with their sorted
 /// machine reasons (verbose only), never merged into a provider's
 /// tallies. Sorted by category. Mechanism ids merge across the
 /// category's rows (counts add per id); overflow terminals add.
 fn unknown_keys_tallies(
     observations: &crate::key_operation_projection::ObjectObservations,
-) -> Vec<(
-    KeyOpTally,
-    Vec<&'static str>,
-    std::collections::BTreeMap<u64, u64>,
-    u64,
-)> {
+) -> Vec<UnknownCategoryTally> {
     use std::collections::{BTreeMap, BTreeSet};
-    let mut categories: BTreeMap<
-        &str,
-        (u64, u64, u64, &str, BTreeSet<&str>, BTreeMap<u64, u64>, u64),
-    > = BTreeMap::new();
+    type CategorySlot<'a> = (
+        u64,
+        u64,
+        u64,
+        &'a str,
+        BTreeSet<&'a str>,
+        BTreeMap<u64, u64>,
+        u64,
+    );
+    let mut categories: BTreeMap<&str, CategorySlot<'_>> = BTreeMap::new();
     for row in &observations.unknown_key_operations {
         let slot = categories
             .entry(row.category)

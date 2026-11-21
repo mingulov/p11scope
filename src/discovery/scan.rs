@@ -24068,18 +24068,40 @@ int main(int argc, char **argv) {
         let grown = reprove(&truncated, &extended).expect("genuine extension carries cached");
         assert_eq!(grown.decoded_slot_count(), 68);
         assert!(!grown.extension_impossible);
-        // A divergent head rescans.
+        // A divergent head rescans past a stale proof (the stale
+        // branch rejects it beside the changed entries) ...
         let mut divergent = extended.clone();
         divergent[8 + 5 * 8..8 + 6 * 8].copy_from_slice(&0x1600u64.to_le_bytes());
         assert!(
             reprove(&stale, &divergent).is_none(),
-            "a divergent head rescans"
+            "a divergent head rescans past a stale proof"
         );
-        // A shorter fresh row rescans.
+        // ... and past the unproved truncated row at the entry-prefix
+        // comparison itself: this is the assertion that kills a mutant
+        // dropping that check.
+        assert!(
+            reprove(&truncated, &divergent).is_none(),
+            "a divergent head rescans past an unproved prefix"
+        );
+        // A shorter fresh row rescans: past a full row at the walk
+        // check ...
         let full = decode(&mislabelled_snapshot(0x0003, 92, 0));
         assert!(
             reprove(&full, &mislabelled_snapshot(0x0003, 68, 0)).is_none(),
             "a shorter row rescans"
+        );
+        // ... and past an unproved shorter prefix at the entry-prefix
+        // comparison itself.
+        let mut shorter = truncated.clone();
+        assert!(
+            shorter.entries.len() > 60,
+            "the truncated row must hold entries past the control cut: {}",
+            shorter.entries.len()
+        );
+        shorter.entries.truncate(60);
+        assert!(
+            carried_replay_row(&truncated, &shorter).is_none(),
+            "an unproved shorter prefix rescans at the prefix matcher"
         );
     }
 

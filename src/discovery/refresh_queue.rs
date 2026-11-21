@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 //! One bounded refresh queue for every retry path (admission owner 3).
 //!
 //! Every refresh intent funnels through [`RefreshQueue::request`]:

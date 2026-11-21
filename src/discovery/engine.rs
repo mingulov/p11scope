@@ -31700,7 +31700,6 @@ impl Engine {
             }
         }
         self.close_cgroup_admissions_at_removal(&victims);
-        self.settle_leader_exits_at_removal(victims.iter().copied());
         for id in &victims {
             // Capacity eviction is a management decision even when the
             // victim's generation is unreadable: tracking ends
@@ -31713,6 +31712,11 @@ impl Engine {
         }
         self.loader_contexts
             .retain(|(view, _, _), _| !victims.contains(view));
+        // Settle at the last moment before the drop (views and their
+        // pidfds are intact until the retain below; nothing above
+        // disturbs them): a pending leader-exit assessment can only be
+        // answered from the retiring view's own pidfd.
+        self.settle_leader_exits_at_removal(victims.iter().copied());
         self.views.retain(|view| !victims.contains(&view.id()));
         for id in &victims {
             self.release_view_id(*id);

@@ -309,6 +309,10 @@ pub(crate) struct KeyReceipt {
     /// Set when retirement ends this association before the S1
     /// terminal (H9 §66 `key_join_lost`); never backfilled.
     pub lost: bool,
+    /// The viewed object's frozen creation-mechanism birth fact
+    /// (controller ruling fix2, F4): the Generate/GeneratePair
+    /// mechanism id, or `None` for every other origin.
+    pub creation_mechanism: Option<u64>,
 }
 
 impl From<&SemanticCall> for EffectOrigin {

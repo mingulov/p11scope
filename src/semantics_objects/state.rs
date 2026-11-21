@@ -509,6 +509,14 @@ struct ViewRecord {
     /// keys (fix round 5): a birth fact, set once at promotion,
     /// never cleared. Gates the unestablished-curve reason.
     creation_expects_curve_params: bool,
+    /// The creation call's guarded return-time mechanism id, kept
+    /// only for `Generate`/`GeneratePair` creations (controller
+    /// ruling fix2, F4): a birth fact, set once at mint, never
+    /// cleared. A key-pair-generation mechanism naming exactly one
+    /// family lets the row show the inferred family when the key
+    /// type stays unknown; every other creation family keeps
+    /// `None` (an operation mechanism never types a derived key).
+    creation_mechanism: Option<u64>,
 }
 
 impl ViewRecord {
@@ -713,6 +721,7 @@ enum DeferredInput {
         attribution_valid: bool,
         first_observed: bool,
         lost: bool,
+        creation_mechanism: Option<u64>,
     },
 }
 
@@ -2285,6 +2294,7 @@ impl ModelState {
                 creation_partly_read: false,
                 keypair_private: false,
                 creation_expects_curve_params: false,
+                creation_mechanism: None,
             },
         );
         self.instances
@@ -2740,6 +2750,7 @@ impl ModelState {
                                         ViewOrigin::FirstObserved
                                     ),
                                     lost: false,
+                                    creation_mechanism: view.creation_mechanism,
                                 },
                                 // The binding names a view the model no
                                 // longer holds: nothing to freeze.
@@ -3125,6 +3136,7 @@ impl ModelState {
         let key_type = view.frozen_key_type();
         let attribution_valid = view.attribution == super::Attribution::Valid;
         let first_observed = matches!(view.origin, ViewOrigin::FirstObserved);
+        let creation_mechanism = view.creation_mechanism;
         if let Some(view) = self.objects.get_mut(&id) {
             view.references = view.references.saturating_add(1);
             if key_use {
@@ -3141,6 +3153,7 @@ impl ModelState {
                 key_type,
                 attribution_valid,
                 first_observed,
+                creation_mechanism,
             });
         }
     }
@@ -3382,6 +3395,21 @@ impl ModelState {
                         // names observed facts).
                         view.creation_expects_curve_params = family == CreationFamily::Create
                             || (family == CreationFamily::GeneratePair && slot == 0);
+                        // Controller ruling fix2 (F4): keep the
+                        // guarded return-time mechanism id on
+                        // Generate/GeneratePair views only — a
+                        // key-pair-generation mechanism naming
+                        // exactly one family types the created key,
+                        // while an operation mechanism never types
+                        // a derived, unwrapped or KEM-created key.
+                        if matches!(
+                            family,
+                            CreationFamily::Generate | CreationFamily::GeneratePair
+                        ) && let MechanismEvidence::Value(mechanism) =
+                            completion.return_mechanism
+                        {
+                            view.creation_mechanism = Some(mechanism);
+                        }
                         for kind in [
                             SafeAttributeKind::Class,
                             SafeAttributeKind::KeyType,
@@ -4709,6 +4737,7 @@ impl ModelState {
                 attribution_valid,
                 first_observed,
                 lost: false,
+                creation_mechanism,
             } = input
             else {
                 continue;
@@ -4730,6 +4759,7 @@ impl ModelState {
                 key_type: *key_type,
                 attribution_valid: *attribution_valid,
                 first_observed: *first_observed,
+                creation_mechanism: *creation_mechanism,
             });
         }
         effects
@@ -5178,6 +5208,7 @@ mod tests {
             creation_partly_read: false,
             keypair_private: false,
             creation_expects_curve_params: false,
+            creation_mechanism: None,
         }
     }
 
@@ -5662,6 +5693,7 @@ mod tests {
                 attribution_valid,
                 first_observed,
                 lost,
+                creation_mechanism: _,
             } => {
                 assert_eq!(
                     first_observed,
@@ -6843,6 +6875,7 @@ mod tests {
                     key_type: _,
                     attribution_valid,
                     first_observed: _,
+                    creation_mechanism: _,
                 } => Some((
                     *call,
                     *object,

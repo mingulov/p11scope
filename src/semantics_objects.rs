@@ -874,6 +874,11 @@ pub(crate) enum ObjectEffect {
         /// observed window, so an unestablished type stays an honest
         /// per-key `unknown`, never a dropped row.
         first_observed: bool,
+        /// The view's frozen creation-mechanism birth fact
+        /// (controller ruling fix2, F4): `Some` only for
+        /// Generate/GeneratePair views minted with a guarded
+        /// return-time mechanism id.
+        creation_mechanism: Option<u64>,
     },
     Destroyed {
         call: CallToken,

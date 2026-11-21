@@ -47,12 +47,17 @@ const _: () = {
     assert!(std::mem::align_of::<super::AsyncId>() == 8);
     assert!(std::mem::size_of::<super::SemanticCall>() == 96);
     // H9 stores the machine's fixed key receipt (niche-filled
-    // `Option<KeyReceipt>`, 64 bytes with the frozen key-type code);
-    // the machine charge below still dominates the node plus entry.
-    // Keymeta adds the per-operation corroboration slot (`Option<u64>`
-    // has no niche: +16 over the H9 layout); the machine charge
+    // `Option<KeyReceipt>`, 56 bytes with the frozen key-type code
+    // and the fix2 F4 creation-mechanism birth fact); the machine
+    // charge below still dominates the node plus entry. Keymeta
+    // adds the per-operation corroboration slot (`Option<u64>` has
+    // no niche: +16 over the H9 layout); the machine charge
     // doubles so the node-plus-entry invariant below still holds.
-    assert!(std::mem::size_of::<super::OpMachine>() == 88);
+    // Fix2 F4 adds the receipt's creation-mechanism birth fact
+    // (`Option<u64>`: +16 over the keymeta layout, 88 to 104);
+    // the doubled charge still dominates, as the invariant below
+    // re-checks.
+    assert!(std::mem::size_of::<super::OpMachine>() == 104);
     assert!(std::mem::size_of::<super::EdgeMechStat>() == 104);
     // Final lease-bearing layouts, rather than the earlier probe types.
     // Each record carries its originating H0 position (`Option<u64>`
@@ -124,10 +129,11 @@ pub(crate) const SEMANTIC_RESOURCE_LIMIT: usize = 160 * 1024 * 1024;
 pub(crate) const SEMANTIC_TRANSITION_SCRATCH: usize = 1024 * 1024;
 pub(crate) const REDUCER_BASE_CHARGE: usize = 8192;
 pub(crate) const OPEN_BINDING_CHARGE: usize = 512;
-// Keymeta corroboration slot plus the frozen key-type code: the
-// 88-byte machine needs 1200 bytes of node-plus-entry dominance
-// (raised 1024 to 2048); 8192 machines reserve 16 MiB worst case,
-// still far under the pool limit.
+// Keymeta corroboration slot plus the frozen key-type code, plus the
+// fix2 F4 creation-mechanism birth fact: the 104-byte machine keeps
+// the 2048 charge with the same dominance margin (raised 1024 to
+// 2048); 8192 machines reserve 16 MiB worst case, still far under
+// the pool limit.
 pub(crate) const ACTIVE_MACHINE_CHARGE: usize = 2048;
 pub(crate) const ASYNC_FACT_CHARGE: usize = 4096;
 pub(crate) const MECHANISM_CHARGE: usize = 2048;

@@ -9284,6 +9284,7 @@ fn key_operation_schema_contract() {
             attribution_valid,
             first_observed: false,
             lost: false,
+            creation_mechanism: None,
         };
         let mut start_sink = Vec::new();
         let c = init("C_SignInit", 7, RSA_PKCS, 800_000 + n as u64 * 10);
@@ -20868,6 +20869,7 @@ fn key_operation_joint_async_pending_mints_deferred_origin() {
                 key_type: _,
                 attribution_valid,
                 first_observed: _,
+                creation_mechanism: _,
             } => Some((*call, *key_use, *input, *label, *attribution_valid)),
             _ => None,
         })
@@ -28415,6 +28417,7 @@ impl KeymetaCtx {
             attribution_valid: true,
             first_observed: false,
             lost: false,
+            creation_mechanism: None,
         }
     }
 
@@ -28594,6 +28597,110 @@ fn keymeta_sign_under_rsa_infers_family() {
         inferred.size.reason,
         Some(crate::keymeta::REASON_NO_LENGTH_EVIDENCE)
     );
+}
+
+/// Controller ruling fix2 (F4): a key minted by a single-family
+/// key-pair-generation mechanism, used under a mechanism that names
+/// no family, with no established key type, shows the creation
+/// family on its row. The key-type field keeps its own honest
+/// state: no label forms, metadata stays unknown.
+#[test]
+fn key_operation_creation_family_seeds_row_without_key_type() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::KeyUseReducer;
+    const ML_KEM_KEY_PAIR_GEN: u64 = 0x0f;
+    const CMS_SIG: u64 = 0x0500; // names no single family
+    const PUBLIC_KEY: u64 = 0xD4D4_D4D4_D4D4_D4D4;
+    const PRIVATE_KEY: u64 = 0xD5D5_D5D5_D5D5_D5D5;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Mint with no template facts at all: the `_KEY_PAIR_GEN`
+    // shape carries no `CKA_KEY_TYPE`.
+    let mut pair = ShapedS1::shaped(
+        "C_GenerateKeyPair",
+        CkRv::OK.0,
+        ML_KEM_KEY_PAIR_GEN,
+        init_capture(),
+    );
+    pair.pair_results = Some((PUBLIC_KEY, PRIVATE_KEY));
+    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &pair);
+    // Use the public half under a mechanism that names no family.
+    let sign_init = ShapedS1 {
+        input0: Some((PUBLIC_KEY, 1)),
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, CMS_SIG, init_capture())
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the sign use proves a row");
+    assert_eq!(row.metadata_at_use, "unknown", "no label forms");
+    let inferred = row.inferred.as_ref().expect("the row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+}
+
+/// F4 negative control: an established key type keeps creation
+/// seeding out — the row carries its label and the use names the
+/// unknown reason, never the creation family.
+#[test]
+fn key_operation_creation_family_stays_out_with_key_type() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let mut receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    receipt.key_type = Some(0x00);
+    receipt.creation_mechanism = Some(0x0f);
+    ctx.start("C_SignInit", 7, Some(0x0500), &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row exists");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    assert_eq!(inferred.family.value, None);
+}
+
+/// F4 yields to use evidence: a valued use mechanism pins the
+/// family alone — the creation mechanism adds no completion and
+/// never conflicts.
+#[test]
+fn key_operation_creation_family_yields_to_use_family() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let mut receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    receipt.creation_mechanism = Some(0x0f);
+    ctx.start("C_SignInit", 7, Some(0x0001), &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
+    assert_eq!(inferred.family.completions, 1);
 }
 
 /// Two distinct specific families conflict with both sides listed;

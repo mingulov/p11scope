@@ -3890,6 +3890,7 @@ impl KeyUseReducer {
                 key_type,
                 attribution_valid,
                 first_observed,
+                creation_mechanism,
                 ..
             } = effect
             else {
@@ -3914,6 +3915,7 @@ impl KeyUseReducer {
                 attribution_valid: *attribution_valid,
                 first_observed: *first_observed,
                 lost: false,
+                creation_mechanism: *creation_mechanism,
             });
         }
         receipts

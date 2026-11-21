@@ -29,7 +29,7 @@ Pick one demo (each takes a few minutes):
   `--pid=host` sees the Desktop virtual machine, not your PC.
 - A few minutes per demo. The commands below use the published
   release image `ghcr.io/mingulov/p11scope:latest`. To pin this
-  exact release, use `ghcr.io/mingulov/p11scope:0.7.1` instead of
+  exact release, use `ghcr.io/mingulov/p11scope:0.8.0` instead of
   `:latest`.
 
 ## The shortest working command
@@ -68,19 +68,19 @@ without it that case is a named gap in the report. On Docker older
 than 24, whose default seccomp allows `bpf()` only with
 `CAP_SYS_ADMIN`, it is also the way to run without the seccomp file.
 
-Prefer a system package over Docker? Install v0.7.1 and use `sudo
+Prefer a system package over Docker? Install v0.8.0 and use `sudo
 p11scope` in place of the `docker run ...` lines (each demo shows the
 swap). On Debian/Ubuntu:
 
 ```sh
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/p11scope_0.7.1_amd64.deb
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.8.0/p11scope_0.8.0_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.8.0/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-sudo apt install ./p11scope_0.7.1_amd64.deb
+sudo apt install ./p11scope_0.8.0_amd64.deb
 ```
 
-On Fedora/RHEL, download `p11scope-0.7.1-1.x86_64.rpm` instead and
-install it with `sudo dnf install ./p11scope-0.7.1-1.x86_64.rpm`.
+On Fedora/RHEL, download `p11scope-0.8.0-1.x86_64.rpm` instead and
+install it with `sudo dnf install ./p11scope-0.8.0-1.x86_64.rpm`.
 
 ## Saving a report
 

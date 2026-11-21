@@ -74,7 +74,7 @@ tarball must hold exactly one `*/p11scope` file):
 
 ```sh
 cd "$(mktemp -d)"
-tarball=/path/to/p11scope-0.7.1-x86_64-linux-musl.tar.gz
+tarball=/path/to/p11scope-0.8.0-x86_64-linux-musl.tar.gz
 (cd "$(dirname "$tarball")" && sha256sum -c SHA256SUMS --ignore-missing)
 mkdir -p ctx/scripts && cp "$tarball" ctx/ \
   && cp /path/to/p11scope/scripts/k8s-profile-entry.sh ctx/scripts/

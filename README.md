@@ -21,17 +21,17 @@ mapped by running processes, so there is no shim to install and no restart.
 
 Get the bundles from the [Releases page](https://github.com/mingulov/p11scope/releases)
 (observer tarball, optional discovery helpers, DEB/RPM packages, source export).
-The 0.7.1 files are listed under the v0.7.1 release.
-For example, install **v0.7.1** after verifying its checksum:
+The 0.8.0 files are listed under the v0.8.0 release.
+For example, install **v0.8.0** after verifying its checksum:
 
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/p11scope-0.7.1-x86_64-linux-musl.tar.gz
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.1/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.8.0/p11scope-0.8.0-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.8.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf p11scope-0.7.1-x86_64-linux-musl.tar.gz
-sudo install -m 0755 p11scope-0.7.1-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+tar -xzf p11scope-0.8.0-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.8.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
 p11scope --version
 sudo p11scope doctor
 ```
@@ -42,7 +42,7 @@ with no interim output; that is normal.)
 System packages, the discovery helper and local builds are in [Install](docs/install.md#install).
 To check a download before installing, see [Verify a download](docs/install.md#verify-a-download).
 Container: the release publishes `ghcr.io/mingulov/p11scope:latest`
-(`:0.7.1` pins the exact version).
+(`:0.8.0` pins the exact version).
 Run `doctor` through it ([privileges](deploy/k8s/README.md)):
 
 ```sh

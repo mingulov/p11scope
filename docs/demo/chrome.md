@@ -109,6 +109,6 @@ p11scope never sees site names, page contents, passwords or keys —
 only which certificate functions ran, how often and how long they
 took. Calls from before the `capturing:` line are not counted.
 
-Prefer a system package? Install v0.7.1 as on the [front
+Prefer a system package? Install v0.8.0 as on the [front
 page](README.md), then run `sudo p11scope profile --pid "$CRPID"
 --duration 70s` instead of the `docker run` line.

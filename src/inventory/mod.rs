@@ -23359,6 +23359,228 @@ mod tests {
         );
     }
 
+    /// Scripted stash counters for the interrupted-Finish hold tests:
+    /// split insert/mismatch reads plus the terminal tuple read, with
+    /// failure poses. All other lane I/O uses quiet defaults (the
+    /// hold under test runs no ticks, drains, or terminal cleanup).
+    #[derive(Default)]
+    struct HoldStashStub {
+        insert: std::collections::VecDeque<u64>,
+        insert_fail: std::collections::VecDeque<bool>,
+        mismatch: std::collections::VecDeque<u64>,
+        mismatch_fail: std::collections::VecDeque<bool>,
+        tuple: std::collections::VecDeque<(u64, u64)>,
+        tuple_fail: std::collections::VecDeque<bool>,
+    }
+
+    impl crate::inventory_semantics::LaneTestIo for HoldStashStub {
+        fn length_stash_insert_loss(&mut self) -> Option<u64> {
+            self.insert.pop_front()
+        }
+
+        fn length_stash_insert_loss_fails(&mut self) -> bool {
+            self.insert_fail.pop_front().unwrap_or(false)
+        }
+
+        fn length_stash_mismatch_loss(&mut self) -> Option<u64> {
+            self.mismatch.pop_front()
+        }
+
+        fn length_stash_mismatch_loss_fails(&mut self) -> bool {
+            self.mismatch_fail.pop_front().unwrap_or(false)
+        }
+
+        fn length_stash_loss(&mut self) -> Option<(u64, u64)> {
+            self.tuple.pop_front()
+        }
+
+        fn length_stash_loss_fails(&mut self) -> bool {
+            self.tuple_fail.pop_front().unwrap_or(false)
+        }
+
+        fn validate_current(
+            &mut self,
+            _receipt: &crate::semantic_capture::CurrentPartitionReceipt,
+            _report: &mut crate::semantic_capture::TickReport,
+        ) -> Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+            Ok(())
+        }
+
+        fn tick(
+            &mut self,
+            domain: crate::attach::capture::NativeDomainId,
+        ) -> Result<
+            crate::inventory_semantics::SemanticBatch,
+            crate::inventory_semantics::SemanticRefusal,
+        > {
+            Ok(crate::inventory_semantics::SemanticBatch::scripted(
+                domain,
+                Vec::new(),
+                0,
+            ))
+        }
+
+        fn refresh(
+            &mut self,
+            pin: std::sync::Arc<crate::process::PidPin>,
+            _slot: u32,
+        ) -> Result<
+            (
+                Vec<p11scope_ebpf_common::ImageIdentity>,
+                std::sync::Arc<crate::process::PidPin>,
+            ),
+            crate::inventory_semantics::SemanticRefusal,
+        > {
+            Ok((Vec::new(), pin))
+        }
+
+        fn has_pending_evidence(&self) -> bool {
+            false
+        }
+
+        fn finish(
+            &mut self,
+            domain: crate::attach::capture::NativeDomainId,
+        ) -> crate::inventory_semantics::SemanticBatch {
+            crate::inventory_semantics::SemanticBatch::scripted(domain, Vec::new(), 0)
+        }
+
+        fn quiescent(&mut self) -> bool {
+            true
+        }
+
+        fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+            Some([(0, 0), (0, 0)])
+        }
+
+        fn drain_events_to(
+            &mut self,
+            _stop: usize,
+            _quantum: usize,
+        ) -> crate::inventory_semantics::LaneDrainOutcome {
+            crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+
+        fn drain_discovery_to(
+            &mut self,
+            _stop: usize,
+            _quantum: usize,
+        ) -> crate::inventory_semantics::LaneDrainOutcome {
+            crate::inventory_semantics::LaneDrainOutcome::default()
+        }
+    }
+
+    #[test]
+    fn hold_joint_lane_for_exit_keeps_the_insert_delta_after_interrupted_finish() {
+        // An interrupted Finish: the machine polled the insert counter
+        // (baseline advanced, delta undisclosed) and yielded before the
+        // mismatch read; the terminal hold's tuple read sees unchanged
+        // totals. The held summary must carry the insert delta, not drop
+        // it, and one named gap must cover both counters.
+        let mut coordinator = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.install_test_io(Box::new(HoldStashStub {
+            insert: std::collections::VecDeque::from([3]),
+            tuple: std::collections::VecDeque::from([(3, 1)]),
+            ..Default::default()
+        }));
+        assert_eq!(
+            lane.poll_length_stash_insert_loss(),
+            Some(3),
+            "the interrupted insert poll reads the rise"
+        );
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let (_, summary) = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "test hold",
+            "joint work abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            (
+                summary.length_insert_failures,
+                summary.length_stash_mismatches
+            ),
+            (3, 1),
+            "the held summary keeps the undisclosed insert delta"
+        );
+        let gaps: Vec<_> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "key sizes lost some lengths")
+            .collect();
+        assert_eq!(gaps.len(), 1, "one named gap covers both counters");
+    }
+
+    #[test]
+    fn hold_joint_lane_for_exit_recovers_after_failed_mismatch_read() {
+        // A failed mismatch read latches unknown; the terminal hold's
+        // tuple read recovers the mismatch counter while the insert
+        // delta is still undisclosed. The held summary must carry both
+        // counters, with one named gap plus one unknown gap.
+        let mut coordinator = coordinator();
+        let mut lane = joint_lane(WindDownIo::completing(), false);
+        lane.install_test_io(Box::new(HoldStashStub {
+            insert: std::collections::VecDeque::from([3]),
+            mismatch_fail: std::collections::VecDeque::from([true]),
+            tuple: std::collections::VecDeque::from([(3, 1)]),
+            ..Default::default()
+        }));
+        assert_eq!(
+            lane.poll_length_stash_insert_loss(),
+            Some(3),
+            "the interrupted insert poll reads the rise"
+        );
+        assert_eq!(
+            lane.poll_length_stash_mismatch_loss(),
+            None,
+            "the posed mismatch read fails"
+        );
+        let mut display = None;
+        let mut warn = WarnSink {
+            display: &mut display,
+        };
+        let (_, summary) = ClassicDriver::hold_joint_lane_for_exit(
+            lane,
+            &mut coordinator,
+            "test hold",
+            "joint work abandoned for exit",
+            &mut warn,
+            None,
+        );
+        assert_eq!(
+            (
+                summary.length_insert_failures,
+                summary.length_stash_mismatches
+            ),
+            (3, 1),
+            "the held summary keeps the insert delta across the failure"
+        );
+        let named = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "key sizes lost some lengths")
+            .count();
+        let unknown = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "key sizes loss unknown")
+            .count();
+        assert_eq!(
+            (named, unknown),
+            (1, 1),
+            "one named gap plus one unknown gap"
+        );
+    }
+
     #[test]
     fn dropped_winding_lane_retains_the_decoder_total_for_the_tail() {
         // A promotion lane still winding down at driver drop is held

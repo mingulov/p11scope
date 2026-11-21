@@ -7741,3 +7741,150 @@ fn ceiling_fold_maps_exact_wordings_only() {
         );
     }
 }
+
+/// A member that still scans drops its republished genuine stops but
+/// keeps its no-table diagnosis: the diagnosis's module path contains
+/// the stop sentence, which a substring filter mistakes for a budget
+/// stop. Driven through the real member filter into the real registry
+/// path, so the diagnosis reaches every surface with its discovery
+/// command and its pid attribution. A member with no unfinished
+/// cursor keeps every gap verbatim, so a stall stays loud.
+#[test]
+fn member_continuation_filter_keeps_no_table_diagnosis() {
+    use crate::discovery::scan::{COLLECTION_STOP_REASON, WORK_CEILING_REASON};
+    use crate::inspect_system::PidGap;
+    // One unfinished cursor: this member still scans.
+    let file = std::fs::File::open("/bin/sh").unwrap();
+    let key = crate::discovery::scan_pass::DecodeCursorKey {
+        pid: 2000,
+        start_time: 9,
+        file: crate::discovery::scan::InspectedFileKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 11,
+            pin: crate::discovery::identity::pin_of(&file).unwrap(),
+            fd_dev: 7,
+        },
+        exec: None,
+    };
+    let cursor = crate::discovery::scan_pass::DecodeCursor {
+        fingerprint: Vec::new(),
+        tables: crate::discovery::scan_pass::SweepFrontier {
+            snapshot: 0,
+            word: 0,
+        },
+        interfaces: crate::discovery::scan_pass::SweepFrontier {
+            snapshot: 0,
+            word: 0,
+        },
+        anchors: None,
+        cached_tables: Vec::new(),
+        cached_interfaces: Vec::new(),
+        unlinked: Vec::new(),
+        targets: Vec::new(),
+        complete: false,
+        validated: false,
+        seq: 0,
+    };
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+        .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+    assert!(budget.record_decode_cursor(key, cursor));
+    let tricky_path = format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so");
+    let tricky_reason = crate::discovery::scan::no_table_found_reason(&tricky_path, false);
+    let wrapped_collection = format!(
+        "memory scan refused: final mapping validation unavailable: {COLLECTION_STOP_REASON}"
+    );
+    let member_gaps = || {
+        vec![
+            PidGap {
+                pid: Some(2000),
+                subject: "capture discovery".into(),
+                reason: WORK_CEILING_REASON.into(),
+                generic: false,
+            },
+            PidGap {
+                pid: Some(2000),
+                subject: "capture discovery".into(),
+                reason: wrapped_collection.clone(),
+                generic: false,
+            },
+            PidGap {
+                pid: Some(2000),
+                subject: tricky_path.clone(),
+                reason: tricky_reason.clone(),
+                generic: false,
+            },
+            PidGap {
+                pid: Some(2000),
+                subject: "unrelated-a".into(),
+                reason: "unrelated reason a".into(),
+                generic: false,
+            },
+        ]
+    };
+    let mut gaps = member_gaps();
+    crate::inspect_system::retain_member_gaps_while_unfinished(&mut gaps, &budget, 2000, Some(9));
+    assert_eq!(
+        gaps.iter().map(|gap| gap.subject.as_str()).collect::<Vec<_>>(),
+        vec![tricky_path.as_str(), "unrelated-a"],
+        "the genuine stops drop but the diagnosis and the control stay: {gaps:?}"
+    );
+    let (mut harness, _caller) = single_caller_harness("present-member-continuation", 1);
+    for gap in &gaps {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: gap.pid,
+                subject: gap.subject.clone(),
+                reason: gap.reason.clone(),
+                budget: None,
+            });
+    }
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    assert_eq!(
+        presentation.gaps.len(),
+        2,
+        "both survivors project their rows: {:?}",
+        presentation.gaps.len()
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains(&tricky_reason),
+        "the diagnosis keeps its reason and discovery command in text: {verbose}"
+    );
+    assert!(
+        !verbose.contains("scan budget exhausted"),
+        "no genuine stop survived to fold: {verbose}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let kept = out["gaps"].as_array().unwrap();
+    assert_eq!(kept.len(), 2, "JSON keeps both survivors: {kept:?}");
+    let tricky_json = kept
+        .iter()
+        .find(|gap| gap["subject"] == tricky_path.as_str())
+        .expect("the diagnosis keeps its JSON row");
+    assert_eq!(
+        tricky_json["reason"],
+        tricky_reason.as_str(),
+        "JSON keeps the diagnosed reason with its command: {kept:?}"
+    );
+    assert_eq!(
+        tricky_json["pid"],
+        serde_json::json!(2000),
+        "JSON keeps the member attribution: {kept:?}"
+    );
+    // Without an unfinished cursor every gap stays verbatim.
+    let quiet = crate::discovery::scan::CaptureWorkBudget::default()
+        .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+    let mut stalled = member_gaps();
+    crate::inspect_system::retain_member_gaps_while_unfinished(&mut stalled, &quiet, 2000, Some(9));
+    assert_eq!(
+        stalled.len(),
+        4,
+        "a stalled member keeps its stops verbatim: {stalled:?}"
+    );
+}

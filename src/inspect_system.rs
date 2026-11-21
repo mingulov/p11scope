@@ -44,8 +44,8 @@ use crate::discovery::kernel_identity::{EXAMINED_ANCHOR_CAP, ExaminedCustody};
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
-    BudgetConsumption, COLLECTION_STOP_REASON, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome,
-    ScanRequest, ScannedModule, Skipped, WORK_CEILING_REASON, scan_process_view_examined,
+    BudgetConsumption, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest,
+    ScannedModule, Skipped, is_collection_stop, is_work_ceiling_stop, scan_process_view_examined,
     scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
@@ -1161,6 +1161,25 @@ fn count_manifest_reason(one_shot: bool) -> DeferredReason {
     }
 }
 
+/// Drop a member's raw pass-budget stops while it holds unfinished
+/// decode cursors (pinning and post-scan phases republish the sticky
+/// stop against a spent budget): the scan's in-progress gap names the
+/// continuation. Members without unfinished cursors keep every gap
+/// verbatim, so a stall stays loud. Stops match by the same exact
+/// provenance rule as the scanner filter, so a diagnosis whose module
+/// path contains the stop sentence keeps its row, command and
+/// attribution.
+pub(crate) fn retain_member_gaps_while_unfinished(
+    gaps: &mut Vec<PidGap>,
+    budget: &CaptureWorkBudget,
+    pid: u32,
+    start_time: Option<u64>,
+) {
+    if budget.view_scan_progress(pid, start_time).is_some() {
+        gaps.retain(|gap| !(is_work_ceiling_stop(&gap.reason) || is_collection_stop(&gap.reason)));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_pinned_member_inner(
     view_handle: &ProcessView,
@@ -1301,15 +1320,7 @@ fn scan_pinned_member_inner(
     // republish the sticky stop against a spent budget): the scan's
     // in-progress gap names the continuation. Members without unfinished
     // cursors keep every gap verbatim, so a stall stays loud.
-    if budget
-        .view_scan_progress(pid, generation.start_time)
-        .is_some()
-    {
-        gaps.retain(|gap| {
-            !(gap.reason.contains(WORK_CEILING_REASON)
-                || gap.reason.contains(COLLECTION_STOP_REASON))
-        });
-    }
+    retain_member_gaps_while_unfinished(&mut gaps, budget, pid, generation.start_time);
     let mapping_scan_completed = outcome.mapping_scan_completed();
     let (modules, status) = match outcome {
         ScanOutcome::Scanned { modules, .. } => (modules, MemberStatus::Scanned),

@@ -985,6 +985,11 @@ fn object_producer_object_family_matrix() {
         "C_GenerateKey",
         "C_UnwrapKey",
         "C_GetAttributeValue",
+        // Controller ruling fix2 (T0 KEM template reads): the KEM
+        // output template authorizes the same bounded reads as
+        // other creation templates (non-secret attributes only).
+        "C_EncapsulateKey",
+        "C_DecapsulateKey",
     ] {
         assert_eq!(
             authorize_entry_templates(fid(name), scalars, DeriveEntry::Unavailable),
@@ -1023,8 +1028,6 @@ fn object_producer_object_family_matrix() {
         "C_WrapKey",
         "C_SetOperationState",
         "C_FindObjects",
-        "C_EncapsulateKey",
-        "C_DecapsulateKey",
     ] {
         assert_eq!(
             authorize_entry_templates(fid(name), scalars, accepted),

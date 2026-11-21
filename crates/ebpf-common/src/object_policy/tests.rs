@@ -458,7 +458,7 @@ const EXPECTED: &[Expected] = &[
         Encapsulate,
         [2, N],
         [7, N],
-        [(N, N), (N, N)],
+        [(3, 4), (N, N)],
         [N, N],
         NamedFunction,
     ),
@@ -467,7 +467,7 @@ const EXPECTED: &[Expected] = &[
         Decapsulate,
         [2, N],
         [7, N],
-        [(N, N), (N, N)],
+        [(3, 4), (N, N)],
         [N, N],
         NamedFunction,
     ),
@@ -1047,5 +1047,19 @@ fn newsite_hkdf_derive_result_protocol_is_authorized() {
             [5, N],
             "mechanism {mechanism:#x} retains arg 5"
         );
+    }
+}
+
+// Controller ruling fix2 (T0 KEM template reads): the KEM output
+// template authorizes the same bounded reads as other creation
+// templates — args (3, 4) name the pair, and only non-secret
+// attributes already in the shipped allowlist ever read (never
+// CKA_VALUE or any secret-bearing attribute).
+#[test]
+fn s2s3_kem_descriptors_authorize_output_template() {
+    for name in ["C_EncapsulateKey", "C_DecapsulateKey"] {
+        let descriptor =
+            object_descriptor(function_id(name)).unwrap_or_else(|| panic!("{name} modeled"));
+        assert_eq!(descriptor.template_args, [(3, 4), (N, N)], "{name}");
     }
 }

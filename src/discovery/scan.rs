@@ -415,8 +415,9 @@ pub(crate) fn read_mountinfo_with<R: Read>(
     // The mount table is per-scan overhead (read once, cached, window-charged):
     // gating it on the per-object leg would make small-but-legitimate legs
     // unusable on mount-heavy hosts, so only the absolute byte cap and the
-    // entry cap below bound the read. Production per-object legs always
-    // exceed any realistic mount table, so this changes no release behavior.
+    // entry cap below bound the read. Worst case is the 64M absolute cap
+    // plus the pass window (the 8M per-operation leg no longer applies to
+    // this read); realistic tables (kilobytes) are unaffected.
     // A zero per-object leg still refuses: a degenerate leg admits nothing.
     if budget.limits().per_object_bytes == 0 {
         return Err(MOUNTINFO_CEILING_REASON.into());

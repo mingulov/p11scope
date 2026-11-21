@@ -658,6 +658,18 @@ struct BirthAssociation {
     deferred: Option<(p11scope_ebpf_common::ImageIdentity, u32)>,
 }
 
+/// A birth-bearing receipt with no admission entry refuses
+/// `NoAdmission`; sighting retries additionally defer for re-offer
+/// (a fresh instance re-attempts the birth; the re-offer path is
+/// bounded per key) instead of silently stranding the wait.
+fn retry_without_admission_deferral(
+    birth_retry: bool,
+    image: p11scope_ebpf_common::ImageIdentity,
+    file_slot: u32,
+) -> Option<(p11scope_ebpf_common::ImageIdentity, u32)> {
+    birth_retry.then_some((image, file_slot))
+}
+
 /// Why one observed New candidate retained S1. Keep the paid association
 /// finite; format the disclosure only after registration ownership ends.
 #[derive(Clone, Copy)]
@@ -1986,6 +1998,28 @@ mod tests {
 
     fn empty_registry() -> CallerRegistry {
         CallerRegistry::new(RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("limits"))
+    }
+
+    /// A birth-bearing receipt with no admission entry refuses
+    /// `NoAdmission`, and a sighting retry additionally defers for
+    /// re-offer (a fresh instance re-attempts the birth) instead of
+    /// silently stranding the wait; other receipts defer nothing.
+    #[test]
+    fn retry_without_admission_defers_for_reoffer() {
+        let image = p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        };
+        assert_eq!(
+            retry_without_admission_deferral(true, image, 3),
+            Some((image, 3)),
+            "retries re-offer for a fresh instance"
+        );
+        assert_eq!(
+            retry_without_admission_deferral(false, image, 3),
+            None,
+            "plain receipts defer nothing"
+        );
     }
 
     #[test]

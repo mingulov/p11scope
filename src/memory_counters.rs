@@ -473,6 +473,9 @@ pub(crate) struct MemorySnapshot {
     floor_ring_bytes: u64,
     self_rss_kb: Option<u64>,
     self_hwm_kb: Option<u64>,
+    /// The observer's own Private_Dirty (inventory path only): the
+    /// soak ground truth beside the counters. Other paths read N/A.
+    self_private_dirty_kb: Option<u64>,
 }
 
 impl MemorySnapshot {
@@ -653,6 +656,7 @@ impl MemorySnapshot {
             floor_ring_bytes: ring,
             self_rss_kb: lens.self_rss_kb,
             self_hwm_kb: lens.self_hwm_kb,
+            self_private_dirty_kb: None,
         }
     }
 
@@ -661,6 +665,7 @@ impl MemorySnapshot {
     pub(crate) fn for_inventory(elapsed_secs: u64, lens: InventoryLens, ring_bytes: u32) -> Self {
         let (staging, ring) = Self::floor_staging_ring(ring_bytes);
         let (rss, hwm) = self_rss_hwm_kb().unzip();
+        let private_dirty = self_private_dirty_kb();
         Self {
             command: "inventory".to_string(),
             elapsed_secs,
@@ -764,6 +769,7 @@ impl MemorySnapshot {
             floor_ring_bytes: ring,
             self_rss_kb: rss,
             self_hwm_kb: hwm,
+            self_private_dirty_kb: private_dirty,
         }
     }
 }
@@ -849,6 +855,28 @@ pub(crate) fn baseline_rss_if_diagnostics(on: bool) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// The observer's own smaps_rollup Private_Dirty in KiB: the soak
+/// attribution's ground-truth total, read by the observer itself so
+/// no privileged sampler is needed. `None` when
+/// `/proc/self/smaps_rollup` is unreadable (never fatal: the
+/// counters stand alone).
+pub(crate) fn self_private_dirty_kb() -> Option<u64> {
+    let rollup = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    for line in rollup.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if key != "Private_Dirty" {
+            continue;
+        }
+        return rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok());
+    }
+    None
 }
 
 /// The observer's own VmRSS/VmHWM in KiB, for the attribution table's
@@ -1559,6 +1587,16 @@ mod tests {
     fn self_rss_reads_current_process() {
         let (rss, hwm) = self_rss_hwm_kb().expect("test host has /proc/self/status");
         assert!(rss > 0 && hwm >= rss, "rss={rss} hwm={hwm}");
+    }
+
+    #[test]
+    fn self_private_dirty_reads_current_process() {
+        let private = self_private_dirty_kb().expect("test host has /proc/self/smaps_rollup");
+        let (rss, _) = self_rss_hwm_kb().expect("test host has /proc/self/status");
+        assert!(
+            private > 0 && private <= rss,
+            "private={private} rss={rss}: Private_Dirty is a positive part of RSS"
+        );
     }
 
     /// Minor 1 twin: the baseline reads only when diagnostics are on;

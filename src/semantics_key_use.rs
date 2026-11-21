@@ -3011,8 +3011,7 @@ impl KeyUseReducer {
     /// gate debit.
     #[cfg(test)]
     pub(crate) fn bump_absorb_read_for_test(&self) {
-        self.test_absorb_reads
-            .set(self.test_absorb_reads.get() + 1);
+        self.test_absorb_reads.set(self.test_absorb_reads.get() + 1);
     }
 
     /// Admit (`true`) or drop (`false`, `size_inference_off`)
@@ -4764,10 +4763,7 @@ impl FeedDisposalCursor {
                     self.preserved_absorb = None;
                     continue;
                 }
-                let absorb = self
-                    .preserved_absorb
-                    .as_mut()
-                    .expect("absorb retained");
+                let absorb = self.preserved_absorb.as_mut().expect("absorb retained");
                 if !absorb.poll(keyuse, gate) {
                     return false;
                 }
@@ -4952,8 +4948,7 @@ impl FeedDisposalCursor {
                         assert!(self.throwaway.is_some(), "joint finalizes once");
                         if self.preserved_absorb.is_none() && self.preserved.is_some() {
                             let preserved = self.preserved.take().expect("joint finalizes once");
-                            self.preserved_absorb =
-                                Some(PreservedAbsorbCursor::new(preserved));
+                            self.preserved_absorb = Some(PreservedAbsorbCursor::new(preserved));
                         }
                         if self.preserved_absorb.is_some() {
                             continue;
@@ -5556,8 +5551,8 @@ mod disposal_tests {
         let mut fallback = StagingLedger::with_resources(pool.reserver());
         fallback.prepare_capacity().unwrap();
         let assoc_bytes = std::mem::size_of::<OpenKeyUse>() as u64;
-        let one_assoc = assoc_bytes as usize
-            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+        let one_assoc =
+            assoc_bytes as usize + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
         pool.reference_set_limit(pool.snapshot().charged_bytes + one_assoc);
         let instance =
             crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(37);
@@ -6422,10 +6417,7 @@ mod disposal_tests {
             }
             assert!(polls < 4096, "{tag}: the disposal must complete");
         }
-        assert!(
-            saw_inflight,
-            "{tag}: the 65-leaf walk must yield mid-mint"
-        );
+        assert!(saw_inflight, "{tag}: the 65-leaf walk must yield mid-mint");
         assert_eq!(feed.staged_len(), 0, "{tag}");
         assert_eq!(
             keyuse.evidence().rows_refused,
@@ -6524,10 +6516,7 @@ mod disposal_tests {
             }
             assert!(polls < 4096, "{tag}: the disposal must complete");
         }
-        assert!(
-            saw_inflight,
-            "{tag}: the 65-leaf walk must yield mid-mint"
-        );
+        assert!(saw_inflight, "{tag}: the 65-leaf walk must yield mid-mint");
         assert_eq!(feed.staged_len(), 0, "{tag}");
         assert_eq!(
             keyuse.evidence().rows_refused,
@@ -6557,8 +6546,8 @@ mod disposal_tests {
     fn feed_disposal_replacement_matches_sync_on_every_schedule() {
         let tag = "replacement-schedule";
         let assoc_bytes = std::mem::size_of::<OpenKeyUse>() as u64;
-        let one_assoc = assoc_bytes as usize
-            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+        let one_assoc =
+            assoc_bytes as usize + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
         // Premise on a scratch pair: the sizing holds exactly one
         // assoc (a second mint refuses while the first lives).
         {

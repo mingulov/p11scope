@@ -3213,12 +3213,14 @@ impl CallerRegistry {
                 use std::ops::Bound::{Excluded, Unbounded};
                 let map = &mut self.instance_state.semantics;
                 match cursor.done_upto {
-                    None => map.iter_mut().next().map(|(id, record)| {
-                        (*id, record.feed.staged_len(), record.feed.mode())
-                    }),
-                    Some(done) => map.range_mut((Excluded(done), Unbounded)).next().map(
-                        |(id, record)| (*id, record.feed.staged_len(), record.feed.mode()),
-                    ),
+                    None => map
+                        .iter_mut()
+                        .next()
+                        .map(|(id, record)| (*id, record.feed.staged_len(), record.feed.mode())),
+                    Some(done) => map
+                        .range_mut((Excluded(done), Unbounded))
+                        .next()
+                        .map(|(id, record)| (*id, record.feed.staged_len(), record.feed.mode())),
                 }
             };
             let Some((next_id, staged_len, mode)) = next else {

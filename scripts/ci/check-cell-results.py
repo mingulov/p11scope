@@ -8,7 +8,8 @@ qualification and detail. Qualification is a closed set: qualified,
 command-contract, owned-provider-counts,
 owned-provider-counts-with-runner-noise,
 owned-provider-counts-with-66-discovery-gap,
-owned-provider-counts-with-ambient-gap, owned-edge-usage-counts,
+owned-provider-counts-with-ambient-gap,
+owned-provider-counts-with-exit-ambient-gap, owned-edge-usage-counts,
 prearm-exactness, verdict-consistency, semantic-names and failed are
 qualified and every qualified row must pass (with owned-edge-usage-counts
 requiring its proof fields in detail); nonqualifying smoke may pass or
@@ -39,6 +40,7 @@ QUALIFIED = {"qualified", "command-contract", "owned-provider-counts",
              "owned-provider-counts-with-runner-noise",
              "owned-provider-counts-with-66-discovery-gap",
              "owned-provider-counts-with-ambient-gap",
+             "owned-provider-counts-with-exit-ambient-gap",
              "owned-edge-usage-counts", "prearm-exactness",
              "verdict-consistency", "semantic-names", "failed"}
 VALID_QUALIFICATIONS = QUALIFIED | {"nonqualifying", "expected-failure"}

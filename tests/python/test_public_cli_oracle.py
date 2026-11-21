@@ -1014,6 +1014,93 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
 
+    def test_exit_ambient_passes_on_system_in_strict_mode(self):
+        # Exit-ambient lane 2026-11-21 (v0.8.0 flakes): a host with
+        # ambient short-lived exits discloses each as a mid-flight
+        # discovery skip plus coincidental deferrals. Strict system
+        # scope accepts the mixed finite-reason shape with exact owned
+        # counts; any other reason, cause or gap still fails. Shape
+        # mirrors the local counter-counts-system reproduction (lossy
+        # [skipped], 3 exits + 2 deferrals, all functions exact).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-exit-ambient-gap")
+        self.assertIn("mid_flight_exits=3", result["detail"])
+        self.assertIn("discovery_skips=2", result["detail"])
+
+    def test_exit_ambient_with_single_exit_passes_on_system_in_strict_mode(self):
+        # The narrow single-transient shape: one ambient exit, no
+        # deferral, exact counts. This is the quiet-runner CI shape (a
+        # lone short-lived exit in an otherwise exact window).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-exit-ambient-gap")
+        self.assertIn("mid_flight_exits=1", result["detail"])
+
+    def test_exit_ambient_with_other_reason_fails_in_strict_mode(self):
+        # The exit arm names exactly two finite reasons: a mid-flight
+        # exit bundled with any other skip reason still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "something else"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_exit_ambient_with_other_class_fails_in_strict_mode(self):
+        # Exit skips bundled with any further observation class are
+        # not the exit-ambient shape: a descendant gap alongside still
+        # fails strict (the ambient arm needs all-disclosable skips).
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 1
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_exit_ambient_with_count_mismatch_fails_in_strict_mode(self):
+        # The exit arm never waives exact owned counts: mixed
+        # exit/deferral skips with a 499/500 deficit still fail strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 499
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
     def test_loader_quiet_passes_on_mt_system_in_strict_mode(self):
         # K1 (v0.8.0 integration): a short-lived workload view recorded
         # unbound (loader arming raced its exit) with no loader hits and

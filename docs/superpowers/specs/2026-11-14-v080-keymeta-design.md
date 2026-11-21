@@ -265,6 +265,33 @@ test against `src/mechanism_names.rs` (every listed id resolves to
 the expected name; every function-adjacent id is either listed or
 pinned `unknown`).
 
+Amendment (controller ruling fix2, 2026-11-21, owner rules): the
+two infer-nothing sentences above are superseded in part. (1) Two
+attested NSS vendor ids infer: `CKM_NSS_ML_KEM` (`0xCE53_4381`)
+names `ml_kem` exactly like standard `CKM_ML_KEM` (softokn
+exposes it with encapsulate/decapsulate flags and NSS TLS uses
+it on non-FIPS softoken), and its keygen twin
+`CKM_NSS_ML_KEM_KEY_PAIR_GEN` (`0xCE53_4380`) infers likewise,
+family-only. Every other vendor id still infers nothing
+(legacy Kyber is not ML-KEM; no `kyber` family exists). (2) A
+key-pair-generation mechanism that names exactly one family
+infers it (source: mechanism), family-only — never consulted by
+a length map, so the parameter set still comes only from lengths
+or template values: `RSA_PKCS`/`RSA_X9_31` keygen (`rsa`),
+`DSA` keygen (`dsa`), `DH_PKCS`/`X9_42_DH`/`KEA` keygen (`dh`;
+KEA keygen names DH — its derives are DH), `EC`/`EC_W_EXTRA_BITS`
+keygen (`ec`), `EC_EDWARDS` keygen (`eddsa`), `ML_KEM`/`ML_DSA`/
+`SLH_DSA` keygen (their PQC families), plus the NSS vendor
+ML-KEM keygen above. Single-key `_KEY_GEN`, `_PARAMETER_GEN`,
+and multi-family or family-less keygen (`EC_MONTGOMERY`,
+`GOSTR3410`, `HSS`/`XMSS`/`XMSSMT`, Kyber) still infer nothing,
+each pinned by a negative control. The `KEA_KEY_PAIR_GEN
+excluded` note below is superseded for family inference (it
+names `dh`). §12's `vendor/unlisted/keygen ids infer nothing`
+twin prescription is superseded likewise: the twins now pin the
+two vendor ids and the thirteen single-family keygen ids as
+inferring, with negative controls for the rest.
+
 - `rsa`: CKM_RSA_PKCS, RSA_9796, RSA_X_509, MD2/MD5/SHA1/RIPEMD128/
   RIPEMD160/SHA224/SHA256/SHA384/SHA512/SHA3_224/SHA3_256/SHA3_384/
   SHA3_512_RSA_PKCS, RSA_PKCS_OAEP, RSA_X9_31, SHA1_RSA_X9_31,

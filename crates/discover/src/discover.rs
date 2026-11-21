@@ -913,11 +913,14 @@ fn snapshot_table(memory: &ProcessMemory, base: usize, set: TableSet) -> TableSn
                 raw.copy_from_slice(&bytes);
                 values.push((field.name, usize::from_ne_bytes(raw)));
             }
-            Err(detail) => {
+            Err(_) => {
+                // The read error carries the helper's raw address and errno;
+                // the diagnostic keeps only fixed text, the failed field and
+                // the retained ordinal count, like the selection tables.
                 return TableSnapshot {
                     walk: WalkOutcome::Unreadable {
                         detail: format!(
-                            "{} after {} complete function words: {detail}",
+                            "{} unreadable after {} complete function words",
                             field.name,
                             values.len()
                         ),
@@ -957,9 +960,12 @@ fn inventory_snapshot(
 ) -> TableSnapshot {
     match source {
         Ok(source) => snapshot_table(memory, base, inventory_tables(source)),
-        Err(header_error) => {
+        Err(_header_error) => {
             // An unavailable header gives no extension evidence, but does not
             // prevent bounded reads of the independently acquired common ABI.
+            // The header error carries the helper's raw address; the
+            // diagnostic keeps only the fixed prefix, like the selection
+            // tables.
             let mut snapshot = snapshot_table(
                 memory,
                 base,
@@ -972,9 +978,9 @@ fn inventory_snapshot(
             );
             let detail = match &snapshot.walk {
                 WalkOutcome::Unreadable { detail } => {
-                    format!("version header unreadable: {header_error}; functions: {detail}")
+                    format!("version header unreadable: metadata unavailable; functions: {detail}")
                 }
-                _ => format!("version header unreadable: {header_error}"),
+                _ => "version header unreadable: metadata unavailable".into(),
             };
             snapshot.walk = WalkOutcome::Unreadable { detail };
             snapshot

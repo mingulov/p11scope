@@ -16829,15 +16829,18 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     };
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
 
-    // Identical settled sleepers admit lowest-pid representatives cleanly.
+    // Identical settled sleepers form one provider shape; over-cap rarity
+    // selection admits its single representative, the lowest pid. Two shapes
+    // would rarity-order instead (a linker-startup transient singleton sorts
+    // first), so this pins the exact one-shape contract, not a pid prefix.
     let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup still captures");
     engine.scheduler.set_quantum_ns_for_test(u64::MAX);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let initial: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
     assert_eq!(
-        initial.as_slice(),
-        &pids[..initial.len()],
-        "the retained views are the lowest-pid members"
+        initial,
+        vec![pids[0]],
+        "one settled shape admits exactly the lowest pid"
     );
     engine.scheduler.set_slice_pids_for_test(2);
 
@@ -48600,7 +48603,10 @@ fn selection_prefers_ld_so_cache_transient_before_settled_group() {
             end: 0x2000,
             file_offset: 0,
             permissions: *b"r-xp",
-            device: Device { major: 0, minor: 35 },
+            device: Device {
+                major: 0,
+                minor: 35,
+            },
             inode,
             raw_path: Some(path.as_bytes().to_vec()),
         }
@@ -54559,6 +54565,11 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
     // dynamic-linker startup (blocked in nanosleep, or fallback to valid maps
     // when /proc/<pid>/wchan is unavailable/zero on restricted kernels), so
     // neither maps snapshots nor 30s walls race under heavy parallel load.
+    // The fallback requires a settled provider shape (no `/etc/ld.so.cache`
+    // transient, non-empty `.so` set, stable across polls): settling on a
+    // partial snapshot admits a singleton that rarity orders before the
+    // settled group. The global tail then waits for all siblings to share
+    // one shape, so capped selection always sees a single group.
     let self_exe = std::env::current_exe().unwrap();
     for guard in &guards {
         let pid = guard.pid();
@@ -54585,16 +54596,87 @@ fn e06_spawn_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
                         .iter()
                         .any(|mapping| mapping.permissions[2] == b'x' && mapping.inode != 0)
                     && MapIndex::new(&maps).is_ok()
+                    && let Some(shape) = e06_settled_shape(&maps)
                 {
-                    settled = true;
-                    break;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    if let Ok(stable_bytes) = std::fs::read(&maps_path)
+                        && let Ok(stable_maps) = parse_maps(&stable_bytes)
+                        && e06_settled_shape(&stable_maps).as_ref() == Some(&shape)
+                    {
+                        settled = true;
+                        break;
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(settled, "sleep child {pid} never settled");
     }
-    guards
+    // Global shape convergence: per-child settling can still leave siblings
+    // on different snapshots (one settled while another was descheduled
+    // mid-startup). Wait until every sibling maps the same provider shape.
+    for _ in 0..400 {
+        let mut shapes: Vec<BTreeSet<ObjectKey>> = Vec::new();
+        let mut converged = true;
+        for guard in &guards {
+            let pid = guard.pid();
+            let Ok(bytes) = std::fs::read(format!("/proc/{pid}/maps")) else {
+                converged = false;
+                break;
+            };
+            let Ok(maps) = parse_maps(&bytes) else {
+                converged = false;
+                break;
+            };
+            let Some(shape) = e06_settled_shape(&maps) else {
+                converged = false;
+                break;
+            };
+            shapes.push(shape);
+        }
+        if converged && shapes.windows(2).all(|pair| pair[0] == pair[1]) {
+            return guards;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let summary: Vec<String> = guards
+        .iter()
+        .map(|guard| {
+            let pid = guard.pid();
+            let detail = std::fs::read(format!("/proc/{pid}/maps"))
+                .ok()
+                .and_then(|bytes| parse_maps(&bytes).ok())
+                .and_then(|maps| e06_settled_shape(&maps))
+                .map(|shape| format!("{} keys", shape.len()))
+                .unwrap_or_else(|| "unsettled".to_string());
+            format!("{pid}={detail}")
+        })
+        .collect();
+    panic!(
+        "sleep children never converged on one provider shape: {}",
+        summary.join(", ")
+    );
+}
+
+/// Settled provider shape for [`e06_spawn_sleeps`] readiness: `Some` only
+/// when the maps carry a non-empty `.so` set with no `/etc/ld.so.cache`
+/// transient (mapped by `ld` during startup; its ".so" substring makes it a
+/// shape member whose singleton rarity-orders before the settled group).
+fn e06_settled_shape(maps: &[MapEntry]) -> Option<BTreeSet<ObjectKey>> {
+    if maps.iter().any(|mapping| {
+        mapping.raw_path.as_ref().is_some_and(|path| {
+            path.windows(b"ld.so.cache".len())
+                .any(|window| window == b"ld.so.cache")
+        })
+    }) {
+        return None;
+    }
+    let shape: BTreeSet<ObjectKey> = maps
+        .iter()
+        .filter(|entry| crate::discovery::scan::is_provider_mapping(entry))
+        .map(ObjectKey::of)
+        .collect();
+    (!shape.is_empty()).then_some(shape)
 }
 
 /// `e06_spawn_sleeps` readiness: every child has finished dynamic-linker

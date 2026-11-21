@@ -63,6 +63,7 @@ RUN = [
     ("test_benign_loader_evidence.py", []),
     ("test_bpf_kernels_contract.py", []),
     ("test_check_bpf_load_journal.py", []),
+    ("test_journal_load_verdict.py", []),
     ("test_privileged_tests_workflow.py", []),
     ("test_bpf_load_report.py", []),
     ("test_bpf_noninterference.py", []),

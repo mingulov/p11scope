@@ -273,6 +273,14 @@ def step_body(bpf_text, step_name):
     return rest[:len(prefix) + match.start()]
 
 
+def journal_driver_text():
+    """The journal load driver: the shell script plus the typed verdict
+    helper it calls for every verdict (scripts/journal-load-verdict.py
+    owns the refusal grammar and the absent-arm loads gate)."""
+    return ((ROOT / "scripts/check-bpf-load-journal.sh").read_text()
+            + (ROOT / "scripts/journal-load-verdict.py").read_text())
+
+
 def check_driver_absence_flag(driver_text, flag, refusal, loads_gate,
                               name):
     """A load driver honors an explicit companion-absence expectation:
@@ -549,7 +557,7 @@ class BpfKernelsContractTests(unittest.TestCase):
                           "check-bpf-load-kernels.sh"))
 
     def test_journal_legs_honor_an_absence_expectation(self):
-        driver = (ROOT / "scripts/check-bpf-load-journal.sh").read_text()
+        driver = journal_driver_text()
         self.assertEqual(
             [], check_driver_absence_flag(
                 driver, "--expect-journal",
@@ -560,7 +568,7 @@ class BpfKernelsContractTests(unittest.TestCase):
                 "check-bpf-load-journal.sh"))
 
     def test_journal_absence_check_catches_a_dropped_gate(self):
-        driver = (ROOT / "scripts/check-bpf-load-journal.sh").read_text()
+        driver = journal_driver_text()
         dropped = driver.replace(
             "refused journal-pair-unavailable-in-build; no journal loads",
             "journal leg passed")

@@ -504,7 +504,7 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
         fixture.assert_claims(
             &claims
                 .iter()
-                .map(|(ordinal, proof)| (*ordinal, proof.clone()))
+                .map(|(ordinal, proof)| (*ordinal, *proof))
                 .collect::<Vec<_>>(),
         );
         assert_eq!(

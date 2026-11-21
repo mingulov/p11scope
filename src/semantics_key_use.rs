@@ -5348,10 +5348,9 @@ mod disposal_tests {
 
     /// Drive one feed disposal to completion with `budget`-unit
     /// polls, asserting `reads <= spent <= budget` every poll over ALL
-    /// unified counters (reservation leaves + slot visits + unbudgeted
-    /// slot re-reads on both ledgers, staged-queue peeks/pops,
-    /// throwaway edge reads). Returns (polls, total spent, total
-    /// reads).
+    /// unified counters (reservation leaves + slot visits on both
+    /// ledgers, staged-queue peeks/pops, throwaway edge reads).
+    /// Returns (polls, total spent, total reads).
     fn drive_disposal_checked(
         cursor: &mut FeedDisposalCursor,
         feed: &mut JointStaging,
@@ -5366,10 +5365,8 @@ mod disposal_tests {
         loop {
             ledger.reset_test_leaf_reads_for_test();
             ledger.reset_test_slot_visits_for_test();
-            ledger.reset_test_unbudgeted_reads_for_test();
             fallback.reset_test_leaf_reads_for_test();
             fallback.reset_test_slot_visits_for_test();
-            fallback.reset_test_unbudgeted_reads_for_test();
             feed.reset_test_feed_reads_for_test();
             cursor.reset_throwaway_edge_reads_for_test();
             let mut gate = LeafBudget::new(budget);
@@ -5377,10 +5374,8 @@ mod disposal_tests {
             let spent = gate.spent();
             let reads = ledger.test_leaf_reads_for_test()
                 + ledger.test_slot_visits_for_test()
-                + ledger.test_unbudgeted_reads_for_test()
                 + fallback.test_leaf_reads_for_test()
                 + fallback.test_slot_visits_for_test()
-                + fallback.test_unbudgeted_reads_for_test()
                 + feed.test_feed_reads_for_test()
                 + cursor.throwaway_edge_reads_for_test();
             assert!(

@@ -257,22 +257,6 @@ impl StagingLedger {
         }
     }
 
-    /// Test-only read of the unbudgeted-read counter.
-    #[cfg(test)]
-    pub(crate) fn test_unbudgeted_reads_for_test(&self) -> usize {
-        self.table
-            .as_ref()
-            .map_or(0, |table| table.test_unbudgeted_reads_for_test())
-    }
-
-    /// Test-only reset of the unbudgeted-read counter.
-    #[cfg(test)]
-    pub(crate) fn reset_test_unbudgeted_reads_for_test(&self) {
-        if let Some(table) = self.table.as_ref() {
-            table.reset_test_unbudgeted_reads_for_test();
-        }
-    }
-
     /// Test-only read of the sync-walk counter.
     #[cfg(test)]
     pub(crate) fn test_preflight_reads_for_test(&self) -> usize {

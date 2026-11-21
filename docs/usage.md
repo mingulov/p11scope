@@ -3034,7 +3034,9 @@ user processes only (kernel threads never count toward it and stay in the
 per transaction and deep-scans 32 of them by default, a request above 128
 is held to 128, and when the cgroup has more members than one transaction
 pins the pass names that limit as a gap. Planning has 2,112 attach slots. Every bounded omission forces `PARTIAL`;
-no retry renews a budget. On hosts where the per-CPU STATS table would exceed
+no retry renews a budget within a pass (the per-pass allowances
+above renew only at the next pass, which resumes where the last one
+stopped). On hosts where the per-CPU STATS table would exceed
 `max(64 MiB, 1% of RAM)`, the ceiling sizes down at load instead (never below
 512 slots); the capture then names the sized ceiling once on stderr and in
 `evidence.slot_sizing`.

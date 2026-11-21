@@ -280,9 +280,13 @@ pub(crate) fn retire_view_only_if_proven_gone(view: ProcessViewId, proof: Retire
   flag, qualified by a real-seam test, or the narrower
   retirement/drain proof with its ruling). The 257th-arm stale
   refusal is demonstrated, not staged in the token adapter.
-- Retirement: all 13 `remove_view` / `replace_view_pins` /
-  `prune_view_pins_to_modules` engine call sites route through the
-  proof gate. `RescanFailed` is NOT proof (only the three closed
+- Retirement: every `remove_view` / `replace_view_pins` /
+  `prune_view_pins_to_modules` engine call site routes through the
+  proof gate. As built, the raw `remove_view` is private to the pin
+  store and retirement goes through `retire_view_or_keep_with_gap`
+  and `retire_view_only_if_proven_gone` (the site count drifted from
+  the draft's 13 as owners merged; the gate, not the count, is the
+  invariant). `RescanFailed` is NOT proof (only the three closed
   constructors are); a failed rescan keeps the committed pins and a
   named gap. This settles fix6 B2a conservatively: leak-then-prove
   beats retire-then-lose.
@@ -364,7 +368,7 @@ refactor.
 | Loader fallback / RT_ADD / RT_CONSISTENT | per-path stamp restore | `with_renewable_restore` helper |
 | Due loader scans | `service_pending_loader_scans` | restore-on-`Wait`, settle on terminal |
 | Survivor acquisition | `scan.rs` cold-survivor path | `Wait` propagates as incomplete, not `Err` |
-| Retirement (all 13 sites) | `remove_view` etc. + `pending_retirements` | `retire_view_only_if_proven_gone` gate |
+| Retirement (every site) | `remove_view` etc. + `pending_retirements` | `retire_view_only_if_proven_gone` gate |
 | Loader slot table | 256, fail-closed exhausted gap | recycling + post-reuse stale proof |
 
 ### Binding/admission (owner 4)
@@ -411,16 +415,27 @@ test ideas live on in the owners' tables (§9).
 - Lane-3 `order_scan_pids_fresh_first` + `truncated_member_pids`
   tiering → becomes the cursor (§4.2; twins adopted).
 - All `debug:` / `P11SCOPE_FIX1_EVLOG` commits on lane 4 → never ported.
-- Substring classifiers (`names_transient_pin_failure`,
-  `scan_pins_waited_only_*`, `names_capture_budget_stop` as
-  retry/terminal deciders) → deciders for the handle class only:
-  the typed outcome files the handle-class waits
-  (`HandleExhaustion`/`ReserveStop`/`BudgetStop`) under the fixed
-  wait subject and every other `Wait` cause under its own subject,
-  so the classifiers recognise exactly the defer-whole shape and a
-  future `Wait` cause that should defer whole must file there too
-  (pinned by the wait-subject split twin). (String matching may
-  otherwise survive inside gap rendering only.)
+- Substring classifiers as retry/terminal deciders → two roles,
+  kept apart:
+  - `scan_pins_waited_only_*` and `pins_waited_for_handles_budget`
+    decide for the handle class only: the typed outcome files the
+    handle-class waits (`HandleExhaustion`/`ReserveStop`/`BudgetStop`)
+    under the fixed wait subject and every other `Wait` cause under
+    its own subject, so these classifiers recognise exactly the
+    defer-whole shape, and a future `Wait` cause that should defer
+    whole must file there too (pinned by the wait-subject split
+    twin over the current nine causes).
+  - `names_capture_budget_stop` is the budget-vocabulary decider of
+    the ending-excuse policy: it matches the closed
+    `BUDGET_EXHAUSTION_REASONS` set (work, deadline, clock, I/O,
+    table and interface window ceilings) so capture-limit stops are
+    never treated as ending excuses. It is not a handle-class decider.
+  - The scan's own stop wordings classify through
+    `is_work_ceiling_stop_reason` (exact bare or scan-refusal-wrapped
+    ceiling, for the presentation fold) and `is_raw_pass_budget_stop`
+    (the stop must close the producer-owned tail, for continuation
+    suppression), never a substring search, so a module path quoting
+    a stop sentence never classifies.
 
 ## 9. Test plan (per owner, RED first on c2a180a71)
 
@@ -474,10 +489,20 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
 - Run-tree waves ×50 on vng 6.12: owners 1+3, remainder per §6.
 - Inventory `--cgroup` finds a large provider (haskoki cell):
   owners 1+2+4 (strict bind, per-pass 1M allowance with walk
-  continuation and decode-cursor resume across passes — snapshots
-  run follow-up passes until the cursors drain — plus three-route
-  classification). No allowance is sized to fit any provider: any
-  app size converges over several passes.
+  continuation and decode-cursor resume across passes, plus
+  three-route classification). Snapshots run follow-up passes while
+  the snapshot's resume ledger sees monotone progress: some cursor
+  identity (process generation, file pin, image) must pass the best
+  rank it reached earlier in the snapshot, identities first reached
+  later count only with real decode work and only for processes born
+  by the snapshot's start, and a converged scan with no bind budget
+  gets the snapshot's single settle pass. The identity set is finite
+  and each rank is bounded, so a snapshot ends without a pass-count
+  gate; when progress stops (a stall, churn, or invalidation), the
+  snapshot ends with the live in-progress gap and the per-stall
+  verdicts naming what remains. No allowance is sized to fit any
+  provider: any app size converges over several passes on a stable
+  host.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

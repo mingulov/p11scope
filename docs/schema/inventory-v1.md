@@ -998,18 +998,23 @@ and never proves an app identity. See the app identity rows of
   or path) in the `reason`, so different modules stay distinct gaps. The first
   occurrence keeps its position in `gaps[]`.
   Repeated scan work-ceiling stops project to the single finite
-  reason `scan budget exhausted` (bare stops and stops wrapped in
-  scan refusals alike, whatever subject filed them): one pass's
-  allowance tripped mid-scan, true per event even when a resumed
-  pass completes the work afterward. Every trip keeps its own
-  `gaps[]` record with its attribution and `repeats`; the snapshot
-  text folds same-subject rows into one counted line
-  (`gap [subject] scan budget exhausted (N times)`) at the first
-  row's position, with the exact summed total, so a slow host that
+  reason `scan budget exhausted` (the bare stop and the stop wrapped
+  in one of the scan's own refusals alike, whatever subject filed
+  it): one pass's allowance tripped mid-scan, true per event even
+  when a resumed pass completes the work afterward. Only those exact
+  scan wordings project; any other reason, including a diagnosis
+  whose module path happens to quote the stop sentence, keeps its
+  own reason. Every trip keeps its own `gaps[]` record with its
+  attribution and `repeats`. Both snapshot text surfaces fold
+  same-subject rows into one counted line with the exact summed
+  event total (each row's `repeats` summed), so a slow host that
   files one trip per pass per caller reads as one line instead of
-  dozens. A lone trip renders bare. The dashboard lists the renamed
-  rows unfolded (its per-row navigation keeps each trip's
-  attribution).
+  dozens: verbose text prints `gap [subject] scan budget exhausted
+  (N times)` at the first row's position, and the concise summary
+  prints `N x subject - scan budget exhausted` in its ordinary
+  ranked place, like every concise group. A lone trip renders bare
+  on both. The dashboard lists the renamed rows unfolded (its
+  per-row navigation keeps each trip's attribution).
   A gap that records a budget refusal carries `budget` with the
   `resource`, its `limit`, and the `requested` occupancy; every other
   gap carries `budget: null`. Run-lifetime admission refusals name the

@@ -1,4 +1,5 @@
 {
+  "_comment": "BUD-1 exception (controller ruling 2026-11-21): journal-gate1/p11_return_journal_length on v7.4-rc2 measures 735873 states (73.6% of the 1M limit), inside the owner bar (verifier pins may grow up to about 75% of 1M). The cell is pinned at the bar itself, 750000, instead of the 115% mechanical pin the recorder refuses past 75%. No BPF refactor: shrinking the program is a v0.8.1 item.",
   "limit": 1000000,
   "min_headroom_percent": 5,
   "programs": {
@@ -604,7 +605,7 @@
       "v6.18.58": 427622,
       "v7.0.14": 310302,
       "v7.3.1": 441011,
-      "v7.4-rc2": 497934
+      "v7.4-rc2": 750000
     }
   }
 }

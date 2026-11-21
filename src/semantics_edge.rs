@@ -3560,6 +3560,11 @@ impl EdgeSemantics {
                         debug_assert!(false, "only fresh admissions insert");
                         return false;
                     };
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
                     self.sequence = self.sequence.wrapping_add(1);
                     let sequence = self.sequence;
                     let resource = self.take_resource_charge(charge);
@@ -3629,6 +3634,11 @@ impl EdgeSemantics {
                         continue;
                     }
                     let best = cursor.best.expect("an over-bound scan finds a record");
+                    if !budget.try_charge() {
+                        return false;
+                    }
+                    #[cfg(test)]
+                    self.bump_edge_read_for_test();
                     let (session, call, origin, resource) = match best {
                         PendingAdmissionBest::Pending { key, .. } => {
                             let record =
@@ -5341,8 +5351,9 @@ mod tests {
                 );
                 assert_eq!(
                     (total_spent, total_reads),
-                    (262, 262),
-                    "route + capture + 257-visit scan + liveness + visit + terminal"
+                    (264, 264),
+                    "route + capture + insert + 257-visit scan + victim removal + \
+                     liveness + visit + terminal"
                 );
             } else {
                 assert_eq!(

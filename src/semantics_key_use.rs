@@ -4919,6 +4919,32 @@ impl FeedDisposalCursor {
             if gate.remaining() == 0 {
                 return false;
             }
+            // FIFO: an Ended close's queued association release drains
+            // before any later Started mint starts or resumes, so a
+            // replacement's outcome never depends on where a credit
+            // boundary lands. A refused grant yields with the release
+            // retained (the mint waits behind it); trailing releases
+            // with no later effects drain via the outer arms.
+            if self.assoc_release.is_some() || !self.assoc_queue.is_empty() {
+                let Some(fallback_ledger) = fallback.as_deref_mut() else {
+                    debug_assert!(false, "a queued assoc release needs its ledger");
+                    return false;
+                };
+                if let Some(release) = self.assoc_release.as_mut() {
+                    let (done, result) = fallback_ledger.release_step(release, gate);
+                    if !done {
+                        return false;
+                    }
+                    self.assoc_release = None;
+                    drop(result);
+                    continue;
+                }
+                if let Some(ticket) = self.assoc_queue.pop_front() {
+                    let cursor = fallback_ledger.release_assoc_cursor(ticket);
+                    self.assoc_release = Some(cursor);
+                    continue;
+                }
+            }
             if self.pending_start.is_some() {
                 let Some(fallback_ledger) = fallback.as_deref_mut() else {
                     debug_assert!(false, "a started drain needs its ledger");
@@ -5375,6 +5401,93 @@ mod disposal_tests {
                 "seed {seed}: queued + drain matches sync"
             );
         }
+    }
+
+    /// A replacement's queued release drains before its mint starts:
+    /// with room for exactly one association, an Ended close followed
+    /// by a Started must free the old ticket before the new mint
+    /// reserves, so the mint succeeds exactly like the synchronous
+    /// release-then-mint order instead of refusing on pool pressure.
+    #[test]
+    fn effect_drain_releases_before_started_mint() {
+        use crate::semantics_edge::OperationId;
+        let tag = "drain-fifo";
+        let pool = SemanticResourcePool::default();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let assoc_bytes = std::mem::size_of::<OpenKeyUse>() as u64;
+        let one_assoc = assoc_bytes as usize
+            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+        pool.reference_set_limit(pool.snapshot().charged_bytes + one_assoc);
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(37);
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let old = OperationId::from_ordinal_for_test(1);
+        let started_old = OperationEffect::Started {
+            id: old,
+            category: "sign",
+            mechanism: Some(0x000d),
+            key_receipt: None,
+            origin: origin("C_SignInit", 5001, 100),
+        };
+        cursor
+            .preserved
+            .as_mut()
+            .expect("joint keeps reducers")
+            .observe_effect(instance, &started_old, None, Some(&mut fallback));
+        assert_eq!(fallback.census(), 1, "{tag}: the old assoc is live");
+        assert!(
+            fallback.mint_keyassoc(16).is_err(),
+            "{tag}: premise: no room for a second assoc while the old lives"
+        );
+        let new = OperationId::from_ordinal_for_test(2);
+        cursor.pending_effects.push_back(OperationEffect::Ended {
+            id: old,
+            category: "sign",
+            outcome: OperationOutcome::Cancelled,
+            origin: origin("C_SignInit", 5001, 200),
+            length: None,
+            corroboration: None,
+        });
+        cursor.pending_effects.push_back(OperationEffect::Started {
+            id: new,
+            category: "sign",
+            mechanism: Some(0x000d),
+            key_receipt: None,
+            origin: origin("C_SignInit", 5001, 200),
+        });
+        let mut polls = 0usize;
+        loop {
+            let mut gate = LeafBudget::new(64);
+            if cursor.poll_effect_drain(Some(&mut fallback), &mut gate) {
+                break;
+            }
+            polls += 1;
+            assert!(polls < 64, "{tag}: the drain must complete");
+        }
+        let preserved = cursor.preserved.as_ref().expect("joint keeps reducers");
+        assert_eq!(
+            preserved.evidence().rows_refused,
+            0,
+            "{tag}: the replacement mint succeeds after the release"
+        );
+        assert!(
+            preserved.open().contains_key(&(instance, new)),
+            "{tag}: the new operation is open"
+        );
+        assert!(
+            !preserved.open().contains_key(&(instance, old)),
+            "{tag}: the replaced operation closed"
+        );
+        assert_eq!(
+            fallback.census(),
+            1,
+            "{tag}: the old ticket freed exactly once; the new one lives"
+        );
+        assert!(
+            cursor.assoc_queue.is_empty() && cursor.assoc_release.is_none(),
+            "{tag}: no release strands behind the mint"
+        );
     }
 
     fn pending_call(session: u64, ts_ns: u64) -> SemanticCall {
@@ -6170,6 +6283,128 @@ mod disposal_tests {
             "{tag}: survivors stay; the head assoc released exactly once"
         );
         assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
+    }
+
+    /// A staged replacement resolves identically on every credit
+    /// schedule: with room for exactly one association, the second
+    /// Init's Ended close frees the old ticket before its Started
+    /// mints, so every uniform schedule from 56 to 64 units matches
+    /// the synchronous release-then-mint oracle exactly (refusals,
+    /// terminals, custody, ticket sequence).
+    #[test]
+    fn feed_disposal_replacement_matches_sync_on_every_schedule() {
+        let tag = "replacement-schedule";
+        let assoc_bytes = std::mem::size_of::<OpenKeyUse>() as u64;
+        let one_assoc = assoc_bytes as usize
+            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+        // Premise on a scratch pair: the sizing holds exactly one
+        // assoc (a second mint refuses while the first lives).
+        {
+            let scratch_pool = SemanticResourcePool::default();
+            let mut scratch = StagingLedger::with_resources(scratch_pool.reserver());
+            scratch.prepare_capacity().unwrap();
+            scratch_pool.reference_set_limit(scratch_pool.snapshot().charged_bytes + one_assoc);
+            let first = scratch.mint_keyassoc(assoc_bytes).unwrap();
+            assert_eq!(first, 1, "{tag}: premise: first mint fits");
+            assert!(
+                scratch.mint_keyassoc(assoc_bytes).is_err(),
+                "{tag}: premise: second mint refuses while the first lives"
+            );
+            scratch.release_keyassoc(first);
+        }
+        let heads = [
+            init_call("C_SignInit", 5001, 0x000d, 100),
+            init_call("C_SignInit", 5001, 0x000d, 200),
+            call("C_SignFinal", 5001, pkcs11_types::CkRv::OK.0, 300),
+        ];
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(39);
+        // Synchronous oracle: release-then-mint per effect, same
+        // exactly-one pool sizing.
+        let sync_pool = SemanticResourcePool::default();
+        let mut sync_fallback = StagingLedger::with_resources(sync_pool.reserver());
+        sync_fallback.prepare_capacity().unwrap();
+        sync_pool.reference_set_limit(sync_pool.snapshot().charged_bytes + one_assoc);
+        let mut sync_edge = EdgeSemantics::default();
+        let mut sync_keyuse = KeyUseReducer::new();
+        for head in &heads {
+            let head_origin = EffectOrigin {
+                function: head.function.clone(),
+                session: head.session,
+                ts_ns: head.ts_ns,
+            };
+            let mut effects = Vec::new();
+            sync_edge.observe_with_effects(head, &head_origin, &mut effects);
+            for effect in &effects {
+                sync_keyuse.observe_effect(instance, effect, None, Some(&mut sync_fallback));
+            }
+        }
+        let sync_snapshot = (
+            unknown_sums(&sync_keyuse),
+            sync_keyuse.evidence().rows_refused,
+            sync_keyuse.evidence().refused_terminals,
+            sync_keyuse.evidence().partial,
+            sync_keyuse.open().len(),
+            sync_fallback.census(),
+            sync_fallback.charged_bytes(),
+        );
+        assert_eq!(
+            sync_snapshot,
+            ([1, 0, 1, 0], 0, 0, false, 0, 0, 0),
+            "{tag}: sync closes the replaced Cancelled and the final Completed"
+        );
+        let sync_ticket = sync_fallback.mint_keyassoc(assoc_bytes).unwrap();
+        assert_eq!(sync_ticket, 3, "{tag}: sync consumed two tickets");
+        for budget in 56..=64usize {
+            let stag = format!("{tag}-b{budget}");
+            let pool = SemanticResourcePool::default();
+            let mut ledger = StagingLedger::with_resources(pool.reserver());
+            ledger.prepare_capacity().unwrap();
+            let mint_pool = SemanticResourcePool::default();
+            let mut fallback = StagingLedger::with_resources(mint_pool.reserver());
+            fallback.prepare_capacity().unwrap();
+            mint_pool.reference_set_limit(mint_pool.snapshot().charged_bytes + one_assoc);
+            let mut feed = joint_feed();
+            for (index, head) in heads.iter().enumerate() {
+                let head_origin = EffectOrigin {
+                    function: head.function.clone(),
+                    session: head.session,
+                    ts_ns: head.ts_ns,
+                };
+                feed.stage(head.clone(), head_origin, (index + 1) as u64, &mut ledger)
+                    .unwrap();
+            }
+            let mut cursor = FeedDisposalCursor::new(instance, true);
+            let mut keyuse = KeyUseReducer::new();
+            drive_disposal_checked(
+                &mut cursor,
+                &mut feed,
+                &mut ledger,
+                &mut fallback,
+                &mut keyuse,
+                budget,
+                &stag,
+            );
+            let snapshot = (
+                unknown_sums(&keyuse),
+                keyuse.evidence().rows_refused,
+                keyuse.evidence().refused_terminals,
+                keyuse.evidence().partial,
+                keyuse.open().len(),
+                fallback.census(),
+                fallback.charged_bytes(),
+            );
+            assert_eq!(
+                snapshot, sync_snapshot,
+                "{stag}: schedule {budget} matches the sync oracle"
+            );
+            let ticket = fallback.mint_keyassoc(assoc_bytes).unwrap();
+            assert_eq!(
+                ticket, sync_ticket,
+                "{stag}: schedule {budget} consumed the sync ticket sequence"
+            );
+            assert_eq!(ledger.staged(), 0, "{stag}: every H9 released");
+        }
     }
 
     /// Budgeted Started drain matches the synchronous Started arm

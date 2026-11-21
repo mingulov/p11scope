@@ -2177,9 +2177,14 @@ impl AggCounters {
     }
 }
 
+/// Bounded mechanism ids per unknown summary (controller ruling
+/// fix2, F3): at most eight distinct ids in first-seen order.
+pub(crate) const UNKNOWN_MECHS_PER_BUCKET: usize = 8;
+
 /// One fixed unknown-key summary's counters (H9 §82): terminal
 /// outcomes partitioned once per primary operation role, plus live
-/// unknown-key activity. Fixed vocabulary — always admitted, never
+/// unknown-key activity, plus the bounded mechanism ids of this
+/// bucket's terminals. Fixed vocabulary — always admitted, never
 /// a positive row, never a capacity refusal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct UnknownCounters {
@@ -2188,6 +2193,14 @@ pub(crate) struct UnknownCounters {
     pub cancelled: u64,
     pub unknown: u64,
     pub active: u64,
+    /// Distinct mechanism ids in first-seen order with per-id
+    /// terminal counts; only the first `mechs_len` slots read.
+    pub mechs: [(u64, u64); UNKNOWN_MECHS_PER_BUCKET],
+    pub mechs_len: u8,
+    /// Terminals whose ids fell past the eight listed: an exact
+    /// terminal count (never a distinct-id guess), so merges add
+    /// exactly and row totals always reconcile.
+    pub further_mechanism_terminals: u64,
 }
 
 impl UnknownCounters {
@@ -2832,6 +2845,9 @@ pub(crate) struct RefusedOpen {
     pub instance: RegistryInstanceId,
     pub category: &'static str,
     pub started_ts_ns: u64,
+    /// The refused start's mechanism (controller ruling fix2, F3):
+    /// its terminal lands on the unknown row with this id.
+    pub mechanism: Option<u64>,
 }
 
 /// The key-use reducer (H9): joins the operation-effect stream to
@@ -2956,10 +2972,18 @@ impl KeyUseReducer {
     }
 
     /// Mark one fixed unknown summary ever-live and add a terminal
-    /// outcome (N9).
-    fn unknown_add(&mut self, index: usize, outcome: OperationOutcome) {
+    /// outcome (N9), recording the terminal's mechanism id when one
+    /// is known (controller ruling fix2, F3).
+    fn unknown_add(
+        &mut self,
+        index: usize,
+        outcome: OperationOutcome,
+        mechanism: Option<u64>,
+    ) {
         self.unknown_ever_live[index] = true;
         self.unknown[index].add(outcome);
+        // RED: the GREEN commit records the id here.
+        let _ = mechanism;
     }
 
     /// Mark one fixed unknown summary ever-live and count live
@@ -3100,7 +3124,7 @@ impl KeyUseReducer {
                 let (slots, len) = Self::resolve(instance, category, receipts);
                 let resolved = &slots[..len];
                 if !self.admits(resolved) {
-                    self.refuse(key, instance, category, origin.ts_ns);
+                    self.refuse(key, instance, category, origin.ts_ns, *mechanism);
                     return;
                 }
                 // One shared reservation owner (N1c): the prospective
@@ -3113,7 +3137,7 @@ impl KeyUseReducer {
                 let target = shared.as_deref_mut().or(fallback.as_deref_mut());
                 let Some(ledger) = target else {
                     debug_assert!(false, "keyassoc mint needs a ledger");
-                    self.refuse(key, instance, category, origin.ts_ns);
+                    self.refuse(key, instance, category, origin.ts_ns, *mechanism);
                     return;
                 };
                 let assoc_bytes = size_of::<OpenKeyUse>() as u64
@@ -3124,7 +3148,7 @@ impl KeyUseReducer {
                 ) {
                     Ok(ticket) => ticket,
                     Err(_) => {
-                        self.refuse(key, instance, category, origin.ts_ns);
+                        self.refuse(key, instance, category, origin.ts_ns, *mechanism);
                         return;
                     }
                 };
@@ -3231,7 +3255,7 @@ impl KeyUseReducer {
                     let slot =
                         unknown_index(refused.category, unbound_reason_for(refused.category));
                     self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
-                    self.unknown_add(slot, *outcome);
+                    self.unknown_add(slot, *outcome, refused.mechanism);
                     self.evidence.refused_terminals =
                         self.evidence.refused_terminals.saturating_add(1);
                     return;
@@ -3240,7 +3264,7 @@ impl KeyUseReducer {
                 // outcome lands in the fixed unknown summary, which
                 // needs no positive row and never refuses.
                 self.evidence.orphan_ends = self.evidence.orphan_ends.saturating_add(1);
-                self.unknown_add(unknown_index("unknown", "unbound"), *outcome);
+                self.unknown_add(unknown_index("unknown", "unbound"), *outcome, None);
             }
             OperationEffect::DirectCompleted {
                 category,
@@ -3259,7 +3283,7 @@ impl KeyUseReducer {
                     // complete atomically) preserves into the fixed
                     // unknown summary — never a positive row.
                     let slot = unknown_index(category, unbound_reason_for(category));
-                    self.unknown_add(slot, OperationOutcome::Completed);
+                    self.unknown_add(slot, OperationOutcome::Completed, *mechanism);
                     self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
                     self.evidence.partial = true;
                     self.evidence.refused_terminals =
@@ -3270,7 +3294,7 @@ impl KeyUseReducer {
                     self.evidence.unknown_key_rows =
                         self.evidence.unknown_key_rows.saturating_add(1);
                     let slot = unknown_index(category, unbound_reason_for(category));
-                    self.unknown_add(slot, OperationOutcome::Completed);
+                    self.unknown_add(slot, OperationOutcome::Completed, *mechanism);
                     return;
                 }
                 let mut saw_primary = false;
@@ -3286,7 +3310,7 @@ impl KeyUseReducer {
                             // The terminal partitions once, by the
                             // primary role only.
                             if slot.primary {
-                                self.unknown_add(index, OperationOutcome::Completed);
+                                self.unknown_add(index, OperationOutcome::Completed, *mechanism);
                             }
                         }
                     }
@@ -3296,7 +3320,7 @@ impl KeyUseReducer {
                     // associations stand above while the missing
                     // primary's terminal partitions unknown.
                     let slot = unknown_index(category, unbound_reason_for(category));
-                    self.unknown_add(slot, OperationOutcome::Completed);
+                    self.unknown_add(slot, OperationOutcome::Completed, *mechanism);
                 }
                 // Atomic completion attributes family and size per
                 // proved association (role-split for wrap/unwrap),
@@ -3653,11 +3677,15 @@ impl KeyUseReducer {
     /// proved primary already counted it. Allocation-free: reserved
     /// buckets and fixed summaries only.
     fn close_open(&mut self, open: OpenKeyUse, outcome: OperationOutcome) {
+        // The open's mechanism rides every unknown terminal below
+        // (controller ruling fix2, F3); captured before the
+        // associations move out.
+        let mechanism = open.mechanism;
         if !open.bound {
             self.evidence.unknown_key_rows = self.evidence.unknown_key_rows.saturating_add(1);
             let slot = unknown_index(open.category, unbound_reason_for(open.category));
             self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
-            self.unknown_add(slot, outcome);
+            self.unknown_add(slot, outcome, mechanism);
             return;
         }
         let mut saw_primary = false;
@@ -3681,7 +3709,7 @@ impl KeyUseReducer {
                 AssocBucket::Unknown(index) => {
                     self.unknown[index].active = self.unknown[index].active.saturating_sub(1);
                     if assoc.primary && !assoc.lost {
-                        self.unknown_add(index, outcome);
+                        self.unknown_add(index, outcome, mechanism);
                     }
                 }
             }
@@ -3689,7 +3717,11 @@ impl KeyUseReducer {
                 // A retired primary's S1 terminal routes once to the
                 // unknown-key summary; its proved bucket already
                 // closed `key_join_lost` above.
-                self.unknown_add(unknown_index(open.category, "key_join_lost"), outcome);
+                self.unknown_add(
+                    unknown_index(open.category, "key_join_lost"),
+                    outcome,
+                    mechanism,
+                );
             }
         }
         if !saw_primary {
@@ -3698,7 +3730,7 @@ impl KeyUseReducer {
             // primary's terminal partitions unknown (never a
             // promotion of the secondary).
             let slot = unknown_index(open.category, unbound_reason_for(open.category));
-            self.unknown_add(slot, outcome);
+            self.unknown_add(slot, outcome, mechanism);
         }
     }
 
@@ -3712,6 +3744,7 @@ impl KeyUseReducer {
         instance: RegistryInstanceId,
         category: &'static str,
         started_ts_ns: u64,
+        mechanism: Option<u64>,
     ) {
         self.refused.insert(
             key,
@@ -3719,6 +3752,7 @@ impl KeyUseReducer {
                 instance,
                 category,
                 started_ts_ns,
+                mechanism,
             },
         );
         let slot = unknown_index(category, unbound_reason_for(category));

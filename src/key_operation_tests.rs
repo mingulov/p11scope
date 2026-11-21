@@ -14474,6 +14474,144 @@ fn key_operation_pqc_matrix_negative() {
     );
 }
 
+/// Controller ruling fix2 (F3): unknown rows carry the bounded
+/// mechanism ids of their terminals — here the two PQC keygen ids
+/// on the receipt-less `generate_key_pair` row — and the section
+/// versions to v10. Full-width ids in first-seen order with
+/// per-id terminal counts.
+#[test]
+fn key_operation_unknown_rows_carry_keygen_mechanism_ids() {
+    use crate::key_operation_projection::OBSERVATIONS_VERSION_V10;
+    use crate::key_operation_projection::object_observations_json;
+    use crate::key_operation_projection::producer::commit;
+    let mut assoc_ledger = StagingLedger::new();
+    let scene = JointScene::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(4);
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for (mechanism, ts) in [(0x0fu64, 700_002), (0x1c, 700_003)] {
+        let mut call = op("C_GenerateKeyPair", 9, ts);
+        call.mechanism = mechanism;
+        call.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        for effect in feed(&mut edge, &mut sink, &call) {
+            keyuse.observe_effect(instance, &effect, Some(&mut assoc_ledger), None);
+        }
+    }
+    let s1only = JointStaging::select_s1_only();
+    let committed = commit(1, &[&s1only], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair")
+        .expect("the keygen row projects");
+    assert_eq!(row.reason, "not_applicable");
+    assert_eq!(row.completed, 2);
+    assert_eq!(
+        row.mechanisms
+            .iter()
+            .map(|entry| (entry.id, entry.count))
+            .collect::<Vec<_>>(),
+        vec![(0x0f, 1), (0x1c, 1)],
+        "first-seen ids with per-id counts"
+    );
+    assert_eq!(row.further_mechanism_terminals, 0);
+    assert_eq!(
+        object_observations_json(&committed)["version"],
+        OBSERVATIONS_VERSION_V10
+    );
+}
+
+/// F3 overflow: ids past the eight listed count their terminals
+/// exactly; repeats of listed ids count up in place.
+#[test]
+fn key_operation_unknown_mechanism_overflow_counts_terminals() {
+    use crate::key_operation_projection::producer::commit;
+    let mut assoc_ledger = StagingLedger::new();
+    let scene = JointScene::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(4);
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Nine distinct real keygen ids, then a repeat of the first.
+    let mut ids = vec![0x0fu64, 0x1c, 0x2d, 0x00, 0x0a, 0x10, 0x20, 0x30, 0x1010];
+    ids.push(0x0f);
+    for (n, mechanism) in ids.into_iter().enumerate() {
+        let mut call = op("C_GenerateKeyPair", 9, 700_000 + n as u64);
+        call.mechanism = mechanism;
+        call.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        for effect in feed(&mut edge, &mut sink, &call) {
+            keyuse.observe_effect(instance, &effect, Some(&mut assoc_ledger), None);
+        }
+    }
+    let s1only = JointStaging::select_s1_only();
+    let committed = commit(1, &[&s1only], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair")
+        .expect("the keygen row projects");
+    assert_eq!(row.completed, 10);
+    assert_eq!(
+        row.mechanisms
+            .iter()
+            .map(|entry| (entry.id, entry.count))
+            .collect::<Vec<_>>(),
+        vec![
+            (0x0f, 2),
+            (0x1c, 1),
+            (0x2d, 1),
+            (0x00, 1),
+            (0x0a, 1),
+            (0x10, 1),
+            (0x20, 1),
+            (0x30, 1),
+        ],
+        "first eight ids in first-seen order"
+    );
+    assert_eq!(
+        row.further_mechanism_terminals, 1,
+        "the ninth id's terminal counts exactly"
+    );
+}
+
+/// F3 preservation: a preserved reducer's unknown-row ids merge
+/// per id in first-seen order, overflow terminals add exactly.
+#[test]
+fn key_operation_unknown_mechanism_ids_merge_on_absorb() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(4);
+    let mut ledgers = [StagingLedger::new(), StagingLedger::new()];
+    let mut reducers = [KeyUseReducer::new(), KeyUseReducer::new()];
+    for (n, mechanism) in [(0, 0x0fu64), (1, 0x1c), (1, 0x0f)] {
+        let mut edge = EdgeSemantics::default();
+        let mut sink = Vec::new();
+        let mut call = op("C_GenerateKeyPair", 9, 700_000 + n as u64);
+        call.mechanism = mechanism;
+        call.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        for effect in feed(&mut edge, &mut sink, &call) {
+            reducers[n].observe_effect(instance, &effect, Some(&mut ledgers[n]), None);
+        }
+    }
+    let [mut first, second] = reducers;
+    first.absorb_preserved(second);
+    let live: Vec<_> = first
+        .unknown_counters()
+        .iter()
+        .filter(|counters| counters.completed > 0)
+        .collect();
+    assert_eq!(live.len(), 1, "one live unknown bucket");
+    assert_eq!(live[0].completed, 3);
+    assert_eq!(
+        live[0].mechs[..live[0].mechs_len as usize].to_vec(),
+        vec![(0x0f, 2), (0x1c, 1)],
+        "merged per id in first-seen order"
+    );
+    assert_eq!(live[0].further_mechanism_terminals, 0);
+}
+
 /// Unique scratch roots for fixture processes (parallel-safe).
 static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

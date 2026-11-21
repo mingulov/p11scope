@@ -69,6 +69,14 @@ pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
 /// outside the v7 enums; v1–v7 output stays byte-stable. Like v7, v9
 /// sections carry the inferred keys on every proved row.
 pub(crate) const OBSERVATIONS_VERSION_V9: u8 = 9;
+/// Section version 10 (unknown-row mechanism ids, controller ruling
+/// fix2 F3): v9 vocabulary plus the `mechanisms` key on unknown-key
+/// rows (at most eight `{id, count}` pairs in first-seen order) and
+/// the optional `further_mechanism_terminals` overflow count. The
+/// renderer emits v10 exactly when an unknown row carries mechanism
+/// content; v1–v9 output stays byte-stable. Like v9, v10 sections
+/// carry the inferred keys on every proved row.
+pub(crate) const OBSERVATIONS_VERSION_V10: u8 = 10;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
 /// (controller KEYMETA-T1 rulings 2026-11-16, ruling 2). The closed
@@ -579,6 +587,24 @@ pub(crate) mod contract {
         "active",
     ];
 
+    /// The closed v10 unknown-row keys: the frozen eight plus the
+    /// required `mechanisms` array (`further_mechanism_terminals`
+    /// stays optional — rendered only when nonzero).
+    pub(crate) const UNKNOWN_ROW_KEYS_V10: [&str; 9] = [
+        "category",
+        "reason",
+        "unit",
+        "completed",
+        "failed",
+        "cancelled",
+        "unknown",
+        "active",
+        "mechanisms",
+    ];
+
+    /// The closed v10 unknown-row mechanism-entry keys.
+    pub(crate) const UNKNOWN_MECH_ROW_KEYS: [&str; 2] = ["id", "count"];
+
     /// Section keys for a v3 section: v1 keys plus `unattributed`
     /// beside the row buckets it counts beside.
     pub(crate) const SECTION_KEYS_V3: [&str; 11] = [
@@ -888,6 +914,14 @@ pub(crate) struct KeyAggRow {
     pub inferred: Option<crate::semantics_key_use::RowInference>,
 }
 
+/// One unknown-row mechanism id with its terminal count (v10):
+/// full-width numeric ids only — never names, bytes or payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnknownMechRow {
+    pub id: u64,
+    pub count: u64,
+}
+
 /// One capture-wide unknown-key summary row: terminals partitioned
 /// here once per primary operation role. Starts are never
 /// fabricated into the unknown bucket: there is no `started`.
@@ -901,6 +935,12 @@ pub(crate) struct UnknownAggRow {
     pub cancelled: u64,
     pub unknown: u64,
     pub active: u64,
+    /// Bounded mechanism ids in first-seen order (v10; empty below
+    /// v10 and on rows whose terminals carried no ids).
+    pub mechanisms: Vec<UnknownMechRow>,
+    /// Terminals past the eight listed ids (v10; renders only when
+    /// nonzero).
+    pub further_mechanism_terminals: u64,
 }
 
 /// One not-attributed counter: how many calls (or first-observed
@@ -1340,8 +1380,11 @@ fn size_detail_json(
 
 /// Render one unknown-key summary row: the exact frozen keys (no
 /// `started` — starts are never fabricated into the unknown bucket).
-pub(crate) fn unknown_row_json(row: &UnknownAggRow) -> serde_json::Value {
-    serde_json::json!({
+/// At v10 the required `mechanisms` array rides along (possibly
+/// empty) plus the overflow count when nonzero; below v10 the
+/// frozen eight keys render byte-stable.
+pub(crate) fn unknown_row_json(row: &UnknownAggRow, version: u8) -> serde_json::Value {
+    let mut rendered = serde_json::json!({
         "category": row.category,
         "reason": row.reason,
         "unit": row.unit,
@@ -1350,7 +1393,27 @@ pub(crate) fn unknown_row_json(row: &UnknownAggRow) -> serde_json::Value {
         "cancelled": row.cancelled,
         "unknown": row.unknown,
         "active": row.active,
-    })
+    });
+    if version >= OBSERVATIONS_VERSION_V10
+        && let Some(object) = rendered.as_object_mut()
+    {
+        object.insert(
+            "mechanisms".to_string(),
+            serde_json::Value::Array(
+                row.mechanisms
+                    .iter()
+                    .map(|entry| serde_json::json!({"id": entry.id, "count": entry.count}))
+                    .collect(),
+            ),
+        );
+        if row.further_mechanism_terminals > 0 {
+            object.insert(
+                "further_mechanism_terminals".to_string(),
+                serde_json::json!(row.further_mechanism_terminals),
+            );
+        }
+    }
+    rendered
 }
 
 /// Render one gap row: the exact frozen keys.
@@ -1556,7 +1619,18 @@ fn has_v7_gap_content(observations: &ObjectObservations) -> bool {
     })
 }
 
+/// v10 content: an unknown row carrying mechanism ids or
+/// overflow terminals.
+fn has_unknown_mechanism_content(observations: &ObjectObservations) -> bool {
+    observations.unknown_key_operations.iter().any(|row| {
+        !row.mechanisms.is_empty() || row.further_mechanism_terminals > 0
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if has_unknown_mechanism_content(observations) {
+        return OBSERVATIONS_VERSION_V10;
+    }
     if has_relaxed_content(observations) {
         return OBSERVATIONS_VERSION_V9;
     }
@@ -1617,7 +1691,7 @@ pub(crate) fn object_observations_json(observations: &ObjectObservations) -> ser
         "sessions": observations.sessions.iter().map(session_row_json).collect::<Vec<_>>(),
         "objects": observations.objects.iter().map(|row| object_row_json(row, version)).collect::<Vec<_>>(),
         "key_operations": observations.key_operations.iter().map(key_row_json).collect::<Vec<_>>(),
-        "unknown_key_operations": observations.unknown_key_operations.iter().map(unknown_row_json).collect::<Vec<_>>(),
+        "unknown_key_operations": observations.unknown_key_operations.iter().map(|row| unknown_row_json(row, version)).collect::<Vec<_>>(),
         "gaps": {
             "rows": observations.gaps.iter().map(gap_row_json).collect::<Vec<_>>(),
             "suppressed": observations.gaps_suppressed,
@@ -2034,6 +2108,14 @@ pub(crate) mod producer {
                 cancelled: counters.cancelled,
                 unknown: counters.unknown,
                 active: counters.active,
+                mechanisms: counters.mechs[..counters.mechs_len as usize]
+                    .iter()
+                    .map(|(id, count)| UnknownMechRow {
+                        id: *id,
+                        count: *count,
+                    })
+                    .collect(),
+                further_mechanism_terminals: counters.further_mechanism_terminals,
             });
         }
         unknown_rows.sort_by(|a, b| (a.category, a.reason).cmp(&(b.category, b.reason)));

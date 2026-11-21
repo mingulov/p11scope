@@ -2056,36 +2056,90 @@ fn key_provider_groups(
 
 /// Capture-wide unknown-key rows grouped by category with their sorted
 /// machine reasons (verbose only), never merged into a provider's
-/// tallies. Sorted by category.
+/// tallies. Sorted by category. Mechanism ids merge across the
+/// category's rows (counts add per id); overflow terminals add.
 fn unknown_keys_tallies(
     observations: &crate::key_operation_projection::ObjectObservations,
-) -> Vec<(KeyOpTally, Vec<&'static str>)> {
+) -> Vec<(
+    KeyOpTally,
+    Vec<&'static str>,
+    std::collections::BTreeMap<u64, u64>,
+    u64,
+)> {
     use std::collections::{BTreeMap, BTreeSet};
-    let mut categories: BTreeMap<&str, (u64, u64, u64, &str, BTreeSet<&str>)> = BTreeMap::new();
+    let mut categories: BTreeMap<&str, (u64, u64, u64, &str, BTreeSet<&str>, BTreeMap<u64, u64>, u64)> =
+        BTreeMap::new();
     for row in &observations.unknown_key_operations {
-        let slot = categories
-            .entry(row.category)
-            .or_insert((0, 0, 0, row.unit, BTreeSet::new()));
+        let slot = categories.entry(row.category).or_insert_with(|| {
+            (
+                0,
+                0,
+                0,
+                row.unit,
+                BTreeSet::new(),
+                BTreeMap::new(),
+                0,
+            )
+        });
         slot.0 = slot.0.saturating_add(row.completed);
         slot.1 = slot.1.saturating_add(row.failed);
         slot.2 = slot.2.saturating_add(row.active);
         slot.4.insert(row.reason);
+        for entry in &row.mechanisms {
+            slot.5
+                .entry(entry.id)
+                .and_modify(|count| *count = count.saturating_add(entry.count))
+                .or_insert(entry.count);
+        }
+        slot.6 = slot
+            .6
+            .saturating_add(row.further_mechanism_terminals);
     }
     categories
         .into_iter()
-        .map(|(category, (completed, failed, active, unit, reasons))| {
-            (
-                KeyOpTally {
-                    category,
-                    completed,
-                    failed,
-                    active,
-                    unit,
-                },
-                reasons.into_iter().collect(),
-            )
-        })
+        .map(
+            |(category, (completed, failed, active, unit, reasons, mechs, further))| {
+                (
+                    KeyOpTally {
+                        category,
+                        completed,
+                        failed,
+                        active,
+                        unit,
+                    },
+                    reasons.into_iter().collect(),
+                    mechs,
+                    further,
+                )
+            },
+        )
         .collect()
+}
+
+/// The verbose unknown-line mechanism suffix (controller ruling fix2,
+/// F3): merged ids by count then id, at most eight, with honest
+/// overflow trailers. `None` when no row carried an id.
+fn unknown_mechs_suffix(
+    mechs: &std::collections::BTreeMap<u64, u64>,
+    further_terminals: u64,
+) -> Option<String> {
+    if mechs.is_empty() && further_terminals == 0 {
+        return None;
+    }
+    let mut ids: Vec<(u64, u64)> = mechs.iter().map(|(id, count)| (*id, *count)).collect();
+    ids.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut parts: Vec<String> = ids
+        .iter()
+        .take(8)
+        .map(|(id, count)| format!("0x{id:x}: {count}"))
+        .collect();
+    if ids.len() > 8 {
+        parts.push(format!("+{} further", ids.len() - 8));
+    }
+    if further_terminals > 0 {
+        parts.push(format!("+{further_terminals} unlisted"));
+    }
+    Some(format!("; mechs {}", parts.join(", ")))
 }
 
 /// One per-category tally segment: what happened to the call, not an
@@ -4815,9 +4869,13 @@ fn render_snapshot_inner(
                     );
                 }
             }
-            for (tally, reasons) in &unknown {
+            for (tally, reasons, mechs, further) in &unknown {
                 let suffix = if verbose {
-                    format!(" ({})", reasons.join(", "))
+                    format!(
+                        " ({}{})",
+                        reasons.join(", "),
+                        unknown_mechs_suffix(mechs, *further).unwrap_or_default()
+                    )
                 } else {
                     String::new()
                 };

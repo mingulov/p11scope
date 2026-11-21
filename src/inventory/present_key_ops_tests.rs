@@ -88,6 +88,8 @@ fn unknown_row(
         cancelled: 0,
         unknown: 0,
         active,
+        mechanisms: Vec::new(),
+        further_mechanism_terminals: 0,
     }
 }
 

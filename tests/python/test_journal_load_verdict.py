@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -493,6 +494,43 @@ class RefusalFormTests(unittest.TestCase):
                         "inspect --pid N' for a scan without capture.")
                 self.assertEqual(verdict.live_refusal_form(line), "did not start")
 
+    @staticmethod
+    def did_not_start(errno_text):
+        return ("p11scope: inventory --system: live capture did not start: "
+                f"loading p11scope's BPF programs failed{errno_text}; run "
+                "'p11scope doctor' for host readiness, or use 'p11scope "
+                "inventory --capture scan' or 'p11scope inspect --pid N' for "
+                "a scan without capture.")
+
+    def test_punctuated_errno_names_fit_by_literal(self):
+        # The two Linux names whose glibc rendering leaves the plain
+        # errno class: ELIBSCN (81) starts with `.`, ETOOMANYREFS (109)
+        # carries `:`. Pinned as literals, independent of the host libc.
+        for name in (".lib section in a.out corrupted",
+                     "Too many references: cannot splice"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    verdict.live_refusal_form(self.did_not_start(f" ({name})")),
+                    "did not start")
+
+    def test_malformed_errno_text_is_not_a_form(self):
+        # Fail closed inside the errno group: only the plain class and
+        # the two exact punctuated names fit. Each twin is one edit off
+        # a real rendering or a bare punctuation fragment.
+        for bad in ("(.)", "(Invalid argument:)", "(.lib)", "(:)",
+                    "(Invalid: argument)", "(.Invalid argument)",
+                    "(.lib section in a.out corrupted.)",
+                    "(.lib section in a.out corrupte)",
+                    "( .lib section in a.out corrupted)",
+                    "(Too many references: cannot splice:)",
+                    "(Too many references: cannot splic)",
+                    "(Too many references:: cannot splice)",
+                    "(Too many references; cannot splice)",
+                    "(too many references: cannot splice)"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(
+                    verdict.live_refusal_form(self.did_not_start(" " + bad)))
+
     def test_observed_guest_refusal_is_a_form(self):
         # The exact line 6.1.188 and 5.15.221 guests printed for the
         # gate's command (real vng run of a dev-tip observer).
@@ -504,6 +542,39 @@ class RefusalFormTests(unittest.TestCase):
         self.assertEqual(verdict.live_refusal_form(observed), "did not start")
         self.assertIsNone(verdict.live_refusal_form(
             observed.replace("p11scope: inventory --system: ", "p11scope: ")))
+
+
+class PairCountTests(unittest.TestCase):
+    """The incomplete-pair reason counts the roots that did not load."""
+
+    def reasons(self, rows, key_sizes):
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "probe.jsonl"
+            path.write_bytes(stream(rows))
+            probe = verdict.ProbeEvidence(path)
+            self.assertTrue(probe.valid, probe.problems)
+            args = types.SimpleNamespace(
+                key_sizes=key_sizes, object="journal", kernel=KERNEL,
+                budgets=None, probe=str(path), observer_sha256="0" * 64)
+            reasons, _detail, _table = verdict.load_verdict(
+                args, 0, verdict.ObserverText(None), probe, None)
+        return [reason for reason in reasons if "journal pair" in reason]
+
+    def test_one_of_two_roots_missing(self):
+        rows = [load_row("p11_entry_journal"), load_row("p11_image_query")]
+        self.assertEqual(self.reasons(rows, "0"),
+                         ["journal pair incomplete (1 of 2 roots missing)"])
+
+    def test_three_of_four_roots_missing(self):
+        # The sized pair adds the two length roots; one loaded root of
+        # four is three missing, not "one".
+        rows = [load_row("p11_entry_journal"), load_row("p11_image_query")]
+        self.assertEqual(self.reasons(rows, "1"),
+                         ["journal pair incomplete (3 of 4 roots missing)"])
+
+    def test_no_root_loaded_is_missing_not_incomplete(self):
+        self.assertEqual(self.reasons([load_row("p11_image_query")], "0"),
+                         ["journal pair missing from probe rows"])
 
 
 if __name__ == "__main__":

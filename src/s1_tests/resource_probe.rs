@@ -902,10 +902,14 @@ fn native_semantic_resource_final_types_pinned() {
     // +8 (Task 7 hazard refusal gap): one more u64 section gap —
     // info endpoints downgraded by the uretprobe-vs-seccomp refusal
     // (2 x 24 + 9 x 8 = 120).
+    // +16 (run-wide unbound fold): the retained pid Vec becomes the
+    // bounded exe-group Vec (24 B for 24 B) plus the two folded
+    // overflow counters (2 x 8 B).
     pin!(
         crate::inventory_present::Presentation,
         1384 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 5 * size_of::<Vec<u8>>()
+            + 2 * size_of::<u64>()
             // a2 re-arm rate: joint_audit_subjects
             + size_of::<
                 Option<

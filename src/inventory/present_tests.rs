@@ -7757,6 +7757,273 @@ fn snapshot_ceiling_fold_sums_repeats_at_first_position_with_bare_singleton() {
     );
 }
 
+/// Concise ceiling anchors bound ranked intervals: each ordinary group
+/// belongs to the interval its first row falls in (the folded ceiling
+/// rows are the boundaries), ranks only within that interval, and the
+/// merged sequence shares one cap. An earlier-source group whose rank
+/// sorts later (`z-early` after `a-late` by subject) still reads ahead
+/// of the ceiling it preceded, and a run of ceilings between two
+/// ordinary groups never takes the earlier group's slot.
+#[test]
+fn concise_ceiling_anchors_rank_ordinary_groups_within_their_interval() {
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    let ordinary = |harness: &mut Harness, subject: &str| {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: subject.into(),
+                reason: format!("{subject} reason"),
+                budget: None,
+            });
+    };
+    let ceiling = |harness: &mut Harness, subject: &str| {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(1000),
+                subject: subject.into(),
+                reason: WORK_CEILING_REASON.into(),
+                budget: None,
+            });
+    };
+    let concise = |harness: &Harness| {
+        let document = harness.render();
+        let presentation = capture_for(harness, &document);
+        render_snapshot(&presentation)
+    };
+    let block = |snapshot: &str, header: &str, len: usize| -> Vec<String> {
+        let lines: Vec<&str> = snapshot.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| *line == header)
+            .unwrap_or_else(|| panic!("missing {header}: {snapshot}"));
+        lines[at..(at + len).min(lines.len())]
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    };
+    // Rank inversion: source order z-early, ceiling, a-late.
+    let (mut inverted, _caller) = single_caller_harness("present-ceiling-interval", 1);
+    ordinary(&mut inverted, "z-early");
+    ceiling(&mut inverted, "libprovider.so");
+    ordinary(&mut inverted, "a-late");
+    inverted.commit();
+    let snapshot = concise(&inverted);
+    assert_eq!(
+        block(&snapshot, "gaps: 3", 4),
+        [
+            "gaps: 3",
+            "  1 x z-early - z-early reason",
+            "  libprovider.so - scan budget exhausted",
+            "  1 x a-late - a-late reason",
+        ],
+        "an earlier-source group keeps its place ahead of the ceiling: {snapshot}"
+    );
+    // Within one interval the existing rank still applies.
+    let (mut ranked, _caller) = single_caller_harness("present-ceiling-interval-rank", 1);
+    ordinary(&mut ranked, "z-early");
+    ordinary(&mut ranked, "m-early");
+    ceiling(&mut ranked, "libprovider.so");
+    ordinary(&mut ranked, "y-late");
+    ordinary(&mut ranked, "b-late");
+    ranked.commit();
+    let snapshot = concise(&ranked);
+    assert_eq!(
+        block(&snapshot, "gaps: 5", 6),
+        [
+            "gaps: 5",
+            "  1 x m-early - m-early reason",
+            "  1 x z-early - z-early reason",
+            "  libprovider.so - scan budget exhausted",
+            "  1 x b-late - b-late reason",
+            "  1 x y-late - y-late reason",
+        ],
+        "each interval ranks its own groups: {snapshot}"
+    );
+    // A group with rows on both sides of a ceiling aggregates once, in
+    // the interval of its first row.
+    let (mut straddle, _caller) = single_caller_harness("present-ceiling-interval-straddle", 1);
+    ordinary(&mut straddle, "z-early");
+    ceiling(&mut straddle, "libprovider.so");
+    straddle
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(42),
+            subject: "z-early".into(),
+            reason: "z-early reason".into(),
+            budget: None,
+        });
+    ordinary(&mut straddle, "a-late");
+    straddle.commit();
+    let snapshot = concise(&straddle);
+    assert_eq!(
+        block(&snapshot, "gaps: 4", 4),
+        [
+            "gaps: 4",
+            "  2 x z-early - z-early reason",
+            "  libprovider.so - scan budget exhausted",
+            "  1 x a-late - a-late reason",
+        ],
+        "a straddling group reads once at its first interval: {snapshot}"
+    );
+    // Twenty ceilings between the two groups: the earlier group keeps
+    // its slot, the cap cuts the ceiling run, and the remainder names
+    // the rest.
+    let (mut capped, _caller) = single_caller_harness("present-ceiling-interval-cap", 1);
+    ordinary(&mut capped, "z-early");
+    for index in 0..20 {
+        ceiling(&mut capped, &format!("ceil-{index:02}.so"));
+    }
+    ordinary(&mut capped, "a-late");
+    capped.commit();
+    let snapshot = concise(&capped);
+    let mut expected = vec![
+        "gaps: 22".to_string(),
+        "  1 x z-early - z-early reason".to_string(),
+    ];
+    for index in 0..19 {
+        expected.push(format!("  ceil-{index:02}.so - scan budget exhausted"));
+    }
+    expected.push("  and 2 more groups (--json has every item)".to_string());
+    assert_eq!(
+        block(&snapshot, "gaps: 22", expected.len()),
+        expected,
+        "the earlier group keeps its slot under the shared cap: {snapshot}"
+    );
+}
+
+/// The member filter drops the pin's own wrapped stops: the real
+/// mount-table producer wraps a budget stop met while pinning as
+/// `cannot read pid <pid>'s mount table: <stop>`, and that row is a
+/// pass-budget stop like the bare and scan-refusal shapes. While the
+/// member still scans, both stop values drop and the no-table
+/// diagnosis (whose path contains the stop sentence) plus an unrelated
+/// control survive; another pid's wrapper is not this member's stop
+/// and stays. Without an unfinished cursor every row stays verbatim.
+#[test]
+fn member_continuation_filter_drops_pin_mount_table_stops() {
+    use crate::discovery::scan::{COLLECTION_STOP_REASON, WORK_CEILING_REASON};
+    use crate::inspect_system::PidGap;
+    let file = std::fs::File::open("/bin/sh").unwrap();
+    let key = crate::discovery::scan_pass::DecodeCursorKey {
+        pid: 2000,
+        start_time: 9,
+        file: crate::discovery::scan::InspectedFileKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 11,
+            pin: crate::discovery::identity::pin_of(&file).unwrap(),
+            fd_dev: 7,
+        },
+        exec: None,
+    };
+    let cursor = crate::discovery::scan_pass::DecodeCursor {
+        fingerprint: Vec::new(),
+        tables: crate::discovery::scan_pass::SweepFrontier {
+            snapshot: 0,
+            word: 0,
+        },
+        interfaces: crate::discovery::scan_pass::SweepFrontier {
+            snapshot: 0,
+            word: 0,
+        },
+        anchors: None,
+        cached_tables: Vec::new(),
+        cached_interfaces: Vec::new(),
+        unlinked: Vec::new(),
+        targets: Vec::new(),
+        complete: false,
+        validated: false,
+        seq: 0,
+    };
+    let tricky_path = format!("/tmp/evil/{WORK_CEILING_REASON}/libprovider.so");
+    let tricky_reason = crate::discovery::scan::no_table_found_reason(&tricky_path, false);
+    for stop in [WORK_CEILING_REASON, COLLECTION_STOP_REASON] {
+        // The real pin-time producer, met with this stop latched.
+        let pin_stop = |pid: u32| {
+            let mut stopped = crate::discovery::scan::CaptureWorkBudget::default()
+                .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+            stopped.pass_owner().set_scan_stop(stop);
+            crate::process::read_view_mountinfo(pid, &mut stopped, || {
+                std::fs::File::open("/proc/self/mountinfo")
+            })
+            .expect_err("a latched stop refuses the mount-table read")
+        };
+        let own = pin_stop(2000);
+        let foreign = pin_stop(2001);
+        assert_eq!(own, format!("cannot read pid 2000's mount table: {stop}"));
+        let member_gaps = || {
+            vec![
+                PidGap {
+                    pid: Some(2000),
+                    subject: "/usr/lib/libprovider.so".into(),
+                    reason: own.clone(),
+                    generic: false,
+                },
+                PidGap {
+                    pid: Some(2000),
+                    subject: "/usr/lib/libother.so".into(),
+                    reason: foreign.clone(),
+                    generic: false,
+                },
+                PidGap {
+                    pid: Some(2000),
+                    subject: tricky_path.clone(),
+                    reason: tricky_reason.clone(),
+                    generic: false,
+                },
+                PidGap {
+                    pid: Some(2000),
+                    subject: "unrelated-a".into(),
+                    reason: "unrelated reason a".into(),
+                    generic: false,
+                },
+            ]
+        };
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(key.clone(), cursor.clone()));
+        let mut gaps = member_gaps();
+        crate::inspect_system::retain_member_gaps_while_unfinished(
+            &mut gaps,
+            &budget,
+            2000,
+            Some(9),
+        );
+        assert_eq!(
+            gaps.iter()
+                .map(|gap| gap.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/usr/lib/libother.so", tricky_path.as_str(), "unrelated-a"],
+            "{stop}: the pin's own stop drops; the diagnosis, the foreign \
+             wrapper and the control stay: {gaps:?}"
+        );
+        let quiet = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        let mut stalled = member_gaps();
+        crate::inspect_system::retain_member_gaps_while_unfinished(
+            &mut stalled,
+            &quiet,
+            2000,
+            Some(9),
+        );
+        assert_eq!(
+            stalled,
+            member_gaps(),
+            "{stop}: a stalled member keeps every row verbatim"
+        );
+    }
+}
+
 /// The ceiling fold maps the exact internal wordings only: the bare
 /// work-ceiling sentence and its scan-refusal wrappings fold;
 /// near misses (the deadline twin, a bare prefix, unrelated

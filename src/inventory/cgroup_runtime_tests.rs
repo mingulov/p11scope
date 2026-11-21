@@ -1661,6 +1661,110 @@ fn cgroup_snapshot_resume_converges_across_healthy_multi_pass_advance() {
     );
 }
 
+/// Recurring layouts under fixed keys stall: two cursors whose layouts
+/// change and later recur (bounds, offsets or permissions remapped
+/// under the same generation, pin and image) keep the covered ground of
+/// every layout they visited. The first circuit grants while each
+/// (identity, layout) pair still has uncovered ground; every later
+/// circuit revisits covered frontiers only and stalls in both
+/// directions, so one cursor's restart never pays for another's.
+#[test]
+fn cgroup_snapshot_resume_refuses_recurring_layout_cycles() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    for swapped in [false, true] {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+        driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+        let k1 = resume_key(7, 9, 11);
+        let k2 = resume_key(7, 9, 12);
+        let at = |a: (u64, u64), b: (u64, u64)| {
+            let (a, b) = if swapped { (b, a) } else { (a, b) };
+            resume_position(vec![
+                (k1.clone(), resume_progress(a.0, (0, a.1), (0, 0), 4, false)),
+                (k2.clone(), resume_progress(b.0, (0, b.1), (0, 0), 4, false)),
+            ])
+        };
+        let circuit = [
+            at((100, 900), (100, 950)),
+            at((100, 950), (200, 900)),
+            at((200, 900), (200, 950)),
+            at((200, 950), (100, 900)),
+        ];
+        let first: Vec<bool> = circuit
+            .iter()
+            .map(|position| pass_resume(&mut driver.inner, position.clone()))
+            .collect();
+        assert_eq!(
+            first,
+            [true, true, true, true],
+            "swapped={swapped}: the first circuit grants uncovered ground only"
+        );
+        for round in 0..8 {
+            for (step, position) in circuit.iter().enumerate() {
+                assert!(
+                    !pass_resume(&mut driver.inner, position.clone()),
+                    "swapped={swapped} round {round} step {step}: a recurring layout \
+                     revisits covered ground and must stall"
+                );
+            }
+        }
+    }
+}
+
+/// A completed sweep stays covered across the settle pass: a cursor
+/// that completes (granting the one settle pass) and then restarts
+/// under the same identity and layout — a re-proof invalidation —
+/// re-scans ground an earlier pass already finished, so neither the
+/// restart nor its later frontiers grant another pass.
+#[test]
+fn cgroup_snapshot_resume_keeps_completed_sweeps_covered_across_settle() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let k1 = resume_key(7, 9, 11);
+    assert!(
+        pass_resume(
+            &mut driver.inner,
+            resume_position(vec![(
+                k1.clone(),
+                resume_progress(100, (0, 900), (0, 0), 4, false)
+            )]),
+        ),
+        "the first unfinished pass resumes"
+    );
+    assert!(
+        pass_resume(
+            &mut driver.inner,
+            resume_position(vec![(
+                k1.clone(),
+                resume_progress(100, (0, 900), (0, 0), 4, true)
+            )]),
+        ),
+        "the completed scan gets its one settle pass"
+    );
+    for word in [950, 960, 5000] {
+        assert!(
+            !pass_resume(
+                &mut driver.inner,
+                resume_position(vec![(
+                    k1.clone(),
+                    resume_progress(100, (0, word), (0, 0), 4, false)
+                )]),
+            ),
+            "a restart over a completed sweep (word {word}) must not grant"
+        );
+    }
+}
+
 #[test]
 fn cgroup_runtime_published_targets_extend_after_scoped_commit_then_receipt_commit() {
     let (_fixture, _child, mut coordinator) = cgroup_provider_scene();

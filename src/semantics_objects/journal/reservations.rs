@@ -382,12 +382,6 @@ pub(super) struct ReservationTable<C> {
     /// the accessor-only test forbids).
     #[cfg(test)]
     test_leaf_reads: std::cell::Cell<usize>,
-    /// Test-only unbudgeted-read counter (RED scaffolding, fix round
-    /// 5): slot vacancy/alias re-reads the sweep and single release
-    /// perform without a debit. Read only by the round-5 gate twin;
-    /// the snapshot fold removes these reads (and their bumps).
-    #[cfg(test)]
-    test_unbudgeted_reads: std::cell::Cell<usize>,
     /// Test-only sync-walk counter: head/inspect/next/link reads of
     /// the synchronous lookup paths (`key_slot`, `id_slot`, free
     /// search/pop), counted with budgeted-split semantics (1 head +
@@ -431,8 +425,6 @@ impl<C> ReservationTable<C> {
             test_slot_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             test_leaf_reads: std::cell::Cell::new(0),
-            #[cfg(test)]
-            test_unbudgeted_reads: std::cell::Cell::new(0),
             #[cfg(test)]
             test_preflight_reads: std::cell::Cell::new(0),
         })
@@ -756,18 +748,6 @@ impl<C> ReservationTable<C> {
     #[cfg(test)]
     pub(super) fn reset_test_leaf_reads_for_test(&self) {
         self.test_leaf_reads.set(0);
-    }
-
-    /// Test-only read of the unbudgeted-read counter.
-    #[cfg(test)]
-    pub(super) fn test_unbudgeted_reads_for_test(&self) -> usize {
-        self.test_unbudgeted_reads.get()
-    }
-
-    /// Test-only reset of the unbudgeted-read counter.
-    #[cfg(test)]
-    pub(super) fn reset_test_unbudgeted_reads_for_test(&self) {
-        self.test_unbudgeted_reads.set(0);
     }
 
     /// Test-only read of the sync-walk counter.

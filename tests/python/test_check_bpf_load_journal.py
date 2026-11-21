@@ -312,11 +312,15 @@ if name=='observer':
         print('unsafe inherited TMPDIR',file=sys.stderr);sys.exit(8)
     mode=os.environ.get('FAKE_MODE','linked')
     rows=json.loads((root/'rows.json').read_text())[mode]
-    for row in rows: os.write(9,(json.dumps(row)+'\n').encode())
-    os.write(9,(json.dumps({'record':'probe-summary','pid':111,'records':len(rows),'write_failures':0,'overflow':False})+'\n').encode())
-    corrupt=os.environ.get('FAKE_PROBE_CORRUPT')
-    if corrupt=='nul': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}\x00trailing\n')
-    elif corrupt=='printable': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}trailing\n')
+    if not os.environ.get('FAKE_PROBE_EMPTY'):
+        for row in rows: os.write(9,(json.dumps(row)+'\n').encode())
+        os.write(9,(json.dumps({'record':'probe-summary','pid':111,'records':len(rows),'write_failures':0,'overflow':False})+'\n').encode())
+        if os.environ.get('FAKE_PROBE_ERROR'): os.write(9,b'{\"record\": \"probe-error\", \"reason\": \"fixture error\"}\n')
+        corrupt=os.environ.get('FAKE_PROBE_CORRUPT')
+        if corrupt=='nul': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}\x00trailing\n')
+        elif corrupt=='printable': os.write(9,b'{\"record\": \"load\", \"root\": \"p11_entry_journal\", \"loaded\": true}trailing\n')
+        elif corrupt=='ff': os.write(9,b'\xff\n')
+        elif corrupt=='nonobject': os.write(9,b'[]\n')
     texts=json.loads((root/'texts.json').read_text())
     sys.stdout.write(texts[mode]['text'])
     sys.exit(texts[mode]['rc'])
@@ -1364,6 +1368,89 @@ class JournalGateTests(unittest.TestCase):
         result, out = self.run_gate(
             KERNEL, mode="refused-noseal-loaded",
             extra={"FAKE_PROBE_CORRUPT": "printable"},
+            expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertIn("although the build omits the object", row["detail"])
+
+    def test_refusal_control_with_empty_probe_fails(self):
+        # Pre-Multi empty: no probe rows at all proves no loads, so
+        # the control must refuse instead of qualifying as no loads.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515",
+            extra={"FAKE_PROBE_EMPTY": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+
+    def test_omitted_build_with_empty_probe_fails(self):
+        # Omitted-build empty: no probe rows at all proves no loads,
+        # so the control must refuse instead of qualifying as no
+        # loads.
+        result, out = self.run_gate(
+            KERNEL, mode="refused-noseal",
+            extra={"FAKE_PROBE_EMPTY": "1"},
+            expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+
+    def test_refusal_control_with_probe_error_fails(self):
+        # Pre-Multi probe-error: a probe-error record means the run
+        # never finished, so the control must refuse instead of
+        # qualifying as no loads.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515",
+            extra={"FAKE_PROBE_ERROR": "1"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+
+    def test_omitted_build_with_probe_error_fails(self):
+        # Omitted-build probe-error: a probe-error record means the
+        # run never finished, so the control must refuse instead of
+        # qualifying as no loads.
+        result, out = self.run_gate(
+            KERNEL, mode="refused-noseal",
+            extra={"FAKE_PROBE_ERROR": "1"},
+            expect_journal="0")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+
+    def test_refusal_control_with_nonascii_suffix_retains_loads(self):
+        # Pre-Multi non-ASCII suffix: loaded rows plus a raw 0xff
+        # byte must refuse qualification and preserve the confirmed
+        # load evidence, never erase it into a valid no-load claim.
+        result, out = self.run_gate(
+            CONTROL_KERNEL, mode="refusal-515-loaded",
+            extra={"FAKE_PROBE_CORRUPT": "ff"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertFalse(row["pass"])
+        self.assertEqual(row["qualification"], "failed")
+        self.assertIn("unreadable or corrupt", row["detail"])
+        self.assertIn("journal pair loaded", row["detail"])
+
+    def test_omitted_build_with_nonobject_suffix_retains_loads(self):
+        # Omitted-build non-object suffix: loaded rows plus a valid
+        # non-object JSON row must refuse qualification and preserve
+        # the confirmed load evidence, never erase it into a valid
+        # no-load claim.
+        result, out = self.run_gate(
+            KERNEL, mode="refused-noseal-loaded",
+            extra={"FAKE_PROBE_CORRUPT": "nonobject"},
             expect_journal="0")
         self.assertEqual(result.returncode, 1, result.stdout)
         (row,) = self.read_rows(out)

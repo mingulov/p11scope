@@ -46,7 +46,7 @@ name order and the namespace must exist first.
 ## Deploy and capture
 
 `20-daemonset.yaml` points at the published observer image
-(`ghcr.io/mingulov/p11scope:0.7.1`, pulled from the registry), so deploying
+(`ghcr.io/mingulov/p11scope:0.7.2`, pulled from the registry), so deploying
 is one apply:
 
 ```sh

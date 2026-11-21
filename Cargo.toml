@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 [package]
 name = "p11scope"
-version = "0.7.1"
+version = "0.7.2"
 authors = ["Denis Mingulov <denis@mingulov.com>"]
 edition = "2024"
 rust-version = "1.99"
@@ -50,7 +50,7 @@ unicode-width = { version = "=0.2.2", default-features = false }
 
 [dev-dependencies]
 jsonschema = { version = "0.60", default-features = false }
-p11scope-discover = { version = "0.7.1", path = "crates/discover" }
+p11scope-discover = { version = "0.7.2", path = "crates/discover" }
 sha2 = "=0.11.0"
 tempfile = "3"
 

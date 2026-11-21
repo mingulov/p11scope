@@ -10,8 +10,9 @@ provider or changing each application's configuration**.
 mechanisms, how fast, what errors": eBPF uprobes observe the providers already
 mapped by running processes, so there is no shim to install and no restart.
 
-> **Status: v0.7.1** answers "which application used which key, and how", with opt-in
-> live key operations (`inventory --key-operations`), streaming inventory events
+> **Status: v0.7.2** answers "which application used which key, and how", with opt-in
+> live key operations (`inventory --key-operations`) now carrying inferred key families,
+> opt-in sizes (`--key-sizes`) and creation-template curves, streaming inventory events
 > (`--event-log -` with `--event-interval`), and a published observer image
 > (`ghcr.io/mingulov/p11scope:latest`). Read the [known
 > limitations](CHANGELOG.md#known-limitations) before relying on a capture;
@@ -91,7 +92,7 @@ named miss — wrap such tools in `sudo p11scope run --user $USER --
 <tool>` (or pass `--prearm-module PATH`) when first-run coverage
 matters.
 
-`doctor` reports host readiness (real output, v0.7.1 on Ubuntu 26.04):
+`doctor` reports host readiness (real output, v0.7.2 on Ubuntu 26.04):
 
 ```
 Doctor: requested-lane checks passed.

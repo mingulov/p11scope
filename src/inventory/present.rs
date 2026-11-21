@@ -3512,8 +3512,7 @@ fn concise_gap_summary_block(gaps: &[GapView], modules: &[ModuleView]) -> Vec<St
     if groups.is_empty() && ceiling.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<((String, String), OrdinaryGapGroup)> =
-        groups.into_iter().collect();
+    let mut ranked: Vec<((String, String), OrdinaryGapGroup)> = groups.into_iter().collect();
     ranked.sort_by(|left, right| {
         // `Option` orders `None` below every `Some`, so a missing
         // rank maps to last place explicitly.

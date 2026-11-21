@@ -1571,17 +1571,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             let Some(entry) = entry else {
                 let receipt = &batch.current[current];
-                // A sighting retry without its admission repeats the
-                // condition the key's New already disclosed once.
-                if receipt.birth_retry() {
-                    continue;
-                }
                 association[first].refusal = Some((
                     self.semantic_bindings
                         .find_by_image(batch.domain, receipt.image())
                         .map(|binding| binding.caller()),
                     BirthRefusal::NoAdmission,
                 ));
+                association[first].deferred = retry_without_admission_deferral(
+                    receipt.birth_retry(),
+                    receipt.image(),
+                    receipt.endpoint().file_slot,
+                );
                 continue;
             };
             let Some(Ok(input)) = batch.entries[entry].input.as_ref() else {

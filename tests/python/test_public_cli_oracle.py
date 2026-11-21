@@ -1041,8 +1041,10 @@ class RunnerNoiseTests(unittest.TestCase):
 
     def test_exit_ambient_with_single_exit_passes_on_system_in_strict_mode(self):
         # The narrow single-transient shape: one ambient exit, no
-        # deferral, exact counts. This is the quiet-runner CI shape (a
-        # lone short-lived exit in an otherwise exact window).
+        # deferral, exact counts. This is the inferred quiet-runner CI
+        # shape (a lone short-lived exit in an otherwise exact window;
+        # the attempt-1 CI JSON is unrecoverable, so the instance is
+        # inferred from local reproductions, not proven).
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [
                 {"name": "discovery subject", "reason": "process exited mid-flight"},
@@ -1100,6 +1102,48 @@ class RunnerNoiseTests(unittest.TestCase):
             d["functions"][0]["calls"] = 499
         result = self.run_case(mutate, cell="system", want=1)
         self.assertIn("owned target count differs", result["detail"])
+
+    def test_exit_ambient_passes_on_system_when_allowed(self):
+        # Relaxed disclosure twin of the strict mixed pass: the hosted
+        # host leg runs `system` with --allow-pid-descendant-gaps, so
+        # an accepted exit/deferral mix must keep the runner-noise
+        # qualification and name both row counts in its detail. An
+        # undisclosed exit row (missing mid_flight_exits) fails here.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+                {"name": "discovery subject", "reason": "discovery unavailable"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system",
+                               allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("mid_flight_exits=3", result["detail"])
+        self.assertIn("discovery_skips=2", result["detail"])
+
+    def test_exit_ambient_with_single_exit_passes_on_system_when_allowed(self):
+        # Relaxed disclosure twin of the strict single-exit pass: a
+        # pure ambient exit under the flag must not qualify as plain
+        # owned-provider-counts; it keeps the runner-noise
+        # qualification and names the exit count.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "process exited mid-flight"},
+            ]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system",
+                               allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-runner-noise")
+        self.assertIn("mid_flight_exits=1", result["detail"])
 
     def test_loader_quiet_passes_on_mt_system_in_strict_mode(self):
         # K1 (v0.8.0 integration): a short-lived workload view recorded

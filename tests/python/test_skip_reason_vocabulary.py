@@ -22,6 +22,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+ORACLE = runpy.run_path(str(ROOT / "scripts/public-cli-oracle.py"))
 RENDER_RS = ROOT / "src" / "render.rs"
 SCHEMA_DOC = ROOT / "docs" / "schema" / "observed-profile-v2.md"
 
@@ -194,6 +195,19 @@ class SkipReasonVocabularyTests(unittest.TestCase):
         doc = SCHEMA_DOC.read_text(encoding="utf-8")
         for reason in sorted(entry | discovery | run_tree | learned):
             self.assertIn(reason, doc, f"schema doc omits {reason!r}")
+
+    def test_oracle_skip_constants_match_canonical_vocabulary(self):
+        # The public-cli oracle names two discovery-skip rows (the
+        # disclosable deferral and the v0.8.0 exit-ambient row); a
+        # drift between its hardcoded copies and the producer
+        # vocabulary would fail closed (safe) but silently stop
+        # qualifying, so pin both rows to the canonical subject and
+        # discovery reasons.
+        _, discovery, _, _ = producer_reasons()
+        for key in ("DISCLOSABLE_DISCOVERY_SKIP", "EXIT_MID_FLIGHT_SKIP"):
+            row = ORACLE[key]
+            self.assertEqual(row["name"], CHECKER["DISCOVERY_SUBJECT"], key)
+            self.assertIn(row["reason"], discovery, key)
 
 
 if __name__ == "__main__":

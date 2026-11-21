@@ -763,9 +763,8 @@ impl StagingLedger {
                     // list or the gate is touched (mirroring the
                     // synchronous charge path): a reserve refusal
                     // consumes no leaf and leaks no slot.
-                    let Some(lease_bytes) = cursor
-                        .bytes_usize
-                        .checked_add(OWNED_ALLOCATION_PADDING)
+                    let Some(lease_bytes) =
+                        cursor.bytes_usize.checked_add(OWNED_ALLOCATION_PADDING)
                     else {
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     };
@@ -1341,11 +1340,7 @@ mod tests {
             matches!(outcome, MintStepOutcome::Done(Ok(1))),
             "the retry commits the retained walk"
         );
-        assert_eq!(
-            gate.spent(),
-            3,
-            "pop plus two link heads, with no re-walk"
-        );
+        assert_eq!(gate.spent(), 3, "pop plus two link heads, with no re-walk");
         assert_eq!(fallback.test_leaf_reads_for_test(), 3);
         assert_eq!(fallback.census(), 1);
     }

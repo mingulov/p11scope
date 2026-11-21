@@ -14744,8 +14744,15 @@ mod tests {
         use super::loads_with_multi_flag;
         // The journal twins load with expected_attach_type=48 under multi so
         // one program can own the group's return/entry links, exactly like
-        // the ordinary static endpoint twins they replace.
-        for program in ["p11_entry_journal", "p11_return_journal"] {
+        // the ordinary static endpoint twins they replace. The length twins
+        // (keymeta Task 2) load multi beside the base pair under the same
+        // STACK_GUARD rule.
+        for program in [
+            "p11_entry_journal",
+            "p11_return_journal",
+            "p11_entry_journal_length",
+            "p11_return_journal_length",
+        ] {
             for dynamic_multi in [false, true] {
                 assert!(
                     loads_with_multi_flag(AttachBackend::Multi, program, dynamic_multi),

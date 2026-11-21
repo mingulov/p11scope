@@ -1627,9 +1627,13 @@ MULTI_LOADED_PROGRAMS = frozenset({
 # journal_pair_takes_the_multi_load_flag in src/attach.rs), so they
 # reference STACK_GUARD, never TAIL_CALLS. Kept beside the ordinary set
 # above, which the object-checker cross-pin derives from the
-# ordinary/inventory loaders alone.
+# ordinary/inventory loaders alone. Keymeta Task 2 spec 8.6: the length
+# twins load multi beside the base pair under the same STACK_GUARD rule
+# (static_probe_side resolves both roots, so loads_with_multi_flag holds;
+# P0 compiles the twins out, so the rule is vacuous there).
 JOURNAL_MULTI_LOADED_PROGRAMS = frozenset({
     "p11_entry_journal", "p11_return_journal",
+    "p11_entry_journal_length", "p11_return_journal_length",
 })
 
 
@@ -2387,6 +2391,11 @@ JOURNAL_MAPS = _DETAILED_BASE_MAPS | {
     "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
     "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
     "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
+    # Keymeta Task 2 spec 8.2: the length-evidence stash (one 32-byte row
+    # per in-flight call at a length endpoint). Journal builds only; both
+    # release flavors compile it (only the length programs are stub-gated,
+    # so P0 keeps the map while compiling the programs out).
+    "EVIDENCE_START": map_def(1, 16, 32, 16_384, 0),
 }
 # The wide production journal object: the journal build takes the build's
 # own Detailed geometry, so the wide release journal carries wide slot
@@ -2398,9 +2407,18 @@ JOURNAL_WIDE_MAPS = WIDE_MAPS | {
     "JOURNAL_MARKER_CTL": map_def(2, 4, 16, 1, 0),
     "JOURNAL_CLASSES": map_def(2, 4, 4, 105, 128),
     "PID_START_TICK": map_def(1, 4, 8, 1_024, 128),
+    # Keymeta Task 2 spec 8.2: the length-evidence stash (see JOURNAL_MAPS).
+    "EVIDENCE_START": map_def(1, 16, 32, 16_384, 0),
 }
 JOURNAL_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {
     "p11_entry_journal", "p11_return_journal",
+}
+# Keymeta Task 2 spec 8.6: the wide (FULL) journal object also carries
+# the length pair. The P0 journal flavor compiles it out (the journal
+# object rides the Detailed BPF flavor, which takes stub-object-attributes
+# under P0), while both flavors keep the EVIDENCE_START map above.
+JOURNAL_WIDE_PROGRAMS = JOURNAL_PROGRAMS | {
+    "p11_entry_journal_length", "p11_return_journal_length",
 }
 
 
@@ -2465,7 +2483,7 @@ FROZEN_INVENTORY = {
     "wide-diagnostic": (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide": (WIDE_MARKER_MAPS, SAFE_PROGRAMS),
     "journal": (JOURNAL_MAPS, JOURNAL_PROGRAMS),
-    "journal-wide": (JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS),
+    "journal-wide": (JOURNAL_WIDE_MAPS, JOURNAL_WIDE_PROGRAMS),
 }
 
 
@@ -2641,17 +2659,21 @@ def self_test():
     assert len(WIDE_MARKER_MAPS) == 46
     assert WIDE_MARKER_MAPS["JOURNAL_MARKER_CTL"] == SAFE_MAPS["JOURNAL_MARKER_CTL"]
     assert len(WIDE_UNSAFE_MAPS) == 46
-    assert len(JOURNAL_MAPS) == 49
+    assert len(JOURNAL_MAPS) == 50
+    assert JOURNAL_MAPS["EVIDENCE_START"] == map_def(1, 16, 32, 16_384, 0)
     assert JOURNAL_WIDE_MAPS["STATS"] == map_def(6, 4, 296, 2_112)
     assert JOURNAL_WIDE_MAPS["RV_COUNTS"] == map_def(5, 16, 8, 8_192)
     assert JOURNAL_WIDE_MAPS["SLOT_FILE"] == map_def(2, 4, 4, 2_112, 128)
     assert JOURNAL_WIDE_MAPS["JOURNAL_MARKER_CTL"] == JOURNAL_MAPS["JOURNAL_MARKER_CTL"]
+    assert JOURNAL_WIDE_MAPS["EVIDENCE_START"] == JOURNAL_MAPS["EVIDENCE_START"]
     assert JOURNAL_WIDE_MAPS["PID_START_TICK"] == SAFE_MAPS["PID_FILTER"]
-    assert len(JOURNAL_WIDE_MAPS) == 49
+    assert len(JOURNAL_WIDE_MAPS) == 50
     assert len(SAFE_PROGRAMS) == 22
     assert len(UNSAFE_PROGRAMS) == 27
     assert len(JOURNAL_PROGRAMS) == 22
     assert JOURNAL_PROGRAMS == (SAFE_PROGRAMS - {"p11_entry", "p11_return"}) | {"p11_entry_journal", "p11_return_journal"}
+    assert len(JOURNAL_WIDE_PROGRAMS) == 24
+    assert JOURNAL_WIDE_PROGRAMS == JOURNAL_PROGRAMS | {"p11_entry_journal_length", "p11_return_journal_length"}
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     base_helpers = (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_COOKIE_HELPERS
                     | REQUIRED_GLOBAL_EXEC_HELPERS | REQUIRED_GLOBAL_EXE_HELPERS | SELECTED_GLOBAL_HELPERS)
@@ -2688,7 +2710,7 @@ def self_test():
     wide_diagnostic = (WIDE_UNSAFE_MAPS, UNSAFE_PROGRAMS, diagnostic[2])
     validate_policy_inventory(wide, wide_diagnostic, "wide", "wide-diagnostic")
     validate_policy_inventory(good, wide_diagnostic, "default", "wide-diagnostic")
-    validate_inventory("journal-wide", JOURNAL_WIDE_MAPS, JOURNAL_PROGRAMS,
+    validate_inventory("journal-wide", JOURNAL_WIDE_MAPS, JOURNAL_WIDE_PROGRAMS,
                        {"p11_entry_journal"} | base_helpers | {"JOURNAL_MARKER_CTL",
                                                                "p11_instance_exec_birth",
                                                                "p11_instance_scope_gap"})

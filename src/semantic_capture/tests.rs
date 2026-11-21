@@ -7499,6 +7499,34 @@ fn healthy_nonempty_tick_and_cached_join_use_one_instance() {
     assert_eq!(capture.router.instances_minted(), 1);
 }
 #[test]
+fn exit_tick_collected_call_joins_before_terminal_retirement() {
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    let joined = prime(&mut capture, &mut io);
+    // The primed task exits before this tick: swap its binding pin
+    // for one on an exited process, so the terminal sweep retires
+    // it in the same tick that collects the call below.
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn true");
+    let pid = child.id();
+    let exited_pin = Arc::new(PidPin::test_pidfd_only(pid));
+    child.wait().expect("reap true");
+    assert!(
+        exited_pin.wait_ready(Some(Duration::ZERO)).unwrap_or(false),
+        "exited pin must read ready"
+    );
+    capture.bindings.get_mut(&1).expect("primed binding").pin = exited_pin;
+    io.call(1, 0);
+    let report = capture.tick_with(&mut io).unwrap();
+    assert_eq!(report.calls().count(), 1);
+    assert_eq!(
+        report.calls().next().unwrap().route(),
+        joined,
+        "an already-collected call must join before the exit retires its image"
+    );
+}
+#[test]
 fn pump_miss_invalidates_before_next_semantic_join_even_when_raise_fails() {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);

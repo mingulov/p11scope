@@ -6375,7 +6375,10 @@ fn key_operation_one_projection_three_consumers() {
     presentation.object_observations = r2.clone();
     let document = render_json_from_presentation(&presentation);
     let section = &document["object_observations"];
-    assert_eq!(section["version"], 10, "r2 trips v10 on the lost terminal's id");
+    assert_eq!(
+        section["version"], 10,
+        "r2 trips v10 on the lost terminal's id"
+    );
 
     // Changed rows re-emit; unchanged rows persist client-side.
     let path = dir.path().join("events.jsonl");
@@ -6389,7 +6392,10 @@ fn key_operation_one_projection_three_consumers() {
     // id), so the three pre-existing unknown rows re-render with
     // the v10 `mechanisms` key and re-emit beside the sign row,
     // the new lost summary and the destroyed object row.
-    assert_eq!(delta.emitted, 6, "three changed rows plus three v10 re-renders");
+    assert_eq!(
+        delta.emitted, 6,
+        "three changed rows plus three v10 re-renders"
+    );
     assert_eq!(
         emitter.tracked(),
         before + 1,
@@ -12655,7 +12661,7 @@ fn key_operation_kem_jsonl_version_dispatch() {
     use crate::discovery::engine::inventory_coordinator::PassReport;
     use crate::inventory_events::{KeyOperationEmitter, pass_payload};
     use crate::key_operation_projection::{
-        OBSERVATIONS_VERSION_V10, OBSERVATIONS_VERSION_V7, object_observations_json,
+        OBSERVATIONS_VERSION_V7, OBSERVATIONS_VERSION_V10, object_observations_json,
     };
     fn row_versions(lines: &[serde_json::Value]) -> Vec<u64> {
         lines

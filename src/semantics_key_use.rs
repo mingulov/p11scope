@@ -4571,9 +4571,12 @@ impl FeedDisposalCursor {
     /// Drive one feed's disposal through the shared pre-debit
     /// `gate`. Returns whether the feed completed. `fallback`
     /// carries the association ledger for Joint preservation (`None`
-    /// for pure feeds, unused); `keyuse` absorbs the preserved
-    /// summaries once at the end. The caller counts the feed visit
-    /// itself before the first poll.
+    /// for pure feeds, unused); the caller prepares its table before
+    /// the credited polls (disposal start does in production), since
+    /// table construction is outside every leaf credit — an
+    /// unprepared fallback refuses Full without a table. `keyuse`
+    /// absorbs the preserved summaries once at the end. The caller
+    /// counts the feed visit itself before the first poll.
     pub(crate) fn poll(
         &mut self,
         feed: &mut JointStaging,
@@ -4582,13 +4585,6 @@ impl FeedDisposalCursor {
         keyuse: &mut KeyUseReducer,
         gate: &mut crate::semantics_objects::journal::LeafBudget,
     ) -> bool {
-        // First use prepares the fallback table once, outside the head
-        // poll and its leaf budget (one-time bounded work, like
-        // staging's own prepare): budgeted mints below assume it
-        // prepared and refuse Full when its pool charge refused.
-        if let Some(fallback_ledger) = fallback.as_deref_mut() {
-            let _ = fallback_ledger.prepare_capacity();
-        }
         loop {
             if gate.remaining() == 0 {
                 return false;
@@ -5988,16 +5984,22 @@ mod disposal_tests {
         assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
     }
 
-    /// First use of a cold fallback prepares its table outside the
-    /// head poll: the head mints, preserves and releases normally
-    /// with every poll inside its debit.
+    /// First use of a cold fallback prepares its table before the
+    /// credited polls (the caller prepares, as disposal start does in
+    /// production): the head mints, preserves and releases normally
+    /// with every poll inside its debit and no refusal.
     #[test]
-    fn feed_disposal_cold_fallback_prepares_outside_head_poll() {
+    fn feed_disposal_cold_fallback_prepares_before_credited_polls() {
         let tag = "mint-first-use";
         let pool = SemanticResourcePool::default();
         let mut ledger = StagingLedger::with_resources(pool.reserver());
         ledger.prepare_capacity().unwrap();
         let mut fallback = StagingLedger::with_resources(pool.reserver());
+        assert!(
+            !fallback.is_prepared_for_test(),
+            "{tag}: premise: the fallback starts cold"
+        );
+        fallback.prepare_capacity().unwrap();
         let mut feed = joint_feed();
         let instance =
             crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(29);
@@ -6022,11 +6024,67 @@ mod disposal_tests {
         assert_eq!(feed.staged_len(), 0, "{tag}");
         assert_eq!(feed.history_disposed(), 1, "{tag}");
         assert_eq!(
+            keyuse.evidence().rows_refused,
+            0,
+            "{tag}: the prepared mint succeeds"
+        );
+        assert_eq!(
             unknown_sums(&keyuse),
             [0, 0, 0, 1],
             "{tag}: the truncated open closes Unknown"
         );
         assert_eq!(fallback.census(), 0, "{tag}: the assoc released");
+        assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
+    }
+
+    /// An unprepared fallback refuses honestly without a table: the
+    /// refused row closes Unknown at finalize with explicit
+    /// evidence, inside every poll's debit, and no ticket or vacancy
+    /// is consumed.
+    #[test]
+    fn feed_disposal_unprepared_fallback_refuses_honestly() {
+        let tag = "mint-unprepared";
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        assert!(
+            !fallback.is_prepared_for_test(),
+            "{tag}: premise: the fallback stays cold"
+        );
+        let mut feed = joint_feed();
+        let instance =
+            crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(41);
+        feed.stage(
+            init_call("C_SignInit", 4007, 0x000d, 100),
+            origin("C_SignInit", 4007, 100),
+            1,
+            &mut ledger,
+        )
+        .unwrap();
+        let mut cursor = FeedDisposalCursor::new(instance, true);
+        let mut keyuse = KeyUseReducer::new();
+        let (_, sync) = drive_disposal_reservation_checked(
+            &mut cursor,
+            &mut feed,
+            &mut ledger,
+            &mut fallback,
+            &mut keyuse,
+            tag,
+        );
+        assert_eq!(sync, 0, "{tag}: no sync walk in the budgeted drain");
+        assert_eq!(feed.staged_len(), 0, "{tag}");
+        assert_eq!(
+            keyuse.evidence().rows_refused,
+            1,
+            "{tag}: exactly one refused row"
+        );
+        assert_eq!(
+            unknown_sums(&keyuse),
+            [0, 0, 0, 1],
+            "{tag}: the refused open closes Unknown"
+        );
+        assert_eq!(fallback.census(), 0, "{tag}: no assoc minted");
         assert_eq!(ledger.staged(), 0, "{tag}: the H9 released");
     }
 

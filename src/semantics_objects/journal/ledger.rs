@@ -329,6 +329,13 @@ impl StagingLedger {
             .map_or(0, |table| table.free_list_len_for_test())
     }
 
+    /// Test-only table presence: whether capacity preparation has
+    /// run (successfully) since construction or the last move.
+    #[cfg(test)]
+    pub(crate) fn is_prepared_for_test(&self) -> bool {
+        self.table.is_some()
+    }
+
     fn key(value: u64) -> RoleKey {
         RoleKey {
             namespace: 0,

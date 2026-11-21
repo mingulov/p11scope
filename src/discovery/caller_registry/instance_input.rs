@@ -3089,7 +3089,12 @@ impl CallerRegistry {
     /// `poll_staged_disposal` until it completes before collecting
     /// above the fence. A started disposal keeps its exact per-feed
     /// reduction state until it finishes; feeds added later wait for
-    /// the next void. Empty registries hold no disposal.
+    /// the next void. Empty registries hold no disposal. The
+    /// association fallback's table prepares here, once, outside any
+    /// leaf credit: no credited poll pays table-construction work.
+    /// A pool-full prepare fails silently and the disposal's mints
+    /// refuse Full without a table (honest refusals, never
+    /// misbehavior).
     pub(crate) fn start_staged_disposal(&mut self) {
         if self.staged_disposal.is_some() {
             return;
@@ -3097,6 +3102,7 @@ impl CallerRegistry {
         if self.instance_state.semantics.is_empty() {
             return;
         }
+        let _ = self.assoc_fallback.prepare_capacity();
         self.staged_disposal = Some(StagedDisposalCursor {
             done_upto: None,
             current: None,
@@ -7420,5 +7426,115 @@ mod staged_disposal_gate_tests {
             reads, 2,
             "the ordered selection and the current-record resume each charge first"
         );
+    }
+
+    /// Disposal start prepares the association fallback before the
+    /// first credit: the table exists before any poll runs, so no
+    /// credited poll pays table-construction work, and the staged
+    /// head mints normally.
+    #[test]
+    fn staged_disposal_prepares_fallback_before_first_credit() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        assert!(
+            !registry.assoc_fallback.is_prepared_for_test(),
+            "premise: the fallback starts cold"
+        );
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(3);
+        let mut record = empty_record(id);
+        record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+        let facts = crate::semantics_edge::SemanticCall {
+            function: "C_SignInit".into(),
+            session: 6003,
+            mechanism: 0x000d,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ts_ns: 100,
+            ..crate::semantics_edge::SemanticCall::default()
+        };
+        let origin = crate::semantics_edge::EffectOrigin {
+            function: "C_SignInit".into(),
+            session: 6003,
+            ts_ns: 100,
+        };
+        record.feed.stage(facts, origin, 1, &mut ledger).unwrap();
+        registry.instance_state.semantics.insert(id, record);
+        registry.start_staged_disposal();
+        assert!(
+            registry.assoc_fallback.is_prepared_for_test(),
+            "start prepares the fallback before any credited poll"
+        );
+        let mut polls = 0usize;
+        loop {
+            let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+            assert!(spent <= 64, "poll {polls} spent {spent} above 64");
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "the disposal must complete");
+        }
+        assert_eq!(
+            registry.joint_keyuse.evidence().rows_refused,
+            0,
+            "the prepared mint succeeds"
+        );
+        assert_eq!(registry.assoc_fallback.census(), 0);
+    }
+
+    /// A pool too small for the fallback table still disposes
+    /// honestly: start cannot prepare, every mint refuses Full
+    /// without a table, and the feed completes with explicit
+    /// refusal evidence instead of misbehaving.
+    #[test]
+    fn staged_disposal_cold_pool_full_refuses_without_table() {
+        let mut registry = CallerRegistry::new(RegistryLimits::default_limits());
+        let held = registry.semantic_resources.snapshot().charged_bytes;
+        registry.semantic_resources.reference_set_limit(held);
+        let pool = SemanticResourcePool::default();
+        let mut ledger = StagingLedger::with_resources(pool.reserver());
+        ledger.prepare_capacity().unwrap();
+        let id = RegistryInstanceId::from_raw(4);
+        let mut record = empty_record(id);
+        record.feed = crate::semantics_key_use::JointStaging::select_joint_for_test();
+        let facts = crate::semantics_edge::SemanticCall {
+            function: "C_SignInit".into(),
+            session: 6004,
+            mechanism: 0x000d,
+            capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+            ts_ns: 100,
+            ..crate::semantics_edge::SemanticCall::default()
+        };
+        let origin = crate::semantics_edge::EffectOrigin {
+            function: "C_SignInit".into(),
+            session: 6004,
+            ts_ns: 100,
+        };
+        record.feed.stage(facts, origin, 1, &mut ledger).unwrap();
+        registry.instance_state.semantics.insert(id, record);
+        registry.start_staged_disposal();
+        assert!(
+            !registry.assoc_fallback.is_prepared_for_test(),
+            "a pool-full start cannot prepare the table"
+        );
+        let mut polls = 0usize;
+        loop {
+            let (done, spent) = registry.poll_staged_disposal(&mut ledger, 64);
+            assert!(spent <= 64, "poll {polls} spent {spent} above 64");
+            polls += 1;
+            if done {
+                break;
+            }
+            assert!(polls < 4096, "the disposal must complete");
+        }
+        assert_eq!(
+            registry.joint_keyuse.evidence().rows_refused,
+            1,
+            "exactly one refused row without a table"
+        );
+        assert_eq!(registry.assoc_fallback.census(), 0);
     }
 }

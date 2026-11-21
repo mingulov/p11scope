@@ -59,14 +59,14 @@ pub(crate) const OBSERVATIONS_VERSION_V6: u8 = 6;
 /// exactly when a row carries non-blank inferred content or a
 /// v7-only gap does; v1–v6 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V7: u8 = 7;
-/// Section version 9 (unknown-row mechanism detail): v7 vocabulary
-/// plus the `mechanisms` key on unknown-key rows (by-number
-/// terminal counts per observed mechanism id) and the
-/// `unknown_mechanism_rows_refused` gap. Version 8 is taken by the
-/// separate Task 7 provider section (shared allocator, spec
-/// §10.1). The renderer emits v9 exactly when an unknown row
-/// carries mechanism detail or the v9-only gap does; v1–v7 output
-/// stays byte-stable.
+/// Section version 9 (unknown-row mechanism detail, provider-internal
+/// re-entry): v7 vocabulary plus the `mechanisms` key on unknown-key
+/// rows (by-number terminal counts per observed mechanism id), the
+/// `unknown_mechanism_rows_refused` gap, and the `provider_internal`
+/// unknown-key and gap reasons. Version 8 is taken by the separate
+/// Task 7 provider section (shared allocator, spec §10.1). The
+/// renderer emits v9 exactly when an unknown row carries v9-only
+/// content or a v9-only gap does; v1–v7 output stays byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V9: u8 = 9;
 /// The named reason an unseen metadata field carries at v6 when its
 /// creation template carried more than the eight observed cells
@@ -490,14 +490,16 @@ pub(crate) mod contract {
         "further_conflicts",
     ];
 
-    /// Frozen unknown-key reasons (H9 §82).
-    pub(crate) const UNKNOWN_REASONS: [&str; 6] = [
+    /// Frozen unknown-key reasons (H9 §82 plus the R2
+    /// provider-internal re-entry reason).
+    pub(crate) const UNKNOWN_REASONS: [&str; 7] = [
         "unbound",
         "key_join_lost",
         "metadata_unknown",
         "metadata_conflicting",
         "role_unavailable",
         "not_applicable",
+        crate::semantics_key_use::PROVIDER_INTERNAL_REASON,
     ];
 
     pub(crate) const UNKNOWN_ROW_KEYS: [&str; 8] = [
@@ -550,10 +552,10 @@ pub(crate) mod contract {
     pub(crate) const GAP_ROW_KEYS: [&str; 3] = ["subject", "reason", "repeats"];
     pub(crate) const GAP_SUBJECTS: [&str; 2] = ["model", "key_operation"];
 
-    /// Frozen gap reasons: the 51 model-gap snakes plus the one key-side
+    /// Frozen gap reasons: the 52 model-gap snakes plus the one key-side
     /// reason. The producer test enumerates every model variant into
     /// this set, so the map cannot drift from the list.
-    pub(crate) const GAP_REASONS: [&str; 52] = [
+    pub(crate) const GAP_REASONS: [&str; 53] = [
         "bootstrap_unproven",
         "bootstrap_refused",
         "prefix_contradiction",
@@ -572,6 +574,7 @@ pub(crate) mod contract {
         "pair_duplicate",
         "null_mechanism_cancel",
         "same_session_overlap",
+        "provider_internal",
         "overlap_uncertain",
         "output_collision",
         "stale_origin",
@@ -1501,8 +1504,30 @@ fn has_v9_content(observations: &ObjectObservations) -> bool {
         .any(|gap| gap.subject == "key_operation" && gap.reason == "unknown_mechanism_rows_refused")
 }
 
+/// v9-only unknown content: a provider-internal re-entry row that
+/// v1–v7 vocabularies forbid.
+fn has_v9_unknown_content(observations: &ObjectObservations) -> bool {
+    observations
+        .unknown_key_operations
+        .iter()
+        .any(|row| row.reason == crate::semantics_key_use::PROVIDER_INTERNAL_REASON)
+}
+
+/// v9-only gap content: a provider-internal re-entry gap that v1–v7
+/// vocabularies forbid. A rowless internal gap (a nested call with
+/// no key-operation terminal) still promotes its section to v9, so
+/// the named gap never rides a version whose vocabulary forbids it.
+fn has_v9_gap_content(observations: &ObjectObservations) -> bool {
+    observations.gaps.iter().any(|gap| {
+        gap.subject == "model" && gap.reason == crate::semantics_key_use::PROVIDER_INTERNAL_REASON
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
-    if has_v9_content(observations) {
+    if has_v9_content(observations)
+        || has_v9_unknown_content(observations)
+        || has_v9_gap_content(observations)
+    {
         return OBSERVATIONS_VERSION_V9;
     }
     if has_inferred_content(observations) || has_v7_gap_content(observations) {
@@ -2398,6 +2423,7 @@ pub(crate) mod producer {
             ObjectGap::PairDuplicate => "pair_duplicate",
             ObjectGap::NullMechanismCancel => "null_mechanism_cancel",
             ObjectGap::SameSessionOverlap => "same_session_overlap",
+            ObjectGap::ProviderInternal => "provider_internal",
             ObjectGap::OverlapUncertain => "overlap_uncertain",
             ObjectGap::OutputCollision => "output_collision",
             ObjectGap::StaleOrigin => "stale_origin",

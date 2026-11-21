@@ -3772,6 +3772,7 @@ fn origin_of(
         entry_mechanism: mechanism_evidence(begin.capture(), begin.entry_mechanism()),
         scope: super::SlotScope::Unknown,
         entry_output: output_evidence(begin.capture()),
+        thread: begin.pid_tgid(),
     }
 }
 
@@ -3845,6 +3846,7 @@ fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> C
         session_out: session_output_of(function, event),
         found: find_of(action, &tail, end.tail_absent()),
         attributes: attributes_of(action, &tail, end.tail_absent()),
+        thread: event.pid_tgid,
     }
 }
 

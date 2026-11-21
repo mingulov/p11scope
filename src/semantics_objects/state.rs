@@ -329,6 +329,9 @@ fn null_mechanism_gap(entry: MechClass, ret: MechanismEvidence) -> Option<Object
 struct Completion {
     cut: u64,
     end_ns: u64,
+    /// Native thread identity at return (from the completion fact;
+    /// internal correlation only, never rendered).
+    end_thread: u64,
     rv: u64,
     return_mechanism: MechanismEvidence,
     results: [ResultSlot; 2],
@@ -345,6 +348,11 @@ struct PendingCall {
     key: CallKey,
     begin: u64,
     entry_ns: u64,
+    /// Native thread identity at entry (from the origin fact;
+    /// internal correlation only, never rendered). Together with
+    /// the completion's return thread it proves same-thread nesting
+    /// for provider-internal re-entry.
+    begin_thread: u64,
     function: u32,
     kind: CallKind,
     session: HandleInput<SessionHandle>,
@@ -1149,6 +1157,7 @@ impl ModelState {
             key: origin.key,
             begin: cut,
             entry_ns: origin.entry_ns,
+            begin_thread: origin.thread,
             function: origin.function,
             kind,
             session: origin.session,
@@ -1253,6 +1262,7 @@ impl ModelState {
         call.completion = Some(Completion {
             cut,
             end_ns: result.end_ns,
+            end_thread: result.thread,
             rv: result.rv,
             return_mechanism: result.return_mechanism,
             results: result.results,
@@ -2034,6 +2044,49 @@ impl ModelState {
         }
     }
 
+    /// Whether `inner` ran strictly inside `outer` on one native
+    /// thread: a later begin, an earlier end (an open outer's
+    /// eventual end cut exceeds every current cut), the same session
+    /// handle, and every known thread identity equal (the inner
+    /// begin/end plus the outer begin, plus the outer end when
+    /// known). The outer thread was alive from its begin until past
+    /// the inner end, so equal native thread ids prove one thread
+    /// (no tid-reuse gap). Anything unproven — another thread, a
+    /// migrated return, partial overlap, an unknown end — answers
+    /// false and keeps the conservative overlap shape.
+    fn strictly_nested_same_thread(inner: &PendingCall, outer: &PendingCall) -> bool {
+        let Some(inner_completion) = inner.completion.as_ref() else {
+            return false;
+        };
+        if inner.begin <= outer.begin {
+            return false;
+        }
+        if outer
+            .end_cut()
+            .is_some_and(|outer_end| inner_completion.cut >= outer_end)
+        {
+            return false;
+        }
+        match (inner.session_handle(), outer.session_handle()) {
+            (Some(a), Some(b)) if a == b => {}
+            _ => return false,
+        }
+        if inner.begin_thread != inner_completion.end_thread {
+            return false;
+        }
+        if inner.begin_thread != outer.begin_thread {
+            return false;
+        }
+        if outer
+            .completion
+            .as_ref()
+            .is_some_and(|outer_completion| outer_completion.end_thread != outer.begin_thread)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Overlapping calls (with known outcomes, guaranteed by the watermark)
     /// that may alter what this call's joins rely on. Neutral calls take
     /// no part as either side: they apply no joins to protect, and they
@@ -2048,6 +2101,26 @@ impl ModelState {
         let Some(x_end) = x.end_cut() else {
             return (None, false);
         };
+        // Controller ruling v080-nss-ec-double R2 (2026-11-21):
+        // provider-internal re-entry names its own gap before any
+        // other overlap is considered, so the classification never
+        // depends on pair order. A call strictly inside another open
+        // non-neutral call on the same session and thread keeps its
+        // conservative join (its key birth is the in-flight outer
+        // call) under the precise reason; H9 routes its terminal to
+        // the `provider_internal` unknown row. The metadata flag is
+        // unread downstream whenever interference is `Some` (every
+        // consumer early-returns on the gap), so `false` is exact.
+        let nested = self.domain_calls(x.domain).into_iter().any(|token_y| {
+            if token_y == token {
+                return false;
+            }
+            let y = &self.pending[&token_y];
+            !y.fenced && y.kind != CallKind::Neutral && Self::strictly_nested_same_thread(x, y)
+        });
+        if nested {
+            return (Some(ObjectGap::ProviderInternal), false);
+        }
         let x_scope = self.session_scope(x.snapshot.session);
         let x_views: Vec<&ViewRecord> = x
             .snapshot
@@ -2085,6 +2158,18 @@ impl ModelState {
             if let (Some(a), Some(b)) = (x.session_handle(), y.session_handle())
                 && a == b
             {
+                // Controller ruling v080-nss-ec-double R2
+                // (2026-11-21): a same-thread strictly-nested inner
+                // call is provider-internal re-entry — part of this
+                // call's own execution, not interference with its
+                // joins — so the outer call ignores it and its
+                // outputs bind. (The inner call itself returned
+                // `ProviderInternal` from the pre-scan above.)
+                // Cross-thread or otherwise unprovable overlap keeps
+                // the conservative gap.
+                if Self::strictly_nested_same_thread(y, x) {
+                    continue;
+                }
                 return (Some(ObjectGap::SameSessionOverlap), metadata);
             }
             if !joins_objects {
@@ -4981,6 +5066,7 @@ mod tests {
             entry_mechanism: MechanismEvidence::Value(0x17),
             scope,
             entry_output: crate::semantics_objects::OutputEvidence::NonNull,
+            thread: cut,
         };
         let create = function_id("C_CreateObject").unwrap();
         let token = model
@@ -5001,6 +5087,7 @@ mod tests {
                 session_out: HandleInput::Value(session),
                 found: crate::semantics_objects::FindResult::NotCaptured,
                 attributes: None,
+                thread: 2,
             },
             &mut ledger,
         );
@@ -5437,6 +5524,7 @@ mod tests {
                 domain: self.domain,
                 key: CallKey::reference(self.next_key),
                 begin: 10,
+                begin_thread: 10,
                 entry_ns: 100,
                 function,
                 kind: CallKind::Object(ObjectAction::Access),
@@ -5449,6 +5537,7 @@ mod tests {
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 11,
+                    end_thread: 11,
                     end_ns: 110,
                     rv: CkRv::PENDING.0,
                     return_mechanism: MechanismEvidence::NotCaptured,
@@ -5485,6 +5574,7 @@ mod tests {
                 domain: self.domain,
                 key: CallKey::reference(self.next_key),
                 begin: 10,
+                begin_thread: 10,
                 entry_ns: 100,
                 function: crate::kinds::function_id("C_CloseSession").expect("catalog function"),
                 kind: CallKind::Lifecycle(lifecycle::CLOSE_SESSION),
@@ -5497,6 +5587,7 @@ mod tests {
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 11,
+                    end_thread: 11,
                     end_ns: 110,
                     rv: CkRv::OK.0,
                     return_mechanism: MechanismEvidence::NotCaptured,
@@ -5533,6 +5624,7 @@ mod tests {
                 domain: self.domain,
                 key: CallKey::reference(self.next_key),
                 begin: 10,
+                begin_thread: 10,
                 entry_ns: 100,
                 function: crate::kinds::function_id("C_SessionCancel").expect("catalog function"),
                 kind: CallKind::Lifecycle(lifecycle::SESSION_CANCEL),
@@ -5545,6 +5637,7 @@ mod tests {
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 11,
+                    end_thread: 11,
                     end_ns: 110,
                     rv,
                     return_mechanism: MechanismEvidence::NotCaptured,
@@ -5716,6 +5809,7 @@ mod tests {
             entry_mechanism: MechanismEvidence::Value(0x17),
             scope,
             entry_output: crate::semantics_objects::OutputEvidence::NonNull,
+            thread: cut,
         };
         let completed = |cut: u64, results| CompletedFact {
             cut: RefCut::reference(cut),
@@ -5726,6 +5820,7 @@ mod tests {
             session_out: HandleInput::Value(session),
             found: crate::semantics_objects::FindResult::NotCaptured,
             attributes: None,
+            thread: cut,
         };
         let settle_to = |model: &mut ObjectSemantics, ledger: &mut StagingLedger, cut: u64| {
             model.settle(
@@ -5935,6 +6030,7 @@ mod tests {
             domain: fx.domain,
             key: CallKey::reference(fx.next_key),
             begin: 10,
+            begin_thread: 10,
             entry_ns: 100,
             function: target,
             kind: CallKind::Object(ObjectAction::Access),
@@ -5950,6 +6046,7 @@ mod tests {
             scope: SlotScope::Unknown,
             completion: Some(Completion {
                 cut: 11,
+                end_thread: 11,
                 end_ns: 110,
                 rv: CkRv::PENDING.0,
                 return_mechanism: MechanismEvidence::NotCaptured,
@@ -7238,6 +7335,7 @@ mod tests {
             domain: fx.domain,
             key: CallKey::reference(fx.next_key),
             begin: 10,
+            begin_thread: 10,
             entry_ns: 100,
             function: target,
             kind: CallKind::Object(ObjectAction::Destroy),
@@ -7253,6 +7351,7 @@ mod tests {
             scope: SlotScope::Unknown,
             completion: Some(Completion {
                 cut: 11,
+                end_thread: 11,
                 end_ns: 110,
                 rv: CkRv::PENDING.0,
                 return_mechanism: MechanismEvidence::NotCaptured,
@@ -7308,6 +7407,7 @@ mod tests {
                 domain: fx.domain,
                 key: other_key,
                 begin: 5,
+                begin_thread: 5,
                 entry_ns: 50,
                 function: target,
                 kind: CallKind::Object(ObjectAction::Access),
@@ -7320,6 +7420,7 @@ mod tests {
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut: 50,
+                    end_thread: 50,
                     end_ns: 150,
                     rv: CkRv::PENDING.0,
                     return_mechanism: MechanismEvidence::NotCaptured,
@@ -7402,6 +7503,7 @@ mod tests {
                 domain: fx.domain,
                 key: CallKey::reference(fx.next_key),
                 begin,
+                begin_thread: begin,
                 entry_ns: 100,
                 function: target,
                 kind: CallKind::Lifecycle(lifecycle::CRYPTOKI_INITIALIZE),
@@ -7414,6 +7516,7 @@ mod tests {
                 scope: SlotScope::Unknown,
                 completion: Some(Completion {
                     cut,
+                    end_thread: cut,
                     end_ns: 110,
                     rv: CkRv::OK.0,
                     return_mechanism: MechanismEvidence::NotCaptured,

@@ -391,6 +391,17 @@ pub(crate) enum ObjectGap {
     NullMechanismCancel,
     // Joins.
     SameSessionOverlap,
+    /// Provider-internal re-entry (controller ruling
+    /// v080-nss-ec-double R2, 2026-11-21): the call started and
+    /// ended on one native thread strictly inside another open call
+    /// on the same session (the known instance is the NSS softoken
+    /// EC-keygen pairwise self-test), so its key birth is the
+    /// still-in-flight outer call and its joins stay unproven. The
+    /// precise name for this overlap: H9 routes the terminal to the
+    /// `provider_internal` unknown row, while the outer call's
+    /// outputs bind. Cross-thread or unprovable overlap keeps
+    /// `SameSessionOverlap`.
+    ProviderInternal,
     OverlapUncertain,
     OutputCollision,
     StaleOrigin,
@@ -695,6 +706,12 @@ pub(crate) struct OriginFact {
     /// guard): only a positively non-null decision authorizes an
     /// encapsulation output. Finite class only, never an address.
     pub(crate) entry_output: OutputEvidence,
+    /// Native thread identity at entry (kernel pid_tgid, already
+    /// captured on the journal BEGIN): privileged internal
+    /// correlation only, never rendered. Proves same-thread nesting
+    /// for provider-internal re-entry (controller ruling
+    /// v080-nss-ec-double R2, 2026-11-21).
+    pub(crate) thread: u64,
 }
 
 /// Captured S1 output-pointer decision (`capture::OUTPUT_*`
@@ -720,6 +737,12 @@ pub(crate) struct CompletedFact {
     pub(crate) session_out: HandleInput<SessionHandle>,
     pub(crate) found: FindResult,
     pub(crate) attributes: Option<AttributeList>,
+    /// Native thread identity at return (kernel pid_tgid, already
+    /// captured on the journal END payload): privileged internal
+    /// correlation only, never rendered. The entry/return pair
+    /// proves the call stayed on one thread (controller ruling
+    /// v080-nss-ec-double R2, 2026-11-21).
+    pub(crate) thread: u64,
 }
 
 /// An opaque scoped monotonic reference frontier. Its producer states that

@@ -2545,6 +2545,38 @@ impl FamilyState {
     }
 }
 
+/// Controller ruling fix2 (F4): seed one proved row's family from
+/// the key's creation mechanism when the use provides no valued
+/// family for this key and no established label or key type stands
+/// against it. The key-type field keeps its own state (no label
+/// forms here); the row shows the inferred family. The creation id
+/// contributes exactly like any other mechanism evidence through
+/// [`FamilyState::accumulate_family`]. `use_mechanism` is the
+/// mechanism typing THIS key (`None` for wrapped keys, whose wrap
+/// mechanism never applies to them).
+fn seed_creation_family(
+    family: &mut FamilyState,
+    established: Option<crate::keymeta::EstablishedKind>,
+    established_type: Option<crate::keymeta::EstablishedKind>,
+    use_mechanism: Option<u64>,
+    creation_mechanism: Option<u64>,
+) {
+    use crate::keymeta::infer_family;
+    if established.is_some() || established_type.is_some() {
+        return;
+    }
+    if use_mechanism.is_some_and(|id| infer_family(id).is_some()) {
+        return;
+    }
+    let Some(created) = creation_mechanism else {
+        return;
+    };
+    if infer_family(created).is_none() {
+        return;
+    }
+    family.accumulate_family(established_type, created);
+}
+
 impl SizeState {
     /// Accumulate one completion's size input (§5.4): valued evidence
     /// upgrades unknowns, same sizes keep the first tag, distinct
@@ -2746,6 +2778,10 @@ struct OpenAssoc {
     /// receipts). Snapshotted at admission: a later query never
     /// re-opens the comparison.
     established_type: Option<crate::keymeta::EstablishedKind>,
+    /// The receipt's frozen creation-mechanism birth fact
+    /// (controller ruling fix2, F4): the Generate/GeneratePair
+    /// mechanism id, or `None` for every other origin.
+    creation_mechanism: Option<u64>,
 }
 
 /// One receipt resolved to its bucket at admission, before any
@@ -3112,6 +3148,7 @@ impl KeyUseReducer {
                             primary: slot.primary,
                             established,
                             established_type,
+                            creation_mechanism: receipt.creation_mechanism,
                         }
                     })
                     .collect();
@@ -3328,6 +3365,13 @@ impl KeyUseReducer {
                     .family
                     .accumulate_family(assoc.established_type, mechanism);
             }
+            seed_creation_family(
+                &mut self.inferred.entry(bucket).or_default().family,
+                assoc.established,
+                assoc.established_type,
+                open.mechanism,
+                assoc.creation_mechanism,
+            );
             self.inferred
                 .entry(bucket)
                 .or_default()
@@ -3400,6 +3444,16 @@ impl KeyUseReducer {
                                     state.reason = Some(REASON_OPERATION_KEY_ONLY);
                                 }
                             }
+                            // The wrap mechanism never types this
+                            // key, so the use side is `None`: only
+                            // the creation side can seed.
+                            seed_creation_family(
+                                &mut self.inferred.entry(bucket).or_default().family,
+                                established,
+                                established_type,
+                                None,
+                                receipt.creation_mechanism,
+                            );
                         }
                         KeyRole::WrappingKey
                         | KeyRole::UnwrappingKey
@@ -3413,6 +3467,13 @@ impl KeyUseReducer {
                                     .family
                                     .accumulate_family(established_type, mechanism);
                             }
+                            seed_creation_family(
+                                &mut self.inferred.entry(bucket).or_default().family,
+                                established,
+                                established_type,
+                                mechanism,
+                                receipt.creation_mechanism,
+                            );
                         }
                         KeyRole::OperationKey | KeyRole::Other => {}
                     }

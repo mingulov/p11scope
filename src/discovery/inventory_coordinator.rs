@@ -2059,7 +2059,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// executable to every image set holding the cookie. Images
     /// staged later join at stage time instead.
     fn backfill_unbound_exe(&mut self, cookie: DomainCookie, exec: StashedExec) {
-        if !self.registry.has_unbound_image(cookie) {
+        if !self.registry.unbound_backfill_admits(cookie) {
             return;
         }
         let (learned, all_learned) = Self::scan_exe_candidates_cached(
@@ -39266,6 +39266,47 @@ int main(void) {
         assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
     }
 
+    /// Late EXEC past the retention window (R2 twin sr-F1): an image
+    /// that folded out of the run-wide retained set before its EXEC
+    /// arrived still resolves in the per-module detail and in JSON —
+    /// only the run-wide aggregate keeps the honest unknown.
+    #[test]
+    fn exec_backfill_past_the_retention_window_resolves_module_and_json_verdicts() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let rows: Vec<_> = (0..600)
+            .map(|index| native.row(41 + index, 1, 1000 + index as u32, 210 + index, 0))
+            .collect();
+        native.witness(rows);
+        assert!(
+            !native
+                .scene
+                .coordinator
+                .registry()
+                .has_unbound_image(DomainCookie::scripted(native.domain, 41)),
+            "cookie 41 folded out of the retained set"
+        );
+        native.execs(vec![exec_record(41, 1000, 100, 8, 99)]);
+        let (text, document) = slice_one_views(&native);
+        let executables = document["modules"][0]["unbound_use"]["executables"]
+            .as_array()
+            .expect("module executables publish");
+        let joined = executables
+            .iter()
+            .find(|exe| exe["pid_host"] == 1000)
+            .expect("the folded pid keeps its module row");
+        assert_eq!(
+            joined["resolution"], "path_unknown",
+            "the module verdict joins the late EXEC: {joined}"
+        );
+        assert_eq!(joined["ino"], 99);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("unidentified callers:")),
+            "the run-wide line still renders:\n{text}"
+        );
+    }
+
     /// The join is the exact typed pair: another ticket, another
     /// domain, or a zero (unavailable) ticket never joins — even
     /// when the pid matches. Never a bare-PID join.
@@ -39836,6 +39877,76 @@ int main(void) {
             .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 1);
         assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
         assert_eq!(native.scene.coordinator.pair_prune_overflow_for_test(), 0);
+    }
+
+    /// Revival past the tombstone keep window (R2 twin F4): a pruned
+    /// dropped pair whose tombstone already age-drained revives from
+    /// zero — the live Pending target carries base 0 while the class
+    /// aggregate still holds the pruned base exactly once, and the
+    /// age-fold overflow does not move.
+    #[test]
+    fn revived_pair_past_the_tombstone_window_restarts_from_zero_with_aggregate_intact() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        let key = PairKey {
+            image: DomainCookie::scripted(native.domain, 41),
+            exec: 1,
+            object: 0,
+        };
+        native.scene.coordinator.pair_targets.insert(
+            key,
+            PairTarget::Dropped {
+                base: 5,
+                base_since: at,
+            },
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS);
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1
+        );
+        // Past the keep window the tombstone drains by age into the
+        // counted overflow; the aggregate keeps the base.
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(at + EXEC_STATE_GRACE_NS + 2 * EXEC_STATE_GRACE_NS);
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            0,
+            "the tombstone drains by age instead of living until domain stop"
+        );
+        assert_eq!(native.scene.coordinator.pruned_pair_totals(), (1, 5));
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            1,
+            "the age fold counts exactly once"
+        );
+        // A late row revives the pair with no tombstone to rebase
+        // past: the Pending target restarts from zero.
+        let row = native.row(41, 1, 7, at, 0);
+        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        assert!(
+            matches!(
+                native.scene.coordinator.pair_targets.get(&key),
+                Some(PairTarget::Pending { base: 0, .. })
+            ),
+            "revival past expiry restarts from zero"
+        );
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 5),
+            "the aggregate still holds the pruned base exactly once"
+        );
+        assert_eq!(
+            native.scene.coordinator.pair_prune_overflow_for_test(),
+            1,
+            "revival moves no overflow"
+        );
     }
 
     /// Resolution source (b): the coordinator exposes the

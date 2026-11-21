@@ -6564,6 +6564,63 @@ fn merged_exe_groups_keep_the_ambiguity_marker() {
     );
 }
 
+/// Past the exe-group bound (R2 twin F2): the oldest pids sit in a
+/// drained quiet group, but the concise callers line still names the
+/// global oldest pid — not just the oldest of the kept groups.
+#[test]
+fn concise_oldest_pids_survive_the_exe_group_bound() {
+    let harness = varied_harness();
+    let document = harness.render();
+    let mut presentation = capture_for(&harness, &document);
+    // 1024 kept groups, all newer than the drained oldest pid 1000.
+    presentation.unbound_exe_groups = (0..1024u64)
+        .map(|index| {
+            let path = format!("/bin/kept{index}");
+            exe_group(
+                &path,
+                1,
+                90,
+                3000 + index,
+                vec![unbound_image(
+                    2000 + index as u32,
+                    3000 + index,
+                    90,
+                    resolved_exe(&path),
+                )],
+                None,
+            )
+        })
+        .collect();
+    presentation.unbound_images = 1025;
+    presentation.unbound_images_saturated = false;
+    // The drained quiet group contributes the global oldest pid, as
+    // the registry's pre-drain carrier does at capture time.
+    presentation.unbound_oldest_pids = vec![unbound_image(
+        1000,
+        1000,
+        1,
+        UnboundExe {
+            dev: 0,
+            ino: 0,
+            path: None,
+            resolution: ExeResolution::NoExecRecord,
+            identity_candidates: Vec::new(),
+        },
+    )];
+    presentation.unbound_fold_overflow_images = 1;
+    presentation.unbound_fold_overflow_calls = 1;
+    presentation.unbound_pids_dropped = 0;
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let callers = concise
+        .lines()
+        .find(|line| line.starts_with("unidentified callers:"))
+        .expect("the callers line renders past the group bound");
+    assert!(
+        callers.contains("1000"),
+        "the callers line names the drained oldest pid: {callers}"
+    );
+}
+
 #[test]
 fn app_hint_appends_a_bracketed_label_and_json_value() {
     let harness = varied_harness();

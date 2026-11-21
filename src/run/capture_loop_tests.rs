@@ -2771,6 +2771,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         identity_unavailable_refused: 0,
         identity_budget_exhausted: false,
         unbound_exe_groups: Vec::new(),
+        unbound_oldest_pids: Vec::new(),
         unbound_fold_overflow_images: 0,
         unbound_fold_overflow_calls: 0,
         unbound_pids_dropped: 0,

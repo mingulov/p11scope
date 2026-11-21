@@ -1290,6 +1290,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         identity_unavailable_refused: 0,
         identity_budget_exhausted: false,
         unbound_exe_groups: Vec::new(),
+        unbound_oldest_pids: Vec::new(),
         unbound_fold_overflow_images: 0,
         unbound_fold_overflow_calls: 0,
         unbound_pids_dropped: 0,

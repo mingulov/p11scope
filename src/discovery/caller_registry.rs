@@ -50,7 +50,7 @@ use crate::semantics_objects::journal::joint_driver::{
     JointCaptureOwner, RawJointQuantum, RawQuantumIdentity,
 };
 use anyhow::{Result, anyhow, bail};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::Arc;
@@ -3062,6 +3062,16 @@ pub(crate) const UNBOUND_RETAINED_MAX: usize = 512;
 /// Distinct folded run-wide exe groups: past it further groups fold
 /// into the counted overflow instead of naming new rows.
 pub(crate) const UNBOUND_FOLD_GROUPS_MAX: usize = 1024;
+/// Recently-folded run-wide cookies remembered with their fold key:
+/// a re-witnessed cookie inside the window refreshes its bucket
+/// exactly (calls accumulate, images unchanged) instead of counting
+/// as a brand-new image, and a late EXEC inside the window still
+/// backfills the per-module verdict. Past the window a re-witnessed
+/// cookie is still never a new image — its calls join the counted
+/// overflow — and a late EXEC keeps the honest unknown. Large
+/// enough that the usual second-object touch (passes apart) hits;
+/// small enough to stay a fixed bounded cost.
+pub(crate) const UNBOUND_FOLD_RING_MAX: usize = 4096;
 /// Oldest pids kept per folded group: the concise lines show five.
 const UNBOUND_FOLD_SAMPLE: usize = 5;
 
@@ -3136,17 +3146,14 @@ impl UnboundExeGroup {
 
     /// Absorb one image: totals grow exactly, the sample keeps the
     /// oldest [`UNBOUND_FOLD_SAMPLE`] by (`first_call_ns`, `pid_host`),
-    /// and the ambiguity keeps the richest candidate list (first on
-    /// ties, deterministically).
+    /// and the ambiguity keeps the richest candidate list — the
+    /// lexicographically smallest on ties, so the marker is a
+    /// content function, never hash order.
     fn absorb(&mut self, pid: &UnboundPid) {
         self.images = self.images.saturating_add(1);
         self.calls = self.calls.saturating_add(pid.calls_at_least);
         self.first_ns = self.first_ns.min(pid.first_call_ns);
-        if pid.exe.identity_candidates.len() > 1
-            && pid.exe.identity_candidates.len() > self.ambiguous.as_ref().map_or(0, Vec::len)
-        {
-            self.ambiguous = Some(pid.exe.identity_candidates.clone());
-        }
+        Self::consider_candidates(&mut self.ambiguous, &pid.exe.identity_candidates);
         let at = self.sample.partition_point(|known| {
             (known.first_call_ns, known.pid_host) < (pid.first_call_ns, pid.pid_host)
         });
@@ -3156,17 +3163,36 @@ impl UnboundExeGroup {
         }
     }
 
+    /// Fold one candidate list into the kept ambiguity marker: a
+    /// strictly richer list wins; on equal length the
+    /// lexicographically smallest wins. Order-free: the same set of
+    /// lists always resolves to the same marker.
+    fn consider_candidates(kept: &mut Option<Vec<String>>, candidates: &[String]) {
+        if candidates.len() <= 1 {
+            return;
+        }
+        let replace = match kept {
+            None => true,
+            Some(known) => {
+                candidates.len() > known.len()
+                    || (candidates.len() == known.len() && candidates < known.as_slice())
+            }
+        };
+        if replace {
+            *kept = Some(candidates.to_vec());
+        }
+    }
+
     /// Merge a same-group aggregate (cross-domain merge, loss flip):
-    /// totals sum, samples merge oldest-first, ambiguity keeps
-    /// richest. The representative exe stays the target's.
+    /// totals sum, samples merge oldest-first, ambiguity keeps the
+    /// richest list (smallest on ties, like [`Self::absorb`]). The
+    /// representative exe stays the target's.
     fn merge(&mut self, other: &Self) {
         self.images = self.images.saturating_add(other.images);
         self.calls = self.calls.saturating_add(other.calls);
         self.first_ns = self.first_ns.min(other.first_ns);
-        if other.ambiguous.as_ref().map_or(0, Vec::len)
-            > self.ambiguous.as_ref().map_or(0, Vec::len)
-        {
-            self.ambiguous = other.ambiguous.clone();
+        if let Some(candidates) = other.ambiguous.as_deref() {
+            Self::consider_candidates(&mut self.ambiguous, candidates);
         }
         let mut merged = Vec::with_capacity(self.sample.len() + other.sample.len());
         let (mut left, mut right) = (self.sample.iter(), other.sample.iter());
@@ -3195,12 +3221,18 @@ impl UnboundExeGroup {
 /// Bounded merged run-wide exe summary for the presentation: every
 /// collected image in exactly one group (at most
 /// [`UNBOUND_FOLD_GROUPS_MAX`]), ranked busiest first, plus the
-/// counted overflow past the group bound.
+/// counted overflow past the group bound — and the global oldest
+/// pids across all groups (taken before the bound drains quiet
+/// groups, so the concise callers line names the true oldest).
 #[derive(Debug, Clone)]
 pub(crate) struct UnboundExeSummary {
     pub groups: Vec<UnboundExeGroup>,
     pub overflow_images: u64,
     pub overflow_calls: u64,
+    /// Global oldest [`UNBOUND_FOLD_SAMPLE`] images across every
+    /// merged group (oldest first), computed before the group-bound
+    /// drain: drained groups still contribute their oldest pids.
+    pub oldest: Vec<UnboundPid>,
 }
 
 /// Run-wide bound on distinct folded mechanism rows: the per-module
@@ -4343,6 +4375,15 @@ pub(crate) struct CallerRegistry {
     /// retained map length this sums the published total in O(1).
     /// Monotonic: folds never leave the aggregate.
     unidentified_folded_total: u64,
+    /// Recently-folded run-wide cookies with the fold key each image
+    /// folded under (its bucket, or the overflowed group when no
+    /// bucket fit): the bounded re-witness index. Disjoint from the
+    /// retained map (folding removes from retained before recording
+    /// here, and a ring cookie never re-inserts as new). Bounded by
+    /// [`UNBOUND_FOLD_RING_MAX`], FIFO-evicted via the order queue.
+    unidentified_fold_ring: HashMap<DomainCookie, UnboundFoldKey>,
+    /// Fold order of the ring above, oldest first: eviction order.
+    unidentified_fold_ring_order: VecDeque<DomainCookie>,
     /// Distinct folded mechanism rows across all per-module departed
     /// aggregates: the run-wide [`MAX_FOLDED_MECHANISMS_GLOBAL`]
     /// budget. Monotonic: folds never leave the aggregate.
@@ -4513,6 +4554,15 @@ impl CallerRegistry {
                 size_of::<(UnboundFoldKey, UnboundExeGroup)>(),
                 crate::memory_counters::HEAP_UNBOUND_FOLD,
             ),
+            // Recently-folded cookies with their fold keys (the
+            // bounded re-witness ring plus its FIFO order queue):
+            // fixed cost under the ring bound.
+            unbound_fold_ring: counter_row(
+                self.unidentified_fold_ring.len(),
+                size_of::<(DomainCookie, UnboundFoldKey)>()
+                    .saturating_add(size_of::<DomainCookie>()),
+                crate::memory_counters::HEAP_UNBOUND_FOLD_RING,
+            ),
             // Folded departed identities and mechanism rows, summed
             // over the per-module aggregates (both bounded; saturation
             // disclosed on the rows themselves).
@@ -4636,6 +4686,8 @@ impl CallerRegistry {
             unidentified_fold_overflow_images: 0,
             unidentified_fold_overflow_calls: 0,
             unidentified_folded_total: 0,
+            unidentified_fold_ring: HashMap::new(),
+            unidentified_fold_ring_order: VecDeque::new(),
             folded_mechs_global: 0,
             folded_identities_global: 0,
             folded_instances_global: 0,
@@ -5870,6 +5922,16 @@ impl CallerRegistry {
         }
         let mut groups: Vec<UnboundExeGroup> = merged.into_values().collect();
         groups.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.first_ns.cmp(&b.first_ns)));
+        // The global oldest sample comes first: every group's sample
+        // holds its oldest images, so the union of samples holds the
+        // global oldest — but only before the drain below drops quiet
+        // groups (with their older pids) past the group bound.
+        let mut oldest: Vec<UnboundPid> = groups
+            .iter()
+            .flat_map(|group| group.sample.iter().cloned())
+            .collect();
+        oldest.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
+        oldest.truncate(UNBOUND_FOLD_SAMPLE);
         let mut overflow_images = self.unidentified_fold_overflow_images;
         let mut overflow_calls = self.unidentified_fold_overflow_calls;
         if groups.len() > UNBOUND_FOLD_GROUPS_MAX {
@@ -5886,6 +5948,7 @@ impl CallerRegistry {
             groups,
             overflow_images,
             overflow_calls,
+            oldest,
         }
     }
 
@@ -7714,6 +7777,7 @@ impl CallerRegistry {
         };
         self.witness_placement.module += 1;
         let limits = self.unbound_image_limits;
+        let module_refresh: bool;
         {
             let module = self.modules.get_mut(&id).expect("indexed module");
             let unbound = module.unbound_use.get_or_insert(UnboundUse {
@@ -7730,6 +7794,13 @@ impl CallerRegistry {
             unbound.entries = unbound.entries.saturating_add(entries);
             let count = unbound.reasons.entry(code).or_default();
             *count = count.saturating_add(1);
+            // Pre-insert membership: the run-wide set below tells a
+            // folded refresh apart from a genuinely new cookie by it
+            // (the module never folds, so it remembers past the
+            // run-wide ring window).
+            module_refresh = image
+                .as_ref()
+                .is_some_and(|image| unbound.images.contains_key(&image.cookie));
             if let Some(image) = image.clone() {
                 Self::insert_unbound_image(
                     &mut unbound.images,
@@ -7741,13 +7812,7 @@ impl CallerRegistry {
             }
         }
         if let Some(image) = image {
-            Self::insert_unbound_image(
-                &mut self.unidentified_images,
-                &mut self.unidentified_images_saturated,
-                &mut self.unidentified_pids_dropped,
-                limits.global,
-                image,
-            );
+            self.insert_run_wide_unbound_image(limits.global, module_refresh, image);
         }
         if unidentified {
             let module = self.modules.get(&id).expect("indexed module");
@@ -7763,6 +7828,73 @@ impl CallerRegistry {
                 ),
             );
         }
+    }
+
+    /// Insert `image` into the run-wide slice-1 image set: a
+    /// retained image refreshes in place (earliest call kept, calls
+    /// accumulated, first executable kept); a folded image inside
+    /// the re-witness ring refreshes its bucket exactly (images
+    /// unchanged — never a new image); a folded image past the ring
+    /// window but still held by this row's module (which never
+    /// folds) refreshes into the counted overflow (images
+    /// unchanged, calls exact); anything else inserts new or, past
+    /// the bound, saturates and counts as dropped. `module_refresh`
+    /// is the row module's pre-insert membership: only a refresh
+    /// the module already holds may take the overflow path, so a
+    /// genuinely new cookie always inserts. Residual: a refresh on
+    /// a module the cookie never touched, past the ring window
+    /// (4096+ folds between touches), re-inserts as new — bounded
+    /// by the run-wide cap and disclosed, never silent saturation.
+    fn insert_run_wide_unbound_image(
+        &mut self,
+        limit: usize,
+        module_refresh: bool,
+        image: UnboundImage,
+    ) {
+        if let Some(known) = self.unidentified_images.get_mut(&image.cookie) {
+            known.first_call_ns = known.first_call_ns.min(image.first_call_ns);
+            known.calls_at_least = known.calls_at_least.saturating_add(image.calls);
+            return;
+        }
+        if self.unidentified_fold_ring.contains_key(&image.cookie) {
+            self.refresh_folded_unbound_image(image);
+            return;
+        }
+        if module_refresh {
+            self.unidentified_fold_overflow_calls = self
+                .unidentified_fold_overflow_calls
+                .saturating_add(image.calls);
+            return;
+        }
+        Self::insert_unbound_image(
+            &mut self.unidentified_images,
+            &mut self.unidentified_images_saturated,
+            &mut self.unidentified_pids_dropped,
+            limit,
+            image,
+        );
+    }
+
+    /// Refresh one folded run-wide image inside the re-witness ring:
+    /// the bucket's calls grow by the refresh and its first call
+    /// stays minimal, while images, the pid sample and the
+    /// representative executable stay untouched (the image is
+    /// already counted once, already sampled, and resolve-once).
+    /// When the ring remembers an overflowed group instead of a
+    /// bucket — or the bucket is gone for any reason — the calls
+    /// join the counted overflow instead. Images never move here.
+    fn refresh_folded_unbound_image(&mut self, image: UnboundImage) {
+        let key = self.unidentified_fold_ring.get(&image.cookie).cloned();
+        if let Some(key) = key
+            && let Some(bucket) = self.unidentified_folded.get_mut(&key)
+        {
+            bucket.calls = bucket.calls.saturating_add(image.calls);
+            bucket.first_ns = bucket.first_ns.min(image.first_call_ns);
+            return;
+        }
+        self.unidentified_fold_overflow_calls = self
+            .unidentified_fold_overflow_calls
+            .saturating_add(image.calls);
     }
 
     /// Insert `image` into a slice-1 image set: a known image keeps
@@ -7823,7 +7955,9 @@ impl CallerRegistry {
     /// Fold one run-wide image out of the retained set into its
     /// (domain, exe) bucket, or into the counted overflow past the
     /// group bound. The published total grows by exactly one either
-    /// way.
+    /// way, and the cookie joins the bounded re-witness ring either
+    /// way (an overflowed cookie's refresh lands back in the
+    /// counted overflow).
     fn fold_unbound_image(&mut self, cookie: DomainCookie, pid: UnboundPid) {
         let key = UnboundFoldKey {
             domain: cookie.domain(),
@@ -7832,31 +7966,67 @@ impl CallerRegistry {
         self.unidentified_folded_total = self.unidentified_folded_total.saturating_add(1);
         if let Some(bucket) = self.unidentified_folded.get_mut(&key) {
             bucket.absorb(&pid);
-            return;
-        }
-        if self.unidentified_folded.len() >= UNBOUND_FOLD_GROUPS_MAX {
+        } else if self.unidentified_folded.len() >= UNBOUND_FOLD_GROUPS_MAX {
             self.unidentified_fold_overflow_images =
                 self.unidentified_fold_overflow_images.saturating_add(1);
             self.unidentified_fold_overflow_calls = self
                 .unidentified_fold_overflow_calls
                 .saturating_add(pid.calls_at_least);
-            return;
+        } else {
+            let mut bucket = UnboundExeGroup::empty(key.group.clone(), pid.exe.clone());
+            bucket.absorb(&pid);
+            self.unidentified_folded.insert(key.clone(), bucket);
         }
-        let mut bucket = UnboundExeGroup::empty(key.group.clone(), pid.exe.clone());
-        bucket.absorb(&pid);
-        self.unidentified_folded.insert(key, bucket);
+        self.remember_folded_cookie(cookie, key);
+    }
+
+    /// Remember one folded cookie with its fold key, FIFO-evicting
+    /// past [`UNBOUND_FOLD_RING_MAX`]: the bounded re-witness index.
+    /// Each cookie folds once (a ring cookie never re-inserts as
+    /// new), so the order queue holds no duplicates.
+    fn remember_folded_cookie(&mut self, cookie: DomainCookie, key: UnboundFoldKey) {
+        self.unidentified_fold_ring.insert(cookie, key);
+        self.unidentified_fold_ring_order.push_back(cookie);
+        while self.unidentified_fold_ring.len() > UNBOUND_FOLD_RING_MAX {
+            let Some(oldest) = self.unidentified_fold_ring_order.pop_front() else {
+                break;
+            };
+            self.unidentified_fold_ring.remove(&oldest);
+        }
+        debug_assert!(
+            self.unidentified_fold_ring.len() <= UNBOUND_FOLD_RING_MAX,
+            "the folded-cookie ring keeps its bound"
+        );
     }
 
     /// Whether the run-wide image set holds `cookie`: the O(1)
-    /// backfill index. A cookie the saturated run-wide set dropped
-    /// but a module set kept misses the backfill and keeps its
-    /// provisional verdict (an honest unknown, disclosed through
+    /// retained index. A cookie the saturated run-wide set dropped
+    /// but a module set kept misses the retained backfill and keeps
+    /// its provisional verdict (an honest unknown, disclosed through
     /// the saturation accounting) — the price of never scanning
-    /// every module per EXEC. Folded cookies miss the same way once
-    /// they leave the retained set; the retention window (hundreds
-    /// of images) covers the usual EXEC delay of a pass or two.
+    /// every module per EXEC.
+    #[cfg_attr(not(test), allow(dead_code))] // Retention twins pin the index; production gates on the ring window.
     pub(crate) fn has_unbound_image(&self, cookie: DomainCookie) -> bool {
         self.unidentified_images.contains_key(&cookie)
+    }
+
+    /// Whether a late EXEC for `cookie` is worth resolving: the
+    /// cookie is retained, or folded inside the re-witness ring
+    /// (whose per-module images still resolve even though the
+    /// run-wide aggregate keeps the honest unknown). Stray EXECs
+    /// for unknown cookies still skip with no `/proc` cost, and a
+    /// folded cookie past the ring window keeps the provisional
+    /// verdict everywhere. The run-wide ring (thousands of images)
+    /// covers the usual EXEC delay of a pass or two.
+    pub(crate) fn unbound_backfill_admits(&self, cookie: DomainCookie) -> bool {
+        self.unidentified_images.contains_key(&cookie)
+            || self.unidentified_fold_ring.contains_key(&cookie)
+    }
+
+    /// Test-only: folded cookies remembered in the re-witness ring.
+    #[cfg(test)]
+    pub(crate) fn fold_ring_len_for_test(&self) -> usize {
+        self.unidentified_fold_ring.len()
     }
 
     /// Backfill one joined executable into every image set holding
@@ -7919,7 +8089,15 @@ impl CallerRegistry {
             } else {
                 let mut merged = UnboundExeGroup::empty(target.group.clone(), lost.clone());
                 merged.merge(&bucket);
-                self.unidentified_folded.insert(target, merged);
+                self.unidentified_folded.insert(target.clone(), merged);
+            }
+            // The re-witness ring follows the flip: a refresh of a
+            // flipped cookie accumulates into the lost bucket, never
+            // a resurrected provisional one.
+            for ring_key in self.unidentified_fold_ring.values_mut() {
+                if *ring_key == key {
+                    *ring_key = target.clone();
+                }
             }
         }
         for module in self.modules.values_mut() {
@@ -12844,6 +13022,67 @@ pub(crate) mod tests {
         );
     }
 
+    /// The summary carries the global oldest pids past the group
+    /// bound (R2 twin F2b): the oldest pid sits in the quietest
+    /// group, which the busiest-first drain drops — but the
+    /// pre-drain carrier still names it.
+    #[test]
+    fn unidentified_summary_carries_global_oldest_pids_past_the_group_bound() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        for index in 0..1025u64 {
+            let cookie = DomainCookie::scripted(domain, 41 + index);
+            let path = format!("/bin/x{index}");
+            let exe = unbound_exe(8, 99 + index, Some(&path), ExeResolution::SystemIndex);
+            // The oldest image calls least, so its group drains.
+            let calls = if index == 0 { 1 } else { 2 };
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1000 + index,
+                UnboundReason::NoLiveCaller,
+                calls,
+                Some(unbound_image(
+                    cookie,
+                    1000 + index as u32,
+                    1000 + index,
+                    calls,
+                    exe,
+                )),
+            );
+            if index % 100 == 99 {
+                registry.publish();
+            }
+        }
+        registry.publish();
+        assert_eq!(registry.unidentified_images(), 1025);
+        let summary = registry.unidentified_exe_summary();
+        assert_eq!(summary.groups.len(), UNBOUND_FOLD_GROUPS_MAX);
+        assert!(
+            summary.overflow_images > 0,
+            "the quietest group drains past the bound"
+        );
+        let kept: Vec<u32> = summary
+            .groups
+            .iter()
+            .flat_map(|group| group.sample.iter().map(|pid| pid.pid_host))
+            .collect();
+        assert!(
+            !kept.contains(&1000),
+            "the oldest pid drains with its quiet group"
+        );
+        let oldest: Vec<u32> = summary.oldest.iter().map(|pid| pid.pid_host).collect();
+        assert_eq!(
+            oldest,
+            vec![1000, 1001, 1002, 1003, 1004],
+            "the carrier names the global oldest pids"
+        );
+    }
+
     /// The loss flip moves folded buckets too: the domain's
     /// still-unjoined folded images read `exec_record_lost` with
     /// exact totals, joined buckets keep their verdicts, and a
@@ -12934,6 +13173,295 @@ pub(crate) mod tests {
         assert_eq!(pids.len(), 1);
         assert_eq!(pids[0].exe, first);
         assert_eq!((pids[0].calls_at_least, pids[0].first_call_ns), (5, 210));
+    }
+
+    /// Re-witnessed folded cookie (v080-rss-churn-bound R2 twin F1): a
+    /// cookie that folded out of the retained set and is staged again
+    /// (a never-bound image touching a second object in a later pass)
+    /// is a refresh, not a new image: the published total counts it
+    /// once with summed calls, and its pid appears once in the
+    /// summary.
+    #[test]
+    fn rewitnessed_folded_cookie_counts_once_with_summed_calls() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        let cookie = DomainCookie::scripted(domain, 41);
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            1000,
+            UnboundReason::NoLiveCaller,
+            2,
+            Some(unbound_image(cookie, 9, 1000, 2, provisional.clone())),
+        );
+        registry.publish();
+        for index in 0..600u64 {
+            let newer = DomainCookie::scripted(domain, 42 + index);
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1001 + index,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(
+                    newer,
+                    1000 + index as u32,
+                    1001 + index,
+                    2,
+                    provisional.clone(),
+                )),
+            );
+            if index % 100 == 99 {
+                registry.publish();
+            }
+        }
+        registry.publish();
+        assert_eq!(registry.unidentified_images(), 601);
+        assert!(
+            !registry.has_unbound_image(cookie),
+            "C folded out of the retained set before the re-witness"
+        );
+        // A later pass re-stages C (second object, later row): a
+        // refresh of the folded image, not a brand-new image.
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            2000,
+            UnboundReason::NoLiveCaller,
+            3,
+            Some(unbound_image(cookie, 9, 2000, 3, provisional.clone())),
+        );
+        registry.publish();
+        assert_eq!(
+            registry.unidentified_images(),
+            601,
+            "the re-witnessed folded cookie counts once"
+        );
+        assert!(
+            !registry.unidentified_images_saturated(),
+            "a refresh is never saturation"
+        );
+        let summary = registry.unidentified_exe_summary();
+        assert_eq!(summary.groups.len(), 1, "one provisional group");
+        assert_eq!(
+            (summary.groups[0].images, summary.groups[0].calls),
+            (601, 1205),
+            "601 images with C's calls summed (2 + 3)"
+        );
+        let dups = summary.groups[0]
+            .sample
+            .iter()
+            .filter(|pid| pid.pid_host == 9)
+            .count();
+        assert_eq!(dups, 1, "the re-witnessed pid appears once in the sample");
+    }
+
+    /// Re-witness past the folded-cookie window (R2 twin F1b): a
+    /// cookie folded so long ago that the bounded ring forgot it
+    /// still never counts as a new image. Its refresh calls join the
+    /// counted overflow (images unchanged), so every total stays
+    /// exact without a false saturation flag.
+    #[test]
+    fn rewitnessed_long_folded_cookie_counts_calls_without_a_new_image() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        let cookie = DomainCookie::scripted(domain, 41);
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            1000,
+            UnboundReason::NoLiveCaller,
+            2,
+            Some(unbound_image(cookie, 9, 1000, 2, provisional.clone())),
+        );
+        registry.publish();
+        const NEWER: u64 = 4700;
+        for index in 0..NEWER {
+            let newer = DomainCookie::scripted(domain, 42 + index);
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1001 + index,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(
+                    newer,
+                    1000 + index as u32,
+                    1001 + index,
+                    2,
+                    provisional.clone(),
+                )),
+            );
+            if index % 100 == 99 {
+                registry.publish();
+            }
+        }
+        registry.publish();
+        assert_eq!(registry.unidentified_images(), NEWER + 1);
+        assert_eq!(
+            registry.fold_ring_len_for_test(),
+            4096,
+            "the ring evicts past its bound, so C is long forgotten"
+        );
+        // A later pass re-stages the long-folded cookie.
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            9000,
+            UnboundReason::NoLiveCaller,
+            3,
+            Some(unbound_image(cookie, 9, 9000, 3, provisional.clone())),
+        );
+        registry.publish();
+        assert_eq!(
+            registry.unidentified_images(),
+            NEWER + 1,
+            "the long-folded re-witness counts no new image"
+        );
+        assert!(
+            !registry.unidentified_images_saturated(),
+            "a refresh is never saturation"
+        );
+        let summary = registry.unidentified_exe_summary();
+        let grouped: u64 = summary.groups.iter().map(|group| group.images).sum();
+        assert_eq!(
+            grouped.saturating_add(summary.overflow_images),
+            NEWER + 1,
+            "groups plus overflow count every image once"
+        );
+        let calls: u64 = summary
+            .groups
+            .iter()
+            .map(|group| group.calls)
+            .sum::<u64>()
+            .saturating_add(summary.overflow_calls);
+        assert_eq!(
+            calls,
+            (NEWER + 1) * 2 + 3,
+            "the refresh calls stay counted exactly"
+        );
+    }
+
+    /// Folded ambiguity ties (R2 twin F3): equal-length richest lists
+    /// resolve by content (the lexicographically smallest wins), not
+    /// by hash iteration order — deterministically across runs.
+    #[test]
+    fn folded_ambiguity_tie_breaks_by_richest_then_smallest_candidates() {
+        let key = UnboundExeGroupKey::Path("/bin/x".to_string());
+        let exe = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::SystemIndex);
+        let pid_with = |pid: u32, first_ns: u64, candidates: &[&str]| UnboundPid {
+            pid_host: pid,
+            first_call_ns: first_ns,
+            calls_at_least: 1,
+            exe: UnboundExe {
+                identity_candidates: candidates
+                    .iter()
+                    .map(|candidate| candidate.to_string())
+                    .collect(),
+                ..exe.clone()
+            },
+        };
+        // Absorb keeps the smallest on ties, whichever arrives first.
+        for first in [vec!["/c", "/d"], vec!["/a", "/b"]] {
+            let mut bucket = UnboundExeGroup::empty(key.clone(), exe.clone());
+            let second = if first[0] == "/c" {
+                vec!["/a", "/b"]
+            } else {
+                vec!["/c", "/d"]
+            };
+            bucket.absorb(&pid_with(9, 210, &first));
+            bucket.absorb(&pid_with(10, 220, &second));
+            assert_eq!(
+                bucket.ambiguous,
+                Some(vec!["/a".to_string(), "/b".to_string()]),
+                "absorb breaks ties by content, not arrival order"
+            );
+        }
+        // Merge keeps the smallest on ties, on either side.
+        for (left, right) in [
+            (vec!["/c", "/d"], vec!["/a", "/b"]),
+            (vec!["/a", "/b"], vec!["/c", "/d"]),
+        ] {
+            let mut target = UnboundExeGroup::empty(key.clone(), exe.clone());
+            target.absorb(&pid_with(9, 210, &left));
+            let mut other = UnboundExeGroup::empty(key.clone(), exe.clone());
+            other.absorb(&pid_with(10, 220, &right));
+            target.merge(&other);
+            assert_eq!(
+                target.ambiguous,
+                Some(vec!["/a".to_string(), "/b".to_string()]),
+                "merge breaks ties by content, not side"
+            );
+        }
+        // A strictly richer list still wins over a smaller poorer one.
+        let mut bucket = UnboundExeGroup::empty(key.clone(), exe.clone());
+        bucket.absorb(&pid_with(9, 210, &["/a", "/b"]));
+        bucket.absorb(&pid_with(10, 220, &["/c", "/d", "/e"]));
+        assert_eq!(
+            bucket.ambiguous,
+            Some(vec!["/c".to_string(), "/d".to_string(), "/e".to_string()]),
+            "richest still wins over smallest"
+        );
+    }
+
+    /// Folded ambiguity across staging orders (R2 twin F3b): two
+    /// images under one path with tied richest lists show the same
+    /// marker whichever stages first.
+    #[test]
+    fn folded_ambiguity_winner_is_stable_across_staging_orders() {
+        let summarize = |first: &[&str], second: &[&str]| {
+            let mut registry = registry();
+            let keys = mapped(
+                &mut registry,
+                CallerId(0),
+                &[("/lib/a.so", 11, AdmissionState::Admitted)],
+            );
+            let domain = NativeDomainId::mint();
+            let exe_for = |candidates: &[&str]| UnboundExe {
+                dev: 8,
+                ino: 99,
+                path: Some("/bin/x".to_string()),
+                resolution: ExeResolution::SystemIndex,
+                identity_candidates: candidates
+                    .iter()
+                    .map(|candidate| candidate.to_string())
+                    .collect(),
+            };
+            for (index, candidates) in [first, second].into_iter().enumerate() {
+                let cookie = DomainCookie::scripted(domain, 41 + index as u64);
+                registry.note_unbound_witness_with_image(
+                    vec![keys[0].clone()],
+                    210 + index as u64,
+                    UnboundReason::NoLiveCaller,
+                    1,
+                    Some(unbound_image(
+                        cookie,
+                        9 + index as u32,
+                        210 + index as u64,
+                        1,
+                        exe_for(candidates),
+                    )),
+                );
+            }
+            registry.publish();
+            let summary = registry.unidentified_exe_summary();
+            assert_eq!(summary.groups.len(), 1);
+            summary.groups[0].ambiguous.clone()
+        };
+        let left = summarize(&["/a", "/b"], &["/c", "/d"]);
+        let right = summarize(&["/c", "/d"], &["/a", "/b"]);
+        assert_eq!(left, right, "the tie winner ignores staging order");
+        assert_eq!(
+            left,
+            Some(vec!["/a".to_string(), "/b".to_string()]),
+            "the tie winner is the smallest list"
+        );
     }
 
     /// The EXEC backfill updates every image set holding the cookie

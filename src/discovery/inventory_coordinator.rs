@@ -5126,11 +5126,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Stash the last valid progress summary before the bundle leaves
     /// for a worker. Only non-empty bundles update the stash (an empty
     /// take is a first pass or a post-discard restart, never new
-    /// information); a converged bundle clears it.
+    /// information); a converged bundle clears it. The stash stays
+    /// meaningful only while the worker owns the bundle or a return
+    /// was discarded; an accepted return replaces it outright (see
+    /// [`Self::replace_scan_progress_stash`]).
     fn stash_scan_progress(&mut self) {
         if self.cgroup_file_facts.has_decode_cursors() {
             self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
         }
+    }
+
+    /// Replace the stashed progress summary with the returned bundle's
+    /// current progress, unconditionally: an accepted worker return
+    /// brings the bundle home, so its progress — or its converged or
+    /// empty absence — is current. A sole hinted object that unmapped
+    /// before the next pass returns an empty bundle; the stash must
+    /// clear instead of projecting the old live progress as a pending
+    /// resume.
+    fn replace_scan_progress_stash(&mut self) {
+        self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
     }
 
     /// The live in-progress gap for the terminal view: when decode
@@ -5243,9 +5257,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // collector took it; a collection discarded between that take and
         // this point (worker failure, stop, or a refusal above) leaves the
         // coordinator without facts, so the next pass re-reads instead of
-        // reusing anything stale.
+        // reusing anything stale. This accepted return replaces the stash
+        // outright (an empty bundle clears it); only worker custody or a
+        // discarded return keeps the older summary.
         self.cgroup_file_facts = collection.take_retained_file_facts();
-        self.stash_scan_progress();
+        self.replace_scan_progress_stash();
         let work = collection.work();
         let events = self
             .adapter
@@ -38819,6 +38835,68 @@ int main(void) {
         assert!(
             coordinator.live_scan_progress_gap().is_none(),
             "the converged scan shows no live in-progress gap"
+        );
+    }
+
+    /// An accepted empty-bundle return clears the stashed scan progress:
+    /// a sole hinted object that unmapped before the next pass leaves no
+    /// unfinished cursors, so the terminal shows no in-progress gap —
+    /// never the old stashed counts as a pending resume. While the worker
+    /// owns the bundle, the stash still serves the live gap (the in-flight
+    /// ownership positive below).
+    #[test]
+    fn accepted_empty_bundle_return_clears_the_stashed_scan_progress() {
+        let mut coordinator = coordinator();
+        // One unfinished cursor, like a sole hinted object mid-scan.
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let key = crate::discovery::scan_pass::DecodeCursorKey {
+            pid: 7,
+            start_time: 9,
+            file: crate::discovery::scan::InspectedFileKey {
+                device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+                inode: 11,
+                pin: crate::discovery::identity::pin_of(&file).unwrap(),
+                fd_dev: 7,
+            },
+            exec: None,
+        };
+        let cursor = crate::discovery::scan_pass::DecodeCursor {
+            fingerprint: Vec::new(),
+            tables: crate::discovery::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            interfaces: crate::discovery::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            anchors: None,
+            cached_tables: Vec::new(),
+            cached_interfaces: Vec::new(),
+            unlinked: Vec::new(),
+            targets: Vec::new(),
+            complete: false,
+            validated: false,
+            seq: 0,
+        };
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default()
+            .with_retained_file_facts(crate::discovery::scan::RetainedFileFacts::default());
+        assert!(budget.record_decode_cursor(key, cursor));
+        coordinator.cgroup_file_facts = budget.take_retained_file_facts();
+        // The take path stashes while the bundle leaves for the worker.
+        coordinator.stash_scan_progress();
+        let _taken = std::mem::take(&mut coordinator.cgroup_file_facts);
+        assert!(
+            coordinator.live_scan_progress_gap().is_some(),
+            "the stash serves the live gap while the worker owns the bundle"
+        );
+        // The worker returns an empty bundle (the sole object unmapped).
+        // The accepted return replaces the stash, clearing it.
+        coordinator.cgroup_file_facts = crate::discovery::scan::RetainedFileFacts::default();
+        coordinator.replace_scan_progress_stash();
+        assert!(
+            coordinator.live_scan_progress_gap().is_none(),
+            "an accepted empty return leaves no stale in-progress gap"
         );
     }
 

@@ -2213,6 +2213,55 @@ impl UnknownCounters {
         }
     }
 
+    /// Record one terminal's mechanism id: repeat ids count up,
+    /// new ids append in first-seen order, and ids past the eight
+    /// listed count their terminals exactly in
+    /// `further_mechanism_terminals`.
+    fn add_mech(&mut self, id: u64) {
+        for slot in self.mechs.iter_mut().take(self.mechs_len as usize) {
+            if slot.0 == id {
+                slot.1 = slot.1.saturating_add(1);
+                return;
+            }
+        }
+        if (self.mechs_len as usize) < UNKNOWN_MECHS_PER_BUCKET {
+            self.mechs[self.mechs_len as usize] = (id, 1);
+            self.mechs_len += 1;
+        } else {
+            self.further_mechanism_terminals =
+                self.further_mechanism_terminals.saturating_add(1);
+        }
+    }
+
+    /// Merge another bucket's mechanism ids (bulk-disposal
+    /// preservation): listed counts add per id in first-seen
+    /// order, and overflow terminals add exactly.
+    fn absorb_mechs(&mut self, other: &Self) {
+        for (id, count) in other.mechs.iter().take(other.mechs_len as usize) {
+            let mut placed = false;
+            for slot in self.mechs.iter_mut().take(self.mechs_len as usize) {
+                if slot.0 == *id {
+                    slot.1 = slot.1.saturating_add(*count);
+                    placed = true;
+                    break;
+                }
+            }
+            if !placed {
+                if (self.mechs_len as usize) < UNKNOWN_MECHS_PER_BUCKET {
+                    self.mechs[self.mechs_len as usize] = (*id, *count);
+                    self.mechs_len += 1;
+                } else {
+                    self.further_mechanism_terminals = self
+                        .further_mechanism_terminals
+                        .saturating_add(*count);
+                }
+            }
+        }
+        self.further_mechanism_terminals = self
+            .further_mechanism_terminals
+            .saturating_add(other.further_mechanism_terminals);
+    }
+
     /// Whether any counter is nonzero: only live summaries publish.
     pub(crate) fn is_live(&self) -> bool {
         self.completed != 0
@@ -2982,8 +3031,9 @@ impl KeyUseReducer {
     ) {
         self.unknown_ever_live[index] = true;
         self.unknown[index].add(outcome);
-        // RED: the GREEN commit records the id here.
-        let _ = mechanism;
+        if let Some(id) = mechanism {
+            self.unknown[index].add_mech(id);
+        }
     }
 
     /// Mark one fixed unknown summary ever-live and count live
@@ -3011,6 +3061,7 @@ impl KeyUseReducer {
             slot.cancelled = slot.cancelled.saturating_add(add.cancelled);
             slot.unknown = slot.unknown.saturating_add(add.unknown);
             slot.active = slot.active.saturating_add(add.active);
+            slot.absorb_mechs(add);
         }
         for (live, add) in self
             .unknown_ever_live

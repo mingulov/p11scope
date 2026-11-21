@@ -100,7 +100,7 @@ LINKED_KEY_SIZES_TEXT = """p11scope: native usage lane active (Inventory capture
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
 key operations: 2 keys on 1 provider; rev 12 populated; 1 session
-  key row 1 object 9 sign key (rsa_2048): probably RSA (from mechanism); RSA 2048 (from signature length)
+  key row i1 object 9 sign key (rsa_2048): probably RSA (from mechanism); RSA 2048 (from signature length)
 p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0
 p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0
 """
@@ -111,7 +111,7 @@ LINKED_KEY_SIZES_NO_RSA_TEXT = """p11scope: native usage lane active (Inventory 
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
 key operations: 1 key on 1 provider; rev 12 populated; 1 session
-  key row 1 object 9 sign key (unknown): probably secret-key (from mechanism); size unknown (no length map for this mechanism)
+  key row i1 object 9 sign key (unknown): probably secret-key (from mechanism); size unknown (no length map for this mechanism)
 p11scope: joint voids: break_dispose=0 break_ingest=0 void_audit=0 void_resync=0 seal_below_fence=0 keys_total=0 keys_refused=0 keys_tainted=0 keys_pending=0 audit_fault_changed_chain=0 audit_fault_changed_reread=0 audit_h3_loss=0 audit_discarded=0 audit_malformed=0 audit_counter_unprovable=0 audit_fault_unreadable=0 audit_resource_unavailable=0 skip_eras=0 voids_ended_joint_feed=0
 p11scope: joint decoder: raw_malformed=0 raw_malformed_unprovable=0
 """
@@ -242,8 +242,8 @@ LINKED_KEY_SIZES_RSA_PRINTABLE_TEXT = LINKED_KEY_SIZES_TEXT.replace(
 #: row carries a metadata label with a space: the producer's
 #: vocabulary uses underscores, so the complete proof must refuse.
 LINKED_KEY_SIZES_RSA_METADATA_SPACE_TEXT = LINKED_KEY_SIZES_TEXT.replace(
-    "key row 1 object 9 sign key (rsa_2048):",
-    "key row 1 object 9 sign key (rsa 2048):", 1)
+    "key row i1 object 9 sign key (rsa_2048):",
+    "key row i1 object 9 sign key (rsa 2048):", 1)
 
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
@@ -544,15 +544,18 @@ class JournalGateTests(unittest.TestCase):
             "refusal-515": {"rc": 1, "text":
                 "p11scope: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
-                "for host readiness\n"},
+                "for host readiness, or use 'p11scope inventory --capture scan' "
+                "or 'p11scope inspect --pid N' for a scan without capture.\n"},
             "refusal-515-loaded": {"rc": 1, "text":
                 "p11scope: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
-                "for host readiness\n"},
+                "for host readiness, or use 'p11scope inventory --capture scan' "
+                "or 'p11scope inspect --pid N' for a scan without capture.\n"},
             "refusal-515-timeout": {"rc": 124, "text":
                 "p11scope: live capture unavailable: loading p11scope's BPF "
                 "programs is not supported on this host; run 'p11scope doctor' "
-                "for host readiness\n"},
+                "for host readiness, or use 'p11scope inventory --capture scan' "
+                "or 'p11scope inspect --pid N' for a scan without capture.\n"},
             "refusal-515-fragment": {"rc": 1, "text":
                 "unrelated diagnostic: live capture unavailable: test\n"},
             "refused-noseal-fragment": {"rc": 0, "text":
@@ -1836,7 +1839,8 @@ class ScriptContractTests(unittest.TestCase):
 
     def test_names_the_finite_refusal_reasons(self):
         self.assertIn("journal-pair-unavailable-in-build", self.text)
-        self.assertIn("live capture \\(needs CAP_\\|refused:\\|unavailable:\\|did not start:\\)", self.text)
+        self.assertIn("p11scope: live capture (needs ", self.text)
+        self.assertIn("for a scan without capture", self.text)
         self.assertIn("p11scope: key operations unavailable", self.text)
 
     def test_runs_one_bounded_guest_per_kernel(self):

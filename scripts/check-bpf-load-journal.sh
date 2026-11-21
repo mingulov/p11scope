@@ -631,7 +631,7 @@ PY
         # Refusal control: the finite pre-Multi refusal, no loaded
         # journal row, no crash. A load or a crash is FAIL.
         REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -q 'live capture \(needs CAP_\|refused:\|unavailable:\|did not start:\)' "$J_TXT"; then
+        if [ ! -f "$J_TXT" ] || ! grep -aEq '^p11scope: live capture (needs [[:print:]]+|refused: [[:print:]]+|unavailable: [[:print:]]+|did not start: [[:print:]]+) for a scan without capture\.$' "$J_TXT"; then
             add_reason "finite live-capture refusal missing"
         fi
         case "$J_RC" in
@@ -668,7 +668,7 @@ PY
         # different outcome or a crash is FAIL. (SMALL builds omit the
         # object; release builds carry it.)
         REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -q 'journal-pair-unavailable-in-build: this build omits the production journal object' "$J_TXT"; then
+        if [ ! -f "$J_TXT" ] || ! grep -aEq '^p11scope: key operations unavailable: journal-pair-unavailable-in-build: this build omits the production journal object; broad inventory continues with S1 mechanisms and API results$' "$J_TXT"; then
             add_reason "exact journal-pair-unavailable-in-build refusal missing"
         fi
         case "$J_RC" in
@@ -755,7 +755,7 @@ PY
     if [ "$KEY_SIZES" = 1 ] && [ -f "$J_TXT" ]; then
         if ! grep -aEq '^key operations: [0-9]+ keys? on [0-9]+ providers?; rev [0-9]+ (populated|partial|stale|unavailable); [0-9]+ sessions?$' "$J_TXT"; then
             add_reason "key rows never rendered under --key-sizes"
-        elif ! grep -aEq '^  key row [^ ]+ object [^ ]+ sign key \([^()]*\): [[:print:]]*RSA 2048 \(from signature length\)[[:print:]]*$' "$J_TXT"; then
+        elif ! grep -aEq '^  key row i[0-9]+ object [0-9]+ sign key \((rsa_1024|rsa_2048|rsa_3072|rsa_4096|rsa_other|aes_128|aes_192|aes_256|aes_other|ec_p256|ec_p384|ec_p521|x25519|x448|ed25519|ed448|hkdf_96|hkdf_128|hkdf_192|hkdf_256|hkdf_384|hkdf_other|generic_96|generic_128|generic_192|generic_256|generic_384|generic_other|ml_dsa_44|ml_dsa_65|ml_dsa_87|ml_kem_512|ml_kem_768|ml_kem_1024|slh_dsa_sha2_128s|slh_dsa_shake_128s|slh_dsa_sha2_128f|slh_dsa_shake_128f|slh_dsa_sha2_192s|slh_dsa_shake_192s|slh_dsa_sha2_192f|slh_dsa_shake_192f|slh_dsa_sha2_256s|slh_dsa_shake_256s|slh_dsa_sha2_256f|slh_dsa_shake_256f|unknown)\): probably RSA \(from mechanism\); RSA 2048 \(from signature length\)$' "$J_TXT"; then
             add_reason "no classified RSA-2048 size under --key-sizes"
         fi
         DECODER_LINES=$(grep -ac '^p11scope: joint decoder:' "$J_TXT" || true)

@@ -39003,9 +39003,9 @@ int main(void) {
     }
 
     /// Churn bound (v080-rss-churn-bound twin G2): the live stream
-    /// view retains one full run-wide pid vector per pass, so process
-    /// churn grows the retained presentation without bound. Past the
-    /// retention bound the view keeps a bounded sample plus exact
+    /// view retained one full run-wide pid vector per pass, so process
+    /// churn grew the retained presentation without bound. Past the
+    /// retention bound the view keeps bounded exe groups plus exact
     /// totals instead of one entry per churn fork.
     #[test]
     fn stream_view_unbound_sample_stays_bounded_under_churn() {
@@ -39027,9 +39027,35 @@ int main(void) {
             1,
         );
         assert!(
-            presentation.unbound_pids.len() <= 512,
-            "the retained view sample stays bounded: {}",
-            presentation.unbound_pids.len()
+            presentation.unbound_exe_groups.len()
+                <= crate::discovery::caller_registry::UNBOUND_FOLD_GROUPS_MAX,
+            "the retained view groups stay bounded: {}",
+            presentation.unbound_exe_groups.len()
+        );
+        let grouped: u64 = presentation
+            .unbound_exe_groups
+            .iter()
+            .map(|group| group.images)
+            .sum::<u64>()
+            .saturating_add(presentation.unbound_fold_overflow_images);
+        assert_eq!(
+            grouped, 600,
+            "groups plus overflow count every churn image exactly once"
+        );
+        assert_eq!(
+            presentation.unbound_images, 600,
+            "the view total stays exact"
+        );
+        let mut oldest: Vec<u32> = presentation
+            .unbound_exe_groups
+            .iter()
+            .flat_map(|group| group.sample.iter().map(|pid| pid.pid_host))
+            .collect();
+        oldest.sort_unstable();
+        assert_eq!(
+            &oldest[..5],
+            &[1000, 1001, 1002, 1003, 1004],
+            "the single group's sample keeps the oldest pids"
         );
     }
 

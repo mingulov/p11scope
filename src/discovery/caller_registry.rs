@@ -3052,6 +3052,157 @@ pub(crate) struct UnboundPid {
     pub exe: UnboundExe,
 }
 
+/// Run-wide retained unidentified images: the newest images by
+/// (`first_call_ns`, `pid_host`) stay per-cookie every publish;
+/// older images fold into exact per-exe aggregates. Small enough to
+/// flatten a soak within minutes, large enough that EXEC backfills
+/// and loss flips — which land within a pass or two of staging —
+/// virtually always hit retained entries.
+pub(crate) const UNBOUND_RETAINED_MAX: usize = 512;
+/// Distinct folded run-wide exe groups: past it further groups fold
+/// into the counted overflow instead of naming new rows.
+pub(crate) const UNBOUND_FOLD_GROUPS_MAX: usize = 1024;
+/// Oldest pids kept per folded group: the concise lines show five.
+const UNBOUND_FOLD_SAMPLE: usize = 5;
+
+/// One folded run-wide exe group key: the concise render grouping,
+/// owned. A resolved image with a path groups by path; anything
+/// else groups by (resolution, dev, ino) — exactly the key
+/// `render_unidentified_executables` groups by, so folded and
+/// retained images merge exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum UnboundExeGroupKey {
+    Path(String),
+    Unknown(ExeResolution, u64, u64),
+}
+
+impl UnboundExeGroupKey {
+    /// The render grouping for one image's executable.
+    fn of(exe: &UnboundExe) -> Self {
+        match (&exe.path, exe.resolution) {
+            (Some(path), resolution) if resolution.is_resolved() => Self::Path(path.clone()),
+            _ => Self::Unknown(exe.resolution, exe.dev, exe.ino),
+        }
+    }
+}
+
+/// One folded run-wide image's aggregate slot: its domain (EXEC loss
+/// flips are per-domain) plus its exe group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UnboundFoldKey {
+    domain: NativeDomainId,
+    group: UnboundExeGroupKey,
+}
+
+/// Exact aggregate of run-wide images for one exe group: image and
+/// call totals plus the oldest-first pid sample and richest
+/// ambiguity list the concise lines render. Stored per
+/// (domain, group); merged across domains for the presentation (the
+/// concise lines never name domains).
+#[derive(Debug, Clone)]
+pub(crate) struct UnboundExeGroup {
+    /// The grouping key (never recomputed from `exe`, so a loss flip
+    /// that merges groups keeps the target key exactly).
+    pub key: UnboundExeGroupKey,
+    /// Representative executable: the first image's, so the label
+    /// reads exactly like that image's row did.
+    pub exe: UnboundExe,
+    /// Exact folded image count.
+    pub images: u64,
+    /// Exact folded `calls_at_least` sum.
+    pub calls: u64,
+    /// Earliest first call (rank tiebreak, like the render).
+    pub first_ns: u64,
+    /// Oldest images first, at most [`UNBOUND_FOLD_SAMPLE`].
+    pub sample: Vec<UnboundPid>,
+    /// Richest identity-candidate list in the group, if any image is
+    /// ambiguous.
+    pub ambiguous: Option<Vec<String>>,
+}
+
+impl UnboundExeGroup {
+    /// An empty group keyed by `key` with `exe` as its label source.
+    fn empty(key: UnboundExeGroupKey, exe: UnboundExe) -> Self {
+        Self {
+            key,
+            exe,
+            images: 0,
+            calls: 0,
+            first_ns: u64::MAX,
+            sample: Vec::new(),
+            ambiguous: None,
+        }
+    }
+
+    /// Absorb one image: totals grow exactly, the sample keeps the
+    /// oldest [`UNBOUND_FOLD_SAMPLE`] by (`first_call_ns`, `pid_host`),
+    /// and the ambiguity keeps the richest candidate list (first on
+    /// ties, deterministically).
+    fn absorb(&mut self, pid: &UnboundPid) {
+        self.images = self.images.saturating_add(1);
+        self.calls = self.calls.saturating_add(pid.calls_at_least);
+        self.first_ns = self.first_ns.min(pid.first_call_ns);
+        if pid.exe.identity_candidates.len() > 1
+            && pid.exe.identity_candidates.len() > self.ambiguous.as_ref().map_or(0, Vec::len)
+        {
+            self.ambiguous = Some(pid.exe.identity_candidates.clone());
+        }
+        let at = self.sample.partition_point(|known| {
+            (known.first_call_ns, known.pid_host) < (pid.first_call_ns, pid.pid_host)
+        });
+        if at < UNBOUND_FOLD_SAMPLE {
+            self.sample.insert(at, pid.clone());
+            self.sample.truncate(UNBOUND_FOLD_SAMPLE);
+        }
+    }
+
+    /// Merge a same-group aggregate (cross-domain merge, loss flip):
+    /// totals sum, samples merge oldest-first, ambiguity keeps
+    /// richest. The representative exe stays the target's.
+    fn merge(&mut self, other: &Self) {
+        self.images = self.images.saturating_add(other.images);
+        self.calls = self.calls.saturating_add(other.calls);
+        self.first_ns = self.first_ns.min(other.first_ns);
+        if other.ambiguous.as_ref().map_or(0, Vec::len)
+            > self.ambiguous.as_ref().map_or(0, Vec::len)
+        {
+            self.ambiguous = other.ambiguous.clone();
+        }
+        let mut merged = Vec::with_capacity(self.sample.len() + other.sample.len());
+        let (mut left, mut right) = (self.sample.iter(), other.sample.iter());
+        let (mut next_left, mut next_right) = (left.next(), right.next());
+        while next_left.is_some() || next_right.is_some() {
+            let take_left = match (next_left, next_right) {
+                (Some(left), Some(right)) => {
+                    (left.first_call_ns, left.pid_host) <= (right.first_call_ns, right.pid_host)
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_left {
+                merged.push(next_left.expect("checked above").clone());
+                next_left = left.next();
+            } else {
+                merged.push(next_right.expect("checked above").clone());
+                next_right = right.next();
+            }
+        }
+        merged.truncate(UNBOUND_FOLD_SAMPLE);
+        self.sample = merged;
+    }
+}
+
+/// Bounded merged run-wide exe summary for the presentation: every
+/// collected image in exactly one group (at most
+/// [`UNBOUND_FOLD_GROUPS_MAX`]), ranked busiest first, plus the
+/// counted overflow past the group bound.
+#[derive(Debug, Clone)]
+pub(crate) struct UnboundExeSummary {
+    pub groups: Vec<UnboundExeGroup>,
+    pub overflow_images: u64,
+    pub overflow_calls: u64,
+}
+
 /// Run-wide bound on distinct folded mechanism rows: the per-module
 /// maps (each like one live edge's
 /// [`MAX_EDGE_MECHANISMS`](crate::semantics_edge::MAX_EDGE_MECHANISMS))
@@ -4167,7 +4318,10 @@ pub(crate) struct CallerRegistry {
     /// union of committed single-module inserts, each with its
     /// historical host pid (Part C). Cookies never publish: only
     /// the count, the saturation flag, and the host-pid list reach
-    /// output.
+    /// output. Every publish folds images past
+    /// [`UNBOUND_RETAINED_MAX`] (oldest first) into the exact
+    /// per-exe aggregates below, so this stays bounded while totals
+    /// stay exact.
     unidentified_images: HashMap<DomainCookie, UnboundPid>,
     /// The run-wide image set hit its bound: the published count is a
     /// lower bound. Sticky.
@@ -4175,6 +4329,20 @@ pub(crate) struct CallerRegistry {
     /// Distinct images (with their host pids) the run-wide bound
     /// turned away, saturating. Sticky.
     unidentified_pids_dropped: u64,
+    /// Folded run-wide images past the retention bound: exact
+    /// per-(domain, exe) aggregates. Bounded by
+    /// [`UNBOUND_FOLD_GROUPS_MAX`]; past it further groups fold into
+    /// the counted overflow below.
+    unidentified_folded: HashMap<UnboundFoldKey, UnboundExeGroup>,
+    /// Folded images whose exe group found no bucket past the group
+    /// bound: counted, never named.
+    unidentified_fold_overflow_images: u64,
+    /// Their folded `calls_at_least` sum: counted with the images.
+    unidentified_fold_overflow_calls: u64,
+    /// Exact folded image total (buckets plus overflow): with the
+    /// retained map length this sums the published total in O(1).
+    /// Monotonic: folds never leave the aggregate.
+    unidentified_folded_total: u64,
     /// Distinct folded mechanism rows across all per-module departed
     /// aggregates: the run-wide [`MAX_FOLDED_MECHANISMS_GLOBAL`]
     /// budget. Monotonic: folds never leave the aggregate.
@@ -4337,6 +4505,14 @@ impl CallerRegistry {
                 size_of::<(DomainCookie, UnboundPid)>(),
                 HEAP_MODULE_KEY,
             ),
+            // Folded run-wide exe groups (bounded buckets with their
+            // pid samples); the retained map above plus these bound
+            // the same data the live stream view clones.
+            unbound_folded: counter_row(
+                self.unidentified_folded.len(),
+                size_of::<(UnboundFoldKey, UnboundExeGroup)>(),
+                crate::memory_counters::HEAP_UNBOUND_FOLD,
+            ),
             // Folded departed identities and mechanism rows, summed
             // over the per-module aggregates (both bounded; saturation
             // disclosed on the rows themselves).
@@ -4456,6 +4632,10 @@ impl CallerRegistry {
             unidentified_images: HashMap::new(),
             unidentified_images_saturated: false,
             unidentified_pids_dropped: 0,
+            unidentified_folded: HashMap::new(),
+            unidentified_fold_overflow_images: 0,
+            unidentified_fold_overflow_calls: 0,
+            unidentified_folded_total: 0,
             folded_mechs_global: 0,
             folded_identities_global: 0,
             folded_instances_global: 0,
@@ -5637,10 +5817,12 @@ impl CallerRegistry {
     }
 
     /// Run-wide distinct unidentified caller images (slice 1): the
-    /// published count — a lower bound while
-    /// [`Self::unidentified_images_saturated`].
+    /// published count — retained plus folded, exact, and a lower
+    /// bound while [`Self::unidentified_images_saturated`].
     pub(crate) fn unidentified_images(&self) -> u64 {
-        u64::try_from(self.unidentified_images.len()).unwrap_or(u64::MAX)
+        u64::try_from(self.unidentified_images.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.unidentified_folded_total)
     }
 
     /// The run-wide image set hit its bound. Sticky.
@@ -5648,13 +5830,63 @@ impl CallerRegistry {
         self.unidentified_images_saturated
     }
 
-    /// Every collected run-wide host pid, oldest first call first
-    /// (Part C): one entry per image, never deduplicated, complete
-    /// while [`Self::unidentified_pids_dropped`] is zero.
+    /// Retained run-wide images, oldest first call first (Part C):
+    /// the bounded recent sample (at most [`UNBOUND_RETAINED_MAX`]),
+    /// never deduplicated. Complete while nothing folded and
+    /// [`Self::unidentified_pids_dropped`] is zero; past the
+    /// retention bound the oldest images live in the exact
+    /// aggregates ([`Self::unidentified_exe_summary`]).
+    /// Test-facing (retention twins pin it); production renders the
+    /// merged summary.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unidentified_pids(&self) -> Vec<UnboundPid> {
         let mut pids: Vec<UnboundPid> = self.unidentified_images.values().cloned().collect();
         pids.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
         pids
+    }
+
+    /// Bounded merged run-wide exe summary for the presentation:
+    /// folded buckets plus retained images grouped alike, domains
+    /// merged — every collected image in exactly one group, ranked
+    /// busiest first, with the counted overflow past the group
+    /// bound. At most [`UNBOUND_FOLD_GROUPS_MAX`] groups: further
+    /// merged groups join the overflow with their images and calls,
+    /// so groups plus overflow always reconcile to
+    /// [`Self::unidentified_images`].
+    pub(crate) fn unidentified_exe_summary(&self) -> UnboundExeSummary {
+        let mut merged: HashMap<UnboundExeGroupKey, UnboundExeGroup> = HashMap::new();
+        for (key, bucket) in &self.unidentified_folded {
+            merged
+                .entry(key.group.clone())
+                .or_insert_with(|| UnboundExeGroup::empty(key.group.clone(), bucket.exe.clone()))
+                .merge(bucket);
+        }
+        for pid in self.unidentified_images.values() {
+            let key = UnboundExeGroupKey::of(&pid.exe);
+            merged
+                .entry(key.clone())
+                .or_insert_with(|| UnboundExeGroup::empty(key, pid.exe.clone()))
+                .absorb(pid);
+        }
+        let mut groups: Vec<UnboundExeGroup> = merged.into_values().collect();
+        groups.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.first_ns.cmp(&b.first_ns)));
+        let mut overflow_images = self.unidentified_fold_overflow_images;
+        let mut overflow_calls = self.unidentified_fold_overflow_calls;
+        if groups.len() > UNBOUND_FOLD_GROUPS_MAX {
+            for group in groups.drain(UNBOUND_FOLD_GROUPS_MAX..) {
+                overflow_images = overflow_images.saturating_add(group.images);
+                overflow_calls = overflow_calls.saturating_add(group.calls);
+            }
+        }
+        debug_assert!(
+            groups.len() <= UNBOUND_FOLD_GROUPS_MAX,
+            "the merged summary keeps the group bound"
+        );
+        UnboundExeSummary {
+            groups,
+            overflow_images,
+            overflow_calls,
+        }
     }
 
     /// Distinct images (with their host pids) the run-wide bound
@@ -6242,6 +6474,7 @@ impl CallerRegistry {
         );
         let applied = self.apply_staged(observer, ledger.as_deref_mut());
         self.complete_publication(ledger);
+        self.fold_unbound_retention();
         applied
     }
 
@@ -7560,12 +7793,65 @@ impl CallerRegistry {
         }
     }
 
+    /// Fold run-wide images past the retention bound into exact
+    /// per-exe aggregates: the newest [`UNBOUND_RETAINED_MAX`] by
+    /// (`first_call_ns`, `pid_host`) stay per-cookie; older images
+    /// fold oldest-first. Totals stay exact; only per-image naming
+    /// past the bound is lost, and the aggregates say so.
+    fn fold_unbound_retention(&mut self) {
+        if self.unidentified_images.len() <= UNBOUND_RETAINED_MAX {
+            return;
+        }
+        let mut order: Vec<(DomainCookie, u64, u32)> = self
+            .unidentified_images
+            .iter()
+            .map(|(cookie, pid)| (*cookie, pid.first_call_ns, pid.pid_host))
+            .collect();
+        order.sort_by(|a, b| (a.1, a.2).cmp(&(b.1, b.2)));
+        let victims = order.len() - UNBOUND_RETAINED_MAX;
+        for (cookie, _, _) in order.into_iter().take(victims) {
+            let Some(pid) = self.unidentified_images.remove(&cookie) else {
+                continue;
+            };
+            self.fold_unbound_image(cookie, pid);
+        }
+    }
+
+    /// Fold one run-wide image out of the retained set into its
+    /// (domain, exe) bucket, or into the counted overflow past the
+    /// group bound. The published total grows by exactly one either
+    /// way.
+    fn fold_unbound_image(&mut self, cookie: DomainCookie, pid: UnboundPid) {
+        let key = UnboundFoldKey {
+            domain: cookie.domain(),
+            group: UnboundExeGroupKey::of(&pid.exe),
+        };
+        self.unidentified_folded_total = self.unidentified_folded_total.saturating_add(1);
+        if let Some(bucket) = self.unidentified_folded.get_mut(&key) {
+            bucket.absorb(&pid);
+            return;
+        }
+        if self.unidentified_folded.len() >= UNBOUND_FOLD_GROUPS_MAX {
+            self.unidentified_fold_overflow_images =
+                self.unidentified_fold_overflow_images.saturating_add(1);
+            self.unidentified_fold_overflow_calls = self
+                .unidentified_fold_overflow_calls
+                .saturating_add(pid.calls_at_least);
+            return;
+        }
+        let mut bucket = UnboundExeGroup::empty(key.group.clone(), pid.exe.clone());
+        bucket.absorb(&pid);
+        self.unidentified_folded.insert(key, bucket);
+    }
+
     /// Whether the run-wide image set holds `cookie`: the O(1)
     /// backfill index. A cookie the saturated run-wide set dropped
     /// but a module set kept misses the backfill and keeps its
     /// provisional verdict (an honest unknown, disclosed through
     /// the saturation accounting) — the price of never scanning
-    /// every module per EXEC.
+    /// every module per EXEC. Folded cookies miss the same way once
+    /// they leave the retained set; the retention window (hundreds
+    /// of images) covers the usual EXEC delay of a pass or two.
     pub(crate) fn has_unbound_image(&self, cookie: DomainCookie) -> bool {
         self.unidentified_images.contains_key(&cookie)
     }
@@ -7589,7 +7875,9 @@ impl CallerRegistry {
     /// Lifecycle evidence was lost in `domain`: every image of that
     /// domain still without a joined EXEC reads `exec_record_lost`.
     /// Images with a joined pair (resolved or unavailable) are
-    /// unaffected: their EXEC provably arrived.
+    /// unaffected: their EXEC provably arrived. Folded images flip by
+    /// bucket: the domain's still-unjoined buckets move to the lost
+    /// group with exact totals.
     pub(crate) fn flip_unbound_exec_loss(&mut self, domain: NativeDomainId) {
         let lost = UnboundExe {
             dev: 0,
@@ -7601,6 +7889,34 @@ impl CallerRegistry {
         for (cookie, known) in self.unidentified_images.iter_mut() {
             if cookie.domain() == domain && known.exe.resolution == ExeResolution::NoExecRecord {
                 known.exe = lost.clone();
+            }
+        }
+        let moving: Vec<UnboundFoldKey> = self
+            .unidentified_folded
+            .keys()
+            .filter(|key| {
+                key.domain == domain
+                    && matches!(
+                        key.group,
+                        UnboundExeGroupKey::Unknown(ExeResolution::NoExecRecord, _, _)
+                    )
+            })
+            .cloned()
+            .collect();
+        for key in moving {
+            let Some(bucket) = self.unidentified_folded.remove(&key) else {
+                continue;
+            };
+            let target = UnboundFoldKey {
+                domain,
+                group: UnboundExeGroupKey::Unknown(ExeResolution::ExecRecordLost, 0, 0),
+            };
+            if let Some(lost_bucket) = self.unidentified_folded.get_mut(&target) {
+                lost_bucket.merge(&bucket);
+            } else {
+                let mut merged = UnboundExeGroup::empty(target.group.clone(), lost.clone());
+                merged.merge(&bucket);
+                self.unidentified_folded.insert(target, merged);
             }
         }
         for module in self.modules.values_mut() {
@@ -12351,6 +12667,196 @@ pub(crate) mod tests {
             !registry.unidentified_images_saturated(),
             "folding is retention, never saturation"
         );
+    }
+
+    /// A registry with `images` staged unbound images across
+    /// publishes (100 per publish), alternating provisional and
+    /// resolved exes, plus their domain for cookie reconstruction.
+    fn churned_registry(images: u64) -> (CallerRegistry, NativeDomainId) {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        let resolved = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::SystemIndex);
+        for index in 0..images {
+            let cookie = DomainCookie::scripted(domain, 41 + index);
+            let exe = if index % 2 == 0 {
+                provisional.clone()
+            } else {
+                resolved.clone()
+            };
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1000 + index,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(
+                    cookie,
+                    1000 + index as u32,
+                    1000 + index,
+                    2,
+                    exe,
+                )),
+            );
+            if index % 100 == 99 {
+                registry.publish();
+            }
+        }
+        registry.publish();
+        (registry, domain)
+    }
+
+    /// Folded exe groups reconcile exactly: every churn image lands
+    /// in exactly one group with its calls, the samples keep the
+    /// oldest pids per group, and the retained set plus the groups
+    /// sum to the published total.
+    #[test]
+    fn folded_exe_groups_reconcile_to_the_exact_total() {
+        let (registry, _) = churned_registry(1200);
+        assert_eq!(registry.unidentified_images(), 1200);
+        assert_eq!(registry.unidentified_pids().len(), 512);
+        let summary = registry.unidentified_exe_summary();
+        assert_eq!(summary.groups.len(), 2, "one group per exe");
+        assert_eq!((summary.overflow_images, summary.overflow_calls), (0, 0));
+        let mut totals = (0u64, 0u64);
+        for group in &summary.groups {
+            totals.0 = totals.0.saturating_add(group.images);
+            totals.1 = totals.1.saturating_add(group.calls);
+            let pids: Vec<u32> = group.sample.iter().map(|pid| pid.pid_host).collect();
+            match &group.key {
+                UnboundExeGroupKey::Unknown(ExeResolution::NoExecRecord, 0, 0) => {
+                    assert_eq!((group.images, group.calls), (600, 1200));
+                    assert_eq!(pids, vec![1000, 1002, 1004, 1006, 1008]);
+                }
+                UnboundExeGroupKey::Path(path) => {
+                    assert_eq!(path, "/bin/x");
+                    assert_eq!((group.images, group.calls), (600, 1200));
+                    assert_eq!(pids, vec![1001, 1003, 1005, 1007, 1009]);
+                }
+                key => panic!("unexpected group key: {key:?}"),
+            }
+        }
+        assert_eq!(
+            totals,
+            (1200, 2400),
+            "groups count every image and call once"
+        );
+        assert_eq!(
+            registry.memory_lens().unbound_folded.len,
+            2,
+            "the lens counts the folded buckets"
+        );
+    }
+
+    /// Past the group bound further groups fold into the counted
+    /// overflow: groups stay bounded while groups plus overflow
+    /// reconcile to the exact total.
+    #[test]
+    fn fold_group_overflow_counts_past_the_group_bound() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        for index in 0..1700u64 {
+            let cookie = DomainCookie::scripted(domain, 41 + index);
+            let path = format!("/bin/x{index}");
+            let exe = unbound_exe(8, 99 + index, Some(&path), ExeResolution::SystemIndex);
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                1000 + index,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(
+                    cookie,
+                    1000 + index as u32,
+                    1000 + index,
+                    2,
+                    exe,
+                )),
+            );
+            if index % 100 == 99 {
+                registry.publish();
+            }
+        }
+        registry.publish();
+        assert_eq!(registry.unidentified_images(), 1700);
+        let summary = registry.unidentified_exe_summary();
+        assert_eq!(summary.groups.len(), UNBOUND_FOLD_GROUPS_MAX);
+        let grouped: u64 = summary
+            .groups
+            .iter()
+            .map(|group| group.images)
+            .sum::<u64>()
+            .saturating_add(summary.overflow_images);
+        assert_eq!(grouped, 1700, "groups plus overflow count every image once");
+        assert!(
+            summary.overflow_images > 0,
+            "distinct exes past the bound overflow instead of naming rows"
+        );
+    }
+
+    /// The loss flip moves folded buckets too: the domain's
+    /// still-unjoined folded images read `exec_record_lost` with
+    /// exact totals, joined buckets keep their verdicts, and a
+    /// second flip changes nothing.
+    #[test]
+    fn exec_loss_flip_moves_folded_buckets_to_lost() {
+        let (mut registry, domain) = churned_registry(600);
+        registry.flip_unbound_exec_loss(domain);
+        let summary = registry.unidentified_exe_summary();
+        assert_eq!(summary.groups.len(), 2);
+        for group in &summary.groups {
+            match &group.key {
+                UnboundExeGroupKey::Unknown(ExeResolution::ExecRecordLost, 0, 0) => {
+                    assert_eq!((group.images, group.calls), (300, 600));
+                }
+                UnboundExeGroupKey::Path(path) => {
+                    assert_eq!(path, "/bin/x");
+                    assert_eq!((group.images, group.calls), (300, 600));
+                }
+                key => panic!("unexpected group key: {key:?}"),
+            }
+        }
+        registry.flip_unbound_exec_loss(domain);
+        let again = registry.unidentified_exe_summary();
+        assert_eq!(again.groups.len(), 2, "a second flip changes nothing");
+        assert_eq!(registry.unidentified_images(), 600);
+    }
+
+    /// A backfill past the retention window keeps the honest unknown:
+    /// the folded image is out of the backfill index (like a
+    /// saturation-dropped one), so the late EXEC attaches nowhere —
+    /// totals stay exact and the group keeps its provisional key.
+    #[test]
+    fn late_backfill_past_the_retention_window_keeps_the_honest_unknown() {
+        let (mut registry, domain) = churned_registry(600);
+        let folded = DomainCookie::scripted(domain, 41);
+        assert!(
+            !registry.has_unbound_image(folded),
+            "the oldest image left the retained backfill index"
+        );
+        let exe = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::SystemIndex);
+        registry.attach_unbound_exe(folded, exe);
+        assert_eq!(registry.unidentified_images(), 600);
+        let summary = registry.unidentified_exe_summary();
+        let provisional = summary
+            .groups
+            .iter()
+            .find(|group| {
+                matches!(
+                    group.key,
+                    UnboundExeGroupKey::Unknown(ExeResolution::NoExecRecord, 0, 0)
+                )
+            })
+            .expect("the provisional group keeps its key");
+        assert_eq!(provisional.images, 300);
     }
 
     /// Resolve-once: a refresh row never replaces the stored

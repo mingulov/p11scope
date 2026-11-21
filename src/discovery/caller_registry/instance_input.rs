@@ -2458,28 +2458,44 @@ impl CallerRegistry {
         std::mem::take(&mut self.joint_reseed_queue)
     }
 
-    /// Queue reseed images for every feed a voided collect affects:
-    /// live Joint feeds (a stream void ends all Joint history, so
-    /// their next seals end their segments) and feeds already waiting
-    /// on a rebirth (an ended segment with drained staging and no
-    /// watchdog trip). The machine calls this once per voided collect
-    /// (stream voids never deliver a seal failure, so the delivery
-    /// path cannot queue for them); audit voids queue through
-    /// delivery as well, and duplicates are skipped. A scoped void
-    /// over-queues healthy feeds harmlessly: re-arm is idempotent and
-    /// a Joint feed ignores a later birth. Bounded by the queue cap;
-    /// the scan itself is bounded by the registry limit. Returns how
-    /// many images were queued.
-    pub(crate) fn queue_reseed_for_ended_feeds(&mut self) -> usize {
+    /// Queue reseed images for live Joint feeds. The machine calls
+    /// this once per voided collect (stream voids never deliver a
+    /// seal failure, so the delivery path cannot queue for them): a
+    /// stream void ends all Joint history, so their next seals end
+    /// their segments and the Births phase re-arms them for one more
+    /// birth. Audit voids queue through delivery as well, and
+    /// duplicates are skipped. A scoped void over-queues healthy
+    /// feeds harmlessly: re-arm is idempotent and a Joint feed
+    /// ignores a later birth. Bounded by the queue cap; the scan
+    /// itself is bounded by the registry limit. Returns how many
+    /// images were queued.
+    pub(crate) fn queue_reseed_for_joint_feeds(&mut self) -> usize {
         use crate::semantics_key_use::FeedMode;
+        self.queue_reseed_where(|record| record.feed.mode() == FeedMode::Joint)
+    }
+
+    /// Queue reseed images for feeds waiting on a rebirth: an ended
+    /// segment with drained staging and no watchdog trip. The machine
+    /// calls this every Births phase before draining: a birth refused
+    /// on transient pressure retries instead of stranding the feed
+    /// until the next void. Duplicates are skipped; offers stay
+    /// rate-limited (one birth per image per quantum at most).
+    /// Bounded by the queue cap; the scan itself is bounded by the
+    /// registry limit. Returns how many images were queued.
+    pub(crate) fn queue_reseed_for_awaiting_feeds(&mut self) -> usize {
+        self.queue_reseed_where(|record| record.feed.reseed_eligible())
+    }
+
+    fn queue_reseed_where(
+        &mut self,
+        mut eligible: impl FnMut(&InstanceSemanticRecord) -> bool,
+    ) -> usize {
         let mut queued = 0usize;
         let ids: Vec<RegistryInstanceId> = self
             .instance_state
             .semantics
             .iter()
-            .filter(|(_, record)| {
-                record.feed.mode() == FeedMode::Joint || record.feed.reseed_eligible()
-            })
+            .filter(|(_, record)| eligible(record))
             .map(|(id, _)| *id)
             .collect();
         for id in ids {

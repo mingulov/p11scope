@@ -3470,10 +3470,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.drain_joint_reseed_queue()
     }
 
-    /// Queue reseed images for every feed waiting on a rebirth after a
-    /// voided collect. Returns how many images were queued.
-    pub(crate) fn queue_reseed_for_ended_feeds(&mut self) -> usize {
-        self.registry.queue_reseed_for_ended_feeds()
+    /// Queue reseed images for live Joint feeds after a voided
+    /// collect. Returns how many images were queued.
+    pub(crate) fn queue_reseed_for_joint_feeds(&mut self) -> usize {
+        self.registry.queue_reseed_for_joint_feeds()
+    }
+
+    /// Queue reseed images for feeds waiting on a rebirth. Returns
+    /// how many images were queued.
+    pub(crate) fn queue_reseed_for_awaiting_feeds(&mut self) -> usize {
+        self.registry.queue_reseed_for_awaiting_feeds()
     }
 
     /// Calls into `service_collected_finish_records_with` (test count).

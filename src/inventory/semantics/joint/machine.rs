@@ -3524,10 +3524,10 @@ impl LiveJointMachine {
                             ),
                         );
                         // Stream voids return no seal failure, so no
-                        // delivery queues their reseed: queue every
-                        // feed the void ended here, so the Births
+                        // delivery queues their reseed: queue the live
+                        // Joint feeds the void ends here, so the Births
                         // phase re-arms them for one more birth.
-                        coordinator.queue_reseed_for_ended_feeds();
+                        coordinator.queue_reseed_for_joint_feeds();
                     }
                 }
                 // Recompute the collection allowance after recovery:
@@ -4178,14 +4178,18 @@ impl LiveJointMachine {
                         coordinator.disclose_birth_reoffer_exhausted(reoffer);
                     }
                 }
-                // Reseed births for voided feeds: clear each queued
-                // image's pinned bootstrap cuts (stale below-cut
-                // evidence would mismatch its fresh birth), then
-                // re-arm its router retry so its next continued
+                // Reseed births for voided feeds: re-queue images
+                // whose feeds still wait on a rebirth (a birth
+                // refused on transient pressure retries instead of
+                // stranding the feed until the next void), then clear
+                // each queued image's pinned bootstrap cuts (stale
+                // below-cut evidence would mismatch its fresh birth),
+                // then re-arm its router retry so its next continued
                 // observation offers one more birth at/above the
                 // fence. Images the lane cannot re-arm (unknown,
                 // retired, or a shell lane with no capture) stay
                 // S1Only with their deferred gap already disclosed.
+                coordinator.queue_reseed_for_awaiting_feeds();
                 for image in coordinator.drain_joint_reseed_queue() {
                     coordinator
                         .joint_capture_mut()

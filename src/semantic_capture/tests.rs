@@ -5722,7 +5722,7 @@ fn joint_birth_witness_refuses_replaced_custody_provider_native_and_fence() {
 /// attempt, so delivery falls back promptly instead of retrying a
 /// take that can never succeed.
 #[test]
-fn joint_birth_witness_stale_fence_refuses_retained_witness() {
+fn joint_birth_witness_stale_fence_refuses_witness_stale() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
     let mut harness = JointBirthHarness::new();
     harness.push_create(1);
@@ -5756,7 +5756,7 @@ fn joint_birth_witness_stale_fence_refuses_retained_witness() {
             harness.fixture.attachment(),
             harness.fixture.binding()
         ),
-        Err(crate::attach::BirthObservationRefusal::RetainedWitnessMismatch),
+        Err(crate::attach::BirthObservationRefusal::WitnessStale),
         "a stale receipt fence is a definitive negative about the retained witness"
     );
 }
@@ -5765,7 +5765,7 @@ fn joint_birth_witness_stale_fence_refuses_retained_witness() {
 /// attempt: only the witness comparison is definitive, so deadline
 /// misses keep retrying.
 #[test]
-fn joint_birth_witness_deadline_refuses_current_partition() {
+fn joint_birth_witness_deadline_refuses_take_deadline() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
     let mut harness = JointBirthHarness::new();
     harness.push_create(1);
@@ -5786,7 +5786,7 @@ fn joint_birth_witness_deadline_refuses_current_partition() {
             harness.fixture.attachment(),
             harness.fixture.binding()
         ),
-        Err(crate::attach::BirthObservationRefusal::CurrentPartition),
+        Err(crate::attach::BirthObservationRefusal::TakeDeadline),
         "a missed window stays a contended attempt"
     );
 }

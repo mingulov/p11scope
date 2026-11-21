@@ -369,12 +369,27 @@ fn joint_audit_storage_refusal_precedes_take_and_global_mutation() {
         .registry_mut()
         .reference_semantic_resource_limit(before.limit_bytes);
     let frame = acquire(&mut fixture, ingested, &attached, &fault);
-    let failure = frame
-        .failure_for_test()
-        .expect("actual seal-time fault changed");
-    assert_eq!(failure.gap, JournalGap::FaultChanged);
-    assert!(failure.affects_proof_for_test(&proof));
-    fixture.assert_claims(&[]);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "the seal-time fault absorbs; no failure is recorded"
+    );
+    let diagnosis = fixture
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
+    assert_eq!(
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        (0, 1, 0),
+        "the seal-time fault absorbs as reread without voiding"
+    );
+    fixture.assert_claims(&[(1, proof)]);
     assert_eq!(
         fixture.real.scene.coordinator.reference_h3_audit_state(),
         (1, false)
@@ -435,28 +450,63 @@ fn joint_audit_no_head_fault_or_malformed_keeps_original_affected_domains() {
         };
         let fault = ReadFault::new(u64::from(!malformed));
         let frame = acquire(&mut fixture, ingested, &attached, &fault);
-        let failure = frame
-            .failure_for_test()
-            .expect("owned collection-wide loss");
+        if malformed {
+            let failure = frame
+                .failure_for_test()
+                .expect("owned collection-wide loss");
+            assert_eq!(failure.gap, JournalGap::Malformed);
+            assert!(
+                claims
+                    .iter()
+                    .all(|(_, proof)| failure.affects_proof_for_test(proof))
+            );
+            assert_eq!(failure.h3_voided, None);
+            assert!(
+                std::ptr::eq(failure, frame.failure_for_test().unwrap()),
+                "re-observation borrows the original failure, never re-runs the void"
+            );
+            fixture.assert_claims(&[]);
+            assert_eq!(
+                fixture.real.scene.coordinator.reference_h3_audit_state(),
+                (takes, false)
+            );
+            assert_eq!(
+                fixture
+                    .real
+                    .scene
+                    .coordinator
+                    .reference_h3_acknowledged_below(),
+                0
+            );
+            assert_eq!(fault.reads.get(), 1);
+            continue;
+        }
+        assert!(
+            frame.failure_for_test().is_none(),
+            "the fault move absorbs; no failure is recorded"
+        );
+        let diagnosis = fixture
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .joint_void_diagnosis();
         assert_eq!(
-            failure.gap,
-            if malformed {
-                JournalGap::Malformed
-            } else {
-                JournalGap::FaultChanged
-            }
+            (
+                diagnosis.audit_fault_absorbed_chain,
+                diagnosis.audit_fault_absorbed_reread,
+                diagnosis.void_audit
+            ),
+            (0, 1, 0),
+            "the fault move absorbs as reread without voiding"
         );
-        assert!(
-            claims
+        fixture.assert_claims(
+            &claims
                 .iter()
-                .all(|(_, proof)| failure.affects_proof_for_test(proof))
+                .map(|(ordinal, proof)| (*ordinal, proof.clone()))
+                .collect::<Vec<_>>(),
         );
-        assert_eq!(failure.h3_voided, None);
-        assert!(
-            std::ptr::eq(failure, frame.failure_for_test().unwrap()),
-            "re-observation borrows the original failure, never re-runs the void"
-        );
-        fixture.assert_claims(&[]);
         assert_eq!(
             fixture.real.scene.coordinator.reference_h3_audit_state(),
             (takes, false)
@@ -494,10 +544,25 @@ fn joint_audit_no_head_clean_frame_establishes_cumulative_fault_baseline() {
     claim_and_finish(&mut fixture, &next);
     let reads_before = fault.reads.get();
     let frame = acquire(&mut fixture, next, &attached, &fault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "the between-frame move absorbs; q1's baseline advances to it"
+    );
+    let diagnosis = fixture
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .joint_void_diagnosis();
     assert_eq!(
-        frame.failure_for_test().unwrap().gap,
-        JournalGap::FaultChanged,
-        "both q2 reads and seal-time fault agree; only q1's actual baseline detects the between-frame move"
+        (
+            diagnosis.audit_fault_absorbed_chain,
+            diagnosis.audit_fault_absorbed_reread,
+            diagnosis.void_audit
+        ),
+        (1, 0, 0),
+        "the between-frame move absorbs as chain without voiding"
     );
     assert_eq!(fault.reads.get(), reads_before + 1);
     assert_eq!(

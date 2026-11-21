@@ -758,26 +758,25 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
         and evidence.get("modules_skipped") == []
         and evidence.get("pid_descendant_gaps", 0) == 0)
-    # Exit-ambient lane 2026-11-21 (v0.8.0 flakes): system/cgroup-scope
-    # captures on hosts with ambient short-lived exits disclose each
-    # exit as a mid-flight discovery skip, plus coincidental
-    # tick-quantum deferrals as the disclosable row. Owned counts stay
-    # exact (the exiting processes made no workload calls; verified on
-    # three counter-system cells with 5, 6 and 11 mixed skips, all
-    # functions exact), zero loss (checked above) and no other class.
-    # Strict accepts any non-empty mix of the two finite reasons; any
-    # other reason, cause set, module skip or gap still fails. The
-    # quiet arm above keeps the pure single-deferral shape; this arm
-    # requires at least one exit row.
+    # Exit-ambient lane 2026-11-21 (v0.8.0 flakes), narrowed: a
+    # named mid-flight exit covers only exit rows. The generic
+    # discovery-unavailable row also projects dropped inventory passes
+    # and held-back admissions (render::capture_skipped_out), which are
+    # indistinguishable from tick-quantum deferrals at the published-row
+    # boundary — so any generic companion to an exit row stays a new
+    # shape (fix the discovery failure or remove the churn instead).
+    # This arm accepts any non-empty all-exit list on system/cgroup
+    # scope with exact owned counts (the exiting processes made no
+    # workload calls), zero loss (checked above) and no other class.
+    # Any other reason, cause set, module skip or gap still fails. The
+    # quiet arm above keeps the pure single-deferral shape.
     ok_exit_ambient = (
         scope in ("system", "cgroup")
         and observation.get("status") == "lossy"
         and observation.get("causes") == ["skipped"]
         and isinstance(skip_entries, list)
         and len(skip_entries) >= 1
-        and all(skip == DISCLOSABLE_DISCOVERY_SKIP or skip == EXIT_MID_FLIGHT_SKIP
-                for skip in skip_entries)
-        and any(skip == EXIT_MID_FLIGHT_SKIP for skip in skip_entries)
+        and all(skip == EXIT_MID_FLIGHT_SKIP for skip in skip_entries)
         and evidence.get("modules_skipped") == []
         and evidence.get("pid_descendant_gaps", 0) == 0)
     # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient

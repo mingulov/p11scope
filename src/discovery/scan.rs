@@ -8078,12 +8078,6 @@ pub(crate) fn is_work_ceiling_stop(reason: &str) -> bool {
     scan_stop_kind(reason, None) == Some(ScanStopKind::WorkCeiling)
 }
 
-/// Whether `reason` is a genuine collection-stop signal under
-/// [`scan_stop_kind`]'s provenance rule, from any process.
-pub(crate) fn is_collection_stop(reason: &str) -> bool {
-    scan_stop_kind(reason, None) == Some(ScanStopKind::CollectionStop)
-}
-
 /// All provider mappings establish inventory authority. They also cover every
 /// searched data snapshot (even empty ones), complete interface descriptors, and
 /// same-object name reads, including their bounded read-ahead. Function targets

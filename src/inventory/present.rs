@@ -3264,11 +3264,14 @@ fn ceiling_fold_line(row: &GapView) -> String {
     }
 }
 
+/// One ranked ordinary group: its (subject, reason) key and tally.
+type RankedGapGroup = ((String, String), OrdinaryGapGroup);
+
 /// One concise line unit: a folded ceiling row or a ranked ordinary
 /// group.
 enum ConciseUnit<'a> {
     Ceiling(&'a GapView),
-    Group(&'a ((String, String), OrdinaryGapGroup)),
+    Group(&'a RankedGapGroup),
 }
 
 /// The single concise ordering owner: the folded ceiling rows, in
@@ -3281,10 +3284,10 @@ enum ConciseUnit<'a> {
 /// already in rank order and the interval sort is stable.
 fn concise_interval_order<'a>(
     ceiling: &[(usize, &'a GapView)],
-    ranked: &'a [((String, String), OrdinaryGapGroup)],
+    ranked: &'a [RankedGapGroup],
 ) -> Vec<ConciseUnit<'a>> {
     let interval = |first: usize| ceiling.partition_point(|(index, _)| *index < first);
-    let mut groups: Vec<(usize, &'a ((String, String), OrdinaryGapGroup))> = ranked
+    let mut groups: Vec<(usize, &'a RankedGapGroup)> = ranked
         .iter()
         .map(|group| (interval(group.1.2), group))
         .collect();

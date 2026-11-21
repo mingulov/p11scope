@@ -12,12 +12,15 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::time::{Duration, Instant};
 
 /// A thread group whose leader is an unreaped zombie with one live
-/// survivor (`spawn`) or two (`spawn_two`). Built with raw syscalls
-/// only (fork-safe): the forked child raw-clones each survivor thread
-/// into its group on a COW-inherited stack, then the child's main
-/// exits its own thread via raw `exit(2)`. Killed and reaped on drop.
-/// The survivors share the child's frozen post-fork mappings, so their
-/// maps stay byte-stable for like-for-like reads.
+/// survivor (`spawn`) or two (`spawn_two`). Built fork+exec: the
+/// forked child re-execs this test binary in helper mode, and the
+/// helper raw-clones each survivor thread into its group on a fresh
+/// anonymous stack, then the helper main exits its own thread via raw
+/// `exit(2)`. Killed and reaped on drop. The exec gives the group a
+/// fresh image — never the fork-inherited mm — so sibling tests' temp
+/// mappings cannot leak into it; the survivors share the helper's
+/// frozen post-exec mappings, so their maps stay byte-stable for
+/// like-for-like reads.
 struct ZombieLeaderGroup {
     tgid: u32,
     survivor: u32,
@@ -67,6 +70,413 @@ extern "C" fn clone_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
     }
 }
 
+/// Fork+exec spawn of this test binary in d4 helper mode: argv forwards
+/// this process's own cmdline (so the group cmdline still reads like
+/// the spawning image) and envp carries exactly the helper protocol
+/// variables (each already `KEY=value` bytes). Built with ordinary
+/// (allocating) calls before the fork; the child only reads it.
+struct HelperExec {
+    // Ownership anchors for the raw pointers below: dropping these
+    // would dangle `argv`/`envp` across the fork.
+    #[allow(dead_code)]
+    argv_bytes: Vec<u8>,
+    argv: Vec<*const libc::c_char>,
+    #[allow(dead_code)]
+    env: Vec<std::ffi::CString>,
+    envp: Vec<*const libc::c_char>,
+}
+
+impl HelperExec {
+    fn with_vars(vars: &[Vec<u8>]) -> Self {
+        let mut argv_bytes = std::fs::read("/proc/self/cmdline").expect("own cmdline reads");
+        // A spare NUL terminates a final segment even if the kernel
+        // ever omits the trailing one; empty segments never become args.
+        argv_bytes.push(0);
+        let mut argv: Vec<*const libc::c_char> = Vec::new();
+        let mut start = 0;
+        for (index, byte) in argv_bytes.iter().enumerate() {
+            if *byte == 0 {
+                if index > start {
+                    argv.push(argv_bytes[start..index].as_ptr().cast());
+                }
+                start = index + 1;
+            }
+        }
+        assert!(!argv.is_empty(), "own cmdline names the image");
+        argv.push(std::ptr::null());
+        let env: Vec<std::ffi::CString> = vars
+            .iter()
+            .map(|var| std::ffi::CString::new(var.as_slice()).expect("helper env encodes"))
+            .collect();
+        let mut envp: Vec<*const libc::c_char> = env.iter().map(|var| var.as_ptr()).collect();
+        envp.push(std::ptr::null());
+        Self {
+            argv_bytes,
+            argv,
+            env,
+            envp,
+        }
+    }
+
+    /// Exec this test binary in helper mode. Only async-signal-safe
+    /// calls past the fork: close the parent's pipe ends, clear
+    /// `CLOEXEC` on the ends the helper inherits (the fork copied our
+    /// fd table, so this is invisible to sibling threads), then
+    /// `execve`. Diverges: a failed exec exits 127, and the parent's
+    /// exact report read then fails loud on EOF.
+    unsafe fn exec_child(&self, keep: &[libc::c_int], drop_ends: &[libc::c_int]) -> ! {
+        for fd in drop_ends {
+            // SAFETY: closing a pipe end we own.
+            unsafe {
+                libc::close(*fd);
+            }
+        }
+        for fd in keep {
+            // SAFETY: clearing CLOEXEC on our own post-fork copy.
+            let cleared = unsafe { libc::fcntl(*fd, libc::F_SETFD, 0) };
+            if cleared < 0 {
+                // SAFETY: a failure exit code.
+                unsafe {
+                    libc::_exit(126);
+                }
+            }
+        }
+        // SAFETY: argv/envp are NUL-terminated pointer arrays over
+        // inherited bytes; the path names our own image.
+        unsafe {
+            libc::execve(
+                c"/proc/self/exe".as_ptr(),
+                self.argv.as_ptr(),
+                self.envp.as_ptr(),
+            );
+            libc::_exit(127);
+        }
+    }
+}
+
+/// Clone flags for every d4 survivor: one thread-group member sharing
+/// mm, fs, files, sighand and sysvsem with the leader it outlives.
+const D4Z_CLONE_FLAGS: libc::c_int = libc::CLONE_VM
+    | libc::CLONE_FS
+    | libc::CLONE_FILES
+    | libc::CLONE_SIGHAND
+    | libc::CLONE_THREAD
+    | libc::CLONE_SYSVSEM;
+
+/// The d4 helper entry, run from `.init_array` before `main` (and
+/// before the libtest harness) in the test binary. Ordinary test
+/// processes return immediately (no helper variable set). An exec'd
+/// helper child never returns: it serves its mode and exits its
+/// leader thread, or exits a failure code. Raw syscalls only — no
+/// allocation, no locks, no panics — so this stays safe before
+/// runtime init and after a multi-threaded fork.
+#[used]
+#[unsafe(link_section = ".init_array")]
+static D4_ZOMBIE_HELPER_ENTRY: unsafe extern "C" fn() = d4_zombie_helper_entry;
+
+/// See [`D4_ZOMBIE_HELPER_ENTRY`].
+unsafe extern "C" fn d4_zombie_helper_entry() {
+    // SAFETY: a static NUL-terminated key; single-threaded here.
+    let mode = unsafe { libc::getenv(c"P11SCOPE_D4Z_MODE".as_ptr()) };
+    if mode.is_null() {
+        return;
+    }
+    // SAFETY: a non-null env value; the helper diverges.
+    unsafe {
+        d4_zombie_helper_main(mode);
+    }
+}
+
+/// Length of a NUL-terminated byte string, bounded so a corrupt
+/// environment cannot loop the helper.
+unsafe fn d4z_c_strlen(ptr: *const u8) -> usize {
+    let mut len = 0;
+    while len < 65536 {
+        // SAFETY: reading one byte at a bounded offset.
+        if unsafe { *ptr.add(len) } == 0 {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// Fetch an env value as (pointer, length) without allocating.
+unsafe fn d4z_getenv(name: *const libc::c_char) -> (*const u8, usize) {
+    // SAFETY: a static NUL-terminated key; single-threaded here.
+    let value = unsafe { libc::getenv(name) } as *const u8;
+    if value.is_null() {
+        return (value, 0);
+    }
+    (value, unsafe { d4z_c_strlen(value) })
+}
+
+/// Fetch a decimal env value, exiting `fail` on anything else.
+unsafe fn d4z_getenv_u32(name: *const libc::c_char, fail: i32) -> u32 {
+    let (ptr, len) = unsafe { d4z_getenv(name) };
+    if ptr.is_null() || len == 0 || len > 10 {
+        // SAFETY: a failure exit code.
+        unsafe {
+            libc::_exit(fail);
+        }
+    }
+    let mut value: u32 = 0;
+    let mut index = 0;
+    while index < len {
+        // SAFETY: reading one byte inside the measured value.
+        let digit = unsafe { *ptr.add(index) };
+        if !digit.is_ascii_digit() {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(fail);
+            }
+        }
+        let Some(scaled) = value.checked_mul(10) else {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(fail);
+            }
+        };
+        let Some(next) = scaled.checked_add(u32::from(digit - b'0')) else {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(fail);
+            }
+        };
+        value = next;
+        index += 1;
+    }
+    value
+}
+
+/// Whether a measured byte string equals `want`.
+unsafe fn d4z_streq(ptr: *const u8, len: usize, want: &[u8]) -> bool {
+    if len != want.len() {
+        return false;
+    }
+    for (index, byte) in want.iter().enumerate() {
+        // SAFETY: reading one byte inside the measured value.
+        if unsafe { *ptr.add(index) } != *byte {
+            return false;
+        }
+    }
+    true
+}
+
+/// One 64 KiB anonymous survivor stack; returns its (16-aligned) top.
+unsafe fn d4z_clone_stack(fail: i32) -> *mut std::ffi::c_void {
+    // SAFETY: an anonymous stack mapping, page-aligned.
+    let stack = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            65536,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if stack == libc::MAP_FAILED {
+        // SAFETY: a failure exit code.
+        unsafe {
+            libc::_exit(fail);
+        }
+    }
+    // SAFETY: the top of the mapping just made.
+    unsafe { (stack as *mut u8).add(65536).cast() }
+}
+
+/// Serve one helper mode, then exit the leader thread alone so the
+/// survivors keep the group. Diverges on every path: unknown modes
+/// and bad variables exit a failure code instead of returning into
+/// the test harness.
+unsafe fn d4_zombie_helper_main(mode: *mut libc::c_char) -> ! {
+    let mode = mode as *const u8;
+    let len = unsafe { d4z_c_strlen(mode) };
+    // Record the owner first: the exec wiped the pre-fork store, and
+    // our parent is the spawner the survivors must die with.
+    // SAFETY: reading our own parent pid.
+    let owner = unsafe { libc::getppid() } as u32;
+    crate::fixture_guard::SURVIVOR_OWNER_PID.store(owner, std::sync::atomic::Ordering::Release);
+    if unsafe { d4z_streq(mode, len, b"leader") } {
+        let wfd = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_WFD".as_ptr(), 30) } as libc::c_int;
+        let count = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_COUNT".as_ptr(), 31) };
+        if count != 1 && count != 2 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(32);
+            }
+        }
+        for _ in 0..count {
+            let top = unsafe { d4z_clone_stack(33) };
+            // SAFETY: raw-cloning one survivor on its own stack.
+            let cloned = unsafe {
+                libc::clone(
+                    clone_survivor_main,
+                    top,
+                    D4Z_CLONE_FLAGS,
+                    wfd as isize as *mut std::ffi::c_void,
+                )
+            };
+            if cloned < 0 {
+                // SAFETY: a failure exit code.
+                unsafe {
+                    libc::_exit(34);
+                }
+            }
+        }
+        // The main thread exits alone; the survivors keep the group.
+        // SAFETY: exiting only this thread.
+        unsafe {
+            libc::syscall(libc::SYS_exit, 0);
+            libc::_exit(0);
+        }
+    }
+    if unsafe { d4z_streq(mode, len, b"mapper") } {
+        let wfd = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_WFD".as_ptr(), 40) } as libc::c_int;
+        let (path, path_len) = unsafe { d4z_getenv(c"P11SCOPE_D4Z_PATH".as_ptr()) };
+        if path.is_null() || path_len == 0 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(41);
+            }
+        }
+        let exec_flag = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_EXEC".as_ptr(), 42) };
+        if exec_flag != 0 && exec_flag != 1 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(43);
+            }
+        }
+        // SAFETY: read-only open of the NUL-terminated fixture path.
+        let fd = unsafe {
+            libc::open(
+                path as *const libc::c_char,
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(11);
+            }
+        }
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: fstat into a valid output slot.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(12);
+            }
+        }
+        // SAFETY: fstat initialized the output.
+        let len = unsafe { stat.assume_init() }.st_size.max(4096) as usize;
+        let prot = if exec_flag == 1 {
+            libc::PROT_READ | libc::PROT_EXEC
+        } else {
+            libc::PROT_READ
+        };
+        // SAFETY: a private file mapping of the held fixture bytes.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len.min(4096),
+                prot,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        // SAFETY: closing the mapped fd we own.
+        unsafe {
+            libc::close(fd);
+        }
+        if at == libc::MAP_FAILED {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(13);
+            }
+        }
+        let addr = at as u64;
+        // SAFETY: writing the stack address bytes to the pipe.
+        if unsafe {
+            libc::write(
+                wfd,
+                std::ptr::from_ref(&addr).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        } != std::mem::size_of::<u64>() as isize
+        {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(14);
+            }
+        }
+        let top = unsafe { d4z_clone_stack(44) };
+        // SAFETY: raw-cloning one survivor on its own stack.
+        let cloned = unsafe {
+            libc::clone(
+                clone_survivor_main,
+                top,
+                D4Z_CLONE_FLAGS,
+                wfd as isize as *mut std::ffi::c_void,
+            )
+        };
+        if cloned < 0 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(15);
+            }
+        }
+        // The main thread exits alone; the survivor keeps the group.
+        // SAFETY: exiting only this thread.
+        unsafe {
+            libc::syscall(libc::SYS_exit, 0);
+            libc::_exit(0);
+        }
+    }
+    if unsafe { d4z_streq(mode, len, b"blocked") } {
+        let gofd = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_GOFD".as_ptr(), 50) } as libc::c_int;
+        let tidfd = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_TIDFD".as_ptr(), 51) } as libc::c_int;
+        let mut go_byte = [0u8; 1];
+        // One go byte; EOF or error exits instead of hanging.
+        // SAFETY: reading one byte into a valid stack slot.
+        let got = unsafe { libc::read(gofd, go_byte.as_mut_ptr().cast(), go_byte.len()) };
+        if got != go_byte.len() as isize {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(1);
+            }
+        }
+        let top = unsafe { d4z_clone_stack(2) };
+        // SAFETY: raw-cloning one survivor on its own stack.
+        let cloned = unsafe {
+            libc::clone(
+                clone_survivor_main,
+                top,
+                D4Z_CLONE_FLAGS,
+                tidfd as isize as *mut std::ffi::c_void,
+            )
+        };
+        if cloned < 0 {
+            // SAFETY: a failure exit code.
+            unsafe {
+                libc::_exit(3);
+            }
+        }
+        // The main thread exits alone; the survivor keeps the group.
+        // SAFETY: exiting only this thread.
+        unsafe {
+            libc::syscall(libc::SYS_exit, 0);
+            libc::_exit(0);
+        }
+    }
+    // SAFETY: a failure exit code for an unknown mode.
+    unsafe {
+        libc::_exit(29);
+    }
+}
+
 impl ZombieLeaderGroup {
     fn spawn() -> Self {
         let (tgid, survivors) = Self::spawn_inner(1);
@@ -88,53 +498,38 @@ impl ZombieLeaderGroup {
         }
     }
 
-    /// Fork a child that raw-clones `count` (1 or 2) survivors, then
-    /// exits its main thread; collect each survivor's reported TID.
+    /// Fork a child that re-execs this test binary in helper mode to
+    /// raw-clone `count` (1 or 2) survivors, then exits its main
+    /// thread; collect each survivor's reported TID. The exec gives the
+    /// group a fresh image — never the fork-inherited mm — so sibling
+    /// tests' temp mappings cannot leak into its maps.
     fn spawn_inner(count: usize) -> (u32, Vec<u32>) {
         assert!(count == 1 || count == 2, "one or two survivors");
-        let mut stacks = [Box::new([0u8; 65536]), Box::new([0u8; 65536])];
-        // Each heap top is 16-aligned (aligned base, multiple-of-16 size).
-        let tops = [
-            stacks[0].as_mut_ptr_range().end as *mut std::ffi::c_void,
-            stacks[1].as_mut_ptr_range().end as *mut std::ffi::c_void,
-        ];
         let (mut pipes, mut tid_bytes) = ([0; 2], [0u8; 8]);
         // SAFETY: two valid two-element arrays for pipe2.
         assert_eq!(
             unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
-        // SAFETY: the child only makes raw syscalls (close, clone, exit) on
-        // the COW-inherited stacks and pipe; no allocator, no pthread, no locks.
         // The survivor's parent-death owner, stored before the fork it
-        // inherits (see `SURVIVOR_OWNER_PID`).
+        // inherits (see `SURVIVOR_OWNER_PID`); the exec'd helper
+        // re-records its own parent after the exec wipes this store.
         crate::fixture_guard::SURVIVOR_OWNER_PID
             .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        let bundle = HelperExec::with_vars(&[
+            b"P11SCOPE_D4Z_MODE=leader".to_vec(),
+            format!("P11SCOPE_D4Z_WFD={}", pipes[1]).into_bytes(),
+            format!("P11SCOPE_D4Z_COUNT={count}").into_bytes(),
+        ]);
+        // SAFETY: the child only closes pipe ends, clears CLOEXEC on
+        // its inherited copies, and execs the helper bundle; no
+        // allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
+            // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                libc::close(pipes[0]);
-                const FLAGS: libc::c_int = libc::CLONE_VM
-                    | libc::CLONE_FS
-                    | libc::CLONE_FILES
-                    | libc::CLONE_SIGHAND
-                    | libc::CLONE_THREAD
-                    | libc::CLONE_SYSVSEM;
-                for top in tops.iter().take(count) {
-                    let cloned = libc::clone(
-                        clone_survivor_main,
-                        *top,
-                        FLAGS,
-                        pipes[1] as isize as *mut std::ffi::c_void,
-                    );
-                    if cloned < 0 {
-                        libc::_exit(1);
-                    }
-                }
-                // The main thread exits alone; the survivors keep the group.
-                libc::syscall(libc::SYS_exit, 0);
-                libc::_exit(0);
+                bundle.exec_child(&[pipes[1]], &[pipes[0]]);
             }
         }
         // SAFETY: the parent keeps the read end and closes its write copy so
@@ -348,9 +743,10 @@ fn zombie_group_with_live_survivor_prepares_through_member() {
     )
     .expect("survivor maps read");
     assert_eq!(prepared.entries, expect);
-    // The member exe is the same group image: the fixture never execs,
-    // so it equals this live process's own exe identity. (The zombie
-    // leader's own exe link is unreadable; only the survivor serves it.)
+    // The member exe is the same group image: the fixture re-execs
+    // its own image, so it equals this live process's own exe identity.
+    // (The zombie leader's own exe link is unreadable; only the
+    // survivor serves it.)
     assert_eq!(
         member.read_exe_identity().expect("member exe reads"),
         crate::discovery::caller_registry::read_exe_identity(std::process::id())
@@ -581,10 +977,10 @@ fn member_confirm_leaves_shared_census_quiescent() {
 }
 
 /// A zombie-leader group whose shared mm holds one mapping of `path` (at
-/// a child-chosen address): the forked child opens and maps the file,
-/// reports the address, raw-clones a survivor, then exits its leader
-/// thread. Only async-signal-safe calls run post-fork. Killed and reaped
-/// on drop.
+/// a child-chosen address): the forked child re-execs this test binary
+/// in helper mode, and the helper opens and maps the file, reports the
+/// address, raw-clones a survivor, then exits its leader thread. Only
+/// async-signal-safe calls run post-fork. Killed and reaped on drop.
 struct ZombieMapperGroup {
     tgid: u32,
     survivor: u32,
@@ -593,10 +989,6 @@ struct ZombieMapperGroup {
 
 impl ZombieMapperGroup {
     fn spawn(path: &std::path::Path, exec: bool) -> Self {
-        let c_path =
-            std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path encodes");
-        let mut stack = Box::new([0u8; 65536]);
-        let stack_top = stack.as_mut_ptr_range().end as *mut std::ffi::c_void;
         // Eight address bytes from the child, then four tid bytes from the
         // survivor (whose write end stays open, so read exactly this many).
         let (mut pipes, mut report) = ([0; 2], [0u8; 12]);
@@ -605,73 +997,28 @@ impl ZombieMapperGroup {
             unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
-        // SAFETY: the child only calls open/fstat/mmap/write/close/clone
-        // and exit on COW memory; no allocator, no pthread, no locks.
         // The survivor's parent-death owner, stored before the fork it
-        // inherits (see `SURVIVOR_OWNER_PID`).
+        // inherits (see `SURVIVOR_OWNER_PID`); the exec'd helper
+        // re-records its own parent after the exec wipes this store.
         crate::fixture_guard::SURVIVOR_OWNER_PID
             .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        let mut path_var = b"P11SCOPE_D4Z_PATH=".to_vec();
+        path_var.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        let bundle = HelperExec::with_vars(&[
+            b"P11SCOPE_D4Z_MODE=mapper".to_vec(),
+            format!("P11SCOPE_D4Z_WFD={}", pipes[1]).into_bytes(),
+            path_var,
+            format!("P11SCOPE_D4Z_EXEC={}", u8::from(exec)).into_bytes(),
+        ]);
+        // SAFETY: the child only closes pipe ends, clears CLOEXEC on
+        // its inherited copies, and execs the helper bundle; no
+        // allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
+            // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                libc::close(pipes[0]);
-                // SAFETY: read-only open of the NUL-terminated fixture path.
-                let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-                if fd < 0 {
-                    libc::_exit(11);
-                }
-                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                if libc::fstat(fd, stat.as_mut_ptr()) != 0 {
-                    libc::_exit(12);
-                }
-                // SAFETY: fstat initialized the output.
-                let len = stat.assume_init().st_size.max(4096) as usize;
-                let prot = if exec {
-                    libc::PROT_READ | libc::PROT_EXEC
-                } else {
-                    libc::PROT_READ
-                };
-                // SAFETY: a private file mapping of the held fixture bytes.
-                let at = libc::mmap(
-                    std::ptr::null_mut(),
-                    len.min(4096),
-                    prot,
-                    libc::MAP_PRIVATE,
-                    fd,
-                    0,
-                );
-                libc::close(fd);
-                if at == libc::MAP_FAILED {
-                    libc::_exit(13);
-                }
-                let addr = at as u64;
-                if libc::write(
-                    pipes[1],
-                    std::ptr::from_ref(&addr).cast(),
-                    std::mem::size_of::<u64>(),
-                ) != std::mem::size_of::<u64>() as isize
-                {
-                    libc::_exit(14);
-                }
-                const FLAGS: libc::c_int = libc::CLONE_VM
-                    | libc::CLONE_FS
-                    | libc::CLONE_FILES
-                    | libc::CLONE_SIGHAND
-                    | libc::CLONE_THREAD
-                    | libc::CLONE_SYSVSEM;
-                let cloned = libc::clone(
-                    clone_survivor_main,
-                    stack_top,
-                    FLAGS,
-                    pipes[1] as isize as *mut std::ffi::c_void,
-                );
-                if cloned < 0 {
-                    libc::_exit(15);
-                }
-                // The main thread exits alone; the survivor keeps the group.
-                libc::syscall(libc::SYS_exit, 0);
-                libc::_exit(0);
+                bundle.exec_child(&[pipes[1]], &[pipes[0]]);
             }
         }
         // SAFETY: the parent keeps the read end and closes its write copy.
@@ -2192,7 +2539,7 @@ fn cold_member_handoff_routes_confirm_through_survivor() {
     // Routing pin: under a ceiling of exactly the handed spend, the
     // matching handoff still carries (only the 0-mint-unit handed path
     // fits; a dropped handoff would need 5 more units for a fresh mint).
-    // The survivor parks in `pause()` on frozen post-fork mappings, so
+    // The survivor parks in `pause()` on frozen post-exec mappings, so
     // the maps spend cannot drift between these back-to-back prepares.
     let pin = Arc::new(PidPin::open(group.tgid).expect("second cold pin opens"));
     let mut work = CaptureWorkBudget::default();
@@ -2234,7 +2581,8 @@ fn cold_member_handoff_routes_confirm_through_survivor() {
 }
 
 /// A zombie-leader group whose view the test opens while the leader
-/// still lives: the forked child blocks on a pipe until released, then
+/// still lives: the forked child re-execs this test binary in helper
+/// mode, and the helper blocks on a pipe until released, then
 /// raw-clones one survivor (reusing the survivor entry point, which
 /// reports its TID over the pipe) and exits its leader thread. Killed
 /// and reaped on drop.
@@ -2260,55 +2608,25 @@ impl BlockedChild {
         // SAFETY: two valid two-element arrays for pipe2.
         assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         assert_eq!(unsafe { libc::pipe2(tid.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        // SAFETY: the child only reads one go byte, mmaps a stack,
-        // clones, and exits its leader thread; no allocator, no
-        // pthread, no locks.
         // The survivor's parent-death owner, stored before the fork it
-        // inherits (see `SURVIVOR_OWNER_PID`).
+        // inherits (see `SURVIVOR_OWNER_PID`); the exec'd helper
+        // re-records its own parent after the exec wipes this store.
         crate::fixture_guard::SURVIVOR_OWNER_PID
             .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        let bundle = HelperExec::with_vars(&[
+            b"P11SCOPE_D4Z_MODE=blocked".to_vec(),
+            format!("P11SCOPE_D4Z_GOFD={}", go[0]).into_bytes(),
+            format!("P11SCOPE_D4Z_TIDFD={}", tid[1]).into_bytes(),
+        ]);
+        // SAFETY: the child only closes pipe ends, clears CLOEXEC on
+        // its inherited copies, and execs the helper bundle; no
+        // allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "blocked fork failed");
         if pid == 0 {
-            let mut go_byte = [0u8; 1];
+            // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                libc::close(go[1]);
-                libc::close(tid[0]);
-                // One go byte; EOF or error exits instead of hanging.
-                let got = libc::read(go[0], go_byte.as_mut_ptr().cast(), go_byte.len());
-                if got != go_byte.len() as isize {
-                    libc::_exit(1);
-                }
-                // SAFETY: an anonymous stack mapping, page-aligned.
-                let stack = libc::mmap(
-                    std::ptr::null_mut(),
-                    65536,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                );
-                if stack == libc::MAP_FAILED {
-                    libc::_exit(2);
-                }
-                const FLAGS: libc::c_int = libc::CLONE_VM
-                    | libc::CLONE_FS
-                    | libc::CLONE_FILES
-                    | libc::CLONE_SIGHAND
-                    | libc::CLONE_THREAD
-                    | libc::CLONE_SYSVSEM;
-                let cloned = libc::clone(
-                    clone_survivor_main,
-                    (stack as *mut u8).add(65536).cast(),
-                    FLAGS,
-                    tid[1] as isize as *mut std::ffi::c_void,
-                );
-                if cloned < 0 {
-                    libc::_exit(3);
-                }
-                // The main thread exits alone; the survivor keeps the group.
-                libc::syscall(libc::SYS_exit, 0);
-                libc::_exit(0);
+                bundle.exec_child(&[go[0], tid[1]], &[go[1], tid[0]]);
             }
         }
         // SAFETY: the parent keeps one end of each pipe.

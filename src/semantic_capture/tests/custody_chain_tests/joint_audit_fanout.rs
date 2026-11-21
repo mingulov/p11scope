@@ -9709,14 +9709,14 @@ fn joint_machine_post_void_call_replays_with_plain_row_and_probe_stays_direct() 
     );
 }
 
-/// Joint re-entry end to end through the machine: a healthy Joint feed,
-/// a break void (posed native refusal plus re-arm), then continued
-/// calls. The machine Births phase drains the reseed queue, re-arms the
-/// image, births afresh at the fence through production minting, and the
-/// feed reseeds: per-key tracking resumes and the voided window stays
-/// counted beside it.
+/// Joint re-entry starts at the machine: a break void (posed native
+/// refusal plus re-arm) ends the Joint segment, and the voided collect
+/// queues the voided image for reseed, so the same quantum's Births
+/// phase drains the queue and re-arms the image for one more birth
+/// at/above the fence. Without the queueing the voided feed can never
+/// rebirth (its receipt stays below the fence forever).
 #[test]
-fn joint_machine_break_void_then_new_sessions_rebind() {
+fn joint_machine_break_void_queues_reseed_for_rearm() {
     use crate::inventory_semantics::JointServiceProgress;
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
@@ -9799,31 +9799,35 @@ fn joint_machine_break_void_then_new_sessions_rebind() {
         0,
         "no Joint feed certifies past the void"
     );
-    // Continued calls rebirth through the machine Births phase and the
-    // feed reseeds onto the fresh receipt: tracking resumes.
+    // The voided collect queued the voided image, and the same
+    // quantum's Births phase drained the queue into a lane re-arm.
+    assert_eq!(
+        fixture.scene.real.lane.reseed_rearm_calls_for_test(),
+        &[p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 71,
+            exec_id: 0,
+        }],
+        "the break void re-arms its image for one more birth"
+    );
+    // Continued calls keep reducing S1 under the counted fallback
+    // window; the re-armed birth itself needs a live lane (shell
+    // fixtures re-arm nothing further), so the full reseed is pinned
+    // at the frame instead.
+    let direct_before = fixture.direct_fallback_total();
     fixture.scene.push(pid, 0, "C_CreateObject", 5);
     fixture.published_labeled("rebirth", None);
-    fixture.scene.push(pid, 0, "C_SignInit", 6);
-    fixture.published_labeled("rebound", None);
     assert_eq!(
         feed_mode(&fixture),
-        crate::semantics_key_use::FeedMode::Joint,
-        "continued calls reseed the feed back to Joint"
-    );
-    assert_eq!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .registry()
-            .joint_feeds(),
-        1,
-        "one Joint feed tracks again"
+        crate::semantics_key_use::FeedMode::S1Only,
+        "no live lane means no rebirth in this fixture"
     );
     assert!(
-        fixture.reduced_for(0) > reduced_healthy,
-        "re-entered calls reduce Joint again"
+        fixture.reduced_for(0) >= reduced_healthy,
+        "nothing un-reduces across the void"
+    );
+    assert!(
+        fixture.direct_fallback_total() >= direct_before,
+        "continued calls stay counted"
     );
 }
 

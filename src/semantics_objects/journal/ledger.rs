@@ -22,6 +22,12 @@ pub(super) struct LedgerGeneration(u64);
 /// namespace 0, so deferred records charge here instead.
 const DEFERRED_NAMESPACE: u64 = 1;
 
+/// Budgeted mint-commit link reads: the id-link and key-link head
+/// loads behind one association insert, one leaf each. The commit
+/// gate debit and the test read report share this count so the two
+/// cannot drift.
+const COMMIT_LINK_LEAVES: usize = 2;
+
 /// Resource provenance only. The private constructor retains the ledger's
 /// nonrecycled generation as well as its private operation ID.
 #[derive(Clone, Copy)]
@@ -82,9 +88,10 @@ pub(crate) struct LedgerReleaseCursor {
 /// Resumable budgeted fallback-association mint: the preflight walk
 /// debits head/inspect/next reads through the shared gate one leaf
 /// per unit; the commit validates the walked ticket, rechecks the
-/// byte limit, reserves the pool charge, pops a free slot and
-/// inserts through the shared write path. The caller retains the
-/// cursor (and its payload lease) until insert or refusal commits.
+/// byte limit, reserves the pool charge before touching storage,
+/// pops a free slot, debits both index-link head reads and inserts
+/// through the shared write path. The caller retains the cursor
+/// (and its payload lease) until insert or refusal commits.
 /// Refusals match the synchronous mint exactly; tickets never
 /// recycle and refusals never consume one.
 pub(crate) struct LedgerMintCursor {
@@ -696,10 +703,12 @@ impl StagingLedger {
     /// Drive one budgeted mint step through the shared pre-debit
     /// `gate`: the walk first (one leaf per head/inspect/next read),
     /// then the commit (ticket validation, byte-limit recheck, pool
-    /// reserve, free pop, insert). Yields without advancing past a
+    /// reserve, free pop, both index-link head reads, insert — one
+    /// leaf per pop and link). Yields without advancing past a
     /// refused leaf; the caller retains the cursor (and its payload
-    /// lease) until `Done`. A refused free-pop charge yields with the
-    /// walk-miss retained (no re-walk).
+    /// lease) until `Done`. A refused pop or link charge yields with
+    /// the walk-miss retained (no re-walk); the popped slot restores
+    /// and the pool lease drops, so the retry is idempotent.
     pub(crate) fn mint_step(
         &mut self,
         cursor: &mut LedgerMintCursor,
@@ -737,46 +746,60 @@ impl StagingLedger {
                     {
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     }
-                    let Some(table) = self.table.as_mut() else {
+                    let Some(table) = self.table.as_ref() else {
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     };
                     if table.census() >= MAX_UNSETTLED_STAGED {
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     }
-                    let slot = match table.budgeted_free_pop(gate) {
-                        FreePopOutcome::Yield => return MintStepOutcome::Yield,
-                        FreePopOutcome::Full => {
-                            return MintStepOutcome::Done(Err(LedgerRefusal::Full));
-                        }
-                        FreePopOutcome::Slot(at) => at,
-                    };
-                    let lease_bytes = cursor
+                    // Lease size and pool reserve run before the free
+                    // list or the gate is touched (mirroring the
+                    // synchronous charge path): a reserve refusal
+                    // consumes no leaf and leaks no slot.
+                    let Some(lease_bytes) = cursor
                         .bytes_usize
                         .checked_add(OWNED_ALLOCATION_PADDING)
-                        .ok_or(LedgerRefusal::Full);
-                    let Ok(lease_bytes) = lease_bytes else {
-                        table.free_restore(slot);
+                    else {
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     };
+                    if gate.remaining() == 0 {
+                        return MintStepOutcome::Yield;
+                    }
                     let charge = match &self.reserver {
                         Some(reserver) => match reserver.reserve(lease_bytes) {
                             Ok(lease) => Some(lease),
-                            Err(_) => {
-                                table.free_restore(slot);
-                                return MintStepOutcome::Done(Err(LedgerRefusal::Full));
-                            }
+                            Err(_) => return MintStepOutcome::Done(Err(LedgerRefusal::Full)),
                         },
                         None => None,
                     };
-                    // The slot stays popped across the reserve above:
-                    // nothing else runs between, so the pop cannot go
-                    // stale, and every refusal path above restores the
-                    // exact vacancy. (A `Full` pop returned before
-                    // reserving.)
+                    // Commit leaves: the free-list pop plus the id-link
+                    // and key-link head reads, one unit each. A refused
+                    // link grant restores the exact vacancy and drops
+                    // the lease (nothing else runs between, so the pop
+                    // cannot go stale); the walk-miss stays retained
+                    // and the retry re-pops idempotently.
                     let Some(table) = self.table.as_mut() else {
                         drop(charge);
                         return MintStepOutcome::Done(Err(LedgerRefusal::Full));
                     };
+                    let slot = match table.budgeted_free_pop(gate) {
+                        FreePopOutcome::Yield => {
+                            drop(charge);
+                            return MintStepOutcome::Yield;
+                        }
+                        FreePopOutcome::Full => {
+                            drop(charge);
+                            return MintStepOutcome::Done(Err(LedgerRefusal::Full));
+                        }
+                        FreePopOutcome::Slot(at) => at,
+                    };
+                    if !gate.try_charge_n(COMMIT_LINK_LEAVES) {
+                        table.free_restore(slot);
+                        drop(charge);
+                        return MintStepOutcome::Yield;
+                    }
+                    #[cfg(test)]
+                    table.add_test_leaf_reads_for_test(COMMIT_LINK_LEAVES);
                     table.init_fresh_operation(slot);
                     table.attach_role_member(
                         Role::Association,
@@ -1245,5 +1268,78 @@ mod tests {
         }
         assert_eq!(fallback.census(), MAX_UNSETTLED_STAGED);
         assert_eq!(fallback.free_list_len_for_test(), 0);
+    }
+
+    /// A budgeted mint commit charges its free-list pop plus both
+    /// index-link head reads: one empty-bucket mint debits exactly
+    /// walk head + pop + id link + key link (4 units, 4 reads).
+    #[test]
+    fn budgeted_mint_commit_charges_pop_and_both_links() {
+        let pool = SemanticResourcePool::default();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let mut cursor = fallback.start_keyassoc_mint(16).unwrap();
+        fallback.reset_test_leaf_reads_for_test();
+        fallback.reset_test_slot_visits_for_test();
+        fallback.reset_test_preflight_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        let outcome = fallback.mint_step(&mut cursor, &mut gate);
+        assert!(
+            matches!(outcome, MintStepOutcome::Done(Ok(1))),
+            "an empty bucket mints ticket 1 in one step"
+        );
+        assert_eq!(gate.spent(), 4, "walk head + pop + two link heads");
+        assert_eq!(
+            fallback.test_leaf_reads_for_test(),
+            4,
+            "every charged leaf performed its read"
+        );
+        assert_eq!(fallback.test_slot_visits_for_test(), 0);
+        assert_eq!(fallback.test_preflight_reads_for_test(), 0);
+        assert_eq!(fallback.census(), 1);
+    }
+
+    /// A link-grant refusal restores the popped slot and drops the
+    /// pool lease without consuming a ticket: the retry re-pops and
+    /// commits without re-walking.
+    #[test]
+    fn budgeted_mint_commit_yield_restores_slot_without_rewalk() {
+        let pool = SemanticResourcePool::default();
+        let mut fallback = StagingLedger::with_resources(pool.reserver());
+        fallback.prepare_capacity().unwrap();
+        let pool_before = pool.snapshot().charged_bytes;
+        let mut cursor = fallback.start_keyassoc_mint(16).unwrap();
+        let mut gate = LeafBudget::new(2);
+        let outcome = fallback.mint_step(&mut cursor, &mut gate);
+        assert!(
+            matches!(outcome, MintStepOutcome::Yield),
+            "walk plus pop fit, but the two link heads need fresh credit"
+        );
+        assert_eq!(gate.spent(), 2);
+        assert_eq!(fallback.census(), 0, "a yielded commit mints nothing");
+        assert_eq!(
+            fallback.free_list_len_for_test(),
+            MAX_UNSETTLED_STAGED,
+            "the yielded pop restores its vacancy"
+        );
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            pool_before,
+            "the yielded commit holds no pool lease"
+        );
+        fallback.reset_test_leaf_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        let outcome = fallback.mint_step(&mut cursor, &mut gate);
+        assert!(
+            matches!(outcome, MintStepOutcome::Done(Ok(1))),
+            "the retry commits the retained walk"
+        );
+        assert_eq!(
+            gate.spent(),
+            3,
+            "pop plus two link heads, with no re-walk"
+        );
+        assert_eq!(fallback.test_leaf_reads_for_test(), 3);
+        assert_eq!(fallback.census(), 1);
     }
 }

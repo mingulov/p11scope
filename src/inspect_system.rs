@@ -45,8 +45,7 @@ use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::proof_stats::{ProofStatPool, proof_stat_threads};
 use crate::discovery::scan::{
     BudgetConsumption, CaptureWorkBudget, IO_CEILING_REASON, ScanOutcome, ScanRequest,
-    ScannedModule, Skipped, is_collection_stop, is_work_ceiling_stop, scan_process_view_examined,
-    scan_skip_truncates,
+    ScannedModule, Skipped, scan_process_view_examined, scan_skip_truncates, scan_stop_kind,
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
@@ -1165,10 +1164,11 @@ fn count_manifest_reason(one_shot: bool) -> DeferredReason {
 /// decode cursors (pinning and post-scan phases republish the sticky
 /// stop against a spent budget): the scan's in-progress gap names the
 /// continuation. Members without unfinished cursors keep every gap
-/// verbatim, so a stall stays loud. Stops match by the same exact
-/// provenance rule as the scanner filter, so a diagnosis whose module
-/// path contains the stop sentence keeps its row, command and
-/// attribution.
+/// verbatim, so a stall stays loud. Stops match through the one
+/// provenance owner ([`scan_stop_kind`], bound to this member's pid) the
+/// scanner filter uses: the bare, scan-refusal and pin-time mount-table
+/// shapes drop, while a diagnosis whose module path contains the stop
+/// sentence keeps its row, command and attribution.
 pub(crate) fn retain_member_gaps_while_unfinished(
     gaps: &mut Vec<PidGap>,
     budget: &CaptureWorkBudget,
@@ -1176,7 +1176,7 @@ pub(crate) fn retain_member_gaps_while_unfinished(
     start_time: Option<u64>,
 ) {
     if budget.view_scan_progress(pid, start_time).is_some() {
-        gaps.retain(|gap| !(is_work_ceiling_stop(&gap.reason) || is_collection_stop(&gap.reason)));
+        gaps.retain(|gap| scan_stop_kind(&gap.reason, Some(pid)).is_none());
     }
 }
 

@@ -1277,8 +1277,7 @@ fn continued_view_gap(
     start_time: Option<u64>,
 ) -> Option<(String, String)> {
     let gap = budget.view_in_progress_gap(pid, start_time)?;
-    skipped
-        .retain(|skip| !(is_work_ceiling_stop(&skip.reason) || is_collection_stop(&skip.reason)));
+    skipped.retain(|skip| scan_stop_kind(&skip.reason, Some(pid)).is_none());
     Some(gap)
 }
 
@@ -8005,52 +8004,89 @@ const INITIAL_MAPS_UNAVAILABLE_REASON: &str =
 const SCAN_GENERATION_CHANGED_REASON: &str =
     "memory scan refused: process generation changed during acquisition";
 
-/// Whether `reason` is a genuine scan work-ceiling stop: the exact bare
-/// sentence or the exact producer-owned refusal wrappings (initial/final
-/// mapping validation, generation change) with the exact stop detail.
-/// Never a substring match: producer advice embeds shell-quoted module
-/// pathnames, and a path containing the sentence must not classify as
-/// a budget stop.
-pub(crate) fn is_work_ceiling_stop(reason: &str) -> bool {
-    is_stop_with_provenance(
-        reason,
-        WORK_CEILING_REASON,
-        &[
-            INITIAL_MAPS_UNAVAILABLE_REASON,
-            FINAL_MAPS_UNAVAILABLE_REASON,
-            SCAN_GENERATION_CHANGED_REASON,
-        ],
-    )
+/// The budget stop a gap reason carries, by exact provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanStopKind {
+    /// [`WORK_CEILING_REASON`]: the pass's work allowance tripped.
+    WorkCeiling,
+    /// [`COLLECTION_STOP_REASON`]: the cgroup collection stopped or its
+    /// shared allowance ran out.
+    CollectionStop,
 }
 
-/// Whether `reason` is a genuine collection-stop signal with the same
-/// provenance rule as [`is_work_ceiling_stop`]: the exact bare sentence
-/// or the exact producer-owned refusal wrappings.
-pub(crate) fn is_collection_stop(reason: &str) -> bool {
-    is_stop_with_provenance(
-        reason,
-        COLLECTION_STOP_REASON,
-        &[
-            INITIAL_MAPS_UNAVAILABLE_REASON,
-            FINAL_MAPS_UNAVAILABLE_REASON,
-            SCAN_GENERATION_CHANGED_REASON,
-        ],
-    )
+/// Producer-owned refusal prefixes that wrap a budget stop as
+/// `{prefix}: {stop}`: initial/final mapping validation and generation
+/// change during a scan.
+const SCAN_STOP_REFUSAL_PREFIXES: [&str; 3] = [
+    INITIAL_MAPS_UNAVAILABLE_REASON,
+    FINAL_MAPS_UNAVAILABLE_REASON,
+    SCAN_GENERATION_CHANGED_REASON,
+];
+
+/// The pin-time mount-table read failure for `pid`: the one producer of
+/// this wording (`process::read_view_mountinfo`) and the classifier
+/// below both use it, so a budget stop met while pinning keeps an exact,
+/// pid-bound provenance.
+pub(crate) fn mount_table_read_reason(pid: u32, detail: &str) -> String {
+    format!("cannot read pid {pid}'s mount table: {detail}")
 }
 
-/// Exact provenance match for one budget-stop sentence: the bare wording
-/// or `{refusal prefix}: {sentence}` for a producer-owned refusal
-/// prefix. Anything else — including producer-unrelated text that
-/// merely contains the sentence — never matches.
-fn is_stop_with_provenance(reason: &str, stop: &str, prefixes: &[&str]) -> bool {
-    if reason == stop {
-        return true;
+/// The pid and detail of a [`mount_table_read_reason`] row.
+fn parse_mount_table_read_reason(reason: &str) -> Option<(u32, &str)> {
+    let rest = reason.strip_prefix("cannot read pid ")?;
+    let (pid, detail) = rest.split_once("'s mount table: ")?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    prefixes.iter().any(|prefix| {
-        reason
+    Some((pid.parse().ok()?, detail))
+}
+
+fn bare_scan_stop(detail: &str) -> Option<ScanStopKind> {
+    match detail {
+        WORK_CEILING_REASON => Some(ScanStopKind::WorkCeiling),
+        COLLECTION_STOP_REASON => Some(ScanStopKind::CollectionStop),
+        _ => None,
+    }
+}
+
+/// The single stop-provenance owner: which budget stop, if any, `reason`
+/// carries. Matches the exact bare sentence, `{refusal prefix}: {stop}`
+/// for a producer-owned scan refusal, or the pin-time mount-table
+/// wrapper with the exact stop detail — for `pid` only, when given
+/// (another process's wrapped stop is not this member's stop). Never a
+/// substring match: producer advice embeds shell-quoted module
+/// pathnames, and a path containing the sentence must not classify as a
+/// budget stop. Every consumer (the scanner and member continuation
+/// filters, the presentation fold) asks this one function.
+pub(crate) fn scan_stop_kind(reason: &str, pid: Option<u32>) -> Option<ScanStopKind> {
+    if let Some(kind) = bare_scan_stop(reason) {
+        return Some(kind);
+    }
+    for prefix in SCAN_STOP_REFUSAL_PREFIXES {
+        if let Some(detail) = reason
             .strip_prefix(prefix)
-            .is_some_and(|tail| tail.strip_prefix(": ").is_some_and(|detail| detail == stop))
-    })
+            .and_then(|tail| tail.strip_prefix(": "))
+        {
+            return bare_scan_stop(detail);
+        }
+    }
+    let (owner, detail) = parse_mount_table_read_reason(reason)?;
+    if pid.is_some_and(|pid| pid != owner) {
+        return None;
+    }
+    bare_scan_stop(detail)
+}
+
+/// Whether `reason` is a genuine scan work-ceiling stop under
+/// [`scan_stop_kind`]'s provenance rule, from any process.
+pub(crate) fn is_work_ceiling_stop(reason: &str) -> bool {
+    scan_stop_kind(reason, None) == Some(ScanStopKind::WorkCeiling)
+}
+
+/// Whether `reason` is a genuine collection-stop signal under
+/// [`scan_stop_kind`]'s provenance rule, from any process.
+pub(crate) fn is_collection_stop(reason: &str) -> bool {
+    scan_stop_kind(reason, None) == Some(ScanStopKind::CollectionStop)
 }
 
 /// All provider mappings establish inventory authority. They also cover every

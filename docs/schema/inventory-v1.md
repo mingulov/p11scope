@@ -998,9 +998,9 @@ and never proves an app identity. See the app identity rows of
   or path) in the `reason`, so different modules stay distinct gaps. The first
   occurrence keeps its position in `gaps[]`.
   Repeated scan work-ceiling stops project to the single finite
-  reason `scan budget exhausted` (the exact bare wording and the
-  exact producer-owned scan-refusal wrappings alike, whatever subject
-  filed them): one pass's allowance tripped mid-scan, true per event
+  reason `scan budget exhausted` (the exact bare wording, the
+  exact producer-owned scan-refusal wrappings and the pin-time
+  mount-table wrapping alike, whatever subject filed them): one pass's allowance tripped mid-scan, true per event
   even when a resumed pass completes the work afterward.
   Producer-unrelated text that merely contains the stop sentence
   (such as a module pathname inside a diagnosis) never projects.
@@ -1009,7 +1009,11 @@ and never proves an app identity. See the app identity rows of
   counted line (`gap [subject] scan budget exhausted (N times)`)
   at the first row's position, with the exact summed total, so a
   slow host that files one trip per pass per caller reads as one
-  line instead of dozens. A lone trip renders bare. The dashboard
+  line instead of dozens. A lone trip renders bare. Concise text
+  treats the folded rows as anchors: each ordinary group reads in
+  the interval between anchors that holds its first row and is
+  ranked only within that interval, and one cap covers the merged
+  lines. The dashboard
   lists the renamed rows unfolded (its per-row navigation keeps each
   trip's attribution).
   A gap that records a budget refusal carries `budget` with the

@@ -92,6 +92,12 @@ const MEMBER_STOP_RETRY_CAP: usize = 1024;
 /// Bounded local clearance memory (the kernel LRU is the authority; this
 /// only saves repeated proofs of files already cleared this capture).
 const MEMBER_STOP_LOCAL_CLEARED_CAP: usize = 16_384;
+/// Bounded maps-read attempts per pass for one stopped member whose maps
+/// cannot be read while its stop still holds (controller ruling, round 3:
+/// a stopped member runs nothing, so the read retries instead of filing
+/// the first-use gap at once). Attempts past this keep the row for the
+/// next pass; the hold bound still resumes it there with the named gap.
+const MEMBER_STOP_UNREADABLE_READ_ATTEMPTS_PER_PASS: u32 = 3;
 
 /// Where a held member's hold stands (see `Engine::hold_state`).
 struct HoldState {
@@ -413,6 +419,78 @@ fn born_before_stop(start_ticks: u64, stop_ns: u64) -> Option<bool> {
     let boot = crate::discovery::pause::boot_ns()?;
     let started = start_ticks.saturating_mul(crate::discovery::pause::clock_tick_ns());
     Some(boot.saturating_sub(started) >= monotonic.saturating_sub(stop_ns))
+}
+
+/// Whether the pending row's stop still proves its member ran nothing
+/// past its stopping mapping: the pin names the same process, that
+/// process is the stopped generation (its start precedes the stop), and
+/// every task is stopped (T), dead (Z/X/x) or dying (`PF_EXITING`). A
+/// stopped task runs nothing; a dead or dying one never returns to
+/// userspace, so it cannot run a provider call unobserved. Any other
+/// shape files the gap (the safe direction): a task running or sleeping
+/// in userspace reach (R/S/D) may have run past the mapping — and a
+/// sleeping task with unreadable maps contradicts its own address space
+/// (sleeping tasks hold their mm and mount namespace), so the sample is
+/// stale and the proof is lost. So does any unreadable pin, start time,
+/// clock or task state, and a reused number (born after the stop).
+/// Lowercase `t` (a ptrace stop) is not a stop proof: the tracer may
+/// resume the task at any time.
+fn stop_still_proves_nothing_ran(pin: &crate::process::PidPin, tgid: u32, since_ns: u64) -> bool {
+    pin.still_the_same()
+        && pin
+            .start_time()
+            .and_then(|start| born_before_stop(start, since_ns))
+            == Some(true)
+        && member_tasks_constrained(tgid)
+}
+
+/// Whether every task of `tgid` is stopped, dead or dying (see
+/// [`stop_still_proves_nothing_ran`]). Each task's stat is read once and
+/// its state and (for R tasks) its flags come from that same read, so no
+/// task can change state between the two. A task gone between the census
+/// and its read contributes as dead (an exited task never runs again);
+/// an empty set is dead too (reaped between the reads: the next pass
+/// counts the departure silently). Any other unreadable census or stat,
+/// or an unparsable state, proves nothing: false.
+fn member_tasks_constrained(tgid: u32) -> bool {
+    let entries = match std::fs::read_dir(format!("/proc/{tgid}/task")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let mut samples = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => return false,
+        };
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return false,
+        };
+        let Some(state) = crate::discovery::pause::parse_task_state(&stat) else {
+            return false;
+        };
+        let flags = (state == b'R').then(|| {
+            std::str::from_utf8(&stat)
+                .ok()
+                .and_then(crate::process::stat_flags_from_stat_text)
+        });
+        samples.push((state, flags.flatten()));
+    }
+    all_tasks_constrained(&samples)
+}
+
+/// Pure core of [`member_tasks_constrained`]: every sampled task must be
+/// stopped (T), dead (Z/X/x) or dying (`PF_EXITING`, whatever its sampled
+/// letter). Flags are only consulted for other letters; an R task with
+/// unknown flags may run. Empty (reaped) holds vacuously.
+fn all_tasks_constrained(tasks: &[(u8, Option<u32>)]) -> bool {
+    tasks.iter().all(|(state, flags)| match state {
+        b'T' | b'Z' | b'X' | b'x' => true,
+        _ => flags.is_some_and(|flags| flags & crate::process::leader_exit::PF_EXITING != 0),
+    })
 }
 
 /// Whether a pinned process outside the run tree is still the member a
@@ -2254,5 +2332,60 @@ d000-e000 r-xp 00000000 103:05 77  /opt/with space.so\n";
             }
         );
         assert_eq!(rows[1].path, b"/opt/with space.so");
+    }
+
+    use crate::process::leader_exit::PF_EXITING;
+
+    /// The stop-hold predicate: stopped, dead and dying tasks hold the
+    /// row for a retry; anything that may run userspace files the gap.
+    #[test]
+    fn stop_hold_samples_pin_every_task_shape() {
+        // Stopped, dead and dying hold.
+        for state in [b'T', b'Z', b'X', b'x'] {
+            assert!(
+                all_tasks_constrained(&[(state, None)]),
+                "{} holds",
+                state as char
+            );
+        }
+        assert!(
+            all_tasks_constrained(&[(b'R', Some(PF_EXITING))]),
+            "dying R holds"
+        );
+        assert!(
+            all_tasks_constrained(&[(b'S', Some(PF_EXITING))]),
+            "dying S holds"
+        );
+        assert!(
+            all_tasks_constrained(&[(b't', Some(PF_EXITING))]),
+            "dying traced holds"
+        );
+        assert!(all_tasks_constrained(&[]), "reaped holds vacuously");
+        // Anything that may run userspace files.
+        for state in [b'R', b'S', b'D', b't', b'K', b'W', b'P', b'I', b'?'] {
+            assert!(
+                !all_tasks_constrained(&[(state, None)]),
+                "{} files",
+                state as char
+            );
+            assert!(
+                !all_tasks_constrained(&[(state, Some(0))]),
+                "{} without PF_EXITING files",
+                state as char
+            );
+        }
+        assert!(
+            !all_tasks_constrained(&[(b'R', None)]),
+            "R with unknown flags files"
+        );
+        // One live task vetoes a constrained group.
+        assert!(
+            !all_tasks_constrained(&[(b'T', None), (b'R', Some(0))]),
+            "a live sibling files"
+        );
+        assert!(
+            all_tasks_constrained(&[(b'T', None), (b'R', Some(PF_EXITING))]),
+            "a dying sibling holds"
+        );
     }
 }

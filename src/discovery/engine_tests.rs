@@ -93312,9 +93312,20 @@ fn member_stop_resumes_a_stopped_member_moved_out_of_the_run_tree() {
     let _ = child.wait();
 }
 
-/// A stopped member whose maps cannot be read resumes (never wedged),
-/// and since nothing about its stopping file is proven, the named
-/// first-use gap is filed.
+/// A stopped member whose maps cannot be read is owed a retry, not an
+/// instant gap (controller ruling, round 3: a member stopped inside
+/// execve whose maps read fails with EINVAL must not file the first-use
+/// gap at once — it is stopped, so nothing can run unobserved; the read
+/// retries in a bounded way per pass and the row waits for the next pass
+/// while the stop is still proven; the gap files only when the member
+/// provably ran past the mapping or the stop proof is lost, and then the
+/// gap is true). The row stays, the member stays stopped, and no gap or
+/// unreadable count is filed. When the read clears and the stopping file
+/// proves truly absent (here: the scripted row names a range the member
+/// never mapped, with stable stopped maps), the honest gap files then.
+/// (The negative twin
+/// `member_stop_unreadable_maps_running_member_files_the_first_use_row`
+/// keeps the instant gap for a member that ran.)
 #[test]
 fn member_stop_unreadable_maps_resume_files_the_first_use_row() {
     let mut io = ScriptedMemberStops::default();
@@ -93323,8 +93334,121 @@ fn member_stop_unreadable_maps_resume_files_the_first_use_row() {
     engine.member_stops.maps_fail.insert(pid);
     let mut session = ScriptedSession::default();
     engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(
+        !files_the_first_use_row(&engine),
+        "a stopped member owes no instant gap"
+    );
+    assert!(io.rows.contains_key(&pid), "its row waits for a retry");
+    assert!(member_still_stopped_for_test(pid), "it stays stopped");
+    assert_eq!(engine.member_stop_stats_for_test().unreadable, 0);
+    assert!(
+        engine.member_stop_stats_for_test().resume_unavailable >= 1,
+        "the deferral counts as kept for a retry"
+    );
+    // The read clears: the stopping file is truly absent from stable
+    // stopped maps, so the honest gap files now.
+    engine.member_stops.maps_fail.remove(&pid);
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 2_000_000));
     assert!(member_resumed_for_test(pid), "the member runs again");
     assert!(!io.rows.contains_key(&pid));
+    assert_eq!(engine.member_stop_stats_for_test().unproven_resumes, 1);
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Negative twin: a member running userspace (R, no `PF_EXITING`) whose
+/// maps cannot be read may have run past its stopping mapping: the named
+/// first-use gap files at once, the row withdraws, and the member is
+/// resumed (never wedged).
+#[test]
+fn member_stop_unreadable_maps_running_member_files_the_first_use_row() {
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("while :; do :; done")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    // A `:` loop issues no syscalls, so once R it stays R.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).unwrap();
+        if crate::discovery::pause::parse_task_state(&stat) == Some(b'R') {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spinner {pid} never reached R"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let mut io = ScriptedMemberStops::default();
+    let stop_ns = crate::attach::monotonic_ns().unwrap();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: stop_ns,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
+        },
+    );
+    let mut engine = member_stop_engine();
+    engine.member_stops.maps_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
+    assert_eq!(engine.member_stop_stats_for_test().unreadable, 1);
+    assert!(files_the_first_use_row(&engine), "the gap is named");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A sleeping (S) member with unreadable maps contradicts its own address
+/// space (sleeping tasks hold their mm and mount namespace), so the sample
+/// is stale and the stop proof is lost: the named first-use gap files at
+/// once, like the running twin's.
+#[test]
+fn member_stop_unreadable_maps_sleeping_member_files_the_first_use_row() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).unwrap();
+        if crate::discovery::pause::parse_task_state(&stat) == Some(b'S') {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "sleeper {pid} never reached S"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let mut io = ScriptedMemberStops::default();
+    let stop_ns = crate::attach::monotonic_ns().unwrap();
+    io.rows.insert(
+        pid,
+        p11scope_ebpf_common::MemberStop {
+            file: p11scope_ebpf_common::MemberFileKey { dev: 1, ino: 1 },
+            hook_ts_ns: stop_ns,
+            vm_start: 0x1000,
+            vm_end: 0x2000,
+            nr_threads: 1,
+            reserved: 0,
+        },
+    );
+    let mut engine = member_stop_engine();
+    engine.member_stops.maps_fail.insert(pid);
+    let mut session = ScriptedSession::default();
+    engine.service_member_stops(&mut io, &mut session, Some(stop_ns + 1_000_000));
+    assert!(!io.rows.contains_key(&pid), "its row is withdrawn");
     assert_eq!(engine.member_stop_stats_for_test().unreadable, 1);
     assert!(files_the_first_use_row(&engine), "the gap is named");
     let _ = child.kill();
@@ -95226,6 +95350,17 @@ fn teardown_wait_span_count(stage: &crate::timing::StageTimings) -> u64 {
         .map_or(0, |(_, _, count)| *count)
 }
 
+/// How many `gone_rewait` spans a stage accumulator recorded: exactly one
+/// per scan whose `gone` micro-wait ran, so the count proves the wait ran
+/// without trusting the silence alone (a wait-less path records none).
+fn gone_rewait_span_count(stage: &crate::timing::StageTimings) -> u64 {
+    stage
+        .ops()
+        .iter()
+        .find(|(op, _, _)| *op == "gone_rewait")
+        .map_or(0, |(_, _, count)| *count)
+}
+
 /// A real 1 GiB child killed mid-scan: the scan starts in the
 /// `PF_EXITING`-not-zombie window (empty maps, pidfd unready, `kill`
 /// succeeds, whole-group proof false) and must file no loud record once
@@ -95513,6 +95648,204 @@ fn teardown_deferral_keeps_zombie_leader_with_live_member_loud() {
         "leader and member are still in their loud shape at the verdict"
     );
     group.call_three();
+}
+
+/// The `gone` micro-wait runs for a zombie leader with a live member — the
+/// leader is dead, so the group is mid-teardown until the census proves
+/// otherwise — but the live member keeps the re-proof false, so the latch
+/// stays loud. The `gone_rewait` span proves the wait ran (a wait-less
+/// path records none); no `teardown_wait` span runs (the leader is already
+/// a zombie, never `PF_EXITING`-not-zombie).
+#[test]
+fn scan_gone_micro_wait_runs_but_stays_loud_for_a_live_member() {
+    use crate::process::cold_view_tests::ColdLeaderSubject;
+    let mut group = ColdLeaderSubject::spawn(1);
+    group.leave_leader();
+    let pid = group.pid();
+    assert!(
+        crate::process::process_is_zombie(pid),
+        "the leader is a real zombie"
+    );
+    let member = group.tids[0];
+    assert!(proc_task_is_live(pid, member), "the member thread is live");
+    let view = ProcessView::open(ProcessViewId(9200), pid).unwrap();
+    assert!(
+        !crate::process::whole_group_proven_exited(&view),
+        "a live member keeps the group unproven"
+    );
+    let mut counters = DiscoveryCounters::default();
+    let mut stage = crate::timing::StageTimings::default();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut stage,
+        &mut TeardownDeferralBudget::new(),
+        None,
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Unavailable {
+                reason: "gone",
+                modules: Vec::new(),
+                skipped: Vec::new(),
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    assert!(result.is_ok(), "the scripted loud scan runs: {result:?}");
+    assert_eq!(
+        counters.scan_unavailable,
+        Some("gone"),
+        "a live member keeps its gone latch loud"
+    );
+    assert_eq!(
+        gone_rewait_span_count(&stage),
+        1,
+        "the micro-wait ran exactly once: {stage:?}"
+    );
+    assert_eq!(
+        teardown_wait_span_count(&stage),
+        0,
+        "no teardown deferral runs for a zombie leader: {stage:?}"
+    );
+    assert!(
+        crate::process::process_is_zombie(pid) && proc_task_is_live(pid, member),
+        "leader and member are still in their loud shape at the verdict"
+    );
+    group.call_three();
+}
+
+/// A member that dies during the `gone` micro-wait silences the latch: the
+/// first proof fails (the member is still alive when the scan lands), the
+/// pidfd wakes when the group exits, and the re-proof holds. The killer
+/// fires 2 ms into the 10 ms wait (robust margins); a deschedule past the
+/// cap retries with a fresh group (bounded, 3 attempts).
+#[test]
+fn scan_gone_micro_wait_silences_a_member_dying_mid_wait() {
+    use crate::discovery::sweep_attribution::tests::d4_zombie_cells::ZombieLeaderGroup;
+    for attempt in 1..=3 {
+        let group = ZombieLeaderGroup::spawn();
+        let pid = group.tgid();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::process::process_is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "attempt {attempt}: leader {pid} never reached zombie state"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let view = ProcessView::open(ProcessViewId(9201), pid).unwrap();
+        assert!(
+            !crate::process::whole_group_proven_exited(&view),
+            "attempt {attempt}: the live survivor keeps the group unproven"
+        );
+        let mut counters = DiscoveryCounters::default();
+        let mut stage = crate::timing::StageTimings::default();
+        let result = scan_and_pin_with(
+            &view,
+            &[],
+            &HookRegistry::builtin(),
+            &mut CaptureWorkBudget::default(),
+            &mut counters,
+            false,
+            &mut stage,
+            &mut TeardownDeferralBudget::new(),
+            None,
+            |_, _, _| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                });
+                Ok::<_, String>(ScanOutcome::Unavailable {
+                    reason: "gone",
+                    modules: Vec::new(),
+                    skipped: Vec::new(),
+                })
+            },
+            None,
+            crate::discovery::handle_table::Filing::Untracked,
+        );
+        // Like the teardown twins: once the group proves exited the pin
+        // step fails its still-same check, silenced by callers via gone.
+        if let Err(error) = &result {
+            assert!(
+                error.to_string().contains("process generation exited")
+                    || error.to_string().contains("pinning process view"),
+                "attempt {attempt}: a teardown pin fails only on the proven exit: {error:?}"
+            );
+        }
+        let silent = counters.scan_unavailable.is_none() && gone_rewait_span_count(&stage) == 1;
+        if silent {
+            return;
+        }
+        if attempt < 3 {
+            continue;
+        }
+        panic!("the micro-wait never silenced in 3 attempts: {counters:?} {stage:?}");
+    }
+}
+
+/// A live leader never enters the `gone` micro-wait: the trigger needs a
+/// dead or exiting leader, so a live group's `gone` latches at once with
+/// no span.
+#[test]
+fn scan_gone_micro_wait_skips_a_live_leader() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(9202), pid).unwrap();
+    assert_eq!(
+        view.original_exited(),
+        Ok(false),
+        "the group is live at the scan"
+    );
+    assert!(
+        !crate::process::whole_group_proven_exited(&view),
+        "a live group never proves exited"
+    );
+    let mut counters = DiscoveryCounters::default();
+    let mut stage = crate::timing::StageTimings::default();
+    let result = scan_and_pin_with(
+        &view,
+        &[],
+        &HookRegistry::builtin(),
+        &mut CaptureWorkBudget::default(),
+        &mut counters,
+        false,
+        &mut stage,
+        &mut TeardownDeferralBudget::new(),
+        None,
+        |_, _, _| {
+            Ok::<_, String>(ScanOutcome::Unavailable {
+                reason: "gone",
+                modules: Vec::new(),
+                skipped: Vec::new(),
+            })
+        },
+        None,
+        crate::discovery::handle_table::Filing::Untracked,
+    );
+    assert!(result.is_ok(), "the scripted loud scan runs: {result:?}");
+    assert_eq!(
+        counters.scan_unavailable,
+        Some("gone"),
+        "a live leader keeps its gone latch loud"
+    );
+    assert_eq!(
+        gone_rewait_span_count(&stage),
+        0,
+        "no micro-wait runs for a live leader: {stage:?}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Unit: the shared deferral budget consumes elapsed waits and saturates

@@ -2116,6 +2116,43 @@ pub(crate) fn stat_flags_from_stat_text(stat: &str) -> Option<u32> {
         .ok()
 }
 
+/// Whether the view's leader is already dead (zombie or dead state) or
+/// inside its own teardown (`PF_EXITING`), in the retained generation: a
+/// reused pid, an unreadable stat and a fallback pin without a retained
+/// birth all read false. The trigger for the post-scan `gone` micro-wait:
+/// a leader this far gone with an unproven census is mid-teardown (a
+/// member with a fatal signal pending, not yet in `do_exit`), never a
+/// live group, so one bounded re-proof is owed before the latch.
+pub(crate) fn leader_dead_or_exiting(view: &ProcessView) -> bool {
+    let Some(retained) = view.start_time() else {
+        return false;
+    };
+    let Ok(stat) = read_proc_stat(view.pid()) else {
+        return false;
+    };
+    stat_text_dead_or_exiting(&stat, retained)
+}
+
+/// Pure core of [`leader_dead_or_exiting`]: the same generation (birth
+/// match) and a dead state or `PF_EXITING`. Anything else — live, reused,
+/// malformed — is false.
+pub(crate) fn stat_text_dead_or_exiting(stat: &str, retained: u64) -> bool {
+    let Ok(birth) = start_time_from_stat(stat) else {
+        return false;
+    };
+    if birth != retained {
+        return false;
+    }
+    let Some(end) = stat.rfind(')') else {
+        return false;
+    };
+    let state = stat[end + 1..].split_whitespace().next().unwrap_or("");
+    if stat_state_is_dead(state) {
+        return true;
+    }
+    stat_flags_from_stat_text(stat).is_some_and(|flags| flags & leader_exit::PF_EXITING != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2125,6 +2162,49 @@ mod tests {
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    /// Full stat lines: state/flags vary, starttime 500.
+    fn dead_or_exiting_line(state: &str, flags: u32) -> String {
+        format!("7 (x) {state} 1 7 7 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0")
+    }
+
+    /// The `gone` micro-wait trigger: dead or exiting in the retained
+    /// generation only.
+    #[test]
+    fn dead_or_exiting_trigger_pins_state_flags_and_birth() {
+        for dead in ["Z", "X", "x"] {
+            assert!(
+                stat_text_dead_or_exiting(&dead_or_exiting_line(dead, 4194560), 500),
+                "{dead} triggers"
+            );
+        }
+        assert!(
+            stat_text_dead_or_exiting(&dead_or_exiting_line("R", 4194560 | 4), 500),
+            "R with PF_EXITING triggers"
+        );
+        assert!(
+            stat_text_dead_or_exiting(
+                "7 (a)b c) R 1 7 7 0 -1 4 0 0 0 0 0 0 0 0 20 0 1 0 500 0 0",
+                500,
+            ),
+            "comm with spaces and parens still parses"
+        );
+        for live in ["R", "S", "D", "T", "t"] {
+            assert!(
+                !stat_text_dead_or_exiting(&dead_or_exiting_line(live, 4194560), 500),
+                "{live} without PF_EXITING stays out"
+            );
+        }
+        assert!(
+            !stat_text_dead_or_exiting(&dead_or_exiting_line("Z", 4194560), 501),
+            "a reused birth stays out"
+        );
+        assert!(
+            !stat_text_dead_or_exiting("7 (x", 500),
+            "malformed stays out"
+        );
+        assert!(!stat_text_dead_or_exiting("", 500), "empty stays out");
+    }
 
     #[test]
     fn tracker_tasks_row_moves_with_admission() {

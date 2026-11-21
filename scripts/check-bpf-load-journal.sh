@@ -521,8 +521,13 @@ for KERNEL in "$@"; do
     # below gates counts, but only budgets gate presence, so the pair
     # is checked explicitly for the unbudgeted kernels too). The third
     # field is the probe parse status (1 valid, 0 unreadable or
-    # corrupt): a malformed suffix must refuse qualification, never
-    # erase confirmed loads into a valid no-load claim.
+    # corrupt): a malformed row must refuse qualification, never
+    # erase confirmed loads into a valid no-load claim. Each
+    # LF-framed row decodes and validates separately, so one bad row
+    # keeps the roots from the valid load rows; the completeness
+    # rules (one summary, exact counts, clean write) mirror the
+    # report reader, and parse validity stays separate from load
+    # evidence.
     PAIR_OUT="0 0 0"
     if [ -f "$J_PROBE" ]; then
         PAIR_OUT=$(python3 - "$J_PROBE" "$KEY_SIZES" <<'PY'
@@ -532,14 +537,63 @@ if len(sys.argv) > 2 and sys.argv[2] == "1":
     pair = pair + ("p11_entry_journal_length", "p11_return_journal_length")
 loaded = set()
 parse_ok = 1
+load_count = 0
+error_count = 0
+summaries = []
 try:
-    with open(sys.argv[1], encoding="ascii") as stream:
-        for line in stream:
-            row = json.loads(line)
-            if row.get("record") == "load" and row.get("loaded") is True:
-                loaded.add(row.get("root"))
-except (OSError, ValueError):
+    with open(sys.argv[1], "rb") as stream:
+        data = stream.read()
+except OSError:
+    print("0 0 0")
+    sys.exit(0)
+rows = data.split(b"\n")
+if rows and rows[-1] == b"":
+    rows.pop()
+if not rows:
     parse_ok = 0
+for raw in rows:
+    try:
+        text = raw.decode("ascii")
+    except ValueError:
+        parse_ok = 0
+        continue
+    if not text.strip():
+        parse_ok = 0
+        continue
+    try:
+        row = json.loads(text)
+    except ValueError:
+        parse_ok = 0
+        continue
+    if type(row) is not dict or type(row.get("record")) is not str:
+        parse_ok = 0
+        continue
+    kind = row["record"]
+    if kind == "load":
+        load_count += 1
+        root = row.get("root")
+        if type(root) is not str or not root:
+            parse_ok = 0
+            continue
+        if row.get("loaded") is True:
+            loaded.add(root)
+        elif row.get("loaded") is not False:
+            parse_ok = 0
+    elif kind == "probe-summary":
+        summaries.append(row)
+    elif kind == "probe-error":
+        error_count += 1
+        parse_ok = 0
+    else:
+        parse_ok = 0
+if len(summaries) != 1:
+    parse_ok = 0
+else:
+    summary = summaries[0]
+    if summary.get("records") != load_count + error_count:
+        parse_ok = 0
+    if summary.get("write_failures") != 0 or summary.get("overflow") is not False:
+        parse_ok = 0
 print(("1" if all(root in loaded for root in pair) else "0"),
       ("1" if any(root in loaded for root in pair) else "0"),
       parse_ok)

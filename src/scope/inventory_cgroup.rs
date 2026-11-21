@@ -134,19 +134,13 @@ impl Default for CgroupWalkLimits {
             file_bytes: 1 << 20,
             total_bytes: 8 << 20,
             path_bytes: 1 << 20,
-            // The shared per-pass work allowance (one rule for every
-            // scope): a pass that does not fit resumes next pass from
-            // its cursors instead of restarting, so the allowance
-            // bounds one pass, never whether a provider is ever found.
-            // Calibrated 2026-11-18: one haskoki-class member (6.3 MiB
-            // of provider data mappings) costs ~1M units, and the
-            // largest known real-world object (libxul, 61 MiB of
-            // readable data) costs ~9.5M; the old 1M ceiling exhausted
-            // on the first large provider of every pass and left the
-            // scope blind. The cgroup pass window carries the same
-            // ceiling; the two counters charge 1:1, so they must stay
-            // equal.
-            work_units: crate::discovery::scan::DEFAULT_WORK_CEILING as usize,
+            // The per-pass work allowance: a pass that does not fit
+            // resumes next pass from its walk continuation and decode
+            // cursors instead of restarting, so the allowance bounds
+            // one pass, never whether a provider is ever found. The
+            // cgroup pass window carries the same ceiling; the two
+            // counters charge 1:1, so they must stay equal.
+            work_units: 1 << 20,
             open_fds: 70,
         }
     }

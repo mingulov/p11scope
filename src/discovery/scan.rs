@@ -588,6 +588,7 @@ pub struct InventoryDiscoveryLimits {
 impl InventoryDiscoveryLimits {
     /// The retained-file ceilings, for pass-limit reshaping that keeps
     /// the run's retained maps.
+    #[cfg(test)]
     pub(crate) fn retained(&self) -> InventoryRetainedLimits {
         self.retained
     }

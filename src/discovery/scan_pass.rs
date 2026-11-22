@@ -343,22 +343,6 @@ pub(crate) fn sweep_resume_words(
     (resume, start)
 }
 
-/// Whether `device`/`inode` is the file half of `key` (ordering-only
-/// match: ordering is advisory, use re-validates the full key plus the
-/// pin and fingerprint).
-pub(crate) fn cursor_key_matches_object(
-    key: &DecodeCursorKey,
-    pid: u32,
-    start_time: u64,
-    device: Device,
-    inode: u64,
-) -> bool {
-    key.pid == pid
-        && key.start_time == start_time
-        && key.file.device == device
-        && key.file.inode == inode
-}
-
 /// Subject of the named resume-history capacity refusal.
 pub(crate) const SCAN_RESUME_HISTORY_FULL_SUBJECT: &str = "scan resume history full";
 
@@ -538,17 +522,71 @@ pub(crate) struct ResumeObservation {
     pub(crate) history_refused: u64,
 }
 
-/// The carried decode cursors with their incrementally kept totals and
-/// the resume history: the single owner of cursor-map mutation. Reads go
-/// through `Deref`; every insert and removal goes through the store, so
-/// the `(done, total, tables)` totals and the history never need a pass
-/// over the map.
+/// Live cursors of one process generation plus the aggregates the
+/// per-view queries read: completed objects and cached tables decoded
+/// so far.
+#[derive(Clone, Debug, Default)]
+struct GenerationCursors {
+    keys: BTreeSet<DecodeCursorKey>,
+    done: usize,
+    tables: usize,
+}
+
+/// Cursor keys ordered by creation sequence: oldest-first victim and
+/// ordering sets (the key breaks sequence ties).
+type SeqKeys = BTreeSet<(u64, DecodeCursorKey)>;
+
+/// The carried decode cursors with their incrementally kept totals,
+/// secondary indexes and the resume history: the single owner of
+/// cursor-map mutation. Reads go through `Deref`; every insert and
+/// removal goes through the store, so the `(done, total, tables)`
+/// totals, the per-view aggregates, the ordering indexes and the
+/// history never need a pass over the map. Every index entry is keyed
+/// by the cursor key (plus the sequence where order matters), so each
+/// insert and removal costs `O(log n)` map work.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecodeCursorStore {
     cursors: BTreeMap<DecodeCursorKey, DecodeCursor>,
     done: usize,
     tables: usize,
     history: ResumeHistory,
+    /// Live cursors by process generation: per-view drops are range
+    /// removals and per-view progress reads the aggregates.
+    by_generation: BTreeMap<(u32, u64), GenerationCursors>,
+    /// Live cursors by `(pid, device, inode)`: object drops across
+    /// generations and pins without scanning the map.
+    by_pid_object: BTreeMap<(u32, Device, u64), BTreeSet<DecodeCursorKey>>,
+    /// Unfinished live cursors by pid: per-pass oldest-first ordering
+    /// reads each pid's minimum sequence directly.
+    unfinished_by_pid: BTreeMap<u32, SeqKeys>,
+    /// Unfinished live cursors by `(pid, start_time, device, inode)`:
+    /// per-object oldest sequence without scanning the map.
+    unfinished_by_object: BTreeMap<(u32, u64, Device, u64), SeqKeys>,
+    /// Completed live cursors by sequence: oldest-completed victims.
+    completed_by_seq: SeqKeys,
+    /// Unfinished live cursors in dead generations by sequence: the
+    /// first reclamation victims (dead work can never resume).
+    dead_unfinished: SeqKeys,
+    /// Completed live cursors in dead generations by sequence: the
+    /// second reclamation victims.
+    dead_completed: SeqKeys,
+    /// Live cursors per sequence number: the next sequence is one past
+    /// the installed maximum without scanning the map.
+    seq_counts: BTreeMap<u64, u64>,
+    /// Accounted bytes of completed live cursors: the reclamation
+    /// pre-check prices them without revisiting the map.
+    completed_bytes: u64,
+    /// Unfinished live cursors in dead generations: count and accounted
+    /// bytes for the reclamation pre-check.
+    dead_unfinished_count: usize,
+    dead_unfinished_bytes: u64,
+    /// Cached process-generation liveness for reclamation, probed once
+    /// per pass (a fresh pass starts unprobed: see `begin_pass`).
+    liveness: BTreeMap<(u32, u64), bool>,
+    /// Live generations not yet probed this pass: the pressure census
+    /// drains this set instead of re-scanning every generation per
+    /// record, so repeated pressure records cost `O(1)` once probed.
+    pending_liveness: BTreeSet<(u32, u64)>,
 }
 
 impl std::ops::Deref for DecodeCursorStore {
@@ -557,6 +595,17 @@ impl std::ops::Deref for DecodeCursorStore {
     fn deref(&self) -> &Self::Target {
         &self.cursors
     }
+}
+
+/// First entry of an ordered victim set that is not `key`: victims
+/// never include the key being recorded.
+fn first_victim_except(set: &SeqKeys, key: &DecodeCursorKey) -> Option<DecodeCursorKey> {
+    let mut entries = set.iter();
+    let (_, first) = entries.next()?;
+    if first != key {
+        return Some(first.clone());
+    }
+    entries.next().map(|(_, next)| next.clone())
 }
 
 impl DecodeCursorStore {
@@ -570,25 +619,336 @@ impl DecodeCursorStore {
         self.tables += cursor.cached_tables.len();
     }
 
+    /// Whether `generation` is proven dead: missing entries sort live
+    /// (never evict on missing proof).
+    fn generation_dead(&self, generation: (u32, u64)) -> bool {
+        self.liveness.get(&generation).is_some_and(|live| !live)
+    }
+
+    /// Index one stored cursor. `bytes` is its accounted size.
+    fn index_add(&mut self, key: &DecodeCursorKey, cursor: &DecodeCursor, bytes: u64) {
+        let generation = (key.pid, key.start_time);
+        let generation_cursors = self.by_generation.entry(generation).or_default();
+        generation_cursors.keys.insert(key.clone());
+        generation_cursors.done += usize::from(cursor.complete);
+        generation_cursors.tables += cursor.cached_tables.len();
+        self.by_pid_object
+            .entry((key.pid, key.file.device, key.file.inode))
+            .or_default()
+            .insert(key.clone());
+        self.seq_counts
+            .entry(cursor.seq)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+        let dead = self.generation_dead(generation);
+        if cursor.complete {
+            self.completed_by_seq.insert((cursor.seq, key.clone()));
+            self.completed_bytes += bytes;
+            if dead {
+                self.dead_completed.insert((cursor.seq, key.clone()));
+            }
+        } else {
+            self.unfinished_by_pid
+                .entry(key.pid)
+                .or_default()
+                .insert((cursor.seq, key.clone()));
+            self.unfinished_by_object
+                .entry((key.pid, key.start_time, key.file.device, key.file.inode))
+                .or_default()
+                .insert((cursor.seq, key.clone()));
+            if dead {
+                self.dead_unfinished.insert((cursor.seq, key.clone()));
+                self.dead_unfinished_count += 1;
+                self.dead_unfinished_bytes += bytes;
+            }
+        }
+        if !self.liveness.contains_key(&generation) {
+            self.pending_liveness.insert(generation);
+        }
+    }
+
+    /// Drop one stored cursor from every index.
+    fn index_remove(&mut self, key: &DecodeCursorKey, cursor: &DecodeCursor) {
+        let bytes = decode_cursor_bytes(key, cursor);
+        let generation = (key.pid, key.start_time);
+        if let Some(generation_cursors) = self.by_generation.get_mut(&generation) {
+            generation_cursors.keys.remove(key);
+            generation_cursors.done -= usize::from(cursor.complete);
+            generation_cursors.tables -= cursor.cached_tables.len();
+            if generation_cursors.keys.is_empty() {
+                self.by_generation.remove(&generation);
+                // An empty generation has nothing to probe for; its
+                // cached liveness stays, so a re-added cursor reuses
+                // this pass's probe instead of repeating process I/O.
+                self.pending_liveness.remove(&generation);
+            }
+        }
+        if let Some(keys) = self
+            .by_pid_object
+            .get_mut(&(key.pid, key.file.device, key.file.inode))
+        {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.by_pid_object
+                    .remove(&(key.pid, key.file.device, key.file.inode));
+            }
+        }
+        if let Some(count) = self.seq_counts.get_mut(&cursor.seq) {
+            *count -= 1;
+            if *count == 0 {
+                self.seq_counts.remove(&cursor.seq);
+            }
+        }
+        if cursor.complete {
+            self.completed_by_seq.remove(&(cursor.seq, key.clone()));
+            self.completed_bytes -= bytes;
+            self.dead_completed.remove(&(cursor.seq, key.clone()));
+        } else {
+            if let Some(seqs) = self.unfinished_by_pid.get_mut(&key.pid) {
+                seqs.remove(&(cursor.seq, key.clone()));
+                if seqs.is_empty() {
+                    self.unfinished_by_pid.remove(&key.pid);
+                }
+            }
+            let object = (key.pid, key.start_time, key.file.device, key.file.inode);
+            if let Some(seqs) = self.unfinished_by_object.get_mut(&object) {
+                seqs.remove(&(cursor.seq, key.clone()));
+                if seqs.is_empty() {
+                    self.unfinished_by_object.remove(&object);
+                }
+            }
+            if self.dead_unfinished.remove(&(cursor.seq, key.clone())) {
+                self.dead_unfinished_count -= 1;
+                self.dead_unfinished_bytes -= bytes;
+            }
+        }
+    }
+
     /// Store one recorded cursor and fold its committed progress into
-    /// the resume history.
-    fn insert(&mut self, key: DecodeCursorKey, cursor: DecodeCursor) {
+    /// the resume history. `bytes` is the new cursor's accounted size;
+    /// a replaced cursor's size is re-derived for the aggregates.
+    fn insert(&mut self, key: DecodeCursorKey, cursor: DecodeCursor, bytes: u64) {
         self.history
             .record(&key, &CommittedCursorProgress::of(&cursor));
         self.count_in(&cursor);
-        if let Some(old) = self.cursors.insert(key, cursor) {
+        if let Some(old) = self.cursors.remove(&key) {
             self.count_out(&old);
+            self.index_remove(&key, &old);
         }
+        self.index_add(&key, &cursor, bytes);
+        self.cursors.insert(key, cursor);
     }
 
     fn remove(&mut self, key: &DecodeCursorKey) -> Option<DecodeCursor> {
         let old = self.cursors.remove(key)?;
         self.count_out(&old);
+        self.index_remove(key, &old);
         Some(old)
     }
 
     fn begin_pass(&mut self) {
         self.history.begin_pass();
+        // A fresh pass reprobes every generation: cached liveness never
+        // crosses a pass boundary, and the victim sets rebuild from the
+        // new probes.
+        self.liveness.clear();
+        self.dead_unfinished.clear();
+        self.dead_completed.clear();
+        self.dead_unfinished_count = 0;
+        self.dead_unfinished_bytes = 0;
+        self.pending_liveness = self.by_generation.keys().copied().collect();
+    }
+
+    /// Record one generation's liveness probe: a newly dead generation
+    /// moves its cursors into the victim sets with their aggregates.
+    /// Each generation probes once per pass; a repeated note is a no-op.
+    fn note_generation_liveness(&mut self, generation: (u32, u64), live: bool) {
+        if self.liveness.insert(generation, live).is_some() {
+            return;
+        }
+        if live {
+            return;
+        }
+        let keys: Vec<DecodeCursorKey> = self
+            .by_generation
+            .get(&generation)
+            .map(|generation_cursors| generation_cursors.keys.iter().cloned().collect())
+            .unwrap_or_default();
+        for key in &keys {
+            let Some(cursor) = self.cursors.get(key) else {
+                continue;
+            };
+            if cursor.complete {
+                self.dead_completed.insert((cursor.seq, key.clone()));
+            } else {
+                self.dead_unfinished.insert((cursor.seq, key.clone()));
+                self.dead_unfinished_count += 1;
+                self.dead_unfinished_bytes += decode_cursor_bytes(key, cursor);
+            }
+        }
+    }
+
+    /// Take the next generation the pressure census must probe: pending
+    /// generations in sorted order, except the recorded key's own
+    /// generation while no other stored cursor shares it (a lone key's
+    /// generation is never probed for its own record). Each generation
+    /// leaves the set once, so repeated pressure records cost `O(1)`
+    /// once every generation is probed.
+    fn take_pending_generation(&mut self, key: &DecodeCursorKey) -> Option<(u32, u64)> {
+        let own = (key.pid, key.start_time);
+        let own_shared = self
+            .by_generation
+            .get(&own)
+            .is_some_and(|generation_cursors| {
+                generation_cursors.keys.len() > usize::from(self.cursors.contains_key(key))
+            });
+        let next = self
+            .pending_liveness
+            .iter()
+            .find(|generation| **generation != own || own_shared)
+            .copied()?;
+        self.pending_liveness.remove(&next);
+        Some(next)
+    }
+
+    /// Requeue a generation whose probe was refused (stop or spent
+    /// shared work): the next record retries it.
+    fn requeue_pending_generation(&mut self, generation: (u32, u64)) {
+        if !self.liveness.contains_key(&generation) && self.by_generation.contains_key(&generation)
+        {
+            self.pending_liveness.insert(generation);
+        }
+    }
+
+    /// `(entries, bytes)` the pressure path could reclaim for `key`'s
+    /// record without touching a live unfinished cursor or the key
+    /// itself: dead generations plus completed cursors, priced from
+    /// the aggregates. `old` is the stored cursor `key` replaces, if
+    /// any. `O(log n)`.
+    fn reclaimable_for(&self, key: &DecodeCursorKey, old: Option<&DecodeCursor>) -> (usize, u64) {
+        let mut entries = self.done + self.dead_unfinished_count;
+        let mut bytes = self
+            .completed_bytes
+            .saturating_add(self.dead_unfinished_bytes);
+        if let Some(old) = old
+            && (old.complete || self.generation_dead((key.pid, key.start_time)))
+        {
+            entries -= 1;
+            bytes = bytes.saturating_sub(decode_cursor_bytes(key, old));
+        }
+        (entries, bytes)
+    }
+
+    /// The next reclamation victim for `key`'s record: dead unfinished
+    /// cursors first (oldest), then dead completed, then live
+    /// completed; live unfinished cursors never qualify and the key
+    /// itself is never a victim. Each phase takes the oldest sequence,
+    /// so the order matches a full-map minimum over (live, complete,
+    /// sequence) exactly. `O(log n)`.
+    fn pressure_victim(&self, key: &DecodeCursorKey) -> Option<DecodeCursorKey> {
+        if let Some(victim) = first_victim_except(&self.dead_unfinished, key) {
+            return Some(victim);
+        }
+        if let Some(victim) = first_victim_except(&self.dead_completed, key) {
+            return Some(victim);
+        }
+        first_victim_except(&self.completed_by_seq, key)
+    }
+
+    /// Next decode-cursor sequence number: one past the installed
+    /// maximum, or zero when the store is empty. `O(log n)`.
+    fn seq_next(&self) -> u64 {
+        self.seq_counts
+            .last_key_value()
+            .map_or(0, |(seq, _)| seq.saturating_add(1))
+    }
+
+    /// Every live cursor key for `pid`, in key order: a range over the
+    /// pid's generations. `O(log n + k)`.
+    fn pid_keys(&self, pid: u32) -> Vec<DecodeCursorKey> {
+        self.by_generation
+            .range((pid, u64::MIN)..=(pid, u64::MAX))
+            .flat_map(|(_, generation_cursors)| generation_cursors.keys.iter().cloned())
+            .collect()
+    }
+
+    /// Live cursor keys for `pid`'s generations other than `start_time`,
+    /// in key order. `O(log n + k)`.
+    fn superseded_keys(&self, pid: u32, start_time: u64) -> Vec<DecodeCursorKey> {
+        self.by_generation
+            .range((pid, u64::MIN)..=(pid, u64::MAX))
+            .filter(|(generation, _)| generation.1 != start_time)
+            .flat_map(|(_, generation_cursors)| generation_cursors.keys.iter().cloned())
+            .collect()
+    }
+
+    /// Live cursor keys for `pid`+`start_time` whose object no mapping
+    /// covers anymore, in key order. Scoped to the generation.
+    fn unmapped_keys(
+        &self,
+        pid: u32,
+        start_time: u64,
+        mapped: &BTreeSet<(Device, u64)>,
+    ) -> Vec<DecodeCursorKey> {
+        self.by_generation
+            .get(&(pid, start_time))
+            .map(|generation_cursors| {
+                generation_cursors
+                    .keys
+                    .iter()
+                    .filter(|key| !mapped.contains(&(key.file.device, key.file.inode)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Live cursor keys for `pid`'s object `(device, inode)` across
+    /// generations and pins, in key order. Scoped to the object.
+    fn stale_object_keys(&self, pid: u32, device: Device, inode: u64) -> Vec<DecodeCursorKey> {
+        self.by_pid_object
+            .get(&(pid, device, inode))
+            .map(|keys| keys.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// `(done, total, tables)` for one view's generation, read from
+    /// the generation aggregates. `O(log n)`.
+    fn generation_progress(&self, pid: u32, start_time: u64) -> Option<(usize, usize, usize)> {
+        let generation_cursors = self.by_generation.get(&(pid, start_time))?;
+        Some((
+            generation_cursors.done,
+            generation_cursors.keys.len(),
+            generation_cursors.tables,
+        ))
+    }
+
+    /// Oldest unfinished cursor sequence for one view's object, read
+    /// from the per-object unfinished index. `O(log n)`.
+    fn unfinished_seq_for_object_key(
+        &self,
+        pid: u32,
+        start_time: u64,
+        device: Device,
+        inode: u64,
+    ) -> Option<u64> {
+        self.unfinished_by_object
+            .get(&(pid, start_time, device, inode))
+            .and_then(|seqs| seqs.first().map(|(seq, _)| *seq))
+    }
+
+    /// Oldest unfinished cursor sequence per pid, read from the
+    /// per-pid unfinished index. `O(pids)`.
+    fn unfinished_min_by_pid(&self) -> BTreeMap<u32, u64> {
+        self.unfinished_by_pid
+            .iter()
+            .filter_map(|(pid, seqs)| seqs.first().map(|(seq, _)| (*pid, *seq)))
+            .collect()
+    }
+
+    /// Whether any live cursor is unfinished. `O(1)`.
+    fn has_unfinished(&self) -> bool {
+        !self.unfinished_by_pid.is_empty()
     }
 
     /// `(done, total, tables)` over the store; `None` when no cursor is
@@ -615,7 +975,6 @@ impl DecodeCursorStore {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecodeResume {
     cursors: DecodeCursorStore,
-    liveness: BTreeMap<(u32, u64), bool>,
     /// Process-liveness probes performed for reclamation. Tests only.
     #[cfg(test)]
     probes: u64,
@@ -1056,17 +1415,13 @@ impl ScanPassOwner {
         self.decode.probes
     }
 
-    /// Whether `pid`/`start_time` still names a live process generation,
-    /// cached per distinct generation for this pass: repeated
-    /// reclamation over the same cursor set probes each generation once.
-    /// Each uncached probe charges one collection-work unit and polls
-    /// the pass stop first, so reclamation stays bounded and
-    /// cancellable; `None` refuses the reclamation (and keeps the old
-    /// cursor).
-    fn decode_generation_live_cached(&mut self, pid: u32, start_time: u64) -> Option<bool> {
-        if let Some(&live) = self.decode.liveness.get(&(pid, start_time)) {
-            return Some(live);
-        }
+    /// Probe whether `pid`/`start_time` still names a live process
+    /// generation and record it in the cursor store (a newly dead
+    /// generation joins the victim sets). Each probe charges one
+    /// collection-work unit and polls the pass stop first, so
+    /// reclamation stays bounded and cancellable; `None` refuses the
+    /// reclamation (and keeps the old cursor).
+    fn probe_decode_generation(&mut self, pid: u32, start_time: u64) -> Option<bool> {
         if self.stopped_now().is_some() {
             return None;
         }
@@ -1074,18 +1429,10 @@ impl ScanPassOwner {
             return None;
         }
         let live = self.decode_cursor_pid_live(pid, start_time);
-        self.decode.liveness.insert((pid, start_time), live);
-        Some(live)
-    }
-
-    /// Cached liveness for victim selection: missing entries sort live
-    /// (never evict on missing proof).
-    fn decode_cached_live(&self, pid: u32, start_time: u64) -> bool {
         self.decode
-            .liveness
-            .get(&(pid, start_time))
-            .copied()
-            .unwrap_or(true)
+            .cursors
+            .note_generation_liveness((pid, start_time), live);
+        Some(live)
     }
 
     /// Record (or advance) one object's decode cursor, bounded by the
@@ -1127,55 +1474,33 @@ impl ScanPassOwner {
             *retained = retained
                 .saturating_sub(old_bytes.unwrap_or(0))
                 .saturating_add(bytes);
-            self.decode.cursors.insert(key, cursor);
+            self.decode.cursors.insert(key, cursor, bytes);
             return true;
         }
-        // Pressure: prove admission with one cached liveness probe per
-        // distinct generation (a stop or spent shared work refuses and
-        // keeps the old cursor).
-        let generations: BTreeSet<(u32, u64)> = self
-            .decode
-            .cursors
-            .keys()
-            .filter(|candidate| *candidate != &key)
-            .map(|candidate| (candidate.pid, candidate.start_time))
-            .collect();
-        for (pid, start_time) in generations {
-            if self
-                .decode_generation_live_cached(pid, start_time)
-                .is_none()
-            {
+        // Pressure: prove admission with one liveness probe per
+        // not-yet-probed generation (a stop or spent shared work
+        // refuses and keeps the old cursor). The census drains the
+        // store's pending set, so repeated pressure records probe only
+        // generations that arrived since the last census.
+        while let Some((pid, start_time)) = self.decode.cursors.take_pending_generation(&key) {
+            if self.probe_decode_generation(pid, start_time).is_none() {
+                self.decode
+                    .cursors
+                    .requeue_pending_generation((pid, start_time));
                 return false;
             }
         }
         // Reclaimable without touching a live unfinished cursor or this
-        // key: dead generations plus completed cursors, selected from
-        // the cached probe results without repeating process I/O.
-        let reclaimable: Vec<DecodeCursorKey> = self
-            .decode
-            .cursors
-            .iter()
-            .filter(|(candidate, cursor)| {
-                *candidate != &key
-                    && (cursor.complete
-                        || !self.decode_cached_live(candidate.pid, candidate.start_time))
-            })
-            .map(|(candidate, _)| candidate.clone())
-            .collect();
-        let reclaimable_bytes = reclaimable.iter().fold(0u64, |bytes, candidate| {
-            bytes.saturating_add(
-                self.decode
-                    .cursors
-                    .get(candidate)
-                    .map(|old| decode_cursor_bytes(candidate, old))
-                    .unwrap_or(0),
-            )
-        });
+        // key: dead generations plus completed cursors, priced from
+        // the store's aggregates.
+        let old_cursor = self.decode.cursors.get(&key);
+        let (reclaimable_entries, reclaimable_bytes) =
+            self.decode.cursors.reclaimable_for(&key, old_cursor);
         let entries_after = self
             .decode
             .cursors
             .len()
-            .saturating_sub(reclaimable.len())
+            .saturating_sub(reclaimable_entries)
             .saturating_add(usize::from(old_bytes.is_none()));
         let bytes_after = retained
             .saturating_sub(reclaimable_bytes)
@@ -1195,26 +1520,10 @@ impl ScanPassOwner {
         };
         while !fits(&self.decode.cursors, *retained) {
             // Dead generations first, then oldest completed; live
-            // unfinished cursors never qualify (filtered above). Victim
-            // selection reuses the cached probe results above: no
-            // repeated process I/O per victim search.
-            let victim = self
-                .decode
-                .cursors
-                .iter()
-                .filter(|(candidate, cursor)| {
-                    *candidate != &key
-                        && (cursor.complete
-                            || !self.decode_cached_live(candidate.pid, candidate.start_time))
-                })
-                .min_by_key(|(candidate, cursor)| {
-                    (
-                        self.decode_cached_live(candidate.pid, candidate.start_time),
-                        cursor.complete,
-                        cursor.seq,
-                    )
-                })
-                .map(|(candidate, _)| candidate.clone());
+            // unfinished cursors never qualify. Victim selection reads
+            // the store's ordered victim sets: no repeated process I/O
+            // and no map scan per victim.
+            let victim = self.decode.cursors.pressure_victim(&key);
             let Some(victim) = victim else {
                 return false;
             };
@@ -1225,7 +1534,7 @@ impl ScanPassOwner {
         *retained = retained
             .saturating_sub(old_bytes.unwrap_or(0))
             .saturating_add(bytes);
-        self.decode.cursors.insert(key, cursor);
+        self.decode.cursors.insert(key, cursor, bytes);
         true
     }
 
@@ -1237,28 +1546,20 @@ impl ScanPassOwner {
 
     /// Next decode-cursor sequence number: one past the installed
     /// maximum, monotonic across passes (creation order is the
-    /// oldest-first scan order).
+    /// oldest-first scan order). `O(log n)` through the store's
+    /// sequence index.
     pub(crate) fn decode_cursors_seq_next(&self) -> u64 {
-        self.decode
-            .cursors
-            .values()
-            .map(|cursor| cursor.seq)
-            .max()
-            .map_or(0, |max| max.saturating_add(1))
+        self.decode.cursors.seq_next()
     }
 
     /// Drop every cursor for `pid` whatever generation or object it
     /// names: a proven generation loss or death retires the whole
     /// pid, so the next pass re-scans fresh instead of replaying a
     /// dead generation. `retained` is the budget's shared counter.
+    /// A range removal over the pid's generations: `O(log n + k)`
+    /// for `k` dropped cursors.
     pub(crate) fn drop_decode_cursors_for_pid(&mut self, pid: u32, retained: &mut u64) {
-        let stale: Vec<DecodeCursorKey> = self
-            .decode
-            .cursors
-            .keys()
-            .filter(|key| key.pid == pid)
-            .cloned()
-            .collect();
+        let stale: Vec<DecodeCursorKey> = self.decode.cursors.pid_keys(pid);
         for key in stale {
             if let Some(old) = self.decode.cursors.remove(&key) {
                 *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
@@ -1268,20 +1569,15 @@ impl ScanPassOwner {
 
     /// Drop `pid`'s cursors for older generations: the view's pinned
     /// start time proves the pid was reused, so only the live
-    /// generation's cursors may resume.
+    /// generation's cursors may resume. A range removal over the pid's
+    /// superseded generations.
     pub(crate) fn drop_superseded_decode_cursors(
         &mut self,
         pid: u32,
         start_time: u64,
         retained: &mut u64,
     ) {
-        let stale: Vec<DecodeCursorKey> = self
-            .decode
-            .cursors
-            .keys()
-            .filter(|key| key.pid == pid && key.start_time != start_time)
-            .cloned()
-            .collect();
+        let stale: Vec<DecodeCursorKey> = self.decode.cursors.superseded_keys(pid, start_time);
         for key in stale {
             if let Some(old) = self.decode.cursors.remove(&key) {
                 *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
@@ -1291,7 +1587,8 @@ impl ScanPassOwner {
 
     /// Drop `pid`+`start_time` cursors whose object no mapping covers
     /// anymore: the fresh maps prove it unmapped, so the stale cursor
-    /// must not linger in progress totals or replay later.
+    /// must not linger in progress totals or replay later. Scoped to
+    /// the view's own generation.
     pub(crate) fn drop_unmapped_decode_cursors(
         &mut self,
         pid: u32,
@@ -1299,17 +1596,8 @@ impl ScanPassOwner {
         mapped: &BTreeSet<(Device, u64)>,
         retained: &mut u64,
     ) {
-        let stale: Vec<DecodeCursorKey> = self
-            .decode
-            .cursors
-            .keys()
-            .filter(|key| {
-                key.pid == pid
-                    && key.start_time == start_time
-                    && !mapped.contains(&(key.file.device, key.file.inode))
-            })
-            .cloned()
-            .collect();
+        let stale: Vec<DecodeCursorKey> =
+            self.decode.cursors.unmapped_keys(pid, start_time, mapped);
         for key in stale {
             if let Some(old) = self.decode.cursors.remove(&key) {
                 *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
@@ -1321,7 +1609,8 @@ impl ScanPassOwner {
     /// generation or pin it names: the fresh scan of that object
     /// supersedes them (a reused pid, a rewritten file, a remapped
     /// layout). Only called when the object was actually reached and
-    /// missed, never speculatively.
+    /// missed, never speculatively. Scoped to the object's own index
+    /// entries.
     pub(crate) fn drop_stale_decode_cursors(
         &mut self,
         pid: u32,
@@ -1329,13 +1618,7 @@ impl ScanPassOwner {
         inode: u64,
         retained: &mut u64,
     ) {
-        let stale: Vec<DecodeCursorKey> = self
-            .decode
-            .cursors
-            .keys()
-            .filter(|key| key.pid == pid && key.file.device == device && key.file.inode == inode)
-            .cloned()
-            .collect();
+        let stale: Vec<DecodeCursorKey> = self.decode.cursors.stale_object_keys(pid, device, inode);
         for key in stale {
             if let Some(old) = self.decode.cursors.remove(&key) {
                 *retained = retained.saturating_sub(decode_cursor_bytes(&key, &old));
@@ -1449,25 +1732,14 @@ impl ScanPassOwner {
     /// `(done, total, tables)` for one view's cursors: completed objects,
     /// cursor-known objects, and cached tables decoded so far. `None`
     /// when the view holds no unfinished cursor (no in-progress gap).
+    /// `O(log n)` through the generation aggregates.
     pub(crate) fn view_scan_progress(
         &self,
         pid: u32,
         start_time: Option<u64>,
     ) -> Option<(usize, usize, usize)> {
         let start_time = start_time?;
-        let mut done = 0usize;
-        let mut total = 0usize;
-        let mut tables = 0usize;
-        for (key, cursor) in self.decode.cursors.iter() {
-            if key.pid != pid || key.start_time != start_time {
-                continue;
-            }
-            total += 1;
-            tables += cursor.cached_tables.len();
-            if cursor.complete {
-                done += 1;
-            }
-        }
+        let (done, total, tables) = self.decode.cursors.generation_progress(pid, start_time)?;
         if total > done {
             Some((done, total, tables))
         } else {
@@ -1494,7 +1766,8 @@ impl ScanPassOwner {
 
     /// Oldest unfinished cursor sequence for one view's object
     /// (`device`/`inode` match only — ordering is advisory; use
-    /// re-validates the full key, pin and fingerprint).
+    /// re-validates the full key, pin and fingerprint). `O(log n)`
+    /// through the per-object unfinished index.
     fn unfinished_seq_for_object(
         &self,
         pid: u32,
@@ -1505,12 +1778,7 @@ impl ScanPassOwner {
         let start_time = start_time?;
         self.decode
             .cursors
-            .iter()
-            .filter(|(key, cursor)| {
-                !cursor.complete && cursor_key_matches_object(key, pid, start_time, device, inode)
-            })
-            .map(|(_, cursor)| cursor.seq)
-            .min()
+            .unfinished_seq_for_object_key(pid, start_time, device, inode)
     }
 
     /// Order one view's object groups oldest-unfinished-first (stable):
@@ -1544,23 +1812,13 @@ impl ScanPassOwner {
     /// Order one pass's member pids oldest-unfinished-first (stable):
     /// members holding unfinished cursors scan before new members, so a
     /// busy pass cannot starve them behind selection or cap order.
-    /// Without unfinished cursors this is a no-op.
+    /// Without unfinished cursors this is a no-op. Reads each pid's
+    /// minimum unfinished sequence from the per-pid index.
     pub(crate) fn order_pids_for_resume(&self, pids: &mut Vec<u32>) {
-        if !self.decode.cursors.values().any(|cursor| !cursor.complete) {
+        if !self.decode.cursors.has_unfinished() {
             return;
         }
-        let min_seq: BTreeMap<u32, u64> = self
-            .decode
-            .cursors
-            .iter()
-            .filter(|(_, cursor)| !cursor.complete)
-            .fold(BTreeMap::new(), |mut min_seq, (key, cursor)| {
-                min_seq
-                    .entry(key.pid)
-                    .and_modify(|seq| *seq = (*seq).min(cursor.seq))
-                    .or_insert(cursor.seq);
-                min_seq
-            });
+        let min_seq: BTreeMap<u32, u64> = self.decode.cursors.unfinished_min_by_pid();
         if min_seq.is_empty() {
             return;
         }
@@ -1599,16 +1857,7 @@ impl ScanPassOwner {
         if cap == 0 {
             return;
         }
-        let mut oldest: BTreeMap<u32, u64> = BTreeMap::new();
-        for (key, cursor) in self.decode.cursors.iter() {
-            if cursor.complete {
-                continue;
-            }
-            oldest
-                .entry(key.pid)
-                .and_modify(|seq| *seq = (*seq).min(cursor.seq))
-                .or_insert(cursor.seq);
-        }
+        let oldest: BTreeMap<u32, u64> = self.decode.cursors.unfinished_min_by_pid();
         if oldest.is_empty() {
             return;
         }

@@ -2152,22 +2152,16 @@ pub(crate) mod producer {
         }
         // The row shape follows the same version decision as the
         // snapshot, marker and stream ([`observations_version`]):
-        // v7 keeps the inferred keys on every proved row, whether a
-        // row carries non-blank content or a v7-only gap does, so a
-        // gap-driven v7 section still renders all 15 keys per row.
-        // v9 keeps them the same way (v9 is v7 shapes plus wider
-        // values). Below v7 every row drops its keys (uniform fill
-        // above, frozen 13 below). Model gaps (collected after this)
-        // never trigger v7 or v9, and the at-most-three key-side gaps
-        // sort before them under the 256-cap, so this decision equals
-        // the final one.
-        let v7 = observations.key_operations.iter().any(|row| {
-            row.inferred
-                .as_ref()
-                .is_some_and(|keys| keys.is_v7_content())
-        }) || has_v7_gap_content(observations)
-            || has_relaxed_content(observations);
-        if !v7 {
+        // v7 and above keep the inferred keys on every proved row,
+        // whether a row carries non-blank content, a v7-only gap
+        // does, or unknown-row mechanism content promotes the
+        // section to v10 (the v10 schema requires both keys on
+        // every proved row). Below v7 every row drops its keys
+        // (uniform fill above, frozen 13 below). Model gaps
+        // (collected after this) never trigger a version, and the
+        // at-most-three key-side gaps sort before them under the
+        // 256-cap, so this decision equals the final one.
+        if observations_version(observations) < OBSERVATIONS_VERSION_V7 {
             for row in &mut observations.key_operations {
                 row.inferred = None;
             }

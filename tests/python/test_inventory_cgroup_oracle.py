@@ -34,6 +34,9 @@ REFRESH_RETAINED = ("the final-sample permit was not granted; "
                     "prior owner facts retained")
 REFRESH_MEMBER_LOST = "the final-sample permit was not granted"
 DEADLINE = "cgroup collection deadline reached"
+PREP_INPUT_INTERRUPTED = "cgroup provider input comparison interrupted"
+PREP_SUBJECT = "cgroup provider preparation incomplete"
+DEADLINE_SUBJECT = "cgroup scope transaction incomplete"
 UNBOUND_SUBJECT = "used by an unidentified caller image"
 UNBOUND_FIRST = "no live caller incarnation held the tgid when the row was read"
 UNBOUND_FIRST_EXITED = "the pinned caller exited before its cookie could be queried"
@@ -210,6 +213,53 @@ class AcceptTests(unittest.TestCase):
         rc, out = run_oracle(report, modfs="ext4")
         self.assertEqual(rc, 0, out)
         self.assertIn("unproven=0 gaps=3", out)
+
+    def test_deadline_straddle_with_preparation_interrupted_passes(self):
+        # CI run 44960926490, v7.3.1 leg: twelve passes, two of them
+        # deadline-cancelled; one cancelled pass was interrupted
+        # mid-preparation (input comparison), so the producer refused
+        # it by name alongside the deadline and the retained refresh.
+        # The deadline is the designed run bound and the interrupted
+        # preparation its designed disclosure, so the shape qualifies.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": REFRESH_RETAINED,
+             "subject": "native owner refresh refused",
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=2 gaps=8", out)
+
+    def test_deadline_straddle_with_preparation_interrupted_passes_witness_available(self):
+        # The preparation-interrupted guard is substrate-independent
+        # like the retained-refresh guard: a witness-available report
+        # with the deadline gap and the interrupted preparation
+        # qualifies.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("unproven=0 gaps=5", out)
 
 
 def healthy_report_with_unbound():
@@ -424,6 +474,34 @@ class RefuseTests(unittest.TestCase):
         rc, out = run_oracle(report, modfs="ext4")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("duplicate retained refresh for one caller", out)
+
+    def test_preparation_interrupted_without_deadline_still_fails(self):
+        # The interrupted preparation only comes with a run-deadline
+        # straddle, so the deadline gap must be present in the same
+        # run; the interrupted row alone stays loud (a budget or fence
+        # interruption without a deadline is a different phenomenon).
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("interrupted preparation without a run deadline", out)
+
+    def test_preparation_interrupted_without_deadline_fails_witness_available(self):
+        # The deadline rule is not degraded-only — a lone interrupted
+        # preparation stays loud on a witness-available report.
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("interrupted preparation without a run deadline", out)
 
 
 if __name__ == "__main__":

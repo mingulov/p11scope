@@ -28114,13 +28114,20 @@ exit 0
 
     #[test]
     fn counts_for_a_late_bound_row_rebase_past_the_pre_admission_sight() {
-        // Late binding: the row was recorded before the admission (t0
-        // 40 < 50) with a first-sight count of 2 (pre-admission calls
-        // the edge never attributes). The bind rebases past that
-        // sight, so only post-admission growth stages: refresh to 5
-        // reads 3.
+        // Late binding with an UNPROVEN seed-to-admission window: the row
+        // was recorded before the admission (t0 40 < 50) with a
+        // first-sight count of 2, and a pid reuse is recorded at 45 —
+        // strictly inside the window. The live cookie still binds (the
+        // live path never consults reuse: the held pin proves its own
+        // generation), but the pre-admission subtotal may predate the
+        // current generation, so the bind rebases past the sight and only
+        // post-admission growth stages: refresh to 5 reads 3. The
+        // excluded 2 are a named counted gap on the member, never a
+        // silent rebase. (Clean windows stage whole instead — the twin
+        // below — per the controller ruling on the r1 late-0 legs.)
         let (mut native, caller) = watched_native();
         native.answer(7, 500, 41);
+        native.scene.coordinator.binder.note_pid_reuse(7, 45);
         let mut row = native.row(41, 1, 7, 40, 0);
         row.entry_count = 2;
         native.read(vec![row]);
@@ -28141,6 +28148,232 @@ exit 0
                 pid_exit: false
             }
         );
+        let gaps: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the excluded sight discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(gaps[0].caller, Some(caller));
+        assert!(
+            gaps[0].reason.contains("(0, 2]"),
+            "the gap counts the excluded absolute: {}",
+            gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn counts_for_a_clean_window_late_bound_row_stage_the_full_sight() {
+        // Clean-window twin of the rebase pin above: same late timing
+        // (t0 40 < 50, first-sight count 2) but the seed-to-admission
+        // window is proven clean — a single admitted module with a
+        // committed edge, exec coverage over the row, and no exec, lost
+        // lifecycle evidence, or pid reuse at or after it. The bind
+        // stages the full sight like an on-time first sight: refresh to
+        // 5 reads 5, with no counted-before-tracking gap.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 5);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 40,
+                lossy: false,
+                pid_exit: false
+            }
+        );
+        assert!(
+            registry.gaps().iter().all(
+                |gap| gap.subject != crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+            ),
+            "a clean window discloses no exclusion: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(rebase_gaps(&native), 0);
+    }
+
+    #[test]
+    fn counts_for_a_clean_window_late_setup_row_base_past_the_seed() {
+        // Live-leg shape: the newcomer's seed and every counted call
+        // finished before the scan admitted it (t0 40 < 50, first-sight
+        // count 44, no post-admission growth), but the window is proven
+        // clean and the first recorded entry observed the setup seed —
+        // so the bind bases past exactly the seed, like an on-time
+        // setup-first row: the edge reads 43 with exactly one rebase
+        // disclosure, never a silent 0.
+        let (mut native, caller, setup, _ordinary) = watched_native_with_setup();
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 40, setup);
+        row.entry_count = 44;
+        native.read(vec![row]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 43);
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 40,
+                lossy: false,
+                pid_exit: false
+            }
+        );
+        assert_eq!(
+            rebase_gaps(&native),
+            1,
+            "the rebased seed discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert!(
+            registry.gaps().iter().all(
+                |gap| gap.subject != crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+            ),
+            "a clean window discloses no exclusion: {:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_pid_reuse_before_the_row_keeps_the_clean_late_window() {
+        // Boundary: a reuse recorded at 39 — strictly before the row's
+        // instant (t0 40) — retires an earlier holder the counted calls
+        // cannot belong to, so the window stays proven clean: refresh
+        // to 5 reads 5.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.binder.note_pid_reuse(7, 39);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 5);
+    }
+
+    #[test]
+    fn a_pid_reuse_at_the_row_vetoes_the_clean_late_window() {
+        // Equality boundary: a reuse recorded exactly at the row's
+        // instant (t0 40) orders ambiguously against the first call, so
+        // the window fails closed: refresh to 5 reads 3 with the named
+        // counted gap on the member.
+        let (mut native, caller) = watched_native();
+        native.answer(7, 500, 41);
+        native.scene.coordinator.binder.note_pid_reuse(7, 40);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 3);
+        let gaps: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the excluded sight discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(gaps[0].caller, Some(caller));
+    }
+
+    #[test]
+    fn a_late_bound_row_without_a_committed_edge_stays_rebased_and_disclosed() {
+        // Placement half of the clean-window proof: the window itself is
+        // clean (no exec, loss, or reuse anywhere), but no COMMITTED edge
+        // proves the placement when the row binds — the caller's mapping
+        // stages in the same window as the row (the late-mapped shape)
+        // and commits only after. The bind keeps the late-rebase
+        // exclusion (refresh to 5 reads 3) and the excluded 2 disclose as
+        // the named counted gap on the member; the committed edge places
+        // growth only.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::System);
+        native.scene.project(7, 120);
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.drain();
+        assert_eq!(
+            native.scene.coordinator.registry.edges().count(),
+            0,
+            "no committed edge when the row binds"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 3);
+        let gaps: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the excluded sight discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(gaps[0].caller, Some(caller));
     }
 
     /// The prepared cgroup commit preserves counts for unnamed slots:

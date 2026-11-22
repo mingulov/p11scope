@@ -3363,6 +3363,11 @@ const WITNESS_UNKNOWN_MODULE: &str = "native witness for an unknown module";
 pub(crate) const WITNESS_SHARED_ENDPOINT: &str = "ambiguous shared endpoint";
 pub(crate) const DEMOTED_COUNT_REJECTED: &str = "rejected demoted count";
 pub(crate) const DEMOTED_COUNT_PLACED: &str = "demoted count placed";
+/// A late-bound row's excluded pre-admission subtotal: the seed-to-admission
+/// window was not proven clean, so the bind rebased past the first sight and
+/// only post-admission growth stages. The excluded absolute is counted here,
+/// on the member, never a silent rebase.
+pub(crate) const COUNTED_BEFORE_TRACKING: &str = "counted before tracking";
 
 /// Where every decided native witness row went, each row exactly once
 /// (C4 review M3): `edge` witnessed one caller edge, `module` became one

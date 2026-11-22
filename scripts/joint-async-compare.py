@@ -83,6 +83,19 @@ NEWSITE_LABELS = {"x25519", "x448", "ed25519", "ed448",
                   "generic_256", "generic_384", "generic_other"}
 LABELS_V6 = LABELS_V5 | NEWSITE_LABELS
 OBJECT_LABELS_V6 = OBJECT_LABELS_V5 | NEWSITE_LABELS
+# H9 section v9 (relaxed provider dialects): the three EC labels for
+# the secp256k1/brainpool curves. Key rows accept the v6 labels plus
+# all three; object views accept the v6 object labels plus the three
+# (`unknown` stays row-level only). v10 carries the v9 shapes plus
+# unknown-row mechanism content.
+RELAXED_LABELS = {"ec_secp256k1", "ec_brainpoolp256r1",
+                  "ec_brainpoolp384r1"}
+LABELS_V9 = LABELS_V6 | RELAXED_LABELS
+OBJECT_LABELS_V9 = OBJECT_LABELS_V6 | RELAXED_LABELS
+# H9 section v10 (bounded unknown-row mechanism ids): at most eight
+# first-seen ids with per-id terminal counts, plus the overflow
+# count when nonzero.
+UNKNOWN_MECHS_PER_ROW = 8
 # H9 section v7 (keymeta inferred family/size): every proved row
 # carries both inferred keys (blank states render unknown); v1–v6
 # rows keep the frozen keys. Per-kind closed vocabularies (§10.2).
@@ -120,7 +133,9 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6, 7)
+# 8 is the Task 7 provider section under the shared allocator,
+# never an object-observations snapshot or row: it stays refused.
+SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5, 6, 7, 9, 10)
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -711,9 +726,16 @@ def _check_key_row(row, where, roles=ROLES, labels=LABELS, version=1):
             row["metadata_at_use"])
 
 
-def _check_unknown_row(row, where):
+def _check_unknown_row(row, where, version=1):
     _require(type(row) is dict, f"{where}: unknown row must be an object")
-    _keys(row, {"category", "reason", "unit"} | set(UNKNOWN_COUNTERS))
+    base = {"category", "reason", "unit"} | set(UNKNOWN_COUNTERS)
+    if version >= 10:
+        allowed = base | {"mechanisms", "further_mechanism_terminals"}
+        _require(set(row) >= base | {"mechanisms"}
+                 and set(row) <= allowed,
+                 f"{where}: unexpected fields")
+    else:
+        _keys(row, base)
     _require(row["category"] in CATEGORIES,
              f"{where}: unknown row category invalid")
     _require(row["reason"] in UNKNOWN_REASONS,
@@ -725,6 +747,25 @@ def _check_unknown_row(row, where):
              f"{where}: unknown row unit {_shown(row['unit'])} disagrees with"
              f" category {row['category']}")
     _check_counters(row, UNKNOWN_COUNTERS, where)
+    if version >= 10:
+        mechs = row["mechanisms"]
+        _require(type(mechs) is list
+                 and len(mechs) <= UNKNOWN_MECHS_PER_ROW,
+                 f"{where}: unknown row mechanisms invalid")
+        seen = set()
+        for entry in mechs:
+            _require(type(entry) is dict
+                     and set(entry) == {"id", "count"}
+                     and _integer(entry["id"])
+                     and _integer(entry["count"]),
+                     f"{where}: unknown row mechanism entry invalid")
+            _require(entry["id"] not in seen,
+                     f"{where}: duplicate unknown row mechanism id")
+            seen.add(entry["id"])
+        if "further_mechanism_terminals" in row:
+            _require(_integer(row["further_mechanism_terminals"])
+                     and row["further_mechanism_terminals"] > 0,
+                     f"{where}: further count renders only when nonzero")
     return (row["category"], row["reason"])
 
 
@@ -756,6 +797,8 @@ def _snapshot_labels(document, tag):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              f"{tag}: snapshot version mismatch")
+    if version >= 9:
+        return LABELS_V9
     if version >= 6:
         return LABELS_V6
     if version >= 5:
@@ -768,6 +811,8 @@ def _snapshot_object_labels(document, tag):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              f"{tag}: snapshot version mismatch")
+    if version >= 9:
+        return OBJECT_LABELS_V9
     if version >= 6:
         return OBJECT_LABELS_V6
     return OBJECT_LABELS_V5 if version >= 5 else LABELS
@@ -811,11 +856,11 @@ def _check_unattributed(document, tag):
     """Validate not-attributed counters: present iff version >= 3.
 
     Version 3 requires a nonempty list (it is emitted iff a count
-    exists); versions 4, 5, 6 and 7 always carry the key and it may be
-    empty.
+    exists); versions 4, 5, 6, 7, 9 and 10 always carry the key and
+    it may be empty.
     """
     version = document["version"]
-    if version not in (3, 4, 5, 6, 7):
+    if version not in (3, 4, 5, 6, 7, 9, 10):
         _require("unattributed" not in document,
                  f"{tag}: unattributed counters before section version 3")
         return
@@ -843,7 +888,8 @@ def validate_snapshot(document, tag):
     keys = {"version", "revision", "status", "reason", "sessions",
             "objects", "key_operations", "unknown_key_operations",
             "gaps", "budgets"}
-    if type(document) is dict and document.get("version") in (3, 4, 5, 6, 7):
+    if type(document) is dict and document.get("version") in (3, 4, 5, 6, 7,
+                                                              9, 10):
         keys |= {"unattributed"}
     _keys(document, keys)
     _check_unattributed(document, tag)
@@ -889,9 +935,15 @@ def validate_snapshot(document, tag):
     _check_sorted_unique(known_keys, f"{tag} snapshot key rows")
     _require(type(document["unknown_key_operations"]) is list,
              f"{tag}: snapshot unknown_key_operations must be a list")
-    unknown_keys = [_check_unknown_row(row, f"{tag} snapshot unknown row {position}")
+    unknown_keys = [_check_unknown_row(row, f"{tag} snapshot unknown row {position}",
+                                       version)
                     for position, row in enumerate(document["unknown_key_operations"])]
     _check_sorted_unique(unknown_keys, f"{tag} snapshot unknown rows")
+    if version >= 10:
+        _require(any(row.get("mechanisms")
+                     or row.get("further_mechanism_terminals", 0) > 0
+                     for row in document["unknown_key_operations"]),
+                 f"{tag}: v10 section without unknown-row mechanism content")
     gaps = document["gaps"]
     _require(type(gaps) is dict, f"{tag}: snapshot gaps must be an object")
     _keys(gaps, {"rows", "suppressed"})
@@ -1098,7 +1150,8 @@ def compare_joint(collision, snapshot):
                               labels, version)] = row
     unknown = {}
     for row in snapshot["unknown_key_operations"]:
-        unknown[_check_unknown_row(row, "joint snapshot unknown row")] = row
+        unknown[_check_unknown_row(row, "joint snapshot unknown row",
+                                    version)] = row
     objects = {row["object"] for row in snapshot["objects"]}
     claimed_known, claimed_unknown = set(), set()
     _require(owner_key in known,
@@ -1299,7 +1352,9 @@ def compare_stream(events, collision, snapshot, view):
         if kind == "object_observed":
             version = _row_event_version(event, where, {"revision", "row"})
             _, creations = _row_vocabularies(version)
-            if version >= 6:
+            if version >= 9:
+                obj_labels = OBJECT_LABELS_V9
+            elif version >= 6:
                 obj_labels = OBJECT_LABELS_V6
             else:
                 obj_labels = OBJECT_LABELS_V5 if version >= 5 else LABELS
@@ -1312,7 +1367,9 @@ def compare_stream(events, collision, snapshot, view):
             version = _row_event_version(event, where,
                                          {"revision", "bucket", "row"})
             roles, _ = _row_vocabularies(version)
-            if version >= 6:
+            if version >= 9:
+                labels = LABELS_V9
+            elif version >= 6:
                 labels = LABELS_V6
             elif version >= 5:
                 labels = LABELS_V5
@@ -1325,7 +1382,8 @@ def compare_stream(events, collision, snapshot, view):
                 key = ("known", _check_key_row(event["row"], where, roles,
                                                 labels, version))
             else:
-                key = ("unknown", _check_unknown_row(event["row"], where))
+                key = ("unknown", _check_unknown_row(event["row"], where,
+                                                      version))
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "pass_committed":

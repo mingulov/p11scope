@@ -677,3 +677,79 @@ fn resume_matrix_split_matches_roomy_and_discards_on_identity_change() {
     }
     assert_eq!(failures, 0, "{report}");
 }
+
+/// A fixture whose view uses the pidfd pin, or the `/proc` start-time
+/// fallback pin when `fallback` is set.
+fn bracket_fixture_on_pin(fallback: bool) -> BracketFixture {
+    let mut fixture = BracketFixture::new(8, true);
+    if fallback {
+        fixture.view = crate::process::start_time_pinned_process_view_for_test(
+            ProcessViewId(71),
+            std::process::id(),
+        )
+        .unwrap();
+    }
+    fixture
+}
+
+/// Generation probes the closing bracket issued after `final_generation`
+/// returned in the last fixture run.
+fn closing_probes_since_final_generation() -> u64 {
+    let mark = FINAL_GENERATION_PROBES
+        .with(std::cell::Cell::take)
+        .expect("the run reached the closing bracket");
+    crate::process::generation_probe_test::count() - mark
+}
+
+/// A budget-stopped closing bracket buys at most one generation probe,
+/// on both pin types: the work-starved bracket (C2: the work ceiling
+/// dies exactly at the bracket) proves its live pin once for staging and
+/// retirement together, and still stages its frontier; the deadline-
+/// starved keep arm probes at most once.
+#[test]
+fn stopped_closing_bracket_probes_its_generation_at_most_once() {
+    for fallback in [false, true] {
+        let mut probe = bracket_fixture_on_pin(fallback);
+        let (outcome, _) = armed_scan_pass(&mut probe, ROOMY_LIMITS, RetainedFileFacts::default());
+        outcome.expect("calibration");
+        let (_, swept_work) = probe.before_b.expect("calibration reaches maps B");
+        let mut fixture = bracket_fixture_on_pin(fallback);
+        let mut budget = CaptureWorkBudget::new(ROOMY_LIMITS)
+            .with_retained_file_facts(RetainedFileFacts::default());
+        budget.set_work_ceiling_for_test(swept_work);
+        FINAL_GENERATION_PROBES.with(|mark| mark.set(None));
+        let first = fixture.run(&mut budget).expect("pass 1");
+        assert!(
+            first.modules().is_empty(),
+            "the work-starved bracket clears"
+        );
+        assert_eq!(
+            closing_probes_since_final_generation(),
+            1,
+            "fallback {fallback}: one closing probe decides staging and retirement"
+        );
+        let carried = budget.take_retained_file_facts();
+        assert_eq!(
+            carried.decode_cursors_for_test().len(),
+            1,
+            "fallback {fallback}: the admitted probe still stages the frontier"
+        );
+
+        let mut keep = bracket_fixture_on_pin(fallback);
+        keep.expire_at_b = true;
+        let mut budget = CaptureWorkBudget::new(ROOMY_LIMITS)
+            .with_retained_file_facts(RetainedFileFacts::default());
+        budget.set_deadline(Some(u64::MAX));
+        FINAL_GENERATION_PROBES.with(|mark| mark.set(None));
+        let kept = keep.run(&mut budget).expect("deadline pass");
+        assert_eq!(
+            kept.modules().len(),
+            1,
+            "the deadline-starved bracket keeps"
+        );
+        assert!(
+            closing_probes_since_final_generation() <= 1,
+            "fallback {fallback}: the keep arm probes at most once"
+        );
+    }
+}

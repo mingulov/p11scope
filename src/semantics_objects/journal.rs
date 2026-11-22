@@ -2223,6 +2223,11 @@ pub(crate) struct JournalAdapter {
     /// scanned while attributing staged calls.
     #[cfg(test)]
     test_seal_census_visits: usize,
+    /// Test-only drain order-proof visits: open entries scanned while
+    /// proving lifecycle windows. Interior mutability so the shared
+    /// `&self` predicate counts without a signature change.
+    #[cfg(test)]
+    test_drain_proof_visits: std::cell::Cell<usize>,
     /// Test-only phase trace: `None` (off) by default; `Some` records
     /// one sample per claim while enabled.
     #[cfg(test)]
@@ -2348,6 +2353,8 @@ impl JournalAdapter {
             test_prune_runs: 0,
             #[cfg(test)]
             test_seal_census_visits: 0,
+            #[cfg(test)]
+            test_drain_proof_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             test_phase_trace: None,
             #[cfg(test)]
@@ -9459,6 +9466,11 @@ impl JournalAdapter {
             return false;
         }
         !self.open.values().any(|sibling| {
+            #[cfg(test)]
+            {
+                self.test_drain_proof_visits
+                    .set(self.test_drain_proof_visits.get() + 1);
+            }
             if !(self.converts_here(key, live, sibling) || sibling.converted_for == Some(key)) {
                 return false;
             }
@@ -22713,6 +22725,289 @@ pub(crate) mod tests {
             )),
             "no outcome is lost: {:?}",
             success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_held_lifecycle_drain_survives_adapter_prune() {
+        // Held lifecycle drain: an opener completes via its drained
+        // return while a holder keeps the settlement watermark below
+        // its cut. The converted opener must remain staged while the
+        // holder pins the watermark; pruning must follow the model
+        // need (single owner), never drop a recovered call whose
+        // deferred End still needs its original.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let open = function_id("C_OpenSession");
+        scene.attest_function("C_Sign");
+        let proof = scene.attest_function("C_OpenSession");
+        let holder = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&holder), JournalDisposition::BeginAdmitted);
+        let begin = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let first = scene.seal(&bootstrap).expect("first seal passes");
+        assert_eq!(first.prefix.settled().len(), 2);
+        let drained = *first
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 2)
+            .expect("the drained call settles in its conversion seal");
+        assert!(
+            !drained.abandoned,
+            "the drained call completes, never abandons"
+        );
+        assert_eq!(
+            drained.end_cut,
+            Some(4),
+            "the completion cut is the abandonment ordinal"
+        );
+        assert!(
+            scene.adapter.open.contains_key(&(1, 2)),
+            "converted opener must remain staged while the holder pins the watermark"
+        );
+        assert!(
+            scene.adapter.open.contains_key(&(1, 1)),
+            "the holder stays staged"
+        );
+    }
+
+    #[test]
+    fn object_journal_drained_open_respects_close_entry_snapshot() {
+        // A close whose BEGIN sits between the opener's observed return
+        // and its abandonment snapshots the acting session at entry.
+        // Moving the opener past that snapshot leaves the session live
+        // (StaleOrigin). The order proof must refuse the move and keep
+        // the counted loss.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close = function_id("C_CloseSession");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let closer = begin_bytes(1, 2, close, 0);
+        assert_eq!(scene.ingest(&closer), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&closer, 0, ENTRY_NS + 80)),
+            JournalDisposition::EndStaged
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("unproven order keeps the loss, never completes");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        assert!(
+            !failure
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "no session opens out of order: {:?}",
+            failure.effects.effects
+        );
+        assert!(
+            scene.model.project().sessions.is_empty(),
+            "no session survives the refused drain"
+        );
+    }
+
+    #[test]
+    fn object_journal_healthy_open_close_entry_snapshot_closes_session() {
+        // Healthy control for the close-entry-snapshot twin: with a real
+        // OpenSession END at cut 2 (instead of a return observed at 2
+        // and certified at 4), the session opens before the closer's
+        // BEGIN and the ordinary lifecycle closes it.
+        use crate::semantics_objects::SessionState;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close = function_id("C_CloseSession");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 60)),
+            JournalDisposition::EndStaged
+        );
+        let closer = begin_bytes(1, 2, close, 0);
+        assert_eq!(scene.ingest(&closer), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&closer, 0, ENTRY_NS + 80)),
+            JournalDisposition::EndStaged
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("healthy lifecycle seals");
+        assert!(
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "the healthy open mints its session: {:?}",
+            success.effects.effects
+        );
+        let sessions = scene.model.project().sessions;
+        assert!(
+            sessions.iter().all(|view| view.state != SessionState::Live),
+            "the ordinary lifecycle leaves nothing live: {:?}",
+            sessions.iter().map(|view| view.state).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn object_journal_drained_device_error_keeps_later_opener_live() {
+        // A neutral drain carrying device-error authority must not retire
+        // a session opened after its true return. The opener's BEGIN/END
+        // sit between the Sign's observed return and its abandonment, so
+        // the drain keeps the counted loss and the later session stays live.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let open = function_id("C_OpenSession");
+        scene.attest_function("C_Sign");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let mut ordinary = ordinary_for(&begin, 0);
+        ordinary.rv = pkcs11_types::CkRv::DEVICE_REMOVED.0;
+        assert_eq!(
+            scene.ingest_ordinary(ordinary),
+            JournalDisposition::ReturnObserved
+        );
+        let opener = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&opener), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&opener, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("refused drain seals");
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::SessionEnded { .. }
+                    | ObjectEffect::Gap {
+                        reason: super::ObjectGap::DeviceLoss,
+                        ..
+                    }
+            )),
+            "the earlier device error must not end the later session: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            scene
+                .model
+                .project()
+                .sessions
+                .iter()
+                .any(|view| view.state == crate::semantics_objects::SessionState::Live),
+            "the later opener stays live"
+        );
+    }
+
+    #[test]
+    fn object_journal_healthy_sign_opener_keeps_session_live() {
+        // Healthy control for the device-error twin: a clean Sign END
+        // plus the same opener leaves the opened session live with no
+        // device loss.
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let open = function_id("C_OpenSession");
+        scene.attest_function("C_Sign");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 60)),
+            JournalDisposition::EndStaged
+        );
+        let opener = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&opener), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&opener, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("healthy seals");
+        assert!(
+            scene
+                .model
+                .project()
+                .sessions
+                .iter()
+                .any(|view| view.state == crate::semantics_objects::SessionState::Live),
+            "the opener stays live: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_drain_order_proof_visits_are_bounded() {
+        // Many empty-window lifecycle drains must not scan the whole open
+        // table per candidate. Each proof visits at most one slice of rows;
+        // the fixed test stages 70 drains over 70 opens (140 rows counting
+        // holders) and requires the total proof visits to stay linear.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        const DRAINS: u64 = 70;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        scene.attest_function_n("C_OpenSession", DRAINS as usize);
+        let proof = scene.attest_function("C_OpenSession");
+        for sequence in 1..=DRAINS {
+            let begin = begin_bytes(1, sequence, open, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            let abandon = abandon_bytes(
+                1,
+                sequence,
+                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                (COOKIE, EXEC),
+            );
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        }
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.adapter.test_drain_proof_visits.set(0);
+        let _ = scene.seal(&bootstrap);
+        let visits = scene.adapter.test_drain_proof_visits.get();
+        assert!(
+            visits <= 64 * 5,
+            "70 empty-window proofs must stay bounded, visited {visits}"
         );
     }
 

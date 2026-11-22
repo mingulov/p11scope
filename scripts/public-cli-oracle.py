@@ -93,6 +93,14 @@ EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited m
 COVERAGE_RETIRED_SKIP = {"name": "counting coverage",
                          "reason": "counting probes were retired mid-capture; "
                                    "calls in the retire window were not observed"}
+# Learned first-use fixed row (v0.8.0): a provider file the fanotify
+# drain staged after its first use. The staged-file count rides in
+# evidence.learned_staged_files, the loss in
+# evidence.learned_event_loss, the cap excess in
+# evidence.learned_cap_skipped, never in the reason.
+LEARNED_FIRST_USE_SKIP = {"name": "learned provider file",
+                          "reason": "a provider file was learned after its first use; "
+                                    "its earlier calls were not observed"}
 # Ambient-burst lane: the harness census schema consumed by the burst arm.
 CENSUS_SCHEMA = "p11scope/system-cell-census/v1"
 # PF_KTHREAD, from linux/sched.h: census exits carrying it are kernel
@@ -813,6 +821,33 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and evidence.get("pid_descendant_gaps", 0) == 0
         and _strategies.get("unavailable") == 1
         and _loader.get("hits") == 0)
+    # Learned first-use lane 2026-11-22 (fix3, Codex B2): a
+    # file-changed learned pin that the retry stages files the one
+    # fixed first-use row for its uncovered provider, with the
+    # staged count in evidence.learned_staged_files. The honest
+    # disclosure qualifies strict and relaxed alike on the
+    # system-scope count cells with exact owned counts (checked
+    # below), zero loss (checked above) and runner noise: exactly
+    # one first-use skip, exactly one staged file, zero learning
+    # loss and cap excess, nonzero descendant gaps, no other class.
+    # The folded prearm refusal (zero stagings) is a real loss and
+    # still fails; two stagings, two rows, any loss, or any further
+    # cause still fails. A quiet (zero-gap) first-use stays a new
+    # shape until observed.
+    ok_learned_first_use = (
+        cell in ("system", "mt-system")
+        and observation.get("status") == "lossy"
+        and observation.get("causes") == ["skipped", "pid_descendant_gaps"]
+        and skip_entries == [LEARNED_FIRST_USE_SKIP]
+        and evidence.get("modules_skipped") == []
+        and type(evidence.get("pid_descendant_gaps", 0)) is int
+        and evidence.get("pid_descendant_gaps", 0) >= 1
+        and type(evidence.get("learned_staged_files", 0)) is int
+        and evidence.get("learned_staged_files", 0) == 1
+        and type(evidence.get("learned_event_loss", 0)) is int
+        and evidence.get("learned_event_loss", 0) == 0
+        and type(evidence.get("learned_cap_skipped", 0)) is int
+        and evidence.get("learned_cap_skipped", 0) == 0)
     # Coverage-retired lane 2026-11-20 (controller ruling, 6g round 2):
     # mt-system's parent plus 4 forked children exit mid-capture; the
     # engine retires the provider's counting slots exactly when its
@@ -931,7 +966,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
                     (isinstance(skip, dict) and skip.get("reason") == "null pointer")
                     for skip in evidence.get("skipped", [])))
         require(ok_exact or ok_noise or ok_skip_family or ok_ambient or ok_quiet
-                or ok_loader_quiet or ok_coverage_retired
+                or ok_loader_quiet or ok_learned_first_use or ok_coverage_retired
                 or ok_coverage_retired_noise or ok_coverage_retired_quiet,
                 "lossy or unknown observation gap class")
     elif gap66:
@@ -946,7 +981,8 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         if burst_note is not None:
             gap_detail += "; " + burst_note
         require(ok_exact or ok_ambient or ok_quiet or ok_lone_gap
-                or ok_loader_quiet or ok_coverage_retired or ok_coverage_retired_quiet,
+                or ok_loader_quiet or ok_learned_first_use
+                or ok_coverage_retired or ok_coverage_retired_quiet,
                 gap_detail)
     else:
         require(ok_exact, "lossy or unknown observation gap class")
@@ -961,13 +997,14 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         report)
     terminal(evidence, profile=mode == "profile")
     # Past the gap gate above, an accepted ambient shape is exactly
-    # ok_ambient, ok_quiet, ok_lone_gap or ok_loader_quiet (the pure
-    # coverage-retired shapes qualify plain below): any other cause
-    # set failed already, so the flags (not re-spelled causes) decide
-    # the qualification. Metrics evidence carries no gaps keys, which
-    # read as zero below; profile-cgroup/run cells carry them and must
-    # read 0.
-    ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet))
+    # ok_ambient, ok_quiet, ok_lone_gap, ok_loader_quiet or
+    # ok_learned_first_use (the pure coverage-retired shapes qualify
+    # plain below): any other cause set failed already, so the flags
+    # (not re-spelled causes) decide the qualification. Metrics
+    # evidence carries no gaps keys, which read as zero below;
+    # profile-cgroup/run cells carry them and must read 0.
+    ambient = (not relaxed and (ok_ambient or ok_quiet or ok_lone_gap or ok_loader_quiet
+                               or ok_learned_first_use))
     if (relaxed or ambient) and evidence.get("pid_descendant_gaps", 0) > 0:
         # The pre-terminal observation pin plus terminal consistency already
         # prove the single observation class: any nonzero multi_rebuild_gaps

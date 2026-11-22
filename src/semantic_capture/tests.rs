@@ -7922,8 +7922,9 @@ fn held_requeue_skips_retired_rebound_exec_and_admits_live() {
     io.pin = pin_c.clone();
     let admitted = capture.tick_with(&mut io).unwrap();
     assert!(
-        admitted.calls().any(|call| call.image().task_cookie == 3
-            && matches!(call.route(), Route::Joined(_))),
+        admitted
+            .calls()
+            .any(|call| call.image().task_cookie == 3 && matches!(call.route(), Route::Joined(_))),
         "the live held key joins"
     );
     assert_eq!(

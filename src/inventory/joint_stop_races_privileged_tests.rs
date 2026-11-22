@@ -1756,6 +1756,13 @@ fn run_stop_case(
         },
         outcome.finish,
     );
+    check_stop_outcome(&outcome, offset_ms)
+}
+
+/// Full assert set for one stop case, over its collected outcome: the
+/// at-Q publication (or disclosed shed), the latch double-naming, the
+/// abandon accounting and the Published-then-WoundDown terminal.
+fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     // (b) The at-Q tick publishes the stashed calls: A's resolved
     // calls reach its edge, or the equation discloses shed loudly.
     if outcome.api_a == outcome.a_semantic {
@@ -1885,4 +1892,74 @@ fn joint_lane_requests_the_linked_journal_session() {
         last, "Some(&journal)",
         "the lane requests the linked session: {body}"
     );
+}
+
+/// Healthy stop outcome for the oracle twins: Published then WoundDown,
+/// A's calls published, the two-owner equation reconciled.
+fn healthy_stop_outcome() -> StopOutcome {
+    StopOutcome {
+        offset_ms: 5,
+        begin: "polling".to_string(),
+        finish_polls: 3,
+        finish: "published".to_string(),
+        first_error: None,
+        latched: false,
+        latch_code: None,
+        h0_stop: "committed".to_string(),
+        wound: "joined".to_string(),
+        wound_polls: 1,
+        taken: true,
+        minted: true,
+        stash_floor: None,
+        stop_counts: (2, 0, 0, 0),
+        api_a: 2,
+        a_semantic: 2,
+        lane_shed: 0,
+        reconciled: true,
+        reconcile_detail: "reconciled".to_string(),
+        abandon_gap: None,
+        branch: "linked".to_string(),
+    }
+}
+
+#[test]
+fn stop_outcome_accepts_the_healthy_published_case() {
+    let outcome = healthy_stop_outcome();
+    check_stop_outcome(&outcome, outcome.offset_ms)
+        .expect("the healthy Published/WoundDown case passes");
+}
+
+#[test]
+fn stop_outcome_refuses_a_b_side_silent_loss() {
+    let mut outcome = healthy_stop_outcome();
+    // B loses one call with no matching named gap: the equation names
+    // the shortfall, while A and the stop state stay healthy.
+    outcome.reconciled = false;
+    outcome.reconcile_detail = "wp7-stop0-stop: every entered call is attributed, slot-refused, \
+         instance-refused or disclosed-shed: entered 2 vs api 1 + shed 0 + \
+         slot 0 + inst 0"
+        .to_string();
+    let error = check_stop_outcome(&outcome, outcome.offset_ms)
+        .expect_err("a B-side silent loss must fail the case");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("reconciliation"),
+        "the failure names reconciliation: {text}"
+    );
+    assert!(
+        text.contains("entered 2 vs api 1"),
+        "the failure carries the equation diagnostic: {text}"
+    );
+}
+
+#[test]
+fn stop_outcome_accepts_a_counted_and_disclosed_shed() {
+    let mut outcome = healthy_stop_outcome();
+    // One call shed in the named caller-less gap: the equation holds
+    // and the shed is disclosed, so the case still passes.
+    outcome.api_a = 1;
+    outcome.lane_shed = 1;
+    outcome.reconciled = true;
+    outcome.reconcile_detail = "reconciled".to_string();
+    check_stop_outcome(&outcome, outcome.offset_ms).expect("a counted and disclosed shed passes");
 }

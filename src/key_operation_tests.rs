@@ -32865,21 +32865,23 @@ fn key_operation_schema_v9_pins_same_thread_nested_reason() {
         6,
         "v1 keeps the six ordinary unknown reasons"
     );
-    // The gap vocabulary gains the precise internal gap and
-    // nothing else.
+    // The gap vocabulary gains the two v9-only gaps (the nested
+    // gap and the refused mechanism-detail gap) and nothing else.
     let mut v7_gaps = values(&v7, "/$defs/gap_reason/enum");
     v7_gaps.push("same_thread_nested".to_string());
+    v7_gaps.push("unknown_mechanism_rows_refused".to_string());
     v7_gaps.sort();
     assert_eq!(
         values(&v9, "/$defs/gap_reason/enum"),
         v7_gaps,
-        "v9 gaps are v7 gaps plus the internal gap"
+        "v9 gaps are v7 gaps plus the two v9-only gaps"
     );
-    // Every other vocabulary and required-key list is v7-identical.
+    // Every other vocabulary and required-key list is v7-identical,
+    // except the unknown-row keys (v9 adds `mechanisms`, pinned by
+    // the unknown-mechanism schema test).
     for pointer in [
         "/required",
         "/$defs/key_row/required",
-        "/$defs/unknown_row/required",
         "/$defs/object_row/required",
         "/$defs/session_row/required",
         "/$defs/gap_row/required",
@@ -35203,8 +35205,14 @@ fn key_operation_schema_v9_pins_unknown_mechanism_keys() {
         .filter(|reason| !v7_gaps.contains(reason))
         .cloned()
         .collect();
-    assert_eq!(added, vec!["unknown_mechanism_rows_refused".to_string()]);
-    assert_eq!(v9_gaps.len(), v7_gaps.len() + 1);
+    assert_eq!(
+        added,
+        vec![
+            "same_thread_nested".to_string(),
+            "unknown_mechanism_rows_refused".to_string()
+        ]
+    );
+    assert_eq!(v9_gaps.len(), v7_gaps.len() + 2);
 }
 
 /// Repeat AES-KW wraps of one proved view count distinct wrapped

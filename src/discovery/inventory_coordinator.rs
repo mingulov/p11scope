@@ -9545,7 +9545,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
                 ..
             }) => (*base, *staged, *staged_ns, *base_since),
-            Some(PairTarget::Dropped { .. }) if retry_rule => (0, 0, 0, held_first),
+            Some(PairTarget::Dropped { .. }) if retry_rule => {
+                // The re-observed absolute stages like an on-time
+                // first sight: past the setup seed when the row's
+                // first recorded entry observed it, whole otherwise —
+                // uniform with binds that never dropped.
+                if self.seeded_first_sight(row, caller) {
+                    (1, 1, held_first, held_first)
+                } else {
+                    (0, 0, 0, held_first)
+                }
+            }
             Some(
                 PairTarget::Dropped { base, base_since }
                 | PairTarget::Suspended {
@@ -9580,7 +9590,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     // tombstone under a retry mark is unreachable — but the
                     // same fresh-absolute rule covers it (the tombstone
                     // consume below keeps the class aggregate exact).
-                    (0, 0, 0, held_first)
+                    if self.seeded_first_sight(row, caller) {
+                        (1, 1, held_first, held_first)
+                    } else {
+                        (0, 0, 0, held_first)
+                    }
                 } else {
                     self.pair_dropped_tombstones
                         .get(&key)

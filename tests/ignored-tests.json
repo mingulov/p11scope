@@ -2,7 +2,7 @@
   "schema": "p11scope/ignored-tests/v1",
   "cells": {
     "privileged": "ignored lib test curated in scripts/run-privileged-lib-tests.sh (default, long, btrfs, overlay, expected-failure, skip or alternative list)",
-    "live-kernel": "ignored integration test needing a real kernel/verifier lane",
+    "live-kernel": "ignored test needing a real kernel/verifier lane",
     "feature": "ignored test needing a cargo feature or a dedicated build configuration; `owner` names the lane that runs it",
     "performance": "ignored timing loop with no pass/fail bar, run by hand",
     "helper": "ignored private helper re-executed by its owning test; never a standalone cell"
@@ -2120,7 +2120,7 @@
     {
       "file": "src/inventory/joint_stop_races_privileged_tests.rs",
       "path": "inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64",
-      "reason": "privileged: 12-case linked Joint stop coverage over a linked journal session (3 preps x 4 offsets; weekly long campaign; S3 suite row via scripts/ci/stop-races.sh); last-waiter disposition: live last waiter before stop unreachable: collected ticks resolve waiters same tick (1,390 slice samples, 0 waiters: 352 healthy runs + 1,038 micro-slice probe); invariant carried by machine twins joint_machine_finish_after_pass_refresh_resolution_publishes_linked, joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked, joint_machine_finish_at_q_expiry_storage_refusal_still_latches (each mutation-proven)",
+      "reason": "privileged: 12-case linked Joint stop coverage over a linked journal session (3 preps x 4 offsets, both qualifying entries force the full matrix; weekly long campaign; S3 suite row via scripts/ci/stop-races.sh); last-waiter disposition: live last waiter before stop unreachable: collected ticks resolve waiters same tick (1,390 slice samples, 0 waiters: 352 linked healthy runs + 1,038 micro-slice S1-precluded probe); invariant carried by machine twins joint_machine_finish_after_pass_refresh_resolution_publishes_linked, joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked, joint_machine_finish_at_q_expiry_storage_refusal_still_latches (each mutation-proven)",
       "cell": "privileged"
     },
     {

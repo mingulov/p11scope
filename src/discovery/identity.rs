@@ -144,6 +144,28 @@ pub(crate) mod provider_metadata_read_test {
     }
 }
 
+/// Test-only one-shot file-change injector for the prearm pin path:
+/// the next prearm prove bumps the proved file's mtime between the
+/// pre-hash pin and the post-hash verification, driving the real
+/// file-changed race (real pin mismatch, no budget touched). The
+/// retry then re-proves the settled file through the production path.
+#[cfg(test)]
+pub(crate) mod prearm_pin_test {
+    use std::cell::Cell;
+
+    thread_local! {
+        static INJECT_CHANGE_ONCE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn inject_file_change_once() {
+        INJECT_CHANGE_ONCE.with(|flag| flag.set(true));
+    }
+
+    pub(crate) fn take_injected_file_change() -> bool {
+        INJECT_CHANGE_ONCE.with(|flag| flag.replace(false))
+    }
+}
+
 pub(crate) fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
     Pin {
         ino: md.ino(),
@@ -9529,6 +9551,15 @@ fn prove_prearm_requests_in_views(
         // during the hash must not become the baseline the capture trusts.
         // The clock read precedes the verification it timestamps.
         let verified_ns = crate::attach::monotonic_ns();
+        // Test-only: drive the real file-changed race once (mtime bump
+        // between the pins, no budget touched). Production never sets it.
+        #[cfg(test)]
+        if crate::discovery::identity::prearm_pin_test::take_injected_file_change() {
+            if let Ok(mtime) = file.metadata().and_then(|md| md.modified()) {
+                let bumped = mtime + std::time::Duration::from_secs(2);
+                let _ = file.set_modified(bumped);
+            }
+        }
         match pin_of(&file) {
             Ok(after) if after == pin => {}
             Ok(_) => {

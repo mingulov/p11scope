@@ -2534,6 +2534,197 @@ fn s2s3_same_thread_nested_invalid_handle_inner_obstructs_outer() {
     );
 }
 
+/// Same-thread nested re-entry with a neutral S1 inner call that
+/// fails ambiguously. The inner `C_DigestUpdate` returns
+/// `CKR_GENERAL_ERROR`, which retires every live view in the
+/// session scope — an effect on object state that runs outside
+/// the Neutral action arm — so the outer-side exemption (one
+/// return-class table for the join class and neutral S1 alike)
+/// does not apply: the outer creation keeps the conservative
+/// same-session gap and binds nothing, while the inner still
+/// applies its own retirement. Before the neutral terminal guard
+/// the outer bound with no gap. RED twin for the narrowed
+/// exemption.
+#[test]
+fn s2s3_same_thread_nested_neutral_general_error_inner_obstructs_outer() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    // Settle H1 before the outer call starts.
+    h.run(3, create(SA), 4, ok().result(0, H1));
+    let outer = h.begin(5, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        6,
+        call("C_DigestUpdate").on(SA).thread(THREAD_A),
+        7,
+        rv(CkRv::GENERAL_ERROR),
+    );
+    h.done(outer, 8, ok().result(0, H2).result(1, H3));
+    let effects = h.settle(8);
+    // The general-error return retired the pre-existing binding.
+    assert!(
+        effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Retired {
+                reason: ObjectGap::AmbiguousOutcome,
+                ..
+            }
+        )),
+        "the inner general-error return retires its scope: {:?}",
+        effects.effects
+    );
+    assert_eq!(
+        created(&effects, outer, 0),
+        None,
+        "an effectful neutral nested inner obstructs the outer outputs"
+    );
+    assert_eq!(
+        unresolved(&effects, outer),
+        Some(ObjectGap::SameSessionOverlap),
+        "a non-neutral-terminal nested inner keeps the conservative gap"
+    );
+    assert_eq!(
+        unresolved(&effects, inner),
+        None,
+        "the neutral inner itself applies its retirement and names no gap"
+    );
+}
+
+/// Same-thread nested re-entry with a healthy neutral S1 inner
+/// call. The inner `C_DigestUpdate` returns `CKR_OK`, which
+/// applies no object or session effect, so the outer-side
+/// exemption still applies: the outer creation binds both outputs
+/// with no gap and the pre-existing binding survives. Guard twin:
+/// the neutral terminal guard must not misfire on effect-neutral
+/// terminals.
+#[test]
+fn s2s3_same_thread_nested_neutral_ok_inner_stays_exempt() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    // Settle H1 before the outer call starts.
+    h.run(3, create(SA), 4, ok().result(0, H1));
+    let outer = h.begin(5, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        6,
+        call("C_DigestUpdate").on(SA).thread(THREAD_A),
+        7,
+        ok(),
+    );
+    h.done(outer, 8, ok().result(0, H2).result(1, H3));
+    let effects = h.settle(8);
+    let public = created(&effects, outer, 0).expect("outer public binds");
+    let private = created(&effects, outer, 1).expect("outer private binds");
+    assert_ne!(public, private, "pair halves are distinct views");
+    assert_eq!(
+        unresolved(&effects, outer),
+        None,
+        "an effect-neutral neutral inner leaves the outer unobstructed"
+    );
+    assert_eq!(
+        unresolved(&effects, inner),
+        None,
+        "a healthy neutral inner names no gap"
+    );
+    assert!(
+        !effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::Retired { .. } | ObjectEffect::AccessEnded { .. }
+        )),
+        "a healthy neutral inner retires nothing: {:?}",
+        effects.effects
+    );
+}
+
+/// The nested exemption is one return-class table shared by the
+/// join class (`Access`, here `C_SignInit`) and neutral S1
+/// (`C_DigestUpdate`): `Ok` and ordinary `Failed` terminals leave
+/// the outer unobstructed, while `InvalidHandle`,
+/// `SessionInvalid`, `Pending` and `Ambiguous` terminals obstruct
+/// it, whatever the inner kind. (`CKR_GENERAL_ERROR` and the
+/// healthy `CKR_OK` neutral shape carry their own retirement pins
+/// above; this table pins the remaining cells.) RED twin for the
+/// single rule: before the neutral terminal guard every neutral
+/// row bound.
+#[test]
+fn s2s3_same_thread_nested_inner_return_class_table() {
+    // (inner kind, return, outer binds, inner gap): `true` rows stay
+    // exempt, `false` rows keep the conservative gap and bind
+    // nothing. A failed join-class inner returns before the
+    // interference check, so it names no gap of its own (unlike the
+    // healthy `Ok` NSS twin); a pending/ambiguous one names its own
+    // terminal gap; neutral inners never name gaps.
+    let cells: &[(&str, CkRv, bool, Option<ObjectGap>)] = &[
+        ("C_DigestUpdate", CkRv::DATA_INVALID, true, None),
+        ("C_DigestUpdate", CkRv::OBJECT_HANDLE_INVALID, false, None),
+        ("C_DigestUpdate", CkRv::SESSION_CLOSED, false, None),
+        ("C_DigestUpdate", CkRv::PENDING, false, None),
+        ("C_DigestUpdate", CkRv::DEVICE_ERROR, false, None),
+        ("C_SignInit", CkRv::DATA_INVALID, true, None),
+        ("C_SignInit", CkRv::KEY_HANDLE_INVALID, false, None),
+        ("C_SignInit", CkRv::SESSION_CLOSED, false, None),
+        (
+            "C_SignInit",
+            CkRv::PENDING,
+            false,
+            Some(ObjectGap::PendingResultUnavailable),
+        ),
+        (
+            "C_SignInit",
+            CkRv::GENERAL_ERROR,
+            false,
+            Some(ObjectGap::AmbiguousOutcome),
+        ),
+    ];
+    for (function, code, binds, inner_gap) in cells {
+        let mut h = Hist::qualified();
+        h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+        // Settle H1 before the outer call starts.
+        h.run(3, create(SA), 4, ok().result(0, H1));
+        let outer = h.begin(5, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+        let inner_call = if *function == "C_SignInit" {
+            sign_init(SA, H1)
+                .thread(THREAD_A)
+                .mech(MechanismEvidence::Value(ECDSA))
+        } else {
+            call(function).on(SA).thread(THREAD_A)
+        };
+        let inner_done = if *function == "C_SignInit" {
+            rv(*code).mech(MechanismEvidence::Value(ECDSA))
+        } else {
+            rv(*code)
+        };
+        let inner = h.run(6, inner_call, 7, inner_done);
+        h.done(outer, 8, ok().result(0, H2).result(1, H3));
+        let effects = h.settle(8);
+        if *binds {
+            assert!(
+                created(&effects, outer, 0).is_some(),
+                "{function} {code:?}: an effect-neutral terminal stays exempt"
+            );
+            assert_eq!(
+                unresolved(&effects, outer),
+                None,
+                "{function} {code:?}: an effect-neutral terminal names no outer gap"
+            );
+        } else {
+            assert_eq!(
+                created(&effects, outer, 0),
+                None,
+                "{function} {code:?}: an effectful terminal obstructs the outer outputs"
+            );
+            assert_eq!(
+                unresolved(&effects, outer),
+                Some(ObjectGap::SameSessionOverlap),
+                "{function} {code:?}: an effectful terminal keeps the conservative gap"
+            );
+        }
+        assert_eq!(
+            unresolved(&effects, inner),
+            *inner_gap,
+            "{function} {code:?}: inner gap"
+        );
+    }
+}
+
 #[test]
 fn s2s3_concurrent_session_contract_cross_session_equal_outputs_collide() {
     let mut h = Hist::qualified();

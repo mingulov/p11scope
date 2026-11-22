@@ -20206,6 +20206,67 @@ pub(crate) mod tests {
         assert!(!text.contains("discovery step unavailable"), "{text}");
     }
 
+    /// Gap-noise fold: the unreadable-member pair projects to its
+    /// own public row, which claims neither exit nor change. A
+    /// member read that fails for an unclassified reason proves
+    /// neither event, so the pair must never fold into the changed
+    /// row; near misses (truncated, suffixed, wrong subject) stay
+    /// generic, and the text names the row with its count instead
+    /// of the generic bucket. RED twin for the unproven split.
+    #[test]
+    fn unreadable_not_checked_pair_projects_to_its_own_row() {
+        use crate::discovery::scan::Skipped;
+        let unchecked = capture_skipped_out(&Skipped {
+            subject: "process view".into(),
+            reason: "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered"
+                .into(),
+        });
+        assert_eq!(unchecked.name, "discovery subject");
+        assert_eq!(
+            unchecked.reason,
+            "process unreadable mid-flight; not checked this pass"
+        );
+        assert!(
+            !unchecked.reason.contains("exited") && !unchecked.reason.contains("changed"),
+            "a live process is never called exited or changed: {}",
+            unchecked.reason
+        );
+        for (subject, reason) in [
+            (
+                "process view",
+                "a process in scope could not be retained or scanned",
+            ),
+            (
+                "process view",
+                "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered; pid 42",
+            ),
+            (
+                "live discovery generation",
+                "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered",
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: subject.into(),
+                reason: reason.into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = vec![unchecked];
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains("process unreadable mid-flight; not checked this pass: 1"),
+            "{text}"
+        );
+        assert!(!text.contains("discovery steps unavailable"), "{text}");
+        assert!(!text.contains("discovery step unavailable"), "{text}");
+    }
+
     /// Gap-noise fold: every work-ceiling wording projects to one
     /// public reason, whatever subject filed it — except a function
     /// subject, which keeps its entry row (the fold must never redact

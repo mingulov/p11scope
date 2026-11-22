@@ -14719,6 +14719,105 @@ fn live_unchanged_member_permission_refusal_names_no_exit_or_change() {
     }
 }
 
+/// A live, unchanged member the scan budget refuses names the
+/// refusal — never an exit-or-change claim. Budget exhaustion is
+/// a named "not checked this pass" state: the process was never
+/// read, so the stop proves neither exit nor change. The real
+/// work ceiling refuses the real open, and the filed row keeps
+/// the ceiling reason so it projects to the scan-budget row.
+/// RED twin for the budget split.
+#[test]
+fn live_unchanged_member_work_ceiling_names_the_refusal() {
+    let pid = std::process::id();
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the test process is live and unchanged"
+    );
+    let mut budget = CaptureWorkBudget::with_work_ceiling(0);
+    let error = match crate::process::ProcessView::open_with_budget(
+        ProcessViewId(0),
+        pid,
+        &mut budget,
+    ) {
+        Ok(_) => panic!("an exhausted budget refuses the open"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error, WORK_CEILING_REASON,
+        "the refusal carries the real work-ceiling reason"
+    );
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the refused process is still live and unchanged"
+    );
+    let mut noise = crate::discovery::noise::DiscoveryNoiseAggregator::default();
+    let skip = unreadable_member_skip(
+        pid,
+        false,
+        &format!("the process generation could not be pinned: {error}"),
+        &mut noise,
+    )
+    .expect("a live pid earns a gap");
+    assert_eq!(
+        skip.reason, WORK_CEILING_REASON,
+        "a budget refusal keeps the ceiling reason"
+    );
+    let projected = render::capture_skipped_out(&skip);
+    assert_eq!(projected.name, "discovery subject");
+    assert_eq!(
+        projected.reason, "scan budget exhausted",
+        "a budget refusal projects to the scan-budget row"
+    );
+    assert!(
+        !projected.reason.contains("exited") && !projected.reason.contains("changed"),
+        "a live process is never called exited or changed: {}",
+        projected.reason
+    );
+}
+
+/// A live, unchanged member whose read fails for an unclassified
+/// reason files an unreadable gap — never an exit-or-change
+/// claim. An I/O failure proves neither exit nor change, so the
+/// failure files its own internal pair and projects to its own
+/// public row, which names neither event. RED twin for the
+/// unproven split.
+#[test]
+fn live_unchanged_member_unclassified_read_names_no_exit_or_change() {
+    let pid = std::process::id();
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the test process is live and unchanged"
+    );
+    let mut noise = crate::discovery::noise::DiscoveryNoiseAggregator::default();
+    for detail in [
+        "the process generation could not be pinned: Input/output error (os error 5)",
+        "the process generation could not be scanned: Cannot allocate memory (os error 12)",
+    ] {
+        let skip =
+            unreadable_member_skip(pid, false, detail, &mut noise).expect("a live pid earns a gap");
+        assert_eq!(
+            skip.subject, "process view",
+            "an unclassified failure keeps the member subject: {detail}"
+        );
+        assert_eq!(
+            skip.reason,
+            "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered",
+            "an unclassified failure files the unreadable pair: {detail}"
+        );
+        let projected = render::capture_skipped_out(&skip);
+        assert_eq!(projected.name, "discovery subject", "{detail}");
+        assert_eq!(
+            projected.reason, "process unreadable mid-flight; not checked this pass",
+            "an unclassified failure projects to the unreadable row: {detail}"
+        );
+        assert!(
+            !projected.reason.contains("exited") && !projected.reason.contains("changed"),
+            "a live process is never called exited or changed: {}",
+            projected.reason
+        );
+    }
+}
+
 /// Twin (guard): a candidate naming only live views applies with no
 /// generation mark and no silence note — the exited-generation fix must
 /// not misfire when nothing is stale.

@@ -79,6 +79,77 @@ PERMISSION_INTERNAL_REASON = (
     "mapped was never discovered")
 
 
+# The engine's unreadable-member mark (src/discovery/engine.rs
+# `unreadable_member_skip`): filed when a live member's read fails
+# for an unclassified reason — the process may be live and
+# unchanged, so the failure proves neither exit nor change.
+UNCHECKED_INTERNAL_REASON = (
+    "a process in scope could not be retained or scanned; "
+    "a provider only that process mapped was never discovered")
+
+
+# Every exact-pair fold matcher `capture_skipped_out` dispatches.
+# A fold guard below asserts its pair is accepted by exactly its
+# own matcher, so a reword that silently moves a pair to another
+# row — or drops it to generic — fails here.
+FOLD_MATCHERS = (
+    "is_mid_flight_pair",
+    "is_stale_deferral_pair",
+    "is_permission_refusal_pair",
+    "is_unreadable_not_checked_pair",
+    "is_loader_context_pair",
+)
+
+
+def assert_fold_projects(internal_subject, internal_reason, matcher, const, pin_test):
+    """Prove an internal pair still folds to its public row.
+
+    End-to-end over the real producer mapping, never matcher text
+    alone: the pair must be accepted by exactly its own matcher
+    (no other fold arm claims it, and the contains-folds cannot
+    either), and the `capture_skipped_out` dispatch must route
+    that matcher to the named public constant. Checking the
+    matcher text alone stays green when the projection is broken
+    — the dispatch arm removed or re-pointed — so this asserts
+    the dispatch result itself. `pin_test` names the render.rs
+    behavioral test that must still cover the row.
+    """
+    render = producer_render_source()
+    assert "fn " + matcher in render, f"producer lost matcher {matcher}"
+    own = render.split("fn " + matcher, 1)[1].split("\n}", 1)[0]
+    assert internal_subject in own and internal_reason in own, \
+        f"producer stopped folding {internal_reason!r} in {matcher}"
+    for name in FOLD_MATCHERS:
+        if name == matcher or "fn " + name not in render:
+            # A matcher that does not exist cannot claim the pair;
+            # presence of every shipped matcher is pinned by its own
+            # guard's accept check above.
+            continue
+        section = render.split("fn " + name, 1)[1].split("\n}", 1)[0]
+        assert not (internal_subject in section and internal_reason in section), \
+            f"producer folded {internal_reason!r} into {name}"
+    body = render.split("pub fn capture_skipped_out", 1)[1].split("\n}\n", 1)[0]
+    assert matcher in body, \
+        f"projection lost its {matcher} dispatch arm"
+    arm = re.split(r"\}\s*else", body.split(matcher, 1)[1], 1)[0]
+    assert const in arm, \
+        f"projection no longer maps {matcher} to {const}"
+    scan = (ROOT / "src" / "discovery" / "scan.rs").read_text(encoding="utf-8")
+    ceiling = re.search(
+        r'WORK_CEILING_REASON: &str =\s*\n?\s*"((?:[^"\\]|\\.)*)"',
+        scan,
+    )
+    assert ceiling is not None, "work-ceiling constant missing from scan.rs"
+    assert ceiling.group(1) not in internal_reason, \
+        "the ceiling fold would swallow this pair"
+    assert not any(char.isdigit() for char in internal_reason), \
+        "the limit folds require digit counts this pair must never carry"
+    assert "fn " + pin_test in render, f"behavioral pin {pin_test} missing"
+    pin = render.split("fn " + pin_test, 1)[1].split("\n    }\n", 1)[0]
+    assert producer_const(const) in pin, \
+        f"behavioral pin {pin_test} no longer covers {const}"
+
+
 def producer_render_source():
     return (ROOT / "src" / "render.rs").read_text(encoding="utf-8")
 
@@ -124,46 +195,74 @@ def producer_permission_row():
             "reason": producer_const("PERMISSION_REFUSAL_REASON")}
 
 
+def producer_unchecked_row():
+    """The public unreadable-member row as the producer defines it today.
+
+    Built from the render.rs constants, never a pasted copy, so the
+    rejection twin below always judges the row the producer emits.
+    """
+    return {"name": producer_const("DISCOVERY_SUBJECT"),
+            "reason": producer_const("UNREADABLE_NOT_CHECKED_REASON")}
+
+
 def assert_permission_refusal_still_folds():
     """Prove the permission-refusal mark still folds to its own row.
 
     Fails loudly (never vacuously green) if the producer stops
     filing the permission mark, stops folding it to the permission
-    row, or folds it back into the changed row: any of those revisits
-    these twins, since the rejection below exists only because the
-    refusal proves neither exit nor change. The behavioral pin is
+    row, folds it into another row, or breaks the projection
+    dispatch: any of those revisits these twins, since the
+    rejection below exists only because the refusal proves neither
+    exit nor change. The behavioral pin is
     render::mid_flight_generation_pairs_project_to_split_public_reasons.
     """
     engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
     assert "UNREADABLE_PERMISSION_REASON" in engine, \
         "producer stopped filing the permission-refusal mark"
-    fold = producer_render_source().split("fn is_permission_refusal_pair", 1)[1].split("\n}", 1)[0]
-    assert PERMISSION_INTERNAL_REASON in fold, \
-        "producer stopped folding the permission refusal to the permission row"
-    changed = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
-    assert PERMISSION_INTERNAL_REASON not in changed, \
-        "producer folded the permission refusal back into the changed row"
+    assert_fold_projects(
+        "process view", PERMISSION_INTERNAL_REASON,
+        "is_permission_refusal_pair", "PERMISSION_REFUSAL_REASON",
+        "mid_flight_generation_pairs_project_to_split_public_reasons")
 
 
 def assert_live_deferral_still_folds():
     """Prove the live stale-deferral mark still folds to its own row.
 
     Fails loudly (never vacuously green) if the producer stops
-    filing the live mark, stops folding it to the deferral row, or
-    folds it back into the changed row: any of those revisits these
-    twins, since the rejection below exists only because neither
-    public row proves an exit. The behavioral pin is
+    filing the live mark, stops folding it to the deferral row,
+    folds it into another row, or breaks the projection dispatch:
+    any of those revisits these twins, since the rejection below
+    exists only because neither public row proves an exit. The
+    behavioral pin is
     render::mid_flight_generation_pairs_project_to_split_public_reasons.
     """
     engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
     assert LIVE_DEFERRAL_INTERNAL_REASON in engine, \
         "producer stopped filing the live stale-deferral mark"
-    fold = producer_render_source().split("fn is_stale_deferral_pair", 1)[1].split("\n}", 1)[0]
-    assert LIVE_DEFERRAL_INTERNAL_REASON in fold, \
-        "producer stopped folding the live deferral to the deferral row"
-    changed = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
-    assert LIVE_DEFERRAL_INTERNAL_REASON not in changed, \
-        "producer folded the live deferral back into the changed row"
+    assert_fold_projects(
+        "live discovery generation", LIVE_DEFERRAL_INTERNAL_REASON,
+        "is_stale_deferral_pair", "STALE_DEFERRAL_REASON",
+        "mid_flight_generation_pairs_project_to_split_public_reasons")
+
+
+def assert_unreadable_not_checked_still_folds():
+    """Prove the unreadable-member mark still folds to its own row.
+
+    Fails loudly (never vacuously green) if the producer stops
+    filing the unreadable mark, stops folding it to the unreadable
+    row, folds it into another row, or breaks the projection
+    dispatch: any of those revisits these twins, since the
+    rejection below exists only because the failure proves neither
+    exit nor change. The behavioral pin is
+    render::unreadable_not_checked_pair_projects_to_its_own_row.
+    """
+    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
+    assert "UNREADABLE_UNCHECKED_REASON" in engine, \
+        "producer stopped filing the unreadable-member mark"
+    assert_fold_projects(
+        "process view", UNCHECKED_INTERNAL_REASON,
+        "is_unreadable_not_checked_pair", "UNREADABLE_NOT_CHECKED_REASON",
+        "unreadable_not_checked_pair_projects_to_its_own_row")
 
 
 def inputs(*, metrics=False, scope="pid", calls=None, cell="profile-pid"):
@@ -1904,6 +2003,30 @@ class SystemAmbientGapTests(unittest.TestCase):
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [dict(permission_row), dict(permission_row),
                                         dict(permission_row)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="counter-counts-system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_unreadable_ambient_with_unchecked_only_fails_strict_counter_counts_system(self):
+        # Twin of the permission-row rejection for the metrics cell:
+        # the unreadable row proves neither exit nor change (it is
+        # filed for a possibly still-live, unchanged process whose
+        # read failed for an unclassified reason), so an
+        # all-unreadable list stays red at the gap gate with exact
+        # owned counts and zero loss. The row under test comes from
+        # the producer's own constants.
+        unchecked_row = producer_unchecked_row()
+        assert_unreadable_not_checked_still_folds()
+        self.assertNotIn("exited", unchecked_row["reason"],
+                         "a live process is never called exited")
+        self.assertNotIn("changed", unchecked_row["reason"],
+                         "an unchanged process is never called changed")
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [dict(unchecked_row), dict(unchecked_row),
+                                        dict(unchecked_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")

@@ -14156,7 +14156,8 @@ struct GetterPrefaultCursor {
 
 /// One warmup candidate range: its maps address, the first matching
 /// pinned object (sorted order, deterministic), the maps key it was
-/// enumerated under, and whether its identity proof completed.
+/// enumerated under, and its proof state (`proven` reads, `refused`
+/// skips silently, neither defers to the next pass).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GetterPrefaultRange {
     start: u64,
@@ -14166,6 +14167,7 @@ struct GetterPrefaultRange {
     device_minor: u64,
     inode: u64,
     proven: bool,
+    refused: bool,
 }
 
 /// Test-only scripted warmup proof and per-pass caps. Production has no
@@ -14182,6 +14184,10 @@ struct GetterPrefaultTestSeam {
     /// Per-pass overrides; `None` keeps the production constant.
     reads_per_pass: Option<usize>,
     proofs_per_pass: Option<usize>,
+    /// Loop-scoped deadline-trip countdown: the warmup's loop poll
+    /// reports a stop after this many more loop checks (and stays
+    /// tripped). Counts loop checks only, never the maps snapshot's.
+    loop_checks_until_trip: Cell<Option<u32>>,
 }
 
 impl Engine {
@@ -26648,7 +26654,9 @@ impl Engine {
         }
         let mut outcome = self.attach_manifest_getters_unsettled(view, session, additions_allowed);
         outcome.1 &= orphans_detached;
-        if outcome.1 && !outcome.2 {
+        // An unfinished warmup blocks settling: the hooks attach only
+        // after the warmup completes, and the owed pass resumes it.
+        if outcome.1 && !outcome.2 && !self.getter_prefault_cursors.contains_key(&view) {
             self.getter_sites_settled.insert(view);
         }
         outcome
@@ -26683,6 +26691,19 @@ impl Engine {
         detached
     }
 
+    /// INV-2 per-pass bounds for the manifest-getter warmup: one
+    /// I/O-bearing row (one target read) per credit, one native call (one
+    /// range identity proof) per credit, at most this many credits per
+    /// pass. Proofs that need no system call (the maps-key fast path)
+    /// spend no credit. The capture frame, deadline and ceilings may stop
+    /// a pass sooner; every deferred pass makes progress (at least one
+    /// read or proof) except a frame spent before any work, so the pass
+    /// count is finite.
+    const GETTER_PREFAULT_READS_PER_PASS: usize = 64;
+    const GETTER_PREFAULT_PROOFS_PER_PASS: usize = 64;
+    /// One warmup read: a faulting 64 KiB window into the target.
+    const GETTER_PREFAULT_CHUNK: usize = 65536;
+
     /// Best-effort pre-fault of a view's manifest-getter objects'
     /// readable non-executable file-backed mappings before the getter
     /// hooks attach. The hooks' BPF reads are nofault: they fail
@@ -26693,38 +26714,121 @@ impl Engine {
     /// removes that common first-touch race; anything uncovered keeps
     /// the normal honest gap path.
     ///
+    /// One bounded pass over the owed warmup: at most
+    /// [`Self::GETTER_PREFAULT_READS_PER_PASS`] target reads and
+    /// [`Self::GETTER_PREFAULT_PROOFS_PER_PASS`] range proofs, fewer on a
+    /// spent frame, deadline or ceiling. A transient stop (spent frame or
+    /// spent credit) saves its cursor and `Deferred`s for the next pass,
+    /// which resumes at the saved offset after revalidating the view's
+    /// generation and every range's (address, key) rendering against
+    /// fresh maps; a range whose file changed underneath is dropped,
+    /// never re-read under its stale proof. A terminal stop (passed
+    /// deadline or ceiling, exited view, unreadable maps or memory)
+    /// abandons the warmup and attaches at once: a best-effort warmup
+    /// must never delay the hooks past the capture's own limits.
+    ///
+    /// No range reads without its identity proof. A maps key alone never
+    /// authorizes a read (inode numbers repeat across Btrfs subvolumes
+    /// and overlay layers): each range proves like-for-like against the
+    /// pinned object's held `vm_file` — the maps-key fast path where the
+    /// filesystem allows it, else the range's own `map_files` stat — and
+    /// unproven ranges (stranger, unreadable, overlay even on equality,
+    /// or no `map_files` capability at all) are refused silently: the
+    /// bytes stay unread, no gap is filed, and a later BPF miss still
+    /// reports honestly. Without the capability the warmup proves
+    /// nothing and reads nothing, and getter acquisition proceeds exactly
+    /// as before the warmup existed.
+    ///
     /// Limits, all silent: only file-backed ranges are faulted (heap and
     /// anonymous-BSS tables stay exposed); every byte read spends the
-    /// capture's window I/O budget through the file-content rule and the
-    /// pass stops early on a ceiling; under an Inventory policy with no
-    /// active scan the allowance is zero, so this faults nothing; a
-    /// partial pre-fault still attaches with no retry; and a page can be
-    /// reclaimed again before the getter returns. Any failure (exited
-    /// view, unreadable maps or memory, expired deadline, exhausted
-    /// budget) simply leaves the normal gap path to report honestly.
+    /// capture's window I/O budget through the file-content rule, and the
+    /// per-object allowance spans passes through the cursor; under an
+    /// Inventory policy with no active scan the allowance is zero, so
+    /// this faults nothing; and a page can be reclaimed again before the
+    /// getter returns.
     fn prefault_manifest_getter_data(
         &mut self,
         view: ProcessViewId,
         sites: &[(PinnedObjectId, u64, String)],
     ) -> GetterPrefaultOutcome {
-        let mut objects = BTreeSet::new();
-        for (object, _, _) in sites {
-            objects.insert(*object);
-        }
+        use GetterPrefaultOutcome::{Complete, Deferred};
+        #[cfg(test)]
+        let (reads_per_pass, proofs_per_pass) = self.getter_prefault_for_test.as_ref().map_or(
+            (
+                Self::GETTER_PREFAULT_READS_PER_PASS,
+                Self::GETTER_PREFAULT_PROOFS_PER_PASS,
+            ),
+            |seam| {
+                (
+                    seam.reads_per_pass
+                        .unwrap_or(Self::GETTER_PREFAULT_READS_PER_PASS),
+                    seam.proofs_per_pass
+                        .unwrap_or(Self::GETTER_PREFAULT_PROOFS_PER_PASS),
+                )
+            },
+        );
+        #[cfg(not(test))]
+        let (reads_per_pass, proofs_per_pass) = (
+            Self::GETTER_PREFAULT_READS_PER_PASS,
+            Self::GETTER_PREFAULT_PROOFS_PER_PASS,
+        );
+        // A pass always makes progress when work remains: the clamps keep
+        // a zero test cap from deferring forever.
+        let reads_per_pass = reads_per_pass.max(1);
+        let proofs_per_pass = proofs_per_pass.max(1);
+        let mut objects: Vec<PinnedObjectId> = sites.iter().map(|site| site.0).collect();
+        objects.sort();
+        objects.dedup();
         if objects.is_empty() {
-            return GetterPrefaultOutcome::Complete;
+            self.getter_prefault_cursors.remove(&view);
+            return Complete;
         }
         let Some(position) = self
             .views
             .iter()
             .position(|candidate| candidate.id() == view)
         else {
-            return GetterPrefaultOutcome::Complete;
+            self.getter_prefault_cursors.remove(&view);
+            return Complete;
         };
+        // A stale generation drops its cursor and attaches at once: the
+        // attach path owns stale views, not the warmup.
+        if !self.views[position].still_the_same() {
+            self.getter_prefault_cursors.remove(&view);
+            return Complete;
+        }
+        // A spent frame yields before any read, keeping (or opening) the
+        // cursor for the next pass.
+        if self.frame_work_exhausted() {
+            let fresh = self
+                .getter_prefault_cursors
+                .get(&view)
+                .is_none_or(|cursor| cursor.objects != objects);
+            if fresh {
+                self.getter_prefault_cursors.insert(
+                    view,
+                    GetterPrefaultCursor {
+                        objects,
+                        ranges: Vec::new(),
+                        next: 0,
+                        next_addr: 0,
+                        op_bytes: 0,
+                        enumerated: false,
+                    },
+                );
+            }
+            return Deferred { frame_spent: true };
+        }
         let Ok(maps) = Self::read_maps(&self.views[position], &mut self.budget) else {
-            return GetterPrefaultOutcome::Complete;
+            self.getter_prefault_cursors.remove(&view);
+            return Complete;
         };
-        let mut ranges = Vec::new();
+        // Candidate ranges in maps order with their first matching object
+        // (sorted, deterministic) and the key they render under.
+        // Enumeration rides the maps snapshot's own charge: an in-memory
+        // filter over a product-bounded snapshot with no system calls;
+        // the credited steps are the proofs and reads below.
+        let mut candidates = Vec::new();
         for mapping in &maps {
             if mapping.permissions[0] != b'r'
                 || mapping.permissions[2] == b'x'
@@ -26734,38 +26838,225 @@ impl Engine {
                 continue;
             }
             let key = ObjectKey::of(mapping);
-            let owned = objects.iter().any(|object| {
+            let Some(object) = objects.iter().find(|object| {
                 self.pinned.object_matches_key(
-                    *object,
+                    **object,
                     key.device.major,
                     key.device.minor,
                     key.inode,
                 )
+            }) else {
+                continue;
+            };
+            candidates.push(GetterPrefaultRange {
+                start: mapping.start,
+                end: mapping.end,
+                object: *object,
+                device_major: key.device.major,
+                device_minor: key.device.minor,
+                inode: key.inode,
+                proven: false,
+                refused: false,
             });
-            if owned {
-                ranges.push((mapping.start, mapping.end));
+        }
+        // Revalidate the cursor against the fresh rendering: new objects
+        // restart the warmup, carried ranges keep their proof and
+        // progress only under an identical (address, key, object)
+        // rendering, and anything else is dropped — never re-read under
+        // a stale proof. Read bytes stay cumulative for the per-object
+        // allowance across restarts.
+        let mut cursor = self.getter_prefault_cursors.remove(&view);
+        if cursor
+            .as_ref()
+            .is_none_or(|cursor| cursor.objects != objects)
+        {
+            cursor = Some(GetterPrefaultCursor {
+                objects,
+                ranges: Vec::new(),
+                next: 0,
+                next_addr: 0,
+                op_bytes: 0,
+                enumerated: false,
+            });
+        }
+        let mut cursor = cursor.expect("a warmup cursor is always present here");
+        let carried = std::mem::take(&mut cursor.ranges);
+        let old_next = cursor.next;
+        let old_addr = cursor.next_addr;
+        let mut merged = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let kept = carried.iter().find(|old| {
+                old.start == candidate.start
+                    && old.end == candidate.end
+                    && old.device_major == candidate.device_major
+                    && old.device_minor == candidate.device_minor
+                    && old.inode == candidate.inode
+                    && old.object == candidate.object
+            });
+            merged.push(kept.cloned().unwrap_or(candidate));
+        }
+        // The resume index follows its range: finished ranges (before the
+        // old index, read or refused) stay finished, the partial range
+        // keeps its offset, and anything new starts at its base.
+        let mut next = merged.len();
+        let mut next_addr = 0u64;
+        for (index, range) in merged.iter().enumerate() {
+            let old_index = carried.iter().position(|old| {
+                old.start == range.start
+                    && old.end == range.end
+                    && old.device_major == range.device_major
+                    && old.device_minor == range.device_minor
+                    && old.inode == range.inode
+                    && old.object == range.object
+            });
+            match old_index {
+                Some(old) if old < old_next => {}
+                Some(old) if old == old_next && old_next < carried.len() => {
+                    next = index;
+                    next_addr = old_addr;
+                    break;
+                }
+                _ => {
+                    next = index;
+                    next_addr = range.start;
+                    break;
+                }
             }
         }
-        if ranges.is_empty() {
-            return GetterPrefaultOutcome::Complete;
+        cursor.ranges = merged;
+        cursor.next = next;
+        cursor.next_addr = next_addr;
+        cursor.enumerated = true;
+        if next >= cursor.ranges.len() {
+            return Complete;
         }
+        // Prove a bounded batch of the pending ranges (maps order from
+        // the resume index). The fast path spends no credit; each
+        // `map_files` stat spends one. Refused ranges skip silently.
+        let pending: Vec<usize> = (next..cursor.ranges.len())
+            .filter(|&index| !cursor.ranges[index].proven && !cursor.ranges[index].refused)
+            .collect();
+        if !pending.is_empty() {
+            let mut held_cache: BTreeMap<PinnedObjectId, Option<MappedFile>> = BTreeMap::new();
+            let mut slow: Vec<(usize, MappedFile)> = Vec::new();
+            for &index in &pending {
+                let range = &cursor.ranges[index];
+                let held = held_cache
+                    .entry(range.object)
+                    .or_insert_with(|| self.getter_prefault_held(range.object).ok());
+                let Some(held) = *held else {
+                    cursor.ranges[index].refused = true;
+                    continue;
+                };
+                let key = ObjectKey {
+                    device: Device {
+                        major: range.device_major,
+                        minor: range.device_minor,
+                    },
+                    inode: range.inode,
+                };
+                if held.key_is_identity(key) {
+                    cursor.ranges[index].proven = true;
+                } else if held.is_overlay_or_unproven() {
+                    // Equality cannot prove an overlay (or unproven
+                    // filesystem) file — a stale lower mapping keeps the
+                    // fresh identity — and the best-effort warmup spends
+                    // no kernel witness.
+                    cursor.ranges[index].refused = true;
+                } else {
+                    slow.push((index, held));
+                }
+            }
+            if !slow.is_empty() {
+                if self.frame_work_exhausted() {
+                    cursor.next = next;
+                    cursor.next_addr = next_addr;
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: true };
+                }
+                if self.budget.check_deadline_now().is_some() {
+                    return Complete;
+                }
+                let take = slow.len().min(proofs_per_pass);
+                let addrs: Vec<(u64, u64)> = slow[..take]
+                    .iter()
+                    .map(|&(index, _)| (cursor.ranges[index].start, cursor.ranges[index].end))
+                    .collect();
+                let batch = self.getter_prefault_batch_identities(position, &addrs);
+                // A short batch refuses: trusting fewer verdicts than
+                // ranges would skip proof. A batch failure (exit or pid
+                // reuse between the brackets) refuses the batch; the next
+                // pass revalidates the generation before trusting anything.
+                let complete = batch
+                    .as_ref()
+                    .is_ok_and(|identities| identities.len() == addrs.len());
+                for (offset, &(index, held)) in slow[..take].iter().enumerate() {
+                    let proved = complete
+                        && batch
+                            .as_ref()
+                            .ok()
+                            .and_then(|identities| identities.get(offset))
+                            .is_some_and(|identity| {
+                                identity
+                                    .as_ref()
+                                    .is_ok_and(|identity| *identity == held.identity)
+                            });
+                    cursor.ranges[index].proven = proved;
+                    cursor.ranges[index].refused = !proved;
+                }
+            }
+        }
+        // Read the proven ranges from the resume index. Refused ranges
+        // skip silently; a range the proof batch did not reach stops the
+        // pass for the next one.
         let mem = self.views[position].with_filesystem(&mut self.budget, |filesystem, _| {
             Ok(filesystem.open_memory())
         });
         let Ok(mem) = mem.map_err(|_| ()).and_then(|inner| inner.map_err(|_| ())) else {
-            return GetterPrefaultOutcome::Complete;
+            return Complete;
         };
-        let mut operation_bytes = 0u64;
-        let mut chunk = [0u8; 65536];
-        for (start, end) in ranges {
-            let mut addr = start;
+        let mut chunk = [0u8; Self::GETTER_PREFAULT_CHUNK];
+        let mut op_bytes = cursor.op_bytes;
+        let mut reads_spent = 0usize;
+        let mut index = next;
+        let mut addr = next_addr;
+        while index < cursor.ranges.len() {
+            if !cursor.ranges[index].proven {
+                if !cursor.ranges[index].refused {
+                    cursor.next = index;
+                    cursor.next_addr = addr;
+                    cursor.op_bytes = op_bytes;
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: false };
+                }
+                index += 1;
+                if index < cursor.ranges.len() {
+                    addr = cursor.ranges[index].start;
+                }
+                continue;
+            }
+            let end = cursor.ranges[index].end;
             while addr < end {
-                if self.budget.check_deadline_now().is_some() {
-                    return GetterPrefaultOutcome::Complete;
+                if self.frame_work_exhausted() {
+                    cursor.next = index;
+                    cursor.next_addr = addr;
+                    cursor.op_bytes = op_bytes;
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: true };
+                }
+                if self.budget.check_deadline_now().is_some() || self.getter_prefault_test_trip() {
+                    return Complete;
+                }
+                if reads_spent >= reads_per_pass {
+                    cursor.next = index;
+                    cursor.next_addr = addr;
+                    cursor.op_bytes = op_bytes;
+                    self.getter_prefault_cursors.insert(view, cursor);
+                    return Deferred { frame_spent: false };
                 }
                 let len = (end - addr).min(chunk.len() as u64) as usize;
-                if self.budget.allowed_io(operation_bytes, len) < len {
-                    return GetterPrefaultOutcome::Complete;
+                if self.budget.allowed_io(op_bytes, len) < len {
+                    return Complete;
                 }
                 match mem.read_at(&mut chunk[..len], addr) {
                     Ok(read) => {
@@ -26774,20 +27065,157 @@ impl Engine {
                         // collection work too would double-charge a large
                         // data walk against the small shared allowance.
                         self.budget.record_window_io(read);
-                        operation_bytes = operation_bytes.saturating_add(read as u64);
+                        op_bytes = op_bytes.saturating_add(read as u64);
+                        reads_spent += 1;
                         if read != len {
                             break;
                         }
                     }
                     Err(_) => break,
                 }
-                let Some(next) = addr.checked_add(len as u64) else {
+                let Some(following) = addr.checked_add(len as u64) else {
                     break;
                 };
-                addr = next;
+                addr = following;
+            }
+            index += 1;
+            if index < cursor.ranges.len() {
+                addr = cursor.ranges[index].start;
             }
         }
-        GetterPrefaultOutcome::Complete
+        Complete
+    }
+
+    /// The pinned object's held `vm_file` proof: the identity owner's
+    /// filed proof when retained, else a fresh self-mapping probe.
+    /// Fails closed (unproven) without the `map_files` capability;
+    /// scripted under the test seam, which never consults production.
+    fn getter_prefault_held(&self, object: PinnedObjectId) -> Result<MappedFile, String> {
+        #[cfg(test)]
+        if let Some(seam) = self.getter_prefault_for_test.as_ref() {
+            return seam
+                .held
+                .get(&object)
+                .copied()
+                .ok_or_else(|| format!("no scripted held proof for object {object:?}"));
+        }
+        self.pinned.object_mapped_identity(object)
+    }
+
+    /// The `vm_file` identities of `ranges` in the view at `position`,
+    /// in input order (see `getter_prefault_live_identities`; scripted
+    /// under the test seam, which never consults production).
+    fn getter_prefault_batch_identities(
+        &mut self,
+        position: usize,
+        ranges: &[(u64, u64)],
+    ) -> Result<Vec<std::io::Result<FileIdentity>>, String> {
+        #[cfg(test)]
+        if let Some(seam) = self.getter_prefault_for_test.as_ref() {
+            return Ok(Self::getter_prefault_scripted_identities(seam, ranges));
+        }
+        Self::getter_prefault_live_identities(&self.views[position], ranges, &mut self.budget)
+    }
+
+    /// The `vm_file` identity of each range, in input order: one
+    /// filesystem proof brackets the batch (like the scan's
+    /// `range_identities`), so generation and mount namespace are proven
+    /// around every stat. Metadata only: nothing opens or reads.
+    fn getter_prefault_live_identities(
+        view: &ProcessView,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<Vec<std::io::Result<FileIdentity>>, String> {
+        view.with_filesystem(budget, |filesystem, budget| {
+            Ok(ranges
+                .iter()
+                .map(|&(start, end)| {
+                    filesystem
+                        .mapped_file_metadata(start, end, budget)
+                        .map(|metadata| {
+                            use std::os::unix::fs::MetadataExt;
+                            FileIdentity {
+                                dev: metadata.dev(),
+                                ino: metadata.ino(),
+                            }
+                        })
+                })
+                .collect())
+        })
+    }
+
+    /// Test-only range identities: scripted per range (`None` reads as
+    /// unreadable), unscripted ranges read as unproven. Never consults
+    /// production, so twins behave identically with or without the
+    /// `map_files` capability.
+    #[cfg(test)]
+    fn getter_prefault_scripted_identities(
+        seam: &GetterPrefaultTestSeam,
+        ranges: &[(u64, u64)],
+    ) -> Vec<std::io::Result<FileIdentity>> {
+        ranges
+            .iter()
+            .map(|range| {
+                seam.ranges.get(range).copied().map_or_else(
+                    || Err(std::io::Error::other("no scripted range identity")),
+                    |scripted| {
+                        scripted.map_or_else(
+                            || {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "scripted unreadable range",
+                                ))
+                            },
+                            Ok,
+                        )
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Test-only loop-trip countdown, consulted by the warmup's loop poll
+    /// alongside the capture deadline.
+    #[cfg(test)]
+    fn getter_prefault_test_trip(&self) -> bool {
+        let Some(seam) = self.getter_prefault_for_test.as_ref() else {
+            return false;
+        };
+        let Some(remaining) = seam.loop_checks_until_trip.get() else {
+            return false;
+        };
+        if remaining == 0 {
+            return true;
+        }
+        seam.loop_checks_until_trip.set(Some(remaining - 1));
+        remaining - 1 == 0
+    }
+
+    /// Production has no loop trip.
+    #[cfg(not(test))]
+    fn getter_prefault_test_trip(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Drops the view's warmup cursor when it enumerated a different
+    /// object set than `sites` (emptied, remapped, or re-filtered), so
+    /// the settle block never pins a view with nothing to warm.
+    fn retire_stale_prefault_cursor(
+        &mut self,
+        view: ProcessViewId,
+        sites: &[(PinnedObjectId, u64, String)],
+    ) {
+        let mut objects: Vec<PinnedObjectId> = sites.iter().map(|site| site.0).collect();
+        objects.sort();
+        objects.dedup();
+        if self
+            .getter_prefault_cursors
+            .get(&view)
+            .is_some_and(|cursor| cursor.objects != objects)
+        {
+            self.getter_prefault_cursors.remove(&view);
+        }
     }
 
     /// Test-only: script the warmup's held proof for `object` and the
@@ -26815,6 +27243,17 @@ impl Engine {
         seam.proofs_per_pass = proofs;
     }
 
+    /// Test-only: trip the warmup's loop poll after `checks` more loop
+    /// deadline checks (the poll's early return stays latched after).
+    /// Counts loop checks only, never the maps snapshot's.
+    #[cfg(test)]
+    fn set_prefault_loop_trip_for_test(&mut self, checks: u32) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .loop_checks_until_trip
+            .set(Some(checks));
+    }
+
     fn attach_manifest_getters_unsettled(
         &mut self,
         view: ProcessViewId,
@@ -26830,6 +27269,7 @@ impl Engine {
                 return (false, false, true, false);
             }
         };
+        self.retire_stale_prefault_cursor(view, &sites);
         if sites.is_empty() {
             return (false, true, false, false);
         }
@@ -26852,6 +27292,7 @@ impl Engine {
                  calls reached only through its table are not counted",
             );
         }
+        self.retire_stale_prefault_cursor(view, &sites);
         if sites.is_empty() {
             return (false, complete, false, false);
         }
@@ -26869,7 +27310,19 @@ impl Engine {
                 return (false, false, false, false);
             }
         };
-        self.prefault_manifest_getter_data(view, &sites);
+        // A deferred warmup re-owes the view without attaching: the hooks
+        // wait for the next pass, which resumes from the saved cursor.
+        // Deferral is scheduling, not loss: complete, unskipped, and (for
+        // a spent frame) booked as a frame deferral like any owed pass.
+        if let GetterPrefaultOutcome::Deferred { frame_spent } =
+            self.prefault_manifest_getter_data(view, &sites)
+        {
+            if frame_spent {
+                self.note_frame_deferral();
+            }
+            self.getter_pass_owed.insert(view);
+            return (false, true, false, false);
+        }
         let pinned = self.pinned.clone();
         let mut collected = CollectedExportWork {
             dynamic: Vec::new(),

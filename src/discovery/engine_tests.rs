@@ -37319,15 +37319,18 @@ fn map_fixture_readonly(file: &std::fs::File, len: usize) -> *mut libc::c_void {
     mapping
 }
 
-/// Whether every page of a `len`-byte range at `start` is resident in
-/// this process (`mincore`, unprivileged for own mappings).
-fn pages_resident(start: u64, len: usize) -> Vec<bool> {
-    let mut residency = vec![0u8; len.div_ceil(4096)];
-    // SAFETY: an owned mapping of this process with a residency vector
-    // sized for its pages, read only on success.
-    let result = unsafe { libc::mincore(start as *mut libc::c_void, len, residency.as_mut_ptr()) };
-    assert_eq!(result, 0, "mincore reads own residency");
-    residency.into_iter().map(|entry| entry & 1 == 1).collect()
+/// Whether the page holding `addr` is present in this process's page
+/// tables (`/proc/self/pagemap` bit 63; the PFN itself stays masked
+/// without privilege, but the present bit reads unprivileged).
+/// Page-cache residency alone cannot move this bit — only a fault does.
+fn page_present(addr: u64) -> bool {
+    use std::os::unix::fs::FileExt as _;
+    let pagemap = std::fs::File::open("/proc/self/pagemap").unwrap();
+    let mut entry = [0u8; 8];
+    pagemap
+        .read_exact_at(&mut entry, (addr / 4096) * 8)
+        .unwrap();
+    u64::from_ne_bytes(entry) & (1 << 63) != 0
 }
 
 /// Ranges whose identity cannot be proven are refused without reading a
@@ -37454,9 +37457,9 @@ fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
 }
 
 /// The warmup faults dropped pages back into the target: after
-/// `MADV_DONTNEED` the fixture's pages read non-resident, after the
-/// proven pass they read resident (`mincore`). Page-cache residency
-/// alone would not move this bit; only a faulting read does.
+/// `MADV_DONTNEED` the fixture's pages lose their present bits, after
+/// the proven pass every page is present again (`/proc/self/pagemap`).
+/// Page-cache residency alone cannot move this bit; only a fault does.
 #[test]
 fn prefault_manifest_getter_data_faults_dropped_pages_back_into_the_target() {
     let fixture = ScanManifestFixture::new();
@@ -37468,15 +37471,15 @@ fn prefault_manifest_getter_data_faults_dropped_pages_back_into_the_target() {
     let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
     install_prefault_fast_proof(&mut engine, object);
     let base = fixture.mapping as u64;
-    let len = fixture.length;
+    let pages = fixture.length.div_ceil(4096);
     // SAFETY: our own guard mapping, discarded and re-faulted below.
     assert_eq!(
-        unsafe { libc::madvise(fixture.mapping, len, libc::MADV_DONTNEED) },
+        unsafe { libc::madvise(fixture.mapping, fixture.length, libc::MADV_DONTNEED,) },
         0
     );
     assert!(
-        pages_resident(base, len).iter().all(|resident| !resident),
-        "premise: the drop leaves every guard page non-resident"
+        (0..pages).all(|page| !page_present(base + page as u64 * 4096)),
+        "premise: the drop clears every guard page's present bit"
     );
     let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
     let before = engine.budget.attempted_io_bytes();
@@ -37487,7 +37490,7 @@ fn prefault_manifest_getter_data_faults_dropped_pages_back_into_the_target() {
         "the pass reads target bytes beyond the maps snapshot"
     );
     assert!(
-        pages_resident(base, len).iter().all(|resident| *resident),
+        (0..pages).all(|page| page_present(base + page as u64 * 4096)),
         "the proven pass faults every guard page back in"
     );
 }
@@ -37566,7 +37569,7 @@ fn attach_manifest_getters_warms_proven_ranges_before_it_attaches() {
     for mapping in mappings {
         assert_eq!(unsafe { libc::munmap(mapping, padded) }, 0);
     }
-    assert_eq!(outcome, (false, true, false, false));
+    assert_eq!(outcome, (false, true, false, true));
     assert!(
         engine.getter_sites_settled.contains(&id),
         "the pass settles the view"
@@ -37587,13 +37590,14 @@ fn attach_manifest_getters_warms_proven_ranges_before_it_attaches() {
     );
 }
 
-/// A collection stop latched mid-loop ends the pass at the loop's
-/// deadline poll: the first chunk is admitted and charged, the second
-/// chunk never reads. The stop is terminal (a passed deadline never
+/// A stop tripped mid-loop ends the pass at the loop's deadline poll:
+/// the first chunk is admitted and charged, the second chunk never
+/// reads. The trip counts loop checks only, so the maps snapshot's size
+/// cannot move it. The stop is terminal (a passed deadline never
 /// unpasses), so the warmup keeps no cursor and attaches at once —
 /// silently, like every warmup refusal.
 #[test]
-fn prefault_manifest_getter_data_stops_mid_loop_on_a_latched_collection_stop() {
+fn prefault_manifest_getter_data_stops_mid_loop_when_its_deadline_poll_trips() {
     let fixture = ScanManifestFixture::new();
     let padded = page_align_fixture_file(&fixture);
     let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
@@ -37613,32 +37617,9 @@ fn prefault_manifest_getter_data_stops_mid_loop_on_a_latched_collection_stop() {
         4,
         "premise: four chunks to walk, one per range"
     );
-    let state = std::sync::Arc::new(std::sync::Mutex::new((false, false, 0u32)));
-    let tripped = std::sync::Arc::clone(&state);
-    engine
-        .budget
-        .set_collection_work(CollectionWork::new(move |units| {
-            let (big_seen, last_was_one, zeros) = &mut *tripped.lock().unwrap();
-            // The maps snapshot's `record_io` (hundreds of units) arms the
-            // trip; the loop's deadline poll and window charge are the
-            // first two zero-unit checkpoints after a one-unit gate past
-            // it, so failing the second latches the stop inside the first
-            // chunk's charge: admitted and charged, with the next chunk
-            // refused at the poll.
-            if units >= 100 {
-                *big_seen = true;
-            }
-            let zero_after_one = units == 0 && *last_was_one;
-            if *big_seen && zero_after_one {
-                *zeros += 1;
-                if *zeros == 2 {
-                    *last_was_one = false;
-                    return false;
-                }
-            }
-            *last_was_one = units == 1;
-            true
-        }));
+    // The second loop check trips: the first chunk admits, the second
+    // chunk's poll stops the pass.
+    engine.set_prefault_loop_trip_for_test(2);
     let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
     let skips = engine.counters.object_skips.len();
     let before = engine.budget.attempted_io_bytes();

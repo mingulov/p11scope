@@ -1422,6 +1422,59 @@ impl SealBootstrapCounts {
     }
 }
 
+/// Diagnostic-only per-stage seal counts: which gate refused or
+/// waited a seal, plus successes and current staging gauges. Counts
+/// only; no identities, paths or payloads. Disclosed on stderr when
+/// verbose text is requested, never a contract and never part of
+/// reports. Instrumentation only: it changes no Joint decision,
+/// seal, fence or gap.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SealStageCounts {
+    pub(crate) domain_tainted: u64,
+    pub(crate) image_tainted: u64,
+    pub(crate) drain_mismatch: u64,
+    pub(crate) domain_ended: u64,
+    pub(crate) closure_stale: u64,
+    pub(crate) frontier_regression: u64,
+    pub(crate) below_fence: u64,
+    pub(crate) unbound_staging: u64,
+    pub(crate) attribution_pending: u64,
+    pub(crate) claim_unmatched: u64,
+    pub(crate) fresh_birth_no_history: u64,
+    pub(crate) floors_past_frontier: u64,
+    pub(crate) abandon_return_pending: u64,
+    pub(crate) refused_return_pending: u64,
+    pub(crate) h3_pending: u64,
+    pub(crate) model_refused: u64,
+    pub(crate) success: u64,
+    pub(crate) open_staged: u64,
+    pub(crate) refused_staged: u64,
+    pub(crate) claims_held: u64,
+}
+
+/// One seal-stage gate (diagnostic-only): counted by
+/// `JournalAdapter::note_seal_stage`, never authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealStageGate {
+    DomainTainted,
+    ImageTainted,
+    DrainMismatch,
+    DomainEnded,
+    ClosureStale,
+    FrontierRegression,
+    BelowFence,
+    UnboundStaging,
+    AttributionPending,
+    ClaimUnmatched,
+    FreshBirthNoHistory,
+    FloorsPastFrontier,
+    AbandonReturnPending,
+    RefusedReturnPending,
+    H3Pending,
+    ModelRefused,
+    Success,
+}
+
 /// One seal bootstrap refusal arm (diagnostic-only): counted by
 /// `JournalAdapter::note_bootstrap_arm`, never authority.
 #[derive(Debug, Clone, Copy)]
@@ -2246,6 +2299,11 @@ pub(crate) struct JournalAdapter {
     /// bootstrap check refused a seal, by arm. Saturating;
     /// instrumentation only, never authority.
     seal_bootstrap: SealBootstrapCounts,
+    /// Diagnostic-only per-stage seal gates: which gate refused,
+    /// waited or passed a seal. Saturating; instrumentation only,
+    /// never authority. Gauges in the stored copy are stale until
+    /// `seal_stage_diagnosis` overwrites them.
+    seal_stages: SealStageCounts,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
@@ -2473,6 +2531,7 @@ impl JournalAdapter {
             reentry_taint_lifts: 0,
             reentry_quarantine_ends: 0,
             seal_bootstrap: SealBootstrapCounts::default(),
+            seal_stages: SealStageCounts::default(),
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
@@ -3766,6 +3825,92 @@ impl JournalAdapter {
     /// arms. Instrumentation only, never authority.
     pub(crate) fn seal_bootstrap_diagnosis(&self) -> SealBootstrapCounts {
         self.seal_bootstrap
+    }
+
+    /// Diagnostic-only (seal stages): count one seal-stage gate.
+    /// Saturating; instrumentation only, never authority.
+    pub(crate) fn note_seal_stage(&mut self, gate: SealStageGate) {
+        let counts = &mut self.seal_stages;
+        match gate {
+            SealStageGate::DomainTainted => {
+                counts.domain_tainted = counts.domain_tainted.saturating_add(1);
+            }
+            SealStageGate::ImageTainted => {
+                counts.image_tainted = counts.image_tainted.saturating_add(1);
+            }
+            SealStageGate::DrainMismatch => {
+                counts.drain_mismatch = counts.drain_mismatch.saturating_add(1);
+            }
+            SealStageGate::DomainEnded => {
+                counts.domain_ended = counts.domain_ended.saturating_add(1);
+            }
+            SealStageGate::ClosureStale => {
+                counts.closure_stale = counts.closure_stale.saturating_add(1);
+            }
+            SealStageGate::FrontierRegression => {
+                counts.frontier_regression = counts.frontier_regression.saturating_add(1);
+            }
+            SealStageGate::BelowFence => {
+                counts.below_fence = counts.below_fence.saturating_add(1);
+            }
+            SealStageGate::UnboundStaging => {
+                counts.unbound_staging = counts.unbound_staging.saturating_add(1);
+            }
+            SealStageGate::AttributionPending => {
+                counts.attribution_pending = counts.attribution_pending.saturating_add(1);
+            }
+            SealStageGate::ClaimUnmatched => {
+                counts.claim_unmatched = counts.claim_unmatched.saturating_add(1);
+            }
+            SealStageGate::FreshBirthNoHistory => {
+                counts.fresh_birth_no_history = counts.fresh_birth_no_history.saturating_add(1);
+            }
+            SealStageGate::FloorsPastFrontier => {
+                counts.floors_past_frontier = counts.floors_past_frontier.saturating_add(1);
+            }
+            SealStageGate::AbandonReturnPending => {
+                counts.abandon_return_pending = counts.abandon_return_pending.saturating_add(1);
+            }
+            SealStageGate::RefusedReturnPending => {
+                counts.refused_return_pending = counts.refused_return_pending.saturating_add(1);
+            }
+            SealStageGate::H3Pending => {
+                counts.h3_pending = counts.h3_pending.saturating_add(1);
+            }
+            SealStageGate::ModelRefused => {
+                counts.model_refused = counts.model_refused.saturating_add(1);
+            }
+            SealStageGate::Success => {
+                counts.success = counts.success.saturating_add(1);
+            }
+        }
+    }
+
+    /// Diagnostic-only (seal stages): adopt a retired owner's
+    /// seal-stage counters across joint-owner replacement.
+    /// Instrumentation only, never authority.
+    pub(crate) fn carry_seal_stage_counts(&mut self, carried: &SealStageCounts) {
+        // Gauges are recomputed at diagnosis; only counters carry.
+        let gauges = (
+            self.seal_stages.open_staged,
+            self.seal_stages.refused_staged,
+            self.seal_stages.claims_held,
+        );
+        self.seal_stages = *carried;
+        self.seal_stages.open_staged = gauges.0;
+        self.seal_stages.refused_staged = gauges.1;
+        self.seal_stages.claims_held = gauges.2;
+    }
+
+    /// Diagnostic-only (seal stages): snapshot the per-stage seal
+    /// gates with current staging gauges. Instrumentation only,
+    /// never authority.
+    pub(crate) fn seal_stage_diagnosis(&self) -> SealStageCounts {
+        let mut counts = self.seal_stages;
+        counts.open_staged = self.open.len() as u64;
+        counts.refused_staged = self.refused.len() as u64;
+        counts.claims_held = self.claim_counts as u64;
+        counts
     }
 
     /// Diagnostic-only (Task 0 plus the scope-round split): snapshot
@@ -8603,8 +8748,14 @@ impl JournalAdapter {
         self.seal_wait.set(SealWait::None);
         let requested = self.retained_failure_domain(bootstrap);
         let outcome = (|| {
-            self.check_collection_owner(audit)?;
+            if let Err(failure) = self.check_collection_owner(audit) {
+                if failure.gap == JournalGap::DrainMismatch {
+                    self.note_seal_stage(SealStageGate::DrainMismatch);
+                }
+                return Err(failure);
+            }
             if frontier.0 > self.consumed_through {
+                self.note_seal_stage(SealStageGate::FrontierRegression);
                 return Err(self.failure(JournalGap::FrontierRegression));
             }
             let reading = fault.fault_epoch();
@@ -8662,12 +8813,14 @@ impl JournalAdapter {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         };
         if state.refused || state.tainted {
+            self.note_seal_stage(SealStageGate::DomainTainted);
             return Err(self.failure(JournalGap::DomainTainted));
         }
         if self.image_taint_blocks(
             (key.cookie, key.exec),
             state.void_fence.max(self.voided_through),
         ) {
+            self.note_seal_stage(SealStageGate::ImageTainted);
             return Err(self.failure(JournalGap::ImageTainted));
         }
         // The collection's drain must be the EVENTS-map identity the
@@ -8679,9 +8832,11 @@ impl JournalAdapter {
         if let Some(drained) = audit.drain_domain
             && self.drain_pins.get(&key.domain_tag) != Some(&drained)
         {
+            self.note_seal_stage(SealStageGate::DrainMismatch);
             return Err(self.failure(JournalGap::DrainMismatch));
         }
         if state.era_ended {
+            self.note_seal_stage(SealStageGate::DomainEnded);
             return Err(self.failure(JournalGap::DomainEnded));
         }
         let completed = state.era_completed;
@@ -8697,6 +8852,7 @@ impl JournalAdapter {
         // The receipt's own generation must be live: a birth verified
         // under a replaced endpoint set proves nothing under this one.
         if bootstrap.closure_generation() != self.closure_generation {
+            self.note_seal_stage(SealStageGate::ClosureStale);
             return Err(self.failure(JournalGap::ClosureStale));
         }
         if let Some(stream) = bootstrap.grant.stream
@@ -8753,6 +8909,9 @@ impl JournalAdapter {
                 BirthRefusal::ImageTainted => JournalGap::ImageTainted,
                 _ => JournalGap::BootstrapMismatch,
             };
+            if gap == JournalGap::ImageTainted {
+                self.note_seal_stage(SealStageGate::ImageTainted);
+            }
             return Err(self.failure(gap));
         }
         // The birth cut pins per key-era at first seal: a later seal for
@@ -8779,6 +8938,7 @@ impl JournalAdapter {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         if frontier < state.sealed_through {
+            self.note_seal_stage(SealStageGate::FrontierRegression);
             return Err(self.failure(JournalGap::FrontierRegression));
         }
         if bootstrap.birth_cut() > frontier {
@@ -8796,6 +8956,7 @@ impl JournalAdapter {
             // Diagnostic-only (Task 0): count the below-fence ending.
             // The refusal below is unchanged.
             self.seal_below_fence = self.seal_below_fence.saturating_add(1);
+            self.note_seal_stage(SealStageGate::BelowFence);
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Unclaimed staged history barriers every seal past it: an
@@ -8805,6 +8966,7 @@ impl JournalAdapter {
         // refused S1-only subjects), each with its gap and ledger
         // accounting.
         if self.has_unbound_staging(frontier) {
+            self.note_seal_stage(SealStageGate::UnboundStaging);
             return Err(self.wait(SealWait::UnboundStaging));
         }
         // With sibling keys, every staged entry for this image needs
@@ -8815,6 +8977,7 @@ impl JournalAdapter {
         match self.attribution_readiness(key, &live, frontier, audit) {
             AttributionReadiness::Ready => {}
             AttributionReadiness::Pending => {
+                self.note_seal_stage(SealStageGate::AttributionPending);
                 return Err(self.wait(SealWait::AttributionPending));
             }
             AttributionReadiness::Unmatched(evidence) => {
@@ -8822,6 +8985,7 @@ impl JournalAdapter {
                 // history cannot be accounted for under any key. End the
                 // attempt named (like duplicate claims) instead of holding.
                 self.taint_image_at(image, TaintCause::ClaimUnmatched, evidence);
+                self.note_seal_stage(SealStageGate::ClaimUnmatched);
                 return Err(self.failure(JournalGap::ClaimUnmatched));
             }
         }
@@ -8834,6 +8998,7 @@ impl JournalAdapter {
         if !state.bootstraps.contains_key(&bootstrap.proof().era)
             && !self.has_staged_history(key, &live, bootstrap.birth_cut(), frontier)
         {
+            self.note_seal_stage(SealStageGate::FreshBirthNoHistory);
             return Err(self.wait(SealWait::FreshBirthNoHistory));
         }
         // The model's bootstrap authority is derived, not supplied:
@@ -8900,6 +9065,7 @@ impl JournalAdapter {
             .map(|entry| entry.begin_ordinal)
             .min();
         if floors > frontier {
+            self.note_seal_stage(SealStageGate::FloorsPastFrontier);
             return Err(self.wait(SealWait::FloorsPastFrontier));
         }
         let fence = match held {
@@ -8915,7 +9081,11 @@ impl JournalAdapter {
         if completed && !self.has_history_through(key, &live, frontier) {
             return self.seal_completed_era(key, bootstrap, frontier, replay);
         }
-        self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
+        let outcome = self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay);
+        if outcome.is_ok() {
+            self.note_seal_stage(SealStageGate::Success);
+        }
+        outcome
     }
 
     /// Whether any staged wire truth for one key sits at or below a
@@ -8958,6 +9128,7 @@ impl JournalAdapter {
         };
         if let Some(replay) = replay {
             let Some((steps, index)) = replay.finish(0) else {
+                self.note_seal_stage(SealStageGate::ModelRefused);
                 return Err(self.failure(JournalGap::ModelRefused));
             };
             prefix.replay_steps = steps;
@@ -8965,6 +9136,7 @@ impl JournalAdapter {
         }
         let state = self.keys.get_mut(&key).expect("sealed key");
         state.sealed_through = frontier;
+        self.note_seal_stage(SealStageGate::Success);
         Ok(SealSuccess {
             prefix,
             effects: ObjectEffects::default(),
@@ -10221,6 +10393,7 @@ impl JournalAdapter {
             }
         }
         if dooming {
+            self.note_seal_stage(SealStageGate::DomainTainted);
             return Err(self.doom_key_for_abandonment(model, key, bootstrap, &live, capable));
         }
         // This key's bounded abandonments need their corroborating
@@ -10237,6 +10410,7 @@ impl JournalAdapter {
                 })
         });
         if unready {
+            self.note_seal_stage(SealStageGate::AbandonReturnPending);
             return Err(self.wait(SealWait::AbandonReturnPending));
         }
         // Every refused begin of this key at or below the frontier needs
@@ -10247,10 +10421,11 @@ impl JournalAdapter {
                 && refused.corroborated_return.is_none_or(|at| at > frontier)
         });
         if refused_unready {
+            self.note_seal_stage(SealStageGate::RefusedReturnPending);
             return Err(self.wait(SealWait::RefusedReturnPending));
         }
         self.validate_invocation_claims(key, &live, frontier, audit)?;
-        self.convert_and_settle(
+        let outcome = self.convert_and_settle(
             model,
             key,
             bootstrap,
@@ -10258,7 +10433,13 @@ impl JournalAdapter {
             model_fence,
             replay,
             &disposable,
-        )
+        );
+        if let Err(failure) = &outcome
+            && failure.gap == JournalGap::ModelRefused
+        {
+            self.note_seal_stage(SealStageGate::ModelRefused);
+        }
+        outcome
     }
 
     fn validate_invocation_claims(
@@ -10316,6 +10497,7 @@ impl JournalAdapter {
                 // Do not let pruning/void turn this ambiguity into a later
                 // singleton winner. Taint preserves every claim unconsumed.
                 self.taint_image(identity.image, TaintCause::ClaimAmbiguity);
+                self.note_seal_stage(SealStageGate::ImageTainted);
                 return Err(self.failure(JournalGap::ImageTainted));
             }
             let claim = claims.front().expect("one exact claim");
@@ -10334,6 +10516,7 @@ impl JournalAdapter {
                 _ => false,
             };
             if !covered {
+                self.note_seal_stage(SealStageGate::H3Pending);
                 return Err(self.failure(JournalGap::H3Pending));
             }
             // The END corroborates the claim's full return-time
@@ -10344,6 +10527,7 @@ impl JournalAdapter {
                     || end.ts_ns != claim.return_ns
                     || !fingerprint_matches_event(&claim.returned, &end))
             {
+                self.note_seal_stage(SealStageGate::H3Pending);
                 return Err(self.failure(JournalGap::H3Pending));
             }
         }
@@ -33515,16 +33699,10 @@ pub(crate) mod tests {
         assert_eq!(counts.drain_mismatch, 1, "drain_mismatch counts");
         assert_eq!(counts.domain_ended, 1, "domain_ended counts");
         assert_eq!(counts.closure_stale, 1, "closure_stale counts");
-        assert_eq!(
-            counts.frontier_regression, 1,
-            "frontier_regression counts"
-        );
+        assert_eq!(counts.frontier_regression, 1, "frontier_regression counts");
         assert_eq!(counts.below_fence, 1, "below_fence counts");
         assert_eq!(counts.unbound_staging, 1, "unbound_staging counts");
-        assert_eq!(
-            counts.attribution_pending, 1,
-            "attribution_pending counts"
-        );
+        assert_eq!(counts.attribution_pending, 1, "attribution_pending counts");
         assert_eq!(counts.claim_unmatched, 1, "claim_unmatched counts");
         assert_eq!(
             counts.fresh_birth_no_history, 1,
@@ -33567,7 +33745,12 @@ pub(crate) mod tests {
         assert_eq!(counts.success, 1, "clean seal counts success");
         assert_eq!(counts.domain_tainted, 0);
         // DomainTainted: the same key refused counts its gate.
-        scene.adapter.keys.get_mut(&proof.key).expect("key held").refused = true;
+        scene
+            .adapter
+            .keys
+            .get_mut(&proof.key)
+            .expect("key held")
+            .refused = true;
         let failure = scene.seal(&bootstrap).expect_err("refused key refuses");
         assert_eq!(failure.gap, JournalGap::DomainTainted);
         let counts = scene.adapter.seal_stage_diagnosis();

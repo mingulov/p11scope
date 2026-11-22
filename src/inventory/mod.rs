@@ -2225,6 +2225,8 @@ fn run_with_terminal_budget(
             drift_tolerated,
             refresh_counts,
         ));
+        let stages = coordinator.joint_seal_stage_diagnosis();
+        inventory_diagnostic(&crate::inventory_semantics::joint_seal_stages_line(&stages));
     }
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
@@ -10044,6 +10046,8 @@ fn run_dashboard(
             drift_tolerated,
             refresh_counts,
         ));
+        let stages = coordinator.joint_seal_stage_diagnosis();
+        display.notice(&crate::inventory_semantics::joint_seal_stages_line(&stages));
     }
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);

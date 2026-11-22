@@ -363,13 +363,13 @@ pub(crate) fn cursor_key_matches_object(
 pub(crate) const SCAN_RESUME_HISTORY_FULL_SUBJECT: &str = "scan resume history full";
 
 /// Render the capacity refusal: `refused` records of unfinished work
-/// the snapshot resume history could not admit.
+/// the snapshot resume history could not admit over the run.
 pub(crate) fn scan_resume_history_full_reason(refused: u64) -> String {
     format!(
-        "{refused} unfinished object cursor record(s) could not join the snapshot resume history \
-         ({MAX_DECODE_CURSORS} tracked objects each already earned a resumed pass or still \
-         scan); their further progress cannot earn another pass, and the work left stays in \
-         the in-progress gap"
+        "{refused} resume record(s) of unfinished work were refused: the snapshot resume \
+         history tracks at most {MAX_DECODE_CURSORS} work-identity/layout pairs plus \
+         {MAX_DECODE_CURSORS} completed ones, and none could make room; the refused progress \
+         earned no further resumed pass"
     )
 }
 
@@ -423,18 +423,29 @@ impl CoveredFrontier {
 ///
 /// Capacity: at [`MAX_DECODE_CURSORS`] pairs, admitting new unfinished
 /// work evicts the oldest *unprotected completed* pair — one that arrived
-/// complete and never earned a pass, so it can never rise and dropping it
-/// costs no termination protection. Completed-only history therefore
-/// never starves advancing work. When every pair is protected or still
-/// unfinished, the unfinished record is refused, counted and named
-/// ([`SCAN_RESUME_HISTORY_FULL_SUBJECT`]); a complete arrival at capacity
-/// is simply not tracked (it can never earn a pass).
+/// complete and never earned a pass. An evicted pair moves to the bounded
+/// completion record (`completed`, at most [`MAX_DECODE_CURSORS`]
+/// pairs), and a complete arrival at capacity joins it directly: a pair
+/// in that record is covered ground for good, so a restart on a layout
+/// that once completed never earns a pass again, even after eviction.
+/// Completed-only history therefore never starves advancing work while
+/// the record has room. Admission at capacity is refused — counted and
+/// named ([`SCAN_RESUME_HISTORY_FULL_SUBJECT`]) — when no unprotected
+/// completed pair exists or the completion record is full (the victim
+/// could not be remembered). The record never shrinks, so once it is
+/// full no pair is admitted at capacity again; a complete arrival that
+/// cannot be recorded then is harmless (it can only return as a
+/// newcomer, which is refused).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ResumeHistory {
     covered: BTreeMap<(DecodeCursorKey, u64), CoveredFrontier>,
     /// Unprotected completed pairs by admission order: the only
     /// eviction candidates.
     evictable: BTreeMap<u64, (DecodeCursorKey, u64)>,
+    /// Completed pairs no longer in `covered` (evicted, or complete on
+    /// arrival at capacity): covered ground for good. Bounded by
+    /// [`MAX_DECODE_CURSORS`]; never shrinks.
+    completed: std::collections::BTreeSet<(DecodeCursorKey, u64)>,
     next_seq: u64,
     /// Some record this pass rose past covered ground.
     raised: bool,
@@ -462,15 +473,26 @@ impl ResumeHistory {
             covered.raise(progress);
             return;
         }
+        if self.completed.contains(&pair) {
+            // Ground this layout once finished: never progress again.
+            return;
+        }
         if self.covered.len() >= MAX_DECODE_CURSORS {
+            let record_room = self.completed.len() < MAX_DECODE_CURSORS;
             if progress.complete {
+                if record_room {
+                    self.completed.insert(pair);
+                }
                 return;
             }
-            let Some((_, victim)) = self.evictable.pop_first() else {
+            if !record_room || self.evictable.is_empty() {
                 self.refused = self.refused.saturating_add(1);
                 return;
-            };
-            self.covered.remove(&victim);
+            }
+            if let Some((_, victim)) = self.evictable.pop_first() {
+                self.covered.remove(&victim);
+                self.completed.insert(victim);
+            }
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);

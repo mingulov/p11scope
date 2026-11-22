@@ -883,6 +883,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// cgroup serial collector installs and takes this bundle; the other
     /// scopes keep their own budget lifetimes.
     cgroup_file_facts: crate::discovery::scan::RetainedFileFacts,
+    /// The run's counted resume-history refusals, stashed from the
+    /// bundle at every take and accepted return (see
+    /// `stash_history_refusals`).
+    history_refusals: u64,
     /// Last valid scan-progress summary while the carried bundle is out
     /// with the worker: the completed pass stashes it as it takes the
     /// bundle back, and collecting the next job stashes the same
@@ -1443,6 +1447,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_cgroup: None,
             completed_cgroup: None,
             cgroup_file_facts: crate::discovery::scan::RetainedFileFacts::default(),
+            history_refusals: 0,
             last_scan_progress: None,
             scanned_owners: BTreeSet::new(),
             churned_owners: BTreeSet::new(),
@@ -5134,6 +5139,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if self.cgroup_file_facts.has_decode_cursors() {
             self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
         }
+        self.stash_history_refusals();
+    }
+
+    /// Keep the run's counted resume-history refusals on the
+    /// coordinator: the bundle's total only rises while the bundle lives
+    /// (refusals never uncount), so the stash takes the larger of the
+    /// two — a carried total is never added twice, and a worker's
+    /// unreturned refusals never count. The stash outlives worker
+    /// custody and a discarded return.
+    fn stash_history_refusals(&mut self) {
+        self.history_refusals = self
+            .history_refusals
+            .max(self.cgroup_file_facts.resume_observation().history_refused);
     }
 
     /// Replace the stashed progress summary with the returned bundle's
@@ -5145,6 +5163,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// resume.
     fn replace_scan_progress_stash(&mut self) {
         self.last_scan_progress = self.cgroup_file_facts.scan_progress_totals();
+        self.stash_history_refusals();
     }
 
     /// The live in-progress gap for the terminal view: when decode
@@ -5171,10 +5190,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// The named resume-history capacity refusal for the terminal view:
     /// unfinished work the snapshot resume history could not admit is
-    /// counted and named, never dropped silently. `None` when nothing was
-    /// refused (or the bundle is in worker custody).
+    /// counted and named, never dropped silently. Reads the home bundle
+    /// and the coordinator's stash, so the count survives worker custody
+    /// and a discarded return. `None` when nothing was refused.
     pub(crate) fn live_scan_history_gap(&self) -> Option<crate::inventory_present::GapView> {
-        let refused = self.cgroup_file_facts.resume_observation().history_refused;
+        let refused = self
+            .history_refusals
+            .max(self.cgroup_file_facts.resume_observation().history_refused);
         (refused > 0).then(|| crate::inventory_present::GapView {
             caller: None,
             module: None,

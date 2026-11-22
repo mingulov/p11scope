@@ -884,9 +884,24 @@ if retained:
 # witness-available report cannot smuggle a lone interrupted row
 # past the qualifier; a budget or fence interruption without a
 # deadline is a different phenomenon and stays loud.
+# Both rows must carry the producer shape: the fixed subject,
+# unscoped (null caller/module/pid), and a positive integer
+# recording count (open-ended: any repeats>=1 qualifies). The
+# producer dedupes identical rows, so duplicates are malformed.
 prep=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup provider input comparison interrupted']
 if prep:
-    assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'interrupted preparation without a run deadline: %r' % (prep,)
+    for g in prep:
+        assert g.get('subject')=='cgroup provider preparation incomplete', 'malformed interrupted preparation row: %r' % (g,)
+        assert g.get('caller') is None and g.get('module') is None and g.get('pid') is None, 'malformed interrupted preparation scope: %r' % (g,)
+        assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,)
+    assert len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,)
+    deadline=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup collection deadline reached']
+    assert deadline, 'interrupted preparation without a run deadline: %r' % (prep,)
+    for g in deadline:
+        assert g.get('subject')=='cgroup scope transaction incomplete', 'malformed run deadline row: %r' % (g,)
+        assert g.get('caller') is None and g.get('module') is None and g.get('pid') is None, 'malformed run deadline scope: %r' % (g,)
+        assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,)
+    assert len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the

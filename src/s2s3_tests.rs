@@ -2651,7 +2651,14 @@ fn s2s3_same_thread_nested_inner_return_class_table() {
     // names no gap of its own (unlike the healthy `Ok` NSS twin);
     // a pending/ambiguous one names its own terminal gap; neutral
     // inners never name gaps.
-    let cells: &[(&str, CkRv, bool, Option<ObjectGap>, Option<ObjectGap>)] = &[
+    type Cell = (
+        &'static str,
+        CkRv,
+        bool,
+        Option<ObjectGap>,
+        Option<ObjectGap>,
+    );
+    let cells: &[Cell] = &[
         ("C_DigestUpdate", CkRv::DATA_INVALID, true, None, None),
         (
             "C_DigestUpdate",

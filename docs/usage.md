@@ -1779,13 +1779,14 @@ Limits that matter in pods:
   `unbound` (with `-v` beside the tallies, and as the row's `reason`
   in `--json`, section version 9); a nested pair whose inner call
   completes without effect (the sign/verify/digest/encrypt/decrypt
-  join class — a successful or ordinarily failed key use such as
-  the healthy NSS self-test `C_SignInit`) alone does not obstruct
-  otherwise provable outer outputs (so when nothing else is
-  unproven, the caller's later uses bind to the created key). An
-  inner call that fails with an object or handle error, or that
-  otherwise changes object or session state, keeps the conservative
-  shape: the outer outputs stay unknown.
+  join class or a neutral S1 operation — a successful or ordinarily
+  failed key use such as the healthy NSS self-test `C_SignInit`,
+  or a healthy `C_DigestUpdate`) alone does not obstruct otherwise
+  provable outer outputs (so when nothing else is unproven, the
+  caller's later uses bind to the created key). An inner call that
+  fails with an object or handle error, or that otherwise changes
+  object or session state, keeps the conservative shape: the outer
+  outputs stay unknown.
   Cross-thread or otherwise unprovable same-session overlap
   keeps the conservative shape: the fenced creation's outputs stay
   unknown and later uses report `unbound`. With `-v`, objects created from templates

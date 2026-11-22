@@ -2641,40 +2641,82 @@ fn s2s3_same_thread_nested_neutral_ok_inner_stays_exempt() {
 /// `SessionInvalid`, `Pending` and `Ambiguous` terminals obstruct
 /// it, whatever the inner kind. (`CKR_GENERAL_ERROR` and the
 /// healthy `CKR_OK` neutral shape carry their own retirement pins
-/// above; this table pins the remaining cells.) RED twin for the
-/// single rule: before the neutral terminal guard every neutral
-/// row bound.
+/// above, and the unit truth table pins every terminal arm
+/// including the invisible ones; this table pins the remaining
+/// end-to-end cells.) RED twin for the single rule: before the
+/// neutral terminal guard every neutral row bound.
 #[test]
 fn s2s3_same_thread_nested_inner_return_class_table() {
-    // (inner kind, return, outer binds, inner gap): `true` rows stay
-    // exempt, `false` rows keep the conservative gap and bind
-    // nothing. A failed join-class inner returns before the
-    // interference check, so it names no gap of its own (unlike the
-    // healthy `Ok` NSS twin); a pending/ambiguous one names its own
-    // terminal gap; neutral inners never name gaps.
-    let cells: &[(&str, CkRv, bool, Option<ObjectGap>)] = &[
-        ("C_DigestUpdate", CkRv::DATA_INVALID, true, None),
-        ("C_DigestUpdate", CkRv::OBJECT_HANDLE_INVALID, false, None),
-        ("C_DigestUpdate", CkRv::SESSION_CLOSED, false, None),
-        ("C_DigestUpdate", CkRv::PENDING, false, None),
-        ("C_DigestUpdate", CkRv::DEVICE_ERROR, false, None),
-        ("C_SignInit", CkRv::DATA_INVALID, true, None),
-        ("C_SignInit", CkRv::KEY_HANDLE_INVALID, false, None),
-        ("C_SignInit", CkRv::SESSION_CLOSED, false, None),
+    // (inner kind, return, outer binds, outer gap, inner gap):
+    // `true` rows stay exempt, `false` rows bind nothing. An inner
+    // that ends the session (a session-invalid close, a device-loss
+    // escalation) makes session liveness report first, so the outer
+    // names `StaleOrigin`, never the interference gap. A failed
+    // join-class inner returns before the interference check, so it
+    // names no gap of its own (unlike the healthy `Ok` NSS twin);
+    // a pending/ambiguous one names its own terminal gap; neutral
+    // inners never name gaps.
+    let cells: &[(&str, CkRv, bool, Option<ObjectGap>, Option<ObjectGap>)] = &[
+        ("C_DigestUpdate", CkRv::DATA_INVALID, true, None, None),
+        (
+            "C_DigestUpdate",
+            CkRv::OBJECT_HANDLE_INVALID,
+            false,
+            Some(ObjectGap::SameSessionOverlap),
+            None,
+        ),
+        (
+            "C_DigestUpdate",
+            CkRv::SESSION_CLOSED,
+            false,
+            Some(ObjectGap::StaleOrigin),
+            None,
+        ),
+        (
+            "C_DigestUpdate",
+            CkRv::PENDING,
+            false,
+            Some(ObjectGap::SameSessionOverlap),
+            None,
+        ),
+        (
+            "C_DigestUpdate",
+            CkRv::DEVICE_ERROR,
+            false,
+            Some(ObjectGap::StaleOrigin),
+            None,
+        ),
+        ("C_SignInit", CkRv::DATA_INVALID, true, None, None),
+        (
+            "C_SignInit",
+            CkRv::KEY_HANDLE_INVALID,
+            false,
+            Some(ObjectGap::SameSessionOverlap),
+            None,
+        ),
+        (
+            "C_SignInit",
+            CkRv::SESSION_CLOSED,
+            false,
+            Some(ObjectGap::StaleOrigin),
+            None,
+        ),
         (
             "C_SignInit",
             CkRv::PENDING,
             false,
+            Some(ObjectGap::SameSessionOverlap),
             Some(ObjectGap::PendingResultUnavailable),
         ),
         (
             "C_SignInit",
             CkRv::GENERAL_ERROR,
             false,
+            Some(ObjectGap::SameSessionOverlap),
             Some(ObjectGap::AmbiguousOutcome),
         ),
     ];
-    for (function, code, binds, inner_gap) in cells {
+    for (function, code, binds, outer_gap, inner_gap) in cells {
         let mut h = Hist::qualified();
         h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
         // Settle H1 before the outer call starts.
@@ -2700,23 +2742,18 @@ fn s2s3_same_thread_nested_inner_return_class_table() {
                 created(&effects, outer, 0).is_some(),
                 "{function} {code:?}: an effect-neutral terminal stays exempt"
             );
-            assert_eq!(
-                unresolved(&effects, outer),
-                None,
-                "{function} {code:?}: an effect-neutral terminal names no outer gap"
-            );
         } else {
             assert_eq!(
                 created(&effects, outer, 0),
                 None,
                 "{function} {code:?}: an effectful terminal obstructs the outer outputs"
             );
-            assert_eq!(
-                unresolved(&effects, outer),
-                Some(ObjectGap::SameSessionOverlap),
-                "{function} {code:?}: an effectful terminal keeps the conservative gap"
-            );
         }
+        assert_eq!(
+            unresolved(&effects, outer),
+            *outer_gap,
+            "{function} {code:?}: outer gap"
+        );
         assert_eq!(
             unresolved(&effects, inner),
             *inner_gap,

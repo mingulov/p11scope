@@ -2103,31 +2103,51 @@ impl ModelState {
         true
     }
 
+    /// Whether one observed terminal leaves every object binding
+    /// and session untouched, whatever the call kind: the single
+    /// return-class table behind the nested exemption. The table is
+    /// decided from the terminal class before — and independently
+    /// of — the inner call's own effects, so an exempt inner
+    /// provably applies none: `Ok`/`Partial` join a binding without
+    /// retiring it; `Failed` is an ordinary ordered failure with no
+    /// effect. `InvalidHandle` ends the named binding's access,
+    /// `SessionInvalid` closes the acting session (both arms run
+    /// outside the Neutral action arm), and `Pending`/`Ambiguous`
+    /// may have acted — the scope retirement and session-loss
+    /// escalations run for every kind, neutral included. An unknown
+    /// terminal never qualifies (fail-closed).
+    fn terminal_effect_neutral(outcome: Option<Outcome>) -> bool {
+        match outcome {
+            Some(Outcome::Ok | Outcome::Partial) => true,
+            Some(Outcome::Failed) => true,
+            Some(Outcome::InvalidHandle) => false,
+            Some(Outcome::SessionInvalid) => false,
+            Some(Outcome::Pending | Outcome::Ambiguous) => false,
+            None => false,
+        }
+    }
+
     /// Whether a strictly-nested same-thread inner call is exempt
     /// from obstructing its outer call: the sign/verify/digest/
-    /// encrypt/decrypt join class (`Access`/`OperationImport`) with
-    /// an effect-neutral terminal. `Ok`/`Partial` join a binding
-    /// without retiring it; `Failed` is an ordinary ordered failure
-    /// with no effect. `InvalidHandle` ends the named binding's
-    /// access, `SessionInvalid` closes the acting session, and
-    /// `Pending`/`Ambiguous` may have acted — none of them is
-    /// neutral. An unknown terminal never qualifies (fail-closed).
+    /// encrypt/decrypt join class (`Access`/`OperationImport`) or a
+    /// neutral S1 operation, with an effect-neutral terminal from
+    /// the single table above.
     fn nested_inner_effect_neutral(inner: &PendingCall) -> bool {
         matches!(
             inner.kind,
             CallKind::Object(ObjectAction::Access | ObjectAction::OperationImport)
-        ) && matches!(
-            inner.outcome(),
-            Some(Outcome::Ok | Outcome::Partial | Outcome::Failed)
-        )
+                | CallKind::Neutral
+        ) && Self::terminal_effect_neutral(inner.outcome())
     }
 
     /// Overlapping calls (with known outcomes, guaranteed by the watermark)
-    /// that may alter what this call's joins rely on. Neutral calls take
-    /// no part as either side: they apply no joins to protect, and they
-    /// apply no object effect that could alter another call's joins.
-    /// Their overlap participation is cut ordering (the watermark), which
-    /// the settlement path already enforces.
+    /// that may alter what this call's joins rely on. A neutral call
+    /// applies no joins to protect, so as the outer side it never
+    /// names a gap; as the inner side it bypasses only on an
+    /// effect-neutral terminal, since its session close and
+    /// scope/session-loss escalations can alter another call's
+    /// joins. Overlap participation is otherwise cut ordering (the
+    /// watermark), which the settlement path already enforces.
     fn interference(&self, token: CallToken) -> (Option<ObjectGap>, bool) {
         let x = &self.pending[&token];
         if x.kind == CallKind::Neutral {
@@ -2190,7 +2210,13 @@ impl ModelState {
             if y.fenced || y.begin >= x_end || y.end_cut().is_some_and(|end| end <= x.begin) {
                 continue;
             }
-            if y.kind == CallKind::Neutral {
+            // A neutral inner bypasses only on an effect-neutral
+            // terminal, under the same single rule as the join
+            // class below: its session close and scope/session-loss
+            // escalations run outside the Neutral action arm, so a
+            // neutral inner that fails with one still obstructs the
+            // outer through the same-session gap.
+            if y.kind == CallKind::Neutral && Self::nested_inner_effect_neutral(y) {
                 continue;
             }
             if let (Some(a), Some(b)) = (x.session_handle(), y.session_handle())
@@ -2208,20 +2234,20 @@ impl ModelState {
                 // from the pre-scan above; its issuer is never
                 // proven.) The exemption covers only the
                 // sign/verify/digest/encrypt/decrypt class — neutral
-                // S1 operations (already skipped above) and
-                // `Access`/`OperationImport` joins that complete
-                // without effect (`Ok`/`Partial` reads and ordinary
-                // `Failed` returns). An inner that fails with an
-                // object/handle error (`InvalidHandle` retires the
-                // binding it named; `SessionInvalid` closes the
-                // session) or whose effect is unproven
-                // (`Pending`/`Ambiguous`, or no terminal yet) is not
-                // exempt: the inner still applies its own
-                // retirement, and the outer keeps the conservative
-                // gap below. Any other nested inner call (creation,
-                // destruction, lookup, attribute write,
-                // session/login lifecycle) falls through to the
-                // conservative gap below, so its destroy and
+                // S1 operations and `Access`/`OperationImport` joins
+                // — that complete without effect (`Ok`/`Partial`
+                // reads and ordinary `Failed` returns, one shared
+                // return-class table whatever the kind). An inner
+                // that fails with an object/handle error
+                // (`InvalidHandle` retires the binding it named;
+                // `SessionInvalid` closes the session) or whose
+                // effect is unproven (`Pending`/`Ambiguous`, or no
+                // terminal yet) is not exempt: the inner still
+                // applies its own retirement, and the outer keeps
+                // the conservative gap below. Any other nested inner
+                // call (creation, destruction, lookup, attribute
+                // write, session/login lifecycle) falls through to
+                // the conservative gap below, so its destroy and
                 // lifecycle effects are never silently ignored.
                 // Cross-thread or otherwise unprovable overlap keeps
                 // the conservative gap.
@@ -5064,6 +5090,33 @@ fn requested_seen(list: Option<&AttributeList>) -> [bool; METADATA_FIELDS] {
 mod tests {
     use super::*;
     use p11scope_ebpf_common::object_policy::SafeCurve;
+
+    /// The nested exemption's single return-class table, pinned
+    /// cell by cell: only `Ok`, `Partial` and ordinary `Failed`
+    /// terminals leave bindings and sessions untouched. Every
+    /// other class — including `SessionInvalid` and the unknown
+    /// terminal, whose withholding is invisible end-to-end because
+    /// session liveness refuses first — withholds the exemption.
+    /// A flipped arm fails here.
+    #[test]
+    fn nested_exemption_terminal_table() {
+        for (outcome, neutral) in [
+            (Some(Outcome::Ok), true),
+            (Some(Outcome::Partial), true),
+            (Some(Outcome::Failed), true),
+            (Some(Outcome::InvalidHandle), false),
+            (Some(Outcome::SessionInvalid), false),
+            (Some(Outcome::Pending), false),
+            (Some(Outcome::Ambiguous), false),
+            (None, false),
+        ] {
+            assert_eq!(
+                ModelState::terminal_effect_neutral(outcome),
+                neutral,
+                "terminal table cell {outcome:?}"
+            );
+        }
+    }
 
     /// No naive redemption in the completion primitive: origins mint
     /// only for calls with a staged completion (`apply_end`), while

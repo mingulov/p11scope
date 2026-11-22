@@ -2613,29 +2613,37 @@ impl FamilyState {
 /// contributes exactly like any other mechanism evidence through
 /// [`FamilyState::accumulate_family`]. `use_mechanism` is the
 /// mechanism typing THIS key (`None` for wrapped keys, whose wrap
-/// mechanism never applies to them).
+/// mechanism never applies to them). `key_type_present` is the raw
+/// established key-type presence: an admitted but unmapped type
+/// (no [`crate::keymeta::EstablishedKind`]) still stands against
+/// the fallback — only a genuinely unknown type permits it.
+/// Returns whether the seed fired. Call sites run the seed first
+/// and skip their use-side increment when it fires, so one
+/// completion selects one evidence path and counts once.
 fn seed_creation_family(
     family: &mut FamilyState,
     established: Option<crate::keymeta::EstablishedKind>,
     established_type: Option<crate::keymeta::EstablishedKind>,
+    key_type_present: bool,
     use_mechanism: Option<u64>,
     creation_mechanism: Option<u32>,
-) {
+) -> bool {
     use crate::keymeta::infer_family;
-    if established.is_some() || established_type.is_some() {
-        return;
+    if established.is_some() || established_type.is_some() || key_type_present {
+        return false;
     }
     if use_mechanism.is_some_and(|id| infer_family(id).is_some()) {
-        return;
+        return false;
     }
     let Some(created) = creation_mechanism else {
-        return;
+        return false;
     };
     let created = u64::from(created);
     if infer_family(created).is_none() {
-        return;
+        return false;
     }
     family.accumulate_family(established_type, created);
+    true
 }
 
 impl SizeState {
@@ -2844,6 +2852,10 @@ struct OpenAssoc {
     /// mechanism id in the 32-bit namespace, or `None` for every
     /// other origin.
     creation_mechanism: Option<u32>,
+    /// Whether the receipt carried an established key-type code at
+    /// admission, mapped or not: an admitted but unmapped type
+    /// still stands against the creation fallback.
+    has_key_type: bool,
 }
 
 /// One receipt resolved to its bucket at admission, before any
@@ -3223,6 +3235,7 @@ impl KeyUseReducer {
                             established,
                             established_type,
                             creation_mechanism: receipt.creation_mechanism,
+                            has_key_type: receipt.key_type.is_some(),
                         }
                     })
                     .collect();
@@ -3432,20 +3445,23 @@ impl KeyUseReducer {
             let AssocBucket::Proved(bucket) = assoc.bucket else {
                 continue;
             };
-            if let Some(mechanism) = open.mechanism {
+            // One evidence path per completion: a firing creation
+            // seed subsumes the use-side increment.
+            let seeded = seed_creation_family(
+                &mut self.inferred.entry(bucket).or_default().family,
+                assoc.established,
+                assoc.established_type,
+                assoc.has_key_type,
+                open.mechanism,
+                assoc.creation_mechanism,
+            );
+            if !seeded && let Some(mechanism) = open.mechanism {
                 self.inferred
                     .entry(bucket)
                     .or_default()
                     .family
                     .accumulate_family(assoc.established_type, mechanism);
             }
-            seed_creation_family(
-                &mut self.inferred.entry(bucket).or_default().family,
-                assoc.established,
-                assoc.established_type,
-                open.mechanism,
-                assoc.creation_mechanism,
-            );
             self.inferred
                 .entry(bucket)
                 .or_default()
@@ -3507,7 +3523,20 @@ impl KeyUseReducer {
                     // from it; unclassifiable roles stay blank.
                     match receipt.role {
                         KeyRole::WrappedKey => {
-                            if mechanism.is_some() {
+                            // The wrap mechanism never types this
+                            // key, so the use side is `None`: only
+                            // the creation side can seed. A firing
+                            // seed subsumes the operation-key-only
+                            // increment below.
+                            let seeded = seed_creation_family(
+                                &mut self.inferred.entry(bucket).or_default().family,
+                                established,
+                                established_type,
+                                receipt.key_type.is_some(),
+                                None,
+                                receipt.creation_mechanism,
+                            );
+                            if !seeded && mechanism.is_some() {
                                 let state = &mut self.inferred.entry(bucket).or_default().family;
                                 // The wrap mechanism is family
                                 // evidence (of its operation-key
@@ -3518,36 +3547,30 @@ impl KeyUseReducer {
                                     state.reason = Some(REASON_OPERATION_KEY_ONLY);
                                 }
                             }
-                            // The wrap mechanism never types this
-                            // key, so the use side is `None`: only
-                            // the creation side can seed.
-                            seed_creation_family(
-                                &mut self.inferred.entry(bucket).or_default().family,
-                                established,
-                                established_type,
-                                None,
-                                receipt.creation_mechanism,
-                            );
                         }
                         KeyRole::WrappingKey
                         | KeyRole::UnwrappingKey
                         | KeyRole::BaseKey
                         | KeyRole::EncapsulationKey
                         | KeyRole::DecapsulationKey => {
-                            if let Some(mechanism) = mechanism {
+                            // One evidence path per completion: a
+                            // firing creation seed subsumes the
+                            // use-side increment.
+                            let seeded = seed_creation_family(
+                                &mut self.inferred.entry(bucket).or_default().family,
+                                established,
+                                established_type,
+                                receipt.key_type.is_some(),
+                                mechanism,
+                                receipt.creation_mechanism,
+                            );
+                            if !seeded && let Some(mechanism) = mechanism {
                                 self.inferred
                                     .entry(bucket)
                                     .or_default()
                                     .family
                                     .accumulate_family(established_type, mechanism);
                             }
-                            seed_creation_family(
-                                &mut self.inferred.entry(bucket).or_default().family,
-                                established,
-                                established_type,
-                                mechanism,
-                                receipt.creation_mechanism,
-                            );
                         }
                         KeyRole::OperationKey | KeyRole::Other => {}
                     }

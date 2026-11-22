@@ -776,5 +776,85 @@ class StraddleShapeTests(unittest.TestCase):
                     self.assertIn(message, out)
 
 
+class DeadlineOnlyShapeTests(unittest.TestCase):
+    # Fix3 (Codex B1): the deadline row carries the same producer
+    # shape with or without a preparation-interruption row — a clean
+    # preparation pass can still hit the run deadline (the retained
+    # refresh shape proves it). Every deadline assert owns an
+    # independent deadline-only twin (no prep row) with its targeted
+    # message on both substrates. (name, drop, over,
+    # extra_deadline, message).
+    CASES = [
+        ("deadline drops caller", ("caller",), {}, False,
+         "malformed run deadline scope"),
+        ("deadline drops module", ("module",), {}, False,
+         "malformed run deadline scope"),
+        ("deadline drops pid", ("pid",), {}, False,
+         "malformed run deadline scope"),
+        ("deadline drops budget", ("budget",), {}, False,
+         "malformed run deadline budget"),
+        ("deadline carries a budget refusal", (),
+         {"budget": SPURIOUS_BUDGET}, False,
+         "malformed run deadline budget"),
+        ("deadline wrong subject only", (),
+         {"subject": "wrong subject"}, False,
+         "malformed run deadline row"),
+        ("deadline caller value only", (), {"caller": "c0"}, False,
+         "malformed run deadline scope"),
+        ("deadline zero count", (), {"repeats": 0}, False,
+         "malformed run deadline count"),
+        ("duplicate deadline rows", (), {}, True,
+         "duplicate run deadline rows"),
+    ]
+
+    def test_deadline_only_valid_shape_passes_on_both_substrates(self):
+        # Control: one producer-exact deadline row with no prep and
+        # no retained row qualifies on both substrates (open-ended
+        # positive; the retained-refresh positives cover the paired
+        # shape).
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            with self.subTest(substrate=modfs):
+                report = base()
+                report["gaps"].append(straddle_deadline_row())
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertEqual(rc, 0, out)
+
+    def test_single_field_mutations_fail_without_prep_row(self):
+        self.assertEqual(len(self.CASES), 9)
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            for name, drop, over, extra_deadline, message in self.CASES:
+                with self.subTest(substrate=modfs, case=name):
+                    report = base()
+                    report["gaps"].append(
+                        straddle_deadline_row(drop=drop, over=over))
+                    if extra_deadline:
+                        report["gaps"].append(straddle_deadline_row())
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(message, out)
+
+    def test_retained_refresh_with_malformed_deadline_fails_without_prep(self):
+        # The retained-refresh presence check reuses the validated
+        # deadline collection: a retained row plus a malformed
+        # deadline (no prep) stays loud with the deadline message,
+        # not the retained message.
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            with self.subTest(substrate=modfs):
+                report = base()
+                report["gaps"].append(
+                    straddle_deadline_row(drop=("caller",)))
+                report["gaps"].append(
+                    {"caller": "c0", "module": None, "pid": 100,
+                     "reason": REFRESH_RETAINED,
+                     "subject": "native owner refresh refused",
+                     "repeats": 1})
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("malformed run deadline scope", out)
+
+
 if __name__ == "__main__":
     unittest.main()

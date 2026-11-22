@@ -21983,6 +21983,138 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_exit_return_drain_opens_session_from_tail_free_call() {
+        // C_OpenSession drain twin of
+        // object_journal_exit_return_drain_recovers_tail_free_call:
+        // the only tail-free function whose drained completion mints
+        // something extra. The recovered session word must open the
+        // returned session, proving the drained value words (not just
+        // the disposition) flow from the corroborating return.
+        use crate::semantics_objects::SessionOrigin;
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        // The fence sits strictly above the corroborated bound, so the
+        // frontier must cover it: one pad record.
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("drained return seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let settled = &success.prefix.settled()[0];
+        assert!(
+            !settled.abandoned,
+            "the drained call completes, never abandons"
+        );
+        assert_eq!(
+            settled.end_cut,
+            Some(3),
+            "the completion cut is the abandonment ordinal"
+        );
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::SessionOpened { .. }
+            )),
+            "the drained handle opens its session: {:?}",
+            success.effects.effects
+        );
+        let opened = scene
+            .model
+            .project()
+            .sessions
+            .iter()
+            .filter(|view| view.origin == SessionOrigin::Opened)
+            .count();
+        assert_eq!(opened, 1, "one session opens from the drained words");
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "no outcome is lost: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_exit_return_drain_failed_open_mints_no_session() {
+        // Value twin of the C_OpenSession drain: a failed (non-OK)
+        // drained return still completes (never abandons), but mints
+        // no session. The recovered rv flows from the corroborating
+        // return; a drained OK and a drained failure stay distinct.
+        use crate::semantics_objects::SessionOrigin;
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 5)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        // The fence sits strictly above the corroborated bound, so the
+        // frontier must cover it: one pad record.
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("drained return seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let settled = &success.prefix.settled()[0];
+        assert!(
+            !settled.abandoned,
+            "the drained call completes, never abandons"
+        );
+        assert_eq!(
+            settled.end_cut,
+            Some(3),
+            "the completion cut is the abandonment ordinal"
+        );
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::SessionOpened { .. }
+            )),
+            "a failed open mints no session: {:?}",
+            success.effects.effects
+        );
+        let opened = scene
+            .model
+            .project()
+            .sessions
+            .iter()
+            .filter(|view| view.origin == SessionOrigin::Opened)
+            .count();
+        assert_eq!(opened, 0, "a failed open mints no session");
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "no outcome is lost: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
     fn joint_keepup_seal_validation_census_is_linear_in_retained() {
         // The live-feed seal attributes every converting call: with a
         // full open table the attribution census must visit each

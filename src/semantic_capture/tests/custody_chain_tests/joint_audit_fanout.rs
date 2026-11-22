@@ -32922,7 +32922,7 @@ fn joint_replay_steps_drained_conversion_completes_tail_free_call() {
     assert_eq!(
         second.prefix.settled()[0].end_cut,
         Some(recovered_cut),
-        "the return cut is the corroborated ordinal"
+        "the completion cut is the abandonment ordinal"
     );
     assert_eq!(second.prefix.replay_calls().len(), 2);
     assert_eq!(

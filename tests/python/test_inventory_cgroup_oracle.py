@@ -169,7 +169,7 @@ class AcceptTests(unittest.TestCase):
         # refusal its designed disclosure, so the shape qualifies.
         report = decided_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": "cgroup scope transaction incomplete",
              "repeats": 2})
@@ -188,7 +188,7 @@ class AcceptTests(unittest.TestCase):
         # the deadline gap and one retained row per caller qualifies.
         report = witness_available_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": "cgroup scope transaction incomplete",
              "repeats": 2})
@@ -223,12 +223,12 @@ class AcceptTests(unittest.TestCase):
         # preparation its designed disclosure, so the shape qualifies.
         report = decided_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -248,12 +248,12 @@ class AcceptTests(unittest.TestCase):
         # qualifies.
         report = witness_available_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -420,7 +420,7 @@ class RefuseTests(unittest.TestCase):
         # the same caller stays loud even with the deadline present.
         report = decided_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": "cgroup scope transaction incomplete",
              "repeats": 2})
@@ -457,7 +457,7 @@ class RefuseTests(unittest.TestCase):
         # deadline present on a witness-available report.
         report = witness_available_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": "cgroup scope transaction incomplete",
              "repeats": 2})
@@ -482,7 +482,7 @@ class RefuseTests(unittest.TestCase):
         # interruption without a deadline is a different phenomenon).
         report = decided_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
@@ -495,7 +495,7 @@ class RefuseTests(unittest.TestCase):
         # preparation stays loud on a witness-available report.
         report = witness_available_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
@@ -508,12 +508,12 @@ class RefuseTests(unittest.TestCase):
         # without its count is malformed and stays loud even with the
         # deadline present.
         report = decided_report()
-        prep = {"caller": None, "module": None, "pid": None,
+        prep = {"caller": None, "module": None, "pid": None, "budget": None,
                 "reason": PREP_INPUT_INTERRUPTED,
                 "subject": PREP_SUBJECT}
         report["gaps"].append(prep)
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -523,12 +523,12 @@ class RefuseTests(unittest.TestCase):
 
     def test_preparation_interrupted_with_missing_count_fails_witness_available(self):
         report = witness_available_report()
-        prep = {"caller": None, "module": None, "pid": None,
+        prep = {"caller": None, "module": None, "pid": None, "budget": None,
                 "reason": PREP_INPUT_INTERRUPTED,
                 "subject": PREP_SUBJECT}
         report["gaps"].append(prep)
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -541,12 +541,12 @@ class RefuseTests(unittest.TestCase):
         # counts recordings, so zero authorizes nothing.
         report = decided_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 0})
@@ -557,12 +557,12 @@ class RefuseTests(unittest.TestCase):
     def test_preparation_interrupted_with_zero_deadline_count_fails_witness_available(self):
         report = witness_available_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 0})
@@ -580,7 +580,7 @@ class RefuseTests(unittest.TestCase):
              "subject": "wrong subject",
              "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -596,7 +596,7 @@ class RefuseTests(unittest.TestCase):
              "subject": "wrong subject",
              "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -609,7 +609,7 @@ class RefuseTests(unittest.TestCase):
         # satisfy the straddle guard.
         report = decided_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
@@ -625,7 +625,7 @@ class RefuseTests(unittest.TestCase):
     def test_preparation_interrupted_with_wrong_deadline_subject_and_caller_fails_witness_available(self):
         report = witness_available_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": PREP_INPUT_INTERRUPTED,
              "subject": PREP_SUBJECT,
              "repeats": 1})
@@ -644,12 +644,12 @@ class RefuseTests(unittest.TestCase):
         report = decided_report()
         for _ in range(2):
             report["gaps"].append(
-                {"caller": None, "module": None, "pid": None,
+                {"caller": None, "module": None, "pid": None, "budget": None,
                  "reason": PREP_INPUT_INTERRUPTED,
                  "subject": PREP_SUBJECT,
                  "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
@@ -661,18 +661,119 @@ class RefuseTests(unittest.TestCase):
         report = witness_available_report()
         for _ in range(2):
             report["gaps"].append(
-                {"caller": None, "module": None, "pid": None,
+                {"caller": None, "module": None, "pid": None, "budget": None,
                  "reason": PREP_INPUT_INTERRUPTED,
                  "subject": PREP_SUBJECT,
                  "repeats": 1})
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": DEADLINE,
              "subject": DEADLINE_SUBJECT,
              "repeats": 2})
         rc, out = run_oracle(report, modfs="ext4")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("duplicate interrupted preparation rows", out)
+
+
+def straddle_prep_row(*, drop=(), over=None):
+    """One producer-exact interrupted-preparation row.
+
+    The JSON renderer always emits `caller`, `module`, `pid` and
+    `budget` (`src/inventory/mod.rs`); both producer sites file null
+    scope with no budget (`src/discovery/inventory_coordinator.rs`).
+    `drop` removes keys (absent is not null), `over` overrides values.
+    """
+    row = {"caller": None, "module": None, "pid": None, "budget": None,
+           "reason": PREP_INPUT_INTERRUPTED,
+           "subject": PREP_SUBJECT,
+           "repeats": 1}
+    for key in drop:
+        del row[key]
+    row.update(over or {})
+    return row
+
+
+def straddle_deadline_row(*, drop=(), over=None):
+    """One producer-exact run-deadline row (same shape, its subject)."""
+    row = {"caller": None, "module": None, "pid": None, "budget": None,
+           "reason": DEADLINE,
+           "subject": DEADLINE_SUBJECT,
+           "repeats": 2}
+    for key in drop:
+        del row[key]
+    row.update(over or {})
+    return row
+
+
+# A producer-shaped budget refusal: neither straddle row may carry one.
+SPURIOUS_BUDGET = {"resource": "inventory_endpoints", "limit": 1,
+                   "requested": 2}
+
+
+class StraddleShapeTests(unittest.TestCase):
+    # Fix2 (Codex B1 + NB3): each straddle row carries its null-valued
+    # keys explicitly, and every guard assert owns an independent
+    # single-field twin with its targeted message — removing any one
+    # assert (subject, scope, budget, duplicate) must fail its twins on
+    # both substrates. (name, prep_drop, prep_over, deadline_drop,
+    # deadline_over, extra_deadline, message).
+    CASES = [
+        ("prep drops caller", ("caller",), {}, (), {}, False,
+         "malformed interrupted preparation scope"),
+        ("prep drops module", ("module",), {}, (), {}, False,
+         "malformed interrupted preparation scope"),
+        ("prep drops pid", ("pid",), {}, (), {}, False,
+         "malformed interrupted preparation scope"),
+        ("prep drops budget", ("budget",), {}, (), {}, False,
+         "malformed interrupted preparation budget"),
+        ("prep carries a budget refusal", (), {"budget": SPURIOUS_BUDGET},
+         (), {}, False, "malformed interrupted preparation budget"),
+        ("prep wrong subject only", (), {"subject": "wrong subject"},
+         (), {}, False, "malformed interrupted preparation row"),
+        ("prep caller value only", (), {"caller": "c0"},
+         (), {}, False, "malformed interrupted preparation scope"),
+        # No module-value twin: a module-bound straddle row is refused
+        # earlier by the owned-module check (fail-closed), so it can
+        # never reach the scope assert; the drop-module twin above pins
+        # the scope assert's module clause instead.
+        ("deadline drops caller", (), {}, ("caller",), {}, False,
+         "malformed run deadline scope"),
+        ("deadline drops module", (), {}, ("module",), {}, False,
+         "malformed run deadline scope"),
+        ("deadline drops pid", (), {}, ("pid",), {}, False,
+         "malformed run deadline scope"),
+        ("deadline drops budget", (), {}, ("budget",), {}, False,
+         "malformed run deadline budget"),
+        ("deadline carries a budget refusal", (), {},
+         (), {"budget": SPURIOUS_BUDGET}, False,
+         "malformed run deadline budget"),
+        ("deadline wrong subject only", (), {},
+         (), {"subject": "wrong subject"}, False,
+         "malformed run deadline row"),
+        ("deadline caller value only", (), {},
+         (), {"caller": "c0"}, False, "malformed run deadline scope"),
+        ("duplicate deadline rows", (), {}, (), {}, True,
+         "duplicate run deadline rows"),
+    ]
+
+    def test_single_field_mutations_fail_on_both_substrates(self):
+        self.assertEqual(len(self.CASES), 15)
+        for modfs, base in (("overlayfs", decided_report),
+                            ("ext4", witness_available_report)):
+            for (name, prep_drop, prep_over, deadline_drop,
+                    deadline_over, extra_deadline, message) in self.CASES:
+                with self.subTest(substrate=modfs, case=name):
+                    report = base()
+                    report["gaps"].append(
+                        straddle_prep_row(drop=prep_drop, over=prep_over))
+                    report["gaps"].append(
+                        straddle_deadline_row(drop=deadline_drop,
+                                             over=deadline_over))
+                    if extra_deadline:
+                        report["gaps"].append(straddle_deadline_row())
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(message, out)
 
 
 if __name__ == "__main__":

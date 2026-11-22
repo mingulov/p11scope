@@ -877,6 +877,16 @@ retained=[g for g in report.get('gaps',[]) if g.get('reason')=='the final-sample
 if retained:
     assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'retained refresh without a run deadline: %r' % (retained,)
     assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
+# The interrupted provider-input comparison only comes with a
+# run-deadline straddle on every substrate: the pass was cancelled
+# mid-preparation, so the deadline gap must be present in the same
+# run. This runs outside the degraded branch so a
+# witness-available report cannot smuggle a lone interrupted row
+# past the qualifier; a budget or fence interruption without a
+# deadline is a different phenomenon and stays loud.
+prep=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup provider input comparison interrupted']
+if prep:
+    assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'interrupted preparation without a run deadline: %r' % (prep,)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the
@@ -898,6 +908,10 @@ if degraded:
     # at any outcome) and retains its facts: the incomplete
     # transaction marks nobody, the disclosure names the caller, and
     # the owner's data stays published. One row per owning caller.
+    # A pass cancelled mid-preparation discloses its interrupted
+    # input comparison by name (run 44960926490, v7.3.1 leg):
+    # the deadline bound above plus this row is the designed
+    # straddle shape, guarded by the deadline presence check above.
     # The bare member-lost variant (no retention suffix: the member
     # died after the final sample of a still-complete transaction)
     # is deliberately NOT known here: it fails loudly below.
@@ -905,7 +919,7 @@ if degraded:
     # the shared transaction, so 'cgroup member scan was incomplete'
     # is deliberately NOT known here: its reappearance fails loudly
     # below instead of hiding.
-    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained'}
+    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained','cgroup provider input comparison interrupted'}
     assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
     assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))

@@ -26909,13 +26909,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn object_journal_quarantine_end_mint_inherits_parent_fence() {
-        // Fence inheritance: a post-void mint carries its parent's
-        // void fence, so a capable doom before the next void still
-        // mints on new proof instead of stranding unfenced. K0
+    fn object_journal_quarantine_end_mint_needs_only_global_fence() {
+        // Global fence: a post-void mint stays unfenced (newborns
+        // inherit nothing — the death rule keeps its per-void-era
+        // brake), yet its capable doom before the next void still
+        // mints on new proof, scoped on the global fence. K0
         // exit-doomed by a void mints K1; K1 tracks, then dooms
         // capably at seal time with no further void; new proof
-        // mints K2 on the inherited fence.
+        // mints K2 on the global fence.
         use p11scope_ebpf_common::object_journal::{
             JOURNAL_REASON_EXEC_EXIT, JOURNAL_REASON_SCOPE_LOST,
         };
@@ -26981,9 +26982,9 @@ pub(crate) mod tests {
             .attest_key(&admitted)
             .expect("an exit doom mints");
         assert_ne!(reborn.key, proof.key, "K1 mints past the exit doom");
-        assert!(
-            scene.adapter.keys[&reborn.key].void_fence > 0,
-            "the mint inherits its parent's fence"
+        assert_eq!(
+            scene.adapter.keys[&reborn.key].void_fence, 0,
+            "newborn keys start unfenced"
         );
         scene
             .paired_admissions
@@ -27053,12 +27054,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn object_journal_quarantine_end_sibling_bind_inherits_fenced_sibling_fence() {
-        // An F1-born sibling inherits the authorizing sibling's
-        // fence, so its own capable doom before the next void still
-        // mints on new proof. K0 fenced by a void authorizes S0;
-        // S0 tracks, then dooms capably at seal time with no
-        // further void; new proof mints S0's next incarnation.
+    fn object_journal_quarantine_end_sibling_needs_only_global_fence() {
+        // An F1-born sibling stays unfenced, yet its own capable
+        // doom before the next void still mints on new proof,
+        // scoped on the global fence. K0 fenced by a void
+        // authorizes S0; S0 tracks, then dooms capably at seal time
+        // with no further void; new proof mints S0's next
+        // incarnation.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
         use pkcs11_types::CkRv;
@@ -27111,9 +27113,9 @@ pub(crate) mod tests {
             .adapter
             .attest_key(&admitted)
             .expect("a sibling binds past a void-fenced sibling");
-        assert!(
-            scene.adapter.keys[&sibling.key].void_fence > 0,
-            "the sibling bind inherits the authorizing fence"
+        assert_eq!(
+            scene.adapter.keys[&sibling.key].void_fence, 0,
+            "newborn keys start unfenced"
         );
         scene
             .paired_admissions

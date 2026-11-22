@@ -1907,6 +1907,10 @@ pub(crate) struct SemanticCapture {
     /// At most one entry per pending or bound image.
     retained: BTreeMap<(u64, u64), (u64, Instant)>,
     terminal_cursor: u64,
+    /// Resume cursor (awaiting token) for the held-admission requeue:
+    /// each pass visits held keys after it, then wraps. This carries
+    /// no authority.
+    held_requeue_cursor: u64,
     /// Fairness among tick-local Joined partitions when Pending scans leave
     /// fewer scan slots than the later calls need. This carries no authority.
     joined_refresh_cursor: Option<(u64, u64, u32)>,
@@ -2060,6 +2064,7 @@ impl SemanticCapture {
             retention_attach_ticks: current_uptime_ticks(),
             retained: BTreeMap::new(),
             terminal_cursor: 0,
+            held_requeue_cursor: 0,
             joined_refresh_cursor: None,
             fault: 0,
             sticky: 0,
@@ -4817,6 +4822,87 @@ impl SemanticCapture {
         self.prune_jobs();
     }
 
+    /// Queue admission jobs for held keys whose pins have since arrived.
+    /// A record collected while its task had no pin waits with no job, and
+    /// no later batch revisits it; without this pass it never scans even
+    /// after the coordinator admits its task. Visits at most `scans`
+    /// distinct keys per pass from the resume cursor (wrapping), queueing
+    /// only keys with a live pin, no existing job, no retirement and room
+    /// to bind; every other key keeps waiting for a later pass, its
+    /// horizon, or stop. Queued jobs join the sweep below, so no new
+    /// budget is spent: the sweep's own bound paces them. Never sheds.
+    fn requeue_held_admissions(
+        &mut self,
+        io: &mut impl CaptureIo,
+        birth_cut: &Option<(
+            JournalBirthCut,
+            crate::semantics_objects::journal::joint_driver::RawQuantumIdentity,
+        )>,
+        report: &mut TickReport,
+    ) {
+        let bound = self.limits.scans;
+        let start = self.held_requeue_cursor;
+        let mut seen: BTreeSet<(u64, u64, u32)> = BTreeSet::new();
+        let mut candidates: Vec<(ImageIdentity, Endpoint, u32, u32)> = Vec::new();
+        let mut last = start;
+        {
+            let after = self
+                .awaiting
+                .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded));
+            let wrapped = self
+                .awaiting
+                .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(start)));
+            for (token, waiting) in after.chain(wrapped) {
+                last = *token;
+                if seen.len() >= bound {
+                    break;
+                }
+                let key = Self::pending_key(waiting);
+                if !seen.insert(key) {
+                    continue;
+                }
+                if self.jobs.iter().any(|job| job.key() == key) {
+                    continue;
+                }
+                let Some(endpoint) = waiting.endpoint else {
+                    continue;
+                };
+                candidates.push((
+                    waiting.record.base.event.image,
+                    endpoint,
+                    waiting.record.base.event.slot,
+                    (waiting.record.base.event.pid_tgid >> 32) as u32,
+                ));
+            }
+        }
+        self.held_requeue_cursor = last;
+        for (image, endpoint, slot, pid) in candidates {
+            if self.router.is_image_retired(image) {
+                continue;
+            }
+            if !self.bindings.contains_key(&image.task_cookie)
+                && self.bindings.len() >= self.limits.bindings
+            {
+                continue;
+            }
+            let Some(pin) = io.target(pid) else {
+                continue;
+            };
+            let Some(deadline) = io.now().checked_add(self.limits.pending_for) else {
+                self.exhaust(report);
+                continue;
+            };
+            self.jobs.push_back(ScanJob {
+                image,
+                endpoint,
+                slot,
+                pin,
+                deadline,
+                birth_cut: birth_cut.clone(),
+            });
+        }
+    }
+
     fn accept_scan(
         &mut self,
         io: &mut impl CaptureIo,
@@ -5390,6 +5476,12 @@ impl SemanticCapture {
                     .get(&key.0)
                     .is_some_and(|binding| binding.current && binding.image.exec_id == key.1)
         });
+        // Held keys whose pins arrived after collection get their first
+        // scan here: no later batch revisits them. Live ticks only: a
+        // collected transaction fixes its binding set at Binding.
+        if !is_collected {
+            self.requeue_held_admissions(io, &birth_cut, &mut report);
+        }
         // Visit each initial queued job at most once. Refused peers rotate.
         let attempts = self.limits.scans.min(self.jobs.len());
         let mut attempted_keys = BTreeSet::new();

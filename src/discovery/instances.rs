@@ -1762,6 +1762,13 @@ impl InstanceRouter {
         self.retired.contains(&image) || self.retirement.retired(image)
     }
 
+    /// Whether this image is retired (task death or exec rebind). The
+    /// capture's admission requeue skips retired images: no scan can
+    /// admit them, so queueing would only waste scan slots.
+    pub(crate) fn is_image_retired(&self, image: ImageIdentity) -> bool {
+        self.image_retired(ImageKey::from(image))
+    }
+
     /// Ends this image only. Eviction compresses its refusal into permanent
     /// per-cookie metadata, without retiring a surviving task or successor.
     /// Only admitted keys' pending calls shed as retired: a key no scan

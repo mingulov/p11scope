@@ -2530,6 +2530,72 @@ fn a_row_absorbed_before_admission_binds_once_the_caller_is_admitted() {
 }
 
 #[test]
+fn a_decided_no_live_caller_row_rebinds_once_its_caller_is_admitted() {
+    // Identity retry: the row decides NoLiveCaller (no live incarnation
+    // holds the tgid when the horizons arrive), then the scan admits
+    // the caller. A later witness pass re-sights the live incarnation
+    // through a fresh cookie query and the row binds on the clean
+    // pre-admission window; the census flips the row's outcome instead
+    // of counting it twice.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::NoLiveCaller)]
+    );
+    let x = run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (1, 1, 0, 0)
+    );
+}
+
+#[test]
+fn a_decided_no_live_caller_row_never_rebinds_a_mismatched_cookie() {
+    // Control: the admitted caller answers a different ticket than the
+    // decided row's, so no later pass re-sights it. No second verdict
+    // and the census keeps the live-miss outcome.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::NoLiveCaller)]
+    );
+    run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 99));
+    run.read(Vec::new());
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), Vec::new());
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (1, 0, 1, 0)
+    );
+    assert_eq!(
+        census.unbound.get(&UnboundReason::NoLiveCaller),
+        Some(&1)
+    );
+}
+
+#[test]
 fn a_late_row_with_an_exec_between_row_and_admission_stays_unbound() {
     // Guard: an exec recorded between the row and the admission voids
     // the late window (the row may be the pre-exec image's).

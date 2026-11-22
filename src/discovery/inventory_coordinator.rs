@@ -24889,6 +24889,230 @@ exit 0
     }
 
     #[test]
+    fn a_no_live_caller_row_rebinds_from_fresh_proof_once_its_caller_is_admitted() {
+        // Identity retry: the row is read while no live incarnation holds
+        // its tgid, so it decides NoLiveCaller and drops with its seed
+        // count folded to module-level use. The member keeps calling (a
+        // later refresh re-observes the absolute), then the scan admits
+        // it. A later pass re-sights the live caller through a fresh
+        // cookie query and the row binds on the clean pre-admission
+        // window; the edge carries the full re-observed absolute and the
+        // stale fold retracts, so the module never counts the seed twice.
+        // Pid 7 is admitted (it carries the committed mappings); pid 9
+        // spawns but stays unadmitted until after the drop.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        // Ordinary synthetic leader-loss scenes explicitly supply the
+        // fresh worker proof. A held pin alone now supplies none.
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, seed folded, no counted edge.
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.entries, 3);
+        assert_eq!(unbound.reasons.get("no_live_caller"), Some(&1));
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.rows, 1);
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound_total(), 1);
+        assert_eq!(census.pending, 0);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .all(|edge| edge.entry_count == 0),
+            "no counted edge before the retry"
+        );
+        // The member keeps calling to 43 while still unadmitted: the
+        // refresh re-observes the absolute after the drop.
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        // The scan admits the member after its seed (recorded 40 <
+        // first-seen 50).
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        // The next witness pass re-sights the live caller and binds on
+        // the clean pre-admission window.
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+        assert_eq!(
+            native.module_unbound(),
+            None,
+            "the stale seed fold retracts once the edge carries it"
+        );
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.edge, placement.module), (1, 0));
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"used by an unidentified caller image".to_string()),
+            "the drop stays disclosed: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    #[test]
+    fn a_retried_row_with_a_competing_image_stays_unbound_without_a_second_fold() {
+        // The retry re-sights the row, but a newer exec sequence of the
+        // same ticket is now known: the re-decision refuses with
+        // ExecAmbiguous instead of binding. The re-decision discloses
+        // through the census flip, the original fold stands exactly once
+        // (no second fold), and the consumed retry never fires again.
+        // Pid 7 is admitted (it carries the committed mappings); pid 9
+        // spawns but stays unadmitted until after the drop.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        // A second image of the same ticket arrives after the admission
+        // and binds on time; the retried first row now competes with it.
+        let mut second = native.row(41, 2, 9, 1_000, 0);
+        second.entry_count = 5;
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.rows, 2);
+        assert_eq!(census.bound, 1);
+        assert_eq!(census.unbound_total(), 1);
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecAmbiguous),
+            Some(&1)
+        );
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), None);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1, "no second fold for the re-decision");
+        assert_eq!(unbound.entries, 3);
+        let registry = &native.scene.coordinator.registry;
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 2);
+        assert_eq!((placement.edge, placement.module), (1, 1));
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the on-time row has an edge");
+        assert_eq!(edge.entry_count, 5);
+        // The consumed retry never fires again: further passes decide
+        // nothing and the census stands still.
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (2, 1, 1, 0)
+        );
+        assert_eq!(native.module_unbound().unwrap().rows, 1);
+    }
+
+    #[test]
+    fn a_retried_row_never_binds_a_mismatched_cookie() {
+        // Control: the live caller answers a different ticket than the
+        // dropped row's, so the retry never re-sights it. No edge, the
+        // fold stands, and the census keeps the live-miss verdict.
+        // Pid 7 is admitted (it carries the committed mappings); pid 9
+        // spawns but stays unadmitted until after the drop.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 99);
+        native.read(Vec::new());
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .all(|edge| edge.entry_count == 0),
+            "no counted edge without a bind"
+        );
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 0, 1, 0)
+        );
+        assert_eq!(
+            census.unbound.get(&UnboundReason::NoLiveCaller),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn a_reused_pid_never_inherits_a_witness_by_pid() {
         let (mut native, caller) = NativeScene::new();
         // pid 7 now holds ticket 99; the row's ticket 41 was its previous

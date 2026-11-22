@@ -746,6 +746,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// unbound verdict), on the domain's finish, or never for a row
     /// that never re-decides (its fold stands, honestly).
     retry_owed: HashMap<PairKey, RetryOwed>,
+    /// Next retained-fold id: keys each fold's actual-landing receipt
+    /// from the ordered registry application.
+    next_fold_id: u64,
     /// Dropped pair bases pruned out of `pair_targets`, bounded. A late
     /// row for one of these pairs still rebases past this exact base,
     /// so pruning never double-counts it. Past the bound a due row is
@@ -1417,6 +1420,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             retry_owed: HashMap::new(),
+            next_fold_id: 0,
             pair_dropped_tombstones: HashMap::new(),
             pair_dropped_totals: HashMap::new(),
             pair_prune_overflow: 0,
@@ -8139,6 +8143,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // value.
         self.binder
             .set_exit_clocks_comparable(self.exit_clocks_comparable);
+        // Refresh retained folds from the ordered application's actual
+        // image-set landings before any decision staged below can
+        // retract one.
+        self.refresh_fold_landings();
         // A completed witness sweep proves no older row for its domain is
         // still in flight; a Finish means no later evidence at all. Both
         // release departed tombstones only after this batch's decisions
@@ -8268,9 +8276,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// tombstone maps (both would otherwise live for the whole capture)
     /// and its EXEC-loss latch. Pair totals stay: they are the exact
     /// counted aggregate, not per-pair revival state. Retained retry
-    /// pairs release their held absolutes (their folds stand: no
-    /// re-observation follows the domain's end) and prune normally
-    /// afterwards.
+    /// pairs disclose the calls they observed while dropped as
+    /// terminal gaps, then release their held absolutes (their folds
+    /// stand: no re-observation follows the domain's end) and prune
+    /// normally afterwards.
     fn finish_native_domain(&mut self, domain: NativeDomainId) {
         self.exec_pruned
             .retain(|cookie, _| cookie.domain() != domain);
@@ -8284,6 +8293,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .copied()
             .collect();
         for key in owed {
+            self.settle_retry_terminal(&key, RetryTerminalCause::Finish);
             self.retry_owed.remove(&key);
             self.pair_counts.remove(&key);
         }
@@ -9800,6 +9810,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// the fold's reason code is constant; a fold exists exactly for
     /// a module first bucket, so the fold retraction covers that move
     /// and every other bucket retracts on its own.
+    /// Refresh retained folds whose inserts the last publication
+    /// applied: replace the note-time landing prediction with the
+    /// ordered application's actual per-set result, so a later
+    /// retraction rolls back exactly what landed. Folds whose owed
+    /// marks already released (revival, terminal settlement) are gone
+    /// and need nothing.
+    fn refresh_fold_landings(&mut self) {
+        let landings = self.registry.take_fold_landings();
+        if landings.is_empty() {
+            return;
+        }
+        for (id, landed_module, landed_global) in landings {
+            for owed in self.retry_owed.values_mut() {
+                if let Some(fold) = owed.fold.as_mut().filter(|fold| fold.id == id) {
+                    fold.image_landed_module = landed_module;
+                    fold.image_landed_global = landed_global;
+                    break;
+                }
+            }
+        }
+    }
+
     fn release_retry_for_bind(&mut self, key: PairKey) {
         let Some(owed) = self.retry_owed.remove(&key) else {
             return;
@@ -9813,11 +9845,59 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 fold.cookie,
                 fold.image_landed_module,
                 fold.image_landed_global,
+                fold.id,
             );
         } else {
             debug_assert_ne!(owed.placement, FirstPlacement::Module);
             self.registry.retract_first_placement(owed.placement);
         }
+    }
+
+    /// Settle a retained identity-retry row that places nothing: the
+    /// held absolute grew past the accounted one while the row waited,
+    /// and no re-observation will ever place the difference. Disclose
+    /// exactly that growth as a named counted gap for the terminal
+    /// cause; the row keeps its first verdict and placement, the fold
+    /// (when one stands) is untouched, and a later revival still
+    /// rebases past the full held absolute. Nothing held past the
+    /// accounted absolute discloses nothing.
+    fn settle_retry_terminal(&mut self, key: &PairKey, cause: RetryTerminalCause) {
+        let Some(owed) = self.retry_owed.get(key) else {
+            return;
+        };
+        let accounted = owed.accounted;
+        let held = self
+            .pair_counts
+            .get(key)
+            .map(|held| held.count)
+            .unwrap_or(accounted);
+        let excluded = held.saturating_sub(accounted);
+        if excluded == 0 {
+            return;
+        }
+        let cause_text = match cause {
+            RetryTerminalCause::ReRefused(reason) => format!("re-refusal ({})", reason.code()),
+            RetryTerminalCause::EndpointLoss => "endpoint resolution loss".to_string(),
+            RetryTerminalCause::Finish => "domain finish".to_string(),
+        };
+        let standing = if accounted > 0 {
+            format!(
+                "the row keeps its first placement and its accounted absolute of {accounted} stands"
+            )
+        } else {
+            "the row keeps its first placement, which supplied no count carrier, so the gap counts the entire held subtotal"
+                .to_string()
+        };
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: crate::discovery::caller_registry::IDENTITY_RETRY_TERMINAL.into(),
+            reason: format!(
+                "{excluded} calls observed while retained for identity retry are excluded at {cause_text}; {standing}"
+            ),
+            budget: None,
+        });
     }
 
     /// Stages one pending pair's held count for publication-time
@@ -11060,10 +11140,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // A re-observation that still resolves to no module
                 // releases without noting unresolved twice: the first
                 // staging already recorded the row's placement, and the
-                // re-drop diagnostic carries the fresh verdict.
+                // re-drop diagnostic carries the fresh verdict. Calls
+                // the row observed while retained disclose as a
+                // terminal gap first.
                 if retry == DecisionRetry::Reobserved {
+                    let key = PairKey::of(&row);
+                    self.settle_retry_terminal(&key, RetryTerminalCause::EndpointLoss);
                     self.drop_pair_count(&row, DiagnosticReason::NotAdmitted, false);
-                    self.retry_owed.remove(&PairKey::of(&row));
+                    self.retry_owed.remove(&key);
                     return Ok(());
                 }
                 // A retained row keeps its held absolute as the
@@ -11074,11 +11158,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if retained {
                     // The `Err` below stages the row's unresolved
                     // bucket; the owed mark remembers it for the move.
+                    // No count carrier yet: a terminal settlement
+                    // accounts the entire held subtotal.
                     self.retry_owed.insert(
                         PairKey::of(&row),
                         RetryOwed {
                             fold: None,
                             placement: FirstPlacement::Unresolved,
+                            accounted: 0,
                         },
                     );
                 }
@@ -11108,10 +11195,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // A re-observation that refuses again releases the pair
                 // without folding twice: the original fold stands and
                 // the fresh verdict discloses through the drop
-                // diagnostic and the census flip.
+                // diagnostic and the census flip. Calls the row
+                // observed while retained disclose as a terminal gap
+                // first.
                 if retry == DecisionRetry::Reobserved {
+                    let key = PairKey::of(&row);
+                    self.settle_retry_terminal(&key, RetryTerminalCause::ReRefused(reason));
                     self.drop_pair_count(&row, diagnostic_binding_reason(reason), false);
-                    self.retry_owed.remove(&PairKey::of(&row));
+                    self.retry_owed.remove(&key);
                     return Ok(());
                 }
                 // The dropped absolute folds into the single module's
@@ -11169,22 +11260,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     calls: folded,
                     exe,
                 };
-                self.registry.note_unbound_witness_with_image(
-                    modules.clone(),
-                    row.recorded_at_ns,
-                    reason,
-                    folded,
-                    Some(image),
-                );
                 // A retained row marks its pair for re-observation and
                 // remembers exactly the fold a retry bind retracts: the
                 // single registered module's fold, or nothing when the
                 // row folds nowhere (shared endpoint, unresolved, or an
                 // unregistered module) — plus the placement bucket the
-                // staging above incremented, mirroring the commit's
+                // staging below increments, mirroring the commit's
                 // buckets. Staging is single-threaded, so the
                 // registration read below sees what the commit
-                // applies.
+                // applies. The fold id keys the insert's actual
+                // landing receipt from the ordered application.
                 let owed = retained.then(|| {
                     let (placement, fold) = match modules.as_slice() {
                         [module] => match self.registry.module_id_for(module) {
@@ -11194,6 +11279,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 (
                                     FirstPlacement::Module,
                                     Some(RetryFold {
+                                        id: self.next_fold_id,
                                         module: module.clone(),
                                         entries: folded,
                                         cookie,
@@ -11208,8 +11294,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         _ => (FirstPlacement::Ambiguous, None),
                     };
                     debug_assert_eq!(fold.is_some(), placement == FirstPlacement::Module);
-                    RetryOwed { fold, placement }
+                    if fold.is_some() {
+                        self.next_fold_id += 1;
+                    }
+                    let accounted = fold.as_ref().map(|fold| fold.entries).unwrap_or(0);
+                    RetryOwed {
+                        fold,
+                        placement,
+                        accounted,
+                    }
                 });
+                match owed.as_ref().and_then(|owed| owed.fold.as_ref()) {
+                    Some(fold) => self.registry.note_unbound_witness_with_fold(
+                        modules.clone(),
+                        row.recorded_at_ns,
+                        reason,
+                        folded,
+                        Some(image),
+                        fold.id,
+                    ),
+                    None => self.registry.note_unbound_witness_with_image(
+                        modules.clone(),
+                        row.recorded_at_ns,
+                        reason,
+                        folded,
+                        Some(image),
+                    ),
+                }
                 if let Some(owed) = owed {
                     self.retry_owed.insert(PairKey::of(&row), owed);
                 }
@@ -13529,11 +13640,13 @@ struct PairKeyClass {
 /// The landing flags record whether the fold's image insert landed in
 /// each image set (a saturated set drops it): the retraction
 /// subtracts only landed calls, so it never eats another fold's.
-/// Predicted at note time from committed state, exact across
-/// batches; drops and retractions staged in the same batch can still
-/// interleave between the prediction and the commit.
+/// Predicted at note time from committed state, then refreshed from
+/// the ordered application's actual landings (a retraction staged in
+/// the same publication as another fold's insert sees the freed or
+/// taken slot); the fold id keys the receipt.
 #[derive(Debug, Clone)]
 struct RetryFold {
+    id: u64,
     module: ModuleKey,
     entries: u64,
     cookie: DomainCookie,
@@ -13543,14 +13656,30 @@ struct RetryFold {
 
 /// What a retained identity-retry row's first staging owes its
 /// re-decision: the single-module fold to retract (when the drop
-/// folded one), and the placement bucket the first staging
-/// incremented. A fold exists exactly for a module bucket: a single
-/// registered module at note time still is at commit (modules are
-/// never unregistered), and every other shape folds nowhere.
+/// folded one), the placement bucket the first staging incremented,
+/// and the absolute already counted for the pair (the fold's entries,
+/// or zero when the first placement supplied no count carrier). A
+/// fold exists exactly for a module bucket: a single registered
+/// module at note time still is at commit (modules are never
+/// unregistered), and every other shape folds nowhere.
 #[derive(Debug, Clone)]
 struct RetryOwed {
     fold: Option<RetryFold>,
     placement: FirstPlacement,
+    accounted: u64,
+}
+
+/// Why a retained identity-retry row settled without placing the
+/// calls it observed while dropped: the terminal disclosure names it.
+#[derive(Debug, Clone, Copy)]
+enum RetryTerminalCause {
+    /// The re-observation refused again with this verdict.
+    ReRefused(UnboundReason),
+    /// The re-observation bound at the binder but its endpoint
+    /// resolved to no module.
+    EndpointLoss,
+    /// The domain finished with the row still retained.
+    Finish,
 }
 
 /// One pruned dropped pair's absolute base and its read anchor: a late

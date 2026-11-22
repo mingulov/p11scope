@@ -2711,7 +2711,20 @@ fn identity_retry_flush_at_finish_flips_the_outcome() {
     run.world.answer(T, 1, d, cookie(d, 7));
     run.read(Vec::new());
     assert_eq!(run.verdicts(), Vec::new(), "fresh horizons still owed");
-    assert_eq!(run.binder.census().pending, 1);
+    // The re-pended row waits internally: the public census keeps one
+    // outcome per row (both live-misses stay in `unbound`, nothing in
+    // `pending`) while the private queues hold the waiting retry.
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (2, 0, 2, 0)
+    );
+    assert_eq!(run.binder.pending_retried_len_for_test(d), 1);
     assert_eq!(run.binder.retry_len_for_test(d), 1);
     run.binder.finish(d);
     let decisions = run.binder.take_decisions();

@@ -610,34 +610,32 @@ pub(crate) enum ResightOutcome {
     Incomplete,
 }
 
-/// Cookie queries charged to one witness batch's re-sight pass: one
+/// Cookie queries charged to one witness batch's re-sight work: one
 /// query (pidfd liveness checks and a BPF map syscall) is one slow
-/// unit under the INV-2 step contract. Rows whose query the allowance
-/// never reached keep their owed attempt for the next batch.
+/// unit under the INV-2 step contract. The re-sight pass and the
+/// identity-retry pass share this single budget per witness batch (one
+/// cooperative action, one budget); rows whose query the budget never
+/// reached keep their owed attempt for the next batch.
 pub(crate) const RESIGHT_QUERIES_PER_PASS: usize = 64;
 
-/// Live-lookup visits charged to one witness batch's re-sight pass:
-/// each owed row the pass pops costs one visit (an in-memory live
-/// lookup, plus a query on a hit while the query allowance lasts),
-/// so a pass never walks the whole pending queue even against the
-/// full 65,536-row bound — 64 passes drain it worst case. Rows the
-/// visit allowance never reached keep their owed attempt for the
-/// next batch, in queue order.
+/// Live-lookup visits charged to one witness batch's re-sight work:
+/// each queued row a pass pops costs one visit (an in-memory live
+/// lookup, plus a query on a hit while the query budget lasts), so a
+/// batch never walks a whole queue even against the full 65,536-row
+/// bound — 64 batches drain it worst case. Both passes share this
+/// single budget per witness batch, and each pass visits at most the
+/// rows queued at its entry (never a revisited row twice in one
+/// batch). Rows the budget never reached keep their owed attempt for
+/// the next batch, in queue order.
 pub(crate) const RESIGHT_VISITS_PER_PASS: usize = 1_024;
 
-/// Cookie queries charged to one witness batch's identity-retry pass:
-/// the same cost model as the re-sight pass (one query is one slow
-/// unit under the INV-2 step contract), with its own allowance so
-/// decided rows awaiting re-observation never starve undecided rows
-/// waiting for their first attempt, or the reverse.
-pub(crate) const RETRY_QUERIES_PER_PASS: usize = 64;
-
-/// Live-lookup visits charged to one witness batch's identity-retry
-/// pass: each retained row the pass pops costs one visit. Rows the
-/// visit allowance never reached stay queued ahead of the revisited
-/// ones, so the next batch resumes with them in queue order (fair
-/// round-robin, never a restart, never a whole-queue scan).
-pub(crate) const RETRY_VISITS_PER_PASS: usize = 1_024;
+/// What one witness batch's re-sight work may still spend: the shared
+/// per-action budget both the re-sight pass and the identity-retry
+/// pass draw from, in alternating order.
+struct WitnessActionBudget {
+    queries: usize,
+    visits: usize,
+}
 
 /// What the cookie query said when the row was read, through the live
 /// incarnation's pin.
@@ -785,12 +783,17 @@ struct DomainState {
     ended: HashSet<CallerId>,
     /// Decided `NoLiveCaller` rows retained for re-observation, in
     /// decision order. Each witness batch's retry pass pops from the
-    /// front within its visit and query allowances and pushes
-    /// unmatched rows back, so a backlog past the allowances is
-    /// revisited in queue order (fair round-robin) without ever
-    /// scanning. Bounded by [`BinderLimits::retry`]; past it decided
-    /// rows shed (they keep their unbound verdict).
+    /// front within the shared visit and query budget and pushes
+    /// unmatched rows back, so a backlog past the budget is revisited
+    /// in queue order (fair round-robin) without ever scanning.
+    /// Bounded by [`BinderLimits::retry`]; past it decided rows shed
+    /// (they keep their unbound verdict).
     retry: VecDeque<RetryRow>,
+    /// Which pass takes the shared budget first on the next witness
+    /// batch: the passes alternate, so sustained arrivals on both
+    /// queues still let each make progress every other batch instead
+    /// of starving the second.
+    retry_first_next: bool,
 }
 
 /// One exec sequence of one ticket: who holds it, and its latest row.
@@ -827,6 +830,7 @@ impl DomainState {
             callers: HashMap::new(),
             ended: HashSet::new(),
             retry: VecDeque::new(),
+            retry_first_next: false,
         }
     }
 
@@ -1431,15 +1435,26 @@ impl NativeBinder {
                 state.health_ns = Some(state.health_ns.map_or(read, |was| was.max(read)));
             }
         }
-        // The re-sight pass runs before the read loop: rows this batch
-        // newly reads were just attempted by the read-time lookup, so
-        // the pass only owes rows carried from earlier batches.
-        let outcome = self.resight_pass(index, lookup, identity);
-        // The identity-retry pass runs next, under its own allowances:
-        // decided `NoLiveCaller` rows carried from earlier batches get
-        // their fresh re-sight, while undecided rows keep their
-        // first-attempt priority above.
-        self.retry_pass(index, lookup, identity);
+        // The re-sight and identity-retry passes run before the read
+        // loop (rows this batch newly reads were just attempted by the
+        // read-time lookup, so both passes only owe rows carried from
+        // earlier batches) against one shared per-action budget, in
+        // alternating order so neither queue starves under sustained
+        // arrivals on both.
+        let retry_first = self.domains[index].retry_first_next;
+        self.domains[index].retry_first_next = !retry_first;
+        let mut budget = WitnessActionBudget {
+            queries: RESIGHT_QUERIES_PER_PASS,
+            visits: RESIGHT_VISITS_PER_PASS,
+        };
+        let outcome = if retry_first {
+            self.retry_pass(index, lookup, identity, &mut budget);
+            self.resight_pass(index, lookup, identity, &mut budget)
+        } else {
+            let outcome = self.resight_pass(index, lookup, identity, &mut budget);
+            self.retry_pass(index, lookup, identity, &mut budget);
+            outcome
+        };
         let read_ns = stamp(batch.rows_read_ns);
         self.census.integrity += batch.integrity.len() as u64;
         for row in &batch.rows {
@@ -1523,29 +1538,33 @@ impl NativeBinder {
     }
 
     /// One bounded re-sight pass over the domain's owed queue, in
-    /// queue order: at most [`RESIGHT_VISITS_PER_PASS`] popped rows
-    /// get their live lookup, and at most
-    /// [`RESIGHT_QUERIES_PER_PASS`] live hits are queried, then the
-    /// pass completion stamp for every row this pass sighted. A miss
-    /// stamps its attempt; a hit past an allowance goes back to the
-    /// queue. The pass reports [`ResightOutcome::Incomplete`] while
-    /// owed rows remain and the next batch resumes with them; it
-    /// never scans the pending rows.
+    /// queue order, drawing from the witness batch's shared budget: at
+    /// most the rows queued at entry are popped for their live lookup
+    /// (never a pushed-back row twice in one batch), and live hits are
+    /// queried while the query budget lasts, then the pass completion
+    /// stamp for every row this pass sighted. A miss stamps its
+    /// attempt; a hit past the query budget goes back to the queue
+    /// behind the rows this pass never reached. The pass reports
+    /// [`ResightOutcome::Incomplete`] while owed rows remain and the
+    /// next batch resumes with them; it never scans the pending rows.
     fn resight_pass<Pin>(
         &mut self,
         index: usize,
         lookup: &dyn CallerLookup<Pin>,
         identity: &mut dyn NativeIdentity<Pin>,
+        budget: &mut WitnessActionBudget,
     ) -> ResightOutcome {
         let current = self.domains[index].batch_seq;
+        let queued_at_entry = self.domains[index].owed.len();
+        let visit_cap = budget.visits.min(queued_at_entry);
         let mut visits = 0usize;
-        let mut queries = 0usize;
         let mut sighted: Vec<u64> = Vec::new();
-        while visits < RESIGHT_VISITS_PER_PASS {
+        while visits < visit_cap {
             let Some(pos) = self.domains[index].owed.pop_front() else {
                 break;
             };
             visits += 1;
+            budget.visits -= 1;
             let rel = pos.saturating_sub(self.domains[index].popped) as usize;
             let Some(row_tgid) = self.domains[index]
                 .pending
@@ -1563,9 +1582,9 @@ impl NativeBinder {
                 continue;
             };
             let hit = lookup.live_caller(row_tgid);
-            if hit.is_some() && queries >= RESIGHT_QUERIES_PER_PASS {
-                // A hit past the query allowance stays owed for the
-                // next pass while later rows are still visited.
+            if hit.is_some() && budget.queries == 0 {
+                // A hit past the query budget stays owed for the next
+                // pass while later rows are still visited.
                 self.domains[index].owed.push_back(pos);
                 continue;
             }
@@ -1582,7 +1601,7 @@ impl NativeBinder {
                     pending.last_attempt = Some(current);
                 }
                 Some(caller) => {
-                    queries += 1;
+                    budget.queries -= 1;
                     pending.resight_due = false;
                     pending.last_attempt = Some(current);
                     pending.sighting = Some(Sighting {
@@ -1644,47 +1663,52 @@ impl NativeBinder {
     }
 
     /// One bounded identity-retry pass over the domain's retained
-    /// rows, in queue order: at most [`RETRY_VISITS_PER_PASS`] popped
-    /// rows get their live lookup, and at most
-    /// [`RETRY_QUERIES_PER_PASS`] live hits are queried. A hit whose
-    /// fresh cookie answer equals the row's ticket re-pends the row
-    /// with a fresh late sighting (an exited hit with the one
-    /// unambiguous retained incarnation re-pends through that
-    /// fallback instead, exactly like the read loop); the normal
-    /// horizons-plus-§3.3 path then decides it from current proof, one
-    /// to two batches later. Anything else — a miss, a mismatched or
-    /// unavailable answer, an exited hit without a fallback, a hit
-    /// past the query allowance, or an unstamped query under a modeled
-    /// clock — keeps its place for a later pass, pushed back in queue
-    /// order, so the next batch resumes fairly. A re-pended row
-    /// decides through the full §3.3 rules, never around them: PID
-    /// reuse answers another ticket and never re-pends, and an exec
-    /// or loss since the admission refuses at re-decision.
+    /// rows, in queue order, drawing from the witness batch's shared
+    /// budget: at most the rows queued at entry are popped for their
+    /// live lookup (each row at most once per pass — never the whole
+    /// budget on one row), and live hits are queried while the query
+    /// budget lasts. A hit whose fresh cookie answer equals the row's
+    /// ticket re-pends the row with a fresh late sighting (an exited
+    /// hit with the one unambiguous retained incarnation re-pends
+    /// through that fallback instead, exactly like the read loop); the
+    /// normal horizons-plus-§3.3 path then decides it from current
+    /// proof, one to two batches later. Anything else — a miss, a
+    /// mismatched or unavailable answer, an exited hit without a
+    /// fallback, a hit past the query budget, or an unstamped query
+    /// under a modeled clock — keeps its place for a later pass,
+    /// pushed back behind the rows this pass never reached, so the
+    /// next batch resumes fairly. A re-pended row decides through the
+    /// full §3.3 rules, never around them: PID reuse answers another
+    /// ticket and never re-pends, and an exec or loss since the
+    /// admission refuses at re-decision.
     fn retry_pass<Pin>(
         &mut self,
         index: usize,
         lookup: &dyn CallerLookup<Pin>,
         identity: &mut dyn NativeIdentity<Pin>,
+        budget: &mut WitnessActionBudget,
     ) {
+        let queued_at_entry = self.domains[index].retry.len();
+        let visit_cap = budget.visits.min(queued_at_entry);
         let mut visits = 0usize;
-        let mut queries = 0usize;
         let mut sighted: Vec<(RetryRow, Sighting, Option<RetainedCaller>)> = Vec::new();
-        while visits < RETRY_VISITS_PER_PASS {
+        while visits < visit_cap {
             let Some(candidate) = self.domains[index].retry.pop_front() else {
                 break;
             };
             visits += 1;
+            budget.visits -= 1;
             let Some(hit) = lookup.live_caller(candidate.row.host_tgid) else {
                 self.domains[index].retry.push_back(candidate);
                 continue;
             };
-            if queries >= RETRY_QUERIES_PER_PASS {
-                // A hit past the query allowance stays queued for the
+            if budget.queries == 0 {
+                // A hit past the query budget stays queued for the
                 // next pass while later rows are still visited.
                 self.domains[index].retry.push_back(candidate);
                 continue;
             }
-            queries += 1;
+            budget.queries -= 1;
             let query = identity.query_cookie(candidate.row.domain, hit.pin);
             let matched = matches!(&query, CookieQuery::Cookie(answered) if *answered == candidate.row.cookie());
             // An exited hit may still re-pend through the one
@@ -1735,6 +1759,11 @@ impl NativeBinder {
         let state = &mut self.domains[index];
         for (candidate, mut sighting, retained) in sighted {
             sighting.sighted_ns = completed;
+            // A re-pended row waits internally: the public row keeps its
+            // first verdict in `unbound` (and its placement) until the
+            // re-decision flips it, so the census keeps exactly one
+            // outcome per row seen — re-observation never stages to
+            // public `pending`.
             state.pending.push_back(Pending {
                 row: candidate.row,
                 read_ns: candidate.read_ns,
@@ -1745,7 +1774,6 @@ impl NativeBinder {
                 retried: true,
             });
             state.next_pos += 1;
-            self.census.pending += 1;
         }
     }
 
@@ -1988,7 +2016,12 @@ impl NativeBinder {
         self.domains[index].retry.clear();
         while let Some(pending) = self.domains[index].pending.pop_front() {
             self.domains[index].popped += 1;
-            self.census.pending -= 1;
+            // A flushed re-observation waited internally (its first
+            // verdict stayed public), so only a first decision leaves
+            // public `pending` here.
+            if !pending.retried {
+                self.census.pending -= 1;
+            }
             let reason = if self.domains[index].awaits_revalidation(&pending) {
                 UnboundReason::ExecCoverageGap
             } else {
@@ -2097,7 +2130,12 @@ impl NativeBinder {
             let state = &mut self.domains[index];
             let pending = state.pending.pop_front().expect("checked front");
             state.popped += 1;
-            self.census.pending -= 1;
+            // A re-decision waited internally (its first verdict stayed
+            // public), so only a first decision leaves public `pending`
+            // here; the re-decision flips the row's outcome below.
+            if !pending.retried {
+                self.census.pending -= 1;
+            }
             let binding = decide(
                 state,
                 &pending,

@@ -3369,6 +3369,10 @@ pub(crate) const DEMOTED_COUNT_PLACED: &str = "demoted count placed";
 /// on the member, never a silent rebase.
 pub(crate) const COUNTED_BEFORE_TRACKING: &str = "counted before tracking";
 
+/// A retained identity-retry row settled without placing the calls it
+/// observed while dropped: the excluded subtotal, counted and named.
+pub(crate) const IDENTITY_RETRY_TERMINAL: &str = "identity retry terminal";
+
 /// Where every decided native witness row went, each row exactly once
 /// (C4 review M3): `edge` witnessed one caller edge, `module` became one
 /// module's `unbound_use` row, `ambiguous` named an endpoint several
@@ -3723,6 +3727,11 @@ enum Mutation {
         /// `None` never inserts (test-direct staging, and the
         /// `no_mapping_edge` path whose caller is known).
         image: Option<UnboundImage>,
+        /// The retained identity-retry fold this insert carries, when
+        /// the stager retained the row: its actual per-set landing is
+        /// recorded at apply time so the matching retraction rolls
+        /// back exactly what landed. `None` records nothing.
+        fold_id: Option<u64>,
     },
     /// Retract one staged single-module unbound fold after the
     /// identity retry bound the row from fresh proof: the edge now
@@ -3739,9 +3748,16 @@ enum Mutation {
         cookie: DomainCookie,
         /// Whether the fold's image insert landed in each image set:
         /// a saturated set drops it, and the retraction subtracts
-        /// only landed calls, so it never eats another fold's.
+        /// only landed calls, so it never eats another fold's. The
+        /// coordinator refreshes these from the ordered application's
+        /// actual landings; when the fold's own insert applied earlier
+        /// in this same publication, that receipt wins over them.
         landed_module: bool,
         landed_global: bool,
+        /// The retained identity-retry fold this retraction unwinds:
+        /// a same-publication insert receipt for it overrides the
+        /// carried flags. `None` trusts the flags.
+        fold_id: Option<u64>,
     },
     /// Retract one retained row's first placement bucket after a
     /// retry-rule rebind moved it to its bound placement: the paired
@@ -4202,6 +4218,14 @@ pub(crate) struct CallerRegistry {
     /// Distinct images (with their host pids) the run-wide bound
     /// turned away, saturating. Sticky.
     unidentified_pids_dropped: u64,
+    /// Actual image-set landings of retained identity-retry folds, one
+    /// `(fold id, module landed, run-wide landed)` per applied
+    /// single-module insert: the ordered application — not the
+    /// note-time committed snapshot — decides whether an insert lands,
+    /// so a retraction staged in the same publication (or a later one
+    /// via the coordinator's drain) rolls back exactly what landed.
+    /// Drained by the coordinator; bounded by folds per publication.
+    fold_landings: Vec<(u64, bool, bool)>,
     /// Distinct folded mechanism rows across all per-module departed
     /// aggregates: the run-wide [`MAX_FOLDED_MECHANISMS_GLOBAL`]
     /// budget. Monotonic: folds never leave the aggregate.
@@ -4481,6 +4505,7 @@ impl CallerRegistry {
             unidentified_images: HashMap::new(),
             unidentified_images_saturated: false,
             unidentified_pids_dropped: 0,
+            fold_landings: Vec::new(),
             folded_mechs_global: 0,
             folded_identities_global: 0,
             pending_count_decisions: Vec::new(),
@@ -5549,6 +5574,30 @@ impl CallerRegistry {
             reason,
             entries,
             image,
+            fold_id: None,
+        });
+    }
+
+    /// Stage one retained identity-retry row's unbound fold: like
+    /// [`Self::note_unbound_witness_with_image`], plus the fold id
+    /// whose actual per-set landing the ordered application records,
+    /// so the matching retraction rolls back exactly what landed.
+    pub(crate) fn note_unbound_witness_with_fold(
+        &mut self,
+        modules: Vec<ModuleKey>,
+        first_ns: u64,
+        reason: UnboundReason,
+        entries: u64,
+        image: Option<UnboundImage>,
+        fold_id: u64,
+    ) {
+        self.staged.push(Mutation::NoteUnboundWitness {
+            modules,
+            first_ns,
+            reason,
+            entries,
+            image,
+            fold_id: Some(fold_id),
         });
     }
 
@@ -5557,7 +5606,8 @@ impl CallerRegistry {
     /// and `cookie` are the folded values; `code` is the fold's
     /// reason code. The landing flags say whether the fold's image
     /// insert landed in each image set; unlanded calls subtract
-    /// nowhere.
+    /// nowhere. `fold_id` names the fold for a same-publication
+    /// insert receipt, which overrides the flags when present.
     pub(crate) fn retract_unbound_fold(
         &mut self,
         module: ModuleKey,
@@ -5566,6 +5616,7 @@ impl CallerRegistry {
         cookie: DomainCookie,
         landed_module: bool,
         landed_global: bool,
+        fold_id: u64,
     ) {
         self.staged.push(Mutation::RetractUnboundFold {
             module,
@@ -5574,6 +5625,7 @@ impl CallerRegistry {
             cookie,
             landed_module,
             landed_global,
+            fold_id: Some(fold_id),
         });
     }
 
@@ -5767,6 +5819,15 @@ impl CallerRegistry {
     /// finalizes its pair targets from these (P3).
     pub(crate) fn take_pending_count_decisions(&mut self) -> Vec<PendingCountDecision> {
         std::mem::take(&mut self.pending_count_decisions)
+    }
+
+    /// Drains the actual image-set landings the last publication applied,
+    /// in apply order: one `(fold id, module landed, run-wide landed)`
+    /// per retained-fold insert. The coordinator refreshes its stored
+    /// folds from these, so a later retraction rolls back exactly what
+    /// the ordered application landed.
+    pub(crate) fn take_fold_landings(&mut self) -> Vec<(u64, bool, bool)> {
+        std::mem::take(&mut self.fold_landings)
     }
 
     /// Stage one global health regression (a native identity, pair, or
@@ -6662,6 +6723,7 @@ impl CallerRegistry {
                 reason,
                 entries,
                 image,
+                fold_id,
             } => match modules.as_slice() {
                 [key] => {
                     self.apply_unbound_use(
@@ -6672,6 +6734,7 @@ impl CallerRegistry {
                         true,
                         entries,
                         image,
+                        fold_id,
                     );
                 }
                 [] => self.witness_placement.unresolved += 1,
@@ -6684,14 +6747,32 @@ impl CallerRegistry {
                 cookie,
                 landed_module,
                 landed_global,
-            } => self.apply_retract_unbound_fold(
-                &module,
-                code,
-                entries,
-                cookie,
-                landed_module,
-                landed_global,
-            ),
+                fold_id,
+            } => {
+                // A same-publication insert receipt for this fold wins
+                // over the carried flags: the fold's own insert staged
+                // strictly before its retraction, so an earlier apply
+                // in this publication already recorded the actual
+                // landing. Otherwise the carried flags (refreshed from
+                // the insert publication's drain) decide.
+                let (landed_module, landed_global) = fold_id
+                    .and_then(|id| {
+                        self.fold_landings
+                            .iter()
+                            .rev()
+                            .find(|(known, _, _)| *known == id)
+                            .map(|(_, module, global)| (*module, *global))
+                    })
+                    .unwrap_or((landed_module, landed_global));
+                self.apply_retract_unbound_fold(
+                    &module,
+                    code,
+                    entries,
+                    cookie,
+                    landed_module,
+                    landed_global,
+                )
+            }
             Mutation::RetractFirstPlacement { bucket } => {
                 let placed = match bucket {
                     FirstPlacement::Module => &mut self.witness_placement.module,
@@ -7241,6 +7322,8 @@ impl CallerRegistry {
                     0,
                     // The caller is known: never an unidentified image.
                     None,
+                    // Never a retained fold: nothing to roll back.
+                    None,
                 );
             }
             RowPlacement::Unresolved => self.witness_placement.unresolved += 1,
@@ -7483,6 +7566,7 @@ impl CallerRegistry {
         unidentified: bool,
         entries: u64,
         image: Option<UnboundImage>,
+        fold_id: Option<u64>,
     ) {
         let Some(id) = self.modules_by_key.get(key).copied() else {
             self.witness_placement.unresolved += 1;
@@ -7499,6 +7583,7 @@ impl CallerRegistry {
         };
         self.witness_placement.module += 1;
         let limits = self.unbound_image_limits;
+        let mut landed_module = false;
         {
             let module = self.modules.get_mut(&id).expect("indexed module");
             let unbound = module.unbound_use.get_or_insert(UnboundUse {
@@ -7516,7 +7601,7 @@ impl CallerRegistry {
             let count = unbound.reasons.entry(code).or_default();
             *count = count.saturating_add(1);
             if let Some(image) = image.clone() {
-                Self::insert_unbound_image(
+                landed_module = Self::insert_unbound_image(
                     &mut unbound.images,
                     &mut unbound.images_saturated,
                     &mut unbound.pids_dropped,
@@ -7525,14 +7610,23 @@ impl CallerRegistry {
                 );
             }
         }
+        let mut landed_global = false;
         if let Some(image) = image {
-            Self::insert_unbound_image(
+            landed_global = Self::insert_unbound_image(
                 &mut self.unidentified_images,
                 &mut self.unidentified_images_saturated,
                 &mut self.unidentified_pids_dropped,
                 limits.global,
                 image,
             );
+        }
+        // The ordered application decides the landing: a retraction
+        // staged earlier in this same publication already freed its
+        // slot, and an insert staged earlier already took it. Record
+        // the actual per-set result for the fold's retraction.
+        if let Some(fold_id) = fold_id {
+            self.fold_landings
+                .push((fold_id, landed_module, landed_global));
         }
         if unidentified {
             let module = self.modules.get(&id).expect("indexed module");
@@ -7629,17 +7723,19 @@ impl CallerRegistry {
     /// the earliest call, accumulates its folded calls, and keeps
     /// its first executable (resolve-once: only the EXEC backfill
     /// and the loss flip update it); a new image past the bound
-    /// saturates and counts as dropped instead of growing.
+    /// saturates and counts as dropped instead of growing. Returns
+    /// whether the insert landed (a saturated drop does not).
     fn insert_unbound_image(
         images: &mut HashMap<DomainCookie, UnboundPid>,
         saturated: &mut bool,
         dropped: &mut u64,
         limit: usize,
         image: UnboundImage,
-    ) {
+    ) -> bool {
         if let Some(known) = images.get_mut(&image.cookie) {
             known.first_call_ns = known.first_call_ns.min(image.first_call_ns);
             known.calls_at_least = known.calls_at_least.saturating_add(image.calls);
+            true
         } else if images.len() < limit {
             images.insert(
                 image.cookie,
@@ -7650,9 +7746,11 @@ impl CallerRegistry {
                     exe: image.exe,
                 },
             );
+            true
         } else {
             *saturated = true;
             *dropped = dropped.saturating_add(1);
+            false
         }
     }
 

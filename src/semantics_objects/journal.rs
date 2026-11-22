@@ -4760,9 +4760,10 @@ fn return_drains_without_tail(function: u32) -> bool {
 
 /// One recovered completion from a drained corroborated return: the
 /// [`completed_of`] shape for a tail-absent END (results, find and
-/// attributes uncaptured), with the cut, return time, rv, return
-/// mechanism and session output of the corroborating ordinary CALL.
-/// Call only under [`return_drains_without_tail`].
+/// attributes uncaptured), cut at the abandonment's own ordinal, with
+/// the return time, rv, return mechanism and session output of the
+/// corroborating ordinary CALL. Call only under
+/// [`return_drains_without_tail`].
 fn completed_from_drained_return(
     at: u64,
     ts_ns: u64,
@@ -4781,21 +4782,27 @@ fn completed_from_drained_return(
     }
 }
 
-/// The drained-return cut for one converted entry, or `None`: the
-/// abandonment is reason-9 within the frontier, the function drains
-/// without a tail, and the corroborated return sits within the
-/// frontier. The settled table and the terminal conversion share this
-/// one predicate, so a drained call completes in both or neither.
+/// The drained-return completion cut for one converted entry, or
+/// `None`: the abandonment is reason-9 within the frontier, the
+/// function drains without a tail, and the corroborated return sits
+/// within the frontier. The cut is the abandonment's own ordinal —
+/// the terminal record of this seal, exactly like an END conversion
+/// completes at its END's ordinal. The corroborated return's ordinal
+/// is stale once a prior seal settled past it, and completing there
+/// contradicts the covered prefix (the model voids the domain); the
+/// abandonment is always fresh. The settled table and the terminal
+/// conversion share this one predicate, so a drained call completes
+/// in both or neither.
 fn drained_return_cut(entry: &OpenEntry, frontier: u64) -> Option<u64> {
-    if entry.abandon.is_some_and(|staged| {
+    let staged = entry.abandon.filter(|staged| {
         staged.ordinal <= frontier
             && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-    }) && return_drains_without_tail(entry.function)
-    {
-        entry.corroborated_return.filter(|at| *at <= frontier)
-    } else {
-        None
+    })?;
+    if !return_drains_without_tail(entry.function) {
+        return None;
     }
+    entry.corroborated_return.filter(|at| *at <= frontier)?;
+    Some(staged.ordinal)
 }
 
 fn tail_u64(tail: &[u8; 240], offset: usize) -> u64 {
@@ -9834,7 +9841,7 @@ impl JournalAdapter {
                     && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
             });
             // A drained return settles as a completion at its
-            // corroborated cut, never as an abandonment.
+            // abandonment cut, never as an abandonment.
             let drained = drained_return_cut(entry, frontier);
             if end.is_none() && !abandoned {
                 continue;
@@ -21824,8 +21831,13 @@ pub(crate) mod tests {
         // the START with SYNC_RETURN_RESULT_LOST while the ordinary CALL
         // already observed the return. A call whose completion needs no
         // BPF tail (C_Sign: tail-absent ENDs) must complete from the
-        // corroborated return instead of losing its outcome. Tail-needing
-        // calls keep the bounded loss (C_CreateObject twin:
+        // corroborated return instead of losing its outcome. The
+        // completion cuts at the abandonment's own ordinal (the
+        // terminal record of the seal, like an END conversion cuts at
+        // its END): the corroborated return's ordinal is stale once a
+        // prior seal settled past it, and completing there contradicts
+        // the covered prefix. Tail-needing calls keep the bounded loss
+        // (C_CreateObject twin:
         // object_journal_bounded_uppers_keep_max_only).
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         let mut scene = Scene::new(image_default());
@@ -21833,12 +21845,12 @@ pub(crate) mod tests {
         let proof = scene.attest_function("C_Sign");
         let begin = begin_bytes(1, 1, sign, 0);
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
-        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
-        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
         assert_eq!(
             scene.ingest_ordinary(ordinary_for(&begin, 0)),
             JournalDisposition::ReturnObserved
         );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
         // The fence sits strictly above the corroborated bound, so the
         // frontier must cover it: one pad record.
         let mut pad = ordinary_for(&begin, 0);
@@ -21855,7 +21867,7 @@ pub(crate) mod tests {
         assert_eq!(
             settled.end_cut,
             Some(3),
-            "the return cut is the corroborated ordinal"
+            "the completion cut is the abandonment ordinal"
         );
         assert!(
             !success.effects.effects.iter().any(|effect| matches!(

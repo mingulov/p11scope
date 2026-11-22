@@ -24483,6 +24483,16 @@ impl Engine {
                     reason: format!("prearm object unavailable: {}", error.problems().join("; ")),
                 };
                 attribution::note(&skip);
+                // Name the stage on the operator channel: the public
+                // skip folds every internal detail into one label, so
+                // without this line a host-cell cause is unverifiable
+                // from its artifacts. No subject: the path stays out of
+                // the channel, the stage plus reason names the class.
+                eprintln!(
+                    "p11scope: learned pin filed ({}): {}",
+                    crate::discovery::identity::learned_pin_stage(&skip.reason),
+                    crate::render::escape_controls(&skip.reason)
+                );
                 self.counters.object_skips.push(skip);
                 self.note_learned_settled(identity);
                 self.member_stops.note_refused(identity);
@@ -24568,11 +24578,36 @@ impl Engine {
                     || self.learned_pin_retries.len() < LEARNED_PIN_RETRY_CAP);
             if retry {
                 self.learned_pin_retries.insert(identity, retries + 1);
+                // The transient race, requeued unfiled: name it so a
+                // host cell that recovers still shows the race fired
+                // (a silent staging leaves no other trace of it).
+                if let Some(trigger) = pinning
+                    .skipped
+                    .iter()
+                    .find(|skip| skip.reason.contains(LEARNED_PIN_RETRY_REASON))
+                {
+                    eprintln!(
+                        "p11scope: learned pin requeued ({}): {}",
+                        crate::discovery::identity::learned_pin_stage(&trigger.reason),
+                        crate::render::escape_controls(&trigger.reason)
+                    );
+                }
                 drop(std::mem::take(&mut pinning.skipped));
                 self.requeue_learned_candidate(candidate);
                 return;
             }
             self.learned_pin_retries.remove(&identity);
+            // Name each filed prearm refusal like the whole-budget arm
+            // above; rows from other families keep their own channels.
+            for skip in &pinning.skipped {
+                if crate::discovery::identity::is_prearm_unavailable_reason(&skip.reason) {
+                    eprintln!(
+                        "p11scope: learned pin filed ({}): {}",
+                        crate::discovery::identity::learned_pin_stage(&skip.reason),
+                        crate::render::escape_controls(&skip.reason)
+                    );
+                }
+            }
             self.note_object_skips(std::mem::take(&mut pinning.skipped));
             self.note_learned_settled(identity);
             self.member_stops.note_refused(identity);

@@ -26606,15 +26606,25 @@ impl Engine {
         detached
     }
 
-    /// Faults a view's manifest-getter objects' readable non-executable
-    /// mappings into its page tables before the getter hooks attach. The
-    /// hooks' BPF reads are nofault: they fail (`-EFAULT`, counted as
-    /// `discovery_read_failures`) on provider-table pages the target never
-    /// touched, even though the same bytes validate fine moments later
-    /// through the faulting `/proc/<pid>/mem` read. Faulting them here
-    /// closes that first-touch race. Best-effort and silent: any failure
-    /// (exited view, unreadable maps or memory, exhausted budget) simply
-    /// leaves the normal gap path to report honestly.
+    /// Best-effort pre-fault of a view's manifest-getter objects'
+    /// readable non-executable file-backed mappings before the getter
+    /// hooks attach. The hooks' BPF reads are nofault: they fail
+    /// (`-EFAULT`, counted as `discovery_read_failures`) on
+    /// provider-table pages the target never touched, even though the
+    /// same bytes validate fine moments later through the faulting
+    /// `/proc/<pid>/mem` read. Faulting the ranges actually read here
+    /// removes that common first-touch race; anything uncovered keeps
+    /// the normal honest gap path.
+    ///
+    /// Limits, all silent: only file-backed ranges are faulted (heap and
+    /// anonymous-BSS tables stay exposed); every byte read spends the
+    /// capture's window I/O budget through the file-content rule and the
+    /// pass stops early on a ceiling; under an Inventory policy with no
+    /// active scan the allowance is zero, so this faults nothing; a
+    /// partial pre-fault still attaches with no retry; and a page can be
+    /// reclaimed again before the getter returns. Any failure (exited
+    /// view, unreadable maps or memory, expired deadline, exhausted
+    /// budget) simply leaves the normal gap path to report honestly.
     fn prefault_manifest_getter_data(
         &mut self,
         view: ProcessViewId,
@@ -26673,13 +26683,20 @@ impl Engine {
         for (start, end) in ranges {
             let mut addr = start;
             while addr < end {
+                if self.budget.check_deadline_now().is_some() {
+                    return;
+                }
                 let len = (end - addr).min(chunk.len() as u64) as usize;
                 if self.budget.allowed_io(operation_bytes, len) < len {
                     return;
                 }
                 match mem.read_at(&mut chunk[..len], addr) {
                     Ok(read) => {
-                        self.budget.record_io(read);
+                        // File-content bytes: the window-only rule, like
+                        // the ELF snapshot reader. Converting them to
+                        // collection work too would double-charge a large
+                        // data walk against the small shared allowance.
+                        self.budget.record_window_io(read);
                         operation_bytes = operation_bytes.saturating_add(read as u64);
                         if read != len {
                             break;

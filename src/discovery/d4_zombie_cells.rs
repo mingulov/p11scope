@@ -8,7 +8,7 @@
 //! mappings on Btrfs.
 
 use super::*;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 /// A thread group whose leader is an unreaped zombie with one live
@@ -2870,4 +2870,645 @@ fn retained_view_scans_survivor_maps_after_leader_exit() {
         error.contains("exited before discovery"),
         "dead groups still exit the scan: {error}"
     );
+}
+
+/// State letter of a live pid from `/proc/<pid>/status` (`R`, `S`, `T`,
+/// `Z`, ...), or `None` when the pid is gone.
+fn d4_early_proc_state(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("State:") {
+            return Some(rest.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Parent pid of a live pid from `/proc/<pid>/status`, or `None`.
+fn d4_early_proc_ppid(pid: u32) -> Option<u32> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Wait until `pid` shows state `want` (`T`, `Z`, ...). Panics past the
+/// deadline (the caller cleans up its own pids before asserting).
+fn d4_early_wait_state(pid: u32, want: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if d4_early_proc_state(pid)
+            .as_deref()
+            .is_some_and(|state| state.starts_with(want))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pid {pid} never reached state {want}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Whether the thread group still holds a live non-leader task in `S`.
+/// A parked survivor reads `S`; the dead leader reads `Z` or is absent
+/// from the listing (kernel-dependent).
+fn d4_early_has_parked_survivor(tgid: u32) -> bool {
+    let Ok(entries) = std::fs::read_dir(format!("/proc/{tgid}/task")) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(tid): Result<u32, _> = entry.file_name().to_string_lossy().parse() else {
+            continue;
+        };
+        if tid == tgid {
+            continue;
+        }
+        let path = format!("/proc/{tgid}/task/{tid}/status");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("State:")
+                && rest.trim().starts_with('S')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Best-effort SIGKILL of `pid` only when its start time still matches
+/// `start` (never a reused pid number). Never panics.
+fn d4_early_kill_if_match(pid: u32, start: u64) {
+    if crate::process::process_start_time(pid).is_ok_and(|birth| birth == start) {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Poll until `pid` is gone or recycled (its start time differs from
+/// `start`). Returns true when gone.
+fn d4_early_gone(pid: u32, start: u64, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while crate::process::process_start_time(pid).is_ok_and(|birth| birth == start) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    true
+}
+
+/// Read exactly 8 bytes (two LE u32 pids) from `fd`. Returns `None` on
+/// EOF before 8 bytes (the spawner failed without reporting).
+fn d4_early_read_pids(fd: libc::c_int) -> Option<(u32, u32)> {
+    let mut report = [0u8; 8];
+    let mut done = 0;
+    while done < report.len() {
+        // SAFETY: reading into a valid stack buffer.
+        let got = unsafe {
+            libc::read(
+                fd,
+                report.as_mut_ptr().add(done).cast(),
+                report.len() - done,
+            )
+        };
+        if got == 0 {
+            return None;
+        }
+        assert!(got > 0, "the spawner report read failed");
+        done += got as usize;
+    }
+    let fixture = u32::from_ne_bytes(report[0..4].try_into().expect("fixture bytes"));
+    let peer = u32::from_ne_bytes(report[4..8].try_into().expect("peer bytes"));
+    Some((fixture, peer))
+}
+
+/// Early spawner death before the helper exec must leave no parked
+/// survivor, even when a peer holds the TID report reader open so the
+/// writer cannot hit EPIPE. The spawner forks the fixture (which stops
+/// before exec), forks a peer holding the report read end, reports both
+/// pids, then parks; the test kills the spawner, checks adoption,
+/// resumes the fixture, and requires the fixture to exit rather than
+/// park a survivor against the adopter.
+#[test]
+fn zombie_leader_early_spawner_death_leaves_no_survivor() {
+    let (mut channel, mut report) = ([0; 2], [0; 2]);
+    // SAFETY: two valid two-element arrays for pipe2.
+    assert_eq!(
+        unsafe { libc::pipe2(channel.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: pipe2 just returned these owned fds.
+    let channel_read = unsafe { OwnedFd::from_raw_fd(channel[0]) };
+    let channel_write = unsafe { OwnedFd::from_raw_fd(channel[1]) };
+    // SAFETY: pipe2 just returned these owned fds.
+    let report_read = unsafe { OwnedFd::from_raw_fd(report[0]) };
+    let report_write = unsafe { OwnedFd::from_raw_fd(report[1]) };
+    let bundle = HelperExec::with_vars(&[
+        b"P11SCOPE_D4Z_MODE=leader".to_vec(),
+        format!("P11SCOPE_D4Z_WFD={}", report_write.as_raw_fd()).into_bytes(),
+        b"P11SCOPE_D4Z_COUNT=1".to_vec(),
+    ]);
+    let cr = channel_read.as_raw_fd();
+    let cw = channel_write.as_raw_fd();
+    let rr = report_read.as_raw_fd();
+    let rw = report_write.as_raw_fd();
+    // SAFETY: the spawner child below only uses async-signal-safe calls
+    // (fork, kill, close, write, pause, exec) on inherited fds and the
+    // pre-built bundle; it never allocates, never panics, never returns.
+    let spawner = unsafe { libc::fork() };
+    assert!(spawner >= 0, "spawner fork failed");
+    if spawner == 0 {
+        unsafe {
+            let fixture = libc::fork();
+            if fixture < 0 {
+                libc::_exit(90);
+            }
+            if fixture == 0 {
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                let keep = [rw];
+                let drop_ends = [rr];
+                bundle.exec_child(&keep, &drop_ends);
+            }
+            let peer = libc::fork();
+            if peer < 0 {
+                libc::kill(fixture, libc::SIGKILL);
+                libc::_exit(91);
+            }
+            if peer == 0 {
+                libc::close(cw);
+                libc::close(cr);
+                libc::close(rw);
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                loop {
+                    libc::pause();
+                }
+            }
+            libc::close(cr);
+            libc::close(rw);
+            let mut pids = [0u8; 8];
+            pids[0..4].copy_from_slice(&(fixture as u32).to_ne_bytes());
+            pids[4..8].copy_from_slice(&(peer as u32).to_ne_bytes());
+            let mut written = 0;
+            while written < pids.len() {
+                let done = libc::write(cw, pids.as_ptr().add(written).cast(), pids.len() - written);
+                if done <= 0 {
+                    libc::kill(fixture, libc::SIGKILL);
+                    libc::kill(peer, libc::SIGKILL);
+                    libc::_exit(92);
+                }
+                written += done as usize;
+            }
+            libc::close(cw);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    let spawner = spawner as u32;
+    drop(report_read);
+    drop(report_write);
+    drop(channel_write);
+    let Some((fixture, peer)) = d4_early_read_pids(cr) else {
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(spawner as libc::pid_t, &mut status, 0);
+        }
+        panic!("the spawner never reported its fixture and peer");
+    };
+    // SAFETY: the read end served its single report.
+    unsafe {
+        libc::close(cr);
+    }
+    std::mem::forget(channel_read);
+    let fixture_start =
+        crate::process::process_start_time(fixture).expect("the stopped fixture has a start time");
+    let peer_start =
+        crate::process::process_start_time(peer).expect("the stopped peer has a start time");
+    d4_early_wait_state(fixture, "T", Duration::from_secs(10));
+    d4_early_wait_state(peer, "T", Duration::from_secs(10));
+    assert_eq!(
+        d4_early_proc_ppid(fixture),
+        Some(spawner),
+        "the fixture parents to the live spawner before the kill"
+    );
+    // SAFETY: signals only the owned spawner pid.
+    unsafe {
+        libc::kill(spawner as libc::pid_t, libc::SIGKILL);
+    }
+    let mut status = 0;
+    // SAFETY: blocking reap of the SIGKILLed spawner; EINTR retries.
+    loop {
+        let waited = unsafe { libc::waitpid(spawner as libc::pid_t, &mut status, 0) };
+        if waited == spawner as libc::pid_t {
+            break;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+    }
+    assert_ne!(
+        d4_early_proc_ppid(fixture),
+        Some(spawner),
+        "the fixture reparented away from the dead spawner"
+    );
+    // SAFETY: resumes only the recorded fixture pid.
+    unsafe {
+        libc::kill(fixture as libc::pid_t, libc::SIGCONT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut parked = false;
+    let mut gone = false;
+    while Instant::now() < deadline {
+        if crate::process::process_start_time(fixture).is_ok_and(|birth| birth != fixture_start)
+            || crate::process::process_start_time(fixture).is_err()
+        {
+            gone = true;
+            break;
+        }
+        if d4_early_proc_state(fixture)
+            .as_deref()
+            .is_some_and(|state| state.starts_with('Z'))
+            && d4_early_has_parked_survivor(fixture)
+        {
+            parked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    d4_early_kill_if_match(peer, peer_start);
+    d4_early_kill_if_match(fixture, fixture_start);
+    assert!(
+        d4_early_gone(peer, peer_start, Duration::from_secs(5)),
+        "the peer {peer} never died in cleanup"
+    );
+    assert!(
+        d4_early_gone(fixture, fixture_start, Duration::from_secs(5)),
+        "the fixture {fixture} never died in cleanup"
+    );
+    assert!(!parked, "the fixture parked a survivor against its adopter");
+    assert!(gone, "the fixture neither exited nor parked a survivor");
+}
+
+/// Early spawner death for the mapper mode: same custody rule as the
+/// leader twin, with the held-file mapping report held open by a peer.
+#[test]
+fn zombie_mapper_early_spawner_death_leaves_no_survivor() {
+    let dir = tempfile::tempdir().expect("mapper fixture tempdir creates");
+    let held = dir.path().join("held-early");
+    std::fs::write(&held, b"mapper early-death fixture\n").expect("held fixture writes");
+    let (mut channel, mut report) = ([0; 2], [0; 2]);
+    // SAFETY: two valid two-element arrays for pipe2.
+    assert_eq!(
+        unsafe { libc::pipe2(channel.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pipe2(report.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    // SAFETY: pipe2 just returned these owned fds.
+    let channel_read = unsafe { OwnedFd::from_raw_fd(channel[0]) };
+    let channel_write = unsafe { OwnedFd::from_raw_fd(channel[1]) };
+    // SAFETY: pipe2 just returned these owned fds.
+    let report_read = unsafe { OwnedFd::from_raw_fd(report[0]) };
+    let report_write = unsafe { OwnedFd::from_raw_fd(report[1]) };
+    let mut path_var = b"P11SCOPE_D4Z_PATH=".to_vec();
+    path_var.extend_from_slice(held.as_os_str().as_encoded_bytes());
+    let bundle = HelperExec::with_vars(&[
+        b"P11SCOPE_D4Z_MODE=mapper".to_vec(),
+        format!("P11SCOPE_D4Z_WFD={}", report_write.as_raw_fd()).into_bytes(),
+        path_var,
+        b"P11SCOPE_D4Z_EXEC=1".to_vec(),
+    ]);
+    let cr = channel_read.as_raw_fd();
+    let cw = channel_write.as_raw_fd();
+    let rr = report_read.as_raw_fd();
+    let rw = report_write.as_raw_fd();
+    // SAFETY: the spawner child below only uses async-signal-safe calls.
+    let spawner = unsafe { libc::fork() };
+    assert!(spawner >= 0, "spawner fork failed");
+    if spawner == 0 {
+        unsafe {
+            let fixture = libc::fork();
+            if fixture < 0 {
+                libc::_exit(90);
+            }
+            if fixture == 0 {
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                let keep = [rw];
+                let drop_ends = [rr];
+                bundle.exec_child(&keep, &drop_ends);
+            }
+            let peer = libc::fork();
+            if peer < 0 {
+                libc::kill(fixture, libc::SIGKILL);
+                libc::_exit(91);
+            }
+            if peer == 0 {
+                libc::close(cw);
+                libc::close(cr);
+                libc::close(rw);
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                loop {
+                    libc::pause();
+                }
+            }
+            libc::close(cr);
+            libc::close(rw);
+            let mut pids = [0u8; 8];
+            pids[0..4].copy_from_slice(&(fixture as u32).to_ne_bytes());
+            pids[4..8].copy_from_slice(&(peer as u32).to_ne_bytes());
+            let mut written = 0;
+            while written < pids.len() {
+                let done = libc::write(cw, pids.as_ptr().add(written).cast(), pids.len() - written);
+                if done <= 0 {
+                    libc::kill(fixture, libc::SIGKILL);
+                    libc::kill(peer, libc::SIGKILL);
+                    libc::_exit(92);
+                }
+                written += done as usize;
+            }
+            libc::close(cw);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    let spawner = spawner as u32;
+    drop(report_read);
+    drop(report_write);
+    drop(channel_write);
+    let Some((fixture, peer)) = d4_early_read_pids(cr) else {
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(spawner as libc::pid_t, &mut status, 0);
+        }
+        panic!("the spawner never reported its fixture and peer");
+    };
+    // SAFETY: the read end served its single report.
+    unsafe {
+        libc::close(cr);
+    }
+    std::mem::forget(channel_read);
+    let fixture_start =
+        crate::process::process_start_time(fixture).expect("the stopped fixture has a start time");
+    let peer_start =
+        crate::process::process_start_time(peer).expect("the stopped peer has a start time");
+    d4_early_wait_state(fixture, "T", Duration::from_secs(10));
+    d4_early_wait_state(peer, "T", Duration::from_secs(10));
+    assert_eq!(
+        d4_early_proc_ppid(fixture),
+        Some(spawner),
+        "the fixture parents to the live spawner before the kill"
+    );
+    // SAFETY: signals only the owned spawner pid.
+    unsafe {
+        libc::kill(spawner as libc::pid_t, libc::SIGKILL);
+    }
+    let mut status = 0;
+    // SAFETY: blocking reap of the SIGKILLed spawner; EINTR retries.
+    loop {
+        let waited = unsafe { libc::waitpid(spawner as libc::pid_t, &mut status, 0) };
+        if waited == spawner as libc::pid_t {
+            break;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+    }
+    assert_ne!(
+        d4_early_proc_ppid(fixture),
+        Some(spawner),
+        "the fixture reparented away from the dead spawner"
+    );
+    // SAFETY: resumes only the recorded fixture pid.
+    unsafe {
+        libc::kill(fixture as libc::pid_t, libc::SIGCONT);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut parked = false;
+    let mut gone = false;
+    while Instant::now() < deadline {
+        if crate::process::process_start_time(fixture).is_ok_and(|birth| birth != fixture_start)
+            || crate::process::process_start_time(fixture).is_err()
+        {
+            gone = true;
+            break;
+        }
+        if d4_early_proc_state(fixture)
+            .as_deref()
+            .is_some_and(|state| state.starts_with('Z'))
+            && d4_early_has_parked_survivor(fixture)
+        {
+            parked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    d4_early_kill_if_match(peer, peer_start);
+    d4_early_kill_if_match(fixture, fixture_start);
+    assert!(
+        d4_early_gone(peer, peer_start, Duration::from_secs(5)),
+        "the peer {peer} never died in cleanup"
+    );
+    assert!(
+        d4_early_gone(fixture, fixture_start, Duration::from_secs(5)),
+        "the fixture {fixture} never died in cleanup"
+    );
+    assert!(!parked, "the fixture parked a survivor against its adopter");
+    assert!(gone, "the fixture neither exited nor parked a survivor");
+}
+
+/// Early spawner death for the go-gated mode: the spawner dies before
+/// the helper exec, the go byte still arrives from the test (the report
+/// reader stays held by the peer), and no survivor may park.
+#[test]
+fn blocked_early_spawner_death_leaves_no_survivor() {
+    let (mut channel, mut go, mut tid) = ([0; 2], [0; 2], [0; 2]);
+    // SAFETY: valid two-element arrays for pipe2.
+    assert_eq!(
+        unsafe { libc::pipe2(channel.as_mut_ptr(), libc::O_CLOEXEC) },
+        0
+    );
+    assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    assert_eq!(unsafe { libc::pipe2(tid.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: pipe2 just returned these owned fds.
+    let channel_read = unsafe { OwnedFd::from_raw_fd(channel[0]) };
+    let channel_write = unsafe { OwnedFd::from_raw_fd(channel[1]) };
+    // SAFETY: pipe2 just returned these owned fds.
+    let go_read = unsafe { OwnedFd::from_raw_fd(go[0]) };
+    let go_write = unsafe { OwnedFd::from_raw_fd(go[1]) };
+    // SAFETY: pipe2 just returned these owned fds.
+    let tid_read = unsafe { OwnedFd::from_raw_fd(tid[0]) };
+    let tid_write = unsafe { OwnedFd::from_raw_fd(tid[1]) };
+    let bundle = HelperExec::with_vars(&[
+        b"P11SCOPE_D4Z_MODE=blocked".to_vec(),
+        format!("P11SCOPE_D4Z_GOFD={}", go_read.as_raw_fd()).into_bytes(),
+        format!("P11SCOPE_D4Z_TIDFD={}", tid_write.as_raw_fd()).into_bytes(),
+    ]);
+    let cr = channel_read.as_raw_fd();
+    let cw = channel_write.as_raw_fd();
+    let gr = go_read.as_raw_fd();
+    let gw = go_write.as_raw_fd();
+    let tr = tid_read.as_raw_fd();
+    let tw = tid_write.as_raw_fd();
+    // SAFETY: the spawner child below only uses async-signal-safe calls.
+    let spawner = unsafe { libc::fork() };
+    assert!(spawner >= 0, "spawner fork failed");
+    if spawner == 0 {
+        unsafe {
+            let fixture = libc::fork();
+            if fixture < 0 {
+                libc::_exit(90);
+            }
+            if fixture == 0 {
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                let keep = [gr, tw];
+                let drop_ends = [gw, tr];
+                bundle.exec_child(&keep, &drop_ends);
+            }
+            let peer = libc::fork();
+            if peer < 0 {
+                libc::kill(fixture, libc::SIGKILL);
+                libc::_exit(91);
+            }
+            if peer == 0 {
+                libc::close(cw);
+                libc::close(cr);
+                libc::close(gr);
+                libc::close(gw);
+                libc::close(tw);
+                libc::kill(libc::getpid(), libc::SIGSTOP);
+                loop {
+                    libc::pause();
+                }
+            }
+            libc::close(cr);
+            libc::close(gr);
+            libc::close(tw);
+            let mut pids = [0u8; 8];
+            pids[0..4].copy_from_slice(&(fixture as u32).to_ne_bytes());
+            pids[4..8].copy_from_slice(&(peer as u32).to_ne_bytes());
+            let mut written = 0;
+            while written < pids.len() {
+                let done = libc::write(cw, pids.as_ptr().add(written).cast(), pids.len() - written);
+                if done <= 0 {
+                    libc::kill(fixture, libc::SIGKILL);
+                    libc::kill(peer, libc::SIGKILL);
+                    libc::_exit(92);
+                }
+                written += done as usize;
+            }
+            libc::close(cw);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    let spawner = spawner as u32;
+    drop(go_read);
+    drop(tid_read);
+    drop(tid_write);
+    drop(channel_write);
+    let Some((fixture, peer)) = d4_early_read_pids(cr) else {
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(spawner as libc::pid_t, &mut status, 0);
+        }
+        panic!("the spawner never reported its fixture and peer");
+    };
+    // SAFETY: the read end served its single report.
+    unsafe {
+        libc::close(cr);
+    }
+    std::mem::forget(channel_read);
+    let fixture_start =
+        crate::process::process_start_time(fixture).expect("the stopped fixture has a start time");
+    let peer_start =
+        crate::process::process_start_time(peer).expect("the stopped peer has a start time");
+    d4_early_wait_state(fixture, "T", Duration::from_secs(10));
+    d4_early_wait_state(peer, "T", Duration::from_secs(10));
+    assert_eq!(
+        d4_early_proc_ppid(fixture),
+        Some(spawner),
+        "the fixture parents to the live spawner before the kill"
+    );
+    // SAFETY: signals only the owned spawner pid.
+    unsafe {
+        libc::kill(spawner as libc::pid_t, libc::SIGKILL);
+    }
+    let mut status = 0;
+    // SAFETY: blocking reap of the SIGKILLed spawner; EINTR retries.
+    loop {
+        let waited = unsafe { libc::waitpid(spawner as libc::pid_t, &mut status, 0) };
+        if waited == spawner as libc::pid_t {
+            break;
+        }
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINTR)
+        );
+    }
+    assert_ne!(
+        d4_early_proc_ppid(fixture),
+        Some(spawner),
+        "the fixture reparented away from the dead spawner"
+    );
+    // SAFETY: resumes only the recorded fixture pid.
+    unsafe {
+        libc::kill(fixture as libc::pid_t, libc::SIGCONT);
+    }
+    // The go byte still arrives (from the held write end) while the TID
+    // reader stays held by the peer; EPIPE only means the fixture already
+    // exited without cloning.
+    // SAFETY: writing one go byte down the held go pipe.
+    let _ = unsafe { libc::write(gw, [1u8].as_ptr().cast(), 1) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut parked = false;
+    let mut gone = false;
+    while Instant::now() < deadline {
+        if crate::process::process_start_time(fixture).is_ok_and(|birth| birth != fixture_start)
+            || crate::process::process_start_time(fixture).is_err()
+        {
+            gone = true;
+            break;
+        }
+        if d4_early_proc_state(fixture)
+            .as_deref()
+            .is_some_and(|state| state.starts_with('Z'))
+            && d4_early_has_parked_survivor(fixture)
+        {
+            parked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    d4_early_kill_if_match(peer, peer_start);
+    d4_early_kill_if_match(fixture, fixture_start);
+    drop(go_write);
+    assert!(
+        d4_early_gone(peer, peer_start, Duration::from_secs(5)),
+        "the peer {peer} never died in cleanup"
+    );
+    assert!(
+        d4_early_gone(fixture, fixture_start, Duration::from_secs(5)),
+        "the fixture {fixture} never died in cleanup"
+    );
+    assert!(!parked, "the fixture parked a survivor against its adopter");
+    assert!(gone, "the fixture neither exited nor parked a survivor");
 }

@@ -6982,22 +6982,52 @@ impl JournalAdapter {
         // ones).
         let fresh = !self.keys.contains_key(&key);
         let minted_incarnation = fresh && key.incarnation > 0;
-        let fenced_siblings = fresh
-            && !minted_incarnation
-            && self
-                .image_keys
+        // The authorizing siblings' newest fence (0 when none
+        // authorizes): a fresh binding beside void-fenced live
+        // registered siblings inherits it below.
+        let sibling_fence = if fresh && !minted_incarnation {
+            self.image_keys
                 .get(&(key.cookie, key.exec))
-                .is_some_and(|siblings| {
-                    siblings.iter().any(|sibling| {
-                        *sibling != key
-                            && self.key_is_live(*sibling)
-                            && self.keys.get(sibling).is_some_and(|state| {
-                                state.model_registered
-                                    && state.void_fence > 0
-                                    && state.void_fence >= state.sealed_through
-                            })
-                    })
-                });
+                .map(|siblings| {
+                    siblings
+                        .iter()
+                        .filter(|sibling| {
+                            **sibling != key
+                                && self.key_is_live(**sibling)
+                                && self.keys.get(*sibling).is_some_and(|state| {
+                                    state.model_registered
+                                        && state.void_fence > 0
+                                        && state.void_fence >= state.sealed_through
+                                })
+                        })
+                        .map(|sibling| self.keys.get(sibling).map_or(0, |state| state.void_fence))
+                        .max()
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let fenced_siblings = sibling_fence > 0;
+        // Fence inheritance: a mint descends from the void era that
+        // authorized it, so a doom before the next void still mints
+        // onward on new proof instead of stranding unfenced. Vacuous
+        // for the newborn (no history at or below the inherited
+        // fence; births cut at the frontier) and invisible to every
+        // fence reader (all max with the global fence; the sibling
+        // rule keys on sealed progress past it, which a newborn
+        // never has).
+        let inherited_fence = if minted_incarnation {
+            let parent = JournalDomainKey {
+                incarnation: key.incarnation.saturating_sub(1),
+                ..key
+            };
+            self.keys.get(&parent).map_or(0, |parent| parent.void_fence)
+        } else if fenced_siblings {
+            sibling_fence
+        } else {
+            0
+        };
         if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.entry(key) {
             if minted_incarnation {
                 self.reentry_incarnations = self.reentry_incarnations.saturating_add(1);
@@ -7007,7 +7037,10 @@ impl JournalAdapter {
             } else if fenced_siblings {
                 self.reentry_sibling_binds = self.reentry_sibling_binds.saturating_add(1);
             }
-            vacant.insert(JournalDomainState::default());
+            vacant.insert(JournalDomainState {
+                void_fence: inherited_fence,
+                ..JournalDomainState::default()
+            });
             self.image_keys
                 .entry((key.cookie, key.exec))
                 .or_default()

@@ -31,9 +31,9 @@ struct ZombieLeaderGroup {
 /// arrives as the argument), then parks in `pause()`. Raw syscalls only.
 extern "C" fn clone_survivor_main(arg: *mut std::ffi::c_void) -> libc::c_int {
     // Parent-death guard (same body as
-    // `crate::fixture_guard::DieWithParent`, with the owner from the
-    // pre-fork store): a test that dies abruptly must not strand the
-    // parking survivor. Async-signal-safe: atomic load, prctl, getppid.
+    // `crate::fixture_guard::DieWithParent`, with the owner the helper
+    // carried across the exec): a test that dies abruptly must not strand
+    // the parking survivor. Async-signal-safe: atomic load, prctl, getppid.
     let owner = crate::fixture_guard::SURVIVOR_OWNER_PID.load(std::sync::atomic::Ordering::Acquire);
     unsafe {
         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
@@ -119,12 +119,26 @@ impl HelperExec {
     }
 
     /// Exec this test binary in helper mode. Only async-signal-safe
-    /// calls past the fork: close the parent's pipe ends, clear
+    /// calls past the fork: arm parent-death SIGKILL against the carried
+    /// `owner` and recheck it (a spawner already gone exits 127 before
+    /// exec, so no orphan starts), close the parent's pipe ends, clear
     /// `CLOEXEC` on the ends the helper inherits (the fork copied our
     /// fd table, so this is invisible to sibling threads), then
     /// `execve`. Diverges: a failed exec exits 127, and the parent's
-    /// exact report read then fails loud on EOF.
-    unsafe fn exec_child(&self, keep: &[libc::c_int], drop_ends: &[libc::c_int]) -> ! {
+    /// exact report read then fails loud on EOF. The death signal
+    /// survives the exec, so the helper stays guarded until it clones
+    /// its own survivors.
+    unsafe fn exec_child(&self, owner: u32, keep: &[libc::c_int], drop_ends: &[libc::c_int]) -> ! {
+        // SAFETY: arming parent death against the carried owner; a parent
+        // already gone exits before exec.
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                libc::_exit(127);
+            }
+            if libc::getppid() != owner as libc::pid_t {
+                libc::_exit(127);
+            }
+        }
         for fd in drop_ends {
             // SAFETY: closing a pipe end we own.
             unsafe {
@@ -293,11 +307,24 @@ unsafe fn d4z_clone_stack(fail: i32) -> *mut std::ffi::c_void {
 unsafe fn d4_zombie_helper_main(mode: *mut libc::c_char) -> ! {
     let mode = mode as *const u8;
     let len = unsafe { d4z_c_strlen(mode) };
-    // Record the owner first: the exec wiped the pre-fork store, and
-    // our parent is the spawner the survivors must die with.
-    // SAFETY: reading our own parent pid.
-    let owner = unsafe { libc::getppid() } as u32;
+    // Record the owner first: the exec wiped the pre-fork store, so the
+    // spawner carries its pre-fork pid explicitly across the exec. Never
+    // sample `getppid` here: a spawner that died before this entry
+    // already reparented us to an adopter, and arming against the adopter
+    // would strand the survivors. The survivors arm and recheck against
+    // this same carried pid.
+    let owner = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_OWNER".as_ptr(), 28) };
     crate::fixture_guard::SURVIVOR_OWNER_PID.store(owner, std::sync::atomic::Ordering::Release);
+    // SAFETY: re-arming parent death against the carried owner; a parent
+    // already gone exits before cloning any survivor.
+    unsafe {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+            libc::_exit(127);
+        }
+        if libc::getppid() != owner as libc::pid_t {
+            libc::_exit(127);
+        }
+    }
     if unsafe { d4z_streq(mode, len, b"leader") } {
         let wfd = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_WFD".as_ptr(), 30) } as libc::c_int;
         let count = unsafe { d4z_getenv_u32(c"P11SCOPE_D4Z_COUNT".as_ptr(), 31) };
@@ -477,6 +504,39 @@ unsafe fn d4_zombie_helper_main(mode: *mut libc::c_char) -> ! {
     }
 }
 
+/// Temporary kill/reap guard for a forked helper child: on drop while
+/// still armed (a report-read panic, including an exec failure that
+/// reads as EOF), SIGKILLs and reaps the child so neither a raw fd nor
+/// an unreaped child strands the harness. Disarm after the complete
+/// report validates, when custody transfers to the fixture drop guard.
+/// Never panics.
+struct D4ChildGuard {
+    pid: libc::pid_t,
+    armed: bool,
+}
+
+impl Drop for D4ChildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            let mut status = 0;
+            loop {
+                let waited = libc::waitpid(self.pid, &mut status, 0);
+                if waited >= 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error().raw_os_error();
+                if err != Some(libc::EINTR) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 impl ZombieLeaderGroup {
     fn spawn() -> Self {
         let (tgid, survivors) = Self::spawn_inner(1);
@@ -511,32 +571,37 @@ impl ZombieLeaderGroup {
             unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
+        // SAFETY: pipe2 just returned these owned fds; owned from creation
+        // so a report-read panic cannot strand the read end.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipes[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipes[1]) };
         // The survivor's parent-death owner, stored before the fork it
-        // inherits (see `SURVIVOR_OWNER_PID`); the exec'd helper
-        // re-records its own parent after the exec wipes this store.
-        crate::fixture_guard::SURVIVOR_OWNER_PID
-            .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        // inherits (see `SURVIVOR_OWNER_PID`) and carried explicitly
+        // across the exec (the exec wipes the store, so the helper must
+        // never sample `getppid`).
+        let owner = std::process::id();
+        crate::fixture_guard::SURVIVOR_OWNER_PID.store(owner, std::sync::atomic::Ordering::Release);
         let bundle = HelperExec::with_vars(&[
             b"P11SCOPE_D4Z_MODE=leader".to_vec(),
-            format!("P11SCOPE_D4Z_WFD={}", pipes[1]).into_bytes(),
+            format!("P11SCOPE_D4Z_WFD={}", write_fd.as_raw_fd()).into_bytes(),
             format!("P11SCOPE_D4Z_COUNT={count}").into_bytes(),
+            format!("P11SCOPE_D4Z_OWNER={owner}").into_bytes(),
         ]);
-        // SAFETY: the child only closes pipe ends, clears CLOEXEC on
-        // its inherited copies, and execs the helper bundle; no
-        // allocator, no pthread, no locks.
+        // SAFETY: the child only arms parent death, closes pipe ends,
+        // clears CLOEXEC on its inherited copies, and execs the helper
+        // bundle; no allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                bundle.exec_child(&[pipes[1]], &[pipes[0]]);
+                bundle.exec_child(owner, &[write_fd.as_raw_fd()], &[read_fd.as_raw_fd()]);
             }
         }
-        // SAFETY: the parent keeps the read end and closes its write copy so
+        let mut guard = D4ChildGuard { pid, armed: true };
+        // The parent keeps the read end and closes its write copy so
         // a dead child reads as EOF instead of hanging the read below.
-        unsafe {
-            libc::close(pipes[1]);
-        }
+        drop(write_fd);
         // Each survivor writes its 4-byte TID in one small pipe write,
         // so the bytes split into intact TIDs in either order.
         let want = 4 * count;
@@ -545,7 +610,7 @@ impl ZombieLeaderGroup {
             // SAFETY: reading into a valid stack buffer.
             let got = unsafe {
                 libc::read(
-                    pipes[0],
+                    read_fd.as_raw_fd(),
                     tid_bytes.as_mut_ptr().add(done).cast(),
                     want - done,
                 )
@@ -553,10 +618,8 @@ impl ZombieLeaderGroup {
             assert!(got > 0, "clone survivor never reported its tid");
             done += got as usize;
         }
-        // SAFETY: the read end served its single read.
-        unsafe {
-            libc::close(pipes[0]);
-        }
+        drop(read_fd);
+        guard.armed = false;
         let survivors = (0..count)
             .map(|index| {
                 u32::from_ne_bytes([
@@ -997,40 +1060,45 @@ impl ZombieMapperGroup {
             unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
+        // SAFETY: pipe2 just returned these owned fds; owned from creation
+        // so a report-read panic cannot strand the read end.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(pipes[0]) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(pipes[1]) };
         // The survivor's parent-death owner, stored before the fork it
-        // inherits (see `SURVIVOR_OWNER_PID`); the exec'd helper
-        // re-records its own parent after the exec wipes this store.
-        crate::fixture_guard::SURVIVOR_OWNER_PID
-            .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        // inherits (see `SURVIVOR_OWNER_PID`) and carried explicitly
+        // across the exec (the exec wipes the store, so the helper must
+        // never sample `getppid`).
+        let owner = std::process::id();
+        crate::fixture_guard::SURVIVOR_OWNER_PID.store(owner, std::sync::atomic::Ordering::Release);
         let mut path_var = b"P11SCOPE_D4Z_PATH=".to_vec();
         path_var.extend_from_slice(path.as_os_str().as_encoded_bytes());
         let bundle = HelperExec::with_vars(&[
             b"P11SCOPE_D4Z_MODE=mapper".to_vec(),
-            format!("P11SCOPE_D4Z_WFD={}", pipes[1]).into_bytes(),
+            format!("P11SCOPE_D4Z_WFD={}", write_fd.as_raw_fd()).into_bytes(),
             path_var,
             format!("P11SCOPE_D4Z_EXEC={}", u8::from(exec)).into_bytes(),
+            format!("P11SCOPE_D4Z_OWNER={owner}").into_bytes(),
         ]);
-        // SAFETY: the child only closes pipe ends, clears CLOEXEC on
-        // its inherited copies, and execs the helper bundle; no
-        // allocator, no pthread, no locks.
+        // SAFETY: the child only arms parent death, closes pipe ends,
+        // clears CLOEXEC on its inherited copies, and execs the helper
+        // bundle; no allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                bundle.exec_child(&[pipes[1]], &[pipes[0]]);
+                bundle.exec_child(owner, &[write_fd.as_raw_fd()], &[read_fd.as_raw_fd()]);
             }
         }
-        // SAFETY: the parent keeps the read end and closes its write copy.
-        unsafe {
-            libc::close(pipes[1]);
-        }
+        let mut guard = D4ChildGuard { pid, armed: true };
+        // The parent keeps the read end and closes its write copy.
+        drop(write_fd);
         let mut done = 0;
         while done < report.len() {
             // SAFETY: reading into a valid stack buffer.
             let got = unsafe {
                 libc::read(
-                    pipes[0],
+                    read_fd.as_raw_fd(),
                     report.as_mut_ptr().add(done).cast(),
                     report.len() - done,
                 )
@@ -1038,10 +1106,8 @@ impl ZombieMapperGroup {
             assert!(got > 0, "mapper child never reported address+tid");
             done += got as usize;
         }
-        // SAFETY: the read end served its single report.
-        unsafe {
-            libc::close(pipes[0]);
-        }
+        drop(read_fd);
+        guard.armed = false;
         let address = u64::from_ne_bytes(report[0..8].try_into().expect("address bytes"));
         let survivor = u32::from_ne_bytes(report[8..12].try_into().expect("tid bytes"));
         assert_ne!(address, 0, "mapped address is real");
@@ -2609,24 +2675,26 @@ impl BlockedChild {
         assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         assert_eq!(unsafe { libc::pipe2(tid.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         // The survivor's parent-death owner, stored before the fork it
-        // inherits (see `SURVIVOR_OWNER_PID`); the exec'd helper
-        // re-records its own parent after the exec wipes this store.
-        crate::fixture_guard::SURVIVOR_OWNER_PID
-            .store(std::process::id(), std::sync::atomic::Ordering::Release);
+        // inherits (see `SURVIVOR_OWNER_PID`) and carried explicitly
+        // across the exec (the exec wipes the store, so the helper must
+        // never sample `getppid`).
+        let owner = std::process::id();
+        crate::fixture_guard::SURVIVOR_OWNER_PID.store(owner, std::sync::atomic::Ordering::Release);
         let bundle = HelperExec::with_vars(&[
             b"P11SCOPE_D4Z_MODE=blocked".to_vec(),
             format!("P11SCOPE_D4Z_GOFD={}", go[0]).into_bytes(),
             format!("P11SCOPE_D4Z_TIDFD={}", tid[1]).into_bytes(),
+            format!("P11SCOPE_D4Z_OWNER={owner}").into_bytes(),
         ]);
-        // SAFETY: the child only closes pipe ends, clears CLOEXEC on
-        // its inherited copies, and execs the helper bundle; no
-        // allocator, no pthread, no locks.
+        // SAFETY: the child only arms parent death, closes pipe ends,
+        // clears CLOEXEC on its inherited copies, and execs the helper
+        // bundle; no allocator, no pthread, no locks.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "blocked fork failed");
         if pid == 0 {
             // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                bundle.exec_child(&[go[0], tid[1]], &[go[1], tid[0]]);
+                bundle.exec_child(owner, &[go[0], tid[1]], &[go[1], tid[0]]);
             }
         }
         // SAFETY: the parent keeps one end of each pipe.
@@ -3020,11 +3088,20 @@ fn zombie_leader_early_spawner_death_leaves_no_survivor() {
         b"P11SCOPE_D4Z_MODE=leader".to_vec(),
         format!("P11SCOPE_D4Z_WFD={}", report_write.as_raw_fd()).into_bytes(),
         b"P11SCOPE_D4Z_COUNT=1".to_vec(),
+        format!("P11SCOPE_D4Z_OWNER={:010}", 0).into_bytes(),
     ]);
     let cr = channel_read.as_raw_fd();
     let cw = channel_write.as_raw_fd();
     let rr = report_read.as_raw_fd();
     let rw = report_write.as_raw_fd();
+    // The placeholder owner value the spawner patches with its own pid
+    // (10 zero-padded digits, NUL preserved). Computed before the fork so
+    // the child only writes bytes.
+    let owner_value_ptr = {
+        let prefix = b"P11SCOPE_D4Z_OWNER=".len();
+        // SAFETY: the bundle just built the placeholder owner var at index 3.
+        unsafe { bundle.env[3].as_ptr().add(prefix) as *mut u8 }
+    };
     // SAFETY: the spawner child below only uses async-signal-safe calls
     // (fork, kill, close, write, pause, exec) on inherited fds and the
     // pre-built bundle; it never allocates, never panics, never returns.
@@ -3032,6 +3109,15 @@ fn zombie_leader_early_spawner_death_leaves_no_survivor() {
     assert!(spawner >= 0, "spawner fork failed");
     if spawner == 0 {
         unsafe {
+            let me = libc::getpid() as u32;
+            let mut digits = [b'0'; 10];
+            let mut value = me;
+            for slot in digits.iter_mut().rev() {
+                *slot = b'0' + (value % 10) as u8;
+                value /= 10;
+            }
+            core::ptr::copy_nonoverlapping(digits.as_ptr(), owner_value_ptr, 10);
+            let spawner_pid = me;
             let fixture = libc::fork();
             if fixture < 0 {
                 libc::_exit(90);
@@ -3040,7 +3126,7 @@ fn zombie_leader_early_spawner_death_leaves_no_survivor() {
                 libc::kill(libc::getpid(), libc::SIGSTOP);
                 let keep = [rw];
                 let drop_ends = [rr];
-                bundle.exec_child(&keep, &drop_ends);
+                bundle.exec_child(spawner_pid, &keep, &drop_ends);
             }
             let peer = libc::fork();
             if peer < 0 {
@@ -3193,16 +3279,31 @@ fn zombie_mapper_early_spawner_death_leaves_no_survivor() {
         format!("P11SCOPE_D4Z_WFD={}", report_write.as_raw_fd()).into_bytes(),
         path_var,
         b"P11SCOPE_D4Z_EXEC=1".to_vec(),
+        format!("P11SCOPE_D4Z_OWNER={:010}", 0).into_bytes(),
     ]);
     let cr = channel_read.as_raw_fd();
     let cw = channel_write.as_raw_fd();
     let rr = report_read.as_raw_fd();
     let rw = report_write.as_raw_fd();
+    let owner_value_ptr = {
+        let prefix = b"P11SCOPE_D4Z_OWNER=".len();
+        // SAFETY: the bundle just built the placeholder owner var at index 4.
+        unsafe { bundle.env[4].as_ptr().add(prefix) as *mut u8 }
+    };
     // SAFETY: the spawner child below only uses async-signal-safe calls.
     let spawner = unsafe { libc::fork() };
     assert!(spawner >= 0, "spawner fork failed");
     if spawner == 0 {
         unsafe {
+            let me = libc::getpid() as u32;
+            let mut digits = [b'0'; 10];
+            let mut value = me;
+            for slot in digits.iter_mut().rev() {
+                *slot = b'0' + (value % 10) as u8;
+                value /= 10;
+            }
+            core::ptr::copy_nonoverlapping(digits.as_ptr(), owner_value_ptr, 10);
+            let spawner_pid = me;
             let fixture = libc::fork();
             if fixture < 0 {
                 libc::_exit(90);
@@ -3211,7 +3312,7 @@ fn zombie_mapper_early_spawner_death_leaves_no_survivor() {
                 libc::kill(libc::getpid(), libc::SIGSTOP);
                 let keep = [rw];
                 let drop_ends = [rr];
-                bundle.exec_child(&keep, &drop_ends);
+                bundle.exec_child(spawner_pid, &keep, &drop_ends);
             }
             let peer = libc::fork();
             if peer < 0 {
@@ -3360,6 +3461,7 @@ fn blocked_early_spawner_death_leaves_no_survivor() {
         b"P11SCOPE_D4Z_MODE=blocked".to_vec(),
         format!("P11SCOPE_D4Z_GOFD={}", go_read.as_raw_fd()).into_bytes(),
         format!("P11SCOPE_D4Z_TIDFD={}", tid_write.as_raw_fd()).into_bytes(),
+        format!("P11SCOPE_D4Z_OWNER={:010}", 0).into_bytes(),
     ]);
     let cr = channel_read.as_raw_fd();
     let cw = channel_write.as_raw_fd();
@@ -3367,11 +3469,25 @@ fn blocked_early_spawner_death_leaves_no_survivor() {
     let gw = go_write.as_raw_fd();
     let tr = tid_read.as_raw_fd();
     let tw = tid_write.as_raw_fd();
+    let owner_value_ptr = {
+        let prefix = b"P11SCOPE_D4Z_OWNER=".len();
+        // SAFETY: the bundle just built the placeholder owner var at index 3.
+        unsafe { bundle.env[3].as_ptr().add(prefix) as *mut u8 }
+    };
     // SAFETY: the spawner child below only uses async-signal-safe calls.
     let spawner = unsafe { libc::fork() };
     assert!(spawner >= 0, "spawner fork failed");
     if spawner == 0 {
         unsafe {
+            let me = libc::getpid() as u32;
+            let mut digits = [b'0'; 10];
+            let mut value = me;
+            for slot in digits.iter_mut().rev() {
+                *slot = b'0' + (value % 10) as u8;
+                value /= 10;
+            }
+            core::ptr::copy_nonoverlapping(digits.as_ptr(), owner_value_ptr, 10);
+            let spawner_pid = me;
             let fixture = libc::fork();
             if fixture < 0 {
                 libc::_exit(90);
@@ -3380,7 +3496,7 @@ fn blocked_early_spawner_death_leaves_no_survivor() {
                 libc::kill(libc::getpid(), libc::SIGSTOP);
                 let keep = [gr, tw];
                 let drop_ends = [gw, tr];
-                bundle.exec_child(&keep, &drop_ends);
+                bundle.exec_child(spawner_pid, &keep, &drop_ends);
             }
             let peer = libc::fork();
             if peer < 0 {

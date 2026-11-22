@@ -1761,7 +1761,9 @@ fn run_stop_case(
 
 /// Full assert set for one stop case, over its collected outcome: the
 /// at-Q publication (or disclosed shed), the latch double-naming, the
-/// abandon accounting and the Published-then-WoundDown terminal.
+/// abandon accounting and the Published-then-WoundDown terminal. The
+/// two-owner reconciliation must hold on every passing case: A-side
+/// publication alone cannot excuse a B-side silent loss.
 fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     // (b) The at-Q tick publishes the stashed calls: A's resolved
     // calls reach its edge, or the equation discloses shed loudly.
@@ -1829,6 +1831,15 @@ fn check_stop_outcome(outcome: &StopOutcome, offset_ms: u64) -> Result<()> {
     ensure!(
         outcome.finish == "published" && outcome.wound == "joined" && outcome.taken,
         "offset {offset_ms}: the finish must reach Published then WoundDown: {outcome}"
+    );
+    // (d) The two-owner reconciliation holds on every passing case:
+    // every entered call on both edges is attributed, refused or
+    // disclosed-shed, never silently lost. After the terminal check so
+    // a wedged finish keeps its wedge diagnostic.
+    ensure!(
+        outcome.reconciled,
+        "offset {offset_ms}: two-owner reconciliation failed: {}",
+        outcome.reconcile_detail,
     );
     Ok(())
 }

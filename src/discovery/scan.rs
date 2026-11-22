@@ -3459,9 +3459,11 @@ enum ReplayRead {
 /// memory: one metered positioned read, admitted by a stop poll and one
 /// charged unit. A 3.x table whose declared extension is unmapped (a
 /// short read that still covers the complete 68-slot legacy prefix)
-/// yields that prefix alone: the re-decode re-proves the prefix with no
-/// extension claim, and a full row or a tail refutation still needs the
-/// declared extent.
+/// yields that prefix alone when the cached row is itself no wider than
+/// the prefix: the re-decode re-proves the prefix with no extension
+/// claim. A wider cached row, a full row or a tail refutation needs the
+/// declared extent; without it the read is unavailable and the cursor
+/// waits with its rows unchanged.
 fn reread_table_extent(
     layout: LinuxLayout,
     table: &ScannedTable,
@@ -3483,15 +3485,22 @@ fn reread_table_extent(
         Some(Ok(read)) => read.min(len),
         Some(Err(_)) => return ReplayRead::Unavailable,
     };
+    // Every byte the kernel returned is charged once, before the extent
+    // is classified.
+    budget.record_io(read);
     let kept = if read == len {
         len
     } else {
         match exact_legacy_prefix_bytes(&extent[..read], layout) {
-            Some(prefix) if prefix <= read => prefix,
+            // Only a cached row no wider than the legacy prefix can be
+            // re-proved from it: an unread tail proves nothing about a
+            // wider cached row's tail entries, so that row waits.
+            Some(prefix) if prefix <= read && table.decoded_slot_count() <= LEGACY_PREFIX_SLOTS => {
+                prefix
+            }
             _ => return ReplayRead::Unavailable,
         }
     };
-    budget.record_io(read);
     extent.truncate(kept);
     ReplayRead::Bytes(extent)
 }
@@ -8081,11 +8090,8 @@ impl ScanIo for ProcScanIo {
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(), String> {
-        if view.cold_filesystem_observed() {
-            return view.cold_closing_proof(budget);
-        }
         let mut refusal = None;
-        let proof = view.metered_closing_proof(&mut || {
+        let mut admit = || {
             if let Some(reason) = budget.stopped_now() {
                 refusal = Some(reason);
                 return false;
@@ -8097,13 +8103,18 @@ impl ScanIo for ProcScanIo {
                     false
                 }
             }
-        });
-        match proof {
-            None => Err(refusal.unwrap_or(WORK_CEILING_REASON).into()),
-            Some(ClosingProof::Current) => Ok(()),
-            Some(ClosingProof::ColdTransition) => view.cold_closing_proof(budget),
-            Some(ClosingProof::Failed(reason)) => Err(reason),
-        }
+        };
+        let cold = if view.cold_filesystem_observed() {
+            view.cold_closing_proof(&mut admit)
+        } else {
+            match view.metered_closing_proof(&mut admit) {
+                None => None,
+                Some(ClosingProof::Current) => Some(Ok(())),
+                Some(ClosingProof::ColdTransition) => view.cold_closing_proof(&mut admit),
+                Some(ClosingProof::Failed(reason)) => Some(Err(reason)),
+            }
+        };
+        cold.unwrap_or_else(|| Err(refusal.unwrap_or(WORK_CEILING_REASON).into()))
     }
 
     fn range_identity(
@@ -24394,6 +24405,9 @@ int main(int argc, char **argv) {
         let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         let view = ProcessView::open(ProcessViewId(98), pid).unwrap();
         let start = crate::process::process_start_time(pid).unwrap();
+        let mut group = crate::process::cold_view_tests::ColdLeaderSubject::spawn(1);
+        group.leave_leader();
+        let cold = ProcessView::open(ProcessViewId(103), group.pid()).unwrap();
         type Entry<'a> = (&'a str, Box<dyn Fn(&mut dyn FnMut() -> bool) + 'a>);
         let entries: Vec<Entry<'_>> = vec![
             (
@@ -24481,6 +24495,12 @@ int main(int argc, char **argv) {
                     let _ = file.replay_read_at(&mut [0u8; 64], 0, admit);
                 }),
             ),
+            (
+                "cold_closing_proof",
+                Box::new(|admit| {
+                    let _ = cold.cold_closing_proof(admit);
+                }),
+            ),
         ];
         let measure = |run: &dyn Fn(&mut dyn FnMut() -> bool), credits: u64| {
             let mut admitted = 0u64;
@@ -24542,6 +24562,8 @@ int main(int argc, char **argv) {
             exercised >= 2 * entries.len(),
             "every entry point met a fault"
         );
+        drop(entries);
+        group.call_three();
     }
 
     /// A task name can hold a newline: the metered start-time reader

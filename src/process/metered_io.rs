@@ -83,6 +83,8 @@ pub(crate) enum NativeOp {
     Fstat,
     Fstatfs,
     Stat,
+    Statx,
+    Getdents,
     Kill,
 }
 
@@ -187,6 +189,47 @@ impl MeteredFile {
             unsafe { libc::open(path.as_ptr(), flags) }.into()
         });
         Some(opened.map(|fd| Self { fd: fd as RawFd }).map_err(Unproven))
+    }
+
+    /// Open the directory `path` read-only and close-on-exec with one
+    /// `open(2)`: two units, the open and the close its drop issues.
+    pub(crate) fn directory(path: &str, admit: &mut dyn FnMut() -> bool) -> Option<Native<Self>> {
+        let path = match c_path(path) {
+            Ok(path) => path,
+            Err(error) => return Some(Err(error)),
+        };
+        if !admit() {
+            return None;
+        }
+        if !admit() {
+            return None;
+        }
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        // SAFETY: `path` is NUL-terminated; the result is a new descriptor or -1.
+        let opened = native(NativeOp::Open, || {
+            unsafe { libc::open(path.as_ptr(), flags) }.into()
+        });
+        Some(opened.map(|fd| Self { fd: fd as RawFd }).map_err(Unproven))
+    }
+
+    /// One `getdents64(2)` of this directory into `buf`: one unit, no
+    /// retry. `Ok(0)` is the end of the directory; parse the records
+    /// with [`dirent_names`].
+    pub(crate) fn getdents(
+        &mut self,
+        buf: &mut [u8],
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<Native<usize>> {
+        if !admit() {
+            return None;
+        }
+        let fd = self.fd;
+        // SAFETY: `fd` is an open directory and `buf` is writable for its
+        // length; the kernel writes whole records only.
+        let read = native(NativeOp::Getdents, || unsafe {
+            libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) as i64
+        });
+        Some(read.map(|count| count as usize).map_err(Unproven))
     }
 
     /// One `read(2)` into `buf`: one unit, no retry.
@@ -467,6 +510,64 @@ pub(crate) fn stat_path(path: &str, admit: &mut dyn FnMut() -> bool) -> Option<N
         Ok(_) => Ok(unsafe { stat.assume_init() }),
         Err(error) => Err(Unproven(error)),
     })
+}
+
+/// The mount-id bit of `statx(2)`'s mask (Linux 5.8).
+const STATX_MNT_ID: u32 = 0x0000_1000;
+
+/// One `statx(2)` of `path` (following links) for its device, inode and
+/// mount id: one unit, no retry.
+pub(crate) fn statx_path(
+    path: &str,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Native<libc::statx>> {
+    let path = match c_path(path) {
+        Ok(path) => path,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    if !admit() {
+        return None;
+    }
+    let target = stat.as_mut_ptr();
+    let mask = libc::STATX_INO | STATX_MNT_ID;
+    // SAFETY: `path` is NUL-terminated; `stat` is zeroed and written by
+    // the kernel, read only on success.
+    let result = native(NativeOp::Statx, || {
+        unsafe { libc::statx(libc::AT_FDCWD, path.as_ptr(), 0, mask, target) }.into()
+    });
+    Some(match result {
+        // SAFETY: zero-initialized and filled by the successful call above.
+        Ok(_) => Ok(unsafe { stat.assume_init() }),
+        Err(error) => Err(Unproven(error)),
+    })
+}
+
+/// The device number a `statx(2)` result names (`st_dev` encoding).
+pub(crate) fn statx_device(stat: &libc::statx) -> u64 {
+    libc::makedev(stat.stx_dev_major, stat.stx_dev_minor)
+}
+
+/// The entry names of `getdents64(2)` records in `buf[..len]` (no
+/// native call). A malformed record ends the walk.
+pub(crate) fn dirent_names(buf: &[u8]) -> Vec<Vec<u8>> {
+    let mut names = Vec::new();
+    let mut at = 0usize;
+    // Each record: d_ino (8), d_off (8), d_reclen (2), d_type (1), name.
+    while let Some(header) = buf.get(at..at + 19) {
+        let reclen = usize::from(u16::from_ne_bytes([header[16], header[17]]));
+        let Some(record) = buf.get(at..at + reclen).filter(|_| reclen > 19) else {
+            break;
+        };
+        let name = &record[19..];
+        let end = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
+        names.push(name[..end].to_vec());
+        at += reclen;
+    }
+    names
 }
 
 /// Whether no process holds `pid`, from one `kill(pid, 0)` (no signal

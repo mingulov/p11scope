@@ -204,7 +204,11 @@ fn task_at(
     work: &mut CaptureWorkBudget,
     deadline: Instant,
 ) -> Result<Task, String> {
-    let stat = text_at(directory, name, STAT_LIMIT, work, deadline)?;
+    task_from_stat(&text_at(directory, name, STAT_LIMIT, work, deadline)?)
+}
+
+/// One task's birth, state and flags from its whole stat record.
+fn task_from_stat(stat: &str) -> Result<Task, String> {
     let end = stat
         .rfind(')')
         .ok_or("cold process task stat is malformed")?;
@@ -218,6 +222,189 @@ fn task_at(
             .ok_or("cold process task state is unavailable")?,
         flags: stat_flags_from_stat_text(&stat).ok_or("cold process task flags are unavailable")?,
     })
+}
+
+/// One task's stat record read whole through the metered primitives.
+/// `None` is a refused admission.
+fn metered_task(path: &str, admit: &mut dyn FnMut() -> bool) -> Option<Result<Task, String>> {
+    Some(match metered_io::read_record(path, STAT_LIMIT, admit)? {
+        Ok(bytes) => task_from_stat(&String::from_utf8_lossy(&bytes)),
+        Err(error) => Err(format!("cold process task stat unreadable: {error}")),
+    })
+}
+
+/// The sorted non-leader task ids of `pid`, from one metered directory
+/// open and one admitted `getdents64` per batch. `None` is a refused
+/// admission; more than [`MAX_MEMBERS`] members fails closed.
+fn metered_task_ids(pid: u32, admit: &mut dyn FnMut() -> bool) -> Option<Result<Vec<u32>, String>> {
+    let mut directory =
+        match metered_io::MeteredFile::directory(&format!("/proc/{pid}/task"), admit)? {
+            Ok(directory) => directory,
+            Err(error) => {
+                return Some(Err(format!(
+                    "cold process task census unavailable: {error}"
+                )));
+            }
+        };
+    let mut tids = Vec::new();
+    let mut buffer = vec![0u8; 4096];
+    // Every batch holds at least one record, so the census of at most
+    // MAX_MEMBERS + 3 entries ends within that many batches.
+    for _ in 0..MAX_MEMBERS + 4 {
+        let read = match directory.getdents(&mut buffer, admit)? {
+            Ok(0) => {
+                tids.sort_unstable();
+                return Some(if tids.is_empty() {
+                    Err("cold process filesystem has no proven live nonleader".into())
+                } else {
+                    Ok(tids)
+                });
+            }
+            Ok(read) => read,
+            Err(error) => {
+                return Some(Err(format!(
+                    "cold process task census unavailable: {error}"
+                )));
+            }
+        };
+        for name in metered_io::dirent_names(&buffer[..read.min(buffer.len())]) {
+            if name == b"." || name == b".." {
+                continue;
+            }
+            let Some(tid) = std::str::from_utf8(&name)
+                .ok()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                return Some(Err("cold process task census is malformed".into()));
+            };
+            if tid == pid {
+                continue;
+            }
+            if tids.len() == MAX_MEMBERS {
+                return Some(Err(
+                    "cold process filesystem member capacity 128 exhausted; namespace remains unproven".into(),
+                ));
+            }
+            tids.push(tid);
+        }
+    }
+    Some(Err("cold process task census did not end".into()))
+}
+
+/// The original leader's stat under the retained pin: its birth and the
+/// Z boundary.
+fn metered_leader_at_z(
+    pin: &PidPin,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Result<(), String>> {
+    let leader = match metered_task(&format!("/proc/{}/stat", pin.pid()), admit)? {
+        Ok(leader) => leader,
+        Err(error) => return Some(Err(error)),
+    };
+    Some(
+        if Some(leader.birth) != pin.start_time() || leader.state != b'Z' {
+            Err("cold process filesystem requires the original leader at Z".into())
+        } else {
+            Ok(())
+        },
+    )
+}
+
+/// The original thread group is still running (its pin proves current).
+fn metered_group_current(
+    pin: &PidPin,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Result<(), String>> {
+    Some(match pin.metered_generation(admit)? {
+        GenerationProof::Current => Ok(()),
+        GenerationProof::Changed => {
+            Err("original process exited during cold filesystem proof".into())
+        }
+        GenerationProof::Unknown => {
+            Err("cannot prove the original process generation during cold filesystem proof".into())
+        }
+    })
+}
+
+/// The cold retained-member closing proof through the metered
+/// primitives, one admitted unit per native call and none retried:
+/// the original group runs (pin), its leader is the original at Z, then
+/// for every member of a task census: a live stat, its mount namespace
+/// (equal to `retained`) and root (device, inode and mount id, shared by
+/// all members), and a second live stat of the same birth; then the same
+/// census, the leader still at Z and the group still running. Every path
+/// is read under the pin bracket, so the pid cannot be reused, and each
+/// member under its own birth bracket. `observed_z` runs once the leader
+/// is proved at Z. `None` is a refused admission (the proof resumes on a
+/// later pass).
+pub(crate) fn metered_cold_closing_proof(
+    pin: &PidPin,
+    retained: MountNamespaceId,
+    admit: &mut dyn FnMut() -> bool,
+    observed_z: impl FnOnce(),
+) -> Option<Result<(), String>> {
+    macro_rules! proven {
+        ($step:expr) => {
+            match $step? {
+                Ok(value) => value,
+                Err(reason) => return Some(Err(reason)),
+            }
+        };
+    }
+    let pid = pin.pid();
+    proven!(metered_group_current(pin, admit));
+    proven!(metered_leader_at_z(pin, admit));
+    observed_z();
+    let tids = proven!(metered_task_ids(pid, admit));
+    let mut shared: Option<RootIdentity> = None;
+    for tid in &tids {
+        let base = format!("/proc/{pid}/task/{tid}");
+        let before = proven!(metered_task(&format!("{base}/stat"), admit));
+        if !before.live() {
+            return Some(Err(
+                "cold process task census contains an unproven or exiting member".into(),
+            ));
+        }
+        let namespace = match metered_io::statx_path(&format!("{base}/ns/mnt"), admit)? {
+            Ok(stat) => MountNamespaceId {
+                device: metered_io::statx_device(&stat),
+                inode: stat.stx_ino,
+            },
+            Err(error) => {
+                return Some(Err(format!(
+                    "cold member mount namespace unavailable: {error}"
+                )));
+            }
+        };
+        if let Err(reason) = ensure_same_mount_namespace(retained, namespace) {
+            return Some(Err(reason));
+        }
+        let root = match metered_io::statx_path(&format!("{base}/root"), admit)? {
+            Ok(stat) => RootIdentity {
+                device: metered_io::statx_device(&stat),
+                inode: stat.stx_ino,
+                mount: stat.stx_mnt_id,
+            },
+            Err(error) => return Some(Err(format!("cold member root unavailable: {error}"))),
+        };
+        if *shared.get_or_insert(root) != root {
+            return Some(Err("cold process filesystem is ambiguous: live members do not share one mount namespace and root".into()));
+        }
+        let after = proven!(metered_task(&format!("{base}/stat"), admit));
+        if after.birth != before.birth || !after.live() {
+            return Some(Err(
+                "cold process member changed while its filesystem was checked".into(),
+            ));
+        }
+    }
+    if proven!(metered_task_ids(pid, admit)) != tids {
+        return Some(Err(
+            "cold process task census changed; filesystem remains unproven".into(),
+        ));
+    }
+    proven!(metered_leader_at_z(pin, admit));
+    proven!(metered_group_current(pin, admit));
+    Some(Ok(()))
 }
 
 fn task_ids(

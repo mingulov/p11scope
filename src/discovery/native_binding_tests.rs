@@ -2747,6 +2747,166 @@ fn identity_retry_flush_at_finish_flips_the_outcome() {
     );
 }
 
+/// The retry completion clock answers just past the re-sight pass's
+/// horizons: a re-pended row waits for fresher horizons, then binds once
+/// they arrive.
+fn retry_completed_just_ahead() -> Option<u64> {
+    Some(1_060)
+}
+
+#[test]
+fn a_repended_row_keeps_one_public_outcome_while_it_waits() {
+    // Exactly-once census across a re-observation: while the re-pended
+    // row waits for its fresh horizons the public census keeps exactly
+    // one outcome per row (`rows == bound + unbound + pending` with the
+    // retained live-miss verdict staying in `unbound` and nothing in
+    // `pending`); the private queues prove the retry actually waited.
+    // After the horizons arrive the row binds and the equation holds.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.binder.set_resight_clock(retry_completed_just_ahead);
+    run.read(vec![row(d, 7, 1, T, 1_500), row(d, 8, 1, T + 1, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![
+            unbound(UnboundReason::NoLiveCaller),
+            unbound(UnboundReason::NoLiveCaller)
+        ]
+    );
+    let _ = run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), Vec::new(), "fresh horizons still owed");
+    // Intermediate publication: one outcome per row, nothing pending.
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (2, 0, 2, 0)
+    );
+    assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&2));
+    // Private queues prove the retry actually waited: one row re-pended
+    // internally, one still retained.
+    assert_eq!(run.binder.pending_retried_len_for_test(d), 1);
+    assert_eq!(run.binder.retry_len_for_test(d), 1);
+    // Drive horizons until the re-observation decides.
+    let mut decided = None;
+    for _ in 0..10 {
+        run.drain(&[]);
+        run.read(Vec::new());
+        let verdicts = run.verdicts();
+        if !verdicts.is_empty() {
+            decided = Some(verdicts);
+            break;
+        }
+    }
+    assert_eq!(decided, Some(vec![bound(CallerId(0))]));
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (2, 1, 1, 0)
+    );
+    assert_eq!(run.binder.pending_retried_len_for_test(d), 0);
+    assert_eq!(run.binder.retry_len_for_test(d), 1);
+}
+
+#[test]
+fn identity_retry_visits_each_row_once_per_pass() {
+    // One retained row whose live caller answers a nonmatching ticket:
+    // each pass spends exactly one lookup and one query on it, then
+    // leaves it queued for the next pass — never the whole allowance on
+    // one row in one batch.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+    run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 99));
+    assert_eq!(run.binder.retry_len_for_test(d), 1);
+    run.world.lookups.set(0);
+    let queries_before = run.world.queries;
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), Vec::new());
+    assert_eq!(run.world.lookups.get(), 1, "one visit per pass");
+    assert_eq!(run.world.queries - queries_before, 1, "one query per pass");
+    assert_eq!(run.binder.retry_len_for_test(d), 1, "still queued");
+    // The next pass retries once more (fair resume, no burst).
+    run.world.lookups.set(0);
+    let queries_before = run.world.queries;
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), Vec::new());
+    assert_eq!(run.world.lookups.get(), 1);
+    assert_eq!(run.world.queries - queries_before, 1);
+}
+
+#[test]
+fn resight_and_retry_share_one_query_budget_per_batch() {
+    // Seventy undecided rows owed their first re-sight plus seventy
+    // decided rows retained for re-observation, every caller admitted
+    // with a matching ticket: each batch spends at most 64 queries
+    // across both passes combined (one cooperative action, one budget),
+    // and both queues drain over later batches (neither starves).
+    let mut run = Run::new();
+    let d = run.domain;
+    let retained: Vec<WitnessRow> = (0..70)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(retained);
+    run.settle();
+    assert_eq!(run.verdicts().len(), 70);
+    assert_eq!(run.binder.retry_len_for_test(d), 70);
+    let owed: Vec<WitnessRow> = (0..70)
+        .map(|i| row(d, 200 + i, 1, T + 100 + i as u32, 1_500))
+        .collect();
+    run.read(owed);
+    assert_eq!(run.verdicts(), Vec::new(), "owed rows wait");
+    for i in 0..70 {
+        run.world.admit(T + i as u32, 1, 1_000 + i as u32, 2_000);
+        run.world.answer(T + i as u32, 1, d, cookie(d, 100 + i));
+        run.world
+            .admit(T + 100 + i as u32, 1, 2_000 + i as u32, 2_000);
+        run.world
+            .answer(T + 100 + i as u32, 1, d, cookie(d, 200 + i));
+    }
+    // Unmodeled clock: sighted rows decide against their reads once
+    // covered. Drain over several batches, capping each batch.
+    let mut decided = 0usize;
+    for _ in 0..8 {
+        let queries_before = run.world.queries;
+        run.drain(&[]);
+        run.read(Vec::new());
+        let batch_queries = run.world.queries - queries_before;
+        assert!(
+            batch_queries <= 64,
+            "one shared budget per action: {batch_queries} queries"
+        );
+        decided += run.verdicts().len();
+    }
+    assert_eq!(decided, 140, "both queues drain");
+    assert_eq!(run.binder.retry_len_for_test(d), 0);
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (140, 140, 0, 0)
+    );
+}
+
 #[test]
 fn identity_retry_sheds_past_its_bound() {
     // A retry set of one: the first decided row is retained, the

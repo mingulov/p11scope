@@ -1306,6 +1306,23 @@ impl NativeBinder {
             .unwrap_or(0)
     }
 
+    /// Test-only: re-pended rows still waiting for their fresh horizons
+    /// in `domain`. Private re-observation state: the public census keeps
+    /// the row's first verdict while it waits here.
+    #[cfg(test)]
+    pub(crate) fn pending_retried_len_for_test(&self, domain: NativeDomainId) -> usize {
+        self.domain_indices
+            .get(&domain)
+            .map(|index| {
+                self.domains[*index]
+                    .pending
+                    .iter()
+                    .filter(|pending| pending.retried)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// Test-only: shrink the per-domain retry bound (shed coverage).
     #[cfg(test)]
     pub(crate) fn set_retry_limit_for_test(&mut self, limit: usize) {

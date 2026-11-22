@@ -29299,6 +29299,1142 @@ exit 0
         assert_eq!((placement.edge, placement.module), (2, 1));
     }
 
+    #[test]
+    fn a_finished_domain_discloses_retained_growth_as_a_terminal_gap() {
+        // Terminal accounting, finish leg: the retained row's refresh grows
+        // 3 -> 43 while the live caller keeps answering a different ticket,
+        // so the retry never re-sights it. Domain finish through the public
+        // `NativeBatch::Finish` releases the held absolute — and the 40
+        // observed-but-unplaced calls disclose as a named counted gap with
+        // diagnostics disabled (never a silent drop). The first fold stands.
+        let (mut native, _) = NativeScene::new();
+        assert!(
+            native.scene.coordinator.diagnostics.is_none(),
+            "ordinary output only: no diagnostics recorder"
+        );
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 99);
+        native.read(Vec::new());
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // Sanity: still retained, the fold stands, the mismatch never
+        // re-sights.
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        let gaps = native.scene.coordinator.registry.gaps();
+        let terminal: Vec<_> = gaps
+            .iter()
+            .filter(|gap| gap.subject == "identity retry terminal")
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "one terminal disclosure, diagnostics disabled: {gaps:?}"
+        );
+        assert!(
+            terminal[0].reason.contains("40"),
+            "the 40 unplaced calls are counted: {:?}",
+            terminal[0].reason
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 0, 1, 0)
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.module, placement.edge), (1, 0));
+    }
+
+    #[test]
+    fn a_retried_row_refused_again_discloses_retained_growth_as_a_terminal_gap() {
+        // Terminal accounting, re-refusal leg: the retained row grows 3 ->
+        // 43 while dropped; its re-observation refuses (a newer exec
+        // sequence of the same ticket competes) instead of binding. The
+        // census flips, the original fold stands exactly once — and the 40
+        // observed-but-unplaced calls disclose as a named counted gap.
+        let (mut native, _) = NativeScene::new();
+        assert!(
+            native.scene.coordinator.diagnostics.is_none(),
+            "ordinary output only: no diagnostics recorder"
+        );
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        // A second image of the same ticket arrives after the admission
+        // and binds on time; the retried first row now competes with it.
+        let mut second = native.row(41, 2, 9, 1_000, 0);
+        second.entry_count = 5;
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.rows, 2);
+        assert_eq!(census.bound, 1);
+        assert_eq!(census.unbound_total(), 1);
+        assert_eq!(census.unbound.get(&UnboundReason::ExecAmbiguous), Some(&1));
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), None);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1, "no second fold for the re-decision");
+        assert_eq!(unbound.entries, 3);
+        let registry = &native.scene.coordinator.registry;
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 2);
+        assert_eq!((placement.edge, placement.module), (1, 1));
+        let gaps = registry.gaps();
+        let terminal: Vec<_> = gaps
+            .iter()
+            .filter(|gap| gap.subject == "identity retry terminal")
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "one terminal disclosure for the refused growth: {gaps:?}"
+        );
+        assert!(
+            terminal[0].reason.contains("40"),
+            "the 40 unplaced calls are counted: {:?}",
+            terminal[0].reason
+        );
+    }
+
+    #[test]
+    fn a_retried_row_with_a_lost_endpoint_discloses_the_held_subtotal_as_a_terminal_gap() {
+        // Terminal accounting, endpoint-loss leg: the retained row's first
+        // staging resolved to no module (no count carrier), then its
+        // refresh grew 3 -> 43. The re-observation binds at the binder but
+        // its endpoint still resolves nowhere, so the pair releases
+        // without noting unresolved twice — and the entire 43-call held
+        // subtotal discloses as a named counted gap. Placement stays one
+        // unresolved row; the released pair still prunes with its base.
+        let scene = CaptureScene::new(2);
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.endpoint = crate::discovery::inventory_attach_set::EndpointId(999);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            (placement.total(), placement.unresolved),
+            (1, 1),
+            "one unresolved placement for the twice-staged row"
+        );
+        let gaps = native.scene.coordinator.registry.gaps();
+        let terminal: Vec<_> = gaps
+            .iter()
+            .filter(|gap| gap.subject == "identity retry terminal")
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "one terminal disclosure for the held subtotal: {gaps:?}"
+        );
+        assert!(
+            terminal[0].reason.contains("43"),
+            "the entire held subtotal is counted: {:?}",
+            terminal[0].reason
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(super::EXEC_STATE_GRACE_NS + 1_000_000);
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 43),
+            "the released pair still prunes with the fresh base"
+        );
+    }
+
+    /// The retry completion stamp lands strictly between the re-pend
+    /// batch's horizons and the next batch's: the re-pended row waits
+    /// exactly one batch, then decides together with the newly read row
+    /// (scripted ticks of 10 per stage: the re-pend read lands at 1040,
+    /// the drain at 1050, the deciding read at 1060).
+    fn retry_completed_between_batches() -> Option<u64> {
+        Some(1_045)
+    }
+
+    #[test]
+    fn same_publication_retract_then_insert_leaves_no_ghost_module_calls() {
+        // Same-publication saturation, module set: A's fold fills the
+        // single per-module image slot; one publication then stages A's
+        // successful rebind (retract) ahead of B's initial drop (insert).
+        // The insert lands on the freed slot even though the committed
+        // snapshot predicted a drop — so B's later clean rebind must
+        // retract B's landed calls, leaving no ghost. Distinct valid
+        // tickets throughout.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.registry.unbound_image_limits =
+            crate::discovery::caller_registry::UnboundImageLimits {
+                per_module: 1,
+                global: 100,
+            };
+        native
+            .scene
+            .coordinator
+            .binder
+            .set_resight_clock(retry_completed_between_batches);
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut row_a = native.row(41, 1, 9, 40, 1);
+        row_a.entry_count = 3;
+        native.witness(vec![row_a]);
+        let caller_a = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        // The re-pend batch reads B's first row while re-sighting A;
+        // neither decides yet (A waits for its fresh horizons).
+        let mut row_b = native.row(42, 1, 10, 45, 1);
+        row_b.entry_count = 7;
+        native.read(vec![row_b]);
+        let census = native.scene.coordinator.binder.census();
+        assert_eq!(census.bound, 0, "A waits for its fresh horizons");
+        assert_eq!(census.unbound_total(), 1);
+        // The drain plus the next read decide both in one batch: A's
+        // rebind stages its retract ahead of B's insert.
+        native.drain();
+        native.read(Vec::new());
+        let census = native.scene.coordinator.binder.census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (2, 1, 1, 0),
+            "both decide in one batch"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // B's clean rebind retracts exactly its landed calls.
+        let caller_b = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(10, ImageAuthority::ScanPinned, 55)
+            .unwrap();
+        native.scene.project(10, 65);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(10, 700, 42);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        for (caller, want) in [(caller_a, 3), (caller_b, 7)] {
+            let edge = registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("each rebound member has an edge");
+            assert_eq!(edge.entry_count, want);
+        }
+        let cookie_b = crate::attach::capture::DomainCookie::scripted(native.domain, 42);
+        let unbound = native.module_unbound();
+        assert_eq!(
+            unbound.as_ref().and_then(|unbound| unbound
+                .images
+                .get(&cookie_b)
+                .map(|image| image.calls_at_least)),
+            None,
+            "no ghost module calls for the retracted fold"
+        );
+        assert_eq!(
+            registry.unidentified_image_calls_for_test(cookie_b),
+            None,
+            "no ghost run-wide calls either"
+        );
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (2, 2, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 2);
+        assert_eq!((placement.edge, placement.module), (2, 0));
+    }
+
+    #[test]
+    fn same_publication_retract_then_insert_leaves_no_ghost_global_calls() {
+        // Same-publication saturation, run-wide set: the same
+        // retract-ahead-of-insert dance with only the global slot
+        // constrained (the per-module sets have room). B's later clean
+        // rebind must retract B's landed run-wide calls.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.registry.unbound_image_limits =
+            crate::discovery::caller_registry::UnboundImageLimits {
+                per_module: 100,
+                global: 1,
+            };
+        native
+            .scene
+            .coordinator
+            .binder
+            .set_resight_clock(retry_completed_between_batches);
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut row_a = native.row(41, 1, 9, 40, 1);
+        row_a.entry_count = 3;
+        native.witness(vec![row_a]);
+        let caller_a = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        let mut row_b = native.row(42, 1, 10, 45, 1);
+        row_b.entry_count = 7;
+        native.read(vec![row_b]);
+        let census = native.scene.coordinator.binder.census();
+        assert_eq!(census.bound, 0, "A waits for its fresh horizons");
+        assert_eq!(census.unbound_total(), 1);
+        native.drain();
+        native.read(Vec::new());
+        let census = native.scene.coordinator.binder.census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (2, 1, 1, 0),
+            "both decide in one batch"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let caller_b = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(10, ImageAuthority::ScanPinned, 55)
+            .unwrap();
+        native.scene.project(10, 65);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(10, 700, 42);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        for (caller, want) in [(caller_a, 3), (caller_b, 7)] {
+            let edge = registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("each rebound member has an edge");
+            assert_eq!(edge.entry_count, want);
+        }
+        let cookie_b = crate::attach::capture::DomainCookie::scripted(native.domain, 42);
+        assert_eq!(
+            registry.unidentified_image_calls_for_test(cookie_b),
+            None,
+            "no ghost run-wide calls for the retracted fold"
+        );
+        let unbound = native.module_unbound();
+        assert_eq!(
+            unbound.as_ref().and_then(|unbound| unbound
+                .images
+                .get(&cookie_b)
+                .map(|image| image.calls_at_least)),
+            None,
+            "no ghost module calls either"
+        );
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (2, 2, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 2);
+        assert_eq!((placement.edge, placement.module), (2, 0));
+    }
+
+    #[test]
+    fn same_publication_double_insert_keeps_the_later_fold_module_calls() {
+        // Same-publication saturation, inverse order, module set: P and Q
+        // drop in one publication while the single per-module slot is
+        // free, so both predict their image lands — but only P's does.
+        // P rebinds and frees the slot; R (an earlier exec sequence of
+        // Q's ticket on Q's tgid) drops and lands; Q rebinds first and
+        // R's older sequence then refuses as a competing image, so R's
+        // fold stands while Q retracts. Q's retraction must not eat R's
+        // standing calls.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.registry.unbound_image_limits =
+            crate::discovery::caller_registry::UnboundImageLimits {
+                per_module: 1,
+                global: 100,
+            };
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut row_p = native.row(41, 1, 9, 100, 1);
+        row_p.entry_count = 5;
+        let mut row_q = native.row(42, 2, 10, 100, 1);
+        row_q.entry_count = 7;
+        native.read(vec![row_p, row_q]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let caller_p = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // R rides the other endpoint of the same provider: the same ticket and
+        // tgid as Q (so their folds share the image cookie) but a different
+        // pair, so each row's absolute counts on its own.
+        let mut row_r = native.row(42, 1, 10, 40, 0);
+        row_r.entry_count = 11;
+        native.witness(vec![row_r]);
+        let caller_q = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(10, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(10, 70);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(10, 700, 42);
+        // Q rebinds first; R's older exec sequence then refuses as a
+        // competing image, so R's fold stands while Q retracts.
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge_p = registry
+            .edges()
+            .find(|edge| edge.caller == caller_p)
+            .expect("P rebound");
+        assert_eq!(edge_p.entry_count, 5);
+        let edge_q = registry
+            .edges()
+            .find(|edge| edge.caller == caller_q)
+            .expect("Q rebound");
+        assert_eq!(edge_q.entry_count, 7);
+        let cookie = crate::attach::capture::DomainCookie::scripted(native.domain, 42);
+        let unbound = native.module_unbound().expect("R stands");
+        assert_eq!(
+            unbound
+                .images
+                .get(&cookie)
+                .map(|image| image.calls_at_least),
+            Some(11),
+            "Q's retraction keeps R's standing module calls"
+        );
+        assert_eq!(
+            registry.unidentified_image_calls_for_test(cookie),
+            Some(11),
+            "and its run-wide calls"
+        );
+        assert!(
+            registry.gaps().iter().all(
+                |gap| gap.subject != crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+            ),
+            "the standing refusal needs no count gap: {:?}",
+            registry.gaps()
+        );
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (3, 2, 1, 0)
+        );
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecAmbiguous),
+            Some(&1),
+            "R refuses as the competing image"
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 3);
+        assert_eq!((placement.edge, placement.module), (2, 1));
+    }
+
+    #[test]
+    fn same_publication_double_insert_keeps_the_later_fold_global_calls() {
+        // Same-publication saturation, inverse order, run-wide set: the
+        // same double-insert dance with only the global slot constrained.
+        // Q's retraction must not eat R's standing run-wide calls.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.registry.unbound_image_limits =
+            crate::discovery::caller_registry::UnboundImageLimits {
+                per_module: 100,
+                global: 1,
+            };
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut row_p = native.row(41, 1, 9, 100, 1);
+        row_p.entry_count = 5;
+        let mut row_q = native.row(42, 2, 10, 100, 1);
+        row_q.entry_count = 7;
+        native.read(vec![row_p, row_q]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let caller_p = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // R rides the other endpoint of the same provider: the same ticket and
+        // tgid as Q (so their folds share the image cookie) but a different
+        // pair, so each row's absolute counts on its own.
+        let mut row_r = native.row(42, 1, 10, 40, 0);
+        row_r.entry_count = 11;
+        native.witness(vec![row_r]);
+        let caller_q = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(10, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(10, 70);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(10, 700, 42);
+        // Q rebinds first; R's older exec sequence then refuses as a
+        // competing image, so R's fold stands while Q retracts.
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge_p = registry
+            .edges()
+            .find(|edge| edge.caller == caller_p)
+            .expect("P rebound");
+        assert_eq!(edge_p.entry_count, 5);
+        let edge_q = registry
+            .edges()
+            .find(|edge| edge.caller == caller_q)
+            .expect("Q rebound");
+        assert_eq!(edge_q.entry_count, 7);
+        let cookie = crate::attach::capture::DomainCookie::scripted(native.domain, 42);
+        assert_eq!(
+            registry.unidentified_image_calls_for_test(cookie),
+            Some(11),
+            "Q's retraction keeps R's standing run-wide calls"
+        );
+        let unbound = native.module_unbound().expect("R stands");
+        assert_eq!(
+            unbound
+                .images
+                .get(&cookie)
+                .map(|image| image.calls_at_least),
+            Some(11),
+            "and its module calls"
+        );
+        assert!(
+            registry.gaps().iter().all(
+                |gap| gap.subject != crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+            ),
+            "the standing refusal needs no count gap: {:?}",
+            registry.gaps()
+        );
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (3, 2, 1, 0)
+        );
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecAmbiguous),
+            Some(&1),
+            "R refuses as the competing image"
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 3);
+        assert_eq!((placement.edge, placement.module), (2, 1));
+    }
+
+    /// One per-witness retry transition's expected counters: the census, the
+    /// placement, the observed-call total the case's rows carried, and the
+    /// terminal-gap disclosure the settlement owes for it.
+    struct RetryMachineExpect {
+        census: (u64, u64, u64, u64),
+        placement: (u64, u64, u64, u64),
+        observed_total: u64,
+        terminal_calls: u64,
+        terminal_rows: usize,
+    }
+
+    /// Check one machine case: the exact counters plus the four
+    /// exactly-once equations (I1: rows == outcomes + pending; I2:
+    /// outcomes == placement total; I3: module == rows sum; I4: observed
+    /// calls == placed + folded + gapped).
+    fn check_retry_machine_case(name: &str, native: &NativeScene, expect: RetryMachineExpect) {
+        let registry = &native.scene.coordinator.registry;
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            expect.census,
+            "{name}: census"
+        );
+        assert_eq!(
+            census.rows,
+            census.bound + census.unbound_total() + census.pending,
+            "{name}: I1 rows == outcomes + pending"
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(
+            (
+                placement.edge,
+                placement.module,
+                placement.ambiguous,
+                placement.unresolved
+            ),
+            expect.placement,
+            "{name}: placement"
+        );
+        assert_eq!(
+            census.bound + census.unbound_total(),
+            placement.total(),
+            "{name}: I2 outcomes == placement total"
+        );
+        let unbound = native.module_unbound();
+        assert_eq!(
+            placement.module,
+            unbound.as_ref().map(|unbound| unbound.rows).unwrap_or(0),
+            "{name}: I3 module == rows sum"
+        );
+        let edge_calls: u64 = registry.edges().map(|edge| edge.entry_count).sum();
+        let fold_calls = unbound.as_ref().map(|unbound| unbound.entries).unwrap_or(0);
+        let mut gap_calls = 0u64;
+        let mut gap_rows = 0usize;
+        for gap in registry.gaps() {
+            if gap.subject == "identity retry terminal" {
+                gap_rows += 1;
+                let first = gap.reason.split_whitespace().next().unwrap_or("?");
+                gap_calls += first.parse::<u64>().unwrap_or_else(|_| {
+                    panic!("{name}: terminal gap without a leading count: {gap:?}")
+                });
+            }
+        }
+        assert_eq!(gap_rows, expect.terminal_rows, "{name}: terminal gap rows");
+        assert_eq!(
+            gap_calls, expect.terminal_calls,
+            "{name}: terminal gap calls"
+        );
+        assert_eq!(
+            edge_calls + fold_calls + gap_calls,
+            expect.observed_total,
+            "{name}: I4 calls placed + folded + gapped == observed"
+        );
+    }
+
+    /// The retry completion clock answers past every scripted horizon: a
+    /// re-pended row waits until the domain finishes it.
+    fn retry_machine_far_ahead() -> Option<u64> {
+        Some(999_999)
+    }
+
+    /// A retained row that grew 3 -> 43 while dropped, its caller admitted
+    /// and mapped: every terminal-path case starts here, then applies its
+    /// own finishing action.
+    fn retained_with_growth() -> NativeScene {
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native
+    }
+
+    fn machine_initial_bind() -> (NativeScene, RetryMachineExpect) {
+        let (mut native, _) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 2;
+        native.witness(vec![row]);
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 1, 0, 0),
+                placement: (1, 0, 0, 0),
+                observed_total: 2,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_initial_mismatch() -> (NativeScene, RetryMachineExpect) {
+        let (mut native, _) = NativeScene::new();
+        native.answer(7, 500, 99);
+        let mut row = native.row(41, 1, 7, 100, 0);
+        row.entry_count = 2;
+        native.witness(vec![row]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .retry_len_for_test(native.domain),
+            0,
+            "only a live-miss retains"
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 0, 1, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 2,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_retain() -> (NativeScene, RetryMachineExpect) {
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .retry_len_for_test(native.domain),
+            1,
+            "the live-miss waits in the retry queue"
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 0, 1, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 3,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_shed() -> (NativeScene, RetryMachineExpect) {
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        native.scene.coordinator.binder.set_retry_limit_for_test(0);
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .retry_len_for_test(native.domain),
+            0,
+            "a full retry set sheds"
+        );
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"identity retry shed".to_string()),
+            "the shed discloses: {:?}",
+            native.gap_subjects()
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 0, 1, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 3,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_repend_wait() -> (NativeScene, RetryMachineExpect) {
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native
+            .scene
+            .coordinator
+            .binder
+            .set_resight_clock(retry_machine_far_ahead);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .pending_retried_len_for_test(native.domain),
+            1,
+            "the retry waits internally"
+        );
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .binder
+                .retry_len_for_test(native.domain),
+            0,
+            "it left the retry queue"
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 0, 1, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 3,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_rebound() -> (NativeScene, RetryMachineExpect) {
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 1, 0, 0),
+                placement: (1, 0, 0, 0),
+                observed_total: 43,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_revival() -> (NativeScene, RetryMachineExpect) {
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 41);
+        native.scene.coordinator.binder.note_pid_reuse(9, 45);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native.scene.coordinator.registry.gaps().iter().all(
+                |gap| gap.subject != crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+            ),
+            "revival needs no new gap"
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 1, 0, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 43,
+                terminal_calls: 0,
+                terminal_rows: 0,
+            },
+        )
+    }
+
+    fn machine_rerefused() -> (NativeScene, RetryMachineExpect) {
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 41);
+        let mut second = native.row(41, 2, 9, 1_000, 0);
+        second.entry_count = 5;
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        (
+            native,
+            RetryMachineExpect {
+                census: (2, 1, 1, 0),
+                placement: (1, 1, 0, 0),
+                observed_total: 48,
+                terminal_calls: 40,
+                terminal_rows: 1,
+            },
+        )
+    }
+
+    fn machine_finish_flush() -> (NativeScene, RetryMachineExpect) {
+        let mut native = retained_with_growth();
+        native
+            .scene
+            .coordinator
+            .binder
+            .set_resight_clock(retry_machine_far_ahead);
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .witness_census()
+                .unbound
+                .get(&UnboundReason::EvidenceIncomplete),
+            Some(&1),
+            "the flushed re-observation supersedes the live-miss"
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 0, 1, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 43,
+                terminal_calls: 40,
+                terminal_rows: 1,
+            },
+        )
+    }
+
+    fn machine_finish_clear() -> (NativeScene, RetryMachineExpect) {
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 99);
+        native.read(Vec::new());
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 0, 1, 0),
+                placement: (0, 1, 0, 0),
+                observed_total: 43,
+                terminal_calls: 40,
+                terminal_rows: 1,
+            },
+        )
+    }
+
+    fn machine_nomod_release() -> (NativeScene, RetryMachineExpect) {
+        let scene = CaptureScene::new(2);
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.endpoint = crate::discovery::inventory_attach_set::EndpointId(999);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(super::EXEC_STATE_GRACE_NS + 1_000_000);
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 43),
+            "the released pair still prunes with the fresh base"
+        );
+        (
+            native,
+            RetryMachineExpect {
+                census: (1, 1, 0, 0),
+                placement: (0, 0, 0, 1),
+                observed_total: 43,
+                terminal_calls: 43,
+                terminal_rows: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn per_witness_retry_machine_counts_each_row_once() {
+        // Per-witness retry state machine, every transition: each case
+        // drives one path on a fresh scene — initial bind, initial
+        // mismatch, retain, shed, re-pend wait, rule rebind, revival,
+        // re-refusal, finish flush, finish clear, endpoint-loss release —
+        // and pins the counters it touches plus the four exactly-once
+        // equations (census, placement, rows sum, calls).
+        let cases: Vec<(&str, fn() -> (NativeScene, RetryMachineExpect))> = vec![
+            ("initial_bind", machine_initial_bind),
+            ("initial_mismatch", machine_initial_mismatch),
+            ("retain", machine_retain),
+            ("shed", machine_shed),
+            ("repend_wait", machine_repend_wait),
+            ("rebound", machine_rebound),
+            ("revival", machine_revival),
+            ("rerefused", machine_rerefused),
+            ("finish_flush", machine_finish_flush),
+            ("finish_clear", machine_finish_clear),
+            ("nomod_release", machine_nomod_release),
+        ];
+        for (name, run) in cases {
+            let (native, expect) = run();
+            check_retry_machine_case(name, &native, expect);
+        }
+    }
+
     /// A watched two-provider scene over [`capture_scene_two_module`]:
     /// pid 7 admitted at 50 and mapped to both providers, exec coverage
     /// from `coverage_ns`.

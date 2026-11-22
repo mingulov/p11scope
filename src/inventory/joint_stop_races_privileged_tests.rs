@@ -771,12 +771,46 @@ enum JointBranch {
 }
 
 fn joint_branch(coordinator: &InventoryCoordinator<OsProcessSource>) -> JointBranch {
-    if coordinator.registry().joint_feeds() > 0 {
+    joint_branch_from(
+        coordinator.registry().joint_feeds(),
+        coordinator.registry().journal_linked(),
+    )
+}
+
+/// Pure branch decision over the two registry inputs: installs prove a
+/// linked world, a latched-unlinked seal proves S1, and zero installs
+/// with the default linkage state is unattributed (never S1).
+fn joint_branch_from(joint_feeds: usize, journal_linked: bool) -> JointBranch {
+    if joint_feeds > 0 {
         JointBranch::Linked
-    } else if !coordinator.registry().journal_linked() {
+    } else if !journal_linked {
         JointBranch::S1
     } else {
         JointBranch::Unattributed
+    }
+}
+
+/// Branch tag printed for a stop case that produced no Joint feeds.
+/// S1 keeps its proven environmental tag; the unattributed default
+/// gets its own tag so the suite cannot mistake an unexplained
+/// absence of feeds for a proven preclusion. Linked runs no tag.
+fn no_feed_branch_tag(branch: &JointBranch) -> Option<&'static str> {
+    match branch {
+        JointBranch::Linked => None,
+        JointBranch::S1 => Some("s1-precluded"),
+        JointBranch::Unattributed => Some("no-feeds-unattributed"),
+    }
+}
+
+/// Reason fragment for a stop case that produced no Joint feeds, naming
+/// the established cause (or its absence) for the bail message.
+fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
+    match branch {
+        JointBranch::Linked => None,
+        JointBranch::S1 => Some("no joint feeds from the linked session"),
+        JointBranch::Unattributed => {
+            Some("no joint feeds and no S1 seal (unattributed linkage default)")
+        }
     }
 }
 
@@ -1391,10 +1425,14 @@ fn run_stop_offset(
     // session: only a session whose loaded object carries both journal
     // roots seals linked. An S1 seal can never wedge (the full matrix
     // passes pre-fix on S1), so running on would be a dry pass. Fail
-    // loudly with the branch tag instead.
-    if !matches!(joint_branch(&coordinator), JointBranch::Linked) {
-        eprintln!("P11SCOPE_CELL_BRANCH={tag}:s1-precluded");
-        anyhow::bail!("{tag}: no joint feeds from the linked session; not attempted");
+    // loudly with the branch tag instead: S1 keeps its proven
+    // environmental tag, while the unattributed default (zero feeds,
+    // no latched seal) gets its own tag and cause.
+    let branch = joint_branch(&coordinator);
+    if let Some(reason) = no_feed_reason(&branch) {
+        let feed_tag = no_feed_branch_tag(&branch).expect("a reason implies a tag");
+        eprintln!("P11SCOPE_CELL_BRANCH={tag}:{feed_tag}");
+        anyhow::bail!("{tag}: {reason}; not attempted");
     }
     eprintln!("P11SCOPE_CELL_BRANCH={tag}:linked");
     std::thread::sleep(Duration::from_millis(offset_ms));
@@ -1652,16 +1690,21 @@ fn run_stop_offset(
 /// resolved calls still in the lane stash counts them or gaps them, never
 /// silently. The lane requests the production journal session (builds that
 /// omit the journal object refuse at lane start); an S1 seal fails loudly
-/// with the s1-precluded branch tag instead of passing dry.
+/// with the s1-precluded branch tag instead of passing dry, while a
+/// feed-less run with no latched seal fails with the distinct
+/// no-feeds-unattributed tag.
 /// Last-waiter disposition: a live last waiter before stop is unreachable
 /// (collected ticks resolve waiters same tick; 1,390 slice samples,
-/// 0 waiters), so this matrix never stages the twins' refresh-to-stash
-/// handoff. The invariant is carried by the machine twins
+/// 0 waiters: 352 linked plus 1,038 micro-slice S1-precluded probe), so
+/// this matrix never stages the twins' refresh-to-stash handoff. The
+/// invariant is carried by the machine twins
 /// `joint_machine_finish_after_pass_refresh_resolution_publishes_linked`,
 /// `joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked`
 /// and `joint_machine_finish_at_q_expiry_storage_refusal_still_latches`.
 /// `WP7_STOP_PREPS` / `WP7_STOP_OFFSETS` (comma-separated indices,
-/// default all) narrow the matrix for exploration.
+/// default all) narrow the matrix for exploration. The qualifying
+/// entries (the long campaign runner and the S3 suite) unset both and
+/// require all 12 linked case tags by exact name.
 #[test]
 #[ignore = "privileged: linked Joint stop coverage (12-case matrix)"]
 fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64() -> Result<()> {
@@ -1973,4 +2016,34 @@ fn stop_outcome_accepts_a_counted_and_disclosed_shed() {
     outcome.reconciled = true;
     outcome.reconcile_detail = "reconciled".to_string();
     check_stop_outcome(&outcome, outcome.offset_ms).expect("a counted and disclosed shed passes");
+}
+
+#[test]
+fn joint_branch_splits_s1_from_the_unattributed_default() {
+    assert!(matches!(joint_branch_from(2, true), JointBranch::Linked));
+    assert!(matches!(joint_branch_from(0, false), JointBranch::S1));
+    assert!(matches!(
+        joint_branch_from(0, true),
+        JointBranch::Unattributed
+    ));
+}
+
+#[test]
+fn no_feed_tags_name_each_branch_cause() {
+    assert_eq!(no_feed_branch_tag(&JointBranch::Linked), None);
+    assert_eq!(no_feed_branch_tag(&JointBranch::S1), Some("s1-precluded"));
+    assert_eq!(
+        no_feed_branch_tag(&JointBranch::Unattributed),
+        Some("no-feeds-unattributed")
+    );
+    assert_eq!(no_feed_reason(&JointBranch::Linked), None);
+    assert_eq!(
+        no_feed_reason(&JointBranch::S1),
+        Some("no joint feeds from the linked session")
+    );
+    let unattributed = no_feed_reason(&JointBranch::Unattributed).expect("a cause");
+    assert!(
+        unattributed.contains("no S1 seal"),
+        "the unattributed cause names the missing seal: {unattributed}"
+    );
 }

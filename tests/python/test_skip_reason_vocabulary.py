@@ -52,10 +52,12 @@ PRODUCER_CONSTANTS = (
     "MANIFEST_OBJECT_UNAVAILABLE",
     "PREARM_OBJECT_UNAVAILABLE",
     "DISCOVERY_TRANSPORT_UNAVAILABLE",
-    # Gap-noise folds: mid-flight exits, scan-budget stops and
-    # loader-context misses file under discovery subject with
-    # finite reasons instead of the generic redaction.
+    # Gap-noise folds: mid-flight changed generations, the
+    # stale-deferral mark, scan-budget stops and loader-context
+    # misses file under discovery subject with finite reasons
+    # instead of the generic redaction.
     "MID_FLIGHT_REASON",
+    "STALE_DEFERRAL_REASON",
     "SCAN_BUDGET_REASON",
     "LOADER_CONTEXT_REASON",
     # Run-tree scope gaps: survivors, degradation, unreadable
@@ -97,7 +99,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
-    nineteen discovery reasons; the run-tree scope renders one of its three
+    twenty discovery reasons; the run-tree scope renders one of its three
     reasons under its own subject, and the learned-file scope renders one
     of its ten reasons under its own subject. The split mirrors
     `capture_skipped_out`'s branches; the strings themselves come from the
@@ -125,6 +127,7 @@ def producer_reasons():
         const["PREARM_OBJECT_UNAVAILABLE"],
         const["DISCOVERY_TRANSPORT_UNAVAILABLE"],
         const["MID_FLIGHT_REASON"],
+        const["STALE_DEFERRAL_REASON"],
         const["SCAN_BUDGET_REASON"],
         const["LOADER_CONTEXT_REASON"],
     }
@@ -147,7 +150,7 @@ def producer_reasons():
     }
     assert (
         len(entry) == 2
-        and len(discovery) == 19
+        and len(discovery) == 20
         and len(run_tree) == 3
         and len(learned) == 10
     ), const
@@ -158,9 +161,18 @@ class SkipReasonVocabularyTests(unittest.TestCase):
     def test_validator_accepts_exactly_the_producer_vocabulary(self):
         entry, discovery, run_tree, learned = producer_reasons()
         # Two-way: a producer reason the validator rejects fails here, and
-        # so does a validator reason the producer never emits.
+        # so does a validator reason the producer never emits — except the
+        # explicitly pinned retired reasons, which the validator still
+        # accepts so archived captures keep validating.
         self.assertEqual(set(CHECKER["ENTRY_REASONS"]), entry)
-        self.assertEqual(set(CHECKER["DISCOVERY_REASONS"]), discovery)
+        self.assertEqual(
+            set(CHECKER["DISCOVERY_REASONS"]),
+            discovery | set(CHECKER["RETIRED_DISCOVERY_REASONS"]),
+        )
+        self.assertEqual(
+            set(CHECKER["RETIRED_DISCOVERY_REASONS"]),
+            {"process exited mid-flight"},
+        )
         self.assertEqual(set(CHECKER["RUN_TREE_REASONS"]), run_tree)
         self.assertEqual(set(CHECKER["LEARNED_SKIP_REASONS"]), learned)
 
@@ -197,14 +209,18 @@ class SkipReasonVocabularyTests(unittest.TestCase):
             self.assertIn(reason, doc, f"schema doc omits {reason!r}")
 
     def test_oracle_skip_constants_match_canonical_vocabulary(self):
-        # The public-cli oracle names two discovery-skip rows (the
-        # disclosable deferral and the v0.8.0 exit-ambient row); a
-        # drift between its hardcoded copies and the producer
-        # vocabulary would fail closed (safe) but silently stop
-        # qualifying, so pin both rows to the canonical subject and
-        # discovery reasons.
+        # The public-cli oracle names three discovery-skip rows (the
+        # disclosable deferral and the two mid-flight rows); a drift
+        # between its hardcoded copies and the producer vocabulary
+        # would fail closed (safe) but silently stop qualifying, so
+        # pin every row to the canonical subject and discovery
+        # reasons.
         _, discovery, _, _ = producer_reasons()
-        for key in ("DISCLOSABLE_DISCOVERY_SKIP", "EXIT_MID_FLIGHT_SKIP"):
+        for key in (
+            "DISCLOSABLE_DISCOVERY_SKIP",
+            "EXIT_MID_FLIGHT_SKIP",
+            "STALE_DEFERRAL_SKIP",
+        ):
             row = ORACLE[key]
             self.assertEqual(row["name"], CHECKER["DISCOVERY_SUBJECT"], key)
             self.assertIn(row["reason"], discovery, key)

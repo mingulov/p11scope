@@ -7098,9 +7098,17 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     assert_eq!(
         reasons
             .iter()
-            .filter(|reason| **reason == "process exited mid-flight")
+            .filter(|reason| **reason == "process exited or changed mid-flight")
             .count(),
-        6,
+        5,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
+            .filter(|reason| **reason == "stale process report deferred mid-flight")
+            .count(),
+        1,
         "{reasons:?}"
     );
     assert_eq!(
@@ -7142,27 +7150,27 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         (
             "live discovery generation",
             "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
-            "process exited mid-flight",
+            "process exited or changed mid-flight",
         ),
         (
             "live inventory generation",
             "an exact retained or newly opened process generation changed during inventory preflight",
-            "process exited mid-flight",
+            "process exited or changed mid-flight",
         ),
         (
             "live inventory generation",
             "an exact retained or newly opened process generation changed during post-retirement preflight",
-            "process exited mid-flight",
+            "process exited or changed mid-flight",
         ),
         (
             "live discovery generation",
             "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
-            "process exited mid-flight",
+            "stale process report deferred mid-flight",
         ),
         (
             "live discovery record",
             "a structurally valid private terminal record failed exact live resolution",
-            "process exited mid-flight",
+            "process exited or changed mid-flight",
         ),
         (
             "live export hook",
@@ -7214,7 +7222,7 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         subject: "process view".into(),
         reason: "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered".into(),
     });
-    assert_eq!(projected.reason, "process exited mid-flight");
+    assert_eq!(projected.reason, "process exited or changed mid-flight");
 }
 
 /// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
@@ -14625,7 +14633,7 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
     );
     assert_eq!(
         render::capture_skipped_out(&engine.counters.object_skips[0]).reason,
-        "process exited mid-flight"
+        "process exited or changed mid-flight"
     );
     assert!(
         unreadable_member_skip(11, true, "scripted, proven gone", &mut noise).is_none(),

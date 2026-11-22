@@ -11204,11 +11204,11 @@ pub(crate) mod tests {
             },
         ];
         for reason in [
-            "process exited mid-flight",
-            "process exited mid-flight",
-            "process exited mid-flight",
-            "process exited mid-flight",
-            "process exited mid-flight",
+            "process exited or changed mid-flight",
+            "process exited or changed mid-flight",
+            "process exited or changed mid-flight",
+            "process exited or changed mid-flight",
+            "stale process report deferred mid-flight",
             "scan budget exhausted",
             "scan budget exhausted",
             "no unique attached loader context",
@@ -11230,7 +11230,8 @@ pub(crate) mod tests {
             );
             for fragment in [
                 "loader context capacity 256 is exhausted: 1",
-                "process exited mid-flight: 5",
+                "process exited or changed mid-flight: 4",
+                "stale process report deferred mid-flight: 1",
                 "scan budget exhausted: 2",
                 "no unique attached loader context: 1",
             ] {
@@ -20042,14 +20043,16 @@ pub(crate) mod tests {
         assert!(text.contains("10 discovery steps unavailable"), "{text}");
     }
 
-    /// Gap-noise fold: the six mid-flight generation pairs project to
-    /// one public reason. Folding renames, never drops: JSON keeps one
-    /// row per underlying record, and the text names the folded row
-    /// with its count instead of the generic bucket.
+    /// Gap-noise fold: the five changed-generation mid-flight pairs
+    /// project to the changed reason, while the live stale-deferral
+    /// pair projects to its own deferral reason, which never claims
+    /// the process exited. Folding renames, never drops: JSON keeps
+    /// one row per underlying record, and the text names each folded
+    /// row with its count instead of the generic bucket.
     #[test]
-    fn mid_flight_generation_pairs_project_to_one_public_reason() {
+    fn mid_flight_generation_pairs_project_to_split_public_reasons() {
         use crate::discovery::scan::Skipped;
-        let internals = [
+        let changed = [
             (
                 "live discovery generation",
                 "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
@@ -20063,10 +20066,6 @@ pub(crate) mod tests {
                 "an exact retained or newly opened process generation changed during post-retirement preflight",
             ),
             (
-                "live discovery generation",
-                "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
-            ),
-            (
                 "live discovery record",
                 "a structurally valid private terminal record failed exact live resolution",
             ),
@@ -20075,19 +20074,36 @@ pub(crate) mod tests {
                 "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
             ),
         ];
-        for (subject, reason) in &internals {
+        for (subject, reason) in &changed {
             let projected = capture_skipped_out(&Skipped {
                 subject: (*subject).into(),
                 reason: (*reason).into(),
             });
             assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
             assert_eq!(
-                projected.reason, "process exited mid-flight",
+                projected.reason, "process exited or changed mid-flight",
                 "{subject} {reason}"
             );
         }
+        // The stale-deferral pair is filed for a possibly still-live
+        // process with retirement deferred: its public row must never
+        // call the process exited.
+        let deferred = capture_skipped_out(&Skipped {
+            subject: "live discovery generation".into(),
+            reason: "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred"
+                .into(),
+        });
+        assert_eq!(deferred.name, "discovery subject");
+        assert_eq!(
+            deferred.reason, "stale process report deferred mid-flight"
+        );
+        assert!(
+            !deferred.reason.contains("exited"),
+            "a live process is never called exited: {}",
+            deferred.reason
+        );
         let mut ev = evidence();
-        ev.skipped = internals
+        ev.skipped = changed
             .iter()
             .map(|(subject, reason)| {
                 capture_skipped_out(&Skipped {
@@ -20095,6 +20111,7 @@ pub(crate) mod tests {
                     reason: (*reason).into(),
                 })
             })
+            .chain(std::iter::once(deferred))
             .collect();
         ev.verdict();
         // One JSON row per underlying record: folding renames, never drops.
@@ -20107,7 +20124,14 @@ pub(crate) mod tests {
         );
         assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 6);
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("process exited mid-flight: 6"), "{text}");
+        assert!(
+            text.contains("process exited or changed mid-flight: 5"),
+            "{text}"
+        );
+        assert!(
+            text.contains("stale process report deferred mid-flight: 1"),
+            "{text}"
+        );
         assert!(!text.contains("discovery steps unavailable"), "{text}");
         assert!(!text.contains("discovery step unavailable"), "{text}");
     }

@@ -271,30 +271,45 @@ def producer_const(name):
 
 
 def producer_exit_row():
-    """The public exit row as the producer defines it today.
+    """The public mid-flight changed row as the producer defines it today.
 
     Built from the render.rs constants, never a pasted copy, so the
     rejection twins below always judge the row the producer emits.
+    (Historical helper name: the row no longer claims an exit.)
     """
     return {"name": producer_const("DISCOVERY_SUBJECT"),
             "reason": producer_const("MID_FLIGHT_REASON")}
 
 
+def producer_deferral_row():
+    """The public stale-deferral row as the producer defines it today.
+
+    Built from the render.rs constants, never a pasted copy, so the
+    rejection twin below always judges the row the producer emits.
+    """
+    return {"name": producer_const("DISCOVERY_SUBJECT"),
+            "reason": producer_const("STALE_DEFERRAL_REASON")}
+
+
 def assert_live_deferral_still_folds():
-    """Prove the live stale-deferral mark still folds to the exit row.
+    """Prove the live stale-deferral mark still folds to its own row.
 
     Fails loudly (never vacuously green) if the producer stops
-    filing the live mark or stops folding it: either change revisits
-    these twins, since the rejection below exists only because the
-    fold is ambiguous. The behavioral pin is
-    render::mid_flight_generation_pairs_project_to_one_public_reason.
+    filing the live mark, stops folding it to the deferral row, or
+    folds it back into the changed row: any of those revisits these
+    twins, since the rejection below exists only because neither
+    public row proves an exit. The behavioral pin is
+    render::mid_flight_generation_pairs_project_to_split_public_reasons.
     """
     engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
     assert LIVE_DEFERRAL_INTERNAL_REASON in engine, \
         "producer stopped filing the live stale-deferral mark"
-    fold = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
+    fold = producer_render_source().split("fn is_stale_deferral_pair", 1)[1].split("\n}", 1)[0]
     assert LIVE_DEFERRAL_INTERNAL_REASON in fold, \
-        "producer stopped folding the live deferral to the exit row"
+        "producer stopped folding the live deferral to the deferral row"
+    changed = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
+    assert LIVE_DEFERRAL_INTERNAL_REASON not in changed, \
+        "producer folded the live deferral back into the changed row"
 
 
 class OracleTests(unittest.TestCase):
@@ -1094,20 +1109,39 @@ class RunnerNoiseTests(unittest.TestCase):
 
     def test_exit_ambient_with_single_exit_fails_on_system_in_strict_mode(self):
         # An exit excuse requires proof the process actually exited.
-        # The public exit row also projects the engine's live
-        # stale-deferral mark (filed for a still-live process with the
-        # view retained), so a lone row with exact counts and zero
-        # loss is ambiguous — a live deferral, not a proven exit —
-        # and the oracle rejects it fail-closed at the gap gate. The
-        # row under test comes from the producer's own constants and
-        # the fold assertion above proves the live mark still maps to
-        # it. Control: test_lone_gap_passes_on_system_in_strict_mode
+        # The public mid-flight changed row covers exit-or-change
+        # without proving either, so a lone row with exact counts
+        # and zero loss is unproven — never an exit excuse — and the
+        # oracle rejects it fail-closed at the gap gate. The row
+        # under test comes from the producer's own constants.
+        # Control: test_lone_gap_passes_on_system_in_strict_mode
         # keeps the proven-exit positive (gaps=1, no skips) with the
         # same exact counts.
         exit_row = producer_exit_row()
         assert_live_deferral_still_folds()
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [dict(exit_row)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_deferral_ambient_with_single_deferral_fails_on_system_in_strict_mode(self):
+        # Twin of the changed-row rejection: the stale-deferral row
+        # is filed for a possibly still-live process with retirement
+        # deferred, so it proves no exit either and the oracle
+        # rejects a lone row fail-closed at the gap gate. The row
+        # under test comes from the producer's own constants and the
+        # fold assertion above proves the live mark still maps to
+        # this row alone, never back to the changed row.
+        deferral_row = producer_deferral_row()
+        assert_live_deferral_still_folds()
+        self.assertNotIn("exited", deferral_row["reason"],
+                         "a live process is never called exited")
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [dict(deferral_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")

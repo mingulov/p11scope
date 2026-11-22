@@ -2179,17 +2179,34 @@ impl ModelState {
             {
                 // Controller ruling v080-nss-ec-double R2
                 // (2026-11-21; renamed neutral in R3): a same-thread
-                // strictly-nested inner call runs entirely inside
-                // this call on one thread — no concurrent
-                // interleaving with this call's joins from another
-                // thread — so the outer call ignores it and the
-                // nested pair alone does not obstruct otherwise
-                // provable outer outputs. (The inner call itself
-                // returned `SameThreadNested` from the pre-scan
-                // above; its issuer is never proven.) Cross-thread
-                // or otherwise unprovable overlap keeps the
-                // conservative gap.
-                if Self::strictly_nested_same_thread(y, x) {
+                // strictly-nested inner call that changes no objects
+                // or sessions runs entirely inside this call on one
+                // thread — no concurrent interleaving with this
+                // call's joins from another thread — so the outer
+                // call ignores it and the nested pair alone does not
+                // obstruct otherwise provable outer outputs. (The
+                // inner call itself returned `SameThreadNested`
+                // from the pre-scan above; its issuer is never
+                // proven.) The exemption covers only the
+                // sign/verify/digest/encrypt/decrypt class — neutral
+                // S1 operations (already skipped above) and
+                // `Access`/`OperationImport` joins, which read a
+                // binding without creating, destroying, converting
+                // or rebinding it. Any other nested inner call
+                // (creation, destruction, lookup, attribute write,
+                // session/login lifecycle) falls through to the
+                // conservative gap below, so its destroy and
+                // lifecycle effects are never silently ignored.
+                // Cross-thread or otherwise unprovable overlap keeps
+                // the conservative gap.
+                if Self::strictly_nested_same_thread(y, x)
+                    && matches!(
+                        y.kind,
+                        CallKind::Object(
+                            ObjectAction::Access | ObjectAction::OperationImport
+                        )
+                    )
+                {
                     continue;
                 }
                 return (Some(ObjectGap::SameSessionOverlap), metadata);

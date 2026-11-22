@@ -11105,6 +11105,9 @@ mod tests {
         /// returns the bytes before it and a read that starts inside it
         /// fails, like `/proc/<pid>/mem` at a hole.
         hole: Option<(u64, u64)>,
+        /// Filesystem magic of the scripted held identity: ext4 unless a
+        /// twin models an overlay mapping that needs the witness.
+        held_magic: u64,
     }
 
     thread_local! {
@@ -11200,7 +11203,7 @@ mod tests {
                 // the original-file witness instead of the legacy join).
                 Some((held, _)) => Some(crate::discovery::identity::MappedFile {
                     identity: held,
-                    fs_magic: Some(0xef53),
+                    fs_magic: Some(self.held_magic),
                 }),
                 None => crate::discovery::identity::self_mapped_file(file).ok(),
             }
@@ -11429,6 +11432,7 @@ mod tests {
                 mapped: None,
                 exe_override: None,
                 hole: None,
+                held_magic: 0xef53,
             }
         }
 
@@ -29248,6 +29252,52 @@ int main(int argc, char **argv) {
         )
         .expect("the scan must complete, not error");
         (outcome, so_path)
+    }
+
+    /// An unavailable witness under scoped collection is a named gap,
+    /// not unfinished decoding: the object's decode cursor completes
+    /// (the gap is re-derived and named on every pass), so the view
+    /// holds no scan in progress and a cgroup member scan can finish.
+    /// The module itself still claims no finished tables scan. Twin: a
+    /// proven witness completes its cursor the same way.
+    #[test]
+    fn cgroup_scoped_unproven_witness_completes_its_decode_cursor() {
+        let run = |collection: bool, magic: u64| {
+            let mut fixture = BracketFixture::new(8, true);
+            let identity = crate::discovery::identity::FileIdentity { dev: 37, ino: 9 };
+            fixture.mapped = Some((identity, identity));
+            fixture.held_magic = magic;
+            let mut budget = CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: u64::MAX,
+                total_bytes: u64::MAX,
+            })
+            .with_retained_file_facts(RetainedFileFacts::default());
+            if collection {
+                budget.set_collection_work(CollectionWork::new(|_| true));
+            }
+            let outcome = fixture.run(&mut budget).unwrap();
+            (outcome, budget.take_retained_file_facts())
+        };
+        let (outcome, carried) = run(true, K1_RED_OVERLAY_MAGIC);
+        assert_eq!(outcome.modules().len(), 1, "{:?}", outcome.skipped());
+        assert!(
+            outcome.skipped().iter().any(|skip| skip
+                .reason
+                .starts_with("original_file_unproven: kernel witness unavailable")),
+            "the witness gap is named: {:?}",
+            outcome.skipped()
+        );
+        assert!(!outcome.modules()[0].tables_scan_finished);
+        assert_eq!(
+            carried.cursor_counts(),
+            (1, 0),
+            "a fully decoded object waits on no later pass: {:?}",
+            carried.decode_cursors_for_test()
+        );
+        // Twin: an ordinary filesystem proves the join and completes.
+        let (outcome, carried) = run(true, 0xef53);
+        assert!(outcome.modules()[0].tables_scan_finished, "{:?}", outcome.skipped());
+        assert_eq!(carried.cursor_counts(), (1, 0));
     }
 
     /// Cgroup inventory on an overlay rootfs: scoped collection

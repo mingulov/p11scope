@@ -2142,7 +2142,7 @@ main() {
         [ -n "$result_line" ] || result_line="(no test result line)"
         verdict=FAIL
         if [ "$rc" -eq 0 ] \
-            && command grep -qF 'test result: ok. 1 passed' "$log"; then
+            && command grep -q '^test result: ok\. 1 passed' "$log"; then
             verdict=PASS
         fi
         matrix_note=
@@ -2158,6 +2158,9 @@ main() {
             if [ -n "$matrix_missing" ]; then
                 verdict=FAIL
                 matrix_note=" (MATRIX SHORT: missing completed cases:$matrix_missing; want wp7-stop0..wp7-stop11)"
+            elif command grep -qE '^P11SCOPE_CELL_BRANCH=wp7-stop(0|1|2|3|4|5|6|7|8|9|10|11):(s1-precluded|no-feeds-unattributed)$' "$log"; then
+                verdict=FAIL
+                matrix_note=" (MIXED: no-feed preclusion tag on a passing matrix; a pass never precludes)"
             fi
         fi
         branch_suffix=$(cell_branch_suffix "$log")

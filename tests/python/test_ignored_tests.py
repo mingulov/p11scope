@@ -1615,20 +1615,25 @@ class IgnoredTestsTests(unittest.TestCase):
         # The full-matrix gate qualifies a pass only on the twelve
         # post-stop completion lines, each matched as a full line: a
         # pre-stop linkage tag (or a completion marker embedded in
-        # another line) must never qualify its case.
+        # another line) must never qualify its case. A no-feed
+        # preclusion tag on a passing matrix fails it as mixed.
         text = RUNNER.read_text(encoding="utf-8")
         self.assertIn(
             'command grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" "$log"',
             text,
         )
         self.assertNotIn("P11SCOPE_CELL_BRANCH=wp7-stop$i:linked", text)
+        self.assertIn("s1-precluded|no-feeds-unattributed", text)
+        self.assertIn("a pass never precludes", text)
+        self.assertIn("command grep -q '^test result: ok\\. 1 passed'", text)
 
     def test_full_matrix_gate_verbatim_block_judges_completion_fixtures(self):
         # Drive the runner's shipped full-matrix block verbatim (the
         # exact lines between its guard and its closing fi) against
         # fixture logs: a full matrix passes, a linked-but-incomplete
-        # one (case 7 linked, never completed) fails naming 7, and a
-        # diagnostic-embedded completion line fails too.
+        # one (case 7 linked, never completed) fails naming 7, a
+        # diagnostic-embedded completion line fails too, and a full
+        # matrix with an S1 preclusion tag fails as mixed.
         text = RUNNER.read_text(encoding="utf-8")
         guard = ('if [ -n "${full_matrix_set[$name]+present}" ]'
                  ' && [ "$verdict" = PASS ]; then')
@@ -1637,6 +1642,7 @@ class IgnoredTestsTests(unittest.TestCase):
         block = text[start:end]
         self.assertIn("matrix_missing", block)
         self.assertIn("MATRIX SHORT", block)
+        self.assertIn("MIXED", block)
 
         def linkage(i):
             return "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i
@@ -1653,11 +1659,13 @@ class IgnoredTestsTests(unittest.TestCase):
         embedded += ("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
                      "emitted late\n")
         embedded += "".join(complete(i) for i in range(8, 12))
+        mixed = full + "P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
         with tempfile.TemporaryDirectory() as tmp:
             paths = {}
             for name, body in (("full.log", full),
                                ("incomplete.log", incomplete),
-                               ("embedded.log", embedded)):
+                               ("embedded.log", embedded),
+                               ("mixed.log", mixed)):
                 path = Path(tmp) / name
                 path.write_text(body, encoding="utf-8")
                 paths[name] = path
@@ -1679,15 +1687,18 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), 3, lines)
+        self.assertEqual(len(lines), 4, lines)
         self.assertIn("verdict=PASS", lines[0], lines)
         self.assertNotIn("MATRIX SHORT", lines[0], lines)
+        self.assertNotIn("MIXED", lines[0], lines)
         self.assertIn("verdict=FAIL", lines[1], lines)
         self.assertIn("7", lines[1], lines)
         self.assertIn("MATRIX SHORT", lines[1], lines)
         self.assertIn("verdict=FAIL", lines[2], lines)
         self.assertIn("7", lines[2], lines)
         self.assertIn("MATRIX SHORT", lines[2], lines)
+        self.assertIn("verdict=FAIL", lines[3], lines)
+        self.assertIn("MIXED", lines[3], lines)
 
     def test_btrfs_pair_staging_surfaces_tool_stderr(self):
         # A hosted pair-staging failure must print the tool's

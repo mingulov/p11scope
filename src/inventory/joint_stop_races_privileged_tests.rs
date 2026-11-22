@@ -744,8 +744,8 @@ fn count_disclosed_gaps(
 }
 
 /// Entries (not repeats) of caller-less gaps with one subject: the
-/// unrouted-shed disclosure beside the lane shed counter, and the
-/// capacity shed that has no counter.
+/// capacity shed that has no counter, and the foreign shed that must be
+/// absent in a fixture-only run.
 fn count_callerless_gap_entries(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     subject: &str,
@@ -756,6 +756,65 @@ fn count_callerless_gap_entries(
         .iter()
         .filter(|gap| gap.caller.is_none() && gap.subject == subject)
         .count()
+}
+
+/// Parse one counted shed reason to its disclosed total, requiring the
+/// label breakdown inside parens to sum to that total. Accepts the two
+/// counted templates for `semantic calls unrouted`: the aggregated
+/// `{total} calls shed without a route ({labels}) with {N} bindings`
+/// and the dropped-batch `{total} calls shed from a dropped {drop}
+/// batch ({labels}) with {N} bindings`. Returns None on any other
+/// shape, an unparsable count, or a breakdown mismatch.
+fn parse_unrouted_gap_total(reason: &str) -> Option<u64> {
+    let (total_str, rest) = reason.split_once(" calls shed ")?;
+    let total: u64 = total_str.trim().parse().ok()?;
+    if reason.contains("from callers other") {
+        return None;
+    }
+    if !rest.contains(" with ") || !rest.contains("bindings") {
+        return None;
+    }
+    let start = rest.find('(')?;
+    let end = rest.find(')')?;
+    if end <= start {
+        return None;
+    }
+    let mut sum = 0u64;
+    let mut labels = 0u32;
+    for part in rest[start + 1..end].split_whitespace() {
+        let (_, count_str) = part.split_once('=')?;
+        let count: u64 = count_str.parse().ok()?;
+        sum = sum.saturating_add(count);
+        labels += 1;
+    }
+    if labels == 0 || sum != total {
+        return None;
+    }
+    Some(total)
+}
+
+/// Summed disclosed total across every caller-less `semantic calls
+/// unrouted` row, multiplying each row's parsed total by its repeats.
+/// Fails naming the offending reason when any row does not parse.
+fn sum_unrouted_disclosed(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    tag: &str,
+) -> Result<u64> {
+    let registry = coordinator.registry();
+    let mut total = 0u64;
+    for (gap, repeats) in registry.gaps().iter().zip(registry.gap_repeats().iter()) {
+        if gap.caller.is_some() || gap.subject != "semantic calls unrouted" {
+            continue;
+        }
+        let parsed = parse_unrouted_gap_total(&gap.reason);
+        ensure!(
+            parsed.is_some(),
+            "{tag}: every unrouted gap carries a counted total with a matching breakdown: {:?}",
+            gap.reason
+        );
+        total = total.saturating_add(parsed.unwrap_or(0).saturating_mul(*repeats));
+    }
+    Ok(total)
 }
 
 /// Trusted Joint-branch selector. `journal_linked` latches from the
@@ -826,13 +885,16 @@ fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
 /// each caller's residual deficit is then nonnegative, so no
 /// caller's surplus can hide another caller's loss. With no shed
 /// every deficit is zero; with shed the deficits sum to the counted,
-/// disclosed shed. An instance refusal needs its retained named
-/// reason for that caller's edge (the per-call counter carries the
-/// arithmetic per R-59; gap rows only prove disclosure, never count
-/// calls). A silent drop breaks its caller's equation. Capacity shed
-/// has no counter, so any capacity gap fails; shed without a printed
-/// named gap (or with suppressed disclosure) fails too, as does any
-/// instance refusal under suppression.
+/// disclosed shed, and the retained unrouted rows disclose that same
+/// total with a matching label breakdown. An instance refusal needs
+/// its retained per-call reason (`instance_unproven`/`caller_unbound`)
+/// for that caller's edge with no registration refusal on the caller
+/// (the per-call counter carries the arithmetic per R-59; gap rows
+/// only prove disclosure, never count calls). A silent drop breaks
+/// its caller's equation. Capacity shed has no counter, so any
+/// capacity gap fails; foreign shed must be absent in a fixture-only
+/// run; shed without a printed counted gap, a gap without the lane
+/// count, an unparsable total, or any suppression fails too.
 ///
 /// One owner's measured populations for stop reconciliation: the ledger
 /// splits (`sem`/`count_only`/`entered`), the edge attribution (`api`),
@@ -857,8 +919,17 @@ fn assert_semantic_reconciled(
     tag: &str,
     owners: &[StopOwnerLedger],
 ) -> Result<()> {
+    ensure!(
+        owners.len() == 2,
+        "{tag}: reconciliation covers exactly the two fixture owners, never a subset: got {}",
+        owners.len()
+    );
+    ensure!(
+        owners[0].caller != owners[1].caller,
+        "{tag}: the two owners name distinct callers"
+    );
     let mut parts = Vec::new();
-    let (mut deficit_sum, mut inst_sum) = (0u64, 0u64);
+    let (mut deficit_sum, mut slot_sum) = (0u64, 0u64);
     for owner in owners {
         let StopOwnerLedger {
             name,
@@ -890,33 +961,74 @@ fn assert_semantic_reconciled(
             &accounted <= entered,
             "{tag}: {name} never over-accounts: api {api} + slot {slot} + inst {inst} <= entered {entered}"
         );
+        ensure!(
+            !coordinator.registry().registration_refused(*caller),
+            "{tag}: {name} has no refused registration to hide behind a call gap: \
+             caller {caller:?}"
+        );
+        let other_input = coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "semantic input refused"
+                && gap.caller == Some(*caller)
+                && gap.reason != "slot"
+        });
+        ensure!(
+            !other_input,
+            "{tag}: {name} carries only slot input refusals, never another conversion cause: \
+             caller {caller:?}"
+        );
+        let edge_gaps: Vec<_> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == "instance semantics refused"
+                    && gap.caller == Some(*caller)
+                    && gap.module == Some(*module)
+            })
+            .collect();
+        if *inst > 0 {
+            let disclosed = edge_gaps
+                .iter()
+                .any(|gap| gap.reason == "instance_unproven" || gap.reason == "caller_unbound");
+            ensure!(
+                disclosed,
+                "{tag}: {name} instance refusals carry a retained per-call reason for their edge: \
+                 inst {inst} caller {caller:?} module {module:?}"
+            );
+            let foreign = edge_gaps
+                .iter()
+                .any(|gap| gap.reason != "instance_unproven" && gap.reason != "caller_unbound");
+            ensure!(
+                !foreign,
+                "{tag}: {name} carries only per-call instance reasons, never a registration cause: \
+                 caller {caller:?} module {module:?}"
+            );
+        } else {
+            ensure!(
+                edge_gaps.is_empty(),
+                "{tag}: {name} carries no instance gap without a refused call: \
+                 caller {caller:?} module {module:?}"
+            );
+        }
         let deficit = entered.saturating_sub(accounted);
         parts.push(format!(
             "{name}(entered={entered} sem={sem} api={api} co={count_only} slot={slot} \
              inst={inst} deficit={deficit})"
         ));
         deficit_sum = deficit_sum.saturating_add(deficit);
-        inst_sum = inst_sum.saturating_add(*inst);
-        if *inst > 0 {
-            let disclosed = coordinator.registry().gaps().iter().any(|gap| {
-                gap.subject == "instance semantics refused"
-                    && gap.caller == Some(*caller)
-                    && gap.module == Some(*module)
-            });
-            ensure!(
-                disclosed,
-                "{tag}: {name} instance refusals carry a retained named reason for their edge: \
-                 inst {inst} caller {caller:?} module {module:?}"
-            );
-        }
+        slot_sum = slot_sum.saturating_add(*slot);
     }
-    let unrouted_entries = count_callerless_gap_entries(coordinator, "semantic calls unrouted");
+    let unrouted_total = sum_unrouted_disclosed(coordinator, tag)?;
     let capacity_entries =
         count_callerless_gap_entries(coordinator, "semantic call outcome capacity");
+    let foreign_entries =
+        count_callerless_gap_entries(coordinator, "semantic calls unrouted from other callers");
+    let foreign_calls = coordinator.registry().foreign_unrouted_calls();
     let suppressed = coordinator.registry().gaps_suppressed();
     eprintln!(
         "JOINT_R16 {tag}-reconcile {} shed={lane_shed} deficits={deficit_sum} \
-         unrouted_entries={unrouted_entries} capacity_entries={capacity_entries} \
+         unrouted_total={unrouted_total} capacity_entries={capacity_entries} \
+         foreign_entries={foreign_entries} foreign_calls={foreign_calls} \
          suppressed={suppressed}",
         parts.join(" ")
     );
@@ -925,14 +1037,19 @@ fn assert_semantic_reconciled(
         "{tag}: no capacity shed without a counter: {capacity_entries} entries"
     );
     ensure!(
-        lane_shed == 0 || (unrouted_entries > 0 && suppressed == 0),
-        "{tag}: shed calls are disclosed in a printed named gap: shed {lane_shed}, \
-         entries {unrouted_entries}, suppressed {suppressed}"
+        foreign_entries == 0 && foreign_calls == 0,
+        "{tag}: no foreign shed in a fixture-only run: entries {foreign_entries}, \
+         calls {foreign_calls}"
     );
     ensure!(
-        inst_sum == 0 || suppressed == 0,
-        "{tag}: instance refusals need unsuppressed disclosure: inst {inst_sum}, \
-         suppressed {suppressed}"
+        suppressed == 0,
+        "{tag}: no suppressed disclosure while reconciling: suppressed {suppressed}, \
+         slot {slot_sum}, deficits {deficit_sum}, shed {lane_shed}"
+    );
+    ensure!(
+        unrouted_total == lane_shed,
+        "{tag}: the retained unrouted total equals the lane shed count: \
+         disclosed {unrouted_total} vs shed {lane_shed}"
     );
     if lane_shed == 0 {
         ensure!(
@@ -1850,6 +1967,15 @@ fn stop_matrix_selector(name: &str, len: usize) -> Result<Vec<usize>> {
         .collect()
 }
 
+/// Qualification evidence for one stop case: the completion line for
+/// `index`, returned only after `check_stop_outcome` succeeds. A
+/// caller that discards the error gets no line: the `?` propagates
+/// the failure instead of emitting anyway.
+fn stop_completion_line(outcome: &StopOutcome, offset_ms: u64, index: usize) -> Result<String> {
+    check_stop_outcome(outcome, offset_ms)?;
+    Ok(format!("P11SCOPE_STOP_COMPLETE=wp7-stop{index}"))
+}
+
 /// One prep times one offset: run the stop and check the full assert set.
 fn run_stop_case(
     workload: &JointWorkload,
@@ -1877,11 +2003,11 @@ fn run_stop_case(
         },
         outcome.finish,
     );
-    check_stop_outcome(&outcome, offset_ms)?;
     // Qualification evidence: this marker prints only after every
     // stop check passed, so the qualifying entries prove the stop
     // completed rather than merely linked.
-    eprintln!("P11SCOPE_STOP_COMPLETE=wp7-stop{index}");
+    let marker = stop_completion_line(&outcome, offset_ms, index)?;
+    eprintln!("{marker}");
     Ok(())
 }
 
@@ -1889,9 +2015,10 @@ fn run_stop_case(
 /// completion marker in `run_stop_case`, emitted only after
 /// `check_stop_outcome` succeeds, so a path that returns early after
 /// the pre-stop linkage diagnostic cannot qualify. The pin reads the
-/// case body above its own body (never its own literals) and checks
-/// the marker follows the checks, so a comment mentioning the marker
-/// cannot satisfy it.
+/// case body above its own body (never its own literals), strips
+/// line comments, and requires the propagated helper call before the
+/// emission, so a discarded error or a commented-out emission cannot
+/// satisfy it.
 #[test]
 fn stop_case_emits_a_completion_marker_after_its_checks() {
     let source = include_str!("joint_stop_races_privileged_tests.rs");
@@ -1911,14 +2038,32 @@ fn stop_case_emits_a_completion_marker_after_its_checks() {
         .split_once("\n}\n")
         .expect("top-level fns close at column 0")
         .0;
-    let checks = body.find("check_stop_outcome(&outcome, offset_ms)");
-    let marker = body.find("P11SCOPE_STOP_COMPLETE=wp7-stop");
-    match (checks, marker) {
-        (Some(checks_at), Some(marker_at)) => assert!(
-            marker_at > checks_at,
-            "the completion marker follows the stop checks: {body}"
+    let code: String = body
+        .lines()
+        .filter_map(|line| {
+            let code = line.split("//").next().unwrap_or("");
+            (!code.trim().is_empty()).then(|| code.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let checks = code.find("stop_completion_line(&outcome, offset_ms, index)?");
+    let marker = code.find("P11SCOPE_STOP_COMPLETE=wp7-stop");
+    // The helper formats the marker; the case prints the returned
+    // line. Either the helper call or a direct propagated check plus
+    // a formatted emission satisfies the order; a discarded error
+    // (no `?`) or a comment-only marker never does.
+    let direct_checks = code.find("check_stop_outcome(&outcome, offset_ms)?");
+    let direct_emit = code.find("eprintln!(\"P11SCOPE_STOP_COMPLETE=wp7-stop");
+    match (checks, marker, direct_checks, direct_emit) {
+        (Some(helper_at), _, _, _) => assert!(
+            code[helper_at..].contains("eprintln!"),
+            "the helper line is printed: {code}"
         ),
-        _ => panic!("run_stop_case checks the outcome then marks completion: {body}"),
+        (_, _, Some(checks_at), Some(emit_at)) => assert!(
+            emit_at > checks_at,
+            "the completion marker follows the propagated stop checks: {code}"
+        ),
+        _ => panic!("run_stop_case propagates the checks then marks completion: {code}"),
     }
 }
 
@@ -2136,6 +2281,31 @@ fn stop_outcome_accepts_a_counted_and_disclosed_shed() {
     outcome.reconciled = true;
     outcome.reconcile_detail = "reconciled".to_string();
     check_stop_outcome(&outcome, outcome.offset_ms).expect("a counted and disclosed shed passes");
+}
+
+#[test]
+fn stop_completion_line_emits_only_after_successful_checks() {
+    // Healthy outcome emits its indexed line; a failed stop outcome
+    // returns the check error with no line. A caller that discards
+    // the error (`let _ =`) gets no line either, so the pin plus this
+    // behavioral twin fail the discard mutation.
+    let healthy = healthy_stop_outcome();
+    let line = stop_completion_line(&healthy, healthy.offset_ms, 3)
+        .expect("a healthy outcome emits its completion line");
+    assert_eq!(line, "P11SCOPE_STOP_COMPLETE=wp7-stop3");
+    let mut failed = healthy_stop_outcome();
+    failed.reconciled = false;
+    failed.reconcile_detail =
+        "wp7-stop3-stop: every entered call is attributed or refused on its own \
+         caller with no shed: caller deficits sum 1"
+            .to_string();
+    let error = stop_completion_line(&failed, failed.offset_ms, 3)
+        .expect_err("a failed stop outcome emits no completion line");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("reconciliation"),
+        "the failure carries the check error: {text}"
+    );
 }
 
 #[test]
@@ -2391,4 +2561,447 @@ fn stop_reconciliation_refuses_instance_refusal_when_disclosure_suppressed() {
         ],
     )
     .expect_err("a suppressed disclosure with instance refusals must fail");
+}
+
+#[test]
+fn stop_reconciliation_accepts_caller_unbound_with_retained_reason() {
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        Some(1),
+        "instance semantics refused",
+        "caller_unbound",
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 1, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect("a disclosed caller_unbound refusal reconciles");
+}
+
+#[test]
+fn stop_reconciliation_refuses_registration_only_reason_for_a_call_refusal() {
+    // A's per-call refusal carries inst=1, but its only retained row
+    // names a registration-only cause: the call disclosure is missing.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        Some(1),
+        "instance semantics refused",
+        "negative_state_capacity",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 1, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a registration-only reason must not disclose a call refusal");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("per-call"),
+        "the failure names the per-call reason class: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_shared_reason_when_registration_refused() {
+    // The retained row names a per-call reason, but the caller also
+    // refused a registration: the row could be the registration's,
+    // so the call disclosure is unproven.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        Some(1),
+        "instance semantics refused",
+        "instance_unproven",
+    );
+    coordinator
+        .registry_mut()
+        .note_registration_refused(crate::discovery::caller_registry::CallerId(1));
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 1, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a shared reason with a refused registration must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("registration"),
+        "the failure names the registration refusal: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_two_shed_with_one_disclosed() {
+    // Two calls shed and missing, but the retained row accounts for
+    // one: the deficits match the lane count while the disclosure
+    // covers half the loss.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed without a route (test=1) with 2 bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        2,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 13, 1, 0]),
+        ],
+    )
+    .expect_err("a half-disclosed shed must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("unrouted total"),
+        "the failure names the unrouted total: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_shed_without_a_gap() {
+    // The lane counts one shed call and B is one short, but no
+    // retained row discloses it.
+    let coordinator = reconciliation_test_coordinator();
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("a shed count without a gap must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("unrouted total"),
+        "the failure names the unrouted total: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_gap_without_a_shed_count() {
+    // Healthy counts with no shed, but a retained row discloses one
+    // shed call: a gap without the lane count.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed without a route (test=1) with 2 bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a gap without a shed count must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("unrouted total"),
+        "the failure names the unrouted total: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_an_unparsable_unrouted_total() {
+    // The retained row names the shed subject but carries no counted
+    // total: the oracle cannot verify the amount.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "shed happened",
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("an unparsable unrouted total must fail");
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_breakdown_mismatch() {
+    // The row claims two shed calls but its labels sum to one.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "2 calls shed without a route (test=1) with 2 bindings",
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        2,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 13, 1, 0]),
+        ],
+    )
+    .expect_err("a breakdown mismatch must fail");
+}
+
+#[test]
+fn stop_reconciliation_refuses_capacity_shed() {
+    // Capacity shed has no lane counter, so any capacity row fails
+    // even when the per-caller counts balance.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic call outcome capacity",
+        "1 calls refused at the bounded finalization limit",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a capacity gap must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("capacity"),
+        "the failure names capacity: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_foreign_shed() {
+    // Only fixtures call in this cell: a foreign-shed row names loss
+    // outside the two owners.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted from other callers",
+        "1 calls shed without a route (test=1) from callers other than the 2 bound callers",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a foreign shed row must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("foreign"),
+        "the failure names foreign shed: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_non_slot_conversion_cause() {
+    // A coverage input refusal for A is not a count-only slot
+    // refusal: it must fail rather than hide in the deficit.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        None,
+        "semantic input refused",
+        "coverage",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a non-slot conversion cause must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("slot"),
+        "the failure names the slot-only rule: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_an_instance_gap_without_a_refused_call() {
+    // A retained per-call row with inst=0 is a gap without a count.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        Some(1),
+        "instance semantics refused",
+        "instance_unproven",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("an instance gap without a refused call must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("without a refused call"),
+        "the failure names the gap-without-count: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_suppressed_slot_disclosure() {
+    // B's slot refusal balances its counts, but another distinct gap
+    // overflowed the bound: the slot count is unproven.
+    let mut coordinator = InventoryCoordinator::new(
+        Scope::Pid(std::process::id()),
+        HookRegistry::builtin(),
+        Vec::new(),
+        vec![],
+        OsProcessSource,
+        RegistryLimits::new(8, 8, 8, 1, 8, 8).expect("a one-gap bound"),
+    )
+    .expect("a test coordinator builds");
+    record_test_gap(
+        &mut coordinator,
+        Some(2),
+        None,
+        "semantic input refused",
+        "slot",
+    );
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "other subject",
+        "other reason",
+    );
+    assert_eq!(
+        coordinator.registry().gaps_suppressed(),
+        1,
+        "the second distinct gap suppresses"
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("a suppressed slot disclosure must fail");
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_missing_owner() {
+    // One owner cannot reconcile two callers: B's loss would be
+    // invisible.
+    let coordinator = reconciliation_test_coordinator();
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[stop_owner("a", 1, 1, [2, 0, 2, 0, 0])],
+    )
+    .expect_err("a single owner must fail");
+}
+
+#[test]
+fn stop_reconciliation_refuses_duplicate_owners() {
+    // Two ledgers for one caller leave the other caller uncovered.
+    let coordinator = reconciliation_test_coordinator();
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("a2", 1, 1, [2, 0, 2, 0, 0]),
+        ],
+    )
+    .expect_err("duplicate owners must fail");
+}
+
+#[test]
+fn stop_reconciliation_refuses_over_attribution() {
+    // A attributes more calls than its semantic ledger holds.
+    let coordinator = reconciliation_test_coordinator();
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 3, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("over-attribution must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("over-attributes"),
+        "the failure names over-attribution: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_over_refused_slots() {
+    // A refuses more slots than its count-only ledger holds.
+    let coordinator = reconciliation_test_coordinator();
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 1, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
+        ],
+    )
+    .expect_err("over-refused slots must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("over-refuses"),
+        "the failure names over-refusal: {text}"
+    );
 }

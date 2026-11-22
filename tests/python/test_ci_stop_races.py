@@ -304,6 +304,163 @@ class CiStopRacesTests(unittest.TestCase):
         self.assertIn("unattributed", joint["detail"])
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
 
+    def test_old_collapsed_s1_tag_without_receipt_fails(self):
+        # The archived probe tag with the collapsed message (no
+        # producer-seal receipt) is ambiguous, never environmental.
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "Error: wp7-stop0: no joint feeds from the linked session; "
+               "not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("ambiguous", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_embedded_s1_tag_does_not_preclude(self):
+        log = ("JOINT_STOP wp7-stop0: P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded "
+               "emitted late\n"
+               "wp7-stop0: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_suffixed_s1_lookalike_does_not_preclude(self):
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop7:s1-precluded-suspected\n"
+               "wp7-stop7: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_after_seven_linked_completions_fails(self):
+        # Seven cases linked and completed, then an S1 tag: preclusion
+        # holds only before any linked case.
+        tags = "".join(
+            "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(7))
+        done = "".join(
+            "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(7))
+        log = (tags + done +
+               "P11SCOPE_CELL_BRANCH=wp7-stop7:s1-precluded\n"
+               "wp7-stop7: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("before any linked case", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_with_linked_tags_fails(self):
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:linked\n"
+               "P11SCOPE_CELL_BRANCH=wp7-stop1:s1-precluded\n"
+               "wp7-stop1: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("mixed", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_without_receipt_fails(self):
+        log = "P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+        self.assertNotIn(wedge_signature(), log)
+        self.assertNotIn("producers unlinked", log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("ambiguous", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_with_unattributed_mixed_fails(self):
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "wp7-stop0: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n"
+               "P11SCOPE_CELL_BRANCH=wp7-stop1:no-feeds-unattributed\n"
+               "wp7-stop1: no joint feeds without S1 seal "
+               "(producers linked, zero installs unexplained); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("mixed", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_with_wedge_mixed_fails_under_expect_one(self):
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "wp7-stop0: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n"
+               "JOINT_STOP wp7-stop0: finish wedges: %s\n" % wedge_signature())
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=True)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("mixed", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_pass_with_s1_tag_fails(self):
+        log = (full_matrix_log() +
+               "P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "wp7-stop0: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("never precludes", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_two_passed_does_not_qualify(self):
+        tags = "".join(
+            "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
+        done = "".join(
+            "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(12))
+        log = tags + done + ("test result: ok. 2 passed; 0 failed; 0 ignored; "
+                             "0 measured; 0 filtered out; finished in 180.00s\n")
+        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_out_of_range_s1_tag_does_not_preclude(self):
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop12:s1-precluded\n"
+               "wp7-stop12: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_unattributed_embedded_maps_to_generic_fail(self):
+        log = ("JOINT_STOP wp7-stop4: P11SCOPE_CELL_BRANCH=wp7-stop4:no-feeds-unattributed "
+               "emitted late\n"
+               "wp7-stop4: no joint feeds without S1 seal "
+               "(producers linked, zero installs unexplained); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        self.assertNotIn("s1-precluded", log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("without the wedge signature", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
     def test_unexpected_pass_with_expect_one_fails(self):
         proc, rows, joint = run_mapping(
             log="test result: ok. 1 passed\n", rc=0, expect_fail=True)

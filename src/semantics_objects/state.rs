@@ -2103,6 +2103,25 @@ impl ModelState {
         true
     }
 
+    /// Whether a strictly-nested same-thread inner call is exempt
+    /// from obstructing its outer call: the sign/verify/digest/
+    /// encrypt/decrypt join class (`Access`/`OperationImport`) with
+    /// an effect-neutral terminal. `Ok`/`Partial` join a binding
+    /// without retiring it; `Failed` is an ordinary ordered failure
+    /// with no effect. `InvalidHandle` ends the named binding's
+    /// access, `SessionInvalid` closes the acting session, and
+    /// `Pending`/`Ambiguous` may have acted — none of them is
+    /// neutral. An unknown terminal never qualifies (fail-closed).
+    fn nested_inner_effect_neutral(inner: &PendingCall) -> bool {
+        matches!(
+            inner.kind,
+            CallKind::Object(ObjectAction::Access | ObjectAction::OperationImport)
+        ) && matches!(
+            inner.outcome(),
+            Some(Outcome::Ok | Outcome::Partial | Outcome::Failed)
+        )
+    }
+
     /// Overlapping calls (with known outcomes, guaranteed by the watermark)
     /// that may alter what this call's joins rely on. Neutral calls take
     /// no part as either side: they apply no joins to protect, and they
@@ -2190,21 +2209,23 @@ impl ModelState {
                 // proven.) The exemption covers only the
                 // sign/verify/digest/encrypt/decrypt class — neutral
                 // S1 operations (already skipped above) and
-                // `Access`/`OperationImport` joins, which read a
-                // binding without creating, destroying, converting
-                // or rebinding it. Any other nested inner call
-                // (creation, destruction, lookup, attribute write,
+                // `Access`/`OperationImport` joins that complete
+                // without effect (`Ok`/`Partial` reads and ordinary
+                // `Failed` returns). An inner that fails with an
+                // object/handle error (`InvalidHandle` retires the
+                // binding it named; `SessionInvalid` closes the
+                // session) or whose effect is unproven
+                // (`Pending`/`Ambiguous`, or no terminal yet) is not
+                // exempt: the inner still applies its own
+                // retirement, and the outer keeps the conservative
+                // gap below. Any other nested inner call (creation,
+                // destruction, lookup, attribute write,
                 // session/login lifecycle) falls through to the
                 // conservative gap below, so its destroy and
                 // lifecycle effects are never silently ignored.
                 // Cross-thread or otherwise unprovable overlap keeps
                 // the conservative gap.
-                if Self::strictly_nested_same_thread(y, x)
-                    && matches!(
-                        y.kind,
-                        CallKind::Object(ObjectAction::Access | ObjectAction::OperationImport)
-                    )
-                {
+                if Self::strictly_nested_same_thread(y, x) && Self::nested_inner_effect_neutral(y) {
                     continue;
                 }
                 return (Some(ObjectGap::SameSessionOverlap), metadata);

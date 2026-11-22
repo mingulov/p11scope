@@ -1459,9 +1459,12 @@ never imply S1 loss.
   a same-thread nested call from an application signal handler or a
   provider callback nests too, so the issuer is never proven). The
   inner call's key join is withheld under the precise reason and
-  its terminal routes to the named unknown row; the nested pair
-  alone does not obstruct otherwise provable outer outputs
-  (versions 1–7 never carry the reason). Plain AES-KW
+  its terminal routes to the named unknown row; a nested pair
+  whose inner completes without effect alone does not obstruct
+  otherwise provable outer outputs (versions 1–7 never carry the
+  reason). An inner that fails with an object/handle error, or
+  that otherwise changes object or session state, obstructs the
+  outer outputs, which stay unknown. Plain AES-KW
   (`CKM_AES_KEY_WRAP`) wrap outputs
   and fresh-view unwrap inputs infer wrapped-key material L−8
   through 8191 material octets (L 8..=8199), about the wrapped

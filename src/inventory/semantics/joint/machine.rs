@@ -4359,10 +4359,11 @@ impl LiveJointMachine {
                 // lane cannot re-offer lands its original refusal
                 // as final, exactly once.
                 for reoffer in &disposition.reoffers {
-                    if lane.reoffer_birth_for(reoffer.image, reoffer.file) {
-                        coordinator.note_birth_reoffer_armed();
-                    } else {
-                        coordinator.disclose_birth_reoffer_exhausted(reoffer);
+                    match lane.live_capture_mut() {
+                        Some(capture) => {
+                            coordinator.execute_birth_reoffer(capture, reoffer);
+                        }
+                        None => coordinator.disclose_birth_reoffer_exhausted(reoffer),
                     }
                 }
                 // Reseed births for voided feeds: re-queue images

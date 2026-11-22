@@ -697,6 +697,7 @@ pub(crate) struct JointBirthFunnel {
     /// Deferred re-offer outcomes, beside their gaps.
     pub(crate) reoffer_armed: u64,
     pub(crate) reoffer_exhausted: u64,
+    pub(crate) reoffer_declined: u64,
 }
 
 impl JointBirthFunnel {
@@ -1878,6 +1879,44 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn note_birth_reoffer_armed(&mut self) {
         self.joint_birth_funnel.reoffer_armed =
             self.joint_birth_funnel.reoffer_armed.saturating_add(1);
+    }
+
+    /// Execute one deferred birth re-offer on its live capture:
+    /// evict and re-mint only when no applied registry key holds the
+    /// observed instances (nothing to orphan); a registered key's
+    /// feed survives on its own re-arm retries instead, and the
+    /// original refusal lands final as declined. Only the Joint
+    /// machine calls this, once per disposition re-offer. Returns
+    /// whether the capture evicted.
+    pub(crate) fn execute_birth_reoffer(
+        &mut self,
+        capture: &mut crate::semantic_capture::SemanticCapture,
+        reoffer: &BirthReoffer,
+    ) -> bool {
+        let routers = capture.current_routers_for(reoffer.image, reoffer.file);
+        let protected = self
+            .registry
+            .joint_image_router_registered(reoffer.image, &routers);
+        if !protected && capture.reoffer_birth_for(reoffer.image, reoffer.file) {
+            self.note_birth_reoffer_armed();
+            return true;
+        }
+        if protected {
+            self.disclose_birth_reoffer_declined(reoffer);
+        } else {
+            self.disclose_birth_reoffer_exhausted(reoffer);
+        }
+        false
+    }
+
+    /// A deferred birth whose re-offer was declined to protect its
+    /// registered feed lands its original refusal here, exactly
+    /// once, under the permanent retained-S1 subject. Only
+    /// [`Self::execute_birth_reoffer`] calls this.
+    pub(crate) fn disclose_birth_reoffer_declined(&mut self, reoffer: &BirthReoffer) {
+        self.joint_birth_funnel.reoffer_declined =
+            self.joint_birth_funnel.reoffer_declined.saturating_add(1);
+        disclose_s1_birth_refusal(&mut self.registry, reoffer.caller, reoffer.reason.clone());
     }
 
     /// Diagnostic-only birth funnel for the stop disclosure.

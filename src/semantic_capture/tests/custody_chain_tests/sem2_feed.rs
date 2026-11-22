@@ -369,7 +369,7 @@ fn joint_birth_funnel_line_format_is_exact() {
          abandoned_prepared=0 storage_refused=0 s1_finalize=0 dropped_ended_domain=0 \
          dropped_foreign_session=0 dropped_backpressure=0 dropped_no_lane=0 \
          dropped_abandoned=0 undecided_at_finish=0 resource_ledger=0 resource_table=0 \
-         reoffer_armed=0 reoffer_exhausted=0 oversized=0 stash_shed=0 merge_refused=0"
+         reoffer_armed=0 reoffer_exhausted=0 reoffer_declined=0 oversized=0 stash_shed=0 merge_refused=0"
     );
     let funnel = JointBirthFunnel {
         prepare_entry: 3,
@@ -386,7 +386,7 @@ fn joint_birth_funnel_line_format_is_exact() {
          abandoned_prepared=0 storage_refused=0 s1_finalize=0 dropped_ended_domain=0 \
          dropped_foreign_session=0 dropped_backpressure=0 dropped_no_lane=0 \
          dropped_abandoned=0 undecided_at_finish=0 resource_ledger=0 resource_table=0 \
-         reoffer_armed=2 reoffer_exhausted=4 oversized=0 stash_shed=2 merge_refused=1"
+         reoffer_armed=2 reoffer_exhausted=4 reoffer_declined=0 oversized=0 stash_shed=2 merge_refused=1"
     );
 }
 

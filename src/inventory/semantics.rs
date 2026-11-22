@@ -2061,8 +2061,8 @@ pub(crate) fn joint_birth_funnel_line(
          storage_refused={} s1_finalize={} dropped_ended_domain={} \
          dropped_foreign_session={} dropped_backpressure={} dropped_no_lane={} \
          dropped_abandoned={} undecided_at_finish={} resource_ledger={} resource_table={} \
-         reoffer_armed={} reoffer_exhausted={} oversized={oversized} stash_shed={stashed} \
-         merge_refused={merge_refused}",
+         reoffer_armed={} reoffer_exhausted={} reoffer_declined={} oversized={oversized} \
+         stash_shed={stashed} merge_refused={merge_refused}",
         funnel.unlinked,
         funnel.prepare_owner,
         funnel.prepare_cursor,
@@ -2085,6 +2085,7 @@ pub(crate) fn joint_birth_funnel_line(
         funnel.resource.table,
         funnel.reoffer_armed,
         funnel.reoffer_exhausted,
+        funnel.reoffer_declined,
     )
 }
 
@@ -2527,17 +2528,6 @@ impl AttestedSemanticLane {
         }
     }
 
-    /// Re-offer one transiently refused Joint birth for (image,
-    /// file) on the live capture's router. Only the Joint machine
-    /// calls this, for the coordinator's deferred dispositions.
-    /// A shell lane has no capture to re-mint on and refuses, so
-    /// the coordinator's refusal stays final there.
-    pub(crate) fn reoffer_birth_for(&mut self, image: ImageIdentity, file: u32) -> bool {
-        self.live
-            .as_mut()
-            .is_some_and(|live| live.capture.reoffer_birth_for(image, file))
-    }
-
     /// Re-arm the birth retry for every observed file of one voided
     /// image on the live capture's router. Only the Joint machine
     /// calls this, for the coordinator's reseed queue. A shell lane
@@ -2679,6 +2669,13 @@ impl AttestedSemanticLane {
                 .as_ref()
                 .map_or(0, |machine| machine.birth_merge_refused())
         })
+    }
+
+    /// The live capture for birth re-offer execution, when this
+    /// lane runs one (a shell lane stages without a capture and
+    /// re-offers nothing).
+    pub(crate) fn live_capture_mut(&mut self) -> Option<&mut SemanticCapture> {
+        self.live.as_deref_mut().map(|live| &mut live.capture)
     }
 
     /// Lane-stash pending floor for the finalizer's disposition: the

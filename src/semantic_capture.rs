@@ -2250,6 +2250,18 @@ impl SemanticCapture {
         (self.birth_offers_formed, self.birth_cooled_withheld)
     }
 
+    /// Current partition instances for one observed (image, file) key,
+    /// for the re-offer guard (an eviction would orphan exactly these
+    /// instances' feeds). Empty when nothing is observed.
+    pub(crate) fn current_routers_for(
+        &self,
+        image: ImageIdentity,
+        file: u32,
+    ) -> Vec<crate::discovery::instances::InstanceId> {
+        self.router
+            .current_instances(self.router.domain(), image, file)
+    }
+
     /// Diagnostic-only mark funnel for the stop disclosure (counts
     /// only): attempts, duplicate refusals, cap refusals, misses.
     pub(crate) fn admitted_mark_funnel_counts(&self) -> (u64, u64, u64, u64) {

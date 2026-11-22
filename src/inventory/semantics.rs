@@ -2034,6 +2034,44 @@ pub(crate) fn joint_bootstraps_line(
     )
 }
 
+/// One stderr line for the diagnostic seal-stage summary: which
+/// gate refused, waited or passed each seal, plus current staging
+/// gauges. Counts only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the Joint-void summary only when
+/// verbose text is requested, never a contract and never in reports.
+pub(crate) fn joint_seal_stages_line(
+    counts: &crate::semantics_objects::journal::SealStageCounts,
+) -> String {
+    format!(
+        "p11scope: joint seal stages: domain_tainted={} image_tainted={} \
+         drain_mismatch={} domain_ended={} closure_stale={} frontier_regression={} \
+         below_fence={} unbound_staging={} attribution_pending={} claim_unmatched={} \
+         fresh_birth_no_history={} floors_past_frontier={} abandon_return_pending={} \
+         refused_return_pending={} h3_pending={} model_refused={} success={} \
+         open_staged={} refused_staged={} claims_held={}",
+        counts.domain_tainted,
+        counts.image_tainted,
+        counts.drain_mismatch,
+        counts.domain_ended,
+        counts.closure_stale,
+        counts.frontier_regression,
+        counts.below_fence,
+        counts.unbound_staging,
+        counts.attribution_pending,
+        counts.claim_unmatched,
+        counts.fresh_birth_no_history,
+        counts.floors_past_frontier,
+        counts.abandon_return_pending,
+        counts.refused_return_pending,
+        counts.h3_pending,
+        counts.model_refused,
+        counts.success,
+        counts.open_staged,
+        counts.refused_staged,
+        counts.claims_held,
+    )
+}
+
 /// One stderr line for the diagnostic audit-subject summary:
 /// staging marks committed, ingested-quantum audits run, and audit
 /// refusals split by whether a running re-arm had happened yet.

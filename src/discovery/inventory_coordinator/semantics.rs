@@ -2337,6 +2337,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // the full diagnosis runs.
         let carried = self.joint_capture.adapter().joint_void_counts();
         let carried_bootstrap = self.joint_capture.adapter().seal_bootstrap_diagnosis();
+        let carried_stages = self.joint_capture.adapter().seal_stage_diagnosis();
         let carried_reentry = self.joint_capture.adapter().joint_reentry_counts();
         self.joint_capture =
             crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
@@ -2352,6 +2353,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_capture
             .adapter_mut()
             .carry_seal_bootstrap_counts(&carried_bootstrap);
+        self.joint_capture
+            .adapter_mut()
+            .carry_seal_stage_counts(&carried_stages);
         Ok(())
     }
 

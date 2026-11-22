@@ -3382,6 +3382,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_capture.adapter().seal_bootstrap_diagnosis()
     }
 
+    /// Seal-stage telemetry: which gate refused, waited or passed
+    /// each seal, plus staging gauges (seal-stage diagnostics).
+    pub(crate) fn joint_seal_stage_diagnosis(
+        &self,
+    ) -> crate::semantics_objects::journal::SealStageCounts {
+        self.joint_capture.adapter().seal_stage_diagnosis()
+    }
+
     /// Disclose audit voids as counted scope gaps (scope round): one
     /// `joint_void_<subcause>_history_loss` gap per void since the last
     /// drain, like ingest-break voids. Scope-wide (not per process).

@@ -7702,11 +7702,34 @@ fn scan_stopped_before_view(started: Instant, reason: &'static str) -> ScanOutco
 // loop; the privileged overlay cells drive the production IO too.
 pub(crate) trait ScanMemory {
     fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize>;
+
+    /// One admitted positioned read for a replay: `None` when `admit`
+    /// refuses (nothing read), otherwise one attempt. Scripted memories
+    /// read directly; the process memory file reads through the metered
+    /// primitive.
+    fn replay_read_at(
+        &self,
+        bytes: &mut [u8],
+        offset: u64,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<std::io::Result<usize>> {
+        admit().then(|| self.read_memory_at(bytes, offset))
+    }
 }
 
 impl ScanMemory for File {
     fn read_memory_at(&self, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
         std::os::unix::fs::FileExt::read_at(self, bytes, offset)
+    }
+
+    fn replay_read_at(
+        &self,
+        bytes: &mut [u8],
+        offset: u64,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<std::io::Result<usize>> {
+        crate::process::metered_io::pread_once(std::os::fd::AsFd::as_fd(self), bytes, offset, admit)
+            .map(|read| read.map_err(|error| std::io::Error::other(error.to_string())))
     }
 }
 
@@ -11053,6 +11076,10 @@ mod tests {
         /// Models an exec between passes (same pid and start time, new
         /// image): decode cursors must miss across it.
         exe_override: Option<PathBuf>,
+        /// An unmapped `[start, end)` range: a read that crosses its start
+        /// returns the bytes before it and a read that starts inside it
+        /// fails, like `/proc/<pid>/mem` at a hole.
+        hole: Option<(u64, u64)>,
     }
 
     thread_local! {
@@ -11066,6 +11093,7 @@ mod tests {
     struct BracketMemory {
         file: File,
         log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        hole: Option<(u64, u64)>,
     }
 
     impl ScanMemory for BracketMemory {
@@ -11073,7 +11101,14 @@ mod tests {
             self.log
                 .borrow_mut()
                 .push(format!("memory {offset:x} {}", bytes.len()));
-            self.file.read_at(bytes, offset)
+            let readable = match self.hole {
+                Some((start, end)) if (start..end).contains(&offset) => {
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
+                Some((start, _)) if offset < start => bytes.len().min((start - offset) as usize),
+                _ => bytes.len(),
+            };
+            self.file.read_at(&mut bytes[..readable], offset)
         }
     }
 
@@ -11121,6 +11156,7 @@ mod tests {
             Ok(BracketMemory {
                 file: self.mem.try_clone()?,
                 log: self.log.clone(),
+                hole: self.hole,
             })
         }
         fn maps_now(&self) -> Option<u64> {
@@ -11367,6 +11403,7 @@ mod tests {
                 final_generation_spend: 0,
                 mapped: None,
                 exe_override: None,
+                hole: None,
             }
         }
 
@@ -24047,6 +24084,109 @@ int main(int argc, char **argv) {
         assert_eq!(polls, 1, "an interrupted poll is never retried");
     }
 
+    /// A missing namespace link is a routing hint, never a proof: the
+    /// closing check of a live warm view whose namespace stat meets
+    /// `ENOENT` takes only the cold retained-member proof, which needs
+    /// the original leader at Z, so it fails closed. It never re-enters
+    /// the warm leader route (whose namespace lookup and pidfd poll would
+    /// run outside the metered primitives and prove the view current),
+    /// and its only metered call is the failed stat. The positive: a warm
+    /// view whose leader then exits proves current through its retained
+    /// live member.
+    #[test]
+    fn closing_namespace_enoent_takes_only_the_cold_proof() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        use crate::process::metered_io::{NativeOp, syscall_test};
+        use std::sync::atomic::Ordering;
+        let view = ProcessView::open(ProcessViewId(99), std::process::id()).unwrap();
+        for credits in [1u64, 4, 8, 64] {
+            let (mut budget, admitted) = credited_resume_budget(credits);
+            let before = syscall_test::count();
+            syscall_test::fail_nth(NativeOp::Stat, 0, libc::ENOENT);
+            let proof = ProcScanIo::new().final_generation(&view, &mut budget);
+            syscall_test::disarm();
+            let calls = syscall_test::since(before);
+            let debits = admitted.load(Ordering::SeqCst);
+            assert!(
+                proof.is_err(),
+                "credits {credits}: a hidden namespace link on a live leader proves nothing, got {proof:?}"
+            );
+            assert_eq!(
+                calls,
+                vec![NativeOp::Stat],
+                "credits {credits}: the failed stat is the only metered call"
+            );
+            assert!(
+                calls.len() as u64 <= debits,
+                "credits {credits}: {calls:?} for {debits} debits"
+            );
+            assert!(
+                !view.cold_filesystem_observed(),
+                "credits {credits}: a live leader never becomes cold custody"
+            );
+        }
+        // Healthy control on the same view: the warm metered proof.
+        let (mut budget, _) = credited_resume_budget(8);
+        assert_eq!(
+            ProcScanIo::new().final_generation(&view, &mut budget),
+            Ok(())
+        );
+
+        // Positive: the leader exits after the warm view opened.
+        let mut group = ColdLeaderSubject::spawn(1);
+        let warm = ProcessView::open(ProcessViewId(100), group.pid()).unwrap();
+        assert!(!warm.cold_filesystem_observed());
+        group.leave_leader();
+        let mut budget = CaptureWorkBudget::default();
+        assert_eq!(
+            ProcScanIo::new().final_generation(&warm, &mut budget),
+            Ok(()),
+            "a zombie leader with a live member proves current through cold custody"
+        );
+        assert!(warm.cold_filesystem_observed());
+        group.call_three();
+    }
+
+    /// The replay's positioned read on the process memory file is one
+    /// metered `pread` per admitted unit: a refused admission issues no
+    /// call, a healthy read issues one, and an interrupted read is one
+    /// unsuccessful attempt (no retry).
+    #[test]
+    fn replay_read_is_one_metered_pread_per_debit() {
+        use crate::process::metered_io::{NativeOp, syscall_test};
+        let file = File::open("/proc/self/exe").unwrap();
+        let mut bytes = [0u8; 64];
+        let before = syscall_test::count();
+        assert!(file.replay_read_at(&mut bytes, 0, &mut || false).is_none());
+        assert!(
+            syscall_test::since(before).is_empty(),
+            "a refused replay read issues no call"
+        );
+        let mut admitted = 0u64;
+        let before = syscall_test::count();
+        let read = file.replay_read_at(&mut bytes, 0, &mut || {
+            admitted += 1;
+            true
+        });
+        assert!(matches!(read, Some(Ok(64))), "{read:?}");
+        assert_eq!(&bytes[..4], b"\x7fELF");
+        assert_eq!(syscall_test::since(before), vec![NativeOp::Pread]);
+        assert_eq!(admitted, 1);
+        let before = syscall_test::count();
+        syscall_test::fail_nth(NativeOp::Pread, 0, libc::EINTR);
+        let read = file.replay_read_at(&mut bytes, 0, &mut || true);
+        syscall_test::disarm();
+        assert!(
+            matches!(read, Some(Err(_))),
+            "an interrupted read is an error"
+        );
+        assert_eq!(
+            syscall_test::since(before),
+            vec![NativeOp::Pread],
+            "an interrupted read is never retried"
+        );
+    }
+
     /// Every metered entry point, at every credit count and with `EINTR`
     /// or `ENOENT` injected at each native call it issues, issues at most
     /// one native call per debit and never repeats the failed call (no
@@ -24130,6 +24270,23 @@ int main(int argc, char **argv) {
                 "metered_closing_proof",
                 Box::new(|admit| {
                     let _ = view.metered_closing_proof(admit);
+                }),
+            ),
+            (
+                "pread_once",
+                Box::new(|admit| {
+                    let _ = metered_io::pread_once(
+                        std::os::fd::AsFd::as_fd(&file),
+                        &mut [0u8; 64],
+                        0,
+                        admit,
+                    );
+                }),
+            ),
+            (
+                "replay_read_at",
+                Box::new(|admit| {
+                    let _ = file.replay_read_at(&mut [0u8; 64], 0, admit);
                 }),
             ),
         ];
@@ -24327,9 +24484,10 @@ int main(int argc, char **argv) {
     /// The admitted native calls the metered primitives issue, each
     /// through the one counting shim (`native`), one per unit. The
     /// prepaid close (`NativeOp::Close`) is bought by its open.
-    const METERED_OPERATIONS: [&str; 8] = [
+    const METERED_OPERATIONS: [&str; 9] = [
         "native(NativeOp::Open,",
         "native(NativeOp::Read,",
+        "native(NativeOp::Pread,",
         "native(NativeOp::Readlink,",
         "native(NativeOp::Poll,",
         "native(NativeOp::Fstat,",
@@ -24341,9 +24499,10 @@ int main(int argc, char **argv) {
     /// The kernel entry points the primitives may reach, only inside a
     /// `native(..)` call: std's wrappers retry (`File::open` loops on
     /// `EINTR`, `read_link` grows its buffer) and so never appear.
-    const NATIVE_SYSCALLS: [&str; 9] = [
+    const NATIVE_SYSCALLS: [&str; 10] = [
         "libc::open(",
         "libc::read(",
+        "libc::pread(",
         "libc::close(",
         "libc::readlink(",
         "libc::poll(",
@@ -24639,6 +24798,7 @@ int main(int argc, char **argv) {
                     "metered_start_time",
                     "metered_pid_generation",
                     "metered_closing_proof",
+                    "cold_closing_proof",
                 ],
             ),
             (
@@ -24742,6 +24902,17 @@ int main(int argc, char **argv) {
                             .into(),
                     );
                 }
+                // One closing path: the metered warm proof, then only the
+                // cold retained-member proof, never the generic route
+                // that may fall back to the warm leader.
+                if body.contains("with_filesystem")
+                    || body.matches("cold_closing_proof(").count() != 2
+                {
+                    violations.push(
+                        "ProcScanIo::final_generation: a cold arm takes only cold_closing_proof"
+                            .into(),
+                    );
+                }
                 proof_free("ProcScanIo::final_generation", body, &mut violations);
             }
             None => violations.push("ProcScanIo::final_generation missing".into()),
@@ -24761,16 +24932,57 @@ int main(int argc, char **argv) {
         match bodies_named(&scan_code, "reread_table_extent") {
             Some(body) => {
                 raw_free("reread_table_extent", body, &mut violations);
+                let read = body.find("replay_read_at(");
                 let stop = body.find("budget.stopped_now()");
                 let spend = body.find("budget.spend(1)");
-                let read = body.find("read_memory_at(");
-                if !(stop < spend && spend < read && stop.is_some()) {
-                    violations
-                        .push("reread_table_extent: stop poll, one charge, then the read".into());
+                if !(read.is_some() && read < stop && stop < spend)
+                    || body.matches("replay_read_at(").count() != 1
+                    || body.matches("budget.spend(").count() != 1
+                    || body.contains("read_memory_at(")
+                {
+                    violations.push(
+                        "reread_table_extent: one metered replay read admitted by a stop poll and one charge"
+                            .into(),
+                    );
                 }
                 walked += 1;
             }
             None => violations.push("reread_table_extent missing".into()),
+        }
+        // The cold closing proof requires cold custody: the original
+        // leader at Z and its live members, never the warm leader route.
+        match production_code("process.rs")
+            .as_deref()
+            .and_then(|code| bodies_named(code, "cold_closing_proof").map(str::to_owned))
+        {
+            Some(body) => {
+                let compact: String = body.split_whitespace().collect();
+                if !compact.contains("ViewFilesystem::open_for_view(&self.pin,true,")
+                    || compact.contains("with_filesystem")
+                    || compact.contains("self.filesystem(")
+                {
+                    violations.push(
+                        "ProcessView::cold_closing_proof: opens only cold custody (require_cold)"
+                            .into(),
+                    );
+                }
+            }
+            None => violations.push("ProcessView::cold_closing_proof missing".into()),
+        }
+        // The production replay read is the one metered pread.
+        match scan_code
+            .find("impl ScanMemory for File")
+            .map(|at| &scan_code[at..])
+            .and_then(|code| bodies_named(code, "replay_read_at"))
+        {
+            Some(body)
+                if body.matches("pread_once(").count() == 1
+                    && !body.contains("read_at(")
+                    && !body.contains("read_memory_at")
+                    && !body.contains("FileExt") => {}
+            Some(_) => violations
+                .push("ScanMemory for File::replay_read_at: exactly one metered pread".into()),
+            None => violations.push("ScanMemory for File::replay_read_at missing".into()),
         }
 
         // 4. The capped member selection charges each stat read.
@@ -26154,6 +26366,7 @@ int main(int argc, char **argv) {
         let memory = BracketMemory {
             file: mem,
             log: Default::default(),
+            hole: None,
         };
         let limits = || inventory_limits(1 << 20, 1 << 20, 4096, 32768, 4096, 1);
         // Armed: the refusal breaks the sweep at the refused word, so the

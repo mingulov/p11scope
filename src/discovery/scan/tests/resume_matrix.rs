@@ -758,11 +758,16 @@ fn stopped_closing_bracket_probes_its_generation_at_most_once() {
 /// the closing bracket, which stages one unvalidated, unfinished cursor.
 /// Returns the fixture (reset for its next pass) and the carried facts.
 fn c2_staged_cursor() -> (BracketFixture, RetainedFileFacts) {
-    let mut probe = BracketFixture::new(8, true);
+    c2_staged_cursor_with(|| BracketFixture::new(8, true))
+}
+
+/// [`c2_staged_cursor`] on the fixture `make` builds.
+fn c2_staged_cursor_with(make: fn() -> BracketFixture) -> (BracketFixture, RetainedFileFacts) {
+    let mut probe = make();
     let (outcome, _) = armed_scan_pass(&mut probe, ROOMY_LIMITS, RetainedFileFacts::default());
     outcome.expect("calibration");
     let (_, swept_work) = probe.before_b.expect("calibration reaches maps B");
-    let mut fixture = BracketFixture::new(8, true);
+    let mut fixture = make();
     let mut budget =
         CaptureWorkBudget::new(ROOMY_LIMITS).with_retained_file_facts(RetainedFileFacts::default());
     budget.set_work_ceiling_for_test(swept_work);
@@ -858,7 +863,12 @@ fn refused_replay_read_keeps_the_carried_cursor() {
 /// A roomy first pass on a fresh fixture: one complete, validated
 /// cursor. Returns the fixture (reset for its next pass) and the facts.
 fn roomy_complete_cursor() -> (BracketFixture, RetainedFileFacts) {
-    let mut fixture = BracketFixture::new(8, true);
+    roomy_complete_cursor_with(|| BracketFixture::new(8, true))
+}
+
+/// [`roomy_complete_cursor`] on the fixture `make` builds.
+fn roomy_complete_cursor_with(make: fn() -> BracketFixture) -> (BracketFixture, RetainedFileFacts) {
+    let mut fixture = make();
     let (outcome, carried) =
         armed_scan_pass(&mut fixture, ROOMY_LIMITS, RetainedFileFacts::default());
     outcome.expect("roomy pass");
@@ -920,5 +930,184 @@ fn inconclusive_replay_reads_keep_the_carried_cursor() {
                 "complete {complete}, {fault}: the carried cursor keeps its row"
             );
         }
+    }
+}
+
+/// Where [`v32_prefix_fixture`] puts its table: the 68-slot legacy
+/// prefix (header word plus 68 pointers) ends at the data mapping end.
+const V32_TABLE: u64 = 0x6000 - 69 * 8;
+
+/// The bracket fixture with its table replaced by a 3.2-labelled one
+/// at the end of the readable data mapping: the legacy prefix is
+/// readable and the declared 3.2 extension falls into unmapped memory.
+fn v32_prefix_fixture() -> BracketFixture {
+    use std::os::unix::fs::FileExt as _;
+    let mut fixture = BracketFixture::new(8, true);
+    fixture.mem.write_all_at(&[0u8; 69 * 8], 0x4800).unwrap();
+    let mut table = vec![0u8; 69 * 8];
+    table[..2].copy_from_slice(&[3, 2]);
+    for slot in 0..68 {
+        let pointer: u64 = match slot {
+            0 => 0x1100,
+            1 => 0,
+            _ => 0x9100,
+        };
+        table[(slot + 1) * 8..(slot + 2) * 8].copy_from_slice(&pointer.to_le_bytes());
+    }
+    fixture.mem.write_all_at(&table, V32_TABLE).unwrap();
+    fixture
+        .mem
+        .write_all_at(&V32_TABLE.to_le_bytes(), 0x7100 + 8)
+        .unwrap();
+    fixture.hole = Some((0x6000, 0x7000));
+    fixture
+}
+
+/// The cached 3.2 row a staged or completed cursor carries.
+fn v32_cached_row(carried: &RetainedFileFacts) -> (DecodeCursorKey, ScannedTable) {
+    let cursors = carried.decode_cursors_for_test();
+    assert_eq!(cursors.len(), 1, "one carried cursor");
+    let (key, cursor) = cursors[0].clone();
+    let row = cursor
+        .cached_tables
+        .iter()
+        .find(|table| table.address == V32_TABLE)
+        .cloned()
+        .expect("the cursor carries the 3.2 row");
+    assert_eq!(
+        (row.version, row.walk, row.decoded_slot_count()),
+        ((3, 2), "known_prefix", 68),
+        "the fresh decode keeps the readable legacy prefix"
+    );
+    (key, row)
+}
+
+/// A 3.2-labelled table whose 68-slot legacy prefix is readable and
+/// whose declared extension is unmapped replays its proven prefix on
+/// every pass: the replay reads the declared extent, meets the hole,
+/// re-proves the complete prefix and publishes it as `known_prefix`
+/// (the extension stays an unproven gap), with the cursor kept, on the
+/// unvalidated (C2 staging) and the validated-complete replay alike.
+/// It matches a fresh roomy decode of the same memory. Controls: a
+/// changed prefix slot rescans to the fresh truth, and a hole inside
+/// the prefix (a short read below the proven span) keeps the cursor
+/// and names the object as waiting.
+#[test]
+fn readable_v32_prefix_with_unmapped_extension_replays_the_prefix() {
+    use std::os::unix::fs::FileExt as _;
+    let fresh = {
+        let mut fixture = v32_prefix_fixture();
+        let (outcome, _) =
+            armed_scan_pass(&mut fixture, ROOMY_LIMITS, RetainedFileFacts::default());
+        outcome.expect("fresh roomy pass")
+    };
+    for complete in [false, true] {
+        let staged = || {
+            if complete {
+                roomy_complete_cursor_with(v32_prefix_fixture)
+            } else {
+                c2_staged_cursor_with(v32_prefix_fixture)
+            }
+        };
+
+        // Unchanged memory: the prefix replays.
+        let (mut fixture, carried) = staged();
+        let (key, row) = v32_cached_row(&carried);
+        let (outcome, after) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+        let outcome = outcome.expect("resume pass");
+        let replayed = fixture.log.borrow().iter().any(|event| {
+            event
+                .strip_prefix(&format!("memory {V32_TABLE:x} "))
+                .and_then(|len| len.parse::<usize>().ok())
+                .is_some_and(|len| len > 69 * 8)
+        });
+        assert!(
+            replayed,
+            "complete {complete}: the replay reads the declared extent: {:?}",
+            fixture.log.borrow()
+        );
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.reason != REPLAY_UNPROVEN_REASON),
+            "complete {complete}: a readable prefix is never skipped: {:?}",
+            outcome.skipped()
+        );
+        let module = only_module(&outcome, "replayed prefix").unwrap();
+        let published = module
+            .tables
+            .iter()
+            .find(|table| table.address == V32_TABLE)
+            .unwrap_or_else(|| panic!("complete {complete}: the proven prefix is published"));
+        assert_eq!(
+            (
+                published.version,
+                published.walk,
+                published.decoded_slot_count()
+            ),
+            ((3, 2), "known_prefix", 68),
+            "complete {complete}: the prefix publishes with the extension gap named"
+        );
+        assert_eq!(published.entries, row.entries);
+        require_equivalent(&outcome, &fresh)
+            .unwrap_or_else(|error| panic!("complete {complete}: {error}"));
+        let kept = after
+            .decode_cursors_for_test()
+            .into_iter()
+            .find(|(held, _)| *held == key)
+            .unwrap_or_else(|| panic!("complete {complete}: the cursor is kept"));
+        assert!(
+            kept.1.complete
+                && kept
+                    .1
+                    .cached_tables
+                    .iter()
+                    .any(|table| table.address == V32_TABLE),
+            "complete {complete}: the cursor completes with its row"
+        );
+
+        // Control: a changed prefix slot rescans to the fresh truth.
+        let (mut fixture, carried) = staged();
+        let (_, row) = v32_cached_row(&carried);
+        fixture
+            .mem
+            .write_all_at(&0x1100u64.to_le_bytes(), V32_TABLE + 3 * 8)
+            .unwrap();
+        let (outcome, _) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+        let outcome = outcome.expect("changed-prefix pass");
+        let module = only_module(&outcome, "changed prefix").unwrap();
+        let published = module
+            .tables
+            .iter()
+            .find(|table| table.address == V32_TABLE)
+            .unwrap_or_else(|| panic!("complete {complete}: the changed prefix rescans"));
+        assert_eq!(published.walk, "known_prefix");
+        assert_ne!(
+            published.entries, row.entries,
+            "complete {complete}: the changed slot is the fresh truth"
+        );
+
+        // Control: a hole inside the prefix checks no complete span.
+        let (mut fixture, carried) = staged();
+        let (key, _) = v32_cached_row(&carried);
+        fixture.hole = Some((V32_TABLE + 100, 0x7000));
+        let (outcome, after) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+        let outcome = outcome.expect("short-prefix pass");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason == REPLAY_UNPROVEN_REASON),
+            "complete {complete}: a short read inside the prefix waits, named: {:?}",
+            outcome.skipped()
+        );
+        assert!(
+            after
+                .decode_cursors_for_test()
+                .iter()
+                .any(|(held, _)| *held == key),
+            "complete {complete}: a short read inside the prefix keeps the cursor"
+        );
     }
 }

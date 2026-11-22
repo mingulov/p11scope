@@ -76,6 +76,7 @@ pub(crate) type Native<T> = Result<T, Unproven>;
 pub(crate) enum NativeOp {
     Open,
     Read,
+    Pread,
     Close,
     Readlink,
     Poll,
@@ -399,6 +400,31 @@ pub(crate) fn fstat(fd: RawFd, admit: &mut dyn FnMut() -> bool) -> Option<Native
         Ok(_) => Ok(unsafe { stat.assume_init() }),
         Err(error) => Err(Unproven(error)),
     })
+}
+
+/// One positioned `pread(2)` of a held descriptor at `offset`: one
+/// unit, one attempt (an interrupted or short read is not retried).
+pub(crate) fn pread_once(
+    fd: BorrowedFd<'_>,
+    buf: &mut [u8],
+    offset: u64,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Native<usize>> {
+    let Ok(offset) = libc::off_t::try_from(offset) else {
+        return Some(Err(Unproven::invalid(
+            "positioned read offset out of range",
+        )));
+    };
+    if !admit() {
+        return None;
+    }
+    let fd = fd.as_raw_fd();
+    // SAFETY: `fd` is a held open descriptor and `buf` is writable for
+    // its length.
+    let read = native(NativeOp::Pread, || unsafe {
+        libc::pread(fd, buf.as_mut_ptr().cast(), buf.len(), offset) as i64
+    });
+    Some(read.map(|count| count as usize).map_err(Unproven))
 }
 
 /// One `fstatfs(2)` of a held descriptor: one unit.

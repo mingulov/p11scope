@@ -55020,6 +55020,11 @@ fn maps_sweep_refusal_does_not_retire_a_retained_generation() {
 fn batch_tail_skip_republishes_byte_identical_facts() {
     let mut fixture = DiscoveryLifecycleFixture::start();
     let mut engine = fixture.discover_before_load();
+    // The refreshes below must be idle after the first one: an unbounded
+    // tick quantum keeps a loaded host from deferring the first rescan
+    // to a later "idle" refresh (which then corroborates and changes the
+    // facts).
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let generation = engine.views[0].id();
     fixture.load();
     engine.request_refresh(fixture.child.pid(), None);

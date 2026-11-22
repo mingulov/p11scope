@@ -29351,7 +29351,11 @@ int main(int argc, char **argv) {
         );
         // Twin: an ordinary filesystem proves the join and completes.
         let (outcome, carried) = run(true, 0xef53);
-        assert!(outcome.modules()[0].tables_scan_finished, "{:?}", outcome.skipped());
+        assert!(
+            outcome.modules()[0].tables_scan_finished,
+            "{:?}",
+            outcome.skipped()
+        );
         assert_eq!(carried.cursor_counts(), (1, 0));
     }
 

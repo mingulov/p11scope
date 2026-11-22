@@ -213,14 +213,14 @@ fn task_from_stat(stat: &str) -> Result<Task, String> {
         .rfind(')')
         .ok_or("cold process task stat is malformed")?;
     Ok(Task {
-        birth: start_time_from_stat(&stat).map_err(|error| error.to_string())?,
+        birth: start_time_from_stat(stat).map_err(|error| error.to_string())?,
         state: stat[end + 1..]
             .split_whitespace()
             .next()
             .and_then(|word| word.as_bytes().first())
             .copied()
             .ok_or("cold process task state is unavailable")?,
-        flags: stat_flags_from_stat_text(&stat).ok_or("cold process task flags are unavailable")?,
+        flags: stat_flags_from_stat_text(stat).ok_or("cold process task flags are unavailable")?,
     })
 }
 

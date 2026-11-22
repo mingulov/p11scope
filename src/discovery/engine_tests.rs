@@ -28,8 +28,10 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScanOutcome, ScannedEntry,
-    ScannedTable, WORK_CEILING_REASON, order_tables_by_evidence,
+    CollectionWork, DETAILED_CAPTURE_IO_BYTES, IO_CEILING_REASON, InventoryDiscoveryLimits,
+    InventoryRetainedLimits, InventoryWindowLimits, ObjectExports, SCAN_DEADLINE_REASON,
+    ScanLimits, ScanOutcome, ScannedEntry, ScannedTable, WORK_CEILING_REASON,
+    order_tables_by_evidence,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
@@ -43,7 +45,7 @@ use p11scope_manifest::manifest::{
     Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification, SurfaceRecord,
     SurfaceSource, Version, WalkOutcome,
 };
-use p11scope_manifest::maps::parse_maps;
+use p11scope_manifest::maps::{ObjectKey, parse_maps};
 use std::cell::Cell;
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -36940,6 +36942,296 @@ fn a_finished_scan_keeps_a_mapped_getter_site() {
     assert_eq!(unsafe { libc::munmap(mapping, fixture.length) }, 0);
     let object = engine.modules[0].object;
     assert_eq!(sites, vec![(object, 0x80, "C_GetFunctionList".to_string())]);
+}
+
+/// Pads the owned fixture file to a page multiple before any scan or
+/// manifest pins it, so the guard mapping's whole span is file-backed
+/// and every prefaulted byte reads from the file (no beyond-EOF tail).
+fn page_align_fixture_file(fixture: &ScanManifestFixture) -> usize {
+    let padded = fixture.length.div_ceil(4096) * 4096;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&fixture.path)
+        .unwrap()
+        .set_len(padded as u64)
+        .unwrap();
+    padded
+}
+
+/// The readable non-executable file-backed span of `object` in this
+/// process's maps, selected with the pre-fault's own predicate.
+fn prefault_expected_span(engine: &Engine, object: PinnedObjectId) -> u64 {
+    let maps = parse_maps(&std::fs::read("/proc/self/maps").unwrap()).unwrap();
+    maps.iter()
+        .filter(|mapping| {
+            mapping.permissions[0] == b'r'
+                && mapping.permissions[2] != b'x'
+                && mapping.inode != 0
+                && mapping.end > mapping.start
+        })
+        .filter(|mapping| {
+            let key = ObjectKey::of(mapping);
+            engine
+                .pinned
+                .object_matches_key(object, key.device.major, key.device.minor, key.inode)
+        })
+        .map(|mapping| mapping.end - mapping.start)
+        .sum()
+}
+
+/// The pre-fault reads the sites' readable file-backed data ranges and
+/// files no gap; an executable mapping of the same object adds no reads
+/// (twin: executable ranges are skipped, and a repeat faults the same
+/// bytes).
+#[test]
+fn prefault_manifest_getter_data_reads_the_sites_data_ranges_not_code() {
+    use std::os::fd::AsRawFd as _;
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    let span = prefault_expected_span(&engine, object);
+    assert!(span > 0, "the fixture owns readable file-backed data");
+    let skips = engine.counters.object_skips.len();
+    // The maps snapshot is charged too; only its size plus jitter rides
+    // above the data span.
+    let maps_bytes = std::fs::read("/proc/self/maps").unwrap().len() as u64;
+    let before = engine.budget.attempted_io_bytes();
+    engine.prefault_manifest_getter_data(id, &sites);
+    let data = engine.budget.attempted_io_bytes() - before;
+    assert!(
+        data > maps_bytes,
+        "the pre-fault reads data beyond the maps snapshot: {data} <= {maps_bytes} (span {span})"
+    );
+    assert!(
+        data <= maps_bytes + span + 65536,
+        "the pre-fault reads only the sites' span: {data} > {maps_bytes} + {span} + jitter"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "a healthy pre-fault files no gap"
+    );
+    // SAFETY: a private read-execute mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            padded,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE,
+            fixture.file.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let before = engine.budget.attempted_io_bytes();
+    engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(mapping, padded) }, 0);
+    let repeat = engine.budget.attempted_io_bytes() - before;
+    assert!(
+        repeat.abs_diff(data) < 4096,
+        "an executable mapping adds no reads: first {data}, repeat {repeat}"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "the repeat files no gap either"
+    );
+}
+
+/// The pre-fault's bytes debit the window, never collection work: with
+/// a counting collection hook, faulting megabytes converts to nearly no
+/// hook units (twin: `record_io` would convert every 32 bytes to a unit).
+#[test]
+fn prefault_manifest_getter_data_charges_the_window_not_collection_work() {
+    use std::os::fd::AsRawFd as _;
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // One file, many mappings: every one matches the pinned object, so
+    // the pre-fault walks megabytes and any per-byte work conversion
+    // dwarfs the maps-read noise.
+    // SAFETY: private read-only mappings of the held fixture file,
+    // unmapped below before the fixture drops.
+    let mut mappings = Vec::new();
+    for _ in 0..128 {
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                padded,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                fixture.file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        mappings.push(mapping);
+    }
+    let charged = std::sync::Arc::new(std::sync::Mutex::new(0u64));
+    let counted = std::sync::Arc::clone(&charged);
+    engine
+        .budget
+        .set_collection_work(CollectionWork::new(move |units| {
+            *counted.lock().unwrap() += units;
+            true
+        }));
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    let hook_before = *charged.lock().unwrap();
+    engine.prefault_manifest_getter_data(id, &sites);
+    for mapping in mappings {
+        // SAFETY: each successful mapping above, released once.
+        assert_eq!(unsafe { libc::munmap(mapping, padded) }, 0);
+    }
+    let read = engine.budget.attempted_io_bytes() - before;
+    let hook = *charged.lock().unwrap() - hook_before;
+    assert!(
+        read > 1024 * 1024,
+        "the pre-fault walks megabytes: only {read} bytes"
+    );
+    assert!(
+        hook < read / 64,
+        "data bytes must debit the window, never convert to collection work: \
+         {hook} hook units for {read} bytes"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "a healthy pre-fault files no gap"
+    );
+}
+
+/// Unusable inputs are silent: empty sites and an unknown view read
+/// nothing at all, and sites naming no mapped object read at most the
+/// maps snapshot (twin: a matching bug would fault megabytes of foreign
+/// mappings). Nothing files a gap.
+#[test]
+fn prefault_manifest_getter_data_is_silent_on_unusable_inputs() {
+    let fixture = ScanManifestFixture::new();
+    page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    engine.prefault_manifest_getter_data(id, &[]);
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        before,
+        "empty sites read nothing"
+    );
+    engine.prefault_manifest_getter_data(ProcessViewId(u32::MAX), &sites);
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        before,
+        "an unknown view reads nothing"
+    );
+    let foreign = vec![(
+        PinnedObjectId(u32::MAX),
+        0x80,
+        "C_GetFunctionList".to_string(),
+    )];
+    engine.prefault_manifest_getter_data(id, &foreign);
+    assert!(
+        engine.budget.attempted_io_bytes() - before < 262_144,
+        "an unmatched object reads at most the maps snapshot"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "unusable inputs file no gap"
+    );
+}
+
+/// A spent budget, an expired deadline, and an Inventory policy with no
+/// active scan all refuse before a byte is read, silently: the pre-fault
+/// never files a gap for its own refusal.
+#[test]
+fn prefault_manifest_getter_data_is_silent_on_a_spent_budget_an_expired_deadline_and_a_scanless_inventory()
+ {
+    let fixture = ScanManifestFixture::new();
+    page_align_fixture_file(&fixture);
+    let fresh = || {
+        let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+        let id = view.id();
+        let engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+        (engine, id)
+    };
+    let sites_for = |engine: &Engine| {
+        vec![(
+            engine.modules[0].object,
+            0x80,
+            "C_GetFunctionList".to_string(),
+        )]
+    };
+    let (mut engine, id) = fresh();
+    engine
+        .budget
+        .record_window_io(DETAILED_CAPTURE_IO_BYTES as usize);
+    let sites = sites_for(&engine);
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        before,
+        "a spent budget reads nothing"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "a spent budget files no gap"
+    );
+    let (mut engine, id) = fresh();
+    engine.budget.set_deadline(Some(0));
+    let sites = sites_for(&engine);
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        before,
+        "an expired deadline reads nothing"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "an expired deadline files no gap"
+    );
+    let (mut engine, id) = fresh();
+    let limits = InventoryDiscoveryLimits::new(
+        1024 * 1024,
+        InventoryWindowLimits::new(8 << 20, 1 << 20, 4096, 32768, 4096).unwrap(),
+        InventoryRetainedLimits::new(1024, 1024, 256, 256, 256, 1 << 20).unwrap(),
+    )
+    .unwrap();
+    engine.budget = CaptureWorkBudget::for_inventory(limits);
+    let sites = sites_for(&engine);
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        before,
+        "an Inventory policy with no active scan reads nothing"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips,
+        "a scanless Inventory files no gap"
+    );
 }
 
 /// The C_GetInterface export fact belongs to the getter's own object: a

@@ -87672,6 +87672,83 @@ fn learned_pin_failure_retries_before_filing() {
     );
 }
 
+/// A file-changed learned pin recovers on the same unexhausted
+/// production budget across the pass boundary: the retry re-proves
+/// through the production pin path with the capture budget the
+/// `profile --system` lifecycle owns (never replaced, never renewed —
+/// DetailedLegacy has no renewable window), and recovery needs no
+/// fresh credit: the allowance stays far from either ceiling with no
+/// sticky stop throughout.
+#[test]
+fn learned_pin_retry_recovers_without_a_fresh_budget() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    // The production lifecycle: the default DetailedLegacy allowance,
+    // the same object the retry below reuses.
+    assert_eq!(
+        engine.budget.policy(),
+        crate::discovery::scan::DiscoveryPolicy::DetailedLegacy
+    );
+    let limits = engine.budget.limits();
+    let work_ceiling = engine.budget.work_ceiling();
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_learned_files();
+    assert!(
+        !engine.pending_learned.is_empty(),
+        "the race requeues the candidate"
+    );
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the retry stages on the same budget"
+    );
+    // No fresh budget was dealt across the pass boundary: the same
+    // allowance, still unexhausted, with no sticky stop.
+    assert_eq!(
+        engine.budget.policy(),
+        crate::discovery::scan::DiscoveryPolicy::DetailedLegacy
+    );
+    assert_eq!(engine.budget.limits(), limits);
+    assert_eq!(engine.budget.work_ceiling(), work_ceiling);
+    assert!(
+        engine.budget.attempted_io_bytes() < limits.total_bytes,
+        "attempted I/O stays below the capture total"
+    );
+    assert!(
+        engine.budget.remaining_window_io().unwrap() > 0,
+        "the capture window still admits reads"
+    );
+    assert!(
+        engine.budget.work_units_count() < work_ceiling,
+        "work stays below the capture ceiling"
+    );
+    assert!(
+        engine.budget.stopped_reason().is_none(),
+        "no sticky stop latched"
+    );
+}
+
 /// A learned pin that keeps hitting the file-changed race files after
 /// a bounded number of retries instead of requeueing forever: a
 /// persistent failure is a real loss and must be disclosed, never

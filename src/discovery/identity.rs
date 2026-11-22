@@ -32,7 +32,7 @@ use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
 use super::handle_table::{AcquireOutcome, DeferredReason, Filing, HandleTable, Held, TableHandle};
 use crate::discovery::scan::{
     CaptureWorkBudget, IO_CEILING_REASON, InspectedFileKey, ScannedEntry, ScannedModule, Skipped,
-    read_maps_or_refuse, read_mountinfo, standard_function_names,
+    WORK_CEILING_REASON, read_maps_or_refuse, read_mountinfo, standard_function_names,
 };
 use crate::manifest_input::{MAX_OBJECTS, MAX_TOTAL_OBJECT_BYTES, validate_structure};
 use crate::process::{
@@ -164,6 +164,71 @@ pub(crate) mod prearm_pin_test {
     pub(crate) fn take_injected_file_change() -> bool {
         INJECT_CHANGE_ONCE.with(|flag| flag.replace(false))
     }
+}
+
+/// Prefix of every prearm-worker refusal reason
+/// (`prearm object unavailable: <detail>`).
+pub(crate) const PREARM_UNAVAILABLE_PREFIX: &str = "prearm object unavailable:";
+
+/// Whether a skip reason is a prearm-worker refusal: the family
+/// [`learned_pin_stage`] classifies and the learned staging reports on
+/// the operator channel. The bare public label (no detail) is not one.
+pub(crate) fn is_prearm_unavailable_reason(reason: &str) -> bool {
+    reason.starts_with(PREARM_UNAVAILABLE_PREFIX)
+}
+
+/// Finite pipeline stage of one learned-pin prearm refusal, for the
+/// operator channel. The public skip folds every
+/// `prearm object unavailable: <detail>` into one label; this maps the
+/// detail back to the stage that refused it, so a host-cell
+/// `$cell.stderr` names the cause class the folded skip hides. Unknown
+/// details map to `other` with their full text preserved at the call
+/// site — new causes stay visible, never silent. Batch deadline and
+/// clock stops have no arm: learned staging runs outside the discovery
+/// batches that install a deadline, so they cannot fire here; if that
+/// ever changes they surface as `other` with their full text.
+pub(crate) fn learned_pin_stage(reason: &str) -> &'static str {
+    let detail = reason
+        .strip_prefix(PREARM_UNAVAILABLE_PREFIX)
+        .map_or(reason, str::trim_start);
+    // Allowance refusals first: they arrive wrapped in the mountinfo
+    // and identify legs, and they are permanent under DetailedLegacy
+    // (the capture budget never renews).
+    if detail.contains(WORK_CEILING_REASON)
+        || detail.contains(IO_CEILING_REASON)
+        || detail.contains("total more than the")
+    {
+        return "budget";
+    }
+    if detail.starts_with("file changed while it was being identified") {
+        return "bracket";
+    }
+    if detail.starts_with("cannot identify the file now") {
+        return "identify";
+    }
+    if detail.starts_with("mapping identity unavailable") {
+        return "identity";
+    }
+    if detail.starts_with("object path cannot be normalized") {
+        return "normalize";
+    }
+    if detail.contains("mount table") {
+        return "mountinfo";
+    }
+    if detail.starts_with("the pre-arm file locator no longer resolves")
+        || detail.starts_with("no exact retained process view exists")
+        || detail.contains("manifest locators must use canonical")
+        || detail.starts_with("fstat failed")
+        || detail.contains("cannot inspect the file locator now")
+        || detail.contains("cannot open the file now")
+        || detail == "--prearm-module paths must be absolute"
+    {
+        return "open";
+    }
+    if detail.starts_with("fstatfs failed while classifying overlayfs") {
+        return "prove";
+    }
+    "other"
 }
 
 pub(crate) fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
@@ -12080,6 +12145,82 @@ mod tests {
         Version, WalkOutcome,
     };
     use std::cell::RefCell;
+
+    /// Every production prearm detail maps to its finite pipeline
+    /// stage; unknown details stay visible under `other` with their
+    /// full text preserved at the call site.
+    #[test]
+    fn learned_pin_stage_names_every_production_detail() {
+        let io_ceiling = crate::discovery::scan::IO_CEILING_REASON;
+        let work_ceiling = crate::discovery::scan::WORK_CEILING_REASON;
+        let mountinfo_ceiling = crate::discovery::scan::MOUNTINFO_CEILING_REASON;
+        let cases = [
+            (
+                "file changed while it was being identified - retry",
+                "bracket",
+            ),
+            ("cannot identify the file now (unexpected EOF)", "identify"),
+            (
+                "cannot identify the file now (manifest and pre-arm objects total more than the 512-byte limit)",
+                "budget",
+            ),
+            (
+                "mapping identity unavailable: mount 42 has no row",
+                "identity",
+            ),
+            ("object path cannot be normalized", "normalize"),
+            ("the pre-arm file locator no longer resolves", "open"),
+            ("no exact retained process view exists for pid 7", "open"),
+            (
+                "/proc/self/fd/9: cannot open the file now (os error 9)",
+                "open",
+            ),
+            (
+                "/proc/1/root/lib: proc-root manifest locators must use canonical /proc/<pid>/root/<path> spelling",
+                "open",
+            ),
+            ("--prearm-module paths must be absolute", "open"),
+            ("fstat failed: os error 9", "open"),
+            ("cannot open observer mount table: os error 24", "mountinfo"),
+            ("cannot read mount table: os error 5", "mountinfo"),
+            ("mount table is not valid UTF-8: bad byte", "mountinfo"),
+            (mountinfo_ceiling, "mountinfo"),
+            ("the target mount table is unreadable: gone", "mountinfo"),
+            (io_ceiling, "budget"),
+            (work_ceiling, "budget"),
+            (
+                "manifest and pre-arm objects total more than the 512-object limit",
+                "budget",
+            ),
+            (
+                "fstatfs failed while classifying overlayfs: os error 9",
+                "prove",
+            ),
+            ("some future refusal nobody mapped yet", "other"),
+        ];
+        assert_eq!(cases.len(), 21);
+        for (detail, stage) in cases {
+            assert_eq!(
+                super::learned_pin_stage(&format!("prearm object unavailable: {detail}")),
+                stage,
+                "detail: {detail}"
+            );
+        }
+        // Unprefixed input maps by the same vocabulary (defensive: the
+        // call sites only pass prearm-prefixed reasons).
+        assert_eq!(
+            super::learned_pin_stage("file changed while it was being identified - retry"),
+            "bracket"
+        );
+        // The family gate: the internal refusal shape passes, the bare
+        // public label does not.
+        assert!(super::is_prearm_unavailable_reason(
+            "prearm object unavailable: file changed while it was being identified - retry"
+        ));
+        assert!(!super::is_prearm_unavailable_reason(
+            "prearm object unavailable"
+        ));
+    }
 
     #[test]
     fn drop_view_claims_keeps_pins_resolvable_without_claims() {

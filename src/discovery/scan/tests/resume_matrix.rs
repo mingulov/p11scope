@@ -753,3 +753,104 @@ fn stopped_closing_bracket_probes_its_generation_at_most_once() {
         );
     }
 }
+
+/// A C2 first pass on a fresh fixture: the work ceiling dies exactly at
+/// the closing bracket, which stages one unvalidated, unfinished cursor.
+/// Returns the fixture (reset for its next pass) and the carried facts.
+fn c2_staged_cursor() -> (BracketFixture, RetainedFileFacts) {
+    let mut probe = BracketFixture::new(8, true);
+    let (outcome, _) = armed_scan_pass(&mut probe, ROOMY_LIMITS, RetainedFileFacts::default());
+    outcome.expect("calibration");
+    let (_, swept_work) = probe.before_b.expect("calibration reaches maps B");
+    let mut fixture = BracketFixture::new(8, true);
+    let mut budget =
+        CaptureWorkBudget::new(ROOMY_LIMITS).with_retained_file_facts(RetainedFileFacts::default());
+    budget.set_work_ceiling_for_test(swept_work);
+    fixture.run(&mut budget).expect("pass 1");
+    let carried = budget.take_retained_file_facts();
+    assert_eq!(
+        carried.decode_cursors_for_test().len(),
+        1,
+        "C2 stages one cursor"
+    );
+    fixture.maps_reads = 0;
+    fixture.log.borrow_mut().clear();
+    (fixture, carried)
+}
+
+/// A roomy budget carrying `carried`, whose shared collection work
+/// admits exactly `credits` units.
+fn credited_roomy_budget(
+    carried: RetainedFileFacts,
+    credits: u64,
+) -> (
+    CaptureWorkBudget,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let spent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = spent.clone();
+    let mut budget = CaptureWorkBudget::new(ROOMY_LIMITS).with_retained_file_facts(carried);
+    budget.set_collection_work(CollectionWork::new(move |units| {
+        use std::sync::atomic::Ordering;
+        let used = counted.load(Ordering::SeqCst);
+        if used.saturating_add(units) > credits {
+            return false;
+        }
+        counted.store(used + units, Ordering::SeqCst);
+        true
+    }));
+    (budget, spent)
+}
+
+/// A failed generation check that proves nothing (a non-budget
+/// `final_generation` error over a live pin, the shape of a denied
+/// mount-namespace read) never retires the pid's carried cursors:
+/// retirement needs a proved exit or reuse.
+#[test]
+fn unproven_generation_failure_keeps_carried_cursors() {
+    let (mut fixture, carried) = c2_staged_cursor();
+    fixture.fail_generation = true;
+    let (_, after) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+    assert!(
+        !after.decode_cursors_for_test().is_empty(),
+        "an unproven generation failure keeps the carried cursor"
+    );
+}
+
+/// A carried cursor survives every shared-credit count on its resume
+/// pass: a refused replay or re-proof read (no bytes checked) never
+/// discards it, and with room the pass resumes it to completion.
+#[test]
+fn refused_replay_read_keeps_the_carried_cursor() {
+    // The units a roomy resume pass spends, so the sweep covers every
+    // stop point up to and past completion.
+    let needed = {
+        let (mut fixture, carried) = c2_staged_cursor();
+        let (mut budget, spent) = credited_roomy_budget(carried, u64::MAX);
+        fixture.run(&mut budget).expect("roomy resume pass");
+        let after = budget.take_retained_file_facts();
+        assert!(
+            after
+                .decode_cursors_for_test()
+                .iter()
+                .all(|(_, cursor)| cursor.complete),
+            "the roomy resume pass completes: {:?}",
+            after.cursor_counts()
+        );
+        spent.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    let mut converged = false;
+    for credits in 0..=needed + 1 {
+        let (mut fixture, carried) = c2_staged_cursor();
+        let (mut budget, _) = credited_roomy_budget(carried, credits);
+        let _ = fixture.run(&mut budget);
+        let after = budget.take_retained_file_facts();
+        let cursors = after.decode_cursors_for_test();
+        assert!(
+            !cursors.is_empty(),
+            "credits {credits}: the carried cursor was discarded without a proof"
+        );
+        converged |= cursors.iter().all(|(_, cursor)| cursor.complete);
+    }
+    assert!(converged, "with enough credit the resumed pass completes");
+}

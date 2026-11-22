@@ -19900,6 +19900,47 @@ mod tests {
         );
     }
 
+    /// The bounded procfs row reader refuses any row over 64 KiB before
+    /// it reaches the match: a matching row of exactly 64 KiB whose
+    /// newline lands in the next chunk is found, one byte longer is
+    /// refused, and so is an unterminated over-long final row.
+    #[test]
+    fn metered_row_reader_refuses_rows_over_64_kib_before_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (64 * 1024, true, true),
+            (64 * 1024 + 1, true, false),
+            (64 * 1024 + 1, false, false),
+        ];
+        for (length, terminated, accepted) in cases {
+            let path = dir.path().join(format!("rows-{length}-{terminated}"));
+            let mut text = b"short row\n".to_vec();
+            let mut row = b"match".to_vec();
+            row.resize(length, b'x');
+            text.extend_from_slice(&row);
+            if terminated {
+                text.extend_from_slice(b"\ntrailer\n");
+            }
+            std::fs::write(&path, &text).unwrap();
+            let found = metered_find_line(path.to_str().unwrap(), &mut || true, |line| {
+                line.starts_with("match").then(|| line.len())
+            })
+            .expect("an unmetered read is never refused");
+            if accepted {
+                assert_eq!(
+                    found,
+                    Ok(Some(length)),
+                    "a {length}-byte row is within the limit"
+                );
+            } else {
+                assert!(
+                    found.is_err(),
+                    "a {length}-byte row (terminated {terminated}) is refused, got {found:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn tmpfs_unresolved_mount_is_a_distinct_nonunique_kind() {
         // A tmpfs mount the table cannot resolve (absent row, malformed

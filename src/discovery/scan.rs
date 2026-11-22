@@ -23585,14 +23585,93 @@ int main(int argc, char **argv) {
         panic!("fn {name} body is closed");
     }
 
-    /// Walk `body` in order: each admission token buys one unit, each
-    /// operation token spends one; an operation with no unit left fails.
-    fn assert_each_operation_admitted(
+    /// Every raw syscall token the guard below recognises: opens and
+    /// file reads (whose `File` drop is a close), metadata calls,
+    /// readlinks (std's `read_link` retries a full buffer), polls and
+    /// their retry wrappers, generation probes and native calls.
+    const RAW_SYSCALL_TOKENS: [&str; 17] = [
+        "std::fs::",
+        "File::open",
+        "OpenOptions",
+        "read_link",
+        ".metadata()",
+        "libc::",
+        "read_to_string",
+        "read_to_end",
+        ".read(",
+        "process_start_time",
+        "still_the_same",
+        "run_while_same",
+        "pidfd_ready",
+        "poll_pidfd_once",
+        "exe_target(",
+        "unsafe",
+        "drop(",
+    ];
+
+    /// The native calls the metered primitives may issue, one per unit.
+    const METERED_OPERATIONS: [&str; 6] = [
+        "std::fs::File::open(",
+        "Read::read(",
+        "libc::readlink(",
+        "libc::poll(",
+        "libc::fstat(",
+        "libc::fstatfs(",
+    ];
+
+    /// Every `fn` body (name, body) in `code`, in source order.
+    fn all_fn_bodies(code: &str) -> Vec<(String, &str)> {
+        let mut bodies = Vec::new();
+        for (at, _) in code.match_indices("fn ") {
+            if at > 0
+                && code[..at]
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                continue;
+            }
+            let name: String = code[at + 3..]
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            let after = code[at + 3 + name.len()..].chars().next();
+            if name.is_empty() || !matches!(after, Some('(' | '<')) {
+                continue;
+            }
+            // A declaration without a body (a trait method) ends at a
+            // `;` outside parentheses and brackets; a definition opens
+            // its body with the first `{` there.
+            let mut depth = 0i32;
+            let mut has_body = false;
+            for ch in code[at..].chars() {
+                match ch {
+                    '(' | '[' => depth += 1,
+                    ')' | ']' => depth -= 1,
+                    '{' if depth == 0 => {
+                        has_body = true;
+                        break;
+                    }
+                    ';' if depth == 0 => break,
+                    _ => {}
+                }
+            }
+            if !has_body {
+                continue;
+            }
+            bodies.push((name.clone(), fn_body(&code[at..], &name)));
+        }
+        bodies
+    }
+
+    /// Ordered admission walk that records, rather than panics on, every
+    /// operation with no unspent admitted unit before it.
+    fn admission_violations(
         what: &str,
         body: &str,
         admits: &[&str],
         operations: &[&str],
-    ) {
+    ) -> Vec<String> {
         let mut events: Vec<(usize, bool, &str)> = Vec::new();
         for admit in admits {
             events.extend(body.match_indices(admit).map(|(at, _)| (at, true, *admit)));
@@ -23604,186 +23683,262 @@ int main(int argc, char **argv) {
             );
         }
         events.sort_unstable();
-        assert!(
-            events.iter().any(|(_, admit, _)| !admit),
-            "{what}: the scan selects at least one operation"
-        );
         let mut units = 0usize;
+        let mut violations = Vec::new();
         for (at, admit, token) in events {
             if admit {
                 units += 1;
-            } else {
-                assert!(
-                    units > 0,
+            } else if units == 0 {
+                violations.push(format!(
                     "{what}: `{token}` at byte {at} has no admitted unit"
-                );
+                ));
+            } else {
                 units -= 1;
             }
         }
+        violations
     }
 
-    /// Source guard over every syscall or file read reachable from the
-    /// resume, cursor-key and closing-bracket code: the resume pass
-    /// owner performs one (the generation probe) and only behind its
-    /// admitted cache; the executable-image bracket, the cursor file
-    /// key and the metered inode classification admit each operation
-    /// first; the closing bracket probes only through its reserved
-    /// check; and the capped member selection charges each stat read.
-    /// A new uncharged read in these sites fails here.
+    fn product_source(relative: &str) -> Option<String> {
+        std::fs::read_to_string(format!("{}/src/{relative}", env!("CARGO_MANIFEST_DIR"))).ok()
+    }
+
+    /// Production text of a source file (its `#[cfg(test)] mod tests`
+    /// cut off), code only.
+    fn production_code(relative: &str) -> Option<String> {
+        let source = product_source(relative)?;
+        let cut = source
+            .find("#[cfg(test)]\nmod tests {")
+            .unwrap_or(source.len());
+        Some(code_only(&source[..cut]))
+    }
+
+    /// Source guard over every syscall reachable from the resume,
+    /// cursor-key, replay and closing-bracket code. Raw syscalls live
+    /// only in the metered primitives (`process/metered_io.rs`): each
+    /// asks `admit()` immediately before its single native call, an open
+    /// buys its close with it (the drop closes, prepaid), and none loops
+    /// or retries. Every audited caller holds no raw syscall token at all
+    /// (closes, polls and their retry wrappers, std readlinks, generation
+    /// probes, opens and reads included) and reaches I/O only through
+    /// those primitives. All violations are collected, so one run names
+    /// every unmetered site.
     #[test]
     fn resume_io_sites_admit_every_syscall() {
-        const SYSCALLS: [&str; 12] = [
-            "std::fs::",
-            "File::open",
-            "read_link",
-            ".metadata()",
-            "process_start_time",
-            "still_the_same",
-            "libc::",
-            "read_to_string",
-            "pidfd",
-            "fstat",
-            "exe_target",
-            "OpenOptions",
-        ];
-        let pass_source = include_str!("scan_pass.rs");
-        let pass_code = code_only(
-            &pass_source[..pass_source
-                .find("#[cfg(test)]\nmod tests {")
-                .expect("scan_pass tests module")],
-        );
-        let mut probes = 0;
-        for (at, _) in pass_code.match_indices("fn ") {
-            let name: String = pass_code[at + 3..]
-                .chars()
-                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
-                .collect();
-            if name.is_empty() || !pass_code[at + 3..].starts_with(&name) {
-                continue;
+        let mut violations: Vec<String> = Vec::new();
+        let mut walked = 0usize;
+        let raw_free = |what: &str, body: &str, violations: &mut Vec<String>| {
+            for token in RAW_SYSCALL_TOKENS {
+                if body.contains(token) {
+                    violations.push(format!(
+                        "{what}: raw syscall token `{token}` outside the metered primitives"
+                    ));
+                }
             }
-            let Some(after) = pass_code[at + 3 + name.len()..].chars().next() else {
+        };
+
+        // 1. The metered primitives.
+        match production_code("process/metered_io.rs") {
+            None => {
+                violations.push("process/metered_io.rs: the metered primitives are missing".into())
+            }
+            Some(primitives) => {
+                let mut covered = 0usize;
+                for (name, body) in all_fn_bodies(&primitives) {
+                    let operations: usize = METERED_OPERATIONS
+                        .iter()
+                        .map(|op| body.matches(op).count())
+                        .sum();
+                    covered += operations;
+                    walked += operations;
+                    violations.extend(admission_violations(
+                        &format!("metered_io::{name}"),
+                        body,
+                        &["admit()"],
+                        &METERED_OPERATIONS,
+                    ));
+                    if operations > 0 {
+                        for keyword in ["loop", "while ", "for "] {
+                            if body.contains(keyword) {
+                                violations.push(format!(
+                                    "metered_io::{name}: `{keyword}` around a native call (a retry)"
+                                ));
+                            }
+                        }
+                    }
+                    if name == "open" && body.matches("admit()").count() != 2 {
+                        violations.push("metered_io::open must buy its open and its close".into());
+                    }
+                    if name == "drop" && (operations > 0 || body.contains("admit()")) {
+                        violations
+                            .push("metered_io: the close in drop is prepaid by the open".into());
+                    }
+                    if name == "find_line"
+                        && !(body.contains("MeteredFile::open(")
+                            && body.contains(".read(&mut chunk, admit)"))
+                    {
+                        violations
+                            .push("metered_io::find_line reads only through MeteredFile".into());
+                    }
+                }
+                let total: usize = METERED_OPERATIONS
+                    .iter()
+                    .map(|op| primitives.matches(op).count())
+                    .sum();
+                if total != covered {
+                    violations.push(format!(
+                        "metered_io: {} native calls outside a walked fn",
+                        total - covered
+                    ));
+                }
+                if covered < 6 {
+                    violations.push(format!("metered_io: only {covered} native calls found"));
+                }
+            }
+        }
+
+        // 2. Callers: no raw token at all.
+        let audited: [(&str, &[&str]); 4] = [
+            (
+                "discovery/scan.rs",
+                &[
+                    "resume_view_exec",
+                    "cursor_file_key_for",
+                    "reserve",
+                    "verdict",
+                ],
+            ),
+            (
+                "discovery/identity.rs",
+                &[
+                    "filesystem_without_unique_inodes_metered",
+                    "file_inodes_are_unique_metered",
+                    "metered_find_line",
+                ],
+            ),
+            ("process.rs", &["metered_generation", "metered_start_time"]),
+            (
+                "discovery/scan_pass.rs",
+                &["decode_generation_live_cached", "admit_resume_syscall"],
+            ),
+        ];
+        for (file, names) in audited {
+            let Some(code) = production_code(file) else {
+                violations.push(format!("{file}: unreadable"));
                 continue;
             };
-            if after != '(' && after != '<' {
-                continue;
-            }
-            let body = fn_body(&pass_code[at..], &name);
-            let found: Vec<&str> = SYSCALLS
-                .iter()
-                .copied()
-                .filter(|token| body.contains(token))
-                .collect();
-            if name == "decode_cursor_pid_live" {
-                assert_eq!(found, ["process_start_time"], "the generation probe");
-                probes += 1;
-            } else {
-                assert!(found.is_empty(), "scan_pass fn {name} performs {found:?}");
-            }
-            if body.contains("decode_cursor_pid_live(") {
-                assert_eq!(
-                    name, "decode_generation_live_cached",
-                    "the probe's only caller"
-                );
-                assert_each_operation_admitted(
-                    "decode_generation_live_cached",
-                    body,
-                    &["admit_resume_syscall()"],
-                    &["decode_cursor_pid_live("],
-                );
+            let bodies = all_fn_bodies(&code);
+            for name in names {
+                let found: Vec<&str> = bodies
+                    .iter()
+                    .filter(|(fn_name, _)| fn_name == name)
+                    .map(|(_, body)| *body)
+                    .collect();
+                if found.is_empty() {
+                    violations.push(format!("{file}: fn {name} is missing"));
+                }
+                for body in found {
+                    raw_free(&format!("{file}::{name}"), body, &mut violations);
+                }
             }
         }
-        assert_eq!(probes, 1, "the generation probe is found");
-        let admission = fn_body(&pass_code, "admit_resume_syscall");
-        assert!(
-            admission.contains("self.stopped_now().is_none()")
-                && admission.contains("self.collection_checkpoint(1)"),
-            "one admission is a stop check plus one charged unit"
-        );
+        // The whole resume pass owner performs no raw syscall.
+        if let Some(pass) = production_code("discovery/scan_pass.rs") {
+            for (name, body) in all_fn_bodies(&pass) {
+                raw_free(&format!("scan_pass::{name}"), body, &mut violations);
+            }
+            let admission = fn_body(&pass, "admit_resume_syscall");
+            if !(admission.contains("self.stopped_now().is_none()")
+                && admission.contains("self.collection_checkpoint(1)"))
+            {
+                violations
+                    .push("admit_resume_syscall: one stop check plus one charged unit".into());
+            }
+        }
 
-        let scan_source = include_str!("scan.rs");
-        let scan_code =
-            code_only(&scan_source[..scan_source.find("#[cfg(test)]\nmod tests {").unwrap()]);
-        assert_each_operation_admitted(
-            "resume_view_exec",
-            fn_body(&scan_code, "resume_view_exec"),
-            &["budget.admit_resume_syscall()"],
-            &["still_the_same()", "read()"],
-        );
-        let key = fn_body(&scan_code, "cursor_file_key_for");
-        assert_each_operation_admitted(
-            "cursor_file_key_for",
-            key,
-            &["budget.admit_resume_syscall()"],
-            &[".metadata()"],
-        );
-        assert!(key.contains("file_inodes_are_unique_metered("));
-        for unmetered in ["file_inodes_are_unique(", "pin_of(", "for_open_file("] {
-            assert!(
-                !key.contains(unmetered),
-                "cursor_file_key_for calls {unmetered}"
-            );
+        // 3. Sites in the scan.
+        let scan_code = production_code("discovery/scan.rs").expect("scan.rs");
+        if scan_code.matches("cursor_file_key_for(").count() != 3 {
+            violations.push("cursor_file_key_for: the definition plus two call sites".into());
         }
-        assert_eq!(
-            scan_code.matches("cursor_file_key_for(").count(),
-            3,
-            "the definition plus the upper- and lower-file call sites"
-        );
         for site in [
             "let mut cursor_file_key = cursor_file_key_for(&file, key, budget);",
             "cursor_file_key = cursor_file_key_for(&proof.file, lower_key, budget);",
         ] {
-            assert!(scan_code.contains(site), "metered call site {site}");
+            if !scan_code.contains(site) {
+                violations.push(format!("metered call site missing: {site}"));
+            }
         }
-        assert_eq!(
-            scan_code.matches("resume_exec_target(").count(),
-            0,
-            "the image read goes through the metered bracket only"
-        );
-        let exec_site = &scan_code[scan_code
-            .find("let cursor_key = match (view.start_time(), cursor_file_key) {")
-            .expect("cursor key site")..];
-        let exec_site = &exec_site[..exec_site.find("let fingerprint").unwrap()];
-        assert!(exec_site.contains("resume_view_exec("));
-        assert_eq!(exec_site.matches("still_the_same()").count(), 1);
-        let bracket = &scan_code[scan_code
-            .find("let generation = io.final_generation(view, budget);")
-            .expect("closing bracket")..];
-        let bracket = &bracket[..bracket.find("examined.clear();").unwrap()];
-        assert!(bracket.contains("closing.still_the_same("));
-        assert_eq!(
-            bracket.matches("still_the_same()").count(),
-            bracket
-                .matches("closing.still_the_same(|| view.still_the_same())")
-                .count(),
-            "the closing bracket probes only through its reserved check"
-        );
-        assert_each_operation_admitted(
-            "ClosingGeneration::still_the_same",
-            fn_body(&scan_code, "still_the_same"),
-            &["self.reserved.take()"],
-            &["probe()"],
-        );
-
-        let identity_code = code_only(include_str!("identity.rs"));
-        for name in [
-            "filesystem_without_unique_inodes_metered",
-            "metered_find_line",
-        ] {
-            assert_each_operation_admitted(
-                name,
-                fn_body(&identity_code, name),
-                &["admit()"],
-                &["libc::fstatfs(", "File::open(", ".read(", "read_to_string("],
-            );
+        if let Some(at) =
+            scan_code.find("let cursor_key = match (view.start_time(), cursor_file_key) {")
+        {
+            let site = &scan_code[at..];
+            let site = &site[..site.find("let fingerprint").unwrap_or(site.len())];
+            raw_free("cursor-key exec site", site, &mut violations);
+            if !(site.contains("resume_view_exec(")
+                && site.contains("view.metered_generation(admit)")
+                && site.contains("io.exe_link(view, admit)"))
+            {
+                violations
+                    .push("cursor-key exec site: metered generation and bounded readlink".into());
+            }
+        } else {
+            violations.push("cursor-key exec site missing".into());
+        }
+        if let Some(at) = scan_code.find("let generation = io.final_generation(view, budget);") {
+            let bracket = &scan_code[at..];
+            let bracket = &bracket[..bracket.find("examined.clear();").unwrap_or(bracket.len())];
+            raw_free("closing bracket", bracket, &mut violations);
+            let verdicts = bracket
+                .matches("closing.verdict(|admit| view.metered_generation(admit))")
+                .count();
+            if verdicts == 0 || verdicts != bracket.matches("metered_generation(").count() {
+                violations.push("closing bracket: probes only through the reserved verdict".into());
+            }
+        } else {
+            violations.push("closing bracket missing".into());
+        }
+        match bodies_named(&scan_code, "reread_table_extent") {
+            Some(body) => {
+                raw_free("reread_table_extent", body, &mut violations);
+                let stop = body.find("budget.stopped_now()");
+                let spend = body.find("budget.spend(1)");
+                let read = body.find("read_memory_at(");
+                if !(stop < spend && spend < read && stop.is_some()) {
+                    violations
+                        .push("reread_table_extent: stop poll, one charge, then the read".into());
+                }
+                walked += 1;
+            }
+            None => violations.push("reread_table_extent missing".into()),
         }
 
-        let cgroup_code = code_only(include_str!("../inspect_system/inventory_cgroup.rs"));
-        assert_each_operation_admitted(
+        // 4. The capped member selection charges each stat read.
+        let cgroup_code = production_code("inspect_system/inventory_cgroup.rs").expect("cgroup");
+        violations.extend(admission_violations(
             "capped_member_selection",
             fn_body(&cgroup_code, "capped_member_selection"),
             &["charge()"],
             &["read_stat("],
+        ));
+        walked += 1;
+
+        if walked < 8 {
+            violations.push(format!("the guard selected only {walked} operations"));
+        }
+        assert!(
+            violations.is_empty(),
+            "{} unmetered site(s):\n{}",
+            violations.len(),
+            violations.join("\n")
         );
+    }
+
+    fn bodies_named<'a>(code: &'a str, name: &str) -> Option<&'a str> {
+        all_fn_bodies(code)
+            .into_iter()
+            .find(|(fn_name, _)| fn_name == name)
+            .map(|(_, body)| body)
     }
 
     #[test]
@@ -24157,6 +24312,57 @@ int main(int argc, char **argv) {
     /// it displaces the rarity-lowest tail, or a younger unfinished
     /// member when the missing one is older — never the reverse — and
     /// skips ineligible pids and members already selected.
+    /// The capped selection keeps its kernel-thread exclusion and the
+    /// reservation's eligibility together: with one credit, the proved
+    /// kernel thread (pid 1) is excluded and counted, nothing more is
+    /// read after the first denial, and the unread member holding an
+    /// unfinished cursor (pid 4) stays eligible and is reserved.
+    #[test]
+    fn capped_selection_excludes_proved_kernel_threads_and_reserves_unread_unfinished() {
+        let sweep: crate::discovery::engine::SweepSnapshots =
+            (1..=4u32).map(|pid| (pid, Vec::new())).collect();
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let (key, cursor) = decode_cursor_for_test(4, 70, 40, false, 0);
+        assert!(budget.record_decode_cursor(key, cursor));
+        let kthread =
+            "1 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 0 0 0 20 0 1 0 5 0 0".to_string();
+        let mut reads = Vec::new();
+        let mut credits = 1usize;
+        let selected = crate::inspect_system::inventory_cgroup::capped_member_selection(
+            &sweep,
+            &BTreeSet::new(),
+            2,
+            &mut budget,
+            &mut |pid| {
+                reads.push(pid);
+                Ok(kthread.clone())
+            },
+            &mut || {
+                if credits == 0 {
+                    return false;
+                }
+                credits -= 1;
+                true
+            },
+        );
+        assert_eq!(reads, [1], "one charged read, none after the denial");
+        assert_eq!(
+            budget.kernel_thread_absences(),
+            1,
+            "the proved kernel thread is counted"
+        );
+        assert!(
+            !selected.contains(&1),
+            "the proved kernel thread is excluded: {selected:?}"
+        );
+        assert!(
+            selected.contains(&4),
+            "the unread unfinished member is reserved: {selected:?}"
+        );
+        assert_eq!(selected.len(), 2, "the cap holds: {selected:?}");
+    }
+
     #[test]
     fn capped_selection_reservation_prefers_oldest_eligible_unfinished() {
         let mut budget =

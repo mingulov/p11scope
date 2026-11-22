@@ -781,10 +781,12 @@ fn native_semantic_resource_final_types_pinned() {
     // The exit-return drain retains the corroborated return beside its
     // ordinal (+40 B: return timestamp plus the ReturnedWords session,
     // mechanism, capture and rv); the drained-converted flag packs with
-    // the existing bool flags (+0 B).
+    // the existing bool flags (+0 B). The committed drain cut retains the
+    // conversion cut beside the flag (+16 B: Option<u64>), so prune and
+    // later replay reuse the conversion disposition instead of re-proving.
     let open_bytes = crate::semantics_objects::journal::JournalAdapter::open_entry_size_for_test();
-    if open_bytes != 1160 + 48 + 16 + 40 {
-        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48 + 16 + 40));
+    if open_bytes != 1160 + 48 + 16 + 40 + 16 {
+        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48 + 16 + 40 + 16));
     }
     pin!(
         crate::semantic_capture::TickOutcome,

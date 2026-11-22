@@ -39382,18 +39382,18 @@ fn joint_machine_flood_buried_call_balances_only_at_drain_quiescence() {
 }
 
 /// Drive one more birth quantum on a prepared scene: push calls, collect,
-/// tick, admit, prepare, ingest, claim and install the closure grant.
-/// Mirrors `prepared_birth_with_flags` per-quantum flow on an existing scene.
+/// tick, admit, prepare, ingest and claim. Mirrors
+/// `prepared_birth_with_flags` per-quantum flow on an existing scene. The
+/// attachment and closure grant come from the first quantum (the scene
+/// mints and seals its attachment once); ingestion between collects
+/// advances the adapter past the consumed cut.
 fn drive_birth_quantum(
     scene: &mut JointScene,
     pid: u32,
     caller: crate::discovery::caller_registry::CallerId,
     files: &[u32],
     seq_base: u64,
-) -> (
-    IngestedRaw,
-    crate::attach::AttachedSemanticSet,
-) {
+) -> IngestedRaw {
     for file in files {
         scene.push(pid, *file, "C_CreateObject", seq_base + u64::from(*file));
     }
@@ -39416,30 +39416,22 @@ fn drive_birth_quantum(
         count += 1;
     }
     assert_eq!(count, files.len(), "every admission claims");
-    let attached = attachment(scene);
-    assert!(
-        scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture_mut()
-            .adapter_mut()
-            .install_closure_grant(&SessionClosureGrant::observe(&attached))
-    );
-    (ingested, attached)
+    ingested
 }
 
 /// Decide births with the real native consume path (validate plus
 /// finish_birth over stamped native rows), then stage and finish.
+/// Returns installs and pending re-offers (returned, never executed
+/// without a machine).
 fn decide_and_finish_births(
     scene: &mut JointScene,
     ingested: &IngestedRaw,
     attached: &crate::attach::AttachedSemanticSet,
     births: &mut crate::inventory_semantics::RetainedJointBirths,
-) -> usize {
+) -> (usize, usize) {
     let h0 = scene.real.h0.clone();
     let publisher = NativePublisher::build();
-    let installed = scene
+    let disposition = scene
         .real
         .scene
         .coordinator
@@ -39460,8 +39452,7 @@ fn decide_and_finish_births(
                 Ok(witness)
             },
         )
-        .unwrap()
-        .installed;
+        .unwrap();
     while scene
         .real
         .scene
@@ -39475,16 +39466,17 @@ fn decide_and_finish_births(
             .coordinator
             .finish_prepared_semantic_batch(&scene.real.lane)
     );
-    installed
+    (disposition.installed, disposition.reoffers.len())
 }
 
-/// Count staged birth-gap recordings: both birth subjects, excluding the
-/// post-install reseed refusal (a birth that installed then failed to
-/// reseed at the drain is installed, not dropped).
-fn staged_birth_gaps(scene: &JointScene) -> u64 {
-    use crate::inventory_present::{
-        JOINT_BIRTH_DEFERRED_SUBJECT, JOINT_BIRTH_UNAVAILABLE_SUBJECT,
-    };
+/// Count staged terminal birth-gap recordings: the unavailable
+/// subject only, excluding the post-install reseed refusal (a birth
+/// that installed then failed to reseed at the drain is installed,
+/// not dropped). Deferred gaps are transient delay notices, not
+/// terminal outcomes: each deferred offer is counted through its
+/// pending re-offer instead.
+fn staged_final_birth_gaps(scene: &JointScene) -> u64 {
+    use crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT;
     scene
         .real
         .scene
@@ -39493,8 +39485,7 @@ fn staged_birth_gaps(scene: &JointScene) -> u64 {
         .staged_gaps_for_test()
         .iter()
         .filter(|gap| {
-            (gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT
-                || gap.subject == JOINT_BIRTH_DEFERRED_SUBJECT)
+            gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT
                 && gap.reason != "joint_birth_segment_unresumable"
         })
         .count() as u64
@@ -39502,9 +39493,12 @@ fn staged_birth_gaps(scene: &JointScene) -> u64 {
 
 /// Birth-funnel conservation on the production seam: every sighting
 /// receipt that carries a birth either installs or is counted exactly
-/// once — at a silent gate (the funnel) or at the association (a birth
-/// gap). Offers formed minus births installed must equal silent drops
-/// plus birth-gap recordings; anything else is silent loss.
+/// once — at a silent gate (the funnel), at the association (a
+/// terminal birth gap), or as a pending re-offer. Deferred gaps are
+/// transient delay notices, not terminal outcomes: each deferred
+/// offer is counted through its pending re-offer instead. Offers
+/// formed minus births installed must equal silent drops plus
+/// terminal gaps plus pending re-offers; anything else is silent loss.
 #[test]
 fn joint_birth_funnel_accounts_every_offer() {
     use crate::inventory_semantics::RetainedJointBirths;
@@ -39518,7 +39512,8 @@ fn joint_birth_funnel_accounts_every_offer() {
     let formed_q1 = scene.real.h0.0.borrow().capture.birth_offer_counts().0;
     assert!(formed_q1 > 0, "Q1 sightings formed birth offers");
     let mut births = RetainedJointBirths::new();
-    let installed_q1 = decide_and_finish_births(&mut scene, &ingested, &attached, &mut births);
+    let (installed_q1, pending_q1) =
+        decide_and_finish_births(&mut scene, &ingested, &attached, &mut births);
     assert!(
         installed_q1 > 0,
         "Q1 births install, so the equation is non-vacuous"
@@ -39545,9 +39540,9 @@ fn joint_birth_funnel_accounts_every_offer() {
             > 0,
         "Q2 re-arms its keys"
     );
-    let (ingested, attached) = drive_birth_quantum(&mut scene, pid, caller, &files, 3);
+    let ingested = drive_birth_quantum(&mut scene, pid, caller, &files, 3);
     let mut births = RetainedJointBirths::new();
-    let _ = decide_and_finish_births(&mut scene, &ingested, &attached, &mut births);
+    let (_, pending_q2) = decide_and_finish_births(&mut scene, &ingested, &attached, &mut births);
     // Q3: re-armed retry offers (Continued arm) under clamped storage,
     // so the association defers instead of installing.
     assert!(
@@ -39561,7 +39556,7 @@ fn joint_birth_funnel_accounts_every_offer() {
             > 0,
         "Q3 re-arms its keys"
     );
-    let (ingested, _attached) = drive_birth_quantum(&mut scene, pid, caller, &files, 5);
+    let ingested = drive_birth_quantum(&mut scene, pid, caller, &files, 5);
     scene
         .real
         .scene
@@ -39571,7 +39566,7 @@ fn joint_birth_funnel_accounts_every_offer() {
     let mut births = RetainedJointBirths::new();
     let h0 = scene.real.h0.clone();
     let publisher = NativePublisher::build();
-    let installed_q3 = scene
+    let disposition = scene
         .real
         .scene
         .coordinator
@@ -39581,29 +39576,33 @@ fn joint_birth_funnel_accounts_every_offer() {
             &mut births,
             |candidate, absence, input, binding, proof, adapter| {
                 let (row, control, _) =
-                    publisher.publish_stamped(&["0", "0"], _attached.generation());
+                    publisher.publish_stamped(&["0", "0"], attached.generation());
                 let mut rows = NativeBirthRows { row, control };
                 let mut owned = h0.0.borrow_mut();
                 let HeldH0 { capture, io, .. } = &mut *owned;
                 capture.validate_birth_candidate(io, &candidate, false)?;
                 let witness = capture.finish_birth(
-                    candidate, absence, input, binding, &_attached, proof, adapter, &mut rows,
+                    candidate, absence, input, binding, &attached, proof, adapter, &mut rows,
                 )?;
                 Ok(witness)
             },
         )
-        .unwrap()
-        .installed;
+        .unwrap();
     assert_eq!(
-        installed_q3, 0,
+        disposition.installed, 0,
         "clamped storage defers every Q3 birth before any install"
+    );
+    let pending_q3 = disposition.reoffers.len();
+    assert!(
+        pending_q3 > 0,
+        "Q3 deferrals re-offer, so the equation is non-vacuous"
     );
     // The equation, over the whole run.
     let (formed, _) = scene.real.h0.0.borrow().capture.birth_offer_counts();
     let installed = scene.real.scene.coordinator.joint_births_installed();
     let funnel = scene.real.scene.coordinator.joint_birth_funnel();
-    let gaps = staged_birth_gaps(&scene);
-    assert!(gaps > 0, "Q3 refusals gapped, so the equation is non-vacuous");
+    let finals = staged_final_birth_gaps(&scene);
+    let pending = (pending_q1 + pending_q2 + pending_q3) as u64;
     assert!(
         formed >= installed,
         "installs never exceed formed offers: {formed} formed vs {installed} installed"
@@ -39615,7 +39614,7 @@ fn joint_birth_funnel_accounts_every_offer() {
     );
     assert_eq!(
         formed - installed,
-        funnel.total_silent_drops() + gaps,
+        funnel.total_silent_drops() + finals + pending,
         "every formed offer installed or counted: {formed} formed, {installed} installed"
     );
 }
@@ -39650,7 +39649,12 @@ fn joint_birth_funnel_counts_foreign_capture_drops() {
         crate::semantics_objects::journal::joint_driver::RawQuantumRefusal::ForeignCapture
     );
     assert_eq!(
-        scene.real.scene.coordinator.joint_birth_funnel().prepare_foreign,
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_birth_funnel()
+            .prepare_owner,
         formed,
         "every formed offer counted at the foreign gate"
     );
@@ -39663,8 +39667,7 @@ fn joint_birth_funnel_counts_foreign_capture_drops() {
 fn joint_birth_funnel_counts_unclaimed_batch_drops() {
     use crate::inventory_semantics::RetainedJointBirths;
 
-    let (held, attached) =
-        HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+    let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
     let mut scene = JointScene::from_held(held, Some(attached));
     scene.real.h0.0.borrow_mut().io.script.local = 1;
     let pid = std::process::id();
@@ -39692,13 +39695,21 @@ fn joint_birth_funnel_counts_unclaimed_batch_drops() {
         .real
         .scene
         .coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _, _| {
-            panic!("an unclaimed batch decides before any consume")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("an unclaimed batch decides before any consume"),
+        )
         .err()
         .expect("an unclaimed batch refuses");
     assert_eq!(
-        scene.real.scene.coordinator.joint_birth_funnel().prepare_cursor,
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_birth_funnel()
+            .prepare_cursor,
         formed,
         "every formed offer counted at the cursor gate"
     );
@@ -39724,13 +39735,21 @@ fn joint_birth_funnel_counts_entry_preamble_drops() {
         .real
         .scene
         .coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _, _| {
-            panic!("a misaligned batch decides before any consume")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a misaligned batch decides before any consume"),
+        )
         .err()
         .expect("a misaligned batch refuses");
     assert_eq!(
-        scene.real.scene.coordinator.joint_birth_funnel().prepare_entry,
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_birth_funnel()
+            .prepare_entry,
         formed,
         "every formed offer counted at the entry gate"
     );
@@ -39750,15 +39769,14 @@ fn joint_birth_funnel_counts_skipped_and_abandoned_births() {
         BirthDisposeCause::StorageRefused,
         BirthDisposeCause::S1Finalize,
     ] {
-        let (mut scene, _ingested, _attached, _grant) =
-            prepared_birth_originals(1, false, false);
+        let (mut scene, _ingested, _attached, _grant) = prepared_birth_originals(1, false, false);
         let formed = scene.real.h0.0.borrow().capture.birth_offer_counts().0;
         assert!(formed > 0, "the batch carries birth offers");
         scene
             .real
             .scene
             .coordinator
-            .dispose_prepared_claims_s1(cause);
+            .dispose_prepared_claims_s1_for_cause(cause);
         let funnel = scene.real.scene.coordinator.joint_birth_funnel();
         let counted = match cause {
             BirthDisposeCause::SkippedNoGrant => funnel.skip_no_grant,
@@ -39776,7 +39794,7 @@ fn joint_birth_funnel_counts_skipped_and_abandoned_births() {
             .real
             .scene
             .coordinator
-            .dispose_prepared_claims_s1(BirthDisposeCause::SkippedEmpty);
+            .dispose_prepared_claims_s1_for_cause(BirthDisposeCause::SkippedEmpty);
         let again = scene.real.scene.coordinator.joint_birth_funnel();
         assert_eq!(
             again.total_silent_drops(),
@@ -39803,8 +39821,7 @@ fn joint_birth_funnel_counts_skipped_and_abandoned_births() {
         "every formed offer counted at the abandon"
     );
     // The hold's abandon counts collected births as dropped.
-    let (held, attached) =
-        HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+    let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
     let mut scene = JointScene::from_held(held, Some(attached));
     scene.real.h0.0.borrow_mut().io.script.local = 1;
     let pid = std::process::id();
@@ -39847,8 +39864,7 @@ fn joint_birth_funnel_counts_skipped_and_abandoned_births() {
 #[test]
 fn joint_birth_funnel_counts_collected_drops() {
     fn staged_scene() -> (JointScene, u64) {
-        let (held, attached) =
-            HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+        let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
         let mut scene = JointScene::from_held(held, Some(attached));
         scene.real.h0.0.borrow_mut().io.script.local = 1;
         let pid = std::process::id();
@@ -39871,7 +39887,18 @@ fn joint_birth_funnel_counts_collected_drops() {
         (scene, formed)
     }
     // Backpressure: a second batch staged while one is pending drops.
+    // The first batch prepares and ingests (advancing the adapter past
+    // its cut) so the second collect resolves; the pending prepared
+    // batch keeps backpressure armed.
     let (mut scene, formed_first) = staged_scene();
+    scene
+        .real
+        .scene
+        .coordinator
+        .prepare_staged_semantic_batch(&mut scene.real.lane, None)
+        .unwrap();
+    let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+    let _ = scene.ingest_with_grant(raw);
     let pid = std::process::id();
     scene
         .real
@@ -39907,14 +39934,18 @@ fn joint_birth_funnel_counts_collected_drops() {
     let (mut scene, formed) = staged_scene();
     scene.real.scene.coordinator.finalize_semantic_batches(None);
     assert_eq!(
-        scene.real.scene.coordinator.joint_birth_funnel().dropped_no_lane,
+        scene
+            .real
+            .scene
+            .coordinator
+            .joint_birth_funnel()
+            .dropped_no_lane,
         formed,
         "a laned batch dropped without authority counts its offers"
     );
     // A foreign Session's batch never stages.
     let (mut scene, _) = staged_scene();
-    let (held, attached) =
-        HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+    let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
     let mut foreign = JointScene::from_held(held, Some(attached));
     foreign.real.h0.0.borrow_mut().io.script.local = 1;
     let pid = std::process::id();
@@ -39983,98 +40014,19 @@ fn scripted_filler_receipt(
     )
 }
 
-/// Receipts shed past merge and stash caps count their births: the
-/// merge carries its birth shed through the report into the batch,
-/// the stash overflow names its own, and preparation drains the
-/// carried shed into the funnel instead of losing it.
+/// Refresh receipts shed past the stash cap count their births on
+/// the stash: overflow sheds oldest-first, and a birth-bearing shed
+/// receipt increments the stash shed the stop line reads. (Merge
+/// truncation itself is defensive-only: fresh plus stashed receipts
+/// can never reach the batch cap, so it counts nothing.)
 #[test]
-fn joint_birth_funnel_carries_merge_and_stash_birth_shed() {
+fn joint_birth_funnel_counts_stash_overflow_birth_shed() {
     use crate::discovery::identity::PinnedObjectId;
     use crate::discovery::identity::test_fixture;
-    use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
-    use crate::inventory_semantics::{RefreshReceiptStash, SemanticBatch};
-    use crate::semantic_capture::TickReport;
+    use crate::discovery::instances::MAX_PENDING;
+    use crate::inventory_semantics::RefreshReceiptStash;
 
     // Real birth-bearing receipts from an actual tick.
-    let (mut scene, _ingested, _attached, _grant) = prepared_birth_originals(1, false, false);
-    let real: Vec<_> = scene
-        .real
-        .scene
-        .coordinator
-        .take_prepared_current_for_birth_test()
-        .expect("the prepared batch owns its receipts")
-        .into_iter()
-        .filter(|receipt| receipt.birth_quantum().is_some())
-        .take(1)
-        .collect();
-    assert_eq!(
-        real.len(),
-        1,
-        "the tick formed a birth-bearing receipt for the shed test"
-    );
-    let domain = scene.real.lane.domain();
-    let pins = test_fixture::real_scan_pin(
-        &std::env::current_exe().unwrap(),
-        None,
-        1,
-        "held-test-image",
-    );
-    let watched = pins.retain_inventory_target(PinnedObjectId(0)).unwrap();
-    // The merge truncates past MAX_INSTANCES; stashed receipts ride
-    // behind fresh ones, so the tail (real births) sheds first.
-    let fresh: Vec<_> = (0..MAX_INSTANCES as u64)
-        .map(|cookie| scripted_filler_receipt(domain, cookie, &watched))
-        .collect();
-    let mut report = TickReport::scripted(Vec::new(), fresh);
-    let shed = report.merge_stashed_current(real);
-    assert_eq!(shed, 1, "one stashed receipt sheds past the cap");
-    assert_eq!(
-        report.birth_shed, 1,
-        "the merge counts the shed receipt's birth"
-    );
-    // The batch carries the shed into preparation, which drains it.
-    let batch = SemanticBatch::from_tick_report(
-        domain,
-        report,
-        Vec::new(),
-        crate::discovery::caller_registry::now_ns(),
-    )
-    .unwrap();
-    // Clear the helper's prepared batch first (its receipts were taken
-    // above, so its disposal counts nothing).
-    scene
-        .real
-        .scene
-        .coordinator
-        .dispose_prepared_claims_s1(
-            crate::discovery::engine::inventory_coordinator::semantics::BirthDisposeCause::S1Finalize,
-        );
-    while scene
-        .real
-        .scene
-        .coordinator
-        .stage_next_prepared_admission(false, true)
-    {}
-    assert!(
-        scene
-            .real
-            .scene
-            .coordinator
-            .finish_prepared_semantic_batch(&scene.real.lane)
-    );
-    scene.real.scene.coordinator.stage_semantic_batch(batch);
-    scene
-        .real
-        .scene
-        .coordinator
-        .prepare_staged_semantic_batch(&mut scene.real.lane, None)
-        .unwrap();
-    assert_eq!(
-        scene.real.scene.coordinator.joint_birth_funnel().upstream_shed,
-        1,
-        "preparation drains the carried birth shed into the funnel"
-    );
-    // Stash overflow sheds oldest-first and counts their births.
     let (mut scene, _ingested, _attached, _grant) = prepared_birth_originals(1, false, false);
     let real: Vec<_> = scene
         .real
@@ -40119,8 +40071,7 @@ fn joint_birth_funnel_carries_merge_and_stash_birth_shed() {
 /// never reach lanes that cannot birth.
 #[test]
 fn joint_birth_funnel_forms_no_offers_without_a_cut() {
-    let (held, attached) =
-        HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+    let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
     let mut scene = JointScene::from_held(held, Some(attached));
     scene.real.h0.0.borrow_mut().io.script.local = 1;
     let pid = std::process::id();
@@ -40133,7 +40084,13 @@ fn joint_birth_funnel_forms_no_offers_without_a_cut() {
         0,
     );
     // No collection: the tick runs without a birth cut.
-    scene.real.h0.0.borrow_mut().io.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .enqueue(pid, 0, "C_SignInit", 0x000d, 0);
     scene.real.h0.0.borrow_mut().collected = None;
     let bindings = scene
         .real
@@ -40144,7 +40101,10 @@ fn joint_birth_funnel_forms_no_offers_without_a_cut() {
     let batch = scene.real.lane.tick(bindings).unwrap();
     scene.admit_providers(pid, caller, &[0]);
     assert!(
-        batch.current_receipts().iter().all(|receipt| receipt.birth_quantum().is_none()),
+        batch
+            .current_receipts()
+            .iter()
+            .all(|receipt| receipt.birth_quantum().is_none()),
         "no cut means no birth on any receipt"
     );
     assert_eq!(
@@ -40182,8 +40142,16 @@ fn joint_birth_funnel_splits_resource_refusal_arms() {
     let reserve = registry.semantic_storage_reserver();
     let mut births = RetainedJointBirths::new();
     let mut arms = BirthReserveArms::default();
-    assert!(births.reserve_for_current(&reserve, &receipt, &mut arms).is_err());
-    assert_eq!((arms.ledger, arms.table), (1, 0), "ledger exhaustion names its arm");
+    assert!(
+        births
+            .reserve_for_current(&reserve, &receipt, &mut arms)
+            .is_err()
+    );
+    assert_eq!(
+        (arms.ledger, arms.table),
+        (1, 0),
+        "ledger exhaustion names its arm"
+    );
     // Room for the receipt's bytes but not for the witness-table
     // growth: the table arm refuses.
     let registry = CallerRegistry::new(RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("limits"));
@@ -40191,6 +40159,71 @@ fn joint_birth_funnel_splits_resource_refusal_arms() {
     let reserve = registry.semantic_storage_reserver();
     let mut births = RetainedJointBirths::new();
     let mut arms = BirthReserveArms::default();
-    assert!(births.reserve_for_current(&reserve, &receipt, &mut arms).is_err());
-    assert_eq!((arms.ledger, arms.table), (0, 1), "table growth names its arm");
+    assert!(
+        births
+            .reserve_for_current(&reserve, &receipt, &mut arms)
+            .is_err()
+    );
+    assert_eq!(
+        (arms.ledger, arms.table),
+        (0, 1),
+        "table growth names its arm"
+    );
+}
+
+/// A re-offer eviction's one-observation cooldown withholds the fresh
+/// sighting's birth despite a present cut: the funnel counts the
+/// withheld birth as cooled, and the receipt carries no birth.
+#[test]
+fn joint_birth_funnel_counts_cooled_withheld_births() {
+    let image = ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    };
+    let (held, attached) = HeldProviders::with_attachment(1, &["C_CreateObject", "C_SignInit"]);
+    let mut scene = JointScene::from_held(held, Some(attached));
+    scene.real.h0.0.borrow_mut().io.script.local = 1;
+    let pid = std::process::id();
+    let caller = scene.real.bind(pid, image, 0);
+    scene.push(pid, 0, "C_CreateObject", 1);
+    let raw = scene.collect_with_fault(&BirthFault);
+    scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = scene.real.tick();
+    scene.admit_providers(pid, caller, &[0]);
+    scene.prepare_batch(batch, 1);
+    let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
+    let _ = scene.ingest_with_grant(raw);
+    assert_eq!(
+        scene.real.h0.0.borrow().capture.birth_offer_counts(),
+        (1, 0),
+        "the first sighting forms one offer"
+    );
+    // Evict the observation (a re-offer) and tick again with a cut:
+    // the fresh sighting's birth is withheld by the cooldown.
+    assert!(
+        scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .capture
+            .reoffer_birth_for(image, 0),
+        "the re-offer evicts"
+    );
+    scene.push(pid, 0, "C_CreateObject", 2);
+    let raw = scene.collect_with_fault(&BirthFault);
+    scene.real.h0.0.borrow_mut().collected = Some(raw);
+    let batch = scene.real.tick();
+    assert!(
+        batch
+            .current_receipts()
+            .iter()
+            .all(|receipt| receipt.birth_quantum().is_none()),
+        "the cooled sighting carries no birth"
+    );
+    assert_eq!(
+        scene.real.h0.0.borrow().capture.birth_offer_counts(),
+        (1, 1),
+        "the withheld birth counts as cooled, not formed"
+    );
 }

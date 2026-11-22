@@ -3417,14 +3417,20 @@ enum ReplayRead {
     Bytes(Vec<u8>),
     /// The cached row names no layout: it can never re-prove.
     Divergent,
-    /// A short or failed read: no byte was checked.
+    /// A failed read, or a short one that stops before the table's
+    /// complete legacy prefix: no complete span was checked.
     Unavailable,
     /// The pass stop or the charge refused the read: nothing was read.
     Refused,
 }
 
 /// Re-read one cached table's full declared extent from current
-/// memory, charged one unit after a stop poll.
+/// memory: one metered positioned read, admitted by a stop poll and one
+/// charged unit. A 3.x table whose declared extension is unmapped (a
+/// short read that still covers the complete 68-slot legacy prefix)
+/// yields that prefix alone: the re-decode re-proves the prefix with no
+/// extension claim, and a full row or a tail refutation still needs the
+/// declared extent.
 fn reread_table_extent(
     layout: LinuxLayout,
     table: &ScannedTable,
@@ -3438,18 +3444,24 @@ fn reread_table_extent(
     let Some(len) = span_bytes(layout, spans) else {
         return ReplayRead::Divergent;
     };
-    if budget.stopped_now().is_some() {
-        return ReplayRead::Refused;
-    }
-    if budget.spend(1).is_err() {
-        return ReplayRead::Refused;
-    }
     let mut extent = vec![0u8; len];
-    match mem.read_memory_at(&mut extent, table.address) {
-        Ok(read) if read == len => {}
-        _ => return ReplayRead::Unavailable,
-    }
-    budget.record_io(len);
+    let read = match mem.replay_read_at(&mut extent, table.address, &mut || {
+        budget.stopped_now().is_none() && budget.spend(1).is_ok()
+    }) {
+        None => return ReplayRead::Refused,
+        Some(Ok(read)) => read.min(len),
+        Some(Err(_)) => return ReplayRead::Unavailable,
+    };
+    let kept = if read == len {
+        len
+    } else {
+        match exact_legacy_prefix_bytes(&extent[..read], layout) {
+            Some(prefix) if prefix <= read => prefix,
+            _ => return ReplayRead::Unavailable,
+        }
+    };
+    budget.record_io(read);
+    extent.truncate(kept);
     ReplayRead::Bytes(extent)
 }
 
@@ -8029,15 +8041,17 @@ impl ScanIo for ProcScanIo {
     /// The closing generation proof. A warm view proves it through the
     /// metered primitives, one debit (a stop poll plus one charged work
     /// unit) per native call: its mount namespace, then its generation.
-    /// A view whose leader exited (now or earlier) keeps the cold
-    /// retained-member proof.
+    /// A view whose leader exited (now, shown by a missing namespace
+    /// link, or earlier) takes only the cold retained-member proof, so
+    /// there is one closing path and it never falls back to the warm
+    /// leader route.
     fn final_generation(
         &mut self,
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(), String> {
         if view.cold_filesystem_observed() {
-            return view.with_filesystem(budget, |_, _| Ok(()));
+            return view.cold_closing_proof(budget);
         }
         let mut refusal = None;
         let proof = view.metered_closing_proof(&mut || {
@@ -8056,7 +8070,7 @@ impl ScanIo for ProcScanIo {
         match proof {
             None => Err(refusal.unwrap_or(WORK_CEILING_REASON).into()),
             Some(ClosingProof::Current) => Ok(()),
-            Some(ClosingProof::ColdTransition) => view.with_filesystem(budget, |_, _| Ok(())),
+            Some(ClosingProof::ColdTransition) => view.cold_closing_proof(budget),
             Some(ClosingProof::Failed(reason)) => Err(reason),
         }
     }

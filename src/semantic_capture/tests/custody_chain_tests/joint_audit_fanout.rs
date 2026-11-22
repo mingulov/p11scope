@@ -39366,6 +39366,116 @@ fn joint_seal_floors_past_frontier_waits_as_future_input() {
     );
 }
 
+/// A decided future wait settles without re-scanning staging: 97
+/// retained rows on another image share the frame, the seal waits
+/// `AbandonReturnPending`, and settlement advances as future input
+/// with zero terminal checks — an eager check would read every row
+/// (past one 64-unit credit) before the single-unit Future charge.
+#[test]
+fn joint_seal_future_wait_skips_terminal_scan_with_populated_staging() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    // One open call plus a healthy pair. The open call carries a
+    // pending return: enough evidence for H0 to form the call, but a
+    // pending return never corroborates — so the abandonment stages
+    // uncorroborated.
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    // 97 retained rows on another image (above every cut, barring
+    // nothing): an eager terminal check would read every one.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let mut remaining = 10;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "the uncorroborated bound waits as future input"
+    );
+    assert_eq!(remaining, 9, "the finished frame charges one unit");
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::AbandonReturnPending,
+        "the wait names its gate"
+    );
+    assert!(
+        ports.read().1.adapter().seal_stage_diagnosis().open_staged > 64,
+        "the staging table holds past one credit of rows"
+    );
+    assert_eq!(
+        ports.read().1.adapter().awaits_terminal_checks_for_test(),
+        0,
+        "the decided wait settles with zero terminal checks"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the consumer advances past the wait"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a Future wait sets no active delivery"
+    );
+}
+
 /// Unbound staging stays retry (the control twin of the future-wait
 /// seals): a seal barriered by history no bound key can account for
 /// keeps retrying instead of advancing as future input — only a void
@@ -39416,6 +39526,11 @@ fn joint_seal_unbound_staging_stays_retry() {
         adapter.seal_stage_diagnosis().unbound_staging >= 1,
         "the wait counts its stage gate"
     );
+    assert_eq!(
+        adapter.awaits_terminal_checks_for_test(),
+        0,
+        "a decided UnboundStaging barrier never re-scans staging at settle"
+    );
     // Past the bound the retry-only seal refuses: it never publishes
     // as a future wait would.
     fixture.machine.set_finish_no_progress_since_for_test(Some(
@@ -39430,14 +39545,18 @@ fn joint_seal_unbound_staging_stays_retry() {
 }
 
 /// A failure-path yield that spent budget is progress at the
-/// delivery seam; a yield with no spend stays stuck. Starved twin:
-/// zero budget yields with no spend, counting stuck with the streak
-/// standing. Draining twin: one unit per visit, and the first spend
-/// counts progress, resetting the streak and the park cursors — so
-/// the watchdog never parks a feed that is draining. Reverting the
-/// arm to unconditional stuck leaves progress at zero here.
+/// delivery seam; a yield with no spend stays stuck. A transient
+/// take retry first records a real stale streak (1,
+/// `BootstrapMismatch`) on the head consumer. Starved twin: zero
+/// budget yields with no spend, counting stuck with the streak and
+/// its cause standing. Draining twin: one unit per visit, and the
+/// first spend counts progress, clearing the streak and its cause
+/// and resetting the park cursors — so the watchdog never parks a
+/// feed that is draining. Deleting only the stale-streak clears
+/// leaves the seeded streak standing here.
 #[test]
 fn joint_failure_yielded_spend_counts_progress_at_delivery() {
+    use crate::semantics_objects::journal::JournalGap;
     use crate::semantics_objects::journal::joint_audit::{DeliverDiagnosis, ParkProgress};
 
     let mut fixture = CanonicalFanoutScene::prior_sealed();
@@ -39446,17 +39565,7 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
     fixture.push_two("C_SignInit", 4);
     let fault = FrameFault::clean();
     let mut frame = fixture.audited(6, 6, &fault);
-    // The collection moves after the audit: the seal fails closed
-    // with a loss both feeds must drain through bounded visits.
-    fault.epoch.set(1);
     let h0 = fixture.scene.real.h0.clone();
-    let mut births = NativeFrameBirths {
-        h0: &h0,
-        attached: &fixture.attached,
-        retained: &mut fixture.births,
-        seen: Vec::new(),
-        unreadable: false,
-    };
     let mut ports = fixture
         .scene
         .real
@@ -39465,10 +39574,28 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
         .joint_frame_ports(&fixture.scene.producers)
         .unwrap();
     frame.bind_targets(&ports).unwrap();
+    // Transient-take preamble: the first seal fails its birth take
+    // with partition contention, and the retry delivery records a
+    // real stuck streak — the stale streak the spending delivery
+    // below must clear.
+    let mut takes = FailTakeOnce {
+        inner: NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        },
+        fail: true,
+    };
     assert_eq!(
-        frame.seal_next(&mut ports, &mut births, &fault),
+        frame.seal_next(&mut ports, &mut takes, &fault),
         Ok(QuantumSealProgress::DeliveryReady),
-        "the moved collection seals its loss for delivery"
+        "the contended take seals its retry for delivery"
+    );
+    assert!(
+        takes.inner.seen.is_empty(),
+        "the failed take reads no birth"
     );
     // Park cursors go nonzero before the progress delivery: a
     // one-unit park scan examines the unstreaked head and yields
@@ -39482,6 +39609,40 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
         (1, 0),
         "the yielded scan leaves its resume cursor"
     );
+    assert_eq!(
+        frame.deliver_next(&mut ports),
+        Ok(QuantumSealProgress::LocalPending),
+        "the contended take retries"
+    );
+    drop(takes);
+    let causes = frame.consumer_stuck_causes_for_test();
+    assert_eq!(causes.len(), 2, "both consumers stay bound");
+    assert_eq!(
+        (causes[0].1, causes[0].2),
+        (1, Some(JournalGap::BootstrapMismatch)),
+        "the retry records a real stale streak and its cause"
+    );
+    // The collection moves after the retry: the next seal fails
+    // closed with a loss both feeds must drain through bounded visits.
+    fault.epoch.set(1);
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    assert_eq!(
+        frame.seal_next(&mut ports, &mut births, &fault),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the moved collection seals its loss for delivery"
+    );
+    let causes = frame.consumer_stuck_causes_for_test();
+    assert_eq!(
+        (causes[0].1, causes[0].2),
+        (1, Some(JournalGap::BootstrapMismatch)),
+        "the stale streak stands across the second seal"
+    );
     let mut diagnosis = DeliverDiagnosis::default();
     // Starved twin: zero budget yields with no spend.
     let mut remaining = 0;
@@ -39492,6 +39653,12 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
     );
     assert_eq!(diagnosis.f_stuck, 1, "no spend counts stuck");
     assert_eq!(diagnosis.f_progress, 0, "no spend is not progress");
+    let causes = frame.consumer_stuck_causes_for_test();
+    assert_eq!(
+        (causes[0].1, causes[0].2),
+        (1, Some(JournalGap::BootstrapMismatch)),
+        "a no-spend yield preserves the stale streak and its cause"
+    );
     // Draining twin: one unit per visit until the first spend.
     for _ in 0..8 {
         if diagnosis.f_progress == 1 {
@@ -39519,6 +39686,13 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
     );
     assert!(
         frame
+            .consumer_stuck_causes_for_test()
+            .iter()
+            .all(|(_, streak, gap)| *streak == 0 && gap.is_none()),
+        "the first spend clears the stale streak and its cause"
+    );
+    assert!(
+        frame
             .consumer_states_for_test()
             .iter()
             .all(|(_, _, streak, parked)| *streak == 0 && !parked),
@@ -39528,6 +39702,65 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
         frame.park_cursors_for_test(),
         (0, 0),
         "progress resets the park cursors"
+    );
+}
+
+/// Seal-stage diagnostics through the production seal: a stopped
+/// adapter refuses the frame seal and counts exactly the `Stopped`
+/// gate. The Scene twin pins the shared note; this twin pins the
+/// production wrapper's call to the shared guard — bypassing the
+/// guard in `seal_in_audit` turns only this test red.
+#[test]
+fn joint_seal_stopped_adapter_counts_through_frame_seal() {
+    use crate::semantics_objects::journal::SealWait;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(2, 2, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let before = ports.read().1.adapter().seal_stage_diagnosis().stopped;
+    // Stop the adapter through the production stop: the staged
+    // history is healthy, only this seal refuses.
+    {
+        let (_, owner, _, _, _) = ports.split();
+        let (adapter, model) = owner.parts();
+        adapter.stop(model);
+    }
+    let mut remaining = 10;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &fault, &mut remaining),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the stopped seal holds its refusal for delivery"
+    );
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::None,
+        "a wrapper refusal waits on nothing"
+    );
+    assert_eq!(
+        ports.read().1.adapter().seal_stage_diagnosis().stopped,
+        before + 1,
+        "the production seal counts its stopped gate"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a refusal sets no positive delivery"
     );
 }
 

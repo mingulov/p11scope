@@ -2265,6 +2265,11 @@ pub(crate) struct JournalAdapter {
     /// credit it debited.
     #[cfg(test)]
     test_leaf_visits: std::cell::Cell<usize>,
+    /// Test-only count of terminal-input checks. Each check re-examines
+    /// staging (a full open/refused scan when the barrier is clear), so
+    /// settlement must skip it for an already-decided wait.
+    #[cfg(test)]
+    awaits_terminal_checks: std::cell::Cell<usize>,
     /// The inline allowance a deciding call may spend on its own
     /// rejection (at most one credit; a budgeted caller lowers it to
     /// what its service budget has left) and what the last deciding
@@ -2531,6 +2536,8 @@ impl JournalAdapter {
             s1only_open: BTreeSet::new(),
             #[cfg(test)]
             test_leaf_visits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            awaits_terminal_checks: std::cell::Cell::new(0),
             inline_credit: SCOPED_RECOVERY_SLICE,
             inline_spent: 0,
             barrier_scan: None,
@@ -2800,6 +2807,12 @@ impl JournalAdapter {
     #[cfg(test)]
     pub(crate) fn leaf_visits_for_test(&self) -> usize {
         self.test_leaf_visits.get()
+    }
+
+    /// Test-only count of terminal-input checks so far.
+    #[cfg(test)]
+    pub(crate) fn awaits_terminal_checks_for_test(&self) -> usize {
+        self.awaits_terminal_checks.get()
     }
 
     /// Test-only: stage `rows` synthetic unconverted open entries cloned
@@ -9584,6 +9597,9 @@ impl JournalAdapter {
         bootstrap: &BootstrapReceipt,
         frontier: ConsumptionOrdinal,
     ) -> bool {
+        #[cfg(test)]
+        self.awaits_terminal_checks
+            .set(self.awaits_terminal_checks.get().saturating_add(1));
         if self.has_unbound_staging(frontier.0) {
             return false;
         }

@@ -1386,6 +1386,28 @@ impl IngestedJointQuantum {
             .collect()
     }
 
+    /// Stuck-delivery streaks and last gaps for progress tests:
+    /// (feed id, streak, last gap) in cursor order.
+    #[cfg(test)]
+    pub(crate) fn consumer_stuck_causes_for_test(
+        &self,
+    ) -> Vec<(
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId,
+        u32,
+        Option<super::JournalGap>,
+    )> {
+        self.consumers
+            .iter()
+            .map(|consumer| {
+                (
+                    consumer.target.id(),
+                    consumer.stuck_streak,
+                    consumer.last_stuck_gap,
+                )
+            })
+            .collect()
+    }
+
     /// Feed ids the frame proves stuck: unfinished consumers (Pending
     /// or Future) with a stuck-delivery streak, parked for forced
     /// fallback, or named by the frame's failure. The watchdog re-arm

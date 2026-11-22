@@ -362,14 +362,14 @@ fn joint_birth_funnel_line_format_is_exact() {
 
     let funnel = JointBirthFunnel::default();
     assert_eq!(
-        joint_birth_funnel_line(0, 0, &funnel, 0, 0),
-        "p11scope: joint birth funnel: formed=0 installed=0 upstream_shed=0 unlinked=0 \
-         prepare_foreign=0 prepare_cursor=0 prepare_entry=0 prepare_capacity_count=0 \
+        joint_birth_funnel_line(0, 0, 0, &funnel, 0, 0, 0),
+        "p11scope: joint birth funnel: formed=0 cooled=0 installed=0 unlinked=0 \
+         prepare_owner=0 prepare_cursor=0 prepare_entry=0 prepare_capacity_count=0 \
          prepare_capacity_bytes=0 prepare_duplicate=0 skip_no_grant=0 skip_empty=0 \
          abandoned_prepared=0 storage_refused=0 s1_finalize=0 dropped_ended_domain=0 \
          dropped_foreign_session=0 dropped_backpressure=0 dropped_no_lane=0 \
          dropped_abandoned=0 undecided_at_finish=0 resource_ledger=0 resource_table=0 \
-         reoffer_armed=0 reoffer_exhausted=0 oversized=0 merge_refused=0"
+         reoffer_armed=0 reoffer_exhausted=0 oversized=0 stash_shed=0 merge_refused=0"
     );
     let funnel = JointBirthFunnel {
         prepare_entry: 3,
@@ -379,14 +379,14 @@ fn joint_birth_funnel_line_format_is_exact() {
         ..JointBirthFunnel::default()
     };
     assert_eq!(
-        joint_birth_funnel_line(10, 6, &funnel, 0, 1),
-        "p11scope: joint birth funnel: formed=10 installed=6 upstream_shed=0 unlinked=0 \
-         prepare_foreign=0 prepare_cursor=0 prepare_entry=3 prepare_capacity_count=0 \
+        joint_birth_funnel_line(10, 1, 6, &funnel, 0, 2, 1),
+        "p11scope: joint birth funnel: formed=10 cooled=1 installed=6 unlinked=0 \
+         prepare_owner=0 prepare_cursor=0 prepare_entry=3 prepare_capacity_count=0 \
          prepare_capacity_bytes=0 prepare_duplicate=0 skip_no_grant=1 skip_empty=0 \
          abandoned_prepared=0 storage_refused=0 s1_finalize=0 dropped_ended_domain=0 \
          dropped_foreign_session=0 dropped_backpressure=0 dropped_no_lane=0 \
          dropped_abandoned=0 undecided_at_finish=0 resource_ledger=0 resource_table=0 \
-         reoffer_armed=2 reoffer_exhausted=4 oversized=0 merge_refused=1"
+         reoffer_armed=2 reoffer_exhausted=4 oversized=0 stash_shed=2 merge_refused=1"
     );
 }
 

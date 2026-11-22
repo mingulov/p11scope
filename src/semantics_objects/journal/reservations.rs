@@ -25,6 +25,10 @@ const MAX_INDEXED: usize = (u16::MAX as usize - 1) / ROLES;
 const INDEX_BUCKETS: usize = 1_024;
 /// Empty chain head/link: outside the node-code range.
 const INDEX_NONE: u16 = u16::MAX;
+/// Empty occupied-list head/link: outside every slot index. The
+/// occupied list spans unindexed tables too, so its links are `u32`
+/// (the `u16` node codes stop at `MAX_INDEXED`).
+const OCC_NONE: u32 = u32::MAX;
 /// Link planes inside each slot: key chains and id chains.
 const KEY_LINKS: usize = 0;
 const ID_LINKS: usize = 1;
@@ -42,6 +46,13 @@ fn node_slot(code: u16) -> usize {
 
 fn node_lane(code: u16) -> usize {
     usize::from(code) % ROLES
+}
+
+/// Occupied-list link for `slot`: every allocatable table fits the
+/// `u32` link range (a wider table is unallocatable).
+fn occ_link(slot: usize) -> u32 {
+    debug_assert!(slot < OCC_NONE as usize);
+    slot as u32
 }
 
 /// Deterministic Fx-style hash for the intrusive index. The seed and
@@ -139,6 +150,11 @@ struct TableSlot<C> {
     next: [[u16; ROLES]; 2],
     /// Free-list link: meaningful only while the slot is vacant.
     free_next: u16,
+    /// Occupied-list links: meaningful only while the slot holds an
+    /// operation (exactly the complement of the free list). The void
+    /// sweep walks these, so vacant capacity costs it no visits.
+    occ_prev: u32,
+    occ_next: u32,
 }
 
 impl<C> TableSlot<C> {
@@ -147,19 +163,21 @@ impl<C> TableSlot<C> {
             operation: None,
             next: [[INDEX_NONE; ROLES]; 2],
             free_next: INDEX_NONE,
+            occ_prev: OCC_NONE,
+            occ_next: OCC_NONE,
         }
     }
 }
 
 /// Resumable cursor for the budgeted role sweep (`release_role_step`).
-/// Slots advance in order; chain unlinks resume from their predecessor
-/// or retained splice position when a credit's leaf budget runs out.
-/// The table stays
+/// Occupied slots advance in list order (`None` resumes at the head);
+/// chain unlinks resume from their predecessor or retained splice
+/// position when a credit's leaf budget runs out. The table stays
 /// lookup-consistent across yields (a removed membership reads absent,
 /// a dangling alias node is skipped), but the caller must not insert,
 /// merge or transfer until the sweep completes.
 pub(super) struct ReleaseRoleCursor {
-    next_slot: usize,
+    next_occ: Option<u32>,
     pending_key: Option<PendingKeyUnlink>,
     pending_alias_slot: Option<usize>,
     pending_alias_lane: usize,
@@ -179,27 +197,35 @@ struct PendingUnlink {
 }
 
 /// One charged slot snapshot: the retained key for the visited role
-/// (if any), occupancy, other-role vacancy, and aliases.
+/// (if any), occupancy, other-role vacancy, aliases, and the
+/// occupied-list neighbors (retained for the sweep's advance and
+/// vacancy unlink, never re-read).
 struct SlotSnapshot {
     key: Option<RoleKey>,
     occupied: bool,
     other_vacant: bool,
     aliases: [Option<ReservationId>; ROLES],
+    occ_prev: u32,
+    occ_next: u32,
 }
 
-/// One swept membership's key unlink with its visit snapshot: whether
-/// the slot vacates once this membership leaves, plus its aliases for
-/// the alias-unlink queue. Retained (never re-read) across yields.
+/// One swept membership's key unlink with its visit snapshot: the
+/// slot, whether it vacates once this membership leaves, its aliases
+/// for the alias-unlink queue, and its occupied-list neighbors for
+/// the vacancy unlink. Retained (never re-read) across yields.
 struct PendingKeyUnlink {
     unlink: PendingUnlink,
+    slot: usize,
     other_vacant: bool,
     aliases: [Option<ReservationId>; ROLES],
+    occ_prev: u32,
+    occ_next: u32,
 }
 
 impl ReleaseRoleCursor {
     pub(super) fn new() -> Self {
         Self {
-            next_slot: 0,
+            next_occ: None,
             pending_key: None,
             pending_alias_slot: None,
             pending_alias_lane: 0,
@@ -369,6 +395,13 @@ pub(super) struct ReservationTable<C> {
     /// Intrusive free list head: per-slot links live in the slots. A
     /// slot is listed exactly while vacant.
     free_head: u16,
+    /// Intrusive occupied-list head and tail: per-slot links live in
+    /// the slots. A slot is listed exactly while it holds an operation
+    /// (every table, indexed or not), in insertion order; the void
+    /// sweep walks this list instead of the slot array, so vacant
+    /// capacity costs it no visits.
+    occ_head: u32,
+    occ_tail: u32,
     /// Test-only lookup cost counter: slot visits across
     /// `key_slot`, `id_slot` and free-slot searches.
     #[cfg(test)]
@@ -421,6 +454,8 @@ impl<C> ReservationTable<C> {
             key_heads: [INDEX_NONE; INDEX_BUCKETS],
             id_heads: [INDEX_NONE; INDEX_BUCKETS],
             free_head,
+            occ_head: OCC_NONE,
+            occ_tail: OCC_NONE,
             #[cfg(test)]
             test_slot_visits: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -482,6 +517,17 @@ impl<C> ReservationTable<C> {
         Some(self.slots[slot].next[plane][lane])
     }
 
+    /// Budgeted occupied-list head load through the single gate: the
+    /// first occupied slot, if any. Billed like an index-head load.
+    fn budgeted_occ_head(&self, budget: &mut LeafBudget) -> Option<u32> {
+        if !budget.try_charge() {
+            return None;
+        }
+        #[cfg(test)]
+        self.test_leaf_reads.set(self.test_leaf_reads.get() + 1);
+        Some(self.occ_head)
+    }
+
     /// Budgeted candidate inspection through the single gate: whether
     /// the node at (`slot`, `lane`) owns `role`/`key`.
     fn budgeted_match(
@@ -529,9 +575,10 @@ impl<C> ReservationTable<C> {
     }
 
     /// Budgeted sweep/scan slot snapshot through the single gate: one
-    /// charged slot access (1 leaf). The caller retains the snapshot
-    /// across yields, so later vacancy and alias decisions never
-    /// re-read the slot.
+    /// charged slot access (1 leaf), including the occupied-list
+    /// neighbors. The caller retains the snapshot across yields, so
+    /// later vacancy, alias and advance decisions never re-read the
+    /// slot.
     fn budgeted_slot_snapshot(
         &self,
         at: usize,
@@ -556,6 +603,8 @@ impl<C> ReservationTable<C> {
                     .all(|(lane, member)| lane == role.index() || member.is_none())
             }),
             aliases: operation.map_or([None; ROLES], |op| op.aliases),
+            occ_prev: self.slots[at].occ_prev,
+            occ_next: self.slots[at].occ_next,
         })
     }
 
@@ -684,6 +733,65 @@ impl<C> ReservationTable<C> {
                 return false;
             }
         }
+    }
+
+    /// Append a fresh operation to the occupied list, keeping
+    /// insertion order. State is taken explicitly so maintenance sites
+    /// can sequence their own borrows.
+    fn occ_push(head: &mut u32, tail: &mut u32, slots: &mut [TableSlot<C>], at: usize) {
+        debug_assert!(
+            slots[at].occ_prev == OCC_NONE && slots[at].occ_next == OCC_NONE,
+            "a fresh operation links exactly once"
+        );
+        let node = occ_link(at);
+        slots[at].occ_prev = *tail;
+        if *tail != OCC_NONE {
+            slots[*tail as usize].occ_next = node;
+        } else {
+            *head = node;
+        }
+        *tail = node;
+    }
+
+    /// Drop a vacated slot from the occupied list with its retained
+    /// neighbors (no reads: the caller snapshotted them at the charged
+    /// visit). Writes only, like splices.
+    fn occ_unlink_known(
+        head: &mut u32,
+        tail: &mut u32,
+        slots: &mut [TableSlot<C>],
+        at: usize,
+        prev: u32,
+        next: u32,
+    ) {
+        if prev == OCC_NONE {
+            *head = next;
+        } else {
+            slots[prev as usize].occ_next = next;
+        }
+        if next == OCC_NONE {
+            *tail = prev;
+        } else {
+            slots[next as usize].occ_prev = prev;
+        }
+        slots[at].occ_prev = OCC_NONE;
+        slots[at].occ_next = OCC_NONE;
+    }
+
+    /// Drop a vacated slot from the occupied list (synchronous paths,
+    /// which read links unbilled like the synchronous chain unlink).
+    fn occ_unlink(head: &mut u32, tail: &mut u32, slots: &mut [TableSlot<C>], at: usize) {
+        let prev = slots[at].occ_prev;
+        let next = slots[at].occ_next;
+        debug_assert!(
+            (prev == OCC_NONE) == (*head == occ_link(at)),
+            "the head agrees with the unlinked slot"
+        );
+        debug_assert!(
+            (next == OCC_NONE) == (*tail == occ_link(at)),
+            "the tail agrees with the unlinked slot"
+        );
+        Self::occ_unlink_known(head, tail, slots, at, prev, next);
     }
 
     /// Pop the first vacant slot from the intrusive free list.
@@ -905,11 +1013,12 @@ impl<C> ReservationTable<C> {
     }
 
     /// One budgeted sweep step over `role` through the shared
-    /// pre-debit `gate` (slot visits plus chain-link reads:
-    /// bucket-head, predecessor and target-successor loads, one unit
-    /// each, never beyond exhaustion). Returns whether the sweep
-    /// completed. The caller holds `cursor` across steps and must not
-    /// insert, merge or transfer until completion.
+    /// pre-debit `gate` (occupied-slot visits plus chain-link reads:
+    /// list-head, bucket-head, predecessor and target-successor
+    /// loads, one unit each, never beyond exhaustion). Vacant slots
+    /// are never visited. Returns whether the sweep completed. The
+    /// caller holds `cursor` across steps and must not insert, merge
+    /// or transfer until completion.
     pub(super) fn release_role_step(
         &mut self,
         role: Role,
@@ -956,7 +1065,6 @@ impl<C> ReservationTable<C> {
                     }
                     cursor.pending_alias_slot = None;
                     cursor.pending_alias_ids = [None; ROLES];
-                    cursor.next_slot = at + 1;
                 }
                 continue;
             }
@@ -966,21 +1074,46 @@ impl<C> ReservationTable<C> {
                     cursor.pending_key = Some(pending);
                     return false;
                 }
-                let at = cursor.next_slot;
+                // The advance past this slot was stashed at its visit.
                 if pending.other_vacant {
-                    self.clear_vacated_slot(at, cursor, pending.aliases);
-                } else {
-                    cursor.next_slot = at + 1;
+                    self.clear_vacated_slot(
+                        pending.slot,
+                        cursor,
+                        pending.aliases,
+                        pending.occ_prev,
+                        pending.occ_next,
+                    );
                 }
                 continue;
             }
-            if cursor.next_slot >= self.slots.len() {
-                return true;
-            }
-            let at = cursor.next_slot;
+            let at = match cursor.next_occ {
+                // A fresh sweep bills its list-head load like an
+                // index-head load, then stashes it: a yield before the
+                // first visit never re-reads the head.
+                None => {
+                    let Some(head) = self.budgeted_occ_head(gate) else {
+                        return false;
+                    };
+                    if head == OCC_NONE {
+                        return true;
+                    }
+                    cursor.next_occ = Some(head);
+                    head as usize
+                }
+                Some(next) => {
+                    if next == OCC_NONE {
+                        return true;
+                    }
+                    next as usize
+                }
+            };
             let Some(snapshot) = self.budgeted_slot_snapshot(at, role, gate) else {
                 return false;
             };
+            // Advance past this slot before its unlinks: later yields
+            // resume beyond it, so the visit never repeats even when
+            // its unlinks span credits.
+            cursor.next_occ = Some(snapshot.occ_next);
             if let Some(key) = snapshot.key {
                 let member = self.slots[at]
                     .operation
@@ -999,42 +1132,64 @@ impl<C> ReservationTable<C> {
                             prev: INDEX_NONE,
                             splice_ready: false,
                         },
+                        slot: at,
                         other_vacant: snapshot.other_vacant,
                         aliases: snapshot.aliases,
+                        occ_prev: snapshot.occ_prev,
+                        occ_next: snapshot.occ_next,
                     });
                     continue;
                 }
                 if snapshot.other_vacant {
-                    self.clear_vacated_slot(at, cursor, snapshot.aliases);
+                    self.clear_vacated_slot(
+                        at,
+                        cursor,
+                        snapshot.aliases,
+                        snapshot.occ_prev,
+                        snapshot.occ_next,
+                    );
                     continue;
                 }
-                cursor.next_slot = at + 1;
                 continue;
             }
             if snapshot.occupied && snapshot.other_vacant {
-                self.clear_vacated_slot(at, cursor, snapshot.aliases);
-            } else {
-                cursor.next_slot = at + 1;
+                self.clear_vacated_slot(
+                    at,
+                    cursor,
+                    snapshot.aliases,
+                    snapshot.occ_prev,
+                    snapshot.occ_next,
+                );
             }
         }
     }
 
-    /// Clear a vacated slot and queue its retained alias unlinks in
+    /// Clear a vacated slot, drop it from the occupied list with its
+    /// retained neighbors, and queue its retained alias unlinks in
     /// the cursor. The slot's chain links stay (dangling but linked)
     /// until each alias splice completes; lookups skip the cleared
     /// operation meanwhile. Unindexed tables never linked aliases, so
-    /// they finish immediately. Reads nothing: vacancy was decided
-    /// and aliases snapshotted at the charged visit.
+    /// they finish immediately. Reads nothing: vacancy, aliases and
+    /// neighbors were snapshotted at the charged visit.
     fn clear_vacated_slot(
         &mut self,
         at: usize,
         cursor: &mut ReleaseRoleCursor,
         aliases: [Option<ReservationId>; ROLES],
+        occ_prev: u32,
+        occ_next: u32,
     ) {
+        Self::occ_unlink_known(
+            &mut self.occ_head,
+            &mut self.occ_tail,
+            &mut self.slots,
+            at,
+            occ_prev,
+            occ_next,
+        );
         self.slots[at].operation = None;
         self.live -= 1;
         if !self.indexed() {
-            cursor.next_slot = at + 1;
             return;
         }
         cursor.pending_alias_slot = Some(at);
@@ -1279,9 +1434,9 @@ impl<C> ReservationTable<C> {
     }
 
     /// Initialize a fresh operation in a popped slot: mint its never
-    /// recycled id, link its id node, count it live. Shared by the
-    /// synchronous insert and the budgeted mint commit so the two
-    /// cannot drift.
+    /// recycled id, link its id node, list it occupied, count it
+    /// live. Shared by the synchronous insert and the budgeted mint
+    /// commit so the two cannot drift.
     pub(super) fn init_fresh_operation(&mut self, at: usize) {
         let id = ReservationId(self.next + 1);
         let mut aliases = [None; ROLES];
@@ -1292,6 +1447,7 @@ impl<C> ReservationTable<C> {
         });
         self.next = id.0;
         self.live += 1;
+        Self::occ_push(&mut self.occ_head, &mut self.occ_tail, &mut self.slots, at);
         if self.indexed() {
             Self::chain_link(
                 &mut self.id_heads,
@@ -1349,6 +1505,7 @@ impl<C> ReservationTable<C> {
         self.populations[role.index()] -= 1;
         if operation.roles.iter().all(Option::is_none) {
             let aliases = operation.aliases;
+            Self::occ_unlink(&mut self.occ_head, &mut self.occ_tail, &mut self.slots, at);
             self.slots[at].operation = None;
             self.live -= 1;
             if self.indexed() {
@@ -1645,6 +1802,12 @@ impl<C> ReservationTable<C> {
                         self.bytes -= member.bytes;
                         let result = (member.bytes, member.charge);
                         if snapshot.other_vacant {
+                            Self::occ_unlink(
+                                &mut self.occ_head,
+                                &mut self.occ_tail,
+                                &mut self.slots,
+                                at,
+                            );
                             self.slots[at].operation = None;
                             self.live -= 1;
                         }
@@ -1686,6 +1849,12 @@ impl<C> ReservationTable<C> {
                     }
                     let taken = result.take().expect("pending release keeps its charge");
                     if other_vacant {
+                        Self::occ_unlink(
+                            &mut self.occ_head,
+                            &mut self.occ_tail,
+                            &mut self.slots,
+                            slot,
+                        );
                         self.slots[slot].operation = None;
                         self.live -= 1;
                         cursor.state = SingleReleaseState::UnlinkingAliases {
@@ -1853,6 +2022,12 @@ impl<C> ReservationTable<C> {
             }
         }
         let head = left_operation.aliases[0].unwrap();
+        Self::occ_unlink(
+            &mut self.occ_head,
+            &mut self.occ_tail,
+            &mut self.slots,
+            right,
+        );
         self.live -= 1;
         if self.indexed() {
             for (lane, key) in &moved_roles[..moved_roles_len] {
@@ -3144,5 +3319,83 @@ mod tests {
                 "{name} must not reload the slot after its charged visit"
             );
         }
+    }
+
+    #[test]
+    fn resource_reservations_void_sweep_visits_occupied_slots_only() {
+        // Three H8 members plus one Model sibling in the 4,096 staging
+        // table: the sweep must bill the occupied slots (plus the head
+        // load and the members' link reads), not the vacant capacity
+        // — one 64-unit credit completes it, every H8 gone, the
+        // sibling untouched.
+        let mut table = ReservationTable::try_new(4_096).unwrap();
+        for ordinal in 0..3u64 {
+            table
+                .insert(Role::H8Open, key(500_000 + ordinal), None, 10, ())
+                .unwrap();
+        }
+        table
+            .insert(Role::Model, key(600_000), None, 20, ())
+            .unwrap();
+        assert_eq!(table.population(Role::H8Open), 3);
+        let mut cursor = ReleaseRoleCursor::new();
+        table.reset_test_leaf_reads_for_test();
+        let mut gate = LeafBudget::new(64);
+        let done = table.release_role_step(Role::H8Open, &mut cursor, &mut gate);
+        let spent = gate.spent();
+        assert!(done, "a 4-operation sparse void completes in one credit");
+        assert!(
+            spent < 64,
+            "the sparse void bills its occupied slots, not the capacity: {spent}"
+        );
+        assert_eq!(
+            spent,
+            table.test_leaf_reads_for_test(),
+            "every billed leaf was read"
+        );
+        assert_eq!(table.population(Role::H8Open), 0);
+        assert_eq!(table.population(Role::Model), 1);
+        assert_eq!(table.member_bytes(Role::Model, key(600_000)), Some(20));
+        assert_eq!((table.census(), table.bytes()), (1, 20));
+    }
+
+    #[test]
+    fn resource_reservations_occupied_list_tracks_live_operations() {
+        // The sweep walks the occupied list, so listing must match
+        // liveness exactly across insert, merge, release and a void
+        // sweep (vacated slots leave, survivors stay, order aside).
+        let listed = |table: &ReservationTable<()>| {
+            let mut slots = Vec::new();
+            let mut node = table.occ_head;
+            while node != OCC_NONE {
+                slots.push(node as usize);
+                node = table.slots[node as usize].occ_next;
+            }
+            slots.sort_unstable();
+            slots
+        };
+        let live = |table: &ReservationTable<()>| {
+            table
+                .slots
+                .iter()
+                .enumerate()
+                .filter_map(|(at, slot)| slot.operation.is_some().then_some(at))
+                .collect::<Vec<_>>()
+        };
+        let mut table = ReservationTable::try_new(64).unwrap();
+        let a = table.insert(Role::Raw, key(1), None, 1, ()).unwrap();
+        let b = table.insert(Role::Model, key(2), None, 1, ()).unwrap();
+        table.insert(Role::H8Open, key(3), None, 1, ()).unwrap();
+        assert_eq!(listed(&table), live(&table));
+        table.merge(a, b).unwrap();
+        assert_eq!(listed(&table), live(&table));
+        table.release(Role::H8Open, key(3)).unwrap();
+        assert_eq!(listed(&table), live(&table));
+        table.release_role(Role::Raw);
+        assert_eq!(listed(&table), live(&table));
+        table.release(Role::Model, key(2)).unwrap();
+        assert_eq!(listed(&table), live(&table));
+        assert!(live(&table).is_empty());
+        assert_eq!(table.census(), 0);
     }
 }

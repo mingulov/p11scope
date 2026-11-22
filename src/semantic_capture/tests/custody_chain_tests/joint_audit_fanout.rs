@@ -33100,23 +33100,26 @@ fn joint_replay_steps_drained_conversion_completes_tail_free_call() {
 
 /// Held-drain twin of
 /// joint_replay_steps_drained_conversion_completes_tail_free_call:
-/// the first drained completion stays held past its conversion seal
-/// (the second call's still-open BEGIN keeps the settlement
-/// watermark below its cut), so the deferred End replays from the
-/// third seal alongside the second drain. That seal must not re-mint
-/// the settled row, its frozen table must describe the held
-/// completion (end cut, never abandoned), and the deferred End must
-/// replay end to end instead of stalling the feed head.
+/// the drained completion stays held past its conversion seal (the
+/// holder's still-open BEGIN keeps the settlement watermark below
+/// its cut), so the deferred End replays from the third seal. That
+/// seal must not re-mint the settled row, its frozen table must
+/// describe the held completion (end cut, never abandoned), and the
+/// deferred End must replay end to end instead of stalling the feed
+/// head. The holder itself is genuinely abandoned at exec exit: its
+/// counted named loss is the honest control.
 #[test]
 fn joint_replay_steps_held_drain_defers_end_past_conversion() {
     use crate::semantics_objects::journal::SealReplayPhase;
     use crate::semantics_objects::journal::tests::abandon_bytes;
     use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
-    // Two exit-raced calls on the same key: both BEGINs and ordinary
-    // returns land here, the abandonments one quantum apart. A
-    // healthy END-closed holder would double-admit (its END's H0 copy
-    // is a second admission for the same invocation), so the holder
-    // is a second drain instead.
+    // One exit-raced call plus one holder on the same key: both
+    // BEGINs and ordinary returns land here, the abandonments one
+    // quantum apart. A healthy END-closed holder would double-admit
+    // (its END's H0 copy is a second admission for the same
+    // invocation), so the holder closes by exec-exit abandonment: a
+    // neutral call with a clean return disposes per call, keeping its
+    // counted named loss while the watermark releases.
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let (target, pid) = fixture.replay_target();
     let (open, ordinary) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 2);
@@ -33256,14 +33259,16 @@ fn joint_replay_steps_held_drain_defers_end_past_conversion() {
     assert!(conversions[0].effect_range().is_empty());
     fixture.scene.assert_claims(&[]);
     let before_feeds = fixture.feeds();
-    let holder_cut = second.prefix.frontier_cut() + 1;
 
-    // The third quantum drains the holder: the watermark releases and
-    // the deferred End mints alongside the fresh one.
+    // The third quantum abandons the holder at exec exit: a neutral
+    // call with a clean corroborated return disposes per call (its
+    // counted named loss), the watermark releases, and the deferred
+    // End mints.
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
     let mut holder_abandon = abandon_bytes(
         u64::from(pid),
         3,
-        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        JOURNAL_REASON_EXEC_EXIT,
         (image.task_cookie, image.exec_id),
     );
     holder_abandon[24..32].copy_from_slice(&held[24..32]);
@@ -33277,27 +33282,15 @@ fn joint_replay_steps_held_drain_defers_end_past_conversion() {
     let mut q3 = fixture.audited(0, 0, &BirthFault);
     assert!(
         q3.failure_for_test().is_none(),
-        "q3 drained ABANDON must preserve resource custody: {:?}",
+        "q3 holder ABANDON must preserve resource custody: {:?}",
         q3.failure_for_test()
     );
     fixture.seal_replay_head(&mut q3, &BirthFault);
     let third = q3.active_seal_for_test().unwrap();
-    assert_eq!(
-        third.prefix.settled().len(),
-        1,
+    assert!(
+        third.prefix.settled().is_empty(),
         "a converted drain never re-mints on a later seal: {:?}",
         third.prefix.settled()
-    );
-    let holder_done = third.prefix.settled()[0];
-    assert_eq!(holder_done.ticket, holder_open.ticket);
-    assert!(
-        !holder_done.abandoned,
-        "the second drain completes, never abandons"
-    );
-    assert_eq!(
-        holder_done.end_cut,
-        Some(holder_cut),
-        "the completion cut is the abandonment ordinal"
     );
     let frozen = *third
         .prefix
@@ -33311,6 +33304,13 @@ fn joint_replay_steps_held_drain_defers_end_past_conversion() {
         "the frozen row keeps the completion cut"
     );
     assert!(!frozen.abandoned, "the frozen row never abandons");
+    let holder_row = *third
+        .prefix
+        .replay_calls()
+        .iter()
+        .find(|call| call.ticket == holder_open.ticket)
+        .expect("the disposed holder stays frozen");
+    assert!(holder_row.abandoned && holder_row.end_cut.is_none());
     assert_original_replay_partition(third);
     for foreign in second.prefix.replay_steps() {
         assert!(third.prefix.call_for_step(foreign).is_none());
@@ -33324,6 +33324,34 @@ fn joint_replay_steps_held_drain_defers_end_past_conversion() {
             .any(|step| step.phase() == SealReplayPhase::BoundedLoss),
         "a drained return mints no loss"
     );
+    // The holder's counted named loss: exactly one per-call loss gap,
+    // owned by a CallLoss step bound to the abandoned call.
+    let lost: Vec<_> = third
+        .effects
+        .effects
+        .iter()
+        .enumerate()
+        .filter(|(_, effect)| {
+            matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: ObjectGap::OutcomeLost
+                }
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(lost.len(), 1, "exactly one per-call loss gap");
+    let owner = third
+        .prefix
+        .replay_steps()
+        .iter()
+        .find(|step| step.effect_range().contains(&lost[0]))
+        .expect("an original replay step owns the per-call loss effect");
+    assert_eq!(owner.phase(), SealReplayPhase::CallLoss);
+    let loss_call = third.prefix.call_for_step(owner).unwrap();
+    assert_eq!(loss_call.ticket, holder_open.ticket);
+    assert!(loss_call.abandoned && loss_call.end_cut.is_none());
     let terminal: Vec<_> = third
         .prefix
         .replay_steps()
@@ -33332,65 +33360,46 @@ fn joint_replay_steps_held_drain_defers_end_past_conversion() {
         .collect();
     assert_eq!(
         terminal.len(),
-        2,
-        "the held drain settles alongside the second drain"
+        1,
+        "the deferred End mints once the watermark releases"
     );
-    for step in &terminal {
-        let call = third.prefix.call_for_step(step).unwrap();
-        if call.ticket == drained.ticket {
-            assert_eq!((*call, step.cut()), (frozen, Some(recovered_cut)));
-        } else {
-            assert_eq!((*call, step.cut()), (holder_done, Some(holder_cut)));
-        }
-        assert!(
-            step.effect_range().is_empty(),
-            "a drained Update completes with no fabricated effects"
-        );
-    }
-    // No loss, no contradiction, no malformation anywhere in the seal:
-    // completing at a stale cut voids the domain instead of recovering.
+    let call = third.prefix.call_for_step(terminal[0]).unwrap();
+    assert_eq!((*call, terminal[0].cut()), (frozen, Some(recovered_cut)));
+    assert!(
+        terminal[0].effect_range().is_empty(),
+        "the drained Update completes with no fabricated effects"
+    );
+    // No contradiction and no malformation anywhere in the seal:
+    // completing at a stale cut voids the domain instead of
+    // recovering. The holder's own OutcomeLost gap is pinned above.
     assert!(
         !third.effects.effects.iter().any(|effect| matches!(
             effect,
             ObjectEffect::AccessEnded {
-                reason: ObjectGap::OutcomeLost
-                    | ObjectGap::PrefixContradiction
-                    | ObjectGap::MalformedFact,
+                reason: ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
                 ..
             } | ObjectEffect::Retired {
-                reason: ObjectGap::OutcomeLost
-                    | ObjectGap::PrefixContradiction
-                    | ObjectGap::MalformedFact,
+                reason: ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
                 ..
             } | ObjectEffect::MetadataInvalidated {
-                reason: ObjectGap::OutcomeLost
-                    | ObjectGap::PrefixContradiction
-                    | ObjectGap::MalformedFact,
+                reason: ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
                 ..
             } | ObjectEffect::Downgraded {
-                reason: ObjectGap::OutcomeLost
-                    | ObjectGap::PrefixContradiction
-                    | ObjectGap::MalformedFact,
+                reason: ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
                 ..
             } | ObjectEffect::Unresolved {
-                reason: ObjectGap::OutcomeLost
-                    | ObjectGap::PrefixContradiction
-                    | ObjectGap::MalformedFact,
+                reason: ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
                 ..
             } | ObjectEffect::Gap {
-                reason: ObjectGap::OutcomeLost
-                    | ObjectGap::PrefixContradiction
-                    | ObjectGap::MalformedFact,
+                reason: ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
             } | ObjectEffect::SessionEnded {
                 end: crate::semantics_objects::SessionEnd::Uncertain(
-                    ObjectGap::OutcomeLost
-                        | ObjectGap::PrefixContradiction
-                        | ObjectGap::MalformedFact,
+                    ObjectGap::PrefixContradiction | ObjectGap::MalformedFact,
                 ),
                 ..
             }
         )),
-        "no outcome is lost and no prefix is contradicted: {:?}",
+        "no prefix is contradicted: {:?}",
         third.effects.effects
     );
     // Seal-time custody matches the conversion twin: the drain changes
@@ -33401,7 +33410,8 @@ fn joint_replay_steps_held_drain_defers_end_past_conversion() {
         "representation activates no H9 replay"
     );
     fixture.scene.assert_claims(&[]);
-    // Both genuine completions replay end to end; nothing disposes.
+    // The deferred End replays end to end; the holder's named loss
+    // reduces through the live reducer with its own span.
     let target_before = before_feeds
         .iter()
         .find(|feed| feed.id == target.id())

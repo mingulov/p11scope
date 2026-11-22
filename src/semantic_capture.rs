@@ -986,7 +986,23 @@ pub(crate) struct TickReport {
     /// possibly waiting: the driver commits promptly so the next
     /// service drains again. Retained deliveries never set this.
     pub(crate) collection_saturated: bool,
+    /// Held-admission requeue skips this tick, per named reason (see
+    /// the `HELD_REQUEUE_SKIP_*` slots): keys evaluated but not queued.
+    /// Deferred, never shed; counts only, no identities.
+    pub(crate) held_requeue_skips: [u64; 5],
 }
+
+/// Slot in `TickReport::held_requeue_skips` for keys that already
+/// have a scan job queued.
+pub(crate) const HELD_REQUEUE_SKIP_HAS_JOB: usize = 0;
+/// Slot for keys with no endpoint (defensive: collection sheds these).
+pub(crate) const HELD_REQUEUE_SKIP_NO_ENDPOINT: usize = 1;
+/// Slot for keys whose image is retired (exit or exec rebind).
+pub(crate) const HELD_REQUEUE_SKIP_RETIRED: usize = 2;
+/// Slot for keys whose task holds no semantic binding.
+pub(crate) const HELD_REQUEUE_SKIP_UNBOUND: usize = 3;
+/// Slot for keys with no live pin for their process this tick.
+pub(crate) const HELD_REQUEUE_SKIP_NO_PIN: usize = 4;
 
 fn pending_q_array_bytes<T>(capacity: usize) -> Option<usize> {
     capacity
@@ -4829,12 +4845,19 @@ impl SemanticCapture {
     /// whose task already holds a semantic binding requeue: the binding
     /// proves the pin-to-task link a held record alone cannot carry, so a
     /// never-bound burst (pid reuse, exec) is never scanned under another
-    /// task's pin. Visits at most `scans` distinct keys per pass from the
-    /// resume cursor (wrapping), queueing only keys with a live pin, no
-    /// existing job and no retirement; every other key keeps waiting for
-    /// a later pass, its horizon, or stop. Queued jobs join the sweep
-    /// below, so no new budget is spent: the sweep's own bound paces
-    /// them. Never sheds.
+    /// task's pin. Visits at most `scans` distinct keys per pass from a
+    /// wrapping resume cursor. The cursor advances past queued keys and
+    /// persistently unserviceable ones (retired, unbound, endpoint-less),
+    /// so a serviceable key behind any number of them is evaluated
+    /// within a finite number of passes; transient waits (already queued,
+    /// pin absent) are retried from the same cursor and resolve or shed
+    /// within a finite horizon, so no key starves forever. Queueing needs
+    /// a live pin, no existing job and no retirement; every other key
+    /// keeps waiting for a later pass, its horizon, or stop.
+    /// Evaluated-but-unqueued keys are counted by named reason in the
+    /// report (`held_requeue_skips`). Queued jobs join the sweep below,
+    /// so no new budget is spent: the sweep's own bound paces them.
+    /// Never sheds.
     fn requeue_held_admissions(
         &mut self,
         io: &mut impl CaptureIo,
@@ -4847,8 +4870,18 @@ impl SemanticCapture {
         let bound = self.limits.scans;
         let start = self.held_requeue_cursor;
         let mut seen: BTreeSet<(u64, u64, u32)> = BTreeSet::new();
-        let mut candidates: Vec<(ImageIdentity, Endpoint, u32, u32)> = Vec::new();
-        let mut last = start;
+        enum Action {
+            Queue(ImageIdentity, Endpoint, u32, Arc<PidPin>),
+            Skip(usize),
+        }
+        let mut actions: Vec<Action> = Vec::new();
+        // The cursor advances past queued keys and persistently
+        // unserviceable ones (retired, unbound, endpoint-less), so a
+        // serviceable key behind any number of them is evaluated within
+        // a finite number of passes. Transient waits (already queued,
+        // pin absent) are retried from the same cursor: they resolve or
+        // shed within a finite horizon, so no key starves forever.
+        let mut last_advanced = start;
         {
             let after = self
                 .awaiting
@@ -4857,57 +4890,77 @@ impl SemanticCapture {
                 .awaiting
                 .range((std::ops::Bound::Unbounded, std::ops::Bound::Included(start)));
             for (token, waiting) in after.chain(wrapped) {
-                last = *token;
                 if seen.len() >= bound {
                     break;
                 }
                 let key = Self::pending_key(waiting);
                 if !seen.insert(key) {
+                    // A second waiter for an evaluated key: past it.
+                    last_advanced = *token;
                     continue;
                 }
+                let image = waiting.record.base.event.image;
+                let pid = (waiting.record.base.event.pid_tgid >> 32) as u32;
                 if self.jobs.iter().any(|job| job.key() == key) {
+                    actions.push(Action::Skip(HELD_REQUEUE_SKIP_HAS_JOB));
                     continue;
                 }
                 let Some(endpoint) = waiting.endpoint else {
+                    actions.push(Action::Skip(HELD_REQUEUE_SKIP_NO_ENDPOINT));
+                    last_advanced = *token;
                     continue;
                 };
-                candidates.push((
-                    waiting.record.base.event.image,
+                // Retired images never requeue (a rebound exec keeps its
+                // binding slot under the successor, so retirement is
+                // checked before the binding gate below).
+                if self.router.is_image_retired(image) {
+                    actions.push(Action::Skip(HELD_REQUEUE_SKIP_RETIRED));
+                    last_advanced = *token;
+                    continue;
+                }
+                // Only bound tasks requeue (see above); the binding also
+                // answers the capacity question, since the accept path skips
+                // its bindings check for an already-bound task.
+                if !self.bindings.contains_key(&image.task_cookie) {
+                    actions.push(Action::Skip(HELD_REQUEUE_SKIP_UNBOUND));
+                    last_advanced = *token;
+                    continue;
+                }
+                let Some(pin) = io.target(pid) else {
+                    actions.push(Action::Skip(HELD_REQUEUE_SKIP_NO_PIN));
+                    continue;
+                };
+                actions.push(Action::Queue(
+                    image,
                     endpoint,
                     waiting.record.base.event.slot,
-                    (waiting.record.base.event.pid_tgid >> 32) as u32,
+                    pin,
                 ));
+                last_advanced = *token;
             }
         }
-        self.held_requeue_cursor = last;
-        for (image, endpoint, slot, pid) in candidates {
-            // Retired images never requeue (a rebound exec keeps its
-            // binding slot under the successor, so retirement is
-            // checked before the binding gate below).
-            if self.router.is_image_retired(image) {
-                continue;
+        self.held_requeue_cursor = last_advanced;
+        for action in actions {
+            match action {
+                Action::Skip(slot) => {
+                    report.held_requeue_skips[slot] =
+                        report.held_requeue_skips[slot].saturating_add(1);
+                }
+                Action::Queue(image, endpoint, slot, pin) => {
+                    let Some(deadline) = io.now().checked_add(self.limits.pending_for) else {
+                        self.exhaust(report);
+                        continue;
+                    };
+                    self.jobs.push_back(ScanJob {
+                        image,
+                        endpoint,
+                        slot,
+                        pin,
+                        deadline,
+                        birth_cut: birth_cut.clone(),
+                    });
+                }
             }
-            // Only bound tasks requeue (see above); the binding also
-            // answers the capacity question, since the accept path skips
-            // its bindings check for an already-bound task.
-            if !self.bindings.contains_key(&image.task_cookie) {
-                continue;
-            }
-            let Some(pin) = io.target(pid) else {
-                continue;
-            };
-            let Some(deadline) = io.now().checked_add(self.limits.pending_for) else {
-                self.exhaust(report);
-                continue;
-            };
-            self.jobs.push_back(ScanJob {
-                image,
-                endpoint,
-                slot,
-                pin,
-                deadline,
-                birth_cut: birth_cut.clone(),
-            });
         }
     }
 

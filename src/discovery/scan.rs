@@ -10808,6 +10808,14 @@ mod tests {
         exe_override: Option<PathBuf>,
     }
 
+    thread_local! {
+        /// Generation probes issued on this thread when the bracket
+        /// fixture's `final_generation` returned: probes counted after
+        /// this mark are the closing bracket's own.
+        static FINAL_GENERATION_PROBES: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
     struct BracketMemory {
         file: File,
         log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
@@ -10914,11 +10922,14 @@ mod tests {
                     .spend(self.final_generation_spend)
                     .map_err(str::to_owned)?;
             }
-            if self.fail_generation {
+            let generation = if self.fail_generation {
                 Err("injected generation loss".into())
             } else {
                 view.run_while_same(|| ())
-            }
+            };
+            FINAL_GENERATION_PROBES
+                .with(|mark| mark.set(Some(crate::process::generation_probe_test::count())));
+            generation
         }
         fn exe_target(&mut self, view: &ProcessView) -> std::io::Result<PathBuf> {
             if let Some(scripted) = &self.exe_override {
@@ -23232,6 +23243,473 @@ int main(int argc, char **argv) {
             "a stopped pass refuses the read"
         );
         assert_eq!(reads, 0, "no procfs read after the stop");
+    }
+
+    /// A resume-armed budget whose shared collection work admits exactly
+    /// `credits` units; the counter reports the units admitted so far.
+    fn credited_resume_budget(
+        credits: u64,
+    ) -> (
+        CaptureWorkBudget,
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let admitted = std::sync::Arc::new(AtomicU64::new(0));
+        let counted = admitted.clone();
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        budget.set_collection_work(CollectionWork::new(move |units| {
+            let spent = counted.load(Ordering::SeqCst);
+            if spent.saturating_add(units) > credits {
+                return false;
+            }
+            counted.store(spent + units, Ordering::SeqCst);
+            true
+        }));
+        (budget, admitted)
+    }
+
+    /// The executable-image bracket buys each operation with its own
+    /// unit: the opening generation check, the readlink and the closing
+    /// check. With fewer than three units the key is refused, never
+    /// built from an unclosed bracket; a proven generation change
+    /// reads no image.
+    #[test]
+    fn resume_exec_bracket_admits_each_generation_check_and_the_read() {
+        use std::sync::atomic::Ordering;
+        for credits in 0..=4u64 {
+            let (mut budget, admitted) = credited_resume_budget(credits);
+            let operations = std::cell::Cell::new(0u64);
+            let image = resume_view_exec(
+                &mut budget,
+                || {
+                    operations.set(operations.get() + 1);
+                    true
+                },
+                || {
+                    operations.set(operations.get() + 1);
+                    Some(b"/bin/sh".to_vec())
+                },
+            );
+            assert!(
+                operations.get() <= admitted.load(Ordering::SeqCst),
+                "credits {credits}: {} operations for {} admitted units",
+                operations.get(),
+                admitted.load(Ordering::SeqCst)
+            );
+            let expected = (credits >= 3).then(|| Some(b"/bin/sh".to_vec()));
+            assert_eq!(image, expected, "credits {credits}");
+            if credits >= 3 {
+                assert_eq!(
+                    operations.get(),
+                    3,
+                    "a healthy bracket runs all three steps"
+                );
+            }
+        }
+        let (mut budget, _) = credited_resume_budget(3);
+        let reads = std::cell::Cell::new(0u64);
+        assert_eq!(
+            resume_view_exec(
+                &mut budget,
+                || false,
+                || {
+                    reads.set(reads.get() + 1);
+                    Some(b"/bin/sh".to_vec())
+                },
+            ),
+            Some(None),
+            "a proven generation change carries no image"
+        );
+        assert_eq!(reads.get(), 0, "no readlink after a failed opening check");
+    }
+
+    /// Count the provider metadata reads (`fstat`, `fstatfs`, mount
+    /// table and fdinfo reads) one action performs on this thread.
+    fn metadata_reads_during<T>(action: impl FnOnce() -> T) -> (T, u64) {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let counted = reads.clone();
+        let value = crate::discovery::identity::provider_metadata_read_test::observe(
+            move |_| counted.set(counted.get() + 1),
+            action,
+        );
+        (value, reads.get())
+    }
+
+    /// One file's cursor-key metadata reads, each under its own unit:
+    /// with `credits` units the helper performs at most `credits`
+    /// reads, a stopped pass performs none, and ample credit yields the
+    /// same key the unmetered helpers compute for the held fd.
+    fn assert_cursor_key_reads_are_admitted(file: &File, ample: u64) {
+        use std::sync::atomic::Ordering;
+        let key = object_key_of(file);
+        let expected = crate::discovery::identity::file_inodes_are_unique(file).then(|| {
+            InspectedFileKey::for_open_file(file, key.device, key.inode, pin_of(file).unwrap())
+                .unwrap()
+        });
+        for credits in (0..=8u64).chain([ample]) {
+            let (mut budget, admitted) = credited_resume_budget(credits);
+            let (got, reads) =
+                metadata_reads_during(|| cursor_file_key_for(file, key, &mut budget));
+            assert!(
+                reads <= admitted.load(Ordering::SeqCst),
+                "credits {credits}: {reads} metadata reads for {} admitted units",
+                admitted.load(Ordering::SeqCst)
+            );
+            if credits == ample {
+                assert_eq!(got, expected, "ample credit keys the held fd");
+            }
+        }
+        let (mut stopped, _) = credited_resume_budget(ample);
+        stopped.pass_owner().set_scan_stop(WORK_CEILING_REASON);
+        let (got, reads) = metadata_reads_during(|| cursor_file_key_for(file, key, &mut stopped));
+        assert_eq!((got, reads), (None, 0), "a stopped pass reads nothing");
+    }
+
+    /// The decode-cursor file key is built from metered reads: every
+    /// `fstat`/`fstatfs` (and, on tmpfs, every mount-table and fdinfo
+    /// read) is admitted first, on an ordinary filesystem and on tmpfs.
+    #[test]
+    fn cursor_file_key_admits_each_metadata_read() {
+        use std::os::fd::AsRawFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("provider.so");
+        std::fs::write(&path, b"provider").unwrap();
+        let file = File::open(&path).unwrap();
+        assert!(
+            crate::discovery::identity::file_inodes_are_unique(&file),
+            "the positive control needs a unique-inode filesystem"
+        );
+        assert_cursor_key_reads_are_admitted(&file, 64);
+        let shm = tempfile::NamedTempFile::new_in("/dev/shm").unwrap();
+        let held = File::open(shm.path()).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fstatfs fills `stat` for the valid fd; read only on success.
+        assert_eq!(
+            unsafe { libc::fstatfs(held.as_raw_fd(), stat.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: initialized by the successful fstatfs above.
+        #[allow(clippy::unnecessary_cast)]
+        let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+        assert_eq!(
+            magic,
+            crate::discovery::identity::TMPFS_SUPER_MAGIC,
+            "/dev/shm is the tmpfs control"
+        );
+        assert_cursor_key_reads_are_admitted(&held, 1 << 20);
+    }
+
+    /// A completed sweep the cursor cache refuses earns no pass of its
+    /// own: with the independent cursor frozen, the completion pass
+    /// raises nothing, while a retained completion (room in the cache)
+    /// still counts as progress.
+    #[test]
+    fn cache_refused_completion_raises_no_pass() {
+        let unit = {
+            let (key, cursor) = decode_cursor_for_test(1, 2, 3, false, 0);
+            decode_cursor_bytes(&key, &cursor)
+        };
+        let at = |pid: u32, inode: u64, word: u64, complete: bool, oversized: bool| {
+            let (key, mut cursor) = decode_cursor_for_test(pid, 9, inode, complete, 0);
+            cursor.tables = SweepFrontier { snapshot: 0, word };
+            if oversized {
+                cursor.anchors = Some(
+                    (0..4096u64)
+                        .map(|address| (address, vec![0usize; 4]))
+                        .collect(),
+                );
+                assert!(decode_cursor_bytes(&key, &cursor) > unit * 4);
+            }
+            (key, cursor)
+        };
+        for (oversized, cache_bytes, raises) in [(true, unit * 4, false), (false, unit * 64, true)]
+        {
+            let mut facts = RetainedFileFacts::default();
+            let mut pass = |records: Vec<(DecodeCursorKey, DecodeCursor)>| {
+                let mut budget = CaptureWorkBudget::for_inventory(tight_export_limits(cache_bytes))
+                    .with_retained_file_facts(std::mem::take(&mut facts));
+                let stored: Vec<bool> = records
+                    .into_iter()
+                    .map(|(key, cursor)| budget.record_decode_cursor(key, cursor))
+                    .collect();
+                facts = budget.take_retained_file_facts();
+                (facts.resume_observation().raised, stored)
+            };
+            let _ = pass(vec![
+                at(7, 11, 100, false, false),
+                at(8, 21, 10, false, false),
+            ]);
+            let (raised, stored) = pass(vec![
+                at(7, 11, 100, false, false),
+                at(8, 21, 10, true, oversized),
+            ]);
+            assert_eq!(
+                stored[1], !oversized,
+                "the completion is refused only when oversized"
+            );
+            assert_eq!(
+                raised, raises,
+                "completion pass (oversized {oversized}): only a retained completion raises"
+            );
+        }
+    }
+
+    /// Source text with `//` comment lines dropped and string and char
+    /// literals blanked, so a scan sees code only.
+    fn code_only(source: &str) -> String {
+        let mut out = String::with_capacity(source.len());
+        for line in source.lines() {
+            if line.trim_start().starts_with("//") {
+                out.push('\n');
+                continue;
+            }
+            let mut chars = line.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '"' => {
+                        out.push('"');
+                        while let Some(inner) = chars.next() {
+                            if inner == '\\' {
+                                chars.next();
+                            } else if inner == '"' {
+                                break;
+                            }
+                        }
+                        out.push('"');
+                    }
+                    '/' if chars.peek() == Some(&'/') => break,
+                    _ => out.push(ch),
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The body (braces included) of the first `fn name` in `code`.
+    fn fn_body<'a>(code: &'a str, name: &str) -> &'a str {
+        let start = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .filter_map(|signature| code.find(signature.as_str()))
+            .min()
+            .unwrap_or_else(|| panic!("fn {name} is present"));
+        let open = start + code[start..].find('{').expect("a body");
+        let mut depth = 0usize;
+        for (offset, ch) in code[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fn {name} body is closed");
+    }
+
+    /// Walk `body` in order: each admission token buys one unit, each
+    /// operation token spends one; an operation with no unit left fails.
+    fn assert_each_operation_admitted(
+        what: &str,
+        body: &str,
+        admits: &[&str],
+        operations: &[&str],
+    ) {
+        let mut events: Vec<(usize, bool, &str)> = Vec::new();
+        for admit in admits {
+            events.extend(body.match_indices(admit).map(|(at, _)| (at, true, *admit)));
+        }
+        for operation in operations {
+            events.extend(
+                body.match_indices(operation)
+                    .map(|(at, _)| (at, false, *operation)),
+            );
+        }
+        events.sort_unstable();
+        assert!(
+            events.iter().any(|(_, admit, _)| !admit),
+            "{what}: the scan selects at least one operation"
+        );
+        let mut units = 0usize;
+        for (at, admit, token) in events {
+            if admit {
+                units += 1;
+            } else {
+                assert!(
+                    units > 0,
+                    "{what}: `{token}` at byte {at} has no admitted unit"
+                );
+                units -= 1;
+            }
+        }
+    }
+
+    /// Source guard over every syscall or file read reachable from the
+    /// resume, cursor-key and closing-bracket code: the resume pass
+    /// owner performs one (the generation probe) and only behind its
+    /// admitted cache; the executable-image bracket, the cursor file
+    /// key and the metered inode classification admit each operation
+    /// first; the closing bracket probes only through its reserved
+    /// check; and the capped member selection charges each stat read.
+    /// A new uncharged read in these sites fails here.
+    #[test]
+    fn resume_io_sites_admit_every_syscall() {
+        const SYSCALLS: [&str; 12] = [
+            "std::fs::",
+            "File::open",
+            "read_link",
+            ".metadata()",
+            "process_start_time",
+            "still_the_same",
+            "libc::",
+            "read_to_string",
+            "pidfd",
+            "fstat",
+            "exe_target",
+            "OpenOptions",
+        ];
+        let pass_source = include_str!("scan_pass.rs");
+        let pass_code = code_only(
+            &pass_source[..pass_source
+                .find("#[cfg(test)]\nmod tests {")
+                .expect("scan_pass tests module")],
+        );
+        let mut probes = 0;
+        for (at, _) in pass_code.match_indices("fn ") {
+            let name: String = pass_code[at + 3..]
+                .chars()
+                .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+                .collect();
+            if name.is_empty() || !pass_code[at + 3..].starts_with(&name) {
+                continue;
+            }
+            let Some(after) = pass_code[at + 3 + name.len()..].chars().next() else {
+                continue;
+            };
+            if after != '(' && after != '<' {
+                continue;
+            }
+            let body = fn_body(&pass_code[at..], &name);
+            let found: Vec<&str> = SYSCALLS
+                .iter()
+                .copied()
+                .filter(|token| body.contains(token))
+                .collect();
+            if name == "decode_cursor_pid_live" {
+                assert_eq!(found, ["process_start_time"], "the generation probe");
+                probes += 1;
+            } else {
+                assert!(found.is_empty(), "scan_pass fn {name} performs {found:?}");
+            }
+            if body.contains("decode_cursor_pid_live(") {
+                assert_eq!(
+                    name, "decode_generation_live_cached",
+                    "the probe's only caller"
+                );
+                assert_each_operation_admitted(
+                    "decode_generation_live_cached",
+                    body,
+                    &["admit_resume_syscall()"],
+                    &["decode_cursor_pid_live("],
+                );
+            }
+        }
+        assert_eq!(probes, 1, "the generation probe is found");
+        let admission = fn_body(&pass_code, "admit_resume_syscall");
+        assert!(
+            admission.contains("self.stopped_now().is_none()")
+                && admission.contains("self.collection_checkpoint(1)"),
+            "one admission is a stop check plus one charged unit"
+        );
+
+        let scan_source = include_str!("scan.rs");
+        let scan_code =
+            code_only(&scan_source[..scan_source.find("#[cfg(test)]\nmod tests {").unwrap()]);
+        assert_each_operation_admitted(
+            "resume_view_exec",
+            fn_body(&scan_code, "resume_view_exec"),
+            &["budget.admit_resume_syscall()"],
+            &["still_the_same()", "read()"],
+        );
+        let key = fn_body(&scan_code, "cursor_file_key_for");
+        assert_each_operation_admitted(
+            "cursor_file_key_for",
+            key,
+            &["budget.admit_resume_syscall()"],
+            &[".metadata()"],
+        );
+        assert!(key.contains("file_inodes_are_unique_metered("));
+        for unmetered in ["file_inodes_are_unique(", "pin_of(", "for_open_file("] {
+            assert!(
+                !key.contains(unmetered),
+                "cursor_file_key_for calls {unmetered}"
+            );
+        }
+        assert_eq!(
+            scan_code.matches("cursor_file_key_for(").count(),
+            3,
+            "the definition plus the upper- and lower-file call sites"
+        );
+        for site in [
+            "let mut cursor_file_key = cursor_file_key_for(&file, key, budget);",
+            "cursor_file_key = cursor_file_key_for(&proof.file, lower_key, budget);",
+        ] {
+            assert!(scan_code.contains(site), "metered call site {site}");
+        }
+        assert_eq!(
+            scan_code.matches("resume_exec_target(").count(),
+            0,
+            "the image read goes through the metered bracket only"
+        );
+        let exec_site = &scan_code[scan_code
+            .find("let cursor_key = match (view.start_time(), cursor_file_key) {")
+            .expect("cursor key site")..];
+        let exec_site = &exec_site[..exec_site.find("let fingerprint").unwrap()];
+        assert!(exec_site.contains("resume_view_exec("));
+        assert_eq!(exec_site.matches("still_the_same()").count(), 1);
+        let bracket = &scan_code[scan_code
+            .find("let generation = io.final_generation(view, budget);")
+            .expect("closing bracket")..];
+        let bracket = &bracket[..bracket.find("examined.clear();").unwrap()];
+        assert!(bracket.contains("closing.still_the_same("));
+        assert_eq!(
+            bracket.matches("still_the_same()").count(),
+            bracket
+                .matches("closing.still_the_same(|| view.still_the_same())")
+                .count(),
+            "the closing bracket probes only through its reserved check"
+        );
+        assert_each_operation_admitted(
+            "ClosingGeneration::still_the_same",
+            fn_body(&scan_code, "still_the_same"),
+            &["self.reserved.take()"],
+            &["probe()"],
+        );
+
+        let identity_code = code_only(include_str!("identity.rs"));
+        for name in [
+            "filesystem_without_unique_inodes_metered",
+            "metered_find_line",
+        ] {
+            assert_each_operation_admitted(
+                name,
+                fn_body(&identity_code, name),
+                &["admit()"],
+                &["libc::fstatfs(", "File::open(", ".read(", "read_to_string("],
+            );
+        }
+
+        let cgroup_code = code_only(include_str!("../inspect_system/inventory_cgroup.rs"));
+        assert_each_operation_admitted(
+            "capped_member_selection",
+            fn_body(&cgroup_code, "capped_member_selection"),
+            &["charge()"],
+            &["read_stat("],
+        );
     }
 
     #[test]

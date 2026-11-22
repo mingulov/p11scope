@@ -1882,6 +1882,165 @@ fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
     );
 }
 
+/// An evicted completion still vetoes its layout: an object that arrived
+/// complete loses its history slot to a newcomer at capacity, then
+/// restarts on the same identity and layout; an independent cursor
+/// supplies the intervening grants, and once it freezes the restarted
+/// object's climb back through ground it already finished earns
+/// nothing. The control restarts a never-completed object instead, and
+/// its genuine rise grants.
+#[test]
+fn cgroup_snapshot_resume_keeps_evicted_completions_covered() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    let victim = resume_key(1, 9, 1);
+    let fresh = resume_key(2, 9, 2);
+    let fixed = resume_key(7, 9, 11);
+    let newcomer = resume_key(7, 9, 12);
+    let completed: Vec<_> = (0..(crate::discovery::scan_pass::MAX_DECODE_CURSORS as u64 - 2))
+        .map(|index| resume_key(8, 9, 1000 + index))
+        .collect();
+    for (returning, expect_grant) in [(&victim, false), (&fresh, true)] {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+        driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+        let mut first = vec![
+            (
+                victim.clone(),
+                resume_progress(100, (2, 0), (2, 0), 1, true),
+            ),
+            (
+                fixed.clone(),
+                resume_progress(100, (0, 100), (0, 0), 4, false),
+            ),
+        ];
+        first.extend(
+            completed
+                .iter()
+                .map(|key| (key.clone(), resume_progress(100, (2, 0), (2, 0), 1, true))),
+        );
+        assert!(pass_resume(&mut driver.inner, resume_position(first)));
+        assert_eq!(
+            driver.inner.cgroup.as_ref().unwrap().resume.posed.len(),
+            crate::discovery::scan_pass::MAX_DECODE_CURSORS,
+            "the history is full"
+        );
+        assert!(pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (
+                    fixed.clone(),
+                    resume_progress(100, (0, 101), (0, 0), 4, false)
+                ),
+                (
+                    newcomer.clone(),
+                    resume_progress(100, (0, 900), (0, 0), 4, false)
+                ),
+            ])
+        ));
+        assert!(pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (
+                    fixed.clone(),
+                    resume_progress(100, (0, 102), (0, 0), 4, false)
+                ),
+                (
+                    returning.clone(),
+                    resume_progress(100, (0, 10), (0, 0), 1, false)
+                ),
+            ])
+        ));
+        assert_eq!(
+            pass_resume(
+                &mut driver.inner,
+                resume_position(vec![
+                    (
+                        fixed.clone(),
+                        resume_progress(100, (0, 102), (0, 0), 4, false)
+                    ),
+                    (
+                        returning.clone(),
+                        resume_progress(100, (0, 20), (0, 0), 1, false)
+                    ),
+                ])
+            ),
+            expect_grant,
+            "only genuine progress authorizes continuation ({returning:?})"
+        );
+    }
+}
+
+/// Once completions can no longer be remembered, admission at capacity
+/// is refused, counted and named: with the history full and the bounded
+/// completion record full, an unfinished newcomer cannot take an evicted
+/// completion's slot (that completion could not be remembered), so its
+/// climb earns no pass and each refused record counts.
+#[test]
+fn cgroup_snapshot_resume_refuses_admission_when_completions_cannot_be_kept() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    let cap = crate::discovery::scan_pass::MAX_DECODE_CURSORS as u64;
+    let fixed = resume_key(7, 9, 11);
+    let newcomer = resume_key(7, 9, 12);
+    let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+    let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+    driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+    let completed = |base: u64, count: u64| -> Vec<_> {
+        (0..count)
+            .map(|index| {
+                (
+                    resume_key(8, 9, base + index),
+                    resume_progress(100, (2, 0), (2, 0), 1, true),
+                )
+            })
+            .collect()
+    };
+    let mut first = vec![(
+        fixed.clone(),
+        resume_progress(100, (0, 100), (0, 0), 4, false),
+    )];
+    first.extend(completed(1_000_000, cap - 1));
+    assert!(pass_resume(&mut driver.inner, resume_position(first)));
+    let mut second = vec![(
+        fixed.clone(),
+        resume_progress(100, (0, 101), (0, 0), 4, false),
+    )];
+    second.extend(completed(2_000_000, cap));
+    assert!(pass_resume(&mut driver.inner, resume_position(second)));
+    let with = |fixed_word: u64, word: u64| {
+        resume_position(vec![
+            (
+                fixed.clone(),
+                resume_progress(100, (0, fixed_word), (0, 0), 4, false),
+            ),
+            (
+                newcomer.clone(),
+                resume_progress(100, (0, word), (0, 0), 4, false),
+            ),
+        ])
+    };
+    assert!(
+        pass_resume(&mut driver.inner, with(102, 900)),
+        "the fixed cursor rose"
+    );
+    assert!(
+        !pass_resume(&mut driver.inner, with(102, 950)),
+        "a refused newcomer's climb earns no pass"
+    );
+    assert_eq!(
+        driver.inner.cgroup.as_ref().unwrap().resume.posed.refused(),
+        2,
+        "each refused record is counted"
+    );
+}
+
 /// A completed sweep stays covered across the settle pass: a cursor
 /// that completes (granting the one settle pass) and then restarts
 /// under the same identity and layout — a re-proof invalidation —

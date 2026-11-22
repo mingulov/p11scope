@@ -45986,6 +45986,64 @@ int main(void) {
         );
     }
 
+    /// A counted resume-history refusal survives every custody path: it
+    /// names while the bundle is home, while the next worker owns the
+    /// bundle, after that worker's collection is discarded, and after an
+    /// accepted return (never counted twice). The reason names tracked
+    /// pairs and refused records, never promising an in-progress gap.
+    #[test]
+    fn cgroup_history_refusal_survives_worker_custody_and_discard() {
+        let refused = |coordinator: &InventoryCoordinator<OsProcessSource>| {
+            coordinator.live_scan_history_gap().map(|gap| gap.reason)
+        };
+        let expect = |reason: Option<String>, stage: &str| {
+            let reason = reason.unwrap_or_else(|| panic!("{stage}: the refusal row vanished"));
+            assert!(
+                reason.starts_with("1 resume record(s) of unfinished work were refused"),
+                "{stage}: {reason}"
+            );
+            assert!(
+                !reason.contains("in-progress gap"),
+                "{stage}: the reason never promises another row: {reason}"
+            );
+        };
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        coordinator.cgroup_file_facts =
+            crate::discovery::scan::RetainedFileFacts::saturated_resume_history_for_test();
+        expect(refused(&coordinator), "home");
+        // Worker custody, then a discarded return.
+        let job = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap();
+        expect(refused(&coordinator), "custody");
+        drop(job);
+        expect(refused(&coordinator), "discarded");
+        // Accepted return: the bundle comes home with its total; the
+        // stashed count is not added again.
+        let (_dir, _child, mut coordinator) = cgroup_provider_scene();
+        coordinator.cgroup_file_facts =
+            crate::discovery::scan::RetainedFileFacts::saturated_resume_history_for_test();
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, crate::discovery::caller_registry::now_ns())
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        let _ = coordinator.take_cgroup_completion();
+        expect(refused(&coordinator), "accepted");
+    }
+
     /// Publication summarizes resume progress without revisiting the
     /// carried cursors: with more than 64 completed cursors carried, the
     /// foreground commit and completion hand-off compute no per-cursor

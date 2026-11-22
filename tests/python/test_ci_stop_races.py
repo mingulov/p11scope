@@ -78,9 +78,31 @@ printf '%s' "$STUB_LOG"
 exit "$STUB_RC"
 """
 
+STUB_LIBTEST_UNIGNORED = """#!/bin/sh
+# An unignored joint cell: plain --list advertises it, but the ignored
+# listing (the set the entry executes) is empty.
+set -u
+if [ "${1:-}" = --list ]; then
+  for arg in "$@"; do
+    if [ "$arg" = --ignored ]; then
+      exit 0
+    fi
+  done
+  echo "$JOINT_CELL_STUB: test"
+  exit 0
+fi
+printf '%s' "$STUB_LOG"
+exit "$STUB_RC"
+"""
 
-def run_mapping(*, log, rc, expect_fail, libtest=True):
-    """Run a verbatim copy of the entry with stubbed qualify/id/libtest."""
+
+def run_mapping(*, log, rc, expect_fail, libtest=True, list_mode="always"):
+    """Run a verbatim copy of the entry with stubbed qualify/id/libtest.
+
+    expect_fail None leaves JOINT_EXPECTED_FAILURE unset (the default
+    path); list_mode "unignored" hides the cell from the ignored
+    listing while plain --list still advertises it.
+    """
     cell = joint_cell()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -97,12 +119,15 @@ def run_mapping(*, log, rc, expect_fail, libtest=True):
         write_exe(bin_dir / "id", STUB_ID)
         env = dict(os.environ)
         env["PATH"] = str(bin_dir) + ":" + env.get("PATH", "")
-        env["JOINT_EXPECTED_FAILURE"] = "1" if expect_fail else "0"
+        if expect_fail is None:
+            env.pop("JOINT_EXPECTED_FAILURE", None)
+        else:
+            env["JOINT_EXPECTED_FAILURE"] = "1" if expect_fail else "0"
         env["STOP_RACES_TRIALS"] = "2"
         env["STOP_RACES_BURST_TRIALS"] = "1"
         if libtest:
             stub = tmp / "libtest"
-            write_exe(stub, STUB_LIBTEST)
+            write_exe(stub, STUB_LIBTEST_UNIGNORED if list_mode == "unignored" else STUB_LIBTEST)
             env["P11SCOPE_LIBTEST"] = str(stub)
             env["JOINT_CELL_STUB"] = cell
             env["STUB_LOG"] = log
@@ -170,6 +195,47 @@ class CiStopRacesTests(unittest.TestCase):
         self.assertIsNotNone(joint, rows)
         self.assertFalse(joint["pass"])
         self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_zero_selected_tests_fail_the_joint_row(self):
+        log = ("running 0 tests\n\n"
+               "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; "
+               "0 filtered out; finished in 0.00s\n")
+        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_unignored_cell_fails_the_joint_row(self):
+        proc, rows, joint = run_mapping(
+            log="test result: ok. 1 passed\n", rc=0, expect_fail=False,
+            list_mode="unignored")
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("missing from test binary", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_unset_expected_failure_defaults_to_clean_pass_qualified(self):
+        proc, rows, joint = run_mapping(
+            log=("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+                 "0 filtered out; finished in 1.00s\n"),
+            rc=0, expect_fail=None)
+        self.assertIsNotNone(joint, rows)
+        self.assertTrue(joint["pass"])
+        self.assertEqual(joint["qualification"], "qualified")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_wedge_signature_under_expect_zero_names_the_wedge(self):
+        log = "JOINT_STOP wp7-stop0: finish wedges without the fix: %s\n" % wedge_signature()
+        self.assertNotIn("s1-precluded", log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("wedge", joint["detail"].lower())
+        self.assertNotIn("without the wedge signature", joint["detail"])
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
 
     def test_missing_libtest_fails_the_joint_row(self):

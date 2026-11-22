@@ -3648,7 +3648,10 @@ impl KeyUseReducer {
             return;
         }
         if let Some(refused) = self.refused.remove(&key) {
-            let slot = unknown_index(refused.category, unbound_reason_for(refused.category));
+            let slot = unknown_index(
+                refused.category,
+                unknown_reason_for(refused.category, refused.internal),
+            );
             self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
             self.unknown_add(slot, *outcome, refused.mechanism);
             self.evidence.refused_terminals = self.evidence.refused_terminals.saturating_add(1);
@@ -3668,7 +3671,7 @@ impl KeyUseReducer {
     /// path, `None` when the effect already resolved. The mint
     /// always targets the fallback ledger (disposal mints
     /// fallback-only, like the synchronous disposal path).
-    #[allow(clippy::too_many_arguments)] // Exact Started identity: instance/id/category/mechanism/receipt/time plus the mint ledger.
+    #[allow(clippy::too_many_arguments)] // Exact Started identity: instance/id/category/mechanism/receipt/time/nesting plus the mint ledger.
     fn drain_started_pre(
         &mut self,
         instance: RegistryInstanceId,
@@ -3677,6 +3680,7 @@ impl KeyUseReducer {
         mechanism: Option<u64>,
         key_receipt: Option<KeyReceipt>,
         started_ts_ns: u64,
+        internal: bool,
         fallback: Option<&crate::semantics_objects::journal::StagingLedger>,
     ) -> Option<PendingStartDrain> {
         let key = (instance, id);
@@ -3691,20 +3695,20 @@ impl KeyUseReducer {
         let (slots, len) = Self::resolve(instance, category, receipts);
         let resolved = &slots[..len];
         if !self.admits(resolved) {
-            self.refuse(key, instance, category, started_ts_ns, mechanism);
+            self.refuse(key, instance, category, started_ts_ns, mechanism, internal);
             return None;
         }
         let assoc_bytes =
             size_of::<OpenKeyUse>() as u64 + (resolved.len() * size_of::<OpenAssoc>()) as u64;
         let Some(ledger) = fallback else {
             debug_assert!(false, "keyassoc mint needs a ledger");
-            self.refuse(key, instance, category, started_ts_ns, mechanism);
+            self.refuse(key, instance, category, started_ts_ns, mechanism, internal);
             return None;
         };
         let mint = match ledger.start_keyassoc_mint(assoc_bytes) {
             Ok(mint) => mint,
             Err(_) => {
-                self.refuse(key, instance, category, started_ts_ns, mechanism);
+                self.refuse(key, instance, category, started_ts_ns, mechanism, internal);
                 return None;
             }
         };
@@ -3714,6 +3718,7 @@ impl KeyUseReducer {
             category,
             mechanism,
             started_ts_ns,
+            internal,
             slots,
             slots_len: len,
             receipts: receipts.to_vec(),
@@ -3754,7 +3759,10 @@ impl KeyUseReducer {
         if start.receipts.is_empty() {
             // A receipt-less open is live unknown-key S1:
             // active now, outcome at close.
-            let slot = unknown_index(start.category, unbound_reason_for(start.category));
+            let slot = unknown_index(
+                start.category,
+                unknown_reason_for(start.category, start.internal),
+            );
             self.unknown_activate(slot);
         }
         // Touched proved buckets forward-fill their parks.
@@ -3772,6 +3780,7 @@ impl KeyUseReducer {
                 started_ts_ns: start.started_ts_ns,
                 associations,
                 bound: !start.receipts.is_empty(),
+                internal: start.internal,
                 ticket,
                 ticket_shared: false,
             },
@@ -4756,6 +4765,7 @@ struct PendingStartDrain {
     category: &'static str,
     mechanism: Option<u64>,
     started_ts_ns: u64,
+    internal: bool,
     slots: [ResolvedAssoc; 2],
     slots_len: usize,
     receipts: Vec<KeyReceipt>,
@@ -5329,6 +5339,7 @@ impl FeedDisposalCursor {
                                 start.category,
                                 start.started_ts_ns,
                                 start.mechanism,
+                                start.internal,
                             ),
                         }
                     }
@@ -5345,6 +5356,7 @@ impl FeedDisposalCursor {
                     mechanism,
                     key_receipt,
                     origin,
+                    internal,
                 } => {
                     let preserved = self.preserved.as_mut().expect("joint keeps reducers");
                     let started = preserved.drain_started_pre(
@@ -5354,6 +5366,7 @@ impl FeedDisposalCursor {
                         mechanism,
                         key_receipt,
                         origin.ts_ns,
+                        internal,
                         fallback.as_deref(),
                     );
                     if let Some(started) = started {
@@ -5707,6 +5720,7 @@ mod disposal_tests {
                         mechanism: Some(0x000d),
                         key_receipt: None,
                         origin: origin("C_SignInit", 1, 100 + ordinal),
+                        internal: false,
                     };
                     keyuse.observe_effect(instance, &effect, None, Some(&mut fallback));
                 }
@@ -5793,6 +5807,7 @@ mod disposal_tests {
             mechanism: Some(0x000d),
             key_receipt: None,
             origin: origin("C_SignInit", 5001, 100),
+            internal: false,
         };
         cursor
             .preserved
@@ -5819,6 +5834,7 @@ mod disposal_tests {
             mechanism: Some(0x000d),
             key_receipt: None,
             origin: origin("C_SignInit", 5001, 200),
+            internal: false,
         });
         let mut polls = 0usize;
         loop {
@@ -6953,6 +6969,7 @@ mod disposal_tests {
                         mechanism: (next().is_multiple_of(2)).then_some(0x000d),
                         key_receipt: None,
                         origin: origin("C_SignInit", 1, 100 + ordinal),
+                        internal: false,
                     };
                     if path == 0 {
                         keyuse.observe_effect(instance, &effect, None, Some(&mut fallback));
@@ -6963,6 +6980,7 @@ mod disposal_tests {
                             mechanism,
                             key_receipt,
                             origin,
+                            internal,
                         } = effect
                         else {
                             unreachable!("constructed Started");
@@ -6974,6 +6992,7 @@ mod disposal_tests {
                             mechanism,
                             key_receipt,
                             origin.ts_ns,
+                            internal,
                             Some(&fallback),
                         );
                         let Some(mut started) = started else {
@@ -6998,6 +7017,7 @@ mod disposal_tests {
                                         started.category,
                                         started.started_ts_ns,
                                         started.mechanism,
+                                        started.internal,
                                     );
                                     break;
                                 }

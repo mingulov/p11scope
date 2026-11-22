@@ -87881,9 +87881,7 @@ fn learned_pin_retry_stages_from_large_mount_table() {
     engine.scope = Scope::System;
     engine.set_learned_rx_for_test(rx);
     let _drain_alive = &tx;
-    crate::discovery::identity::prearm_pin_test::inject_mountinfo_append_for_reads(
-        2, 1_048_589,
-    );
+    crate::discovery::identity::prearm_pin_test::inject_mountinfo_append_for_reads(2, 1_048_589);
     crate::discovery::identity::prearm_pin_test::inject_file_change_once();
     engine.service_learned_files();
     assert!(
@@ -87956,10 +87954,7 @@ fn learned_pin_refuses_overlimit_mount_table() {
     engine.scope = Scope::System;
     engine.set_learned_rx_for_test(rx);
     let _drain_alive = &tx;
-    crate::discovery::identity::prearm_pin_test::inject_mountinfo_append_for_reads(
-        1,
-        67_108_865,
-    );
+    crate::discovery::identity::prearm_pin_test::inject_mountinfo_append_for_reads(1, 67_108_865);
     engine.service_learned_files();
     assert!(
         engine.learned_settled.contains(&(dev, ino)),
@@ -87976,7 +87971,9 @@ fn learned_pin_refuses_overlimit_mount_table() {
     assert_eq!(engine.learned_staged_files_for_test(), 0);
     let internal: Vec<_> = engine.counters.object_skips.iter().collect();
     assert!(
-        internal.iter().any(|skip| skip.reason.contains("mount table")),
+        internal
+            .iter()
+            .any(|skip| skip.reason.contains("mount table")),
         "the refusal names the mount table: {internal:?}"
     );
     assert!(

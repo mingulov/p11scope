@@ -14156,8 +14156,10 @@ struct GetterPrefaultCursor {
 
 /// One warmup candidate range: its maps address, the first matching
 /// pinned object (sorted order, deterministic), the maps key it was
-/// enumerated under, and its proof state (`proven` reads, `refused`
-/// skips silently, neither defers to the next pass).
+/// enumerated under, its proof state (`proven` reads, `refused`
+/// skips silently, neither defers to the next pass), and its per-range
+/// next unread address (absolute; `end` when completed). Offsets persist
+/// across passes; proof never does (re-proved every pass).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GetterPrefaultRange {
     start: u64,
@@ -14168,6 +14170,7 @@ struct GetterPrefaultRange {
     inode: u64,
     proven: bool,
     refused: bool,
+    next_addr: u64,
 }
 
 /// Test-only scripted warmup proof and per-pass caps. Production has no
@@ -14181,6 +14184,17 @@ struct GetterPrefaultTestSeam {
     /// Scripted range identities (`None` reads as unreadable; missing
     /// ranges read as unscripted, hence unproven).
     ranges: BTreeMap<(u64, u64), Option<FileIdentity>>,
+    /// Scripted pre-read re-proof identities: when a range is present
+    /// here, its re-proof before the first byte reads this instead of
+    /// `ranges` (simulating a remap between proof and read). Absent
+    /// ranges re-prove from `ranges`.
+    reproof_ranges: BTreeMap<(u64, u64), Option<FileIdentity>>,
+    /// Ranges whose `read_at` fails with a simulated I/O error (the
+    /// attempt still spends its read credit and is recorded).
+    fail_reads: BTreeSet<(u64, u64)>,
+    /// Every read attempt in order: `(addr, len, ok)`. Recorded for
+    /// real and simulated reads alike; production has no seam.
+    record_attempts: RefCell<Vec<(u64, usize, bool)>>,
     /// Per-pass overrides; `None` keeps the production constant.
     reads_per_pass: Option<usize>,
     proofs_per_pass: Option<usize>,
@@ -26857,6 +26871,7 @@ impl Engine {
                 inode: key.inode,
                 proven: false,
                 refused: false,
+                next_addr: mapping.start,
             });
         }
         // Revalidate the cursor against the fresh rendering: new objects
@@ -27044,7 +27059,7 @@ impl Engine {
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: true };
                 }
-                if self.budget.check_deadline_now().is_some() || self.getter_prefault_test_trip() {
+                if self.getter_prefault_should_stop() {
                     return Complete;
                 }
                 if reads_spent >= reads_per_pass {
@@ -27058,8 +27073,18 @@ impl Engine {
                 if self.budget.allowed_io(op_bytes, len) < len {
                     return Complete;
                 }
+                // Test-only attempt record (no behavior change): every
+                // `read_at`, success or failure, in order.
+                #[cfg(test)]
+                let record = |seam: &GetterPrefaultTestSeam, ok: bool| {
+                    seam.record_attempts.borrow_mut().push((addr, len, ok));
+                };
                 match mem.read_at(&mut chunk[..len], addr) {
                     Ok(read) => {
+                        #[cfg(test)]
+                        if let Some(seam) = self.getter_prefault_for_test.as_ref() {
+                            record(seam, true);
+                        }
                         // File-content bytes: the window-only rule, like
                         // the ELF snapshot reader. Converting them to
                         // collection work too would double-charge a large
@@ -27071,7 +27096,13 @@ impl Engine {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        #[cfg(test)]
+                        if let Some(seam) = self.getter_prefault_for_test.as_ref() {
+                            record(seam, false);
+                        }
+                        break;
+                    }
                 }
                 let Some(following) = addr.checked_add(len as u64) else {
                     break;
@@ -27198,6 +27229,13 @@ impl Engine {
         false
     }
 
+    /// The warmup loop's stop poll: the capture deadline decides (the
+    /// test trip rides alongside it; fix3 latches real deadline state
+    /// so the production poll alone is the decider).
+    fn getter_prefault_should_stop(&mut self) -> bool {
+        self.budget.check_deadline_now().is_some() || self.getter_prefault_test_trip()
+    }
+
     /// Drops the view's warmup cursor when it enumerated a different
     /// object set than `sites` (emptied, remapped, or re-filtered), so
     /// the settle block never pins a view with nothing to warm.
@@ -27252,6 +27290,37 @@ impl Engine {
             .get_or_insert_default()
             .loop_checks_until_trip
             .set(Some(checks));
+    }
+
+    /// Test-only: script the pre-read re-proof identities (see
+    /// `GetterPrefaultTestSeam::reproof_ranges`). Absent ranges re-prove
+    /// from `ranges`.
+    #[cfg(test)]
+    fn set_prefault_reproof_for_test(&mut self, ranges: Vec<((u64, u64), Option<FileIdentity>)>) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .reproof_ranges
+            .extend(ranges);
+    }
+
+    /// Test-only: fail the `read_at` for these ranges with a simulated
+    /// I/O error (the attempt still spends its credit and is recorded).
+    #[cfg(test)]
+    fn set_prefault_fail_reads_for_test(&mut self, ranges: Vec<(u64, u64)>) {
+        self.getter_prefault_for_test
+            .get_or_insert_default()
+            .fail_reads
+            .extend(ranges);
+    }
+
+    /// Test-only: every read attempt so far, in order, as
+    /// `(addr, len, ok)`. Empty without the seam.
+    #[cfg(test)]
+    fn prefault_attempts_for_test(&self) -> Vec<(u64, usize, bool)> {
+        self.getter_prefault_for_test
+            .as_ref()
+            .map(|seam| seam.record_attempts.borrow().clone())
+            .unwrap_or_default()
     }
 
     fn attach_manifest_getters_unsettled(

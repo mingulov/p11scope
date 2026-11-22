@@ -37337,8 +37337,9 @@ fn page_present(addr: u64) -> bool {
 /// target byte: a stranger identity, an unreadable range, and — stricter
 /// than the scan guard — an overlay identity even on equality (a stale
 /// lower mapping keeps the fresh `(dev, ino)`, so equality proves nothing
-/// and the best-effort warmup spends no witness). No gap: refusal loses
-/// nothing, and a later BPF miss still reports honestly.
+/// and the best-effort warmup spends no witness). Each refusal files its
+/// finite named counted gap; a later BPF miss still reports honestly via
+/// its independent counter.
 #[test]
 fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
     use crate::discovery::identity::{FileIdentity, MappedFile};
@@ -37356,9 +37357,17 @@ fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
     };
     // A stranger identity and an unreadable range: the held proof is
     // unmatchable, so every range takes the slow path and refuses.
-    for (label, range) in [
-        ("stranger", Some(FileIdentity { dev: 2, ino: 2 })),
-        ("unreadable", None),
+    for (label, range, reason) in [
+        (
+            "stranger",
+            Some(FileIdentity { dev: 2, ino: 2 }),
+            "a manifest getter warmup range refused: range identity mismatch",
+        ),
+        (
+            "unreadable",
+            None,
+            "a manifest getter warmup range refused: range identity unreadable",
+        ),
     ] {
         let (mut engine, id, object, sites) = fresh();
         let ranges = prefault_candidate_ranges(&engine, object);
@@ -37393,8 +37402,15 @@ fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
         );
         assert_eq!(
             engine.counters.object_skips.len(),
-            skips,
-            "{label}: a refused warmup files no gap"
+            skips + 1,
+            "{label}: a refused warmup files its named gap"
+        );
+        let gap = &engine.counters.object_skips[skips];
+        assert_eq!(gap.subject, "live manifest getter warmup", "{label}");
+        assert_eq!(gap.reason, reason, "{label}");
+        assert!(
+            engine.prefault_attempts_for_test().is_empty(),
+            "{label}: a refused warmup attempts zero reads"
         );
     }
     // Overlay equality still refuses: the held identity matches the maps
@@ -37451,8 +37467,18 @@ fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
     );
     assert_eq!(
         engine.counters.object_skips.len(),
-        skips,
-        "overlay: a refused warmup files no gap"
+        skips + 1,
+        "overlay: a refused warmup files its named gap"
+    );
+    let gap = &engine.counters.object_skips[skips];
+    assert_eq!(gap.subject, "live manifest getter warmup", "overlay");
+    assert_eq!(
+        gap.reason, "a manifest getter warmup range refused: overlay identity unproven",
+        "overlay"
+    );
+    assert!(
+        engine.prefault_attempts_for_test().is_empty(),
+        "overlay: a refused warmup attempts zero reads"
     );
 }
 
@@ -37593,9 +37619,10 @@ fn attach_manifest_getters_warms_proven_ranges_before_it_attaches() {
 /// A stop tripped mid-loop ends the pass at the loop's deadline poll:
 /// the first chunk is admitted and charged, the second chunk never
 /// reads. The trip counts loop checks only, so the maps snapshot's size
-/// cannot move it. The stop is terminal (a passed deadline never
-/// unpasses), so the warmup keeps no cursor and attaches at once —
-/// silently, like every warmup refusal.
+/// cannot move it. The trip latches real deadline state, so the
+/// production poll alone decides (removing it unstops the loop). The stop
+/// is terminal (a passed deadline never unpasses), so the warmup keeps no
+/// cursor and attaches at once — silently, like every warmup refusal.
 #[test]
 fn prefault_manifest_getter_data_stops_mid_loop_when_its_deadline_poll_trips() {
     let fixture = ScanManifestFixture::new();
@@ -37633,6 +37660,11 @@ fn prefault_manifest_getter_data_stops_mid_loop_when_its_deadline_poll_trips() {
         !engine.getter_prefault_cursors.contains_key(&id),
         "a terminal stop keeps no cursor"
     );
+    assert_eq!(
+        engine.budget.deadline_for_test(),
+        Some(0),
+        "the trip latches real deadline state for the production poll"
+    );
     let delta = engine.budget.attempted_io_bytes() - before;
     let first = ranges[0].1 - ranges[0].0;
     let second = ranges[1].1 - ranges[1].0;
@@ -37648,6 +37680,11 @@ fn prefault_manifest_getter_data_stops_mid_loop_when_its_deadline_poll_trips() {
         engine.counters.object_skips.len(),
         skips,
         "the stop files no gap"
+    );
+    assert_eq!(
+        engine.prefault_attempts_for_test().len(),
+        1,
+        "exactly one chunk was attempted"
     );
 }
 
@@ -38210,6 +38247,442 @@ fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass(
         engine.counters.object_skips.len(),
         skips,
         "a resumed warmup files no gap"
+    );
+}
+
+/// Maps `len` bytes of `file` privately at a low address the kernel did
+/// not pick (below every existing mapping), so the new range sorts ahead
+/// of all current candidates. Tries fixed low candidates with
+/// `MAP_FIXED_NOREPLACE`; panics when none is free (premise failure, not
+/// a warmup failure). The caller unmaps the returned base once.
+fn map_fixture_low(file: &std::fs::File, len: usize) -> *mut libc::c_void {
+    use std::os::fd::AsRawFd as _;
+    for candidate in [0x1000_0000u64, 0x2000_0000, 0x3000_0000, 0x4000_0000] {
+        // SAFETY: a private read-only mapping of the held fixture file at
+        // a fixed address that is free (`MAP_FIXED_NOREPLACE` fails
+        // otherwise).
+        let mapping = unsafe {
+            libc::mmap(
+                candidate as *mut libc::c_void,
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_FIXED_NOREPLACE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if mapping != libc::MAP_FAILED {
+            assert_eq!(mapping as u64, candidate);
+            return mapping;
+        }
+    }
+    panic!("premise: no free low address for the prepended range");
+}
+
+/// A stable maps rendering never carries proof across passes: when the
+/// slow identity changes underneath an unchanged `(start, end, key,
+/// object)` tuple (a Btrfs subvolume collision), the resumed pass
+/// re-proves and refuses, reading zero bytes from the replacement.
+/// (Twin: a carried `proven=true` would skip the re-proof and read.)
+#[test]
+fn prefault_manifest_getter_data_reproves_a_stable_range_whose_slow_identity_changed() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let extra = map_fixture_readonly(&fixture.file, padded);
+    // A tmpfs identity no maps key renders: every range takes the slow
+    // path and proves per range.
+    let held_identity = FileIdentity { dev: 7, ino: 7 };
+    let ranges = prefault_candidate_ranges(&engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two chunks");
+    let scripted: Vec<((u64, u64), Option<FileIdentity>)> = ranges
+        .iter()
+        .map(|range| (*range, Some(held_identity)))
+        .collect();
+    engine.set_prefault_proof_for_test(
+        object,
+        MappedFile {
+            identity: held_identity,
+            fs_magic: Some(0x0102_1994),
+        },
+        scripted,
+    );
+    engine.set_prefault_caps_for_test(Some(1), None);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "premise: the first pass warms one range and defers"
+    );
+    let attempts_before = engine.prefault_attempts_for_test().len();
+    assert_eq!(attempts_before, 1, "premise: one chunk attempted");
+    // The replacement keeps the maps tuple but changes the slow identity.
+    let stranger = FileIdentity { dev: 8, ino: 8 };
+    engine
+        .getter_prefault_for_test
+        .as_mut()
+        .unwrap()
+        .ranges
+        .insert(ranges[1], Some(stranger));
+    let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(extra, padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert!(
+        !engine.getter_prefault_cursors.contains_key(&id),
+        "a refused tail keeps no cursor"
+    );
+    let delta = engine.budget.attempted_io_bytes() - before;
+    assert!(
+        delta <= maps_len + 8192,
+        "zero bytes from the replacement: {delta} > {maps_len} + 8192"
+    );
+    assert_eq!(
+        engine.prefault_attempts_for_test().len(),
+        attempts_before,
+        "the resumed pass attempts zero reads"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips + 1,
+        "the refusal files its named gap"
+    );
+    let gap = &engine.counters.object_skips[skips];
+    assert_eq!(gap.subject, "live manifest getter warmup");
+    assert_eq!(
+        gap.reason,
+        "a manifest getter warmup range refused: range identity mismatch"
+    );
+}
+
+/// A range remapped between proof and read is re-proved before its first
+/// byte: the batch proof sees the old file, the pre-read re-proof sees
+/// the stranger, and zero bytes are read from the replacement. (Twin: no
+/// re-proof would read under the stale batch verdict.)
+#[test]
+fn prefault_manifest_getter_data_refuses_a_range_remapped_between_proof_and_read() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let extra = map_fixture_readonly(&fixture.file, padded);
+    let held_identity = FileIdentity { dev: 7, ino: 7 };
+    let ranges = prefault_candidate_ranges(&engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two chunks");
+    let scripted: Vec<((u64, u64), Option<FileIdentity>)> = ranges
+        .iter()
+        .map(|range| (*range, Some(held_identity)))
+        .collect();
+    engine.set_prefault_proof_for_test(
+        object,
+        MappedFile {
+            identity: held_identity,
+            fs_magic: Some(0x0102_1994),
+        },
+        scripted,
+    );
+    // The second range remaps between the batch proof and its first read.
+    engine.set_prefault_reproof_for_test(vec![(ranges[1], Some(FileIdentity { dev: 8, ino: 8 }))]);
+    let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
+    let skips = engine.counters.object_skips.len();
+    let before = engine.budget.attempted_io_bytes();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(extra, padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert!(
+        !engine.getter_prefault_cursors.contains_key(&id),
+        "a refused tail keeps no cursor"
+    );
+    let attempts = engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "only the stable range reads: {attempts:?}"
+    );
+    assert_eq!(attempts[0].0, ranges[0].0, "the stable range's base");
+    assert!(attempts[0].2, "the stable read succeeds");
+    let delta = engine.budget.attempted_io_bytes() - before;
+    let first = ranges[0].1 - ranges[0].0;
+    assert!(
+        delta < maps_len + first + 8192,
+        "zero bytes from the replacement: {delta} >= {maps_len} + {first} + 8192"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        skips + 1,
+        "the refusal files its named gap"
+    );
+}
+
+/// Every `read_at` attempt spends its read credit, including failures: with
+/// one credit per pass and two failing ranges, the first pass attempts one
+/// and defers (it must not attempt both for free). (Twin: spending only on
+/// success would attempt both and complete in one pass.)
+#[test]
+fn prefault_manifest_getter_data_spends_a_read_credit_for_every_failed_read() {
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let extra = map_fixture_readonly(&fixture.file, padded);
+    let ranges = install_prefault_fast_proof(&mut engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two chunks");
+    engine.set_prefault_fail_reads_for_test(ranges.clone());
+    engine.set_prefault_caps_for_test(Some(1), None);
+    let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
+    let before = engine.budget.attempted_io_bytes();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "a spent read credit defers, even when the attempt failed"
+    );
+    let attempts = engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts.len(),
+        1,
+        "one attempt before the deferral: {attempts:?}"
+    );
+    assert!(!attempts[0].2, "the attempt failed as scripted");
+    let delta = engine.budget.attempted_io_bytes() - before;
+    assert!(
+        delta <= maps_len + 8192,
+        "a failed read charges no target bytes: {delta} > {maps_len} + 8192"
+    );
+    let before = engine.budget.attempted_io_bytes();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(extra, padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts.len(),
+        2,
+        "both failures attempted, one per pass: {attempts:?}"
+    );
+    assert!(attempts.iter().all(|attempt| !attempt.2));
+    let delta = engine.budget.attempted_io_bytes() - before;
+    assert!(
+        delta <= maps_len + 8192,
+        "the second failure charges no target bytes either: {delta} > {maps_len} + 8192"
+    );
+}
+
+/// Held-identity lookups share the proof cap: with two proof credits per
+/// pass and three slow ranges of one object, each pass affords one held
+/// lookup plus one range stat, so three ranges take three passes. (Twin:
+/// free held lookups would prove two ranges per pass and finish in two.)
+#[test]
+fn prefault_manifest_getter_data_admits_held_probes_under_the_proof_cap() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: private read-only mappings of the held fixture file,
+    // unmapped below before the fixture drops.
+    let mut mappings = Vec::new();
+    for _ in 0..2 {
+        mappings.push(map_fixture_readonly(&fixture.file, padded));
+    }
+    let identity = FileIdentity { dev: 7, ino: 7 };
+    let ranges = prefault_candidate_ranges(&engine, object);
+    assert_eq!(ranges.len(), 3, "premise: exactly three chunks");
+    let scripted: Vec<((u64, u64), Option<FileIdentity>)> = ranges
+        .iter()
+        .map(|range| (*range, Some(identity)))
+        .collect();
+    engine.set_prefault_proof_for_test(
+        object,
+        MappedFile {
+            identity,
+            fs_magic: Some(0x0102_1994),
+        },
+        scripted,
+    );
+    engine.set_prefault_caps_for_test(None, Some(2));
+    for (pass, proven) in [(1usize, 0usize), (2, 1)] {
+        let outcome = engine.prefault_manifest_getter_data(id, &sites);
+        assert_eq!(
+            outcome,
+            GetterPrefaultOutcome::Deferred { frame_spent: false },
+            "pass {pass} defers on its spent proof credits"
+        );
+        let cursor = engine
+            .getter_prefault_cursors
+            .get(&id)
+            .expect("a deferred pass saves its cursor")
+            .clone();
+        assert!(cursor.ranges[proven].proven, "pass {pass} proves its range");
+        assert!(
+            !cursor.ranges[proven + 1].proven,
+            "pass {pass} proves exactly one more range under the shared cap"
+        );
+    }
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    for mapping in mappings {
+        // SAFETY: each successful mapping above, released once.
+        assert_eq!(unsafe { libc::munmap(mapping, padded) }, 0);
+    }
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert!(
+        !engine.getter_prefault_cursors.contains_key(&id),
+        "a finished warmup keeps no cursor"
+    );
+}
+
+/// An ordinary rescan preserves the warmup's per-range progress when the
+/// view, sites and mappings are unchanged: the next pass resumes at its
+/// saved offset instead of re-reading finished ranges. (Twin: dropping
+/// the whole cursor would restart from the base and defer again.)
+#[test]
+fn prefault_manifest_getter_data_preserves_progress_across_an_unchanged_rescan() {
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let scan_modules = modules.clone();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let extra = map_fixture_readonly(&fixture.file, padded);
+    let ranges = install_prefault_fast_proof(&mut engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two chunks");
+    engine.set_prefault_caps_for_test(Some(1), None);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "premise: the first pass warms one range and defers"
+    );
+    // An unchanged rescan: same generation, same modules.
+    let admission = engine.views[0].view_admission();
+    engine.note_scan_observed(id, admission, &scan_modules);
+    let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
+    let before = engine.budget.attempted_io_bytes();
+    let attempts_before = engine.prefault_attempts_for_test().len();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: the successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(extra, padded) }, 0);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Complete,
+        "the resumed pass finishes instead of restarting"
+    );
+    let attempts = engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts.len(),
+        attempts_before + 1,
+        "exactly one more chunk, never a finished range: {attempts:?}"
+    );
+    assert_eq!(
+        attempts[attempts_before].0, ranges[1].0,
+        "resumes at range one"
+    );
+    let delta = engine.budget.attempted_io_bytes() - before;
+    let second = ranges[1].1 - ranges[1].0;
+    assert!(
+        delta < maps_len + second + 8192,
+        "no re-read of the finished range: {delta} >= {maps_len} + {second} + 8192"
+    );
+}
+
+/// A new range sorting ahead of finished work never rewinds it: with range
+/// zero completed, a prepended range warms from its base while the
+/// completed range stays skipped and the pending range resumes. (Twin: a
+/// single resume index would re-read the finished range from its base.)
+#[test]
+fn prefault_manifest_getter_data_skips_finished_ranges_when_a_new_range_sorts_ahead() {
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: a private read-only mapping of the held fixture file,
+    // unmapped below before the fixture drops.
+    let extra = map_fixture_readonly(&fixture.file, padded);
+    let ranges = install_prefault_fast_proof(&mut engine, object);
+    assert_eq!(ranges.len(), 2, "premise: exactly two chunks");
+    engine.set_prefault_caps_for_test(Some(1), None);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "premise: the first pass completes range zero and defers"
+    );
+    // A new range of the same object, sorting ahead of all current work.
+    // SAFETY: a private read-only mapping of the held fixture file at a
+    // free low address, unmapped below before the fixture drops.
+    let prepended = map_fixture_low(&fixture.file, padded);
+    let current = prefault_candidate_ranges(&engine, object);
+    assert_eq!(
+        current.len(),
+        3,
+        "premise: the prepended range is a candidate"
+    );
+    assert!(
+        current[0].1 - current[0].0 == padded as u64 && current[0].0 < ranges[0].0,
+        "premise: the new range sorts ahead: {current:?} vs {ranges:?}"
+    );
+    engine.set_prefault_caps_for_test(None, None);
+    let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
+    let before = engine.budget.attempted_io_bytes();
+    let attempts_before = engine.prefault_attempts_for_test().len();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    // SAFETY: each successful mapping above, released once.
+    assert_eq!(unsafe { libc::munmap(prepended, padded) }, 0);
+    assert_eq!(unsafe { libc::munmap(extra, padded) }, 0);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = engine.prefault_attempts_for_test();
+    let fresh = &attempts[attempts_before..];
+    assert_eq!(
+        fresh.len(),
+        2,
+        "the new range plus the pending one, never the finished: {fresh:?}"
+    );
+    assert_eq!(
+        fresh[0].0, current[0].0,
+        "the new range warms from its base"
+    );
+    assert_eq!(fresh[1].0, ranges[1].0, "the pending range resumes");
+    let delta = engine.budget.attempted_io_bytes() - before;
+    let fresh_bytes: u64 = current
+        .iter()
+        .filter(|range| **range != ranges[0])
+        .map(|range| range.1 - range.0)
+        .sum();
+    assert!(
+        delta < maps_len + fresh_bytes + 8192,
+        "the finished range is never re-read: {delta} >= {maps_len} + {fresh_bytes} + 8192"
     );
 }
 

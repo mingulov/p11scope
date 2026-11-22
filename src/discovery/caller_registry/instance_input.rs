@@ -2704,6 +2704,27 @@ impl CallerRegistry {
         self.instance_state.by_key.contains_key(&input.key) && !self.admitted_feed_is_s1only(input)
     }
 
+    /// Whether any applied registry key is registered for one of these
+    /// router instances of an image. A re-offer eviction for such an
+    /// image would orphan its feed (the reseedable segment, receipt
+    /// and cooldown), so the machine declines to evict and the key
+    /// waits on its own re-arm retries instead. Only applied records
+    /// count: staged-but-unapplied rows hold no feed yet. Matches
+    /// image plus router exactly; domain and module are ignored (a
+    /// superset, fail safe: over-protection only delays a futile
+    /// eviction).
+    pub(crate) fn joint_image_router_registered(
+        &self,
+        image: p11scope_ebpf_common::ImageIdentity,
+        routers: &[crate::discovery::instances::InstanceId],
+    ) -> bool {
+        self.instance_state.by_key.keys().any(|key| {
+            key.image.task_cookie == image.task_cookie
+                && key.image.exec_id == image.exec_id
+                && routers.contains(&key.router)
+        })
+    }
+
     pub(crate) fn joint_staged_count(&self, target: &JointFeedTarget) -> Option<usize> {
         let record = self.instance_state.semantics.get(&target.id)?;
         (record.caller == target.caller

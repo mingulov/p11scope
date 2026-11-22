@@ -38011,9 +38011,12 @@ fn joint_reoffer_declines_registered_key_without_evicting() {
         .real
         .scene
         .coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _, _| {
-            panic!("a clamped batch decides before any consume")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a clamped batch decides before any consume"),
+        )
         .unwrap();
     assert_eq!(disposition.installed, 0);
     assert_eq!(
@@ -38022,47 +38025,38 @@ fn joint_reoffer_declines_registered_key_without_evicting() {
         "the clamped birth re-offers its key"
     );
     let image = disposition.reoffers[0].image;
-    let before = scene
-        .real
-        .h0
-        .0
-        .borrow()
-        .capture
-        .router()
-        .current_instances(
-            scene.real.lane.domain(),
-            image,
-            disposition.reoffers[0].file,
-        );
+    let before = scene.real.h0.0.borrow().capture.router().current_instances(
+        scene.real.lane.domain(),
+        image,
+        disposition.reoffers[0].file,
+    );
     assert!(
         !before.is_empty(),
         "the observed key has instances before the re-offer"
     );
     let coordinator = &mut scene.real.scene.coordinator;
-    let lane = &mut scene.real.lane;
+    let mut capture = scene.real.h0.0.borrow_mut();
     assert!(
-        !coordinator.execute_birth_reoffer(lane, &disposition.reoffers[0]),
+        !coordinator.execute_birth_reoffer(&mut capture.capture, &disposition.reoffers[0]),
         "a registered key is never evicted"
     );
-    let after = scene
-        .real
-        .h0
-        .0
-        .borrow()
-        .capture
-        .router()
-        .current_instances(
-            scene.real.lane.domain(),
-            image,
-            disposition.reoffers[0].file,
-        );
+    drop(capture);
+    let after = scene.real.h0.0.borrow().capture.router().current_instances(
+        scene.real.lane.domain(),
+        image,
+        disposition.reoffers[0].file,
+    );
     assert_eq!(
         after, before,
         "the observation stays exactly as it was: no eviction, no re-mint"
     );
     let funnel = scene.real.scene.coordinator.joint_birth_funnel();
     assert_eq!(
-        (funnel.reoffer_armed, funnel.reoffer_declined, funnel.reoffer_exhausted),
+        (
+            funnel.reoffer_armed,
+            funnel.reoffer_declined,
+            funnel.reoffer_exhausted
+        ),
         (0, 1, 0),
         "the declined re-offer counts as declined, beside its final gap"
     );
@@ -38102,21 +38096,29 @@ fn joint_reoffer_evicts_unregistered_key() {
         .real
         .scene
         .coordinator
-        .prepare_joint_births(&ingested, &scene.producers, &mut births, |_, _, _, _, _, _| {
-            panic!("a clamped batch decides before any consume")
-        })
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |_, _, _, _, _, _| panic!("a clamped batch decides before any consume"),
+        )
         .unwrap();
     assert_eq!(disposition.reoffers.len(), 1);
     // No publish: nothing is applied, so the key is unregistered.
     let coordinator = &mut scene.real.scene.coordinator;
-    let lane = &mut scene.real.lane;
+    let mut capture = scene.real.h0.0.borrow_mut();
     assert!(
-        coordinator.execute_birth_reoffer(lane, &disposition.reoffers[0]),
+        coordinator.execute_birth_reoffer(&mut capture.capture, &disposition.reoffers[0]),
         "an unregistered key still evicts for re-offer"
     );
+    drop(capture);
     let funnel = scene.real.scene.coordinator.joint_birth_funnel();
     assert_eq!(
-        (funnel.reoffer_armed, funnel.reoffer_declined, funnel.reoffer_exhausted),
+        (
+            funnel.reoffer_armed,
+            funnel.reoffer_declined,
+            funnel.reoffer_exhausted
+        ),
         (1, 0, 0),
         "the armed re-offer counts as armed"
     );

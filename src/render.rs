@@ -20068,9 +20068,11 @@ pub(crate) mod tests {
     /// Gap-noise fold: the five changed-generation mid-flight pairs
     /// project to the changed reason, while the live stale-deferral
     /// pair projects to its own deferral reason, which never claims
-    /// the process exited. Folding renames, never drops: JSON keeps
-    /// one row per underlying record, and the text names each folded
-    /// row with its count instead of the generic bucket.
+    /// the process exited, and the permission-refusal pair projects
+    /// to its own permission row, which claims neither exit nor
+    /// change. Folding renames, never drops: JSON keeps one row per
+    /// underlying record, and the text names each folded row with its
+    /// count instead of the generic bucket.
     #[test]
     fn mid_flight_generation_pairs_project_to_split_public_reasons() {
         use crate::discovery::scan::Skipped;
@@ -20122,6 +20124,24 @@ pub(crate) mod tests {
             "a live process is never called exited: {}",
             deferred.reason
         );
+        // The permission-refusal pair is filed for a possibly
+        // still-live, unchanged process whose read was denied: its
+        // public row must claim neither exit nor change.
+        let refused = capture_skipped_out(&Skipped {
+            subject: "process view".into(),
+            reason: "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered"
+                .into(),
+        });
+        assert_eq!(refused.name, "discovery subject");
+        assert_eq!(
+            refused.reason,
+            "process unreadable mid-flight; permission denied"
+        );
+        assert!(
+            !refused.reason.contains("exited") && !refused.reason.contains("changed"),
+            "a live process is never called exited or changed: {}",
+            refused.reason
+        );
         let mut ev = evidence();
         ev.skipped = changed
             .iter()
@@ -20132,17 +20152,18 @@ pub(crate) mod tests {
                 })
             })
             .chain(std::iter::once(deferred))
+            .chain(std::iter::once(refused))
             .collect();
         ev.verdict();
         // One JSON row per underlying record: folding renames, never drops.
-        assert_eq!(ev.skipped.len(), 6);
+        assert_eq!(ev.skipped.len(), 7);
         let document = profile_json(
             &reports_fixture(),
             VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
-        assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 6);
+        assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 7);
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
             text.contains("process exited or changed mid-flight: 5"),
@@ -20150,6 +20171,10 @@ pub(crate) mod tests {
         );
         assert!(
             text.contains("stale process report deferred mid-flight: 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("process unreadable mid-flight; permission denied: 1"),
             "{text}"
         );
         assert!(!text.contains("discovery steps unavailable"), "{text}");
@@ -20304,6 +20329,30 @@ pub(crate) mod tests {
                 "a process in scope could not be retained or scanned before it changed",
             ),
             (
+                "live discovery generation",
+                "a stale generation report was contradicted or unprovable on pin recheck",
+            ),
+            (
+                "live discovery generation",
+                "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred; pid 42",
+            ),
+            (
+                "live inventory generation",
+                "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+            ),
+            (
+                "process view",
+                "a process in scope could not be retained or scanned; permission was denied",
+            ),
+            (
+                "process view",
+                "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered; pid 42",
+            ),
+            (
+                "live discovery generation",
+                "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered",
+            ),
+            (
                 "live export hook",
                 "a refreshed provider had no unique attached loader context!",
             ),
@@ -20355,7 +20404,7 @@ pub(crate) mod tests {
             .collect();
         ev.verdict();
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("12 discovery steps unavailable"), "{text}");
+        assert!(text.contains("18 discovery steps unavailable"), "{text}");
     }
 
     /// View-collapse fix1 (RED): the deep-scan selection cap projects to

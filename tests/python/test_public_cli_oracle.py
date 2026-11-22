@@ -256,6 +256,16 @@ LIVE_DEFERRAL_INTERNAL_REASON = (
     "recheck; retirement deferred")
 
 
+# The engine's permission-refusal mark (src/discovery/engine.rs
+# `unreadable_member_skip`): filed when a live member's read fails
+# with EACCES/EPERM — the process may be live and unchanged, so the
+# refusal proves neither exit nor change.
+PERMISSION_INTERNAL_REASON = (
+    "a process in scope could not be retained or scanned; "
+    "permission was denied, and a provider only that process "
+    "mapped was never discovered")
+
+
 def producer_render_source():
     return (ROOT / "src" / "render.rs").read_text(encoding="utf-8")
 
@@ -289,6 +299,37 @@ def producer_deferral_row():
     """
     return {"name": producer_const("DISCOVERY_SUBJECT"),
             "reason": producer_const("STALE_DEFERRAL_REASON")}
+
+
+def producer_permission_row():
+    """The public permission-refusal row as the producer defines it today.
+
+    Built from the render.rs constants, never a pasted copy, so the
+    rejection twin below always judges the row the producer emits.
+    """
+    return {"name": producer_const("DISCOVERY_SUBJECT"),
+            "reason": producer_const("PERMISSION_REFUSAL_REASON")}
+
+
+def assert_permission_refusal_still_folds():
+    """Prove the permission-refusal mark still folds to its own row.
+
+    Fails loudly (never vacuously green) if the producer stops
+    filing the permission mark, stops folding it to the permission
+    row, or folds it back into the changed row: any of those revisits
+    these twins, since the rejection below exists only because the
+    refusal proves neither exit nor change. The behavioral pin is
+    render::mid_flight_generation_pairs_project_to_split_public_reasons.
+    """
+    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
+    assert "UNREADABLE_PERMISSION_REASON" in engine, \
+        "producer stopped filing the permission-refusal mark"
+    fold = producer_render_source().split("fn is_permission_refusal_pair", 1)[1].split("\n}", 1)[0]
+    assert PERMISSION_INTERNAL_REASON in fold, \
+        "producer stopped folding the permission refusal to the permission row"
+    changed = producer_render_source().split("fn is_mid_flight_pair", 1)[1].split("\n}", 1)[0]
+    assert PERMISSION_INTERNAL_REASON not in changed, \
+        "producer folded the permission refusal back into the changed row"
 
 
 def assert_live_deferral_still_folds():
@@ -1142,6 +1183,29 @@ class RunnerNoiseTests(unittest.TestCase):
                          "a live process is never called exited")
         def mutate(d, l, r):
             d["evidence"]["skipped"] = [dict(deferral_row)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_permission_ambient_with_single_refusal_fails_on_system_in_strict_mode(self):
+        # Twin of the changed-row rejection: the permission row is
+        # filed for a possibly still-live, unchanged process whose
+        # read was denied, so it proves neither exit nor change and
+        # the oracle rejects a lone row fail-closed at the gap gate.
+        # The row under test comes from the producer's own constants
+        # and the fold assertion above proves the refusal mark still
+        # maps to this row alone, never back to the changed row.
+        permission_row = producer_permission_row()
+        assert_permission_refusal_still_folds()
+        self.assertNotIn("exited", permission_row["reason"],
+                         "a live process is never called exited")
+        self.assertNotIn("changed", permission_row["reason"],
+                         "an unchanged process is never called changed")
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [dict(permission_row)]
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["skipped"]}
             d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")

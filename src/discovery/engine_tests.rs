@@ -7058,6 +7058,10 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
             "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
         ),
         (
+            "process view",
+            "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered",
+        ),
+        (
             "capture discovery",
             "capture discovery work ceiling reached; remaining provider bytes were not scanned",
         ),
@@ -7114,6 +7118,14 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     assert_eq!(
         reasons
             .iter()
+            .filter(|reason| **reason == "process unreadable mid-flight; permission denied")
+            .count(),
+        1,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
             .filter(|reason| **reason == "scan budget exhausted")
             .count(),
         3,
@@ -7135,9 +7147,9 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for all eight folded gap-noise pairs (five mid-flight
-/// changed, one stale-deferral, two loader-context): filing sites
-/// without a cheap live seam pin
+/// Drift guard for all nine folded gap-noise pairs (five mid-flight
+/// changed, one stale-deferral, one permission-refusal, two
+/// loader-context): filing sites without a cheap live seam pin
 /// their exact strings in source, so a reword must update the
 /// projection allowlist in the same patch instead of silently
 /// unfolding back to generic. Each pair also asserts its
@@ -7224,6 +7236,27 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         reason: "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered".into(),
     });
     assert_eq!(projected.reason, "process exited or changed mid-flight");
+    // The ninth pair lives in split `UNREADABLE_PERMISSION_*`
+    // constants, pinned the same way.
+    for marker in [
+        "UNREADABLE_PERMISSION_SUBJECT",
+        "UNREADABLE_PERMISSION_REASON",
+        "\"a process in scope could not be retained or scanned; permission was denied, and a provider",
+        "only that process mapped was never discovered",
+    ] {
+        assert!(
+            source.contains(marker),
+            "the permission-refusal filing site must keep {marker}"
+        );
+    }
+    let projected = crate::render::capture_skipped_out(&Skipped {
+        subject: "process view".into(),
+        reason: "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered".into(),
+    });
+    assert_eq!(
+        projected.reason,
+        "process unreadable mid-flight; permission denied"
+    );
 }
 
 /// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
@@ -14640,6 +14673,50 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
         unreadable_member_skip(11, true, "scripted, proven gone", &mut noise).is_none(),
         "a generation that is provably gone is the ordinary end of a process"
     );
+}
+
+/// A live, unchanged member whose read fails with permission denied
+/// files an unreadable/permission gap — never an exit-or-change
+/// claim. EACCES/EPERM is not evidence the process exited or
+/// changed, so the refusal files its own internal pair and projects
+/// to its own public row, which names neither event. Both errno
+/// wordings (EACCES, EPERM) take the permission arm. RED twin for
+/// the permission split.
+#[test]
+fn live_unchanged_member_permission_refusal_names_no_exit_or_change() {
+    let pid = std::process::id();
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the test process is live and unchanged"
+    );
+    let mut noise = crate::discovery::noise::DiscoveryNoiseAggregator::default();
+    for detail in [
+        "the process generation could not be pinned: Permission denied (os error 13)",
+        "the process generation could not be scanned: Operation not permitted (os error 1)",
+    ] {
+        let skip =
+            unreadable_member_skip(pid, false, detail, &mut noise).expect("a live pid earns a gap");
+        assert_eq!(
+            skip.subject, "process view",
+            "a permission refusal keeps the member subject: {detail}"
+        );
+        assert_eq!(
+            skip.reason,
+            "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered",
+            "a permission refusal files the permission pair: {detail}"
+        );
+        let projected = render::capture_skipped_out(&skip);
+        assert_eq!(projected.name, "discovery subject", "{detail}");
+        assert_eq!(
+            projected.reason, "process unreadable mid-flight; permission denied",
+            "a permission refusal projects to the permission row: {detail}"
+        );
+        assert!(
+            !projected.reason.contains("exited") && !projected.reason.contains("changed"),
+            "a live process is never called exited or changed: {}",
+            projected.reason
+        );
+    }
 }
 
 /// Twin (guard): a candidate naming only live views applies with no

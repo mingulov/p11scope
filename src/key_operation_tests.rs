@@ -27804,6 +27804,388 @@ fn key_operation_take_reseed_bound_per_image() {
     );
 }
 
+/// A reseed that would arm into a stuck/unauditable session stays
+/// S1Only with a named gap instead of re-arming the stuck session
+/// (seen live in verify5m3: a fresh-proof reseed 2.3 s after a
+/// stuck-session abandon staged 79 + 294 calls into the stuck
+/// audits, and the lane stopped at Staging WrongPhase in the same
+/// quantum as the seal-time doom that ended the reseeded segment).
+/// The trip fires even when the abandon discards nothing (the live
+/// abandon that preceded the lethal reseed discarded 0 staged calls
+/// from 0 feeds): the re-arm itself is the stuckness evidence.
+/// The next fresh proof retries once the session proves healthy.
+#[test]
+fn key_operation_reseed_into_unhealthy_session_stays_s1only_with_named_gap() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only)
+    );
+    // The stuck-session abandon trips the health gate even with
+    // nothing staged to discard (the live idx-11 shape).
+    guarded.registry.reset_quantum_touched_feeds();
+    let (stuck, calls, feeds) = guarded
+        .registry
+        .discard_quantum_touched_staged(guarded.scene.adapter.ledger_mut());
+    assert!(
+        stuck.is_empty() && calls == 0 && feeds == 0,
+        "the posed abandon discards nothing, like the live one"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), fresh),
+        "the install stages; the reseed arm itself refuses"
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the unhealthy session keeps S1Only"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .any(|gap| gap.reason == "joint_birth_reseed_session_unhealthy"),
+        "the refused reseed names the unhealthy session"
+    );
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .all(|gap| gap.reason != crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON),
+        "no recovery is claimed while the session is unhealthy"
+    );
+}
+
+/// The health window opens after exactly three clean passes: two
+/// still refuse (the lethal live reseed landed ~2 s after its
+/// abandon), the third re-arms. Three passes cover one full 6 s
+/// wedge horizon at the documented ~2 s pass cadence, so a reseed
+/// arms only after the session survives a whole no-progress horizon
+/// without abandoning.
+#[test]
+fn key_operation_reseed_health_window_opens_after_three_clean_passes() {
+    fn voided_scene() -> (GuardedScene, InstanceKey, RegistryInstanceId) {
+        let mut guarded = GuardedScene::new();
+        let bootstrap = guarded.scene.bootstrap();
+        let joint_key = guarded.key(1);
+        assert!(
+            guarded
+                .registry
+                .install_joint_receipt(joint_key.clone(), bootstrap)
+        );
+        let (_, joint_id) = guarded.register(1);
+        let (facts, position) =
+            guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+        let mut failure = guarded.scene.adapter.scripted_failure(
+            JournalGap::H3Loss,
+            &bootstrap,
+            crate::semantics_objects::ObjectEffects::default(),
+        );
+        failure.fence = Some(1);
+        let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+        let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+            joint_id,
+            &failure,
+            &mut h3,
+            &guarded.scene.model,
+            guarded.scene.adapter.ledger_mut(),
+        );
+        assert!(matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        ));
+        (guarded, joint_key, joint_id)
+    }
+    fn attempt_reseed(guarded: &mut GuardedScene, joint_key: &InstanceKey) {
+        let bootstrap = guarded.scene.bootstrap();
+        let fresh = BootstrapReceipt::scripted(
+            bootstrap.proof(),
+            BirthKind::AttachObserved,
+            1,
+            bootstrap.closure_generation(),
+        );
+        assert!(
+            guarded
+                .registry
+                .install_joint_receipt(joint_key.clone(), fresh)
+        );
+        guarded.registry.note_instance(AdmittedInstance::scripted(
+            joint_key.clone(),
+            guarded.caller,
+        ));
+        guarded.registry.publish();
+    }
+    // Two clean passes after the abandon: still unhealthy.
+    let (mut guarded, joint_key, joint_id) = voided_scene();
+    guarded.registry.reset_quantum_touched_feeds();
+    let _ = guarded
+        .registry
+        .discard_quantum_touched_staged(guarded.scene.adapter.ledger_mut());
+    guarded.registry.reset_quantum_touched_feeds();
+    guarded.registry.reset_quantum_touched_feeds();
+    attempt_reseed(&mut guarded, &joint_key);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "two clean passes still refuse the reseed"
+    );
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .any(|gap| gap.reason == "joint_birth_reseed_session_unhealthy"),
+        "the second-pass refusal names the unhealthy session"
+    );
+    // The third clean pass opens the window: the same fresh proof
+    // reseeds.
+    let (mut guarded, joint_key, joint_id) = voided_scene();
+    guarded.registry.reset_quantum_touched_feeds();
+    let _ = guarded
+        .registry
+        .discard_quantum_touched_staged(guarded.scene.adapter.ledger_mut());
+    guarded.registry.reset_quantum_touched_feeds();
+    guarded.registry.reset_quantum_touched_feeds();
+    guarded.registry.reset_quantum_touched_feeds();
+    attempt_reseed(&mut guarded, &joint_key);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "three clean passes re-arm the reseed"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+}
+
+/// F6 re-scope (round 4, controller ruling): the unconditional retry
+/// guarantee no longer covers reseeds (they wait out the unhealthy
+/// window above); it covers non-reseed arms only. In one unhealthy
+/// window, a voided feed's reseed refuses with the health gap while
+/// a pristine feed's first birth still arms Joint: the gate never
+/// wedges new tracking, only re-entry into unauditable sessions.
+#[test]
+fn key_operation_health_gate_bars_only_reseeds_pristine_arms_still_arm() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    // A pristine second feed: registered, never Joint, never called.
+    let pristine_key = guarded.key(2);
+    let (_, pristine_id) = guarded.register(2);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(pristine_id),
+        Some(FeedMode::S1Only)
+    );
+    // One stuck-session abandon bars the window for reseeds.
+    guarded.registry.reset_quantum_touched_feeds();
+    let _ = guarded
+        .registry
+        .discard_quantum_touched_staged(guarded.scene.adapter.ledger_mut());
+    // The voided feed's reseed refuses in the window.
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), fresh)
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the reseed waits out the unhealthy window"
+    );
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .any(|gap| gap.reason == "joint_birth_reseed_session_unhealthy"),
+        "the refused reseed names the unhealthy session"
+    );
+    // The pristine feed's first birth arms in the same window.
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(pristine_key.clone(), bootstrap)
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        pristine_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(pristine_id),
+        Some(FeedMode::Joint),
+        "a first-time arm never waits on session health"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+}
+
+/// The proven-stuck abandon trips the same health window: a reseed
+/// right after a provenance-narrowed discard refuses with the health
+/// gap. Both re-arm discard seams feed the one gate.
+#[test]
+fn key_operation_reseed_refuses_after_proven_stuck_abandon() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let (stuck, calls, feeds) = guarded
+        .registry
+        .discard_proven_stuck_staged(guarded.scene.adapter.ledger_mut(), &[joint_id]);
+    assert!(
+        stuck.is_empty() && calls == 0 && feeds == 0,
+        "the voided feed holds nothing to discard"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), fresh)
+    );
+    guarded.registry.note_instance(AdmittedInstance::scripted(
+        joint_key.clone(),
+        guarded.caller,
+    ));
+    guarded.registry.publish();
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the proven-stuck abandon bars the reseed"
+    );
+    assert!(
+        guarded
+            .registry
+            .staged_gaps_for_test()
+            .iter()
+            .any(|gap| gap.reason == "joint_birth_reseed_session_unhealthy"),
+        "the refused reseed names the unhealthy session"
+    );
+}
+
 /// A transiently failed fresh-evidence take is unknown, not
 /// negative: its delivery retries with staging and Joint mode intact
 /// (the next tick takes again) instead of falling the whole session

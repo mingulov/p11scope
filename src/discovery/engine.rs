@@ -24545,10 +24545,15 @@ impl Engine {
             // would only re-prove the same refusal.
             const LEARNED_PIN_RETRIES: u8 = 10;
             const LEARNED_PIN_RETRY_CAP: usize = 128;
-            let budget_pressure = pinning.skipped.iter().any(|skip| {
-                skip.reason.contains("ceiling") || skip.reason.contains("retry")
-            });
-            let retries = self.learned_pin_retries.get(&identity).copied().unwrap_or(0);
+            let budget_pressure = pinning
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("ceiling") || skip.reason.contains("retry"));
+            let retries = self
+                .learned_pin_retries
+                .get(&identity)
+                .copied()
+                .unwrap_or(0);
             let retry = budget_pressure
                 && !self.learned_finalize
                 && retries < LEARNED_PIN_RETRIES

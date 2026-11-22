@@ -87672,15 +87672,15 @@ fn learned_pin_failure_retries_before_filing() {
     );
 }
 
-/// A file-changed learned pin recovers on the same unexhausted
-/// production budget across the pass boundary: the retry re-proves
-/// through the production pin path with the capture budget the
-/// `profile --system` lifecycle owns (never replaced, never renewed —
-/// DetailedLegacy has no renewable window), and recovery needs no
-/// fresh credit: the allowance stays far from either ceiling with no
-/// sticky stop throughout.
+/// A file-changed learned pin recovers on its own per-pass budget
+/// across the pass boundary: the retry re-proves through the
+/// production pin path against a fresh per-pass allowance — never the
+/// capture budget — so recovery needs no capture credit and leaves
+/// the capture allowance exactly as it found it. DetailedLegacy still
+/// offers no renewable window; the per-pass budget is a separate small
+/// allowance per retry attempt, like the per-tick pin bound.
 #[test]
-fn learned_pin_retry_recovers_without_a_fresh_budget() {
+fn learned_pin_retry_recovers_on_its_pass_budget() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
     let library = fixture._dir.path().join("seed-provider.so");
     let file = std::fs::File::open(&library).unwrap();
@@ -87717,14 +87717,27 @@ fn learned_pin_retry_recovers_without_a_fresh_budget() {
         !engine.pending_learned.is_empty(),
         "the race requeues the candidate"
     );
+    let attempted_before_retry = engine.budget.attempted_io_bytes();
+    let work_before_retry = engine.budget.work_units_count();
     engine.service_learned_files();
     assert_eq!(
         engine.learned_staged_files_for_test(),
         1,
-        "the retry stages on the same budget"
+        "the retry stages on its pass budget"
     );
-    // No fresh budget was dealt across the pass boundary: the same
-    // allowance, still unexhausted, with no sticky stop.
+    // The retry drew no capture credit: the capture allowance is
+    // exactly as the failed attempt left it — same policy, same
+    // limits, same counters, still unexhausted, no sticky stop.
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        attempted_before_retry,
+        "the re-proof charges the pass budget, not the capture total"
+    );
+    assert_eq!(
+        engine.budget.work_units_count(),
+        work_before_retry,
+        "the re-proof spends pass work, not capture work"
+    );
     assert_eq!(
         engine.budget.policy(),
         crate::discovery::scan::DiscoveryPolicy::DetailedLegacy
@@ -87746,6 +87759,95 @@ fn learned_pin_retry_recovers_without_a_fresh_budget() {
     assert!(
         engine.budget.stopped_reason().is_none(),
         "no sticky stop latched"
+    );
+}
+
+/// A file-changed learned pin still recovers when capture pressure
+/// lands between the race and the retry: the first attempt requeues
+/// on the production capture budget, the capture allowance then
+/// exhausts the production way (charged reads, no budget touched
+/// otherwise), and the retry re-proves against its own fresh per-pass
+/// budget and stages — the capture budget stays exhausted throughout
+/// (no capture credit, no hand-fed replacement).
+#[test]
+fn learned_pin_retry_recovers_when_pressure_lands_between_passes() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_learned_files();
+    assert!(
+        !engine.pending_learned.is_empty(),
+        "the race requeues the candidate"
+    );
+    // Capture pressure arrives between the passes, the way production
+    // scans charge it (charged reads, no budget replacement).
+    engine.budget.record_io(512 * 1024 * 1024);
+    assert_eq!(
+        engine.budget.remaining_window_io().unwrap(),
+        0,
+        "the capture allowance is spent before the retry"
+    );
+    let spent = engine.budget.attempted_io_bytes();
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the retry stages on its pass budget despite exhausted capture credit"
+    );
+    assert!(engine.learned_settled.contains(&(dev, ino)));
+    // The capture budget paid nothing for the recovery: still
+    // exhausted, still the same DetailedLegacy allowance.
+    assert_eq!(
+        engine.budget.remaining_window_io().unwrap(),
+        0,
+        "the retry drew no capture credit"
+    );
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        spent,
+        "the re-proof left the capture total alone"
+    );
+    assert_eq!(
+        engine.budget.policy(),
+        crate::discovery::scan::DiscoveryPolicy::DetailedLegacy
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "no prearm gap after a recovered pin stages: {public:?}"
+    );
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "the staged file files its first-use row: {public:?}"
     );
 }
 

@@ -828,16 +828,42 @@ fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
 /// no counter, so any capacity gap fails; shed without a printed
 /// named gap (or with suppressed disclosure) fails too.
 ///
-/// Owners are (name, sem, count_only, entered, api, slot, inst).
+/// One owner's measured populations for stop reconciliation: the ledger
+/// splits (`sem`/`count_only`/`entered`), the edge attribution (`api`),
+/// the disclosed slot refusals (`slot`), and the per-call instance
+/// refusals (`inst`, R-59). `caller`/`module` identify the fixture edge
+/// whose retained gap rows disclose the instance refusals.
+struct StopOwnerLedger {
+    name: &'static str,
+    caller: crate::discovery::caller_registry::CallerId,
+    module: crate::discovery::caller_registry::ModuleId,
+    sem: u64,
+    count_only: u64,
+    entered: u64,
+    api: u64,
+    slot: u64,
+    inst: u64,
+}
+
 fn assert_semantic_reconciled(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     lane_shed: u64,
     tag: &str,
-    owners: &[(&str, u64, u64, u64, u64, u64, u64)],
+    owners: &[StopOwnerLedger],
 ) -> Result<()> {
     let mut parts = Vec::new();
     let (mut entered_sum, mut api_sum, mut slot_sum, mut inst_sum) = (0u64, 0u64, 0u64, 0u64);
-    for (name, sem, count_only, entered, api, slot, inst) in owners {
+    for owner in owners {
+        let StopOwnerLedger {
+            name,
+            sem,
+            count_only,
+            entered,
+            api,
+            slot,
+            inst,
+            ..
+        } = owner;
         ensure!(
             api <= sem,
             "{tag}: {name} never over-attributes: api {api} <= sem {sem}"
@@ -1583,6 +1609,8 @@ fn run_stop_offset(
     let (b_semantic, b_count_only) = ledger_semantic_split(&per_function_b);
     let caller_a = caller_of(driver.coordinator, process_a.pid())?;
     let caller_b = caller_of(driver.coordinator, process_b.pid())?;
+    let module_a = module_of(driver.coordinator, "live-joint-held.so")?;
+    let module_b = module_of(driver.coordinator, "soft-copy.so")?;
     let api_b = edge_b.api_returns.unwrap_or(0);
     let slot_a = count_disclosed_gaps(
         driver.coordinator,
@@ -1609,24 +1637,28 @@ fn run_stop_offset(
         lane_shed,
         &format!("{tag}-stop"),
         &[
-            (
-                "a",
-                a_semantic,
-                a_count_only,
-                a_semantic + a_count_only,
-                edge_a.api_returns.unwrap_or(0),
-                slot_a,
-                inst_a,
-            ),
-            (
-                "b",
-                b_semantic,
-                b_count_only,
-                b_semantic + b_count_only,
-                api_b,
-                slot_b,
-                inst_b,
-            ),
+            StopOwnerLedger {
+                name: "a",
+                caller: caller_a,
+                module: module_a,
+                sem: a_semantic,
+                count_only: a_count_only,
+                entered: a_semantic + a_count_only,
+                api: edge_a.api_returns.unwrap_or(0),
+                slot: slot_a,
+                inst: inst_a,
+            },
+            StopOwnerLedger {
+                name: "b",
+                caller: caller_b,
+                module: module_b,
+                sem: b_semantic,
+                count_only: b_count_only,
+                entered: b_semantic + b_count_only,
+                api: api_b,
+                slot: slot_b,
+                inst: inst_b,
+            },
         ],
     );
     let (reconciled, reconcile_detail) = match reconcile {
@@ -2046,4 +2078,214 @@ fn no_feed_tags_name_each_branch_cause() {
         unattributed.contains("no S1 seal"),
         "the unattributed cause names the missing seal: {unattributed}"
     );
+}
+
+/// Empty coordinator for the reconciliation twins: the equation reads
+/// only the registry gaps and the suppression counter, so no live
+/// lane is needed.
+fn reconciliation_test_coordinator() -> InventoryCoordinator<OsProcessSource> {
+    InventoryCoordinator::new(
+        Scope::Pid(std::process::id()),
+        HookRegistry::builtin(),
+        Vec::new(),
+        vec![],
+        OsProcessSource,
+        RegistryLimits::default_limits(),
+    )
+    .expect("a test coordinator builds")
+}
+
+fn stop_owner(
+    name: &'static str,
+    caller: u32,
+    module: u32,
+    sem: u64,
+    count_only: u64,
+    api: u64,
+    slot: u64,
+    inst: u64,
+) -> StopOwnerLedger {
+    use crate::discovery::caller_registry::{CallerId, ModuleId};
+    StopOwnerLedger {
+        name,
+        caller: CallerId(caller),
+        module: ModuleId(module),
+        sem,
+        count_only,
+        entered: sem + count_only,
+        api,
+        slot,
+        inst,
+    }
+}
+
+fn record_test_gap(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    caller: Option<u32>,
+    module: Option<u32>,
+    subject: &str,
+    reason: &str,
+) {
+    use crate::discovery::caller_registry::{CallerId, ModuleId, RegistryGap};
+    coordinator.registry_mut().record_gap(RegistryGap {
+        caller: caller.map(CallerId),
+        module: module.map(ModuleId),
+        pid: None,
+        subject: subject.to_string(),
+        reason: reason.to_string(),
+        budget: None,
+    });
+    coordinator.registry_mut().publish();
+}
+
+#[test]
+fn stop_reconciliation_accepts_healthy_two_owner_counts() {
+    let coordinator = reconciliation_test_coordinator();
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 2, 0, 0),
+            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+        ],
+    )
+    .expect("healthy A=2/2 and B=15+1/16 reconcile");
+}
+
+#[test]
+fn stop_reconciliation_refuses_cross_caller_compensation() {
+    // An extra instance refusal charged to A must not hide a missing
+    // B call: the pooled sums match (18 entered vs 16 api + 1 slot +
+    // 1 inst) but per-caller A over-refuses and B under-accounts.
+    let coordinator = reconciliation_test_coordinator();
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 2, 0, 1),
+            stop_owner("b", 2, 2, 15, 1, 14, 1, 0),
+        ],
+    )
+    .expect_err("an A-side extra refusal hiding a B-side loss must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains('a') || text.contains('b'),
+        "the failure names the offending caller: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_instance_refusal_without_retained_reason() {
+    // A's counts balance only through its instance refusal, but no
+    // retained gap row discloses that refusal for A's edge.
+    let coordinator = reconciliation_test_coordinator();
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 1, 0, 1),
+            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+        ],
+    )
+    .expect_err("an undisclosed instance refusal must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("instance"),
+        "the failure names the instance disclosure: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_accepts_instance_refusal_with_retained_reason() {
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        Some(1),
+        "instance semantics refused",
+        "instance_unproven",
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 1, 0, 1),
+            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+        ],
+    )
+    .expect("a disclosed instance refusal reconciles");
+}
+
+#[test]
+fn stop_reconciliation_accepts_disclosed_shed_per_caller() {
+    // B is one call short and the lane shed counts and discloses it
+    // in the named caller-less gap: each caller's deficit is
+    // nonnegative and the deficits sum to the shed.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed without a route (test=1) with 2 bindings",
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 2, 0, 0),
+            stop_owner("b", 2, 2, 15, 1, 14, 1, 0),
+        ],
+    )
+    .expect("a counted and disclosed shed reconciles per caller");
+}
+
+#[test]
+fn stop_reconciliation_refuses_instance_refusal_when_disclosure_suppressed() {
+    // The instance reason row is retained for A, but another distinct
+    // gap overflowed the bound: with suppression nonzero the lane
+    // cannot prove no instance disclosure was dropped.
+    let mut coordinator = InventoryCoordinator::new(
+        Scope::Pid(std::process::id()),
+        HookRegistry::builtin(),
+        Vec::new(),
+        vec![],
+        OsProcessSource,
+        RegistryLimits::new(8, 8, 8, 1, 8, 8).expect("a one-gap bound"),
+    )
+    .expect("a test coordinator builds");
+    record_test_gap(
+        &mut coordinator,
+        Some(1),
+        Some(1),
+        "instance semantics refused",
+        "instance_unproven",
+    );
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "other subject",
+        "other reason",
+    );
+    assert_eq!(
+        coordinator.registry().gaps_suppressed(),
+        1,
+        "the second distinct gap suppresses"
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 1, 0, 1),
+            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+        ],
+    )
+    .expect_err("a suppressed disclosure with instance refusals must fail");
 }

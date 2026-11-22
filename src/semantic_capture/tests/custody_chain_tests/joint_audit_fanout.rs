@@ -31729,6 +31729,7 @@ impl CanonicalFanoutScene {
 fn with_genuine_prior_terminal(
     reverse_head: bool,
     drive_h9: bool,
+    loss_function: &'static str,
     after_seal: impl FnOnce(
         &mut CanonicalFanoutScene,
         &mut IngestedJointQuantum,
@@ -31742,16 +31743,11 @@ fn with_genuine_prior_terminal(
     use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     let (target, pid) = fixture.replay_target();
-    let (open, ordinary) = fixture.scene.encoded(
-        pid,
-        0,
-        if drive_h9 {
-            "C_SignInit"
-        } else {
-            "C_SignUpdate"
-        },
-        2,
-    );
+    // The conversion loss needs a tail-needing (object) function: its
+    // result/find/attribute tail is truly gone with the END. Tail-free
+    // functions drain their corroborated return into a completion
+    // instead (joint_replay_steps_drained_conversion_completes_tail_free_call).
+    let (open, ordinary) = fixture.scene.encoded(pid, 0, loss_function, 2);
     let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
     let ordinary = if reverse_head {
         // B began first but returns after A. H0 therefore admits A before B,
@@ -32797,7 +32793,309 @@ fn joint_deferred_s1only_negative_keeps_disjoint_s1only_history_negative_only() 
 
 #[test]
 fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
-    with_genuine_prior_terminal(false, false, |_, _, _, _, _| false);
+    // Kept-loss twin: C_SignInit needs its BPF tail, so the reason-9
+    // conversion still loses boundedly. The C_SignUpdate staging this
+    // test previously used now drains to a completion; that recovered
+    // outcome is pinned by
+    // joint_replay_steps_drained_conversion_completes_tail_free_call.
+    with_genuine_prior_terminal(false, false, "C_SignInit", |_, _, _, _, _| false);
+}
+
+/// Drained twin of joint_replay_steps_keep_prior_terminal_after_conversion_loss:
+/// the same exit-during-return staging (BEGIN + corroborated ordinary OK
+/// return + ABANDON(9)) on a tail-free call (C_SignUpdate) completes from
+/// the drained return instead of losing its outcome, while the retained
+/// prior terminal still replays exactly once.
+#[test]
+fn joint_replay_steps_drained_conversion_completes_tail_free_call() {
+    use crate::semantics_objects::journal::SealReplayPhase;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    // Staging mirrors with_genuine_prior_terminal(false, false) verbatim.
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 2);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    fixture.scene.drain.source_mut().push_record(open.to_vec());
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(ordinary[24..392].to_vec());
+    fixture.scene.drain.source_mut().push_record(held.to_vec());
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(complete.to_vec());
+    let mut q1 = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        q1.failure_for_test().is_none(),
+        "q1 must have an actual clean audit: {:?}",
+        q1.failure_for_test()
+    );
+    fixture.seal_replay_head(&mut q1, &BirthFault);
+    let first = q1.active_seal_for_test().unwrap();
+    assert_eq!(first.prefix.domain(), target.bootstrap().domain());
+    assert_eq!(first.prefix.settled().len(), 2);
+    let old = *first
+        .prefix
+        .settled()
+        .iter()
+        .find(|call| call.end_cut.is_some())
+        .unwrap();
+    let drained = *first
+        .prefix
+        .settled()
+        .iter()
+        .find(|call| call.end_cut.is_none())
+        .unwrap();
+    // The abandonment is the sole record the second quantum consumes,
+    // so its ordinal is the quantum's first fresh cut; the drained
+    // completion cuts there, like an END conversion cuts at its END.
+    let recovered_cut = first.prefix.frontier_cut() + 1;
+    assert!(!(old.key.admission() < drained.key.admission()));
+    assert!(
+        first.effects.effects.is_empty(),
+        "the real open holds the watermark"
+    );
+    assert_original_replay_partition(first);
+    assert!(
+        !first
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::End)
+    );
+    fixture.scene.assert_claims(&[]);
+    let before_feeds = fixture.feeds();
+    let before_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(before_roles[..4], [0, 2, 2, 2]);
+
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(abandon.to_vec());
+    let mut q2 = fixture.audited(0, 0, &BirthFault);
+    assert!(
+        q2.failure_for_test().is_none(),
+        "q2 drained ABANDON must preserve resource custody: {:?}",
+        q2.failure_for_test()
+    );
+    fixture.seal_replay_head(&mut q2, &BirthFault);
+    let second = q2.active_seal_for_test().unwrap();
+    assert_eq!(
+        second.prefix.settled().len(),
+        1,
+        "legacy delta stays unchanged"
+    );
+    assert!(
+        !second.prefix.settled()[0].abandoned,
+        "the drained call completes, never abandons"
+    );
+    assert_eq!(
+        second.prefix.settled()[0].end_cut,
+        Some(recovered_cut),
+        "the return cut is the corroborated ordinal"
+    );
+    assert_eq!(second.prefix.replay_calls().len(), 2);
+    assert_eq!(
+        second.prefix.replay_calls()[1],
+        old,
+        "capture the retained original before prune"
+    );
+    assert_original_replay_partition(second);
+    for foreign in q1.active_seal_for_test().unwrap().prefix.replay_steps() {
+        assert!(second.prefix.call_for_step(foreign).is_none());
+        assert!(second.effects_for_step(foreign).is_none());
+    }
+    assert!(
+        !second
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::BoundedLoss),
+        "a drained return mints no loss"
+    );
+    let terminal: Vec<_> = second
+        .prefix
+        .replay_steps()
+        .iter()
+        .filter(|step| step.phase() == SealReplayPhase::End)
+        .collect();
+    assert_eq!(
+        terminal.len(),
+        2,
+        "the drained call settles alongside the retained complete original"
+    );
+    // The conversion completes cleanly at the abandonment cut: no
+    // contradiction, no loss, no effects at all (a bare Update return
+    // carries no object facts to mint).
+    let conversions: Vec<_> = second
+        .prefix
+        .replay_steps()
+        .iter()
+        .filter(|step| step.phase() == SealReplayPhase::Conversion)
+        .collect();
+    assert_eq!(conversions.len(), 1);
+    assert_eq!(conversions[0].cut(), Some(recovered_cut));
+    assert!(conversions[0].effect_range().is_empty());
+    let recovered = second.prefix.settled()[0];
+    for step in &terminal {
+        let call = second.prefix.call_for_step(step).unwrap();
+        if call.ticket == old.ticket {
+            assert_eq!((*call, step.cut()), (old, old.end_cut));
+            let effects = &second.effects.effects[step.effect_range()];
+            assert_eq!(effects.len(), 2);
+            assert!(matches!(
+                &effects[0],
+                ObjectEffect::FirstObserved { call, .. } if *call == old.ticket
+            ));
+            assert!(matches!(
+                &effects[1],
+                ObjectEffect::Referenced { call, key_use, .. }
+                    if *call == old.ticket && *key_use
+            ));
+        } else {
+            assert_eq!((*call, step.cut()), (recovered, Some(recovered_cut)));
+            assert!(
+                step.effect_range().is_empty(),
+                "the drained Update completes with no fabricated effects"
+            );
+        }
+    }
+    // No loss, no contradiction, no malformation anywhere in the seal:
+    // completing at a stale cut voids the domain instead of recovering.
+    assert!(
+        !second.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::AccessEnded {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Retired {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::MetadataInvalidated {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Downgraded {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Unresolved {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Gap {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+            } | ObjectEffect::SessionEnded {
+                end: crate::semantics_objects::SessionEnd::Uncertain(
+                    ObjectGap::OutcomeLost
+                        | ObjectGap::PrefixContradiction
+                        | ObjectGap::MalformedFact,
+                ),
+                ..
+            }
+        )),
+        "no outcome is lost and no prefix is contradicted: {:?}",
+        second.effects.effects
+    );
+    // Seal-time custody is identical to the loss twin: the drain
+    // changes only the terminal disposition, not staging retention.
+    assert_eq!(
+        fixture.feeds(),
+        before_feeds,
+        "representation activates no H9 replay"
+    );
+    fixture.scene.assert_claims(&[]);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .ledger()
+            .roles_for_test()[..4],
+        [0, 0, 0, 2]
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_audit_state(),
+        (3, false)
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .reference_h3_acknowledged_below(),
+        0
+    );
+    // Both genuine completions replay end to end; nothing disposes.
+    let target_before = before_feeds
+        .iter()
+        .find(|feed| feed.id == target.id())
+        .unwrap();
+    let base = (target_before.reduced, target_before.disposed);
+    let counts = fixture.s1_counts(target.id());
+    fixture.finish_bounded_batch(q2, false);
+    let feed = fixture
+        .feeds()
+        .into_iter()
+        .find(|feed| feed.id == target.id())
+        .unwrap();
+    assert_eq!(
+        (feed.reduced - base.0, feed.disposed - base.1, feed.staged),
+        (2, 0, 0)
+    );
+    let current = fixture.s1_counts(target.id());
+    assert_eq!(
+        current.0 - counts.0,
+        2,
+        "the drained completion is S1-positive replay, never disposal"
+    );
 }
 
 #[test]
@@ -33393,6 +33691,7 @@ fn key_operation_joint_batch_bounded_loss_keeps_exact_admission_head() {
         with_genuine_prior_terminal(
             reverse_head,
             true,
+            "C_SignInit",
             |fixture, frame, target, complete, lost| {
                 assert_eq!(
                     complete.function, lost.function,

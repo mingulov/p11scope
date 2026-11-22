@@ -1974,6 +1974,62 @@ fn cgroup_snapshot_resume_keeps_evicted_completions_covered() {
     }
 }
 
+/// A completion that arrives directly at capacity is remembered under
+/// its own layout: with the history full and completion-record slots
+/// free, an object arrives complete, then restarts on the same
+/// identity and layout; with every other cursor frozen its climb earns
+/// nothing. The same identity on a fresh layout is new work: admitted,
+/// and its rise earns a pass.
+#[test]
+fn cgroup_snapshot_resume_keeps_direct_completion_arrivals_covered() {
+    use crate::inspect_system::inventory_cgroup::{ScopedCollectionGap, ScopedCollectionOutcome};
+    use crate::scope::inventory_cgroup::CgroupIncomplete;
+    let work_limit = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::Membership(
+        CgroupIncomplete::WorkLimit,
+    ));
+    let cap = crate::discovery::scan_pass::MAX_DECODE_CURSORS as u64;
+    let fixed = resume_key(7, 9, 11);
+    let arrival = resume_key(6, 9, 6);
+    for (restart_layout, expect_grant) in [(300u64, false), (301u64, true)] {
+        let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
+        let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
+        driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
+        let mut first = vec![(fixed.clone(), resume_progress(100, (0, 100), (0, 0), 4, false))];
+        first.extend((0..cap - 1).map(|index| {
+            (
+                resume_key(8, 9, 1_000_000 + index),
+                resume_progress(100, (2, 0), (2, 0), 1, true),
+            )
+        }));
+        assert!(pass_resume(&mut driver.inner, resume_position(first)));
+        assert!(pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (fixed.clone(), resume_progress(100, (0, 101), (0, 0), 4, false)),
+                (arrival.clone(), resume_progress(300, (2, 0), (2, 0), 1, true)),
+            ])
+        ));
+        assert!(pass_resume(
+            &mut driver.inner,
+            resume_position(vec![
+                (fixed.clone(), resume_progress(100, (0, 102), (0, 0), 4, false)),
+                (arrival.clone(), resume_progress(restart_layout, (0, 5), (0, 0), 1, false)),
+            ])
+        ));
+        assert_eq!(
+            pass_resume(
+                &mut driver.inner,
+                resume_position(vec![
+                    (fixed.clone(), resume_progress(100, (0, 102), (0, 0), 4, false)),
+                    (arrival.clone(), resume_progress(restart_layout, (0, 20), (0, 0), 1, false)),
+                ])
+            ),
+            expect_grant,
+            "layout {restart_layout}: only new work earns a pass"
+        );
+    }
+}
+
 /// Once completions can no longer be remembered, admission at capacity
 /// is refused, counted and named: with the history full and the bounded
 /// completion record full, an unfinished newcomer cannot take an evicted

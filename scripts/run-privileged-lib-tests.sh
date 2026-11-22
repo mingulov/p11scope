@@ -803,9 +803,10 @@ manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_
 # requires every matrix case (not a campaign list: every member also
 # runs as a long cell). The runner unsets the cell's narrowing
 # selectors for exactly these cells and fails a pass that lacks any
-# linked case tag, so inherited WP7_STOP_PREPS / WP7_STOP_OFFSETS
-# narrowing can never qualify as the full matrix. Direct libtest runs
-# keep narrowing for exploration.
+# post-stop completion line (matched as a full line), so inherited
+# WP7_STOP_PREPS / WP7_STOP_OFFSETS narrowing can never qualify as
+# the full matrix. Direct libtest runs keep narrowing for
+# exploration.
 FULL_MATRIX_TESTS=(
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 )
@@ -837,7 +838,7 @@ attach::inventory::activation::privileged_tests::privileged_inventory_multi_n819
 # unreachable (collected ticks resolve waiters same tick); the invariant
 # lives in the machine twins named in tests/ignored-tests.json. The
 # runner unsets WP7_STOP_PREPS / WP7_STOP_OFFSETS for this cell and
-# requires all 12 linked case tags for a pass (FULL_MATRIX_TESTS).
+# requires all 12 stop-completion lines for a pass (FULL_MATRIX_TESTS).
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 # G21 default-ring wrap needs 266 changing observed rounds per leg (532 per
 # two-leg cell; 260 counted + 4 shared + fence + proof per leg, 264 without
@@ -2149,14 +2150,14 @@ main() {
         if [ -n "${full_matrix_set[$name]+present}" ] && [ "$verdict" = PASS ]; then
             i=0
             while [ "$i" -lt 12 ]; do
-                if ! command grep -qF "P11SCOPE_CELL_BRANCH=wp7-stop$i:linked" "$log"; then
+                if ! command grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" "$log"; then
                     matrix_missing="$matrix_missing $i"
                 fi
                 i=$((i + 1))
             done
             if [ -n "$matrix_missing" ]; then
                 verdict=FAIL
-                matrix_note=" (MATRIX SHORT: missing linked cases:$matrix_missing; want wp7-stop0..wp7-stop11)"
+                matrix_note=" (MATRIX SHORT: missing completed cases:$matrix_missing; want wp7-stop0..wp7-stop11)"
             fi
         fi
         branch_suffix=$(cell_branch_suffix "$log")

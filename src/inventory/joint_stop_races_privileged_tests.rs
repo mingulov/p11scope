@@ -1778,7 +1778,8 @@ fn run_stop_offset(
 /// `WP7_STOP_PREPS` / `WP7_STOP_OFFSETS` (comma-separated indices,
 /// default all) narrow the matrix for exploration. The qualifying
 /// entries (the long campaign runner and the S3 suite) unset both and
-/// require all 12 linked case tags by exact name.
+/// require all 12 post-stop completion lines by exact full-line match;
+/// pre-stop linkage tags alone never qualify.
 #[test]
 #[ignore = "privileged: linked Joint stop coverage (12-case matrix)"]
 fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64() -> Result<()> {
@@ -1873,7 +1874,12 @@ fn run_stop_case(
         },
         outcome.finish,
     );
-    check_stop_outcome(&outcome, offset_ms)
+    check_stop_outcome(&outcome, offset_ms)?;
+    // Qualification evidence: this marker prints only after every
+    // stop check passed, so the qualifying entries prove the stop
+    // completed rather than merely linked.
+    eprintln!("P11SCOPE_STOP_COMPLETE=wp7-stop{index}");
+    Ok(())
 }
 
 /// The stop cell must prove each case finished its stop: pin the

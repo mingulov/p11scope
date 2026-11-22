@@ -38,8 +38,9 @@
 #     WP7_STOP_OFFSETS narrowing is unset for the cell (direct libtest
 #     runs keep narrowing for exploration), the cell runs with
 #     --nocapture so its per-case tags reach the log, and the qualified
-#     row requires all 12 wp7-stopN:linked tags by exact name. A pass
-#     with fewer cases fails the row as matrix-short.
+#     row requires all 12 post-stop completion lines by exact full-line
+#     match. A pass with fewer completed cases fails the row as
+#     matrix-short; pre-stop linkage tags alone never qualify.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ROOT=$(cd "$HERE/../.." && pwd) || exit 64
@@ -111,7 +112,7 @@ else
   if [ "$joint_rc" = 0 ]; then
     i=0
     while [ "$i" -lt 12 ]; do
-      if ! grep -qF "P11SCOPE_CELL_BRANCH=wp7-stop$i:linked" joint-cell.log; then
+      if ! grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" joint-cell.log; then
         joint_matrix_missing="$joint_matrix_missing $i"
       fi
       i=$((i + 1))
@@ -125,7 +126,7 @@ else
     joint_detail='joint cell unexpectedly passed under JOINT_EXPECTED_FAILURE=1; set 0 once the wedge is gone for good'
   elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ] \
       && grep -q '^test result: ok\. [1-9][0-9]* passed' joint-cell.log; then
-    joint_detail="joint cell passed without the full linked matrix (missing linked cases:$joint_matrix_missing); the qualifying entry forces all 12 wp7-stop cases"
+    joint_detail="joint cell passed without the full stop matrix (missing completed cases:$joint_matrix_missing); the qualifying entry forces all 12 wp7-stop cases"
   elif [ "$joint_rc" = 0 ]; then
     joint_detail='joint cell exited 0 without a passing test (zero selected or unmapped output); see joint-cell.log'
   elif [ "$EXPECT_JOINT_FAIL" = 1 ] && grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then

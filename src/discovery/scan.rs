@@ -6454,12 +6454,38 @@ pub(crate) fn witness_join_with_copyup(
 /// object then scans fresh every pass, never worse than no cursor. A pin
 /// read here that races the facts read simply misses next pass (a
 /// changed file is re-read, never trusted stale).
-fn cursor_file_key_for(file: &File, key: ObjectKey) -> Option<InspectedFileKey> {
+fn cursor_file_key_for(
+    file: &File,
+    key: ObjectKey,
+    _budget: &mut CaptureWorkBudget,
+) -> Option<InspectedFileKey> {
     if !file_inodes_are_unique(file) {
         return None;
     }
     let pin = pin_of(file).ok()?;
     InspectedFileKey::for_open_file(file, key.device, key.inode, pin).ok()
+}
+
+/// The view's executable image for a resumable cursor key, read inside
+/// a generation bracket: a generation check, the `/proc/<pid>/exe`
+/// readlink, and a second generation check. `None` refuses the read (the
+/// object carries no cursor key this pass); `Some(None)` is a read that
+/// failed or saw the generation change.
+fn resume_view_exec(
+    budget: &mut CaptureWorkBudget,
+    mut still_the_same: impl FnMut() -> bool,
+    read: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<Option<Vec<u8>>> {
+    budget.resume_exec_target(|| {
+        if !still_the_same() {
+            return None;
+        }
+        let image = read();
+        if !still_the_same() {
+            return None;
+        }
+        image
+    })
 }
 
 /// Whether two decoded interfaces are the same triple, ignoring the
@@ -9056,7 +9082,7 @@ fn scan_view_examined_mode(
         // The decode-cursor file key for the winning file (re-pointed at
         // the proven lower file after a copy-up join below): `None`
         // scans fresh every pass, never worse than no cursor.
-        let mut cursor_file_key = cursor_file_key_for(&file, key);
+        let mut cursor_file_key = cursor_file_key_for(&file, key, budget);
         substage::add(3, sub_facts);
         let mut hook_exports: Vec<String> = facts
             .exports
@@ -9152,7 +9178,7 @@ fn scan_view_examined_mode(
                         };
                     // The joined lower file is the object this module now
                     // describes: the cursor follows it too.
-                    cursor_file_key = cursor_file_key_for(&proof.file, lower_key);
+                    cursor_file_key = cursor_file_key_for(&proof.file, lower_key, budget);
                     let lower_hooks: Vec<String> = lower_facts
                         .exports
                         .iter()
@@ -9285,12 +9311,15 @@ fn scan_view_examined_mode(
                 // read leaves the object without a key this pass.
                 let exec = if budget.resume_armed() {
                     if view_exec.is_none() {
-                        view_exec = budget.resume_exec_target(|| {
-                            view.run_while_same(|| io.exe_target(view))
-                                .ok()
-                                .and_then(|result| result.ok())
-                                .map(|target| target.as_os_str().as_bytes().to_vec())
-                        });
+                        view_exec = resume_view_exec(
+                            budget,
+                            || view.still_the_same(),
+                            || {
+                                io.exe_target(view)
+                                    .ok()
+                                    .map(|target| target.as_os_str().as_bytes().to_vec())
+                            },
+                        );
                     }
                     view_exec.clone()
                 } else {

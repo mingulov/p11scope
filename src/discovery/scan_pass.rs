@@ -153,6 +153,34 @@ thread_local! {
     pub(crate) static PROGRESS_SUMMARIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Selected-slot visits performed by capped resume reservation on
+    /// this thread: one per examined selection slot while building the
+    /// victim orders plus one per tail/unfinished displacement decision.
+    /// Linear in (selection + eligible); the pre-index quadratic scan
+    /// visited all slots per missing member instead.
+    pub(crate) static RESERVE_SLOT_VISITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: selected-slot visits so far (see `RESERVE_SLOT_VISITS`).
+#[cfg(test)]
+pub(crate) fn reserve_slot_visits() -> usize {
+    RESERVE_SLOT_VISITS.with(|visits| visits.get())
+}
+
+/// Test-only: reset the selected-slot visit counter.
+#[cfg(test)]
+pub(crate) fn reset_reserve_slot_visits() {
+    RESERVE_SLOT_VISITS.with(|visits| visits.set(0));
+}
+
+#[cfg(test)]
+fn note_reserve_slot_visit() {
+    RESERVE_SLOT_VISITS.with(|visits| visits.set(visits.get().saturating_add(1)));
+}
+
 /// Committed per-cursor progress for the snapshot resume decision: the
 /// layout the frontiers were recorded under, both sweep frontiers, the
 /// decoded-table count and completion. Same cursor key plus same layout
@@ -1848,6 +1876,15 @@ impl ScanPassOwner {
     /// cursors this is a no-op. Called after rarity selection and
     /// before resume ordering, so capped passes cannot starve resumed
     /// work behind selection order.
+    ///
+    /// Linearithmic: the tail-victim stack (rarity-lowest first) and the
+    /// selected-unfinished victim order (youngest first, highest
+    /// position breaking sequence ties) are built once, then consumed
+    /// as pending members arrive oldest-first. Inserted members are
+    /// older than every later arrival, so they never become victims
+    /// themselves and the first refused unfinished displacement ends
+    /// the pass (later arrivals are younger still). A strictly older
+    /// incoming sequence is required to displace an unfinished member.
     pub(crate) fn reserve_unfinished_selection(
         &self,
         selected: &mut Vec<u32>,
@@ -1865,6 +1902,33 @@ impl ScanPassOwner {
         let mut pending: Vec<(u64, u32)> = oldest.iter().map(|(pid, seq)| (*seq, *pid)).collect();
         pending.sort();
         let mut selected_set: BTreeSet<u32> = selected.iter().copied().collect();
+        // Tail victims: positions of non-unfinished members, ascending,
+        // so `pop` yields the rarity-lowest (highest position) first.
+        // Pushed members append past these indices, leaving them valid.
+        let mut tail_victims: Vec<usize> = Vec::new();
+        for (index, member) in selected.iter().enumerate() {
+            #[cfg(test)]
+            note_reserve_slot_visit();
+            if !unfinished.contains(member) {
+                tail_victims.push(index);
+            }
+        }
+        // Selected unfinished victims youngest-first; the highest
+        // position comes first among equal sequences (the old
+        // `max_by_key` returned the last maximum). Tail-inserted and
+        // earlier-displaced members are older than every later arrival,
+        // so the order over the initial selection is complete: inserted
+        // members never become victims in this same pass.
+        let mut unfinished_victims: Vec<(u64, usize)> = Vec::new();
+        for (index, member) in selected.iter().enumerate() {
+            #[cfg(test)]
+            note_reserve_slot_visit();
+            if let Some(seq) = oldest.get(member) {
+                unfinished_victims.push((*seq, index));
+            }
+        }
+        unfinished_victims.sort_by(|left, right| right.cmp(left));
+        let mut unfinished_head: usize = 0;
         for (seq, pid) in pending {
             if selected_set.contains(&pid) || !eligible.contains(&pid) {
                 continue;
@@ -1874,30 +1938,32 @@ impl ScanPassOwner {
                 selected_set.insert(pid);
                 continue;
             }
-            if let Some(victim) = selected
-                .iter()
-                .rposition(|member| !unfinished.contains(member))
-            {
+            if let Some(victim) = tail_victims.pop() {
+                #[cfg(test)]
+                note_reserve_slot_visit();
                 selected_set.remove(&selected[victim]);
                 selected[victim] = pid;
                 selected_set.insert(pid);
                 continue;
             }
             // Every selected member is unfinished: displace the youngest
-            // one when the missing member is older. Processed
+            // one when the missing member is strictly older. Processed
             // oldest-first, displacement only flows old-over-young, so
-            // no pair ping-pongs.
-            let youngest = selected
-                .iter()
-                .enumerate()
-                .filter(|(_, member)| unfinished.contains(member))
-                .max_by_key(|(_, member)| oldest.get(member).copied().unwrap_or(u64::MAX));
-            if let Some((victim, _)) = youngest
-                && oldest.get(&selected[victim]).copied().unwrap_or(0) > seq
-            {
+            // no pair ping-pongs — and the first refusal ends the pass,
+            // since later arrivals are younger still.
+            if unfinished_head >= unfinished_victims.len() {
+                break;
+            }
+            #[cfg(test)]
+            note_reserve_slot_visit();
+            let (victim_seq, victim) = unfinished_victims[unfinished_head];
+            if victim_seq > seq {
                 selected_set.remove(&selected[victim]);
                 selected[victim] = pid;
                 selected_set.insert(pid);
+                unfinished_head += 1;
+            } else {
+                break;
             }
         }
     }

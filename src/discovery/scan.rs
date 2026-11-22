@@ -23537,6 +23537,101 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// Capped reservation visits selection slots linearly. With N
+    /// eligible unfinished members and N/2 slots held by younger
+    /// unfinished work, the per-missing full-selection scan visited
+    /// N^2 slots (16,384 at the 128-member cgroup cap with 64 slots);
+    /// the victim orders are built once and consumed oldest-first, so
+    /// each slot is visited a constant number of times. The oldest
+    /// half survives in every case.
+    #[test]
+    fn capped_selection_reservation_visits_slots_linearly() {
+        use super::super::scan_pass::{reserve_slot_visits, reset_reserve_slot_visits};
+        for n in [16usize, 32, 64, 128] {
+            let cap = n / 2;
+            let mut budget =
+                CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+            // Eligible members carry the oldest sequences.
+            for pid in 1..=n as u32 {
+                let (key, cursor) =
+                    decode_cursor_for_test(pid, 70, u64::from(pid), false, u64::from(pid - 1));
+                assert!(budget.record_decode_cursor(key, cursor));
+            }
+            // The selection starts full of younger unfinished work
+            // outside the eligible set, so every eligible member is
+            // missing against a full selection.
+            let young_base = 100_000u32;
+            for offset in 0..cap as u32 {
+                let pid = young_base + offset;
+                let (key, cursor) = decode_cursor_for_test(
+                    pid,
+                    70,
+                    u64::from(pid),
+                    false,
+                    1_000_000 + u64::from(offset),
+                );
+                assert!(budget.record_decode_cursor(key, cursor));
+            }
+            let mut selected: Vec<u32> = (young_base..young_base + cap as u32).collect();
+            let eligible: BTreeSet<u32> = (1..=n as u32).collect();
+            reset_reserve_slot_visits();
+            budget.reserve_unfinished_selection(&mut selected, &eligible, cap);
+            let visits = reserve_slot_visits();
+            let mut survivors = selected.clone();
+            survivors.sort_unstable();
+            assert_eq!(
+                survivors,
+                (1..=cap as u32).collect::<Vec<_>>(),
+                "the oldest half survives at N={n}"
+            );
+            // Two build passes over the slots plus one decision per
+            // eligible arrival, with headroom. The quadratic scan
+            // needed N^2 visits (16,384 at N=128).
+            let bound = 2 * cap + 2 * n;
+            assert!(
+                visits <= bound,
+                "N={n}: {visits} slot visits exceed linear bound {bound}"
+            );
+        }
+    }
+
+    /// Capped reservation breaks equal unfinished victim sequences by
+    /// the highest selection position: a missing older member displaces
+    /// the last of the tied youngest, never the first.
+    #[test]
+    fn capped_selection_reservation_breaks_victim_ties_by_position() {
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for (pid, seq) in [(1001u32, 10u64), (1002u32, 10u64), (1003u32, 0u64)] {
+            let (key, cursor) = decode_cursor_for_test(pid, 70, u64::from(pid), false, seq);
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        let mut selected = vec![1001u32, 1002u32];
+        let eligible = BTreeSet::from([1001u32, 1002u32, 1003u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 2);
+        assert_eq!(
+            selected,
+            vec![1001, 1003],
+            "the tied youngest at the highest position yields to the older missing member"
+        );
+        // An equal sequence never displaces: the missing member with the
+        // same oldest sequence as the selection waits.
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for (pid, seq) in [(1001u32, 10u64), (1002u32, 10u64)] {
+            let (key, cursor) = decode_cursor_for_test(pid, 70, u64::from(pid), false, seq);
+            assert!(budget.record_decode_cursor(key, cursor));
+        }
+        let mut selected = vec![1001u32];
+        let eligible = BTreeSet::from([1001u32, 1002u32]);
+        budget.reserve_unfinished_selection(&mut selected, &eligible, 1);
+        assert_eq!(
+            selected,
+            vec![1001],
+            "an equal sequence never displaces the selected unfinished member"
+        );
+    }
+
     /// Drive one scan pass with an armed budget: `limits` plus the carried
     /// bundle (empty for pass one). Returns the outcome and the bundle the
     /// pass takes back, so twins can thread real resume state across passes.

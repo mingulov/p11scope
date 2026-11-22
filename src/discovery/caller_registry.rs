@@ -7366,6 +7366,28 @@ impl CallerRegistry {
         });
     }
 
+    /// A late-bound row's excluded pre-admission subtotal: the
+    /// seed-to-admission window was not proven clean (`cause`), so the bind
+    /// rebased past the first sight and only post-admission growth stages.
+    /// The excluded absolute is a named counted gap on the caller, never a
+    /// silent rebase. Nothing is staged when `sight` is 0 (no exclusion).
+    pub(crate) fn note_counted_before_tracking(
+        &mut self,
+        caller: CallerId,
+        sight: u64,
+        cause: &str,
+    ) {
+        if sight == 0 {
+            return;
+        }
+        self.record_gap(RegistryGap {
+            caller: Some(caller), module: None, pid: None,
+            subject: COUNTED_BEFORE_TRACKING.into(),
+            reason: format!("{sight} pre-admission calls are excluded from this member's edge (absolute count range (0, {sight}]): {cause}; only post-admission growth stages"),
+            budget: None,
+        });
+    }
+
     /// One row whose endpoint several admitted modules share, with no
     /// single module (or single caller edge) to carry it: a gap per module,
     /// no edge, no module-level use.

@@ -122,6 +122,16 @@ base 0, preserving the observed count. Each rebased seed discloses
 its window through exactly one `demoted count placed` gap recording
 a count of placements on its module.
 
+Since v0.8.0 a row recorded before its caller's admission (a late
+bind) stages its full pre-admission subtotal when the
+seed-to-admission window is proven clean for that member — a single
+admitted edge carries the row, and no exec, lost lifecycle evidence,
+or pid reuse sits at or after the row's instant — taking the same
+base an on-time first sight takes (past the setup seed when
+observed). Anything unproven keeps the late-rebase exclusion, and
+the excluded absolute discloses as a `counted before tracking` gap
+on the member, never a silent zero.
+
 ### A leader exit retires sessions even while other threads live
 
 The observer learns of an exit from the leader thread, so a process

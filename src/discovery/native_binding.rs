@@ -456,6 +456,25 @@ pub(crate) struct Decision {
     pub retry: DecisionRetry,
 }
 
+/// Why a late-bound row's seed-to-admission window is not proven clean for
+/// count attribution. The count base fails closed on any break: the bind
+/// keeps the late-rebase exclusion and the excluded subtotal discloses as a
+/// named counted gap on the member, never a silent rebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateWindowBreak {
+    /// Exec coverage does not cover the row's instant (unknown or later),
+    /// so an unrecorded exec may hide between the row and the admission.
+    Coverage,
+    /// An exec of the tgid is recorded at or after the row's instant.
+    Exec,
+    /// Lifecycle evidence was lost at or after the row's instant.
+    Loss,
+    /// A pid reuse is recorded at or after the row's instant: reconcile
+    /// retired the tracked generation while the pid named a live process,
+    /// so the current generation may postdate the counted calls.
+    Reuse,
+}
+
 /// Proof that one incarnation's image ended, seen natively: under the
 /// incarnation's held pidfd its bound ticket answered a later exec sequence,
 /// or the leader task changed. Only the binder constructs it (private
@@ -950,6 +969,50 @@ impl NativeBinder {
     #[cfg(test)]
     pub(crate) fn reuse_len_for_test(&self) -> usize {
         self.reuse_ns.len()
+    }
+
+    /// Why a late-bound row's seed-to-admission window is not proven clean
+    /// for count attribution, if anything breaks it: exec coverage does not
+    /// cover the row's instant, or an exec of the tgid, lost lifecycle
+    /// evidence, or a recorded pid reuse sits at or after it. The §3.3 live
+    /// path proves the first three when it binds late — but a cached image
+    /// bind skips them for the row's own instant, and no live path consults
+    /// pid reuse (a held pin proves its own generation while pre-admission
+    /// calls may predate it) — so the count base re-proves the window
+    /// itself. Unknown domains fail closed.
+    pub(crate) fn late_count_window_break(&self, row: &WitnessRow) -> Option<LateWindowBreak> {
+        let state = self
+            .domain_indices
+            .get(&row.domain)
+            .and_then(|index| self.domains.get(*index));
+        let Some(state) = state else {
+            // Unknown domain: no coverage proves the window clean.
+            return Some(LateWindowBreak::Coverage);
+        };
+        if state.predates_coverage(row.recorded_at_ns) {
+            return Some(LateWindowBreak::Coverage);
+        }
+        if state
+            .exec_ns
+            .get(&row.host_tgid)
+            .is_some_and(|&exec_ns| exec_ns >= row.recorded_at_ns)
+        {
+            return Some(LateWindowBreak::Exec);
+        }
+        if state
+            .loss_ns
+            .is_some_and(|loss_ns| loss_ns >= row.recorded_at_ns)
+        {
+            return Some(LateWindowBreak::Loss);
+        }
+        if self
+            .reuse_ns
+            .get(&row.host_tgid)
+            .is_some_and(|&at_ns| at_ns >= row.recorded_at_ns)
+        {
+            return Some(LateWindowBreak::Reuse);
+        }
+        None
     }
 
     pub(crate) fn census(&self) -> &BindingCensus {

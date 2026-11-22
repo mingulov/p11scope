@@ -53,8 +53,8 @@ use crate::discovery::inventory_attach_set::{
 };
 use crate::discovery::native_binding::{
     BinderLimits, Binding, BoundImage, CallerLookup, CurrentBindingCheck, CurrentBindingRequest,
-    CurrentBindingSighting, Decision, DecisionRetry, ExecTransition, LiveCaller, NativeBinder,
-    NativeIdentity, RetainedCaller, UnboundReason,
+    CurrentBindingSighting, Decision, DecisionRetry, ExecTransition, LateWindowBreak, LiveCaller,
+    NativeBinder, NativeIdentity, RetainedCaller, UnboundReason,
 };
 use crate::discovery::scan::{
     INVENTORY_WINDOW_IO_BYTES, InventoryDiscoveryLimits, InventoryRetainedLimits,
@@ -9481,6 +9481,62 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .is_some_and(|live| *live < started)
     }
 
+    /// Why a late-bound row's pre-admission subtotal stays excluded, if
+    /// anything breaks the clean-window proof: the row resolves to no
+    /// single admitted module with a committed edge for the caller, or the
+    /// binder cannot prove the seed-to-admission window clean (exec
+    /// coverage over the row, no exec, lost lifecycle evidence, or pid
+    /// reuse at or after it). The binder's `Bound` verdict alone does not
+    /// prove the window: a cached image bind skips the window rules for the
+    /// row's own instant, and no live path consults pid reuse. `None` is
+    /// the proven window: the bind stages whole, like an on-time first
+    /// sight.
+    fn late_count_window_break(
+        &self,
+        row: &WitnessRow,
+        caller: CallerId,
+        modules: &[ModuleKey],
+    ) -> Option<String> {
+        let [only] = modules else {
+            return Some(format!(
+                "the witness endpoint is shared by {} admitted modules, so no single edge proves the placement",
+                modules.len()
+            ));
+        };
+        let single_edge = self
+            .registry
+            .module_id_for(only)
+            .and_then(|id| {
+                self.registry.module(id).filter(|record| {
+                    record.admission == AdmissionState::Admitted
+                        && self.registry.edge(caller, id).is_some()
+                })
+            })
+            .is_some();
+        if !single_edge {
+            return Some(
+                "no committed edge for this caller on an admitted module proves the placement"
+                    .to_string(),
+            );
+        }
+        self.binder
+            .late_count_window_break(row)
+            .map(|breach| match breach {
+                LateWindowBreak::Coverage => {
+                    "exec coverage does not prove the seed-to-admission window clean".to_string()
+                }
+                LateWindowBreak::Exec => {
+                    "an exec of the tgid is recorded at or after the row's instant".to_string()
+                }
+                LateWindowBreak::Loss => {
+                    "lifecycle evidence was lost at or after the row's instant".to_string()
+                }
+                LateWindowBreak::Reuse => {
+                    "a pid reuse is recorded at or after the row's instant".to_string()
+                }
+            })
+    }
+
     fn bind_pair_count(
         &mut self,
         row: &WitnessRow,
@@ -9565,9 +9621,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // A pruned dropped pair keeps its exact base as a tombstone:
             // the revival rebases past it exactly like an unpruned drop.
             // A late-bound row (recorded before its caller's admission)
-            // rebases past its first sight instead: the pre-admission
-            // subtotal is unattributed, and only post-admission growth
-            // stages. An on-time row whose first recorded entry passed
+            // stages whole when its seed-to-admission window is proven
+            // clean — a single admitted edge and no exec, loss, or reuse
+            // at or after the row — taking the same base an on-time
+            // first sight takes (past the setup seed when observed).
+            // Anything unproven rebases past its first sight instead: the
+            // pre-admission subtotal is unattributed, only post-admission
+            // growth stages, and the excluded absolute discloses as a
+            // named counted gap on the member, never a silent rebase.
+            // An on-time row whose first recorded entry passed
             // through a plan-proven setup endpoint, whose caller
             // spawned after the initial attach with the endpoint
             // already live, observed its setup seed first: it bases
@@ -9578,8 +9640,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .record(caller)
                     .is_some_and(|record| row.recorded_at_ns < record.first_seen_ns);
                 let fresh = if late {
-                    let sight = row.entry_count;
-                    (sight, sight, held_first, held_first)
+                    match self.late_count_window_break(row, caller, modules) {
+                        None if self.seeded_first_sight(row, caller) => {
+                            (1, 1, held_first, held_first)
+                        }
+                        None => (0, 0, 0, held_first),
+                        Some(cause) => {
+                            let sight = row.entry_count;
+                            self.registry
+                                .note_counted_before_tracking(caller, sight, &cause);
+                            (sight, sight, held_first, held_first)
+                        }
+                    }
                 } else if self.seeded_first_sight(row, caller) {
                     (1, 1, held_first, held_first)
                 } else {

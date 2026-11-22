@@ -2160,6 +2160,7 @@ main() {
             fi
         fi
         branch_suffix=$(cell_branch_suffix "$log")
+        branch_suffix="$branch_suffix$matrix_note"
         if [ -n "${xfail_reason[$name]+present}" ]; then
             if [ "$verdict" = "PASS" ]; then
                 xpass=$((xpass + 1))
@@ -2178,7 +2179,7 @@ main() {
             else
                 fail=$((fail + 1))
             fi
-            echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix$matrix_note" | tee -a "$results"
+            echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix" | tee -a "$results"
         fi
     done
 

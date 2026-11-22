@@ -803,15 +803,20 @@ impl ProcessView {
 
     /// The closing proof of a view whose leader exited (now or earlier):
     /// cold retained-member custody only, which requires the original
-    /// leader at Z and every member live, then re-proves the retained
-    /// namespace and members. It never takes the warm leader route, so a
-    /// hidden namespace link on a live leader fails closed.
-    pub(crate) fn cold_closing_proof(&self, work: &mut CaptureWorkBudget) -> Result<(), String> {
-        let filesystem = ViewFilesystem::open_for_view(&self.pin, true, work, || {
+    /// leader at Z and every member live, with the retained namespace and
+    /// one shared root, through the metered primitives (one admitted unit
+    /// per native call, see
+    /// [`view_filesystem::metered_cold_closing_proof`]). It never takes the
+    /// warm leader route, so a hidden namespace link on a live leader
+    /// fails closed. `None` is a refused admission.
+    pub(crate) fn cold_closing_proof(
+        &self,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<(), String>> {
+        view_filesystem::metered_cold_closing_proof(&self.pin, self.mount_namespace, admit, || {
             self.cold_filesystem_observed
                 .store(true, std::sync::atomic::Ordering::Release)
-        })?;
-        self.ensure_filesystem(&filesystem, work)
+        })
     }
 
     /// Whether this view's original thread group has exited or can never

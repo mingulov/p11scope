@@ -631,6 +631,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// refusal counters above, so a soak can tell whether re-arms
     /// make later refusals more likely.
     joint_first_rearm_seen: bool,
+    /// Birth-funnel silent drops this run (diagnostics): every
+    /// sighting offer dropped at a gate that names no per-birth gap,
+    /// by gate. Offers formed minus births installed must equal
+    /// these plus birth-gap recordings. Saturating; instrumentation
+    /// only, never authority.
+    joint_birth_funnel: semantics::JointBirthFunnel,
+    /// Births installed this run (diagnostics): the association's
+    /// installed dispositions accumulated. Saturating.
+    joint_births_installed: u64,
     #[cfg(test)]
     refuse_joint_finish_publication_once: bool,
     /// Optional hints retain only their own identity-qualified source state.
@@ -1333,6 +1342,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             joint_subject_refusals_before_rearm: 0,
             joint_subject_refusals_after_rearm: 0,
             joint_first_rearm_seen: false,
+            joint_birth_funnel: semantics::JointBirthFunnel::default(),
+            joint_births_installed: 0,
             #[cfg(test)]
             refuse_joint_finish_publication_once: false,
             caller_metadata: None,

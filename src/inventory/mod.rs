@@ -3352,6 +3352,11 @@ struct SemanticStopCounts {
     marks_refused_dup: u64,
     marks_refused_cap: u64,
     admission_binding_miss: u64,
+    birth_formed: u64,
+    birth_cooled: u64,
+    birth_oversized: u64,
+    birth_stashed: u64,
+    birth_merge_refused: u64,
 }
 
 impl SemanticStopCounts {
@@ -3368,6 +3373,10 @@ impl SemanticStopCounts {
         let (admitted_reported, admitted_attached) = lane.admitted_mint_counts();
         let (marks_attempted, marks_refused_dup, marks_refused_cap, admission_binding_miss) =
             lane.admitted_mark_funnel_counts();
+        let (birth_formed, birth_cooled) = lane.birth_offer_counts();
+        let birth_oversized = lane.oversized_birth_shed();
+        let birth_stashed = lane.stashed_birth_shed();
+        let birth_merge_refused = lane.merge_refused_births();
         Self {
             refusals,
             overflow_refusals,
@@ -3386,6 +3395,11 @@ impl SemanticStopCounts {
             marks_refused_dup,
             marks_refused_cap,
             admission_binding_miss,
+            birth_formed,
+            birth_cooled,
+            birth_oversized,
+            birth_stashed,
+            birth_merge_refused,
         }
     }
 }
@@ -3463,6 +3477,15 @@ fn disclose_semantic_stop(
             births.map_or(0, |latched| latched.records as u64),
             births.map_or(0, |latched| latched.grants as u64),
             births.map_or(0, |latched| latched.negatives as u64),
+        ));
+        warn.emit(&crate::inventory_semantics::joint_birth_funnel_line(
+            counts.birth_formed,
+            counts.birth_cooled,
+            coordinator.joint_births_installed(),
+            coordinator.joint_birth_funnel(),
+            counts.birth_oversized,
+            counts.birth_stashed,
+            counts.birth_merge_refused,
         ));
         let seals = coordinator.seal_diagnosis();
         warn.emit(&crate::inventory_semantics::joint_seals_line(
@@ -27734,6 +27757,11 @@ mod promotion_driver_tests {
             marks_refused_dup: 0,
             marks_refused_cap: 0,
             admission_binding_miss: 0,
+            birth_formed: 0,
+            birth_cooled: 0,
+            birth_oversized: 0,
+            birth_stashed: 0,
+            birth_merge_refused: 0,
         };
         disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
         assert_eq!(
@@ -27805,6 +27833,11 @@ mod promotion_driver_tests {
             marks_refused_dup: 0,
             marks_refused_cap: 0,
             admission_binding_miss: 0,
+            birth_formed: 0,
+            birth_cooled: 0,
+            birth_oversized: 0,
+            birth_stashed: 0,
+            birth_merge_refused: 0,
         };
         disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
         assert_eq!(

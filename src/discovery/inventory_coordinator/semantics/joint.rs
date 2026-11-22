@@ -658,6 +658,104 @@ struct BirthAssociation {
     deferred: Option<(p11scope_ebpf_common::ImageIdentity, u32)>,
 }
 
+/// Diagnostic-only birth funnel: every sighting offer dropped at a
+/// gate that names no per-birth gap, by gate, plus the retained-birth
+/// reservation arms and re-offer outcomes beside their gaps. Offers
+/// formed minus births installed must equal [`Self::total_silent_drops`]
+/// plus terminal birth-gap recordings plus pending re-offers (deferred
+/// gaps are transient delay notices, counted through their re-offer);
+/// anything else is silent loss. Saturating; instrumentation only,
+/// never authority.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JointBirthFunnel {
+    /// Unlinked-lane births barred with the one lane disclosure.
+    pub(crate) unlinked: u64,
+    /// Batch-wide preparation refusals, by gate.
+    pub(crate) prepare_owner: u64,
+    pub(crate) prepare_cursor: u64,
+    pub(crate) prepare_entry: u64,
+    pub(crate) prepare_capacity_count: u64,
+    pub(crate) prepare_capacity_bytes: u64,
+    pub(crate) prepare_duplicate: u64,
+    /// Prepared births disposed to S1, by disposing cause.
+    pub(crate) skip_no_grant: u64,
+    pub(crate) skip_empty: u64,
+    pub(crate) abandoned_prepared: u64,
+    pub(crate) storage_refused: u64,
+    pub(crate) s1_finalize: u64,
+    /// Collected batches dropped before preparation, by gate.
+    pub(crate) dropped_ended_domain: u64,
+    pub(crate) dropped_foreign_session: u64,
+    pub(crate) dropped_backpressure: u64,
+    pub(crate) dropped_no_lane: u64,
+    pub(crate) dropped_abandoned: u64,
+    /// Prepared batches finished with undecided, unaccounted births.
+    /// Always zero: any nonzero is a funnel bug, never production loss.
+    pub(crate) undecided_at_finish: u64,
+    /// Retained-birth reservation arms, beside their Resource gaps.
+    pub(crate) resource: BirthReserveArms,
+    /// Deferred re-offer outcomes, beside their gaps.
+    pub(crate) reoffer_armed: u64,
+    pub(crate) reoffer_exhausted: u64,
+}
+
+impl JointBirthFunnel {
+    /// Silent drops: every bucket whose offers carry no per-birth
+    /// gap. The reservation arms and re-offer outcomes ride beside
+    /// their gaps and stay out of the equation.
+    pub(crate) fn total_silent_drops(&self) -> u64 {
+        self.unlinked
+            .saturating_add(self.prepare_owner)
+            .saturating_add(self.prepare_cursor)
+            .saturating_add(self.prepare_entry)
+            .saturating_add(self.prepare_capacity_count)
+            .saturating_add(self.prepare_capacity_bytes)
+            .saturating_add(self.prepare_duplicate)
+            .saturating_add(self.skip_no_grant)
+            .saturating_add(self.skip_empty)
+            .saturating_add(self.abandoned_prepared)
+            .saturating_add(self.storage_refused)
+            .saturating_add(self.s1_finalize)
+            .saturating_add(self.dropped_ended_domain)
+            .saturating_add(self.dropped_foreign_session)
+            .saturating_add(self.dropped_backpressure)
+            .saturating_add(self.dropped_no_lane)
+            .saturating_add(self.dropped_abandoned)
+            .saturating_add(self.undecided_at_finish)
+    }
+}
+
+/// Diagnostic-only retained-birth reservation arms: ledger
+/// exhaustion (no room for the receipt's bytes) vs table growth (no
+/// room for the next witness capacity). Beside the Resource gap.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BirthReserveArms {
+    pub(crate) ledger: u64,
+    pub(crate) table: u64,
+}
+
+/// Why one prepared batch's births disposed to S1 without a birth
+/// decision: the machine skipped births (no grantable admission, or
+/// an empty disposition), the hold abandoned the batch, retention
+/// storage refused, or the S1 finalizer drained the batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BirthDisposeCause {
+    SkippedNoGrant,
+    SkippedEmpty,
+    Abandoned,
+    StorageRefused,
+    S1Finalize,
+}
+
+/// Count one prepared batch's birth-bearing receipts at a batch-wide
+/// refusal into its funnel bucket, marking the batch accounted so the
+/// hold's abandon recounts nothing.
+fn note_prepare_birth_drop(batch: &mut PreparedSemanticBatch, bucket: &mut u64) {
+    let drops = crate::semantic_capture::count_birth_receipts(batch.current_receipts());
+    batch.birth_funnel_accounted = true;
+    *bucket = bucket.saturating_add(drops);
+}
+
 /// A birth-bearing receipt with no admission entry refuses
 /// `NoAdmission`; sighting retries additionally defer for re-offer
 /// (a fresh instance re-attempts the birth; the re-offer path is
@@ -942,6 +1040,12 @@ pub(crate) struct PreparedSemanticBatch {
     claim_cursor: usize,
     stage_cursor: usize,
     births_decided: bool,
+    /// The birth funnel counted this batch's offers at a batch-wide
+    /// refusal or disposal. Decided batches need no flag (their
+    /// `births_decided` covers them); disposal paths count only
+    /// batches with neither set, so a refused batch recounts nothing
+    /// at the hold's abandon.
+    birth_funnel_accounted: bool,
     // Buffers and nested owned payloads drop before their retained charge.
     storage: Option<ResourceLease>,
     /// Test-only legacy switch: file fingerprint claims even without
@@ -978,6 +1082,7 @@ impl PreparedSemanticBatch {
             claim_cursor: 0,
             stage_cursor: 0,
             births_decided: false,
+            birth_funnel_accounted: false,
             storage: None,
             #[cfg(test)]
             test_legacy_claims: false,
@@ -1034,6 +1139,13 @@ impl PreparedSemanticBatch {
 
     pub(crate) fn current_receipts(&self) -> &[crate::semantic_capture::CurrentPartitionReceipt] {
         &self.current
+    }
+
+    /// Whether the birth funnel already counted this batch's offers:
+    /// births decided at the association, or drops counted at a
+    /// batch-wide refusal or disposal.
+    pub(crate) fn birth_funnel_decided(&self) -> bool {
+        self.births_decided || self.birth_funnel_accounted
     }
 
     pub(crate) fn claims(
@@ -1384,7 +1496,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         >,
     ) -> Result<PreparedBirthDisposition, RawQuantumRefusal> {
         let adapter = self.joint_capture.adapter();
-        ingested.validate_owner(adapter, producers)?;
+        if let Err(refusal) = ingested.validate_owner(adapter, producers) {
+            if let Some(PendingSemanticBatch::Prepared(batch)) = self
+                .semantic_finalizer
+                .as_mut()
+                .and_then(|state| state.pending_semantic.as_mut())
+            {
+                note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_owner);
+            }
+            return Err(refusal);
+        }
         let Some(PendingSemanticBatch::Prepared(batch)) = self
             .semantic_finalizer
             .as_mut()
@@ -1393,6 +1514,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return Err(RawQuantumRefusal::Admission);
         };
         if batch.domain != producers.native_domain() {
+            note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_owner);
             return Err(RawQuantumRefusal::ForeignCapture);
         }
         if batch.births_decided {
@@ -1402,8 +1524,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
         }
         if batch.claim_cursor != batch.entries.len() || batch.stage_cursor != 0 {
+            note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_cursor);
             return Err(RawQuantumRefusal::Admission);
         }
+        let mut preamble_failed = false;
         for entry in &batch.entries {
             // An admission retained as plain S1 is not claimed as
             // Joint evidence: it stages no birth and names no original.
@@ -1414,8 +1538,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     || (!ingested.matches_admission(input)
                         && !ingested.matches_retained_admission(input, adapter)))
             {
-                return Err(RawQuantumRefusal::Admission);
+                preamble_failed = true;
+                break;
             }
+        }
+        if preamble_failed {
+            note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_entry);
+            return Err(RawQuantumRefusal::Admission);
         }
         // OD33/R-50 wedge guard, after the admission preamble (whose
         // refusals stand unchanged) and before any birth work: an
@@ -1427,18 +1556,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 .as_mut()
                 .and_then(|state| state.pending_semantic.as_mut())
             {
+                let drops = crate::semantic_capture::count_birth_receipts(batch.current_receipts());
+                self.joint_birth_funnel.unlinked =
+                    self.joint_birth_funnel.unlinked.saturating_add(drops);
                 batch.births_decided = true;
             }
             return Ok(disposition);
         }
-        let count = batch
+        let count = match batch
             .current
             .iter()
             .filter(|receipt| receipt.birth_quantum().is_some())
             .try_fold(0usize, |count, receipt| {
                 count.checked_add(receipt.instances().len())
-            })
-            .ok_or(RawQuantumRefusal::Capacity)?;
+            }) {
+            Some(count) => count,
+            None => {
+                note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_capacity_count);
+                return Err(RawQuantumRefusal::Capacity);
+            }
+        };
         if count == 0 {
             batch.births_decided = true;
             return Ok(PreparedBirthDisposition {
@@ -1447,8 +1584,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
         }
         let reserve = self.registry.semantic_storage_reserver();
-        let bytes =
-            allocation_bytes::<BirthAssociation>(count).ok_or(RawQuantumRefusal::Capacity)?;
+        let bytes = match allocation_bytes::<BirthAssociation>(count) {
+            Some(bytes) => bytes,
+            None => {
+                note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_capacity_bytes);
+                return Err(RawQuantumRefusal::Capacity);
+            }
+        };
         let Ok(_association_storage) = reserve.reserve(bytes) else {
             batch.births_decided = true;
             return Ok(deferred_disposition(
@@ -1495,6 +1637,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .windows(2)
             .any(|pair| (pair[0].image, pair[0].router) == (pair[1].image, pair[1].router))
         {
+            note_prepare_birth_drop(batch, &mut self.joint_birth_funnel.prepare_duplicate);
             return Err(RawQuantumRefusal::Admission);
         }
         // One increasing admission walk and binary lookup; never scan the
@@ -1624,7 +1767,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ));
                 continue;
             }
-            let Ok(mut slot) = births.reserve_for_current(&reserve, receipt) else {
+            let Ok(mut slot) = births.reserve_for_current(
+                &reserve,
+                receipt,
+                &mut self.joint_birth_funnel.resource,
+            ) else {
                 association[first].refusal = Some((caller, BirthRefusal::Resource));
                 association[first].deferred = Some(reoffer_key);
                 continue;
@@ -1707,6 +1854,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         births.order_for_native_reads();
+        self.joint_births_installed = self.joint_births_installed.saturating_add(installed as u64);
         Ok(PreparedBirthDisposition {
             installed,
             reoffers,
@@ -1719,7 +1867,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// retained-S1 subject. Only the Joint machine calls this,
     /// once per disposition re-offer it failed to arm.
     pub(crate) fn disclose_birth_reoffer_exhausted(&mut self, reoffer: &BirthReoffer) {
+        self.joint_birth_funnel.reoffer_exhausted =
+            self.joint_birth_funnel.reoffer_exhausted.saturating_add(1);
         disclose_s1_birth_refusal(&mut self.registry, reoffer.caller, reoffer.reason.clone());
+    }
+
+    /// Count one armed deferred re-offer beside its delay gap. Only
+    /// the Joint machine calls this, once per disposition re-offer
+    /// the lane evicted and re-minted.
+    pub(crate) fn note_birth_reoffer_armed(&mut self) {
+        self.joint_birth_funnel.reoffer_armed =
+            self.joint_birth_funnel.reoffer_armed.saturating_add(1);
+    }
+
+    /// Diagnostic-only birth funnel for the stop disclosure.
+    pub(crate) fn joint_birth_funnel(&self) -> &JointBirthFunnel {
+        &self.joint_birth_funnel
+    }
+
+    /// Diagnostic-only installed births for the stop disclosure.
+    pub(crate) fn joint_births_installed(&self) -> u64 {
+        self.joint_births_installed
     }
 
     /// The idle machine walks actual accepted image bindings and actual
@@ -1772,7 +1940,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 reason: "semantic_resource_capacity".into(),
                 budget: None,
             });
-            self.drain_prepared_s1(&mut prepared);
+            self.drain_prepared_s1(&mut prepared, BirthDisposeCause::StorageRefused);
             self.finish_semantic_preparation(prepared, lane.stash_pending_floor());
             return Err(SemanticRefusal::ProviderStorage);
         }
@@ -1847,13 +2015,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     pub(crate) fn dispose_prepared_claims_s1(&mut self) {
+        self.dispose_prepared_claims_s1_for_cause(BirthDisposeCause::S1Finalize);
+    }
+
+    /// Dispose prepared claims to S1, counting the batch's offers at
+    /// the disposing cause unless births already decided or counted.
+    pub(crate) fn dispose_prepared_claims_s1_for_cause(&mut self, cause: BirthDisposeCause) {
         if let Some(PendingSemanticBatch::Prepared(batch)) = self
             .semantic_finalizer
             .as_mut()
             .and_then(|state| state.pending_semantic.as_mut())
         {
+            Self::note_disposed_births(&mut self.joint_birth_funnel, batch, cause);
             batch.dispose_claims_s1();
         }
+    }
+
+    /// Count one disposed batch's birth-bearing receipts at its
+    /// disposing cause, unless births already decided or counted.
+    fn note_disposed_births(
+        funnel: &mut JointBirthFunnel,
+        prepared: &mut PreparedSemanticBatch,
+        cause: BirthDisposeCause,
+    ) {
+        if prepared.births_decided || prepared.birth_funnel_accounted {
+            return;
+        }
+        let drops = crate::semantic_capture::count_birth_receipts(prepared.current_receipts());
+        prepared.birth_funnel_accounted = true;
+        let bucket = match cause {
+            BirthDisposeCause::SkippedNoGrant => &mut funnel.skip_no_grant,
+            BirthDisposeCause::SkippedEmpty => &mut funnel.skip_empty,
+            BirthDisposeCause::Abandoned => &mut funnel.abandoned_prepared,
+            BirthDisposeCause::StorageRefused => &mut funnel.storage_refused,
+            BirthDisposeCause::S1Finalize => &mut funnel.s1_finalize,
+        };
+        *bucket = bucket.saturating_add(drops);
     }
 
     pub(crate) fn stage_next_prepared_admission(
@@ -1959,7 +2156,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         true
     }
 
-    pub(super) fn drain_prepared_s1(&mut self, prepared: &mut PreparedSemanticBatch) {
+    pub(super) fn drain_prepared_s1(
+        &mut self,
+        prepared: &mut PreparedSemanticBatch,
+        cause: BirthDisposeCause,
+    ) {
+        Self::note_disposed_births(&mut self.joint_birth_funnel, prepared, cause);
         prepared.dispose_claims_s1();
         let state = self
             .semantic_finalizer

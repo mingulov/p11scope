@@ -1197,6 +1197,55 @@ impl RetainedFileFacts {
             .collect()
     }
 
+    /// Test-only: a carried bundle whose snapshot resume history refused
+    /// one unfinished record, built through the production budget path:
+    /// the full cursor cap of unfinished cursors (fake pids), one pid's
+    /// cursor dropped from the live map (its history pair stays), then a
+    /// new unfinished record that fits the map but not the history.
+    #[cfg(test)]
+    pub(crate) fn saturated_resume_history_for_test() -> Self {
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let pin = super::identity::pin_of(&file).unwrap();
+        let key = |pid: u32| DecodeCursorKey {
+            pid,
+            start_time: 9,
+            file: InspectedFileKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 11,
+                pin: pin.clone(),
+                fd_dev: 7,
+            },
+            exec: None,
+        };
+        let cursor = || DecodeCursor {
+            fingerprint: Vec::new(),
+            tables: super::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 1,
+            },
+            interfaces: super::scan_pass::SweepFrontier {
+                snapshot: 0,
+                word: 0,
+            },
+            anchors: None,
+            cached_tables: Vec::new(),
+            cached_interfaces: Vec::new(),
+            unlinked: Vec::new(),
+            targets: Vec::new(),
+            complete: false,
+            validated: false,
+            seq: 0,
+        };
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        for index in 0..super::scan_pass::MAX_DECODE_CURSORS as u32 {
+            assert!(budget.record_decode_cursor(key(4_000_000 + index), cursor()));
+        }
+        budget.drop_decode_cursors_for_pid(4_000_000);
+        assert!(budget.record_decode_cursor(key(4_100_000), cursor()));
+        budget.take_retained_file_facts()
+    }
+
     /// Whether the carried bundle holds any decode cursor: a bundle
     /// without cursors keeps the legacy collection-gap verdict path
     /// verbatim, so single-shot postures never see the progress states.

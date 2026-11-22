@@ -8036,6 +8036,69 @@ fn concise_cap_keeps_run_wide_and_terminal_progress_rows() {
     }
 }
 
+/// The resume-history refusal reads at the cap boundary and in JSON:
+/// nineteen early ordinary groups and one ceiling, then the counted
+/// refusal row from a production-saturated bundle, which survives the
+/// cap in concise text and carries its count in JSON.
+#[test]
+fn concise_cap_keeps_the_resume_history_refusal() {
+    use crate::discovery::scan::WORK_CEILING_REASON;
+    let (mut harness, _caller) = single_caller_harness("present-history-refusal", 1);
+    for index in 0..19u32 {
+        harness
+            .coordinator_mut()
+            .registry_mut()
+            .record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: Some(5000 + index),
+                subject: format!("obj-{index:02}"),
+                reason: format!("reason {index:02}"),
+                budget: None,
+            });
+    }
+    harness
+        .coordinator_mut()
+        .registry_mut()
+        .record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: Some(1000),
+            subject: "libceil.so".into(),
+            reason: WORK_CEILING_REASON.into(),
+            budget: None,
+        });
+    harness.coordinator_mut().set_cgroup_file_facts_for_test(
+        crate::discovery::scan::RetainedFileFacts::saturated_resume_history_for_test(),
+    );
+    harness.commit();
+    let document = harness.render();
+    let presentation = capture_for(&harness, &document);
+    let snapshot = render_snapshot(&presentation);
+    assert!(
+        snapshot
+            .lines()
+            .any(|line| line.contains("scan resume history full")
+                && line.contains("1 resume record(s) of unfinished work were refused")),
+        "the refusal survives the cap with its count: {snapshot}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let row = out["gaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|gap| gap["subject"] == "scan resume history full")
+        .unwrap_or_else(|| panic!("missing refusal row: {out}"))
+        .clone();
+    assert!(
+        row["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 resume record(s) of unfinished work were refused"),
+        "{row:?}"
+    );
+}
+
 /// The protected tier outgrows the cap rather than fold: twenty-two
 /// distinct run-wide capture failures all read, and only the ordinary
 /// group behind them folds into the remainder.

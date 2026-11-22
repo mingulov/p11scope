@@ -1073,19 +1073,15 @@ impl ScanPassOwner {
         crate::process::process_start_time(pid).is_ok_and(|live| live == start_time)
     }
 
-    /// Read the view's executable image for a resumable cursor key
-    /// (one procfs read per view). `None` refuses the read: the object
-    /// then carries no cursor key this pass (no resume, record or drop).
-    pub(crate) fn resume_exec_target(
-        &mut self,
-        read: impl FnOnce() -> Option<Vec<u8>>,
-    ) -> Option<Option<Vec<u8>>> {
-        // One procfs read: never after the pass stops, and charged one
-        // unit of shared collection work like a liveness probe.
-        if self.stopped_now().is_some() || !self.collection_checkpoint(1) {
-            return None;
-        }
-        Some(read())
+    /// Admit one resume-side syscall: a generation probe (a pidfd poll
+    /// or one `/proc/<pid>/stat` read), the `/proc/<pid>/exe` readlink,
+    /// an `fstat`/`fstatfs`, one small procfs file read, or one bounded
+    /// chunk (or 64 rows) of a procfs table. Refused once the pass has
+    /// stopped; otherwise charged one unit of shared collection work.
+    /// Every syscall the resume, cursor-key and closing-bracket code
+    /// issues is bought here first (a source guard pins the sites).
+    pub(crate) fn admit_resume_syscall(&mut self) -> bool {
+        self.stopped_now().is_none() && self.collection_checkpoint(1)
     }
 
     /// Test-only: process-liveness probes performed for decode-cursor
@@ -1106,10 +1102,7 @@ impl ScanPassOwner {
         if let Some(&live) = self.decode.liveness.get(&(pid, start_time)) {
             return Some(live);
         }
-        if self.stopped_now().is_some() {
-            return None;
-        }
-        if !self.collection_checkpoint(1) {
+        if !self.admit_resume_syscall() {
             return None;
         }
         let live = self.decode_cursor_pid_live(pid, start_time);

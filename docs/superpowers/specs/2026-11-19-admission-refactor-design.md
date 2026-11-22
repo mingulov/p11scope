@@ -522,6 +522,20 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   the continuation was consumed), so no later pass can re-earn ground
   through the lost history. When nothing rises, the
   snapshot stops and the live in-progress gap names the work left.
+- Resume I/O is charged per syscall (owner 2, INV-2): every syscall or
+  file read the resume, cursor-key and closing-bracket code issues is
+  admitted first through one admission (stop check plus one unit of
+  shared collection work). The cursor file key admits its `fstatfs`,
+  its single `fstat` (pin and fd device together) and, on tmpfs, the
+  fdinfo and mount-table reads in 4 KiB chunks with one more unit per
+  64 rows, stopping at the matching row. The executable-image bracket
+  admits its opening generation check, readlink and closing check
+  separately and refuses the key when the closing check cannot be
+  bought. A failed closing bracket probes its live pin at most once,
+  through a check reserved when the view's scan starts, shared by the
+  keep, staging and retirement decisions; an unknown generation
+  neither stages nor retires, so the carried cursor stays. A source
+  guard test pins these sites and fails on a new unadmitted read.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

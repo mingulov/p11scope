@@ -833,42 +833,132 @@ pub(crate) fn mount_super_options(mountinfo: &str, mnt_id: u64) -> Option<&str> 
 }
 
 fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, String> {
+    filesystem_without_unique_inodes_metered(fd, &mut || true)
+        .expect("an unmetered classification admits every step")
+}
+
+/// [`filesystem_without_unique_inodes`] with every syscall admitted
+/// first: `admit()` is asked before the `fstatfs` and, on tmpfs, by the
+/// bounded fdinfo and mount-table readers (before each open, each chunk
+/// read and each 64 rows examined). `None` is a refusal.
+fn filesystem_without_unique_inodes_metered(
+    fd: RawFd,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Result<Option<&'static str>, String>> {
+    if !admit() {
+        return None;
+    }
     #[cfg(test)]
     provider_metadata_read_test::metadata_read();
     let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
     if unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) } != 0 {
-        return Err(format!(
+        return Some(Err(format!(
             "fstatfs failed while classifying inode uniqueness: {}",
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     // SAFETY: the successful `fstatfs` above initialized `buf`. `f_type` is
     // signed on some ABIs; the magic numbers are 32-bit values.
     #[allow(clippy::unnecessary_cast)]
     let f_type = unsafe { buf.assume_init().f_type } as u64 & 0xffff_ffff;
     if let Some(kind) = nonunique_inode_kind(f_type) {
-        return Ok(Some(kind));
+        return Some(Ok(Some(kind)));
     }
     if f_type != TMPFS_SUPER_MAGIC {
-        return Ok(None);
+        return Some(Ok(None));
     }
     // Tmpfs uniqueness is a mount option, not a magic: resolve this fd's
     // mount and read its super-options. Any failure fails closed in the
     // callers, which refuse the join (or the cache entry) on `Err`.
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|error| format!("reading mount table failed: {error}"))?;
-    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
-        .map_err(|error| format!("reading fd mount identity failed: {error}"))?;
-    let mount_id = fdinfo
-        .lines()
-        .find_map(|line| line.strip_prefix("mnt_id:\t"))
-        .ok_or_else(|| "fd mount identity is missing".to_string())?;
-    let mount_id = mount_id
-        .parse()
-        .map_err(|_| format!("invalid fd mount identity {mount_id:?}"))?;
-    let super_options = mount_super_options(&mountinfo, mount_id);
-    Ok(tmpfs_nonunique_kind(super_options))
+    let mount_id = match metered_find_line(&format!("/proc/self/fdinfo/{fd}"), admit, |line| {
+        line.strip_prefix("mnt_id:\t").map(str::to_owned)
+    })? {
+        Ok(Some(mount_id)) => mount_id,
+        Ok(None) => return Some(Err("fd mount identity is missing".to_string())),
+        Err(error) => return Some(Err(format!("reading fd mount identity failed: {error}"))),
+    };
+    let Ok(mount_id) = mount_id.parse::<u64>() else {
+        return Some(Err(format!("invalid fd mount identity {mount_id:?}")));
+    };
+    let super_options = match metered_find_line("/proc/self/mountinfo", admit, |line| {
+        mount_super_options(line, mount_id).map(str::to_owned)
+    })? {
+        Ok(options) => options,
+        Err(error) => return Some(Err(format!("reading mount table failed: {error}"))),
+    };
+    Some(Ok(tmpfs_nonunique_kind(super_options.as_deref())))
+}
+
+/// The first row of a procfs file that `find` accepts, read in bounded
+/// chunks: `admit()` is asked before the open, before every chunk read
+/// and before every 64 rows examined; `None` is a refusal. The search
+/// stops at the first match, so an early row never costs the whole
+/// table; a row longer than 64 KiB, or one that is not UTF-8, fails
+/// closed.
+fn metered_find_line<T>(
+    path: &str,
+    admit: &mut dyn FnMut() -> bool,
+    mut find: impl FnMut(&str) -> Option<T>,
+) -> Option<Result<Option<T>, String>> {
+    use std::io::Read as _;
+    const CHUNK_BYTES: usize = 4096;
+    const MAX_ROW_BYTES: usize = 64 * 1024;
+    if !admit() {
+        return None;
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; CHUNK_BYTES];
+    let mut rows = 0u64;
+    loop {
+        if !admit() {
+            return None;
+        }
+        #[cfg(test)]
+        provider_metadata_read_test::metadata_read();
+        let count = match file.read(&mut chunk) {
+            Ok(count) => count,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        let eof = count == 0;
+        // The carried partial row holds no newline: search the new bytes.
+        let mut search = pending.len();
+        pending.extend_from_slice(&chunk[..count]);
+        let mut start = 0;
+        loop {
+            let end = match pending[search..].iter().position(|byte| *byte == b'\n') {
+                Some(offset) => search + offset,
+                None if eof && start < pending.len() => pending.len(),
+                None => break,
+            };
+            rows += 1;
+            if rows % 64 == 0 && !admit() {
+                return None;
+            }
+            let Ok(row) = std::str::from_utf8(&pending[start..end]) else {
+                return Some(Err("procfs row is not UTF-8".into()));
+            };
+            if let Some(found) = find(row) {
+                return Some(Ok(Some(found)));
+            }
+            start = (end + 1).min(pending.len());
+            search = start;
+            if end == pending.len() {
+                break;
+            }
+        }
+        pending.drain(..start);
+        if eof {
+            return Some(Ok(None));
+        }
+        if pending.len() > MAX_ROW_BYTES {
+            return Some(Err("procfs row exceeds 64 KiB".into()));
+        }
+    }
 }
 
 /// Whether identity decisions may treat this fd's `(st_dev, st_ino)` as
@@ -878,6 +968,17 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 /// Fail-closed everywhere it is used.
 pub(crate) fn file_inodes_are_unique(file: &std::fs::File) -> bool {
     filesystem_without_unique_inodes(file.as_raw_fd()).is_ok_and(|kind| kind.is_none())
+}
+
+/// [`file_inodes_are_unique`] with every syscall admitted first (see
+/// [`filesystem_without_unique_inodes_metered`]): `None` when an
+/// admission was refused, otherwise the same fail-closed verdict.
+pub(crate) fn file_inodes_are_unique_metered(
+    file: &std::fs::File,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<bool> {
+    filesystem_without_unique_inodes_metered(file.as_raw_fd(), admit)
+        .map(|verdict| verdict.is_ok_and(|kind| kind.is_none()))
 }
 
 /// The identity of the file the kernel installed in one mapping (the VMA's

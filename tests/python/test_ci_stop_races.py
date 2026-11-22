@@ -461,6 +461,110 @@ class CiStopRacesTests(unittest.TestCase):
         self.assertIn("without the wedge signature", joint["detail"])
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
 
+    def test_s1_tag_with_mismatched_receipt_case_fails(self):
+        # Case-0 tag with a case-7 terminal error: the tag and its
+        # receipt name different cases, so the preclusion is unproven.
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "wp7-stop7: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_lone_later_s1_preclusion_fails(self):
+        # A case-7 tag and error with no earlier records: the
+        # qualifying entry runs the matrix in order and the first
+        # error ends it, so a lone later preclusion is impossible.
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop7:s1-precluded\n"
+               "wp7-stop7: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_receipt_inside_diagnostic_fails(self):
+        # Case-0 tag with the receipt substring inside a diagnostic
+        # line instead of standing as the full terminal error.
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "JOINT_STOP wp7-stop0: diagnostic no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted seen\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_s1_with_conflicting_unattributed_receipt_fails(self):
+        # Case-0 tag and error plus a contradictory unattributed
+        # receipt without its tag: the run proves both seals.
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+               "wp7-stop0: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n"
+               "wp7-stop0: no joint feeds without S1 seal "
+               "(producers linked, zero installs unexplained); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("mixed", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_mixed_unattributed_wedge_fails_under_expect_one(self):
+        # Explicit unattributed tag and receipt plus a wedge-signature
+        # diagnostic: under expectation this is mixed evidence, never
+        # an expected failure.
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop4:no-feeds-unattributed\n"
+               "wp7-stop4: no joint feeds without S1 seal "
+               "(producers linked, zero installs unexplained); not attempted\n"
+               "JOINT_STOP wp7-stop4: diagnostic %s seen\n" % wedge_signature())
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=True)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_malformed_pass_summary_fails(self):
+        # Full 12-case matrix but a malformed libtest summary: the
+        # pass count carries a suffix and failures are nonzero.
+        tags = "".join(
+            "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
+        done = "".join(
+            "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(12))
+        log = tags + done + ("test result: ok. 1 passed_suspected; 9 failed; "
+                             "0 ignored; 0 measured; 0 filtered out; "
+                             "finished in 180.00s\n")
+        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_pass_followed_by_failed_terminal_fails(self):
+        # A valid-looking summary followed by a failed terminal
+        # result: the verdict follows the terminal line, not an
+        # earlier pass.
+        tags = "".join(
+            "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
+        done = "".join(
+            "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(12))
+        log = tags + done + ("test result: ok. 1 passed; 0 failed; 0 ignored; "
+                             "0 measured; 0 filtered out; finished in 180.00s\n"
+                             "test result: FAILED. 0 passed; 1 failed; 0 ignored; "
+                             "0 measured; 0 filtered out; finished in 180.01s\n")
+        proc, rows, joint = run_mapping(log=log, rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
     def test_unexpected_pass_with_expect_one_fails(self):
         proc, rows, joint = run_mapping(
             log="test result: ok. 1 passed\n", rc=0, expect_fail=True)

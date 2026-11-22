@@ -2504,7 +2504,7 @@ fn stop_reconciliation_accepts_disclosed_shed_per_caller() {
         None,
         None,
         "semantic calls unrouted",
-        "1 calls shed without a route (test=1) with 2 bindings",
+        "1 calls shed without a route (unobserved=1) with 2 bindings",
     );
     assert_semantic_reconciled(
         &coordinator,
@@ -2658,7 +2658,7 @@ fn stop_reconciliation_refuses_two_shed_with_one_disclosed() {
         None,
         None,
         "semantic calls unrouted",
-        "1 calls shed without a route (test=1) with 2 bindings",
+        "1 calls shed without a route (unobserved=1) with 2 bindings",
     );
     let error = assert_semantic_reconciled(
         &coordinator,
@@ -2709,7 +2709,7 @@ fn stop_reconciliation_refuses_gap_without_a_shed_count() {
         None,
         None,
         "semantic calls unrouted",
-        "1 calls shed without a route (test=1) with 2 bindings",
+        "1 calls shed without a route (unobserved=1) with 2 bindings",
     );
     let error = assert_semantic_reconciled(
         &coordinator,
@@ -2761,7 +2761,7 @@ fn stop_reconciliation_refuses_a_breakdown_mismatch() {
         None,
         None,
         "semantic calls unrouted",
-        "2 calls shed without a route (test=1) with 2 bindings",
+        "2 calls shed without a route (unobserved=1) with 2 bindings",
     );
     assert_semantic_reconciled(
         &coordinator,
@@ -2814,7 +2814,7 @@ fn stop_reconciliation_refuses_foreign_shed() {
         None,
         None,
         "semantic calls unrouted from other callers",
-        "1 calls shed without a route (test=1) from callers other than the 2 bound callers",
+        "1 calls shed without a route (unobserved=1) from callers other than the 2 bound callers",
     );
     let error = assert_semantic_reconciled(
         &coordinator,
@@ -3003,5 +3003,175 @@ fn stop_reconciliation_refuses_over_refused_slots() {
     assert!(
         text.contains("over-refuses"),
         "the failure names over-refusal: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_blank_shed_cause() {
+    // Otherwise balanced (one disclosed shed, B one short), but the
+    // retained row leaves the cause blank: a counted shed with no
+    // named reason is not disclosed loss.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed without a route (=1) with 2 bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("a blank shed cause must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("counted total"),
+        "the failure names the unparsable row: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_an_unknown_shed_cause() {
+    // Otherwise balanced, but the cause names no route-loss reason:
+    // only the producer vocabulary discloses shed.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed without a route (test=1) with 2 bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("an unknown shed cause must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("counted total"),
+        "the failure names the unparsable row: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_accepts_a_dropped_batch_shed() {
+    // The second producer template discloses the same balanced shed:
+    // one call from a dropped batch with a named cause.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed from a dropped abandoned batch (unobserved=1) with 2 bindings",
+    );
+    assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect("a dropped-batch shed with a named cause reconciles");
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_blank_dropped_batch_cause() {
+    // Dropped-batch shape with a blank cause: balanced counts do not
+    // excuse an unnamed reason.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed from a dropped abandoned batch (=1) with 2 bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("a blank dropped-batch cause must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("counted total"),
+        "the failure names the unparsable row: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_shed_row_with_an_unparsable_binding_count() {
+    // Named cause and balanced counts, but the binding count is not
+    // a number: the row matches neither producer template.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed without a route (unobserved=1) with two bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("an unparsable binding count must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("counted total"),
+        "the failure names the unparsable row: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_shed_row_with_an_unknown_drop_word() {
+    // Named cause and balanced counts, but the drop word names no
+    // producer batch: the row matches neither template.
+    let mut coordinator = reconciliation_test_coordinator();
+    record_test_gap(
+        &mut coordinator,
+        None,
+        None,
+        "semantic calls unrouted",
+        "1 calls shed from a dropped bogus batch (unobserved=1) with 2 bindings",
+    );
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        1,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
+        ],
+    )
+    .expect_err("an unknown drop word must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("counted total"),
+        "the failure names the unparsable row: {text}"
     );
 }

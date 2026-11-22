@@ -1700,6 +1700,74 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("verdict=FAIL", lines[3], lines)
         self.assertIn("MIXED", lines[3], lines)
 
+    def test_full_matrix_verdict_requires_a_strict_terminal_result(self):
+        # Drive the runner's shipped verdict-plus-matrix block verbatim
+        # (the terminal result line plus the twelve completion lines)
+        # against fixture logs: a full matrix with a valid terminal
+        # result passes, a malformed pass summary fails, and a valid
+        # summary followed by a failed terminal result fails. The
+        # verdict and the printed result line come from the same
+        # terminal line.
+        text = RUNNER.read_text(encoding="utf-8")
+        verdict_start = text.index("result_line=$(command grep")
+        guard = ('if [ -n "${full_matrix_set[$name]+present}" ]'
+                 ' && [ "$verdict" = PASS ]; then')
+        matrix_start = text.index(guard)
+        matrix_end = text.index("\n        fi\n", matrix_start) + len("\n        fi\n")
+        block = text[verdict_start:matrix_end]
+        self.assertIn("verdict=FAIL", block)
+        self.assertIn("verdict=PASS", block)
+        self.assertIn("matrix_missing", block)
+
+        def linkage(i):
+            return "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i
+
+        def complete(i):
+            return "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i
+
+        ok = ("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+              "0 filtered out; finished in 180.00s\n")
+        malformed = ("test result: ok. 1 passed_suspected; 9 failed; 0 ignored; "
+                     "0 measured; 0 filtered out; finished in 180.00s\n")
+        failed = ("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
+                  "0 measured; 0 filtered out; finished in 180.01s\n")
+        full = "".join(linkage(i) for i in range(12))
+        full += "".join(complete(i) for i in range(12))
+        healthy = full + ok
+        bad_summary = full + malformed
+        valid_then_failed = full + ok + failed
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {}
+            for name, body in (("healthy.log", healthy),
+                               ("malformed.log", bad_summary),
+                               ("valid-then-failed.log", valid_then_failed)):
+                path = Path(tmp) / name
+                path.write_text(body, encoding="utf-8")
+                paths[name] = path
+            script = ""
+            for name, path in paths.items():
+                script += (
+                    'name="probe-cell"; rc=0; '
+                    'declare -A full_matrix_set=([probe-cell]=1); '
+                    'log="%s"; ' % path +
+                    block + "\n" +
+                    'printf "<@@%s verdict=%%s result=%%s@@>\\n" '
+                    '"$verdict" "$result_line"; ' % name
+                )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("verdict=PASS", lines[0], lines)
+        self.assertIn("1 passed; 0 failed", lines[0], lines)
+        self.assertIn("verdict=FAIL", lines[1], lines)
+        self.assertIn("verdict=FAIL", lines[2], lines)
+        self.assertIn("FAILED", lines[2], lines)
+
     def test_btrfs_pair_staging_surfaces_tool_stderr(self):
         # A hosted pair-staging failure must print the tool's
         # reason, not just the generic "cannot ..." line: stderr

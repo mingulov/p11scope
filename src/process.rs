@@ -980,6 +980,135 @@ pub(crate) fn metered_start_time(
     )
 }
 
+/// One `/proc/<pid>/stat` row read through the metered row reader:
+/// the open (with its close) plus one read, each admitted first;
+/// `None` is a refusal. Callers parse the row with the pure
+/// `stat_*_from_stat` helpers and treat every error as unknown.
+pub(crate) fn metered_stat_text(
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<io::Result<String>> {
+    Some(
+        match metered_io::find_line(&format!("/proc/{pid}/stat"), admit, |row| {
+            Some(row.to_owned())
+        })? {
+            Ok(Some(row)) => Ok(row),
+            Ok(None) => Err(io::Error::new(io::ErrorKind::InvalidData, "empty stat")),
+            Err(error) => Err(error),
+        },
+    )
+}
+
+/// A metered user/kernel classification: a user process, a task with
+/// the `PF_KTHREAD` flag, or an unproven pid (an unreadable or
+/// unparsable stat). Unknown stays eligible wherever it is used and
+/// is never cached as a proven class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidClass {
+    User,
+    KernelThread,
+    Unknown,
+}
+
+/// [`metered_stat_text`] under an explicit proc root (a fixture
+/// tree in tests, `/proc` live): `None` is a refusal.
+pub(crate) fn metered_stat_text_at(
+    proc_root: &std::path::Path,
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<io::Result<String>> {
+    let path = proc_root.join(pid.to_string()).join("stat");
+    let Some(path) = path.to_str() else {
+        return Some(Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "non-UTF-8 stat path",
+        )));
+    };
+    Some(
+        match metered_io::find_line(path, admit, |row| Some(row.to_owned()))? {
+            Ok(Some(row)) => Ok(row),
+            Ok(None) => Err(io::Error::new(io::ErrorKind::InvalidData, "empty stat")),
+            Err(error) => Err(error),
+        },
+    )
+}
+
+/// One metered `PF_KTHREAD` classification of `pid` (see
+/// [`metered_stat_text`]): `None` is a refused admission.
+pub(crate) fn metered_pid_class(pid: u32, admit: &mut dyn FnMut() -> bool) -> Option<PidClass> {
+    let row = match metered_stat_text(pid, admit)? {
+        Ok(row) => row,
+        Err(_) => return Some(PidClass::Unknown),
+    };
+    Some(match stat_flags_from_stat_text(&row) {
+        Some(flags) if flags & PF_KTHREAD != 0 => PidClass::KernelThread,
+        Some(_) => PidClass::User,
+        None => PidClass::Unknown,
+    })
+}
+
+/// [`metered_pid_class`] under an explicit proc root (a fixture
+/// tree in tests, `/proc` live): `None` is a refusal.
+pub(crate) fn metered_pid_class_at(
+    proc_root: &std::path::Path,
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<PidClass> {
+    let row = match metered_stat_text_at(proc_root, pid, admit)? {
+        Ok(row) => row,
+        Err(_) => return Some(PidClass::Unknown),
+    };
+    Some(match stat_flags_from_stat_text(&row) {
+        Some(flags) if flags & PF_KTHREAD != 0 => PidClass::KernelThread,
+        Some(_) => PidClass::User,
+        None => PidClass::Unknown,
+    })
+}
+
+/// One metered liveness probe of `pid` (see [`metered_stat_text`]):
+/// `Changed` is provably dead (a reaped pid, a zombie or a dead
+/// state word), `Current` is any other parsed state, `Unknown` is an
+/// unreadable or unparsable stat. `None` is a refused admission.
+pub(crate) fn metered_generation_dead(
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<GenerationProof> {
+    let row = match metered_stat_text(pid, admit)? {
+        Ok(row) => row,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Some(GenerationProof::Changed);
+        }
+        Err(_) => return Some(GenerationProof::Unknown),
+    };
+    let Some(end) = row.rfind(')') else {
+        return Some(GenerationProof::Unknown);
+    };
+    let dead = row[end + 1..]
+        .split_whitespace()
+        .next()
+        .is_some_and(stat_state_is_dead);
+    Some(if dead {
+        GenerationProof::Changed
+    } else {
+        GenerationProof::Current
+    })
+}
+
+/// Whether a member whose scan failed is gone for skip purposes (see
+/// [`metered_generation_dead`]): the pin's verdict stands, and a fresh
+/// metered read covers the zombie the pin cannot see. `None` is a
+/// refused admission; the caller keeps the loud skip.
+pub(crate) fn metered_scan_failure_gone(
+    original_exited: bool,
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<bool> {
+    if original_exited {
+        return Some(true);
+    }
+    metered_generation_dead(pid, admit).map(|proof| matches!(proof, GenerationProof::Changed))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OriginalGenerationState {
     Current,
@@ -2136,6 +2265,7 @@ pub(crate) fn generation_dead(pid: u32) -> bool {
 /// so a fresh `generation_dead` read covers the zombie the pin cannot see.
 /// Reuse-safe like `generation_dead`: either verdict only fires when the
 /// original generation is provably dead.
+#[cfg(test)]
 pub(crate) fn scan_failure_gone(original_exited: bool, pid: u32) -> bool {
     original_exited || generation_dead(pid)
 }

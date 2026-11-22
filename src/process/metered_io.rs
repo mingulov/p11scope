@@ -1,7 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-//! Metered I/O primitives for the resume, cursor-key, replay and
-//! closing-bracket code (INV-2: one admitted unit per native call).
+//! Metered I/O primitives for the resume, cursor-key, replay,
+//! closing-bracket, provider-facts, census and kernel-thread code
+//! (INV-2: one admitted unit per native call).
 //!
 //! Each primitive asks `admit()` immediately before its single native
 //! call and never retries: an interrupted or failed call returns its
@@ -16,7 +17,8 @@ use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, RawFd};
 
 /// Test-only count of native calls the primitives issued on this
-/// thread (opens, reads, closes, polls, readlinks, fstat and fstatfs).
+/// thread (opens, reads, closes, polls, readlinks, stats, fstat and
+/// fstatfs).
 #[cfg(test)]
 pub(crate) mod syscall_test {
     use std::cell::Cell;
@@ -258,4 +260,51 @@ pub(crate) fn fstatfs(
     }
     // SAFETY: initialized by the successful call above.
     Some(Ok(unsafe { stat.assume_init() }))
+}
+
+/// One `stat(2)` of a path: one unit, no retry. Like
+/// [`std::fs::metadata`], links are followed. An interrupted or failed
+/// call returns its error for the caller to treat as unknown.
+pub(crate) fn stat_path(
+    path: &std::path::Path,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<io::Result<libc::stat>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return Some(Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "stat path holds a NUL byte",
+        )));
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if !admit() {
+        return None;
+    }
+    issued();
+    // SAFETY: `path` is NUL-terminated; `stat` is read only on success.
+    if unsafe { libc::stat(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Some(Err(io::Error::last_os_error()));
+    }
+    // SAFETY: initialized by the successful call above.
+    Some(Ok(unsafe { stat.assume_init() }))
+}
+
+/// Whether a procfs file holds at least one byte, read through
+/// [`MeteredFile`]: the open (with its close) plus one single-byte
+/// read, each admitted first; `None` is a refusal. A mapping-heavy
+/// address space is never read whole: one byte decides.
+pub(crate) fn read_first_byte(
+    path: &str,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<io::Result<Option<u8>>> {
+    let mut file = match MeteredFile::open(path, admit)? {
+        Ok(file) => file,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut byte = [0u8; 1];
+    match file.read(&mut byte, admit)? {
+        Ok(0) => Some(Ok(None)),
+        Ok(_) => Some(Ok(Some(byte[0]))),
+        Err(error) => Some(Err(error)),
+    }
 }

@@ -10,9 +10,11 @@
 use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
+#[cfg(test)]
+use crate::discovery::identity::pin_of;
 use crate::discovery::identity::{
-    ExaminedObject, FileIdentity, MappedFile, Pin, file_inodes_are_unique, forwardable_getter,
-    pin_of,
+    ExaminedObject, FileIdentity, MappedFile, Pin, file_inodes_are_unique_metered,
+    forwardable_getter, pin_of_metered,
 };
 #[cfg(test)]
 use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
@@ -992,6 +994,26 @@ impl InspectedFileKey {
             pin,
             fd_dev,
         })
+    }
+
+    /// [`Self::for_open_file`] with its `fstat` admitted first (one
+    /// unit): `None` is a refusal, with no native call issued. The pin
+    /// and the fd's own `st_dev` come from the same result, so the key
+    /// never mixes two instants of a changing file.
+    pub(crate) fn for_open_file_metered(
+        file: &File,
+        device: Device,
+        inode: u64,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<Result<Self, String>> {
+        let stat = match crate::process::metered_io::fstat(
+            std::os::fd::AsRawFd::as_raw_fd(file),
+            admit,
+        )? {
+            Ok(stat) => stat,
+            Err(error) => return Some(Err(format!("fstat failed: {error}"))),
+        };
+        Some(Ok(Self::of_stat(&stat, device, inode)))
     }
 }
 
@@ -2413,6 +2435,13 @@ impl CaptureWorkBudget {
     #[cfg(test)]
     pub(crate) fn decode_liveness_probes(&self) -> u64 {
         self.pass.decode_liveness_probes()
+    }
+
+    /// The cursor's tiers with every live start-time read through the
+    /// metered row reader (see
+    /// [`super::scan_pass::ScanPassOwner::tiers_for_selection_metered`]).
+    pub(crate) fn tiers_for_selection_metered(&mut self) -> super::scan_pass::MemberTiers {
+        self.pass.tiers_for_selection_metered()
     }
 
     /// Record (or advance) one object's decode cursor through the pass
@@ -6765,27 +6794,46 @@ fn record_module_cursor(
 /// gate refusal (table-cap or pre-parse format) — with zero reads. On
 /// filesystems without unique inode numbers the key cannot name one
 /// file, so neither is ever cached there: always read, never store.
+/// Every metadata read is admitted first; a refused admission returns
+/// the pass stop and caches nothing.
 fn provider_facts_for(
     file: &File,
     key: ObjectKey,
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<ElfExportFacts, String> {
-    let before = pin_of(file)?;
+    // One admitted fstat names the bracket pin and the cache key
+    // together, so the key never mixes two instants of a changing file.
+    let cache_key =
+        match InspectedFileKey::for_open_file_metered(file, key.device, key.inode, &mut || {
+            budget.admit_resume_syscall()
+        }) {
+            Some(Ok(cache_key)) => cache_key,
+            Some(Err(error)) => return Err(error),
+            None => return Err(metered_refusal_reason(budget)),
+        };
+    let before = cache_key.pin;
     // Neither policy gates this demand-paged export check on whole size;
     // both charge the header tables before the parse and the remainder
     // after.
-    let cache_key = InspectedFileKey::for_open_file(file, key.device, key.inode, before)?;
     // On filesystems without unique inode numbers the key cannot name
     // one file, so the facts are never cached there: always read, never
     // store.
-    let cacheable = file_inodes_are_unique(file);
+    let cacheable =
+        match file_inodes_are_unique_metered(file, &mut || budget.admit_resume_syscall()) {
+            Some(cacheable) => cacheable,
+            None => return Err(metered_refusal_reason(budget)),
+        };
     // Nothing is read for this hit, but the file may have changed since
     // `before`; only the still-unchanged file may reuse the cached facts.
+    // A refused or failed re-probe never reuses: it re-reads below.
+    let unchanged = |file: &File, before: &Pin, admit: &mut dyn FnMut() -> bool| {
+        pin_of_metered(file, admit).is_some_and(|after| after.is_ok_and(|after| after == *before))
+    };
     let cached = if cacheable {
         budget
             .elf_export_facts_for(&cache_key)
-            .filter(|_| pin_of(file).is_ok_and(|after| after == before))
+            .filter(|_| unchanged(file, &before, &mut || budget.admit_resume_syscall()))
     } else {
         None
     };
@@ -6794,7 +6842,7 @@ fn provider_facts_for(
     if cacheable
         && let Some(reason) = budget
             .table_cap_refusal_for(&cache_key)
-            .filter(|_| pin_of(file).is_ok_and(|after| after == before))
+            .filter(|_| unchanged(file, &before, &mut || budget.admit_resume_syscall()))
     {
         return Err(reason);
     }
@@ -6807,10 +6855,16 @@ fn provider_facts_for(
                     // Cache the gate refusal (table-cap or pre-parse
                     // format) under the stable pin bracket, like the
                     // facts below; every other refusal (ceilings,
-                    // deadlines, corrupt bytes) re-reads.
+                    // deadlines, corrupt bytes) re-reads. A refused
+                    // re-probe never caches.
+                    let bracket = match pin_of_metered(file, &mut || budget.admit_resume_syscall())
+                    {
+                        Some(after) => check_pin_after_read(after, &before).is_ok(),
+                        None => false,
+                    };
                     if cacheable
                         && p11scope_manifest::elf::is_gate_refusal_reason(&reason)
-                        && check_pin_after_read(pin_of(file), &before).is_ok()
+                        && bracket
                     {
                         budget.note_table_cap_refusal(cache_key, reason.clone());
                     }
@@ -6818,13 +6872,27 @@ fn provider_facts_for(
                 }
             };
             // File-derived anchor exclusions share the export pin bracket.
-            check_pin_after_read(pin_of(file), &before)?;
+            // A refused re-probe keeps the facts uncached and names the stop.
+            let after = match pin_of_metered(file, &mut || budget.admit_resume_syscall()) {
+                Some(after) => after,
+                None => return Err(metered_refusal_reason(budget)),
+            };
+            check_pin_after_read(after, &before)?;
             if cacheable {
                 budget.note_elf_export_facts(cache_key, facts.clone());
             }
             Ok(facts)
         }
     }
+}
+
+/// The pass stop to name when a metered metadata read is refused: the
+/// latched stop, or the work ceiling when none latched yet.
+fn metered_refusal_reason(budget: &CaptureWorkBudget) -> String {
+    budget
+        .stopped_reason()
+        .unwrap_or(WORK_CEILING_REASON)
+        .to_string()
 }
 
 /// Attribute `--module` hints to one opened file: the first matched
@@ -8474,6 +8542,24 @@ fn exited_before_discovery(pid: u32) -> String {
     format!("pid {pid} exited before discovery")
 }
 
+/// One metered generation gate for the scan entry: `Current` scans,
+/// `Changed` takes the exited path, and an unproven generation stays
+/// loud without naming an exit it did not prove. A refused admission
+/// issues no probe and lets the scan reach its first I/O checkpoint,
+/// which refuses with the latched stop exactly as before (every
+/// refusal latches a stop, and `acquire_scan_maps` stop-checks before
+/// opening anything) — the member retries next pass.
+fn scan_gate_generation(view: &ProcessView, budget: &mut CaptureWorkBudget) -> Result<(), String> {
+    match view.metered_generation(&mut || budget.admit_resume_syscall()) {
+        Some(GenerationProof::Current) | None => Ok(()),
+        Some(GenerationProof::Changed) => Err(exited_before_discovery(view.pid())),
+        Some(GenerationProof::Unknown) => Err(format!(
+            "pid {} generation unproven before discovery; scan deferred",
+            view.pid()
+        )),
+    }
+}
+
 /// How a successfully read but empty initial maps snapshot classifies.
 /// Only a positively identified kernel thread is verified absence;
 /// everything unproven keeps the refusal.
@@ -8752,9 +8838,7 @@ fn scan_view_examined_mode(
     if request.pid != view.pid() {
         return Err("scan request pid does not match its process view".into());
     }
-    if !view.still_the_same() {
-        return Err(exited_before_discovery(request.pid));
-    }
+    scan_gate_generation(view, budget)?;
     let started = Instant::now();
     let pid = request.pid;
     let refused_initial = |reason: String| {
@@ -18384,8 +18468,8 @@ int main(int argc, char **argv) {
         // identity it examined.
         for helper_line in [
             "let (named_hint, refusal) = first_attributable_hint(matched, hints, file);",
-            "let before = pin_of(file)?;",
-            "check_pin_after_read(pin_of(file), &before)?;",
+            "let before = cache_key.pin;",
+            "check_pin_after_read(after, &before)?;",
             "identity: mapped.identity,",
             "key_is_identity: mapped.key_is_identity(key),",
         ] {
@@ -22544,7 +22628,10 @@ int main(int argc, char **argv) {
             64,
             "the refusal charges its 64-byte header probe only"
         );
-        assert_eq!(budget.work_units_count(), 0);
+        // The admitted metadata bracket: the cache-key fstat, the
+        // uniqueness fstatfs, and the pin re-probe that caches the
+        // gate refusal (one unit each).
+        assert_eq!(budget.work_units_count(), 3);
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
     }
@@ -22561,8 +22648,11 @@ int main(int argc, char **argv) {
         let key = object_key_of(&file);
         let (gated, _) = p11scope_manifest::elf::read_table_bounds(&file);
         let tables = gated.expect("the fixture parses").table_bytes();
+        // Two work units admit the metadata bracket (the cache-key
+        // fstat and the uniqueness fstatfs) but no table entry, so the
+        // refusal still lands on the pre-parse entry spend below.
         let mut budget =
-            CaptureWorkBudget::for_inventory(inventory_limits(8 << 20, 1, 4096, 32768, 4096, 512));
+            CaptureWorkBudget::for_inventory(inventory_limits(8 << 20, 2, 4096, 32768, 4096, 512));
         let window = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
         let scan = budget.checkpoint(window.clone()).unwrap();
         let error =
@@ -22632,7 +22722,10 @@ int main(int argc, char **argv) {
             64,
             "the cached refusal rereads nothing"
         );
-        assert_eq!(budget.work_units_count(), 0);
+        // Two admitted metadata brackets (3 units each: the cache-key
+        // fstat, the uniqueness fstatfs, and one pin re-probe), and no
+        // table re-spend: the repeat reuses the cached refusal.
+        assert_eq!(budget.work_units_count(), 6);
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
     }
@@ -22683,7 +22776,9 @@ int main(int argc, char **argv) {
                 64,
                 "the cached {name} refusal rereads nothing"
             );
-            assert_eq!(budget.work_units_count(), 0, "{name}");
+            // Two admitted metadata brackets (3 units each), and no
+            // table re-spend: the repeat reuses the cached refusal.
+            assert_eq!(budget.work_units_count(), 6, "{name}");
             budget.finish_scan(scan).unwrap();
             budget.finish_window(window).unwrap();
         }
@@ -23642,6 +23737,85 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// The census primitives issue one native call per admitted unit:
+    /// a path `stat` costs one unit and matches `metadata`, and the
+    /// first-byte read costs its open (with its close) plus one read,
+    /// telling an empty maps from a mapped one.
+    #[test]
+    fn metered_census_primitives_issue_one_native_call_per_admitted_unit() {
+        use crate::process::metered_io::{self, syscall_test};
+        let run =
+            |what: &str, ample: u64, action: &mut dyn FnMut(&mut dyn FnMut() -> bool) -> bool| {
+                for credits in (0..=8u64).chain([ample]) {
+                    let mut admitted = 0u64;
+                    let before = syscall_test::count();
+                    let healthy = action(&mut || {
+                        if admitted == credits {
+                            return false;
+                        }
+                        admitted += 1;
+                        true
+                    });
+                    let issued = syscall_test::count() - before;
+                    assert!(
+                        issued <= admitted,
+                        "{what}, credits {credits}: {issued} native calls for {admitted} units"
+                    );
+                    if credits == ample {
+                        assert!(healthy, "{what}: ample credit gives the unmetered answer");
+                    }
+                }
+            };
+        let meta = std::fs::metadata("/proc/self/exe").unwrap();
+        run("stat path", 1, &mut |admit| {
+            use std::os::unix::fs::MetadataExt as _;
+            matches!(
+                metered_io::stat_path(std::path::Path::new("/proc/self/exe"), admit),
+                Some(Ok(stat)) if stat.st_dev == meta.dev() && stat.st_ino == meta.ino()
+            )
+        });
+        run("first byte of mapped maps", 3, &mut |admit| {
+            matches!(
+                metered_io::read_first_byte("/proc/self/maps", admit),
+                Some(Ok(Some(_)))
+            )
+        });
+        // An empty file reads no byte; a missing one errors.
+        assert!(
+            matches!(
+                metered_io::read_first_byte("/proc/self/exe", &mut || true),
+                Some(Ok(Some(_)))
+            ),
+            "a non-empty file yields its first byte"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(
+            matches!(
+                metered_io::read_first_byte(empty.to_str().unwrap(), &mut || true),
+                Some(Ok(None))
+            ),
+            "an empty file reads no byte"
+        );
+        assert!(
+            matches!(
+                metered_io::read_first_byte("/proc/self/no-such-file", &mut || true),
+                Some(Err(_))
+            ),
+            "a missing file errors"
+        );
+        assert!(
+            matches!(
+                metered_io::stat_path(std::path::Path::new("/proc/self/no-such-file"), &mut || {
+                    true
+                }),
+                Some(Err(_))
+            ),
+            "a missing path errors"
+        );
+    }
+
     /// Generation verdicts carry proof: a reused pid (different start
     /// time on the fallback pin) is a proved change, a fallback pin with
     /// no retained start time proves nothing, and the closing check turns
@@ -23711,6 +23885,82 @@ int main(int argc, char **argv) {
             action,
         );
         (value, reads.get())
+    }
+
+    /// Provider export facts read only through admitted metadata:
+    /// with `credits` collection units the helper performs at most
+    /// `credits` metadata reads, a refused admission names the pass
+    /// stop and issues no native call (caching nothing), and ample
+    /// credit reads the facts.
+    #[test]
+    fn provider_facts_admit_each_metadata_read_and_cache_nothing_on_refusal() {
+        use std::sync::atomic::Ordering;
+        let fixture = ElfExportFactsFixture::new_provider();
+        let file = File::open(&fixture.path).unwrap();
+        let key = object_key_of(&file);
+        for credits in (0..=8u64).chain([1 << 20]) {
+            let (mut budget, admitted) = credited_resume_budget(credits);
+            let (got, reads) =
+                metadata_reads_during(|| provider_facts_for(&file, key, &[], &mut budget));
+            assert!(
+                reads <= admitted.load(Ordering::SeqCst),
+                "credits {credits}: {reads} metadata reads for {} admitted units",
+                admitted.load(Ordering::SeqCst)
+            );
+            if credits == 0 {
+                assert_eq!(reads, 0, "a refusal issues no native call");
+                let error = got.unwrap_err();
+                assert_eq!(error, COLLECTION_STOP_REASON, "a refusal names the stop");
+                assert!(
+                    !p11scope_manifest::elf::is_gate_refusal_reason(&error),
+                    "a stop is never cached as a gate refusal"
+                );
+            } else if credits == 1 << 20 {
+                assert!(got.is_ok(), "ample credit reads the facts");
+            }
+        }
+        // A stopped pass reads nothing either.
+        let (mut stopped, _) = credited_resume_budget(1 << 20);
+        stopped.pass_owner().set_scan_stop(WORK_CEILING_REASON);
+        let (got, reads) =
+            metadata_reads_during(|| provider_facts_for(&file, key, &[], &mut stopped));
+        assert_eq!(reads, 0, "a stopped pass reads nothing");
+        assert_eq!(got.unwrap_err(), WORK_CEILING_REASON);
+    }
+
+    /// The scan entry gate proves its generation before it names an
+    /// exit: a current view scans, a changed generation takes the
+    /// exited path with the same text, an unproven generation stays
+    /// loud without naming an exit, and a refused admission issues no
+    /// probe and lets the scan reach its first I/O checkpoint (which
+    /// refuses with the latched stop exactly as before).
+    #[test]
+    fn scan_gate_generation_proves_before_it_names() {
+        let pid = std::process::id();
+        // Current: the live view scans.
+        let view = crate::process::ProcessView::open(ProcessViewId(71), pid).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        assert!(scan_gate_generation(&view, &mut budget).is_ok());
+        // Changed: the recycled pin takes the exited path, same text.
+        let reused = crate::process::reused_process_view_for_test(ProcessViewId(72), pid).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let error = scan_gate_generation(&reused, &mut budget).unwrap_err();
+        assert!(
+            error.contains(&format!("pid {pid} exited before discovery")),
+            "{error}"
+        );
+        // Unknown: the unprovable pin names no exit.
+        let unprovable =
+            crate::process::unprovable_process_view_for_test(ProcessViewId(73), pid).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let error = scan_gate_generation(&unprovable, &mut budget).unwrap_err();
+        assert!(error.contains("unproven"), "{error}");
+        assert!(!error.contains("exited"), "{error}");
+        // Refused: no probe issues, and the scan proceeds to its
+        // first I/O checkpoint with the stop latched for it.
+        let (mut refused, _) = credited_resume_budget(0);
+        assert!(scan_gate_generation(&view, &mut refused).is_ok());
+        assert_eq!(refused.stopped_reason(), Some(COLLECTION_STOP_REASON));
     }
 
     /// One file's cursor-key metadata reads, each under its own unit:
@@ -23891,8 +24141,11 @@ int main(int argc, char **argv) {
     /// Every raw syscall token the guard below recognises: opens and
     /// file reads (whose `File` drop is a close), metadata calls,
     /// readlinks (std's `read_link` retries a full buffer), polls and
-    /// their retry wrappers, generation probes and native calls.
-    const RAW_SYSCALL_TOKENS: [&str; 17] = [
+    /// their retry wrappers, generation probes, provider-metadata
+    /// probes, census and kernel-thread classifiers, and native calls.
+    /// Unmetered-helper tokens carry their `(` so the `_metered`
+    /// suffixed replacements do not match.
+    const RAW_SYSCALL_TOKENS: [&str; 36] = [
         "std::fs::",
         "File::open",
         "OpenOptions",
@@ -23910,16 +24163,36 @@ int main(int argc, char **argv) {
         "exe_target(",
         "unsafe",
         "drop(",
+        "read_proc_stat(",
+        "process_is_zombie(",
+        "process_is_kthread(",
+        "::generation_dead(",
+        "::scan_failure_gone(",
+        "process_stat_pair(",
+        "pid_is_kernel_thread(",
+        "maps_is_empty(",
+        "newcomer_arrival_possible(",
+        "owned_watch_member_image(",
+        "same_kernel_file(",
+        "user_process_pids(",
+        "pid_is_user_process(",
+        "kernel_thread_exclusions(",
+        "census_over_cap(",
+        "pin_of(",
+        "pin_of_fd(",
+        "file_inodes_are_unique(",
+        "for_open_file(",
     ];
 
     /// The native calls the metered primitives may issue, one per unit.
-    const METERED_OPERATIONS: [&str; 6] = [
+    const METERED_OPERATIONS: [&str; 7] = [
         "std::fs::File::open(",
         "Read::read(",
         "libc::readlink(",
         "libc::poll(",
         "libc::fstat(",
         "libc::fstatfs(",
+        "libc::stat(",
     ];
 
     /// Every `fn` body (name, body) in `code`, in source order.
@@ -24083,6 +24356,17 @@ int main(int argc, char **argv) {
                         violations
                             .push("metered_io::find_line reads only through MeteredFile".into());
                     }
+                    if name == "read_first_byte"
+                        && !(body.contains("MeteredFile::open(")
+                            && body.contains(".read(&mut byte, admit)"))
+                    {
+                        violations.push(
+                            "metered_io::read_first_byte reads only through MeteredFile".into(),
+                        );
+                    }
+                    if name == "stat_path" && !body.contains("libc::stat(") {
+                        violations.push("metered_io::stat_path stats once".into());
+                    }
                 }
                 let total: usize = METERED_OPERATIONS
                     .iter()
@@ -24094,14 +24378,14 @@ int main(int argc, char **argv) {
                         total - covered
                     ));
                 }
-                if covered < 6 {
+                if covered < 7 {
                     violations.push(format!("metered_io: only {covered} native calls found"));
                 }
             }
         }
 
         // 2. Callers: no raw token at all.
-        let audited: [(&str, &[&str]); 4] = [
+        let audited: [(&str, &[&str]); 7] = [
             (
                 "discovery/scan.rs",
                 &[
@@ -24109,6 +24393,9 @@ int main(int argc, char **argv) {
                     "cursor_file_key_for",
                     "reserve",
                     "verdict",
+                    "provider_facts_for",
+                    "scan_gate_generation",
+                    "for_open_file_metered",
                 ],
             ),
             (
@@ -24117,12 +24404,48 @@ int main(int argc, char **argv) {
                     "filesystem_without_unique_inodes_metered",
                     "file_inodes_are_unique_metered",
                     "metered_find_line",
+                    "pin_of_metered",
                 ],
             ),
-            ("process.rs", &["metered_generation", "metered_start_time"]),
+            (
+                "process.rs",
+                &[
+                    "metered_generation",
+                    "metered_start_time",
+                    "metered_stat_text",
+                    "metered_stat_text_at",
+                    "metered_pid_class",
+                    "metered_pid_class_at",
+                    "metered_generation_dead",
+                    "metered_scan_failure_gone",
+                ],
+            ),
             (
                 "discovery/scan_pass.rs",
-                &["decode_generation_live_cached", "admit_resume_syscall"],
+                &[
+                    "decode_generation_live_cached",
+                    "admit_resume_syscall",
+                    "charge_scan_work",
+                    "tiers_for_selection_metered",
+                ],
+            ),
+            (
+                "discovery/engine.rs",
+                &[
+                    "cached_user_process_pids",
+                    "user_process_pids_metered",
+                    "kernel_thread_exclusions_metered",
+                    "pid_is_kernel_thread_metered",
+                    "newcomer_arrival_possible_metered",
+                    "owned_watch_member_image_metered",
+                    "seed_initial_kernel_threads",
+                    "classify_newly_listed_pid",
+                ],
+            ),
+            ("inspect_system.rs", &["census_over_cap_metered"]),
+            (
+                "inspect_system/inventory_cgroup.rs",
+                &["charged_census_over_cap", "capped_member_selection"],
             ),
         ];
         for (file, names) in audited {
@@ -24151,11 +24474,14 @@ int main(int argc, char **argv) {
                 raw_free(&format!("scan_pass::{name}"), body, &mut violations);
             }
             let admission = fn_body(&pass, "admit_resume_syscall");
-            if !(admission.contains("self.stopped_now().is_none()")
-                && admission.contains("self.collection_checkpoint(1)"))
+            if !(admission.contains("self.stopped_now()")
+                && admission.contains("self.collection_checkpoint(1)")
+                && admission.contains("self.charge_scan_work(1)"))
             {
-                violations
-                    .push("admit_resume_syscall: one stop check plus one charged unit".into());
+                violations.push(
+                    "admit_resume_syscall: one stop check, one collection unit, one scan-work unit"
+                        .into(),
+                );
             }
         }
 
@@ -24225,6 +24551,176 @@ int main(int argc, char **argv) {
             &["read_stat("],
         ));
         walked += 1;
+
+        // 5. Provider facts read only through the metered pins.
+        match bodies_named(&scan_code, "provider_facts_for") {
+            Some(body) => {
+                for required in [
+                    "pin_of_metered(",
+                    "for_open_file_metered(",
+                    "file_inodes_are_unique_metered(",
+                ] {
+                    if !body.contains(required) {
+                        violations.push(format!(
+                            "provider_facts_for: metered site missing: {required}"
+                        ));
+                    }
+                }
+                for forbidden in [
+                    "pin_of(file",
+                    "for_open_file(file",
+                    "file_inodes_are_unique(file",
+                ] {
+                    if body.contains(forbidden) {
+                        violations.push(format!(
+                            "provider_facts_for: unmetered site remains: {forbidden}"
+                        ));
+                    }
+                }
+                walked += 1;
+            }
+            None => violations.push("provider_facts_for missing".into()),
+        }
+
+        // 6. The scan gate proves its generation through one metered helper.
+        match bodies_named(&scan_code, "scan_view_examined_mode") {
+            Some(body) => {
+                if !body.contains("scan_gate_generation(") {
+                    violations.push("scan_view_examined_mode: metered gate missing".into());
+                }
+                if body.contains("view.still_the_same()") {
+                    violations
+                        .push("scan_view_examined_mode: unmetered still_the_same remains".into());
+                }
+                walked += 1;
+            }
+            None => violations.push("scan_view_examined_mode missing".into()),
+        }
+
+        // 7. Census and kernel-thread sites read only through metered classifiers.
+        let engine_code = production_code("discovery/engine.rs").expect("engine");
+        match bodies_named(&engine_code, "select_excluding_kernel_threads") {
+            Some(body) => {
+                if !body.contains("kernel_thread_exclusions_metered(") {
+                    violations
+                        .push("select_excluding_kernel_threads: metered exclusions missing".into());
+                }
+                if body.contains("kernel_thread_exclusions(sweep") {
+                    violations.push(
+                        "select_excluding_kernel_threads: unmetered exclusions remain".into(),
+                    );
+                }
+                walked += 1;
+            }
+            None => violations.push("select_excluding_kernel_threads missing".into()),
+        }
+        if !engine_code.contains("tiers_for_selection_metered()") {
+            violations.push("discover_plan: metered tiers missing".into());
+        }
+        if engine_code.contains("tiers_for_selection(|pid|") {
+            violations.push("discover_plan: unmetered tiers remain".into());
+        }
+        // The capture census filters through the metered classifier.
+        if engine_code.contains("user_process_pids(&pids, Path::new") {
+            violations.push("capture census: unmetered filter remains".into());
+        }
+        if engine_code.matches("user_process_pids_metered(").count() < 2 {
+            violations
+                .push("capture census: metered filter missing (definition plus its call)".into());
+        }
+        if engine_code.contains("kernel_thread_exclusions(&sweep") {
+            violations.push("capture counts: unmetered exclusions remain".into());
+        }
+        // Scan-failure classification proves death through the metered helper.
+        let failure_total = engine_code.matches("scan_failure_gone(").count();
+        let failure_metered = engine_code.matches("metered_scan_failure_gone(").count();
+        if failure_total != failure_metered {
+            violations.push("scan failure classification: unmetered helper remains".into());
+        }
+        if failure_metered < 3 {
+            violations
+                .push("scan failure classification: metered calls missing (three sites)".into());
+        }
+        if engine_code
+            .matches("kernel_thread_exclusions_metered(")
+            .count()
+            < 3
+        {
+            violations.push(
+                "capture counts: metered exclusions missing (definition plus both calls)".into(),
+            );
+        }
+        match bodies_named(&engine_code, "newcomer_arrival_possible_metered") {
+            Some(_) => walked += 1,
+            None => violations.push("newcomer_arrival_possible_metered missing".into()),
+        }
+        // The live newcomer filter classifies through the metered helper.
+        if let Some(at) = engine_code.find("newcomer_arrival_possible(&self.proc_root") {
+            violations.push(format!(
+                "newcomer filter: unmetered classifier remains at byte {at}"
+            ));
+        }
+        if engine_code
+            .matches("newcomer_arrival_possible_metered(")
+            .count()
+            < 2
+        {
+            violations.push(
+                "newcomer filter: metered classifier missing (definition plus its call)".into(),
+            );
+        }
+        // The owned watch classifies lazily through the metered helper.
+        match bodies_named(&engine_code, "owned_tree_watch") {
+            Some(body) => {
+                if body.contains("pid_is_user_process(&self.proc_root") {
+                    violations.push("owned watch: unmetered lazy classifier remains".into());
+                }
+                if !body.contains("metered_pid_class_at(") {
+                    violations.push("owned watch: metered lazy classifier missing".into());
+                }
+                walked += 1;
+            }
+            None => violations.push("owned_tree_watch missing".into()),
+        }
+        // The owned watch compares member images through the metered helper.
+        if engine_code.contains("owned_watch_member_image(&self.proc_root") {
+            violations.push("owned watch: unmetered member image remains".into());
+        }
+        if engine_code
+            .matches("owned_watch_member_image_metered(")
+            .count()
+            < 2
+        {
+            violations.push(
+                "owned watch: metered member image missing (definition plus its calls)".into(),
+            );
+        }
+        let system_code = production_code("inspect_system.rs").expect("system");
+        match bodies_named(&system_code, "collect_members_identity") {
+            Some(body) => {
+                if body.contains("census_over_cap(&pids") {
+                    violations.push("system census: unmetered census remains".into());
+                }
+                if !body.contains("census_over_cap_metered(") {
+                    violations.push("system census: metered census missing".into());
+                }
+                walked += 1;
+            }
+            None => violations.push("collect_members_identity missing".into()),
+        }
+        // The cgroup census and selection closures read through metered_io.
+        if cgroup_code.contains("pid_is_user_process(Path::new") {
+            violations.push("cgroup census: unmetered is_user remains".into());
+        }
+        if !cgroup_code.contains("metered_pid_class(") {
+            violations.push("cgroup census: metered classifier missing".into());
+        }
+        if cgroup_code.contains("read_to_string(format!(") {
+            violations.push("cgroup selection: unmetered read_stat remains".into());
+        }
+        if !cgroup_code.contains("metered_stat_text(") {
+            violations.push("cgroup selection: metered read_stat missing".into());
+        }
 
         if walked < 8 {
             violations.push(format!("the guard selected only {walked} operations"));

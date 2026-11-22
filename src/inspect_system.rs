@@ -29,9 +29,12 @@
 use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
+#[cfg(test)]
+use crate::discovery::engine::user_process_pids;
 use crate::discovery::engine::{
     MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
-    select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip, user_process_pids,
+    select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip,
+    user_process_pids_metered,
 };
 use crate::discovery::handle_table::{DeferredReason, HandleTable};
 use crate::discovery::hooks::HookRegistry;
@@ -751,9 +754,40 @@ pub(crate) fn build_identity_custody(
 /// total) and in the under-cap selection, so only the verdict changes.
 /// Fail-closed like `user_process_pids`: an unreadable stat counts.
 /// `proc_root` is `/proc` live, a fixture tree in tests.
+#[cfg(test)]
 pub(crate) fn census_over_cap(pids: &[u32], proc_root: &Path, cap: usize) -> bool {
     // Under the cap on the raw count, no stat read can change the verdict.
     pids.len() > cap && user_process_pids(pids, proc_root).len() > cap
+}
+
+/// [`census_over_cap`] with every stat read admitted first (see
+/// [`user_process_pids_metered`]): under the cap on the raw count it
+/// reads nothing. A refused admission answers over-cap without
+/// further reads, taking the bounded capped path.
+pub(crate) fn census_over_cap_metered(
+    pids: &[u32],
+    proc_root: &Path,
+    cap: usize,
+    budget: &mut CaptureWorkBudget,
+) -> bool {
+    // Under the cap on the raw count, no stat read can change the verdict.
+    if pids.len() <= cap {
+        return false;
+    }
+    let mut refused = false;
+    let users = user_process_pids_metered(pids, proc_root, &mut || {
+        let admitted = budget.admit_resume_syscall();
+        refused = refused || !admitted;
+        admitted
+    });
+    // A refusal keeps the unfiltered remainder (see
+    // `user_process_pids_metered`), which can only push the count up:
+    // recounting the filtered pids alone would undercount. The verdict
+    // counts users only when every pid classified.
+    if refused {
+        return true;
+    }
+    users.len() > cap
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -798,7 +832,7 @@ fn collect_members_identity(
     // then, from its counts.
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
-    let cap_hit = census_over_cap(&pids, Path::new("/proc"), cap);
+    let cap_hit = census_over_cap_metered(&pids, Path::new("/proc"), cap, &mut budget);
     let mut selected: Vec<u32> = if cap_hit {
         progress!(
             "p11scope: sweeping {} process maps (cap {cap})...",
@@ -12687,6 +12721,36 @@ mod census_tests {
             ],
             "(cap, engine, inspect --system, cgroup) over-cap verdicts"
         );
+    }
+
+    /// The metered system census matches the unmetered verdict with
+    /// ample credit and answers over-cap without further reads once an
+    /// admission refuses (the bounded capped path); under the raw cap
+    /// it reads nothing and answers under-cap even when refused.
+    #[test]
+    fn metered_system_census_matches_unmetered_and_answers_over_cap_on_refusal() {
+        // 40 kernel threads + 20 user processes + 1 unreadable = 61
+        // pids, 21 users.
+        let (root, pids) = fixture("metered", 40, 20);
+        for cap in [21usize, 30, 60, 61, 20, 5] {
+            let mut ample = CaptureWorkBudget::default();
+            assert_eq!(
+                census_over_cap_metered(&pids, &root, cap, &mut ample),
+                census_over_cap(&pids, &root, cap),
+                "cap {cap}"
+            );
+        }
+        let mut refused = CaptureWorkBudget::default();
+        refused.set_collection_work(crate::discovery::scan::CollectionWork::new(|_| false));
+        assert!(
+            census_over_cap_metered(&pids, &root, 60, &mut refused),
+            "a refusal answers over-cap"
+        );
+        assert!(
+            !census_over_cap_metered(&pids, &root, 61, &mut refused),
+            "under the raw cap a refusal still answers under-cap"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Kernel threads stay in the "N processes in scope" count: the census

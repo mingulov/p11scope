@@ -831,6 +831,19 @@ impl ResumeCursor {
         self.own_spend.retain(|task, _| live_pids.contains(&task.0));
     }
 
+    /// Every task the tier projection reads a live start-time for:
+    /// examined, fresh, streaked and spend-tracked tasks together, so
+    /// the metered projection reads each distinct pid once.
+    pub(crate) fn tasks_for_tiers(&self) -> BTreeSet<MemberTask> {
+        self.examined
+            .iter()
+            .chain(self.fresh.iter())
+            .chain(self.streaks.keys())
+            .chain(self.own_spend.keys())
+            .copied()
+            .collect()
+    }
+
     /// Projects the tiers to pid sets for selection: recorded tasks
     /// whose live start-time still matches, plus tasks recorded
     /// without a start-time (nothing verifiable, so nothing dropped).
@@ -1063,13 +1076,69 @@ impl ScanPassOwner {
 
     /// Admit one resume-side syscall: a generation probe (a pidfd poll
     /// or one `/proc/<pid>/stat` read), the `/proc/<pid>/exe` readlink,
-    /// an `fstat`/`fstatfs`, one small procfs file read, or one bounded
-    /// chunk (or 64 rows) of a procfs table. Refused once the pass has
-    /// stopped; otherwise charged one unit of shared collection work.
-    /// Every syscall the resume, cursor-key and closing-bracket code
-    /// issues is bought here first (a source guard pins the sites).
+    /// an `fstat`/`fstatfs`/`stat`, one small procfs file read, or one
+    /// bounded chunk (or 64 rows) of a procfs table. Refused once the
+    /// pass has stopped; otherwise charged one unit of shared
+    /// collection work, plus one unit of scan work outside cgroup
+    /// scopes (where no collection work exists to charge). Every
+    /// syscall the resume, cursor-key, closing-bracket, provider-facts,
+    /// census and kernel-thread code issues is bought here first (a
+    /// source guard pins the sites).
     pub(crate) fn admit_resume_syscall(&mut self) -> bool {
-        self.stopped_now().is_none() && self.collection_checkpoint(1)
+        if self.stopped_now().is_some() {
+            return false;
+        }
+        if !self.collection_checkpoint(1) {
+            return false;
+        }
+        self.charge_scan_work(1)
+    }
+
+    /// Charge one scan-work unit for a resume-side syscall outside
+    /// cgroup scopes: the active window's allowance on Inventory, the
+    /// renewing work ceiling on Detailed. Inside a cgroup scope the
+    /// collection checkpoint above already charged the shared
+    /// allowance, so this charges nothing more; on Inventory without
+    /// an active window there is no scan-work ceiling to charge.
+    /// A refusal latches the work-ceiling stop, like [`Self::charge`].
+    fn charge_scan_work(&mut self, units: u64) -> bool {
+        if self.has_collection_work() {
+            return true;
+        }
+        match self.policy {
+            DiscoveryPolicy::Inventory(_) => {
+                let Some(window) = self.active_window.as_mut() else {
+                    return true;
+                };
+                let Some(next) = window.work_units.checked_add(units) else {
+                    self.set_scan_stop(WORK_CEILING_REASON);
+                    return false;
+                };
+                if next > window.limits.work_units {
+                    self.set_scan_stop(WORK_CEILING_REASON);
+                    return false;
+                }
+                window.work_units = next;
+                self.work_units = self.work_units.saturating_add(units);
+                true
+            }
+            DiscoveryPolicy::DetailedLegacy => {
+                if self.work_ceiling == 0 {
+                    self.set_scan_stop(WORK_CEILING_REASON);
+                    return false;
+                }
+                let Some(next) = self.work_units.checked_add(units) else {
+                    self.set_scan_stop(WORK_CEILING_REASON);
+                    return false;
+                };
+                if next > self.work_ceiling {
+                    self.set_scan_stop(WORK_CEILING_REASON);
+                    return false;
+                }
+                self.work_units = next;
+                true
+            }
+        }
     }
 
     /// Test-only: process-liveness probes performed for decode-cursor
@@ -1706,6 +1775,32 @@ impl ScanPassOwner {
 
     pub(crate) fn cursor(&self) -> &ResumeCursor {
         &self.cursor
+    }
+
+    /// [`ResumeCursor::tiers_for_selection`] with every live
+    /// start-time read through the metered row reader (one admitted
+    /// open with its close plus one read per distinct task pid). A
+    /// refused or unreadable start time sorts its task as not live
+    /// (never-attempted, so it scans first and never stalls).
+    pub(crate) fn tiers_for_selection_metered(&mut self) -> MemberTiers {
+        let tasks: BTreeSet<u32> = self
+            .cursor
+            .tasks_for_tiers()
+            .into_iter()
+            .map(|task| task.0)
+            .collect();
+        let mut live: BTreeMap<u32, Option<u64>> = BTreeMap::new();
+        for pid in tasks {
+            let start = match crate::process::metered_start_time(pid, &mut || {
+                self.admit_resume_syscall()
+            }) {
+                Some(Ok(start)) => Some(start),
+                Some(Err(_)) | None => None,
+            };
+            live.insert(pid, start);
+        }
+        self.cursor
+            .tiers_for_selection(|pid| live.get(&pid).copied().flatten())
     }
 
     pub(crate) fn cursor_mut(&mut self) -> &mut ResumeCursor {
@@ -3233,6 +3328,99 @@ mod tests {
                 .own_spend_for_test()
                 .contains_key(&(10, Some(100))),
             "the old incarnation's spend never transfers"
+        );
+    }
+
+    /// Resume-side syscalls charge the scan-work ceiling outside
+    /// cgroup scopes: a Detailed pass admits up to its ceiling, an
+    /// Inventory window up to its work limit, and a cgroup scope
+    /// charges its collection work only (no double charge).
+    #[test]
+    fn admit_resume_syscall_charges_scan_work_outside_cgroup_scopes() {
+        // Detailed: 5 units admit, the 6th trips the ceiling.
+        let mut pass = detailed(5, 1024);
+        for index in 0..5 {
+            assert!(pass.admit_resume_syscall(), "unit {index} admits");
+        }
+        assert!(!pass.admit_resume_syscall(), "the ceiling refuses");
+        assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
+        assert_eq!(pass.work_units(), 5);
+
+        // A zero cap admits nothing.
+        let mut pass = detailed(0, 1024);
+        assert!(!pass.admit_resume_syscall());
+        assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
+
+        // Inventory window: admits up to the window work limit.
+        // The window deadline sits past any live clock reading, so
+        // the admit path's stop check never trips on time.
+        let mut pass = ScanPassOwner::inventory(inventory_limits());
+        let window = pass
+            .begin_window_with_limits(WindowId::new(1), window_limits(), u64::MAX)
+            .unwrap();
+        let scan = pass.checkpoint(window.clone()).unwrap();
+        for _ in 0..100 {
+            assert!(pass.admit_resume_syscall());
+        }
+        assert!(!pass.admit_resume_syscall());
+        assert_eq!(pass.stopped_reason(), Some(WORK_CEILING_REASON));
+        pass.finish_scan(scan).unwrap();
+        pass.finish_window(window).unwrap();
+
+        // Inventory without a window: no ceiling to charge.
+        let mut pass = ScanPassOwner::inventory(inventory_limits());
+        assert!(pass.admit_resume_syscall());
+        assert_eq!(pass.stopped_reason(), None);
+
+        // Cgroup scope: the collection work governs, and the
+        // scan-work tallies stay untouched (no double charge).
+        let mut pass = detailed(5, 1024);
+        pass.set_collection_work(CollectionWork::new(|_| true));
+        for _ in 0..10 {
+            assert!(pass.admit_resume_syscall());
+        }
+        assert_eq!(pass.work_units(), 0);
+        assert_eq!(pass.stopped_reason(), None);
+    }
+
+    /// The metered tier projection reads each distinct task pid once
+    /// through the metered row reader: with ample credit it matches
+    /// the unmetered projection, and a refused admission sorts every
+    /// task as never-attempted (empty tiers: scans first, never
+    /// stalled).
+    #[test]
+    fn tiers_for_selection_metered_matches_unmetered_and_empties_on_refusal() {
+        let live_pid = std::process::id();
+        let live_start = crate::process::process_start_time(live_pid).unwrap();
+        let mut pass = detailed(u64::MAX, u64::MAX);
+        pass.cursor_mut().note_member_outcomes(&[
+            ((live_pid, Some(live_start)), MemberOutcome::Examined, 10),
+            ((u32::MAX - 1, Some(13)), MemberOutcome::CutShortOther, 20),
+        ]);
+        let plain = pass
+            .cursor()
+            .tiers_for_selection(|pid| crate::process::process_start_time(pid).ok());
+        let metered = pass.tiers_for_selection_metered();
+        assert_eq!(metered, plain, "ample credit matches the unmetered tiers");
+        assert!(
+            metered.examined.contains(&live_pid),
+            "the live task keeps its tier"
+        );
+
+        // A refused admission sorts every task as never-attempted.
+        let mut refused = detailed(0, 1024);
+        refused.cursor_mut().note_member_outcomes(&[(
+            (live_pid, Some(live_start)),
+            MemberOutcome::Examined,
+            10,
+        )]);
+        let tiers = refused.tiers_for_selection_metered();
+        assert!(
+            tiers.examined.is_empty()
+                && tiers.retry.is_empty()
+                && tiers.demoted.is_empty()
+                && tiers.spend.is_empty(),
+            "a refusal empties every tier: {tiers:?}"
         );
     }
 }

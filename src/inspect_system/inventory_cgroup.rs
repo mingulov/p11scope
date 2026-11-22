@@ -1071,7 +1071,16 @@ pub(crate) fn collect_with(
     let cap_hit = charged_census_over_cap(
         &pids,
         cap,
-        &mut |pid| crate::discovery::engine::pid_is_user_process(Path::new("/proc"), pid),
+        &mut |pid| {
+            // Admitted by the wrapper's charge above: the metered read
+            // issues its owned open/read/prepaid-close without
+            // re-charging the shared allowance. An unproven pid counts,
+            // like the unmetered read it replaces.
+            !matches!(
+                crate::process::metered_pid_class(pid, &mut || true),
+                Some(crate::process::PidClass::KernelThread)
+            )
+        },
         &mut || work.charge(1),
     );
     let mut timings = StageTimings::new();
@@ -1104,7 +1113,15 @@ pub(crate) fn collect_with(
             &sweep_unavailable,
             cap,
             &mut budget,
-            &mut |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")),
+            &mut |pid| {
+                // Admitted by the wrapper's charge above (see the
+                // census closure): an unreadable stat stays eligible.
+                match crate::process::metered_stat_text(pid, &mut || true) {
+                    Some(Ok(text)) => Ok(text),
+                    Some(Err(error)) => Err(error),
+                    None => Err(std::io::Error::other("collection work spent")),
+                }
+            },
             &mut || work.charge(1),
         );
     }

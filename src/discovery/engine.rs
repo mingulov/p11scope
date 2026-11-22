@@ -8571,6 +8571,7 @@ fn scan_pins_waited_only_for_budget(skips: &[Skipped]) -> bool {
 /// unavailable pid all stay eligible. Selection reads a snapshot: a pid
 /// recycled between the sweep and the stat read is handled no worse than
 /// today's deep-scan classification of a changed generation.
+#[cfg(test)]
 pub(crate) fn kernel_thread_exclusions(
     sweep: &SweepSnapshots,
     unavailable: &BTreeSet<u32>,
@@ -8605,6 +8606,33 @@ pub(crate) fn kernel_thread_exclusions_with(
     excluded
 }
 
+/// [`kernel_thread_exclusions`] with every stat read admitted first
+/// (see [`process::metered_pid_class_at`]): only a proven
+/// `KernelThread` is excluded. An unproven pid stays eligible, and a
+/// refused admission reads no further stat, leaving every unread
+/// candidate eligible.
+pub(crate) fn kernel_thread_exclusions_metered(
+    sweep: &SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    proc_root: &Path,
+    admit: &mut dyn FnMut() -> bool,
+) -> BTreeSet<u32> {
+    let mut excluded = BTreeSet::new();
+    for (pid, entries) in sweep {
+        if !entries.is_empty() || unavailable.contains(pid) {
+            continue;
+        }
+        match process::metered_pid_class_at(proc_root, *pid, admit) {
+            Some(process::PidClass::KernelThread) => {
+                excluded.insert(*pid);
+            }
+            Some(_) => {}
+            None => return excluded,
+        }
+    }
+    excluded
+}
+
 /// The user processes among `pids`: everything without the `PF_KTHREAD`
 /// flag in `{proc_root}/<pid>/stat`. Kernel threads have no user address
 /// space and can never call a provider, so the capture-discovery
@@ -8612,6 +8640,7 @@ pub(crate) fn kernel_thread_exclusions_with(
 /// triggers over-cap on the unfiltered pid count; see its own path).
 /// Fail-closed: an unreadable or unparsable stat keeps the pid.
 /// `proc_root` is `/proc` live, a fixture tree in tests.
+#[cfg(test)]
 pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
     pids.iter()
         .copied()
@@ -8619,10 +8648,34 @@ pub(crate) fn user_process_pids(pids: &[u32], proc_root: &Path) -> Vec<u32> {
         .collect()
 }
 
+/// [`user_process_pids`] with every stat read admitted first (see
+/// [`process::metered_pid_class_at`]): one admitted open with its
+/// close plus one read per pid. An unproven pid stays eligible, like
+/// above. A refused admission keeps the current and every remaining
+/// pid unfiltered and reads no further stat.
+pub(crate) fn user_process_pids_metered(
+    pids: &[u32],
+    proc_root: &Path,
+    admit: &mut dyn FnMut() -> bool,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(pids.len());
+    for (index, pid) in pids.iter().copied().enumerate() {
+        match process::metered_pid_class_at(proc_root, pid, admit) {
+            Some(process::PidClass::KernelThread) => {}
+            Some(_) => out.push(pid),
+            None => {
+                out.extend_from_slice(&pids[index..]);
+                return out;
+            }
+        }
+    }
+    out
+}
+
 /// One cached pid classification (§8.2): the `/proc/<pid>` directory
 /// identity the class was read under, and whether the pid is a user
 /// process. The identity is the (inode, mtime) pair from a single
-/// `metadata()` call: procfs destroys and recreates the directory on
+/// admitted `stat`: procfs destroys and recreates the directory on
 /// reuse, so a reused pid always gets a fresh inode, while the mtime
 /// alone cannot confirm the generation — it is coarse (tick
 /// granularity) and set when the inode is created on lookup, not at
@@ -8637,6 +8690,18 @@ struct PidClassCacheEntry {
     is_user: bool,
 }
 
+/// The `(inode, mtime)` guard pair of one metered directory `stat`
+/// (see [`PidClassCacheEntry`]): `None` when the mtime predates the
+/// epoch, which never happens on procfs.
+fn cached_guard_pair(stat: &libc::stat) -> Option<(u64, std::time::SystemTime)> {
+    use std::time::{Duration, UNIX_EPOCH};
+    let mtime = UNIX_EPOCH.checked_add(Duration::new(
+        u64::try_from(stat.st_mtime).ok()?,
+        u32::try_from(stat.st_mtime_nsec).unwrap_or(0),
+    ))?;
+    Some((stat.st_ino, mtime))
+}
+
 impl Engine {
     /// The user processes among `pids`, with classifications cached
     /// across refreshes (§8.2): a pid whose `/proc/<pid>` directory
@@ -8644,8 +8709,8 @@ impl Engine {
     /// reuses it without re-reading its stat file; a changed or
     /// unreadable pair re-reads and re-classifies from the fresh
     /// stat exactly like [`user_process_pids`], never keeping the
-    /// cached class. Both halves come from the same `metadata()`
-    /// call, so the pair is one atomic identity. The fresh read is
+    /// cached class. Both halves come from the same admitted `stat`,
+    /// so the pair is one atomic identity. The fresh read is
     /// correct either way: `PF_KTHREAD` is immutable per task
     /// generation, and neither the coarse directory mtime nor the
     /// stat start time (10 ms jiffies) can tell same-tick or
@@ -8656,15 +8721,21 @@ impl Engine {
     /// cache never outgrows the live scope.
     pub(crate) fn cached_user_process_pids(&mut self, pids: &[u32]) -> Vec<u32> {
         let mut out = Vec::with_capacity(pids.len());
-        let mut dir = self.proc_root.clone();
         for pid in pids {
-            dir.push(pid.to_string());
-            let guard = std::fs::metadata(&dir).ok().and_then(|metadata| {
-                metadata
-                    .modified()
-                    .ok()
-                    .map(|mtime| (metadata.ino(), mtime))
-            });
+            let dir = self.proc_root.join(pid.to_string());
+            // One admitted `stat` reads the guard pair (see
+            // `process::metered_io::stat_path`). A refusal keeps the
+            // pid eligible without touching the cache or the counters.
+            let guard = match process::metered_io::stat_path(&dir, &mut || {
+                self.budget.admit_resume_syscall()
+            }) {
+                Some(Ok(stat)) => cached_guard_pair(&stat),
+                Some(Err(_)) => None,
+                None => {
+                    out.push(*pid);
+                    continue;
+                }
+            };
             let cached_class = match (&guard, self.pid_class_cache.get(pid)) {
                 (Some((ino, mtime)), Some(entry))
                     if entry.dir_ino == *ino && entry.dir_mtime == *mtime =>
@@ -8678,7 +8749,6 @@ impl Engine {
                 if is_user {
                     out.push(*pid);
                 }
-                dir.pop();
                 continue;
             }
             self.pid_cache_misses = self.pid_cache_misses.saturating_add(1);
@@ -8689,17 +8759,18 @@ impl Engine {
             // start time can prove otherwise (same-tick reuse shares
             // the mtime, same-jiffy reuse the start time), so keeping
             // the cached class would pin a stale verdict for the new
-            // generation's lifetime.
-            dir.push("stat");
-            match std::fs::read_to_string(&dir) {
-                Ok(text) => {
-                    let flags = process::stat_flags_from_stat_text(&text);
-                    let is_user = !flags.is_some_and(|flags| flags & process::PF_KTHREAD != 0);
-                    // Cache only parsed classes: an unparsable stat
-                    // stays eligible but uncached, like an unreadable
-                    // one, and is re-read on the next refresh.
-                    if let Some((ino, mtime)) = guard
-                        && flags.is_some()
+            // generation's lifetime. A refusal keeps the pid eligible
+            // without touching the cache.
+            match process::metered_pid_class_at(&self.proc_root, *pid, &mut || {
+                self.budget.admit_resume_syscall()
+            }) {
+                Some(class) => {
+                    let is_user = !matches!(class, process::PidClass::KernelThread);
+                    // Cache only parsed classes: an unproven pid stays
+                    // eligible but uncached, like an unreadable one,
+                    // and is re-read on the next refresh.
+                    if let (Some((ino, mtime)), false) =
+                        (guard, matches!(class, process::PidClass::Unknown))
                     {
                         self.pid_class_cache.insert(
                             *pid,
@@ -8714,14 +8785,10 @@ impl Engine {
                         out.push(*pid);
                     }
                 }
-                Err(_) => {
-                    // Fail-closed and uncached: an unreadable stat stays
-                    // eligible and is re-read on the next refresh.
+                None => {
                     out.push(*pid);
                 }
             }
-            dir.pop();
-            dir.pop();
         }
         let live: BTreeSet<u32> = pids.iter().copied().collect();
         self.pid_class_cache.retain(|pid, _| live.contains(pid));
@@ -8758,6 +8825,7 @@ impl Engine {
 /// unparsable stat. Single-pid form so the owned-tree watch can classify
 /// lazily and stop once its rotation room fills, instead of reading every
 /// unseen pid's stat to admit zero when full.
+#[cfg(test)]
 pub(crate) fn pid_is_user_process(proc_root: &Path, pid: u32) -> bool {
     !std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")).is_ok_and(|text| {
         process::stat_flags_from_stat_text(&text)
@@ -8829,10 +8897,27 @@ fn owned_watch_rescan_delay_ns(unproductive: u32) -> u64 {
 /// One watched member's executable identity: the `/proc/<pid>/exe`
 /// target's (`st_dev`, `st_ino`), or `None` when unreadable. Identity
 /// only, compared with itself across scans; never published.
+#[cfg(test)]
 fn owned_watch_member_image(proc_root: &Path, pid: u32) -> Option<(u64, u64)> {
     std::fs::metadata(proc_root.join(pid.to_string()).join("exe"))
         .ok()
         .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// [`owned_watch_member_image`] with its `stat` admitted first (see
+/// [`process::metered_io::stat_path`]): `None` is a refusal, distinct
+/// from `Some(None)` (an unreadable image). Callers keep the carried
+/// image on either.
+fn owned_watch_member_image_metered(
+    proc_root: &Path,
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Option<(u64, u64)>> {
+    let exe = proc_root.join(pid.to_string()).join("exe");
+    match process::metered_io::stat_path(&exe, admit)? {
+        Ok(stat) => Some(Some((stat.st_dev, stat.st_ino))),
+        Err(_) => Some(None),
+    }
 }
 
 /// True when `pid` is provably a kernel thread with no user address
@@ -8844,6 +8929,7 @@ fn owned_watch_member_image(proc_root: &Path, pid: u32) -> Option<(u64, u64)> {
 /// the same cause. Fail-closed: any unreadable or unparsable input —
 /// a reaped pid, a refused maps read, a malformed stat — answers
 /// false and the caller keeps counting.
+#[cfg(test)]
 pub(crate) fn pid_is_kernel_thread(proc_root: &Path, pid: u32) -> bool {
     let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"));
     let flagged = stat.is_ok_and(|text| {
@@ -8858,6 +8944,7 @@ pub(crate) fn pid_is_kernel_thread(proc_root: &Path, pid: u32) -> bool {
 
 /// True when `{proc_root}/<pid>/maps` reads zero bytes: no user
 /// mappings. Fail-closed (false) on any open or read error.
+#[cfg(test)]
 fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
     let mut file = match std::fs::File::open(proc_root.join(pid.to_string()).join("maps")) {
         Ok(file) => file,
@@ -8865,6 +8952,32 @@ fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
     };
     let mut byte = [0u8; 1];
     matches!(std::io::Read::read(&mut file, &mut byte), Ok(0))
+}
+
+/// [`pid_is_kernel_thread`] with every read admitted first: the stat
+/// flag (see [`process::metered_pid_class_at`]), then one admitted
+/// byte of the maps (see [`process::metered_io::read_first_byte`])
+/// when the flag is set. `None` is a refused admission. `Some(false)`
+/// keeps the caller counting, like the unproven pid above.
+pub(crate) fn pid_is_kernel_thread_metered(
+    proc_root: &Path,
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<bool> {
+    if !matches!(
+        process::metered_pid_class_at(proc_root, pid, admit)?,
+        process::PidClass::KernelThread
+    ) {
+        return Some(false);
+    }
+    let maps = proc_root.join(pid.to_string()).join("maps");
+    let Some(maps) = maps.to_str() else {
+        return Some(false);
+    };
+    match process::metered_io::read_first_byte(maps, admit)? {
+        Ok(first) => Some(first.is_none()),
+        Err(_) => Some(false),
+    }
 }
 
 /// True when `pid` may arrive as a newcomer this tick: its task is provably
@@ -8891,14 +9004,30 @@ fn maps_is_empty(proc_root: &Path, pid: u32) -> bool {
 /// count, open or closed; the tick reads the incrementally kept map
 /// instead of rebuilding the set from every admission on record.
 /// `proc_root` is `/proc` live, a fixture tree in tests.
-pub(crate) fn newcomer_arrival_possible(
+///
+/// [`newcomer_arrival_possible`] with its stat read admitted first
+/// (see [`process::metered_stat_text_at`]): `None` is a refused
+/// admission, and the caller marks nothing on it.
+pub(crate) fn newcomer_arrival_possible_metered(
     proc_root: &Path,
     pid: u32,
     admitted_pid_counts: &BTreeMap<u32, usize>,
-) -> bool {
-    let Ok(stat) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) else {
-        return !admitted_pid_counts.contains_key(&pid);
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<bool> {
+    let stat = match process::metered_stat_text_at(proc_root, pid, admit)? {
+        Ok(stat) => stat,
+        Err(_) => return Some(!admitted_pid_counts.contains_key(&pid)),
     };
+    Some(newcomer_arrival_from_stat(&stat, pid, admitted_pid_counts))
+}
+
+/// The newcomer verdict for one stat row, shared by the metered
+/// reader and its twins so their classifications cannot drift.
+fn newcomer_arrival_from_stat(
+    stat: &str,
+    pid: u32,
+    admitted_pid_counts: &BTreeMap<u32, usize>,
+) -> bool {
     let Some(end) = stat.rfind(')') else {
         return !admitted_pid_counts.contains_key(&pid);
     };
@@ -8934,7 +9063,9 @@ pub(crate) fn select_excluding_kernel_threads(
     budget: &mut CaptureWorkBudget,
     tiers: &crate::discovery::scan_pass::MemberTiers,
 ) -> Vec<u32> {
-    let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
+    let excluded = kernel_thread_exclusions_metered(sweep, unavailable, proc_root, &mut || {
+        budget.admit_resume_syscall()
+    });
     select_excluding_given(sweep, &excluded, cap, budget, tiers)
 }
 
@@ -9486,7 +9617,9 @@ fn discover_plan(
     let pids = if named {
         pids
     } else {
-        user_process_pids(&pids, Path::new("/proc"))
+        user_process_pids_metered(&pids, Path::new("/proc"), &mut || {
+            discovered.budget.admit_resume_syscall()
+        })
     };
     // Two-phase scan: phase 1 sweeps every in-scope pid's maps, phase 2
     // deep-scans the selected candidates only. Under the cap selection
@@ -9495,11 +9628,7 @@ fn discover_plan(
     // Over the cap the sweep is kept for the counted gap below: user
     // processes only (kernel threads excluded), with same-shape sharing
     // counted from the retained views after the scans.
-    let tiers = discovered
-        .budget
-        .pass_owner_ref()
-        .cursor()
-        .tiers_for_selection(|pid| crate::process::process_start_time(pid).ok());
+    let tiers = discovered.budget.tiers_for_selection_metered();
     let (selected, over_cap_sweep): (Vec<u32>, Option<(SweepSnapshots, BTreeSet<u32>)>) =
         if pids.len() > max_scan_pids {
             let sweep_start = crate::attach::monotonic_ns();
@@ -9532,7 +9661,12 @@ fn discover_plan(
             );
             // Recomputed for counts only (no double budget note): the
             // selection above already counted these on the budget.
-            let excluded = kernel_thread_exclusions(&sweep, &sweep_unavailable, Path::new("/proc"));
+            let excluded = kernel_thread_exclusions_metered(
+                &sweep,
+                &sweep_unavailable,
+                Path::new("/proc"),
+                &mut || discovered.budget.admit_resume_syscall(),
+            );
             let context = Some((sweep, excluded));
             (selected, context)
         } else {
@@ -9890,8 +10024,14 @@ fn discover_plan(
                 discovered.base_counters.noise.merge(&counters.noise);
                 // A zombie is an exited generation even when the pin fell
                 // back to /proc identity: silent like a reaped exit
-                // instead of an unreadable-member skip.
-                let gone = process::scan_failure_gone(view.original_exited() == Ok(true), *pid);
+                // instead of an unreadable-member skip. A refused
+                // admission keeps the loud skip.
+                let gone = process::metered_scan_failure_gone(
+                    view.original_exited() == Ok(true),
+                    *pid,
+                    &mut || discovered.budget.admit_resume_syscall(),
+                )
+                .unwrap_or(false);
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
                     gone,
@@ -15653,7 +15793,12 @@ impl Engine {
             if self.known_kernel_threads.len() >= MAX_SCAN_PIDS {
                 break;
             }
-            if pid_is_kernel_thread(&self.proc_root, *pid) {
+            // A refused admission seeds nothing: the ledger keeps
+            // whatever earlier pids proved.
+            let proven = pid_is_kernel_thread_metered(&self.proc_root, *pid, &mut || {
+                self.budget.admit_resume_syscall()
+            });
+            if proven == Some(true) {
                 self.known_kernel_threads.insert(*pid, 0);
             }
         }
@@ -17576,14 +17721,22 @@ impl Engine {
     /// Fail-closed: past the bound new marks drop, and a kthread with
     /// no known generation bound earns no live proof.
     fn classify_newly_listed_pid(&mut self, pid: u32, proof_lower: Option<u64>) {
-        if pid_is_kernel_thread(&self.proc_root, pid) {
-            if let Some(lower) = proof_lower
-                && self.known_kernel_threads.len() < MAX_SCAN_PIDS
-            {
-                self.known_kernel_threads.insert(pid, lower);
+        // A refused admission keeps the ledger: it neither proves a
+        // kernel thread nor clears a possibly reused mark.
+        match pid_is_kernel_thread_metered(&self.proc_root, pid, &mut || {
+            self.budget.admit_resume_syscall()
+        }) {
+            Some(true) => {
+                if let Some(lower) = proof_lower
+                    && self.known_kernel_threads.len() < MAX_SCAN_PIDS
+                {
+                    self.known_kernel_threads.insert(pid, lower);
+                }
             }
-        } else {
-            self.known_kernel_threads.remove(&pid);
+            Some(false) => {
+                self.known_kernel_threads.remove(&pid);
+            }
+            None => {}
         }
     }
 
@@ -22846,9 +22999,20 @@ impl Engine {
             // members keep their original first-seen time (true rejoins are
             // unaffected: `retain` above pruned their seen entry on leave,
             // so they still get a fresh clock).
+            // A refused admission issues no native call and selects
+            // the pid unclassified: the capture budget refuses its
+            // scan below, so the member stays in rotation backed off
+            // instead of dropping as departed.
             let selected = select_user_pids_lazily(
                 &unseen,
-                |pid| pid_is_user_process(&self.proc_root, pid),
+                |pid| {
+                    !matches!(
+                        process::metered_pid_class_at(&self.proc_root, pid, &mut || {
+                            self.budget.admit_resume_syscall()
+                        }),
+                        Some(process::PidClass::KernelThread)
+                    )
+                },
                 room,
             );
             for pid in selected {
@@ -22899,7 +23063,12 @@ impl Engine {
                     && entry.next_eligible_ns > now_ns
                     && entry.image.is_some()
                 {
-                    let image = owned_watch_member_image(&self.proc_root, pid);
+                    // A refused admission keeps the backoff: the image
+                    // check simply does not run this round.
+                    let image = owned_watch_member_image_metered(&self.proc_root, pid, &mut || {
+                        self.budget.admit_resume_syscall()
+                    })
+                    .flatten();
                     if image.is_some() && image != entry.image {
                         entry.unproductive = 0;
                         entry.next_eligible_ns = 0;
@@ -22956,7 +23125,12 @@ impl Engine {
     /// transient views retain nothing, and the frames' own scans mark
     /// what they retain.
     fn scan_owned_watch_member(&mut self, pid: u32, now_ns: u64) {
-        let image = owned_watch_member_image(&self.proc_root, pid);
+        // A refused admission keeps the carried image: the `is_some`
+        // guards below skip every update on `None`.
+        let image = owned_watch_member_image_metered(&self.proc_root, pid, &mut || {
+            self.budget.admit_resume_syscall()
+        })
+        .flatten();
         let Some(entry) = self.owned_watch_unproven.get_mut(&pid) else {
             return;
         };
@@ -23015,8 +23189,13 @@ impl Engine {
         // it: an exit drops it, an exec (new image) or other generation
         // change rescans promptly. Neither counts as unproductive.
         let exited = view.original_exited().unwrap_or(false);
-        let image_changed =
-            image.is_some() && owned_watch_member_image(&self.proc_root, pid) != image;
+        // A refused re-read keeps the pre-scan image verdict: no
+        // restart on a refusal. An unreadable re-read still restarts,
+        // exactly like the unmetered read it replaces.
+        let fresh = owned_watch_member_image_metered(&self.proc_root, pid, &mut || {
+            self.budget.admit_resume_syscall()
+        });
+        let image_changed = image.is_some() && fresh.is_some_and(|fresh| fresh != image);
         let (modules, mut pins, _complete) = match scan_result {
             Ok(scan) => scan,
             Err(_) => {
@@ -30937,11 +31116,14 @@ impl Engine {
                     let pid = self.views[position].pid();
                     // A zombie is an exited generation even when the pin fell
                     // back to /proc identity: silent like a reaped exit
-                    // instead of an unreadable-member skip.
-                    let gone = process::scan_failure_gone(
+                    // instead of an unreadable-member skip. A refused
+                    // admission keeps the loud skip.
+                    let gone = process::metered_scan_failure_gone(
                         self.views[position].original_exited() == Ok(true),
                         pid,
-                    );
+                        &mut || self.budget.admit_resume_syscall(),
+                    )
+                    .unwrap_or(false);
                     failed_pids.insert(pid);
                     let detail = format!("{failure}: {error:#}");
                     skipped.extend(unreadable_member_skip(
@@ -32701,8 +32883,14 @@ impl Engine {
                     failed_refresh_pids.insert(pid);
                     // A zombie is an exited generation even when the pin fell
                     // back to /proc identity: silent like a reaped exit
-                    // instead of an unreadable-member skip.
-                    let gone = process::scan_failure_gone(view.original_exited() == Ok(true), pid);
+                    // instead of an unreadable-member skip. A refused
+                    // admission keeps the loud skip.
+                    let gone = process::metered_scan_failure_gone(
+                        view.original_exited() == Ok(true),
+                        pid,
+                        &mut || self.budget.admit_resume_syscall(),
+                    )
+                    .unwrap_or(false);
                     skipped.extend(unreadable_member_skip(
                         pid,
                         gone,
@@ -33153,12 +33341,25 @@ impl Engine {
         // never a newcomer (see newcomer_arrival_possible). Closed
         // admissions stay on record after their views settle, so a readdir
         // race relisting a just-reaped pid cannot re-mark it.
-        let new_pids: Vec<_> = desired
+        let unheld: Vec<_> = desired
             .difference(&known_pids)
             .copied()
             .filter(|pid| !self.held_back_waiting(*pid))
+            .collect();
+        let new_pids: Vec<_> = unheld
+            .into_iter()
             .filter(|pid| {
-                newcomer_arrival_possible(&self.proc_root, *pid, &self.admitted_cgroup_pid_counts)
+                // A refused admission classifies like an unreadable
+                // stat: an untracked pid may still arrive (its queued
+                // request survives), while a tracked one is the same
+                // dying generation, never a newcomer.
+                newcomer_arrival_possible_metered(
+                    &self.proc_root,
+                    *pid,
+                    &self.admitted_cgroup_pid_counts,
+                    &mut || self.budget.admit_resume_syscall(),
+                )
+                .unwrap_or_else(|| !self.admitted_cgroup_pid_counts.contains_key(pid))
             })
             .collect();
         self.stage_timings.span(

@@ -50164,6 +50164,14 @@ fn e07_engine() -> Engine {
         per_object_bytes: u64::MAX,
         total_bytes: u64::MAX,
     });
+    // The rescan scans this (instrumented, huge) test binary: its
+    // honestly admitted syscalls need headroom above the fixed 16M
+    // ceiling. The twins pin rescan application and retention, not
+    // the ceiling value.
+    engine
+        .budget
+        .pass_owner()
+        .set_work_ceiling_for_test(64 * 1024 * 1024);
     engine
 }
 
@@ -94269,5 +94277,219 @@ fn admission_owner1_snapshot_binds_no_refused_module() {
             "[{leg}] only the proving view binds: {bound_views:?}"
         );
         assert!(!pins.rejects(raw.key), "[{leg}] the key stays admitted");
+    }
+}
+
+/// The metered census filter matches the unmetered one with ample
+/// credit (only a proven kernel thread drops), keeps unproven pids
+/// eligible, and keeps every remaining pid unfiltered once an
+/// admission refuses, reading no further stat.
+#[test]
+fn metered_census_filter_matches_unmetered_and_keeps_on_refusal() {
+    fn stat_line(pid: u32, comm: &str, flags: u32) -> String {
+        format!("{pid} ({comm}) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for (pid, flags) in [
+        (101u32, 0u32),
+        (102, crate::process::PF_KTHREAD),
+        (103, 0u32),
+    ] {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("stat"), stat_line(pid, "p", flags)).unwrap();
+    }
+    // An unparsable stat and an absent pid stay eligible.
+    let malformed = proc_root.join("104");
+    std::fs::create_dir_all(&malformed).unwrap();
+    std::fs::write(malformed.join("stat"), "malformed").unwrap();
+    let pids = vec![101, 102, 103, 104, 105];
+    let expected = user_process_pids(&pids, proc_root);
+    assert_eq!(expected, vec![101, 103, 104, 105]);
+    let metered = user_process_pids_metered(&pids, proc_root, &mut || true);
+    assert_eq!(
+        metered, expected,
+        "ample credit matches the unmetered filter"
+    );
+    // A refusal keeps the current and every remaining pid unfiltered:
+    // with zero credit nothing classifies, so everything stays.
+    let refused = user_process_pids_metered(&pids, proc_root, &mut || false);
+    assert_eq!(refused, pids, "a refusal keeps every pid unfiltered");
+    // A partial refusal stops mid-census: one stat costs three units
+    // (open, close, read), so three credits classify pid 101 (kept)
+    // and refuse pid 102, keeping 102..=105 unfiltered.
+    let mut admitted = 0u64;
+    let partial = user_process_pids_metered(&pids, proc_root, &mut || {
+        if admitted == 3 {
+            return false;
+        }
+        admitted += 1;
+        true
+    });
+    assert_eq!(partial, vec![101, 102, 103, 104, 105]);
+}
+
+/// The metered kernel-thread proofs match the unmetered ones with
+/// ample credit and keep the caller counting on any refusal: only
+/// the flag plus empty maps proves a thread, and only proven threads
+/// leave the selection.
+#[test]
+fn metered_kernel_thread_proofs_match_unmetered_and_keep_on_refusal() {
+    fn stat(pid: u32, flags: u32) -> String {
+        format!("{pid} (p) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for (pid, flags) in [
+        (10u32, crate::process::PF_KTHREAD),
+        (11, 0u32),
+        (12, crate::process::PF_KTHREAD),
+    ] {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("stat"), stat(pid, flags)).unwrap();
+    }
+    std::fs::write(proc_root.join("10").join("maps"), "").unwrap();
+    std::fs::write(proc_root.join("11").join("maps"), "").unwrap();
+    std::fs::write(
+        proc_root.join("12").join("maps"),
+        "00400000-00401000 r-xp 00000000 08:01 7\n",
+    )
+    .unwrap();
+    // Single-pid proof: only the flag plus empty maps proves.
+    assert_eq!(
+        pid_is_kernel_thread_metered(proc_root, 10, &mut || true),
+        Some(true)
+    );
+    for pid in [11, 12, 13] {
+        assert_eq!(
+            pid_is_kernel_thread_metered(proc_root, pid, &mut || true),
+            Some(false),
+            "pid {pid} stays countable"
+        );
+        assert_eq!(
+            pid_is_kernel_thread_metered(proc_root, pid, &mut || false),
+            None,
+            "pid {pid}: a refusal proves nothing"
+        );
+    }
+    // Sweep exclusions: the empty, available, flagged snapshot drops.
+    let sweep: SweepSnapshots = vec![
+        (10, Vec::new()),
+        (11, Vec::new()),
+        (
+            12,
+            parse_maps(b"00400000-00401000 r-xp 00000000 08:01 7\n").unwrap(),
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let excluded =
+        kernel_thread_exclusions_metered(&sweep, &BTreeSet::new(), proc_root, &mut || true);
+    assert_eq!(excluded, BTreeSet::from([10]));
+    let refused =
+        kernel_thread_exclusions_metered(&sweep, &BTreeSet::new(), proc_root, &mut || false);
+    assert!(
+        refused.is_empty(),
+        "a refusal excludes nothing: {refused:?}"
+    );
+}
+
+/// The cached census classifier keeps its hit behavior with ample
+/// credit and keeps every pid eligible without touching the cache or
+/// the counters once an admission refuses.
+#[test]
+fn cached_classifier_keeps_eligible_and_caches_nothing_on_refusal() {
+    fn stat(pid: u32, flags: u32) -> String {
+        format!("{pid} (p) S 0 0 0 0 -1 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 0 0")
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    for (pid, flags) in [(101u32, 0u32), (102, crate::process::PF_KTHREAD)] {
+        let pid_dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::fs::write(pid_dir.join("stat"), stat(pid, flags)).unwrap();
+    }
+    let mut engine = system_generation_engine();
+    engine.proc_root = proc_root.to_path_buf();
+    // Ample: the user pid stays, the thread drops, both cache.
+    assert_eq!(engine.cached_user_process_pids(&[101, 102]), vec![101]);
+    assert_eq!(engine.pid_class_cache_len_for_test(), 2);
+    // A repeat hits the cache for both.
+    assert_eq!(engine.cached_user_process_pids(&[101, 102]), vec![101]);
+    assert_eq!(engine.pid_cache_stats_for_test(), (2, 2));
+    // A refused pass keeps every pid eligible without touching the
+    // cache or the counters.
+    engine
+        .budget
+        .set_collection_work(crate::discovery::scan::CollectionWork::new(|_| false));
+    assert_eq!(
+        engine.cached_user_process_pids(&[101, 102, 103]),
+        vec![101, 102, 103]
+    );
+    assert_eq!(
+        engine.pid_class_cache_len_for_test(),
+        2,
+        "a refusal caches nothing new"
+    );
+    assert_eq!(
+        engine.pid_cache_stats_for_test(),
+        (2, 2),
+        "a refusal counts neither a hit nor a miss"
+    );
+}
+
+/// The metered newcomer classifier matches the shared verdict with
+/// ample credit: a running pid may arrive, a whole-group zombie may
+/// not, and an unreadable pid follows the admitted map. A refusal
+/// proves nothing (`None`); the live filter classifies it like an
+/// unreadable stat so queued requests survive stopped ticks.
+#[test]
+fn metered_newcomer_classifier_matches_shared_verdict_and_proves_nothing_on_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let proc_root = dir.path();
+    // Running user task (state S).
+    let running = proc_root.join("201");
+    std::fs::create_dir_all(&running).unwrap();
+    std::fs::write(
+        running.join("stat"),
+        "201 (p) S 0 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0",
+    )
+    .unwrap();
+    // Whole-group zombie (state Z, one thread).
+    let zombie = proc_root.join("202");
+    std::fs::create_dir_all(&zombie).unwrap();
+    std::fs::write(
+        zombie.join("stat"),
+        "202 (p) Z 0 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0",
+    )
+    .unwrap();
+    let empty: BTreeMap<u32, usize> = BTreeMap::new();
+    let tracked: BTreeMap<u32, usize> = BTreeMap::from([(203, 1)]);
+    assert_eq!(
+        newcomer_arrival_possible_metered(proc_root, 201, &empty, &mut || true),
+        Some(true)
+    );
+    assert_eq!(
+        newcomer_arrival_possible_metered(proc_root, 202, &empty, &mut || true),
+        Some(false)
+    );
+    // Unreadable: the admitted map decides.
+    assert_eq!(
+        newcomer_arrival_possible_metered(proc_root, 203, &empty, &mut || true),
+        Some(true)
+    );
+    assert_eq!(
+        newcomer_arrival_possible_metered(proc_root, 203, &tracked, &mut || true),
+        Some(false)
+    );
+    // Refused: proves nothing for any pid.
+    for pid in [201, 202, 203] {
+        assert_eq!(
+            newcomer_arrival_possible_metered(proc_root, pid, &empty, &mut || false),
+            None,
+            "pid {pid}: a refusal proves nothing"
+        );
     }
 }

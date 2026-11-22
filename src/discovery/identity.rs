@@ -61,6 +61,22 @@ pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     Ok(pin_from_metadata(&md))
 }
 
+/// [`pin_of`] with its `fstat` admitted first (see
+/// [`crate::process::metered_io::fstat`]): `None` is a refusal, with
+/// no native call issued. A failed call reads as unknown for the
+/// caller to keep loud.
+pub(crate) fn pin_of_metered(
+    file: &std::fs::File,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<Result<Pin, String>> {
+    Some(
+        match crate::process::metered_io::fstat(file.as_raw_fd(), admit)? {
+            Ok(stat) => Ok(pin_from_stat(&stat)),
+            Err(error) => Err(format!("fstat failed: {error}")),
+        },
+    )
+}
+
 /// `pin_of` for a borrowed descriptor (the pre-arm witness holds
 /// `OwnedFd`s, not `File`s): the same `(ino, size, ctime)` identity
 /// from the same fstat domain.

@@ -7,13 +7,16 @@ Both legs run the same workload (ML-DSA-44/65/87 + ML-KEM-512/768/1024,
 each generated once and used once) under `inventory --pid
 --key-operations`, once with `--key-sizes` and once without. This judge
 requires, per leg: the workload's exact known counts and FIPS lengths;
-the four PQC mechanism rows with exact call counts; twelve per-key rows
-whose metadata label, inferred family and (sizes leg) inferred parameter
-set name the exact set; six generate_key_pair completions and no other
-unknown row, with the keygen mechanism ids (15x3, 28x3) on that row;
-and the verbose text showing family + parameter set on
-every PQC key row plus the `pqc keys:` spotlight with all six sets.
-Anything missing fails: no skip counts as a pass.
+the four PQC mechanism rows with exact call counts; the exact
+(operation, parameter set) matrix — one completed row per expected
+pair, zero unexpected pairs — with each row's metadata label,
+inferred family and (sizes leg) inferred parameter set naming its
+pair; six generate_key_pair completions and no other unknown row,
+with the keygen mechanism ids (15x3, 28x3) on that row; and the
+verbose text showing one row per matrix pair, each with its own
+family display and (sizes leg) length set, plus the `pqc keys:`
+spotlight with all six sets. Anything missing fails: no skip
+counts as a pass.
 
 No gap assertion: the workload's setup calls (Initialize, sessions,
 login) legitimately precede the semantic receipt under deferred
@@ -45,7 +48,18 @@ WANT_MECHS = {
 }
 
 PQC_OPS = {"sign", "verify", "encapsulate", "decapsulate"}
-WANT_OP_COMPLETED = {"sign": 3, "verify": 3, "encapsulate": 3, "decapsulate": 3}
+# The exact expected matrix: one completed row per (operation,
+# parameter set) pair. Totals per operation plus the union of
+# labels are not enough: a relabeled row keeps every total and
+# every union while voiding a required pair.
+OP_LABELS = {"sign": ("ml_dsa_44", "ml_dsa_65", "ml_dsa_87"),
+             "verify": ("ml_dsa_44", "ml_dsa_65", "ml_dsa_87"),
+             "encapsulate": ("ml_kem_512", "ml_kem_768", "ml_kem_1024"),
+             "decapsulate": ("ml_kem_512", "ml_kem_768",
+                             "ml_kem_1024")}
+WANT_PAIRS = frozenset((op, label)
+                       for op, labels in OP_LABELS.items()
+                       for label in labels)
 LABEL_FAMILY = {
     "ml_kem_512": "ml_kem", "ml_kem_768": "ml_kem", "ml_kem_1024": "ml_kem",
     "ml_dsa_44": "ml_dsa", "ml_dsa_65": "ml_dsa", "ml_dsa_87": "ml_dsa",
@@ -130,13 +144,7 @@ def check_key_rows(fail, leg, inv, sizes):
             if r.get("category") in PQC_OPS]
     if len(rows) != 12:
         fail.add(leg, f"{len(rows)} PQC key rows, want 12")
-    done = {}
-    for row in rows:
-        done[row.get("category")] = done.get(row.get("category"), 0) + row.get("completed", 0)
-    for op, want in sorted(WANT_OP_COMPLETED.items()):
-        if done.get(op, 0) != want:
-            fail.add(leg, f"{op} completed={done.get(op, 0)}, want {want}")
-    seen_labels = set()
+    pairs = []
     for row in rows:
         where = (f"{leg} row {row.get('instance')}/{row.get('object')}/"
                  f"{row.get('category')}")
@@ -146,7 +154,11 @@ def check_key_rows(fail, leg, inv, sizes):
         if label not in LABEL_FAMILY:
             fail.add(leg, f"{where} metadata_at_use={label!r}, want a PQC set")
             continue
-        seen_labels.add(label)
+        if row.get("completed") != 1:
+            fail.add(leg, f"{where} completed={row.get('completed')}, "
+                          "want exactly one")
+        else:
+            pairs.append((row.get("category"), label))
         fam = row.get("inferred_family", {})
         if fam.get("status") != "inferred" or fam.get("value") != LABEL_FAMILY[label]:
             fail.add(leg, f"{where} family={fam!r}, want inferred "
@@ -162,8 +174,18 @@ def check_key_rows(fail, leg, inv, sizes):
                 fail.add(leg, f"{where} size={size!r}, want inferred {label}")
         elif size.get("status") != "unknown" or size.get("detail") is not None:
             fail.add(leg, f"{where} size={size!r}, want unknown without detail")
-    if seen_labels != set(LABEL_FAMILY):
-        fail.add(leg, f"labels seen {sorted(seen_labels)}, want all six sets")
+    missing = sorted(WANT_PAIRS - set(pairs))
+    unexpected = sorted(set(pairs) - WANT_PAIRS)
+    duplicated = sorted({pair for pair in pairs if pairs.count(pair) > 1})
+    if missing:
+        fail.add(leg, f"matrix pairs missing {missing}, "
+                      "want all twelve (operation, set) pairs exactly once")
+    if unexpected:
+        fail.add(leg, f"matrix pairs unexpected {unexpected}, "
+                      "want only the twelve (operation, set) pairs")
+    if duplicated:
+        fail.add(leg, f"matrix pairs duplicated {duplicated}, "
+                      "want one completed row per pair")
     unknown = oo.get("unknown_key_operations", [])
     if len(unknown) != 1:
         fail.add(leg, f"{len(unknown)} unknown rows, want exactly the keygen row")
@@ -183,6 +205,10 @@ def check_key_rows(fail, leg, inv, sizes):
                           f"{row.get('further_mechanism_terminals')!r}, want 0")
 
 
+OP_LENGTH_NOUN = {"sign": "signature", "verify": "signature",
+                "encapsulate": "ciphertext", "decapsulate": "ciphertext"}
+
+
 def check_text(fail, leg, text_path, sizes):
     lines = Path(text_path).read_text(encoding="utf-8").splitlines()
     key_rows = [ln for ln in lines if ln.startswith("  key row ")]
@@ -190,15 +216,29 @@ def check_text(fail, leg, text_path, sizes):
                 if any(f" {op} " in ln for op in PQC_OPS)]
     if len(pqc_rows) != 12:
         fail.add(leg, f"text has {len(pqc_rows)} PQC key rows, want 12")
+    pairs = []
     for ln in pqc_rows:
-        if "(ml_kem_" not in ln and "(ml_dsa_" not in ln:
-            fail.add(leg, f"text row lacks a PQC label: {ln[:120]}")
-        if ("probably ML-KEM (from mechanism)" not in ln
-                and "probably ML-DSA (from mechanism)" not in ln):
-            fail.add(leg, f"text row lacks a PQC family: {ln[:120]}")
-        if sizes and ("(from ciphertext length)" not in ln
-                      and "(from signature length)" not in ln):
-            fail.add(leg, f"text row lacks a length set: {ln[:120]}")
+        ops = [op for op in PQC_OPS if f" {op} " in ln]
+        labels = [label for label in LABEL_FAMILY if f"({label}" in ln]
+        if len(ops) != 1 or len(labels) != 1:
+            fail.add(leg, f"text row lacks a single (operation, set) "
+                          f"pair: {ln[:120]}")
+            continue
+        op, label = ops[0], labels[0]
+        pairs.append((op, label))
+        want_family = FAMILY_DISPLAY[LABEL_FAMILY[label]]
+        if f"probably {want_family} (from mechanism)" not in ln:
+            fail.add(leg, f"text row lacks the {label} family: {ln[:120]}")
+        if sizes and f"(from {OP_LENGTH_NOUN[op]} length)" not in ln:
+            fail.add(leg, f"text row lacks the {op} length set: {ln[:120]}")
+    missing = sorted(WANT_PAIRS - set(pairs))
+    unexpected = sorted(set(pairs) - WANT_PAIRS)
+    if missing:
+        fail.add(leg, f"text pairs missing {missing}, want one verbose "
+                      "row per (operation, set) pair")
+    if unexpected:
+        fail.add(leg, f"text pairs unexpected {unexpected}, want one "
+                      "verbose row per (operation, set) pair")
     spot = [ln for ln in lines if ln.startswith("  pqc keys: ")]
     if len(spot) != 1:
         fail.add(leg, f"{len(spot)} `pqc keys:` lines, want 1")

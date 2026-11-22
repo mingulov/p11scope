@@ -22,12 +22,12 @@ use crate::discovery::elf_needed;
 use crate::discovery::handle_table::{DeferredReason, Filing, HandleTable};
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
-    ClaimAuthority, ConservativePinSelection, ExaminedObject, GraphStep, InstalledModulesBacking,
-    InstalledPinsBacking, KernelSelfMappingProbe, ManifestPinError, ManifestPinning,
-    ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId, PinnedObjects,
-    PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
-    RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
-    StaleManifestObject, bind_scanned_modules, bind_scanned_modules_strict,
+    ClaimAuthority, ConservativePinSelection, ExaminedObject, FileIdentity, GraphStep,
+    InstalledModulesBacking, InstalledPinsBacking, KernelSelfMappingProbe, ManifestPinError,
+    ManifestPinning, ManifestStaleReason, MappedFile, Pin, PinnedConservativeCursor,
+    PinnedObjectId, PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule,
+    RetainedScannedInputs, RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor,
+    SelfMappingProbe, StaleManifestObject, bind_scanned_modules, bind_scanned_modules_strict,
     bind_scanned_modules_strict_gated, canonicalize_scanned_overlays, open_view_executable_cached,
     open_view_rooted_object_cached, opened_file_matches_maps,
     pin_manifest_objects_deferred_in_views_with_budget_and_filing,
@@ -1115,6 +1115,19 @@ pub struct Engine {
     /// a rescan (a refresh would retire the loader context the record
     /// belongs to, with its deferred scans).
     getter_pass_owed: BTreeSet<ProcessViewId>,
+    /// Resumable manifest-getter warmup cursors (see
+    /// `prefault_manifest_getter_data`): one per view with an unfinished
+    /// pass, part of the owed-getter work. Cleared when the warmup
+    /// completes, the view settles, rescans, retires or releases, or the
+    /// sites' objects change. Bounded by the retained views; each cursor's
+    /// ranges are product-bounded (memory-only, freed whole per the
+    /// 2026-11-13 ruling).
+    getter_prefault_cursors: BTreeMap<ProcessViewId, GetterPrefaultCursor>,
+    /// Test-only scripted warmup proof and per-pass caps. Production has
+    /// no seam: proof always comes from the pinned identity owner and
+    /// the target's `map_files` entries.
+    #[cfg(test)]
+    getter_prefault_for_test: Option<GetterPrefaultTestSeam>,
     /// The deduplicated bound-context set behind `loader_discovery`'s
     /// strategy/timing/capture counts (design §9.2). Keyed by the exact
     /// internal `{process generation, bound identity state, load kind}` — so
@@ -14111,6 +14124,66 @@ enum AdmissionLedger {
     },
 }
 
+/// One manifest-getter warmup pass's outcome (see
+/// `Engine::prefault_manifest_getter_data`): `Complete` attaches now
+/// (warmed, refused, or abandoned on a terminal stop), `Deferred`
+/// re-owes the view and resumes from its saved cursor on the next pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GetterPrefaultOutcome {
+    Complete,
+    Deferred { frame_spent: bool },
+}
+
+/// A warmup pass's resumable position: the enumerated ranges with their
+/// proof state and the next unread address. Revalidated against fresh
+/// maps every pass; ranges whose file changed underneath are dropped,
+/// never re-read under a stale proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GetterPrefaultCursor {
+    /// The sites' sorted unique objects this cursor enumerated.
+    objects: Vec<PinnedObjectId>,
+    /// Candidate ranges in maps order.
+    ranges: Vec<GetterPrefaultRange>,
+    /// Index of the range holding `next_addr`.
+    next: usize,
+    /// Absolute resume address within `ranges[next]`.
+    next_addr: u64,
+    /// Cumulative read bytes for the per-object allowance.
+    op_bytes: u64,
+    /// False when the frame was spent before enumeration ran.
+    enumerated: bool,
+}
+
+/// One warmup candidate range: its maps address, the first matching
+/// pinned object (sorted order, deterministic), the maps key it was
+/// enumerated under, and whether its identity proof completed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GetterPrefaultRange {
+    start: u64,
+    end: u64,
+    object: PinnedObjectId,
+    device_major: u64,
+    device_minor: u64,
+    inode: u64,
+    proven: bool,
+}
+
+/// Test-only scripted warmup proof and per-pass caps. Production has no
+/// seam: proof always comes from the pinned identity owner and the
+/// target's `map_files` entries, and the caps are the named constants.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+struct GetterPrefaultTestSeam {
+    /// Scripted held proof per object (missing objects are unproven).
+    held: BTreeMap<PinnedObjectId, MappedFile>,
+    /// Scripted range identities (`None` reads as unreadable; missing
+    /// ranges read as unscripted, hence unproven).
+    ranges: BTreeMap<(u64, u64), Option<FileIdentity>>,
+    /// Per-pass overrides; `None` keeps the production constant.
+    reads_per_pass: Option<usize>,
+    proofs_per_pass: Option<usize>,
+}
+
 impl Engine {
     fn empty() -> Self {
         Self {
@@ -14339,6 +14412,9 @@ impl Engine {
             startup_views: BTreeSet::new(),
             getter_unreturned: BTreeSet::new(),
             getter_pass_owed: BTreeSet::new(),
+            getter_prefault_cursors: BTreeMap::new(),
+            #[cfg(test)]
+            getter_prefault_for_test: None,
             selection_claims: BTreeMap::new(),
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
@@ -16600,6 +16676,7 @@ impl Engine {
         self.note_getter_unreturned(id);
         self.startup_views.remove(&id);
         self.getter_pass_owed.remove(&id);
+        self.getter_prefault_cursors.remove(&id);
         // Its selection bindings fail closed now, as a retirement's do: a
         // C_GetInterface selection on the released view is never reported
         // as silently covered by a hook that is about to be detached.
@@ -26629,23 +26706,23 @@ impl Engine {
         &mut self,
         view: ProcessViewId,
         sites: &[(PinnedObjectId, u64, String)],
-    ) {
+    ) -> GetterPrefaultOutcome {
         let mut objects = BTreeSet::new();
         for (object, _, _) in sites {
             objects.insert(*object);
         }
         if objects.is_empty() {
-            return;
+            return GetterPrefaultOutcome::Complete;
         }
         let Some(position) = self
             .views
             .iter()
             .position(|candidate| candidate.id() == view)
         else {
-            return;
+            return GetterPrefaultOutcome::Complete;
         };
         let Ok(maps) = Self::read_maps(&self.views[position], &mut self.budget) else {
-            return;
+            return GetterPrefaultOutcome::Complete;
         };
         let mut ranges = Vec::new();
         for mapping in &maps {
@@ -26670,13 +26747,13 @@ impl Engine {
             }
         }
         if ranges.is_empty() {
-            return;
+            return GetterPrefaultOutcome::Complete;
         }
         let mem = self.views[position].with_filesystem(&mut self.budget, |filesystem, _| {
             Ok(filesystem.open_memory())
         });
         let Ok(mem) = mem.map_err(|_| ()).and_then(|inner| inner.map_err(|_| ())) else {
-            return;
+            return GetterPrefaultOutcome::Complete;
         };
         let mut operation_bytes = 0u64;
         let mut chunk = [0u8; 65536];
@@ -26684,11 +26761,11 @@ impl Engine {
             let mut addr = start;
             while addr < end {
                 if self.budget.check_deadline_now().is_some() {
-                    return;
+                    return GetterPrefaultOutcome::Complete;
                 }
                 let len = (end - addr).min(chunk.len() as u64) as usize;
                 if self.budget.allowed_io(operation_bytes, len) < len {
-                    return;
+                    return GetterPrefaultOutcome::Complete;
                 }
                 match mem.read_at(&mut chunk[..len], addr) {
                     Ok(read) => {
@@ -26710,6 +26787,32 @@ impl Engine {
                 addr = next;
             }
         }
+        GetterPrefaultOutcome::Complete
+    }
+
+    /// Test-only: script the warmup's held proof for `object` and the
+    /// range identities it proves against. Missing entries read as
+    /// unproven; caps stay at the production constants unless
+    /// `set_prefault_caps_for_test` overrides them.
+    #[cfg(test)]
+    fn set_prefault_proof_for_test(
+        &mut self,
+        object: PinnedObjectId,
+        held: MappedFile,
+        ranges: Vec<((u64, u64), Option<FileIdentity>)>,
+    ) {
+        let seam = self.getter_prefault_for_test.get_or_insert_default();
+        seam.held.insert(object, held);
+        seam.ranges.extend(ranges);
+    }
+
+    /// Test-only: run the warmup with `reads` target reads and `proofs`
+    /// range proofs per pass; `None` keeps the production constant.
+    #[cfg(test)]
+    fn set_prefault_caps_for_test(&mut self, reads: Option<usize>, proofs: Option<usize>) {
+        let seam = self.getter_prefault_for_test.get_or_insert_default();
+        seam.reads_per_pass = reads;
+        seam.proofs_per_pass = proofs;
     }
 
     fn attach_manifest_getters_unsettled(
@@ -28587,6 +28690,7 @@ impl Engine {
         closure: &mut PauseClosure,
     ) {
         self.getter_sites_settled.remove(&view);
+        self.getter_prefault_cursors.remove(&view);
         self.note_getter_unreturned(view);
         let Some(context) = self.view_getter_contexts.remove(&view) else {
             return;
@@ -32326,6 +32430,7 @@ impl Engine {
     ) {
         // A rescan may have found a newly mapped getter object.
         self.getter_sites_settled.remove(&view);
+        self.getter_prefault_cursors.remove(&view);
         if !modules.is_empty() {
             self.exploratory_dirty.insert(view);
         }

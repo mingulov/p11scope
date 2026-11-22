@@ -543,9 +543,9 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   only current keeps or stages, only changed retires, unknown leaves
   carried cursors untouched. The cache victim sorts live unless the
   start time differs or the process is missing.
-- A replay read refused by the pass stop or by shared credit keeps the
-  carried cursor installed; only a read that succeeds and then fails
-  its bytes check drops it. The stop is polled before each replay
+- A replay read or re-proof target charge refused by the pass stop or
+  by shared credit keeps the carried cursor installed; only a read
+  that succeeds and then fails its bytes check drops it. The stop is polled before each replay
   charge and inside the triple read.
 - A source guard test collects every site that issues raw I/O (std
   file opens and reads whose drop closes a descriptor, std readlinks,

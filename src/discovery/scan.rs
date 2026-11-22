@@ -10257,17 +10257,21 @@ fn scan_view_examined_mode(
         let truncated = skipped[skipped_before_module..]
             .iter()
             .any(|skip| scan_skip_truncates(&skip.reason));
-        module.tables_scan_finished = !io_exhausted
+        let decode_finished = !io_exhausted
             && !truncated
-            && !witness_unproven
             && budget.refusal_counts() == refusals_before_module
             && stop_before_module.is_none()
             && budget.stopped_reason().is_none();
+        module.tables_scan_finished = decode_finished && !witness_unproven;
         // Stage this object's decode cursor: the next pass resumes from
         // these frontiers instead of restarting. Completeness is the
-        // finished-scan gate just proved — full acquisition, decoding
-        // and validation — never bare frontier arithmetic. The bracket
-        // below decides whether this staging records.
+        // decode gate just proved — full acquisition, decoding and
+        // validation — never bare frontier arithmetic. An unavailable
+        // witness is not unfinished decoding: no later pass decodes
+        // more, the replay re-derives the witness gap on every pass and
+        // withholds finished-ness there, so the cursor completes and the
+        // view holds no scan in progress. The bracket below decides
+        // whether this staging records.
         pending_cursors.push(PendingCursor {
             key: cursor_key,
             module_key: key,
@@ -10281,7 +10285,7 @@ fn scan_view_examined_mode(
             swept_tables,
             swept_ifaces,
             data_len: data.len(),
-            complete: module.tables_scan_finished,
+            complete: decode_finished,
             unlinked: unlinked_remaining,
         });
         if module_refused_undecoded(&module, refusals_before_module, budget.refusal_counts()) {

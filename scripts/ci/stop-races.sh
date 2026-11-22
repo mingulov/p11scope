@@ -31,7 +31,15 @@
 #     carrying the S1-preclusion tag is recorded
 #     environment-precluded instead: without joint feeds the cell
 #     cannot evaluate either way. This holds whatever
-#     JOINT_EXPECTED_FAILURE says.
+#     JOINT_EXPECTED_FAILURE says. A failure carrying the unattributed
+#     no-feed tag (no feeds, no S1 seal) fails the row with its cause:
+#     only the proven S1 tag is environmental.
+#   The entry forces the full 12-case matrix: inherited WP7_STOP_PREPS /
+#     WP7_STOP_OFFSETS narrowing is unset for the cell (direct libtest
+#     runs keep narrowing for exploration), the cell runs with
+#     --nocapture so its per-case tags reach the log, and the qualified
+#     row requires all 12 wp7-stopN:linked tags by exact name. A pass
+#     with fewer cases fails the row as matrix-short.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 64
 ROOT=$(cd "$HERE/../.." && pwd) || exit 64
@@ -98,12 +106,26 @@ elif ! "$LIBTEST" --list --ignored --exact "$JOINT_CELL" 2>/dev/null | grep -qx 
   joint_detail="harness: joint cell missing from test binary: $JOINT_CELL"
 else
   joint_rc=0
-  "$LIBTEST" --exact "$JOINT_CELL" --ignored > joint-cell.log 2>&1 || joint_rc=$?
+  env -u WP7_STOP_PREPS -u WP7_STOP_OFFSETS "$LIBTEST" --exact "$JOINT_CELL" --ignored --nocapture > joint-cell.log 2>&1 || joint_rc=$?
+  joint_matrix_missing=''
+  if [ "$joint_rc" = 0 ]; then
+    i=0
+    while [ "$i" -lt 12 ]; do
+      if ! grep -qF "P11SCOPE_CELL_BRANCH=wp7-stop$i:linked" joint-cell.log; then
+        joint_matrix_missing="$joint_matrix_missing $i"
+      fi
+      i=$((i + 1))
+    done
+  fi
   if [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ] \
-      && grep -q '^test result: ok\. [1-9][0-9]* passed' joint-cell.log; then
-    joint_pass=1; joint_qual='qualified'; joint_detail='joint stop after last waiter resolves reaches Published then WoundDown'
+      && grep -q '^test result: ok\. [1-9][0-9]* passed' joint-cell.log \
+      && [ -z "$joint_matrix_missing" ]; then
+    joint_pass=1; joint_qual='qualified'; joint_detail='linked joint stop reaches Published then WoundDown (12-case matrix)'
   elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 1 ]; then
     joint_detail='joint cell unexpectedly passed under JOINT_EXPECTED_FAILURE=1; set 0 once the wedge is gone for good'
+  elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ] \
+      && grep -q '^test result: ok\. [1-9][0-9]* passed' joint-cell.log; then
+    joint_detail="joint cell passed without the full linked matrix (missing linked cases:$joint_matrix_missing); the qualifying entry forces all 12 wp7-stop cases"
   elif [ "$joint_rc" = 0 ]; then
     joint_detail='joint cell exited 0 without a passing test (zero selected or unmapped output); see joint-cell.log'
   elif [ "$EXPECT_JOINT_FAIL" = 1 ] && grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
@@ -114,6 +136,8 @@ else
   elif grep -q 'P11SCOPE_CELL_BRANCH=.*:s1-precluded' joint-cell.log; then
     joint_detail='environment-precluded: S1 seal without joint feeds; the linked session produced no births; see joint-cell.log'
     joint_qual='environment-precluded'
+  elif grep -q 'P11SCOPE_CELL_BRANCH=.*:no-feeds-unattributed' joint-cell.log; then
+    joint_detail='joint cell produced no feeds without an S1 seal (unattributed linkage default); not environmental; see joint-cell.log'
   else
     joint_detail='joint cell failed without the wedge signature (regression or new failure); see joint-cell.log'
   fi

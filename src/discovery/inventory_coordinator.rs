@@ -43,9 +43,10 @@ use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
     CallerLifecycle, CallerRegistry, CountPublication, CoverageNote, DepartedIdentity,
-    EdgeFoldFacts, EdgeRecord, ExeIdentity, ExeResolution, ImageAuthority, MappingState, ModuleId,
-    ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap,
-    RegistryLimits, ScopedOwnerProof, UnboundExe, UnboundImage, UnknownReason, UseCoverage,
+    EdgeFoldFacts, EdgeRecord, ExeIdentity, ExeResolution, FirstPlacement, ImageAuthority,
+    MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection,
+    ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnboundExe, UnboundImage,
+    UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, DecisionLog, ENDPOINT_RESOURCE,
@@ -737,13 +738,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// into the held count (re-observed, never staged) and the prune
     /// pass leaves the target alone, so a later re-bind places the
     /// fresh absolute. The value names the staged single-module fold
-    /// to retract on a retry bind (`None`: the drop folded nothing —
-    /// an unadmitted module or a shared endpoint). One entry per
-    /// retained row at most, so the map is bounded by the binder's
-    /// retry bound; entries release on the re-decision (bind or
-    /// second unbound verdict), on the domain's finish, or never for
-    /// a row that never re-decides (its fold stands, honestly).
-    retry_owed: HashMap<PairKey, Option<RetryFold>>,
+    /// to retract on a retry bind (no fold: the drop folded nothing —
+    /// an unadmitted module or a shared endpoint), and the placement
+    /// bucket the first staging incremented. One entry per retained
+    /// row at most, so the map is bounded by the binder's retry
+    /// bound; entries release on the re-decision (bind or second
+    /// unbound verdict), on the domain's finish, or never for a row
+    /// that never re-decides (its fold stands, honestly).
+    retry_owed: HashMap<PairKey, RetryOwed>,
     /// Dropped pair bases pruned out of `pair_targets`, bounded. A late
     /// row for one of these pairs still rebases past this exact base,
     /// so pruning never double-counts it. Past the bound a due row is
@@ -6441,9 +6443,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn apply_reconcile_events(&mut self, events: &[CallerEvent], now_ns: u64) {
         // Forward recorded PID reuses first: every reconcile (scan,
         // scoped, or empty pass) funnels through here, so the binder
-        // learns each turnover whether or not a successor admitted. PID
-        // scope only: the retained fallback (the sole consumer) runs
-        // there, so other scopes never grow the reuse table.
+        // learns each turnover whether or not a successor admitted.
+        // PID scope only: the retained fallback (which voids holders
+        // on reuse) runs there, and the late count proof's reuse arm
+        // only has data there — other scopes never grow the table.
+        // Outside PID scope that arm is vacuous by design: a live or
+        // cached bind proves its incarnation through ticket equality
+        // (cookies are lifetime tickets of one leader task, never
+        // reused), so the window proof there rests on coverage, exec,
+        // and loss.
         let reuses = self.adapter.take_pid_reuses();
         if matches!(self.engine.scope, Scope::Pid(_)) {
             for (pid, at_ns) in reuses {
@@ -9537,13 +9545,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
     }
 
+    /// Bind one pair's held count, returning whether the re-observed
+    /// bind met the retry rule (whole staging with the fold
+    /// retracted). A re-observed bind that misses it keeps its first
+    /// witness placement instead of staging a second one.
     fn bind_pair_count(
         &mut self,
         row: &WitnessRow,
         caller: CallerId,
         modules: &[ModuleKey],
         retried: bool,
-    ) {
+    ) -> bool {
         let key = PairKey::of(row);
         let held_first = self
             .pair_counts
@@ -9570,8 +9582,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.pair_targets.get(&key),
             Some(PairTarget::Dropped { .. })
         ) || self.pair_dropped_tombstones.contains_key(&key);
-        let retry_place_ok = match (modules, self.retry_owed.get(&key)) {
-            ([only], Some(fold)) if fold.as_ref().is_none_or(|fold| &fold.module == only) => {
+        let owed_fold = self
+            .retry_owed
+            .get(&key)
+            .and_then(|owed| owed.fold.as_ref());
+        let retry_place_ok = match (modules, owed_fold) {
+            ([only], fold) if fold.is_none_or(|fold| &fold.module == only) => {
                 self.registry.module_id_for(only).and_then(|id| {
                     self.registry.module(id).filter(|record| {
                         record.admission == AdmissionState::Admitted
@@ -9582,7 +9598,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             _ => None,
         }
         .is_some();
-        let retry_rule = retry_rebind && retry_target_ok && retry_place_ok;
+        // The §3.3 re-decision already re-proves coverage, exec, and
+        // loss for the row — but no live path consults pid reuse, so
+        // the retry rule re-proves that arm itself: a turnover at or
+        // after the row voids whole staging, keeping ordinary revival
+        // with the fold standing instead (no new gap: the standing
+        // fold plus the drop diagnostic already count and name the
+        // subtotal). Reuse records exist only under PID scope;
+        // elsewhere the arm is vacuous by design — a ticket-matched
+        // bind proves the incarnation.
+        let retry_reuse_ok = !retry_rebind
+            || !matches!(
+                self.binder.late_count_window_break(row),
+                Some(LateWindowBreak::Reuse)
+            );
+        let retry_rule = retry_rebind && retry_target_ok && retry_place_ok && retry_reuse_ok;
         if retry_rebind && !retry_rule {
             self.retry_owed.remove(&key);
         }
@@ -9635,49 +9665,48 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // already live, observed its setup seed first: it bases
             // past exactly that one call, so only counted calls stage.
             None => {
-                let late = self
-                    .adapter
-                    .record(caller)
-                    .is_some_and(|record| row.recorded_at_ns < record.first_seen_ns);
-                let fresh = if late {
-                    match self.late_count_window_break(row, caller, modules) {
-                        None if self.seeded_first_sight(row, caller) => {
-                            (1, 1, held_first, held_first)
-                        }
-                        None => (0, 0, 0, held_first),
-                        Some(cause) => {
-                            let sight = row.entry_count;
-                            self.registry
-                                .note_counted_before_tracking(caller, sight, &cause);
-                            (sight, sight, held_first, held_first)
-                        }
-                    }
-                } else if self.seeded_first_sight(row, caller) {
-                    (1, 1, held_first, held_first)
-                } else {
-                    (0, 0, 0, held_first)
-                };
+                // Defensive first: retained pairs skip the prune pass,
+                // so a tombstone under a retry mark is unreachable —
+                // but the same fresh-absolute rule covers it (the
+                // tombstone consume below keeps the class aggregate
+                // exact). It is checked before the late computation so
+                // a discarded gap can never stage.
                 if retry_rule && self.pair_dropped_tombstones.contains_key(&key) {
-                    // Defensive: retained pairs skip the prune pass, so a
-                    // tombstone under a retry mark is unreachable — but the
-                    // same fresh-absolute rule covers it (the tombstone
-                    // consume below keeps the class aggregate exact).
                     if self.seeded_first_sight(row, caller) {
                         (1, 1, held_first, held_first)
                     } else {
                         (0, 0, 0, held_first)
                     }
+                } else if let Some(pruned) = self.pair_dropped_tombstones.get(&key) {
+                    (
+                        pruned.base,
+                        pruned.base,
+                        pruned.base_since,
+                        pruned.base_since,
+                    )
                 } else {
-                    self.pair_dropped_tombstones
-                        .get(&key)
-                        .map_or(fresh, |pruned| {
-                            (
-                                pruned.base,
-                                pruned.base,
-                                pruned.base_since,
-                                pruned.base_since,
-                            )
-                        })
+                    let late = self
+                        .adapter
+                        .record(caller)
+                        .is_some_and(|record| row.recorded_at_ns < record.first_seen_ns);
+                    if late {
+                        match self.late_count_window_break(row, caller, modules) {
+                            None if self.seeded_first_sight(row, caller) => {
+                                (1, 1, held_first, held_first)
+                            }
+                            None => (0, 0, 0, held_first),
+                            Some(cause) => {
+                                let sight = row.entry_count;
+                                self.registry
+                                    .note_counted_before_tracking(caller, sight, &cause);
+                                (sight, sight, held_first, held_first)
+                            }
+                        }
+                    } else if self.seeded_first_sight(row, caller) {
+                        (1, 1, held_first, held_first)
+                    } else {
+                        (0, 0, 0, held_first)
+                    }
                 }
             }
         };
@@ -9760,21 +9789,34 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 *staged_ns = count.anchor_ns;
             }
         }
+        retry_rule
     }
 
     /// Consume a retry mark on its re-observed bind: the pair counts
-    /// from here, so the mark leaves and the staged single-module fold
-    /// (when the drop folded one) retracts — the edge carries the
-    /// calls from this publication on. Only `NoLiveCaller` rows are
-    /// ever retained, so the fold's reason code is constant.
+    /// from here, the staged single-module fold (when the drop folded
+    /// one) retracts — the edge carries the calls from this
+    /// publication on — and the row's first placement moves to its
+    /// bound bucket. Only `NoLiveCaller` rows are ever retained, so
+    /// the fold's reason code is constant; a fold exists exactly for
+    /// a module first bucket, so the fold retraction covers that move
+    /// and every other bucket retracts on its own.
     fn release_retry_for_bind(&mut self, key: PairKey) {
-        if let Some(Some(fold)) = self.retry_owed.remove(&key) {
+        let Some(owed) = self.retry_owed.remove(&key) else {
+            return;
+        };
+        if let Some(fold) = owed.fold {
+            debug_assert_eq!(owed.placement, FirstPlacement::Module);
             self.registry.retract_unbound_fold(
                 fold.module,
                 UnboundReason::NoLiveCaller.code(),
                 fold.entries,
                 fold.cookie,
+                fold.image_landed_module,
+                fold.image_landed_global,
             );
+        } else {
+            debug_assert_ne!(owed.placement, FirstPlacement::Module);
+            self.registry.retract_first_placement(owed.placement);
         }
     }
 
@@ -11030,7 +11072,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let retained = retry == DecisionRetry::RetainedForRetry;
                 self.drop_pair_count(&row, DiagnosticReason::NotAdmitted, retained);
                 if retained {
-                    self.retry_owed.insert(PairKey::of(&row), None);
+                    // The `Err` below stages the row's unresolved
+                    // bucket; the owed mark remembers it for the move.
+                    self.retry_owed.insert(
+                        PairKey::of(&row),
+                        RetryOwed {
+                            fold: None,
+                            placement: FirstPlacement::Unresolved,
+                        },
+                    );
                 }
                 if let Binding::Unbound(unbound) = binding {
                     self.note_preadmission(row.host_tgid, &[None], unbound, row.recorded_at_ns);
@@ -11043,9 +11093,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         match binding {
             Binding::Bound(caller) => {
-                self.bind_pair_count(&row, caller, &modules, retry == DecisionRetry::Reobserved);
-                self.registry
-                    .note_bound_witness(caller, modules, row.recorded_at_ns)
+                let reobserved = retry == DecisionRetry::Reobserved;
+                let retry_rule = self.bind_pair_count(&row, caller, &modules, reobserved);
+                // A re-observed bind that meets the retry rule moved the
+                // row's first placement to this bound one; one that
+                // misses it keeps its first placement instead of staging
+                // a second — the fold stands, and so does its bucket.
+                if !reobserved || retry_rule {
+                    self.registry
+                        .note_bound_witness(caller, modules, row.recorded_at_ns)
+                }
             }
             Binding::Unbound(reason) => {
                 // A re-observation that refuses again releases the pair
@@ -11123,21 +11180,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // remembers exactly the fold a retry bind retracts: the
                 // single registered module's fold, or nothing when the
                 // row folds nowhere (shared endpoint, unresolved, or an
-                // unregistered module). Staging is single-threaded, so
-                // the registration read below sees what the commit
+                // unregistered module) — plus the placement bucket the
+                // staging above incremented, mirroring the commit's
+                // buckets. Staging is single-threaded, so the
+                // registration read below sees what the commit
                 // applies.
-                let fold = retained.then(|| {
-                    let [module] = modules.as_slice() else {
-                        return None;
+                let owed = retained.then(|| {
+                    let (placement, fold) = match modules.as_slice() {
+                        [module] => match self.registry.module_id_for(module) {
+                            Some(id) => {
+                                let (image_landed_module, image_landed_global) =
+                                    self.registry.unbound_image_landing(id, cookie);
+                                (
+                                    FirstPlacement::Module,
+                                    Some(RetryFold {
+                                        module: module.clone(),
+                                        entries: folded,
+                                        cookie,
+                                        image_landed_module,
+                                        image_landed_global,
+                                    }),
+                                )
+                            }
+                            None => (FirstPlacement::Unresolved, None),
+                        },
+                        [] => (FirstPlacement::Unresolved, None),
+                        _ => (FirstPlacement::Ambiguous, None),
                     };
-                    self.registry.module_id_for(module).map(|_| RetryFold {
-                        module: module.clone(),
-                        entries: folded,
-                        cookie,
-                    })
+                    debug_assert_eq!(fold.is_some(), placement == FirstPlacement::Module);
+                    RetryOwed { fold, placement }
                 });
-                if retained {
-                    self.retry_owed.insert(PairKey::of(&row), fold.flatten());
+                if let Some(owed) = owed {
+                    self.retry_owed.insert(PairKey::of(&row), owed);
                 }
             }
         }
@@ -13452,11 +13526,31 @@ struct PairKeyClass {
 /// One staged single-module unbound fold owed to a retained
 /// identity-retry row: the module, folded entries, and image cookie
 /// a retry bind retracts, so the edge carries the calls exactly once.
+/// The landing flags record whether the fold's image insert landed in
+/// each image set (a saturated set drops it): the retraction
+/// subtracts only landed calls, so it never eats another fold's.
+/// Predicted at note time from committed state, exact across
+/// batches; drops and retractions staged in the same batch can still
+/// interleave between the prediction and the commit.
 #[derive(Debug, Clone)]
 struct RetryFold {
     module: ModuleKey,
     entries: u64,
     cookie: DomainCookie,
+    image_landed_module: bool,
+    image_landed_global: bool,
+}
+
+/// What a retained identity-retry row's first staging owes its
+/// re-decision: the single-module fold to retract (when the drop
+/// folded one), and the placement bucket the first staging
+/// incremented. A fold exists exactly for a module bucket: a single
+/// registered module at note time still is at commit (modules are
+/// never unregistered), and every other shape folds nowhere.
+#[derive(Debug, Clone)]
+struct RetryOwed {
+    fold: Option<RetryFold>,
+    placement: FirstPlacement,
 }
 
 /// One pruned dropped pair's absolute base and its read anchor: a late
@@ -28709,11 +28803,7 @@ exit 0
         let placement = registry.witness_placement();
         assert_eq!(placement.total(), 1);
         assert_eq!((placement.ambiguous, placement.edge), (1, 0));
-        assert_eq!(
-            registry.edges().count(),
-            0,
-            "no edge without a mapping"
-        );
+        assert_eq!(registry.edges().count(), 0, "no edge without a mapping");
         assert!(
             registry
                 .gaps()
@@ -29137,14 +29227,11 @@ exit 0
         scene.project(7, 60);
         scene.coordinator.commit_batch(false).unwrap();
         let mut native = NativeScene::over(scene, 0);
-        native
-            .scene
-            .coordinator
-            .registry
-            .unbound_image_limits = crate::discovery::caller_registry::UnboundImageLimits {
-            per_module: 1,
-            global: 1,
-        };
+        native.scene.coordinator.registry.unbound_image_limits =
+            crate::discovery::caller_registry::UnboundImageLimits {
+                per_module: 1,
+                global: 1,
+            };
         // X drops on object A: its image fills the single slots.
         let mut row_x = native.row(41, 1, 9, 40, 0);
         row_x.entry_count = 5;
@@ -38408,7 +38495,11 @@ int main(void) {
     fn pid_reuse_reaches_the_binder_under_pid_scope_only() {
         // The retained fallback runs under PID scope only, so only PID
         // turnovers are forwarded; system/cgroup scopes never grow the
-        // binder's reuse table.
+        // binder's reuse table. The late count proof's reuse arm reads
+        // the same table, so it only has data under PID scope too —
+        // elsewhere the live ticket match already proves the
+        // incarnation, and the window proof rests on coverage, exec,
+        // and loss.
         for (scope, want) in [(Scope::Pid(std::process::id()), 1), (Scope::System, 0)] {
             let (mut native, _) = watched_native();
             native.scene.coordinator.engine.scope = scope.clone();

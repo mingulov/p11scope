@@ -2,7 +2,7 @@
 <!-- SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com> -->
 # Flake quarantine mapping
 
-The seven recorded failure signatures from
+The ten recorded failure signatures from
 [`known-flakes.md`](known-flakes.md), each with its owning lane, its
 isolation, and how to triage it. Nothing here weakens a test: the main
 suite runs every flake unfiltered, and the quarantine lane
@@ -12,14 +12,14 @@ exactly once, serially, as triage evidence. Lint-only or audit-only failures
 remain red in their required gates without launching these unrelated repros.
 A green quarantine run never greens the workflow.
 
-Isolation applied to all seven: serial execution (one test at a time, no
+Isolation applied to all ten: serial execution (one test at a time, no
 lane-parallel siblings), exact `--exact` filters (no neighbor tests in the
 binary run), `--test-threads=1`, and a private `CARGO_TARGET_DIR`
 (`target/quarantine`, separate from the main build, so build IO never
 contends with a running lane). One combined offline Cargo compilation emits
 the library and artifact-contract test executable paths as JSON. The runner
 accepts exactly those two current test executables inside the private target,
-then invokes them directly for the seven serial cases; Cargo does not run
+then invokes them directly for the ten serial cases; Cargo does not run
 between cases. Missing, ambiguous or nonexecutable outputs fail the lane.
 CI reuses only the existing exact bpf-linker tool cache here; cold compilation
 and the tests' own fixture work remain.
@@ -33,6 +33,9 @@ and the tests' own fixture work remain.
 | 5 | `actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines` (`--lib`) | run-lane handoff unit tests | `--test-threads=1` + serial: retry-deadline assertions run without lib-test parallelism. |
 | 6 | `release_seal_denies_the_caller_path_to_every_reached_command` (`--test artifact_contracts`) | release-seal lane | Exact filter + serial: caller-path denial runs without sibling lane load. |
 | 7 | `signal_settlement_observes_second_sigint_during_fallback_term_grace` (`--lib`) | signal-settlement unit tests | `--test-threads=1` + serial: SIGINT-during-grace timing runs alone. |
+| 8 | `discovery::engine::tests::async_global::async_global_quiet_handoff_still_runs_one_fresh_scoped_scan_after_hint_consumption` (`--lib`) | engine async-global tests | Exact filter + serial: quiet-handoff scan timing runs without lib-test parallelism. |
+| 9 | `discovery::scan::tests::mem_esrch_mid_scan_takes_the_exited_path_not_unavailable` (`--lib`) | discovery scan unit tests | Exact filter + serial: the ptrace/zombie/proc-walk race runs without sibling load. |
+| 10 | `discovery::engine::tests::teardown_wait_breaks_on_stop_and_stays_loud` (`--lib`) | engine teardown/scan tests | Exact filter + serial: the stop-thread/teardown-wait race runs alone. |
 
 Triage: run `scripts/run-flake-quarantine.sh` locally with the pinned
 release toolchain (`.release-rust-version`) and prepared dependencies.

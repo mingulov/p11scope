@@ -125,8 +125,10 @@ a count of placements on its module.
 Since v0.8.0 a row recorded before its caller's admission (a late
 bind) stages its full pre-admission subtotal when the
 seed-to-admission window is proven clean for that member — a single
-admitted edge carries the row, and no exec, lost lifecycle evidence,
-or pid reuse sits at or after the row's instant — taking the same
+admitted edge carries the row, and no exec or lost lifecycle evidence
+sits at or after the row's instant (plus, under `--pid`, no recorded
+pid reuse: reuse records exist only there, while on other scopes the
+bind's ticket match already proves the incarnation) — taking the same
 base an on-time first sight takes (past the setup seed when
 observed). Anything unproven keeps the late-rebase exclusion, and
 the excluded absolute discloses as a `counted before tracking` gap

@@ -3384,6 +3384,20 @@ pub(crate) struct WitnessPlacement {
     pub unresolved: u64,
 }
 
+/// Which bucket a retained identity-retry row's first staging
+/// incremented: its single registered module's fold, a shared
+/// endpoint's ambiguity, or an endpoint that named no registered
+/// module. A retry-rule rebind moves the placement (decrementing this
+/// bucket while the bound witness increments its own); any other
+/// re-observation keeps it, so the twice-staged row still lands in
+/// exactly one bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirstPlacement {
+    Module,
+    Ambiguous,
+    Unresolved,
+}
+
 /// One publication-time pending-count placement (P3): where the count
 /// landed — decided together with its witness, from the same committed
 /// state, so the two can never diverge.
@@ -3723,6 +3737,19 @@ enum Mutation {
         code: &'static str,
         entries: u64,
         cookie: DomainCookie,
+        /// Whether the fold's image insert landed in each image set:
+        /// a saturated set drops it, and the retraction subtracts
+        /// only landed calls, so it never eats another fold's.
+        landed_module: bool,
+        landed_global: bool,
+    },
+    /// Retract one retained row's first placement bucket after a
+    /// retry-rule rebind moved it to its bound placement: the paired
+    /// bound witness increments the new bucket, so the twice-staged
+    /// row still lands in exactly one. Staged only alongside that
+    /// bound witness, for the bucket the first staging incremented.
+    RetractFirstPlacement {
+        bucket: FirstPlacement,
     },
     NoteUnresolvedWitness,
     NoteUseBeforeAdmission {
@@ -5528,20 +5555,34 @@ impl CallerRegistry {
     /// Stage the retraction of one single-module unbound fold after
     /// the identity retry bound the row from fresh proof. `entries`
     /// and `cookie` are the folded values; `code` is the fold's
-    /// reason code.
+    /// reason code. The landing flags say whether the fold's image
+    /// insert landed in each image set; unlanded calls subtract
+    /// nowhere.
     pub(crate) fn retract_unbound_fold(
         &mut self,
         module: ModuleKey,
         code: &'static str,
         entries: u64,
         cookie: DomainCookie,
+        landed_module: bool,
+        landed_global: bool,
     ) {
         self.staged.push(Mutation::RetractUnboundFold {
             module,
             code,
             entries,
             cookie,
+            landed_module,
+            landed_global,
         });
+    }
+
+    /// Stage the retraction of one retained row's first placement
+    /// bucket after its retry-rule rebind: the paired bound witness
+    /// stages the new bucket in the same batch, so the row moves
+    /// buckets without ever counting twice.
+    pub(crate) fn retract_first_placement(&mut self, bucket: FirstPlacement) {
+        self.staged.push(Mutation::RetractFirstPlacement { bucket });
     }
 
     /// Stage one decided witness row whose endpoint resolved to no admitted
@@ -6641,7 +6682,24 @@ impl CallerRegistry {
                 code,
                 entries,
                 cookie,
-            } => self.apply_retract_unbound_fold(&module, code, entries, cookie),
+                landed_module,
+                landed_global,
+            } => self.apply_retract_unbound_fold(
+                &module,
+                code,
+                entries,
+                cookie,
+                landed_module,
+                landed_global,
+            ),
+            Mutation::RetractFirstPlacement { bucket } => {
+                let placed = match bucket {
+                    FirstPlacement::Module => &mut self.witness_placement.module,
+                    FirstPlacement::Ambiguous => &mut self.witness_placement.ambiguous,
+                    FirstPlacement::Unresolved => &mut self.witness_placement.unresolved,
+                };
+                *placed = placed.saturating_sub(1);
+            }
             Mutation::NoteUnresolvedWitness => self.witness_placement.unresolved += 1,
             Mutation::NoteUseBeforeAdmission {
                 caller,
@@ -7494,8 +7552,10 @@ impl CallerRegistry {
 
     /// Unwind one staged single-module unbound fold after the
     /// identity retry bound the row: rows, folded entries, the reason
-    /// count, the image's folded calls (per-module and run-wide), and
-    /// the module placement each step back exactly once, so the
+    /// count, the image's landed calls (per-module and run-wide —
+    /// a saturated set drops the insert, and unlanded calls subtract
+    /// nowhere), and the module placement each step back exactly once,
+    /// so the
     /// placement invariants (`module` equals the rows sum; the total
     /// equals the census outcomes) hold across the flip. A reason or
     /// image count that reaches zero leaves its map: no row with that
@@ -7514,6 +7574,8 @@ impl CallerRegistry {
         code: &'static str,
         entries: u64,
         cookie: DomainCookie,
+        landed_module: bool,
+        landed_global: bool,
     ) {
         let Some(id) = self.modules_by_key.get(key).copied() else {
             debug_assert!(false, "retraction names a registered module");
@@ -7533,14 +7595,17 @@ impl CallerRegistry {
                     unbound.reasons.remove(code);
                 }
             }
-            if let Some(known) = unbound.images.get_mut(&cookie) {
+            // A fold whose image insert the saturated set dropped
+            // contributed no calls: subtracting them would eat a
+            // standing fold's.
+            if landed_module && let Some(known) = unbound.images.get_mut(&cookie) {
                 known.calls_at_least = known.calls_at_least.saturating_sub(entries);
                 if known.calls_at_least == 0 {
                     unbound.images.remove(&cookie);
                 }
             }
         }
-        if let Some(known) = self.unidentified_images.get_mut(&cookie) {
+        if landed_global && let Some(known) = self.unidentified_images.get_mut(&cookie) {
             known.calls_at_least = known.calls_at_least.saturating_sub(entries);
             if known.calls_at_least == 0 {
                 self.unidentified_images.remove(&cookie);
@@ -7608,6 +7673,26 @@ impl CallerRegistry {
         self.unidentified_images
             .get(&cookie)
             .map(|known| known.calls_at_least)
+    }
+
+    /// Whether one more image insert for `cookie` would land in the
+    /// module's and the run-wide image sets from committed state: a
+    /// known image always lands (it accumulates), a new one lands
+    /// below the bound. The coordinator predicts one fold's landing
+    /// at note time with this, mirroring
+    /// [`Self::insert_unbound_image`].
+    pub(crate) fn unbound_image_landing(&self, id: ModuleId, cookie: DomainCookie) -> (bool, bool) {
+        let module_lands = self
+            .modules
+            .get(&id)
+            .and_then(|module| module.unbound_use.as_ref())
+            .map_or(self.unbound_image_limits.per_module > 0, |unbound| {
+                unbound.images.contains_key(&cookie)
+                    || unbound.images.len() < self.unbound_image_limits.per_module
+            });
+        let global_lands = self.unidentified_images.contains_key(&cookie)
+            || self.unidentified_images.len() < self.unbound_image_limits.global;
+        (module_lands, global_lands)
     }
 
     /// Backfill one joined executable into every image set holding

@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-# run-flake-quarantine.sh — serial, isolated re-runs of the seven ledgered
+# run-flake-quarantine.sh — serial, isolated re-runs of the ten ledgered
 # flakes (docs/notes/known-flakes.md, mapping in
 # docs/notes/test-quarantine.md). Triage evidence only: a green quarantine
 # run never greens the workflow (CI runs it failure-gated), and no test is
@@ -134,6 +134,9 @@ run_artifact "native_helper_suite_recorded_launcher_requires_authenticated_gener
 run_lib "run::tests::actual_handoff_helpers_preserve_errno_and_retry_without_renewing_deadlines"
 run_artifact "release_seal_denies_the_caller_path_to_every_reached_command"
 run_lib "run::tests::signal_settlement_observes_second_sigint_during_fallback_term_grace"
+run_lib "discovery::engine::tests::async_global::async_global_quiet_handoff_still_runs_one_fresh_scoped_scan_after_hint_consumption"
+run_lib "discovery::scan::tests::mem_esrch_mid_scan_takes_the_exited_path_not_unavailable"
+run_lib "discovery::engine::tests::teardown_wait_breaks_on_stop_and_stays_loud"
 
 echo "quarantine: $pass passed, $fail failed in isolation"
 [ "$fail" -eq 0 ]

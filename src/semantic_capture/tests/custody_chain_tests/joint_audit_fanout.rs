@@ -17208,10 +17208,10 @@ fn joint_machine_staging_rearm_names_staging_cause_in_its_gap() {
         .scene
         .coordinator
         .registry()
-        .gaps()
-        .iter()
-        .filter(|gap| gap.subject == QUANTUM_ABANDONED)
-        .map(|gap| gap.reason.clone())
+        .staged_scope_gaps_for_test()
+        .into_iter()
+        .filter(|(subject, _)| subject == QUANTUM_ABANDONED)
+        .map(|(_, reason)| reason)
         .collect();
     assert_eq!(
         abandoned.len(),

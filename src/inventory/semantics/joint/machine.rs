@@ -109,6 +109,8 @@ pub(crate) enum RunningRearmRefusal {
     FrameMissing,
     /// The latch sits at a phase the abandon cannot dispose in
     /// full: only a refusal at the audit step (Auditing or Audited)
+    /// or while staging (Staging, whose ingested quantum and
+    /// prepared batch dispose exactly like the audit step's)
     /// re-arms.
     WrongPhase,
     /// The re-arm rate bound is spent. The stop gap renders
@@ -142,7 +144,7 @@ impl RunningRearmRefusal {
             Self::FinishActive => "the lane was already finishing",
             Self::WatchdogTripped => "a no-progress trip was already standing",
             Self::FrameMissing => "the audited pass had nothing left to abandon",
-            Self::WrongPhase => "only a refusal at the audit step can be continued past",
+            Self::WrongPhase => "only a refusal at the audit or staging step can be continued past",
             Self::BoundSpent => "the interruption limit was already spent",
             Self::ClockUnread => "the clock could not be read",
             Self::LaneNotLive => "the lane was no longer live",
@@ -1829,18 +1831,21 @@ impl LiveJointMachine {
     }
 
     /// The latched shapes a running re-arm admits: an `Unavailable`
-    /// refusal at the audit step, outside any Finish and without a
-    /// finish no-progress trip — at Audited with the retained frame
-    /// still held, or at Auditing (the audit refused before it ran,
-    /// holding the ingested quantum and its untaken H3 disposition).
-    /// A running audit trip admits too: the stuck frame is abandoned
-    /// with counted named gaps and the lane re-arms for new frames
-    /// (owner partial-not-stop), bounded by the re-arm rate window
-    /// like any other interruption. The re-arm disposes exactly that
-    /// custody in full (the frame through
-    /// `abandon_unfinished_joint_publication`; the unaudited quantum by
-    /// taking its H3 slot as the audit would and dropping it); every
-    /// other phase keeps Raw/H8/report custody no running path may drop
+    /// refusal at the audit step or while staging, outside any Finish
+    /// and without a finish no-progress trip — at Audited with the
+    /// retained frame still held, at Auditing (the audit refused
+    /// before it ran, holding the ingested quantum and its untaken
+    /// H3 disposition), or at Staging (the same ingested quantum
+    /// plus the prepared batch mid-staging). A running audit trip
+    /// admits too: the stuck frame is abandoned with counted named
+    /// gaps and the lane re-arms for new frames (owner
+    /// partial-not-stop), bounded by the re-arm rate window like any
+    /// other interruption. The re-arm disposes exactly that custody
+    /// in full (the frame through
+    /// `abandon_unfinished_joint_publication`, which also drains a
+    /// stranded prepared batch S1; the unaudited quantum by taking
+    /// its H3 slot as the audit would and dropping it); every other
+    /// phase keeps Raw/H8/report custody no running path may drop
     /// or replay.
     fn running_rearm_shape(&self, reason: SemanticRefusal) -> bool {
         self.running_rearm_shape_refusal(reason).is_none()
@@ -1863,23 +1868,28 @@ impl LiveJointMachine {
             Some(Phase::Audited { frame: Some(_), .. }) => None,
             Some(Phase::Audited { .. }) => Some(RunningRearmRefusal::FrameMissing),
             Some(Phase::Auditing { .. }) => None,
+            Some(Phase::Staging { .. }) => None,
             _ => Some(RunningRearmRefusal::WrongPhase),
         }
     }
 
     /// Re-arm a running machine past one transient refusal or running
     /// audit trip ("partial, never stop"): abandon only the refused
-    /// quantum through the same named abandon the exit hold uses,
-    /// discard exactly the feeds that staged this quantum, and record
-    /// a scoped break so the next Idle collect voids the stuck
+    /// quantum through the same named abandon the exit hold uses
+    /// (which also drains a Staging latch's stranded prepared batch
+    /// S1), discard exactly the feeds that staged this quantum, and
+    /// record a scoped break so the next Idle collect voids the stuck
     /// session's history (named) while healthy sessions keep staged
     /// proof and re-prove above their own fences — then resume at
     /// Idle. The refused phase is never re-run and its frame never
-    /// resumes. `None` admits no re-arm and changes nothing: the latch
-    /// stands for the driver's hold (any other latched shape, a Finish,
-    /// a finish no-progress trip, the rate bound, a lane no longer live,
-    /// or a lane whose next collect cannot re-sync). A running audit
-    /// trip re-arms: its stuck frame is the abandoned quantum.
+    /// resumes. Admitted latches: Auditing, Audited with its frame,
+    /// and Staging (same ingested custody as Auditing, plus the
+    /// prepared batch the abandon drains). `None` admits no re-arm
+    /// and changes nothing: the latch stands for the driver's hold
+    /// (any other latched shape, a Finish, a finish no-progress
+    /// trip, the rate bound, a lane no longer live, or a lane whose
+    /// next collect cannot re-sync). A running audit trip re-arms:
+    /// its stuck frame is the abandoned quantum.
     /// A frame abandon that still leaves a publication standing also
     /// returns `None`; the hold's own abandon then finds it exactly as
     /// it would have. `Some(true)` when the abandoned publication was
@@ -1960,6 +1970,14 @@ impl LiveJointMachine {
             }) => frame.provenance_stuck_feed_ids(),
             _ => Vec::new(),
         };
+        // Preserve the Staging sub-exit for the counted gap before
+        // the phase resets below: only a Staging latch names its
+        // cause (a stale detail from an older Staging pass must
+        // never leak into another phase's re-arm).
+        let staging_cause = match self.phase {
+            Some(Phase::Staging { .. }) => self.staging_detail,
+            _ => None,
+        };
         let frame = self.take_abandoned_frame();
         coordinator.abandon_unfinished_joint_publication(lane, frame, reason.to_string());
         if coordinator.publication_pending() {
@@ -1987,19 +2005,24 @@ impl LiveJointMachine {
         // the re-arm bound until the lane stops. Pristine feeds
         // never take part.
         coordinator.note_reseeded_stuck_passes(&stuck_feeds, now);
-        // A refusal at Auditing came before the audit ran: the machine
-        // still holds the ingested quantum, and the coordinator its
-        // untaken H3 disposition. Take that slot exactly as the audit
-        // would have, so the finalizer matches an Audited re-arm's
-        // dropped frame; the ingested quantum drops with the phase
-        // below. Its calls stay counted (the cancelled publication kept
-        // their staged registry facts) and its journal custody is
-        // voided, named, by the next collect, like any abandoned
-        // quantum. An Audited frame already took its slot. A slot held
-        // for another producer stops the re-arm instead, named: the
-        // next preparation would refuse it anyway, and the hold then
-        // finds the abandoned publication as-is.
-        if matches!(self.phase, Some(Phase::Auditing { .. })) {
+        // A refusal at Auditing or Staging came before the audit ran:
+        // the machine still holds the ingested quantum, and the
+        // coordinator its untaken H3 disposition. Take that slot
+        // exactly as the audit would have, so the finalizer matches
+        // an Audited re-arm's dropped frame; the ingested quantum
+        // drops with the phase below. Its calls stay counted (the
+        // cancelled publication kept their staged registry facts,
+        // and the abandon drained the stranded prepared batch S1)
+        // and its journal custody is voided, named, by the next
+        // collect, like any abandoned quantum. An Audited frame
+        // already took its slot. A slot held for another producer
+        // stops the re-arm instead, named: the next preparation
+        // would refuse it anyway, and the hold then finds the
+        // abandoned publication as-is.
+        if matches!(
+            self.phase,
+            Some(Phase::Auditing { .. } | Phase::Staging { .. })
+        ) {
             match coordinator.take_unaudited_joint_h3(&self.producers) {
                 UnauditedH3Take::Taken | UnauditedH3Take::NothingPending => {}
                 UnauditedH3Take::ForeignHeld => {
@@ -2049,10 +2072,13 @@ impl LiveJointMachine {
         } else {
             "feeds"
         };
+        let staging_suffix = staging_cause.map_or(String::new(), |detail| {
+            format!("; staging refused at {detail}")
+        });
         coordinator.note_scope_gap(
             RUNNING_REARM_SUBJECT.to_string(),
             format!(
-                "{reason}; discarded {discarded_calls} staged {call_word} from {discarded_feeds} {feed_word} of the stuck session; per-key attribution unknown for those calls; healthy sessions keep staged proof and continue exact; processes started later are tracked"
+                "{reason}; discarded {discarded_calls} staged {call_word} from {discarded_feeds} {feed_word} of the stuck session; per-key attribution unknown for those calls; healthy sessions keep staged proof and continue exact; processes started later are tracked{staging_suffix}"
             ),
         );
         Some(published)

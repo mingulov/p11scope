@@ -503,6 +503,177 @@ class RefuseTests(unittest.TestCase):
         self.assertNotEqual(rc, 0, out)
         self.assertIn("interrupted preparation without a run deadline", out)
 
+    def test_preparation_interrupted_with_missing_count_fails(self):
+        # The producer counts every recording (repeats>=1): a prep row
+        # without its count is malformed and stays loud even with the
+        # deadline present.
+        report = decided_report()
+        prep = {"caller": None, "module": None, "pid": None,
+                "reason": PREP_INPUT_INTERRUPTED,
+                "subject": PREP_SUBJECT}
+        report["gaps"].append(prep)
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed interrupted preparation count", out)
+
+    def test_preparation_interrupted_with_missing_count_fails_witness_available(self):
+        report = witness_available_report()
+        prep = {"caller": None, "module": None, "pid": None,
+                "reason": PREP_INPUT_INTERRUPTED,
+                "subject": PREP_SUBJECT}
+        report["gaps"].append(prep)
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed interrupted preparation count", out)
+
+    def test_preparation_interrupted_with_zero_deadline_count_fails(self):
+        # A deadline row with zero recordings is malformed: repeats
+        # counts recordings, so zero authorizes nothing.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 0})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed run deadline count", out)
+
+    def test_preparation_interrupted_with_zero_deadline_count_fails_witness_available(self):
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 0})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed run deadline count", out)
+
+    def test_preparation_interrupted_with_wrong_subject_and_caller_fails(self):
+        # A caller-bound row with the wrong producer subject is not the
+        # unscoped preparation disclosure the exception names.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": "wrong subject",
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed interrupted preparation", out)
+
+    def test_preparation_interrupted_with_wrong_subject_and_caller_fails_witness_available(self):
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": "wrong subject",
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed interrupted preparation", out)
+
+    def test_preparation_interrupted_with_wrong_deadline_subject_and_caller_fails(self):
+        # A caller-bound deadline row with the wrong subject does not
+        # satisfy the straddle guard.
+        report = decided_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": DEADLINE,
+             "subject": "wrong subject",
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed run deadline", out)
+
+    def test_preparation_interrupted_with_wrong_deadline_subject_and_caller_fails_witness_available(self):
+        report = witness_available_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": PREP_INPUT_INTERRUPTED,
+             "subject": PREP_SUBJECT,
+             "repeats": 1})
+        report["gaps"].append(
+            {"caller": "c0", "module": None, "pid": 100,
+             "reason": DEADLINE,
+             "subject": "wrong subject",
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("malformed run deadline", out)
+
+    def test_duplicate_preparation_interrupted_rows_fail(self):
+        # The producer publishes one row per distinct shape with repeats
+        # counting recordings: duplicate identical prep rows are malformed.
+        report = decided_report()
+        for _ in range(2):
+            report["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "reason": PREP_INPUT_INTERRUPTED,
+                 "subject": PREP_SUBJECT,
+                 "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("duplicate interrupted preparation rows", out)
+
+    def test_duplicate_preparation_interrupted_rows_fail_witness_available(self):
+        report = witness_available_report()
+        for _ in range(2):
+            report["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "reason": PREP_INPUT_INTERRUPTED,
+                 "subject": PREP_SUBJECT,
+                 "repeats": 1})
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": DEADLINE,
+             "subject": DEADLINE_SUBJECT,
+             "repeats": 2})
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("duplicate interrupted preparation rows", out)
+
 
 if __name__ == "__main__":
     unittest.main()

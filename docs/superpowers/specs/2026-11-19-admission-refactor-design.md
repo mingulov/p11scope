@@ -529,7 +529,8 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   one shim, straight to `libc`: std's wrappers retry `EINTR` or grow
   buffers under one unit and are not used. An open buys two units
   (itself and its close, issued on drop); each read, `fstat`, `fstatfs`,
-  `stat`, readlink, pidfd poll, pid probe and replay `pread` one unit,
+  `stat`, `statx`, `getdents64`, readlink, pidfd poll, pid probe and
+  replay `pread` one unit,
   each after a stop check, and none retries. The row reader reads 4 KiB chunks, buys
   one more unit per 64 rows and refuses a row over 64 KiB before
   decoding or matching it. The stat start time is read as a whole
@@ -550,8 +551,15 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   gone, or whose leader already exited, takes only the cold
   retained-member proof: it requires the original leader at Z and every
   member live, and never falls back to the warm leader route, so a
-  hidden namespace link on a live leader fails closed. There is one
-  closing path. A failed check is probed again only through the units
+  hidden namespace link on a live leader fails closed. The cold proof
+  runs through the same primitives, one debit per native call: the
+  group generation, the leader's stat at Z, one bounded `getdents64`
+  census of the task directory, then per member a stat, a `statx` of
+  its namespace link (compared with the admitted namespace) and of its
+  root (one shared root identity), and a second stat with the same
+  birth, then the census, the leader and the generation again. A
+  refused admission fails the proof for this pass; the next pass starts
+  it again from its first call. There is one closing path. A failed check is probed again only through the units
   reserved when the view's scan starts (five, the fallback pin's worst
   case), at most once, shared by the keep, staging and retirement
   decisions: only current keeps or stages, only changed retires,
@@ -561,10 +569,15 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   metered `pread` of the held memory descriptor. A 3.x table whose
   declared extension is unmapped, with its complete 68-slot legacy
   prefix readable, re-proves that prefix alone and keeps publishing it
-  as `known_prefix` (the extension stays an unproven gap, OD35); a full
-  row or a tail refutation still needs the declared extent.
+  as `known_prefix` (the extension stays an unproven gap, OD35). A
+  cached row decoded past the 68 slots (a full row) or a tail
+  refutation still needs the declared extent: its unreadable tail is
+  unavailable, so the cursor and its rows stay and the object is named
+  as waiting. Every successful read charges its returned bytes, also
+  one that ends inside the prefix.
 - Replay outcomes are typed: bytes read, divergent, unavailable (a
-  failed read, or a short one that stops inside the legacy prefix) or
+  failed read, or a short one that stops inside the legacy prefix or
+  inside a full row) or
   refused (the pass stop, the work charge, a
   retained table key or a target charge). Only divergent bytes drop the
   carried cursor. On a running pass an unavailable or refused replay
@@ -575,8 +588,11 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   primitives, requires every kernel entry point to sit inside the shim,
   forbids raw I/O and errno inspection in the audited callers, and
   requires the production closing proof (the cold arms through the
-  cold-only proof), the typed replay outcomes and one metered replay
-  read.
+  metered cold-only proof, whose helpers are audited callers), the
+  typed replay outcomes and one metered replay read. A real cold group
+  runs the cold proof at every credit count and with `EINTR` at each
+  call; the thread's read-syscall counter shows no read outside the
+  shim.
   A behaviour test runs every primitive at every credit count and with
   `EINTR` and `ENOENT` injected at each native call, counting the calls
   at the shim against the debits.

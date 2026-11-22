@@ -108,11 +108,19 @@ at entry with no dereference (`C_Verify`, `C_VerifyFinal`,
 `C_Decrypt`, `C_UnwrapKey`, `C_DecapsulateKey`) — acquired only
 under `--key-sizes` (with `--key-operations`, off by default) in the
 extra journal length programs; never buffer, key-material, PIN or
-environment bytes. The implemented boundary is EC parameter lengths
-5/7/10/11, value lengths 12/16/24/32/48, key types including 0x42,
-the seven-member derive set and promotion with per-field source and
-reason, plus the classified length shapes (§5.2) with the `length`
-source.
+environment bytes. The
+[KEM output templates and relaxed provider dialects (v0.8.0 PQC cell)](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)
+section is APPROVED and IMPLEMENTED under controller ruling fix2
+(2026-11-20): KEM output-template reads through the same bounded
+reader (never `CKA_VALUE` or any secret-bearing attribute), the
+widened Class/KeyType/ValueLen/ModulusBits/EC sets with the two
+attested NSS vendor spellings, and v9/v10 publication. The
+implemented boundary is EC parameter lengths 5/7/10/11/12/14,
+value lengths 1..=4096 bytes, modulus bits 256..=16384, classes
+0..=11, key types 0x00..=0x05|0x10..=0x4b plus the two vendor
+spellings, the seven-member derive set and promotion with
+per-field source and reason, plus the classified length shapes
+(§5.2) with the `length` source.
 Apart from the sections the status line lists, this document does not
 enable capture, describe implemented fields, or qualify a release. The
 implemented contracts remain
@@ -248,8 +256,8 @@ the stated observation. Failed creation produces no object or creation time.
 | `C_GenerateKeyPair` | None | public out 6, private out 7; distinct results | public 2 / 3, private 4 / 5 |
 | `C_DeriveKey` | base key 2 | out 5 only for a supported scalar-result mechanism below; no identity with base | 3 / 4 only after the same entry-time mechanism guard |
 | `C_UnwrapKey` | unwrapping key 2 | out 7 | 5 / 6 |
-| `C_EncapsulateKey` | encapsulation key 2 | out 7; only with a positively non-null entry ciphertext pointer | None (T0: no template read) |
-| `C_DecapsulateKey` | decapsulation key 2 | out 7 | None (T0: no template read) |
+| `C_EncapsulateKey` | encapsulation key 2 | out 7; only with a positively non-null entry ciphertext pointer | 3 / 4 ([T0 superseded in part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)) |
+| `C_DecapsulateKey` | decapsulation key 2 | out 7 | 3 / 4 ([T0 superseded in part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)) |
 | `C_DestroyObject`, `C_GetObjectSize`, `C_GetAttributeValue`, `C_SetAttributeValue` | object 1 | None | None; `C_GetAttributeValue` uses the separate result protocol below |
 | `C_EncryptInit`, `C_DecryptInit`, `C_SignInit`, `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit` | key 2 | None | None |
 | `C_MessageEncryptInit`, `C_MessageDecryptInit`, `C_MessageSignInit`, `C_MessageVerifyInit`, `C_VerifySignatureInit` | key 2 | None | None |
@@ -345,8 +353,8 @@ explicit, narrow internal exceptions, not finite attribute values.
 | Find entry capacity | Arg 2, target-width scalar; retain only validation/cap state. | Private in-flight state; publish bounded decoded count and truncation status, not arbitrary caller capacity. | Count/capacity violation permits no array read. C4. |
 | Find returned-count pointer | Arg 3; full target-word span; matched CKR_OK only. | Private in-flight state only. | Null/unreadable count permits no array read. C1/C4. |
 | Find returned count and handles | Read count once; require `count <= entry_capacity`; validate the complete claimed array span before reading at most eight handles. Recheck count after the bounded read. | At most eight private handle words; publish first-observed pseudonyms, decoded count 0..8 and a truncation flag. No raw count/array. | Changed count discards the batch; failed element is unknown, never a zero handle. Count >8 records bounded omission and invalidates any assumption of an exhaustive search. C4. |
-| Template pointer and count | Only the six template-authorized creation families above (KEM excluded under T0), or `C_GetAttributeValue` args 2/3; checked `count * 3W` span. Inspect first eight slots of each allowed template. | Request templates read at entry and discarded; GetAttribute headers retained only until matching return. Publish finite omission/read status, not raw count/pointer. | Overflow refuses decode; >8 records truncation; a failed header is unknown. Never recurse into array attributes. C1/C5/C6. |
-| KEM template-header span scalars | `C_EncapsulateKey`/`C_DecapsulateKey` args 3/4 register words only: checked `count * 3W` span arithmetic to test disjointness from the result cell. No template header or value is read under T0. | Probe scratch during entry only; no retention, no publication. | Unreadable words, overflowing count, or an invalid/overlapping span withholds the result pointer (unavailable); over-cap counts guard by arithmetic alone. C1/C3. |
+| Template pointer and count | Only the template-authorized creation families above (KEM excluded under T0; [superseded in part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)), or `C_GetAttributeValue` args 2/3; checked `count * 3W` span. Inspect first eight slots of each allowed template. | Request templates read at entry and discarded; GetAttribute headers retained only until matching return. Publish finite omission/read status, not raw count/pointer. | Overflow refuses decode; >8 records truncation; a failed header is unknown. Never recurse into array attributes. C1/C5/C6. |
+| KEM template-header span scalars | `C_EncapsulateKey`/`C_DecapsulateKey` args 3/4 register words only: checked `count * 3W` span arithmetic to test disjointness from the result cell. No template header or value is read under T0 ([no-read clause superseded in part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell); the span guard itself is unchanged). | Probe scratch during entry only; no retention, no publication. | Unreadable words, overflowing count, or an invalid/overlapping span withholds the result pointer (unavailable); over-cap counts guard by arithmetic alone. C1/C3. |
 | KEM length-cell address | `C_EncapsulateKey` arg 6 register word only: one-word span guard against the result cell; the length value is never read. Decapsulation arg 6 is a scalar length value and is never consulted. | Probe scratch during entry only; no retention, no publication. | Unreadable address or an invalid/overlapping span withholds the result pointer; null has no span. C1/C3. |
 | KEM ciphertext/result-span guard | `C_EncapsulateKey`/`C_DecapsulateKey` arg 5 register word only: the ciphertext base bounds a wholly-below ordering check against the result cell. No ciphertext byte, no length value, and no decapsulation scalar length is read or used as a bound. | Probe scratch during entry only; no retention, no publication. | Unreadable arg 5, equality/interior/at-or-above-base geometry, or a null contradicting the non-null S1 decision withholds the result pointer; a null decapsulation input has no span. C1/C3. |
 | KEM entry ciphertext-pointer decision | The owned call's validated S1 entry output-pointer state (finite null/non-null/unreadable class, never an address) for `C_EncapsulateKey`: only a positively non-null decision authorizes result-pointer retention. | Decided at entry; retained as retained-vs-zero result pointer only, in the existing fixed side-row fields (no new retained KEM field). Public result-unavailable reason only. | Null or unavailable decision retains no pointer: zero result-cell reads, no output authority, no key-use count. S1 call accounting unchanged. C1/C3. |
@@ -359,12 +367,12 @@ explicit, narrow internal exceptions, not finite attribute values.
 | `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a TOKEN request is never promoted by CKR_OK creation alone (R2 new-site: other finite facts promote; TOKEN stays query-established). C3/C5/C6. |
 | `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 12, 16, 24, 32 or 48 only. | Finite byte-size code; label in bits only with an independently established matching AES/HKDF/generic-secret type. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
 | `CKA_MODULUS_BITS` | Exact selector 0x0121; one target word equal to a selected RSA size below. | Finite size code; RSA label requires matching RSA type/provenance. | Other values unknown; no modulus or exponent buffer read. C5/C6. |
-| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 5, 7, 10 or 11 and byte-for-byte equality to one complete encoding below. At most eleven bytes in probe scratch. | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires a matching EC type with provenance: 0x03 with any established curve, 0x40 with ed25519/ed448, 0x41 with x25519/x448; a mismatched curve stays unlabeled with its named reason, as does an unestablished curve on a `C_CreateObject` or public-half `C_GenerateKeyPair` creation with a complete seen template (no other creation family carries it). | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
+| `CKA_EC_PARAMS` | Exact selector 0x0180; exact length 5, 7, 10 or 11 ([now 5, 7, 10, 11, 12 or 14](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)) and byte-for-byte equality to one complete encoding below. At most eleven bytes in probe scratch ([now fourteen](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)). | Only curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve label requires a matching EC type with provenance: 0x03 with any established curve, 0x40 with ed25519/ed448, 0x41 with x25519/x448; a mismatched curve stays unlabeled with its named reason, as does an unestablished curve on a `C_CreateObject` or public-half `C_GenerateKeyPair` creation with a complete seen template (no other creation family carries it). | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
 | Public identities and derived facts | Monotonic capture-local allocation plus accepted reducer transitions; never raw handle, IP or digest of either. | `instance#N`, `sess#N`, `object#N`; finite origin/lifecycle/metadata states, times within observation, and saturating counts. JSON, JSONL and dashboard use the same immutable projection. | Allocation exhaustion refuses new association, records loss, and never reuses an ID. C3/C7/C8. |
 | Per-module `C_Initialize` roll-up | New aggregation over already-captured fields only: the attested slot name (`C_Initialize`, single-named, authorized, unambiguous probe) plus the verbatim return code, from joined and shed semantic Events since the lane sealed. No new capture: no argv, env, keys, PINs, payloads, handles or addresses are read or retained for this roll-up. | Saturating per-module counts (`calls`, `ok`, `already_initialized`), the last non-OK/non-already return as a `returns`-shaped row, and a finite status (`initialised`, `failed`, `unseen`, `unknown`) with its detail line, in JSON and verbose text. | The verdict fails closed: `unknown` when the lane never sealed or EVENTS loss (or an unreadable loss counter) may have hidden evidence; zero observed calls word the absence, never "never initialised". |
 | Operation length cell (S-protocol) | Named out positions only (the §5.1 S-cells); entry retention with an entry capacity read plus the `1<<20` cap, full-span validation of the cell word and disjointness against the call's own output buffer (NULL base skips the check: query shapes read); return read on terminal CKR_OK, BUFFER_TOO_SMALL and query-shape OK only; PENDING and every other return never. | Private in-flight plus completed-call transport; cleared on every terminal path; public numeric value only from CLASSIFIED shapes per §5.2 — query values never classify, BUFFER_TOO_SMALL corroborates only (§5.4). | Null cell, absurd capacity, overlap, overflow or refused shape: unavailable with a named reason, never a guessed bound. Gated by `--key-sizes` (off by default, §10.5): without the flag no length word is acquired on any path. |
 | Operation length scalar (V-protocol) | Named in positions only (the §5.1 V-scalars); entry snapshot of the register or stack word; no dereference, no pointer retention. | Private in-flight plus completed-call transport; cleared on every terminal path; admitted userspace-side on CKR_OK only (SIGNATURE_INVALID excluded); same publication as the S-cell row. | Non-OK or ambiguous evidence: unavailable, never classified. Gated by `--key-sizes` as above. |
-| KEM length lift | `C_EncapsulateKey` arg 6 cell and `C_DecapsulateKey` arg 6 scalar snapshot as evidence under the S/V guards above; the LP64 seventh-argument word is read from the caller user stack, as are the approved words on ia32 — that stack fetch acquires argument words only, never a pointee; the EncapsulateKey cell dereference is the separately authorized S-row read above. T0 stays for template headers, values, ciphertext bytes and bounds — arg 6 as a bound stays forbidden, as evidence it is snapshotted. | Same retention and publication as the S/V rows. | Same failure rules; T0 withholds still apply. Gated by `--key-sizes` as above. |
+| KEM length lift | `C_EncapsulateKey` arg 6 cell and `C_DecapsulateKey` arg 6 scalar snapshot as evidence under the S/V guards above; the LP64 seventh-argument word is read from the caller user stack, as are the approved words on ia32 — that stack fetch acquires argument words only, never a pointee; the EncapsulateKey cell dereference is the separately authorized S-row read above. T0 stays for template headers, values, ciphertext bytes and bounds ([headers/values superseded for KEM output templates](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell); ciphertext bytes and bounds stay T0) — arg 6 as a bound stays forbidden, as evidence it is snapshotted. | Same retention and publication as the S/V rows. | Same failure rules; T0 withholds still apply. Gated by `--key-sizes` as above. |
 | Provider info struct (`C_GetInfo`) — **PROPOSED** (v0.8.0 keymeta Task 7; no capture authority until reviewed) | Named position only (arg 0); entry retention with a full-span guard of the per-ABI struct size (LP64 88, ia32 76); return read of the two §17.1 field ranges on CKR_OK only (§17.1). The struct pads are never fetched, not read-and-scrubbed. | Private in-flight plus info-record transport; clear on every terminal path; public parsed fields only: cryptoki/library versions, manufacturer, description, flags. | Null/unreadable pointer or a non-OK return: unavailable, never a guessed value. Ships in default inventory and CBOM (§17.7), independent of `--key-sizes`. |
 | Token info ranges (`C_GetTokenInfo`) — **PROPOSED** (v0.8.0 keymeta Task 7; no capture authority until reviewed) | Named positions only (slot scalar arg 0, pointer arg 1); entry retention with a full-span guard of the per-ABI struct size (LP64 208, ia32 160) plus the slot-scalar snapshot; return read of the four §17.1 ranges on CKR_OK only. §17.2 bytes (serial, label, session counts, memory sizes, utcTime) are never fetched, not read-and-scrubbed. | Private in-flight plus info-record transport with the slot scalar from the record header; clear on every terminal path; public parsed fields only: manufacturer, model, flags (incl. the PIN-state bits), PIN min/max lens, hardware/firmware versions. | Null/unreadable pointer or a non-OK return: unavailable, never a guessed value. Ships in default inventory and CBOM (§17.7), independent of `--key-sizes`. |
 | Mechanism info struct (`C_GetMechanismInfo`) — **PROPOSED** (v0.8.0 keymeta Task 7; no capture authority until reviewed) | Named positions only (slot scalar arg 0, mechanism scalar arg 1, pointer arg 2); entry retention with a full-span guard of the per-ABI struct size (LP64 24, ia32 12) plus the slot/mechanism-scalar snapshot; return read of the whole `CK_MECHANISM_INFO` on CKR_OK only. | Private in-flight plus info-record transport with the slot/mechanism scalars from the record header; clear on every terminal path; public min/max key size as raw mechanism-dependent numbers and flags (incl. `CKF_HW`). | Null/unreadable pointer or a non-OK return: unavailable, never a guessed value. Ships in default inventory and CBOM (§17.7), independent of `--key-sizes`. |
@@ -380,7 +388,10 @@ stay the authority). The selected attribute
 selectors are a deliberately small subset of the pinned [pkcs11-types
 attribute definitions](https://github.com/mingulov/pkcs11-components/blob/v0.2.3/crates/types/src/attribute.rs).
 These sets are closed; support for another standard or vendor value requires
-a reviewed policy change, not numeric passthrough.
+a reviewed policy change, not numeric passthrough. The
+[KEM output templates and relaxed provider dialects](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)
+section below is such a reviewed change; its Class/KeyType/ValueLen/
+ModulusBits/EC sets apply from v0.8.0.
 
 | Field | Exact accepted values and labels |
 | --- | --- |
@@ -439,7 +450,8 @@ cross-session lifetime reasoning and keeps its stronger
 query-established bar. Promotion is per field: an unlisted key
 type (e.g. 0x33/0x34) stays unknown and promotes nothing, while
 the same template's finite value length promotes with
-`creation_success` and never labels.
+`creation_success` and never labels ([`0x33`/`0x34` now establish,
+still without a label](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)).
 
 For `C_GetAttributeValue`, accept per-attribute result processing only on
 `CKR_OK`, `CKR_ATTRIBUTE_SENSITIVE`, `CKR_ATTRIBUTE_TYPE_INVALID`, or
@@ -1493,8 +1505,9 @@ section version 5 of
 [docs/schema/inventory-v1-object-observations-v5.schema.json](../schema/inventory-v1-object-observations-v5.schema.json):
 the two read rows below plus the finite eighteen-label publication.
 It supersedes the M2 "no ML-KEM/PQC labels, vocabulary unchanged"
-clause for parameter-set labels only; KEM T0 (no template read on
-encapsulate/decapsulate), the terminal states and every other M2
+clause for parameter-set labels only ([KEM T0 superseded in
+part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell));
+the terminal states and every other M2
 behavior stay in force. Allowlist-v1 bytes are unchanged.
 
 The observed value is a provider-reported attribute word from an
@@ -1506,7 +1519,7 @@ recognized mechanism never labels.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| `CKA_PARAMETER_SET` (P1) | Exact selector 0x061d at full target width before any pointer/length read, on the already template-authorized creation calls (requested) and `C_GetAttributeValue` (established) only; KEM calls gain no read. The read is selector-`0x061d`-driven: any authorised slot carrying that selector classifies, not only slots beside PQC key types. One target word (`W` bytes LP64/ia32, `ulValueLen` exact, ia32 zero-extended with high-bit refusal); the word must be `1..=12`. The H7-E4 request/Get protocols (selector-first, capacity, alias/overlap, header recheck, accepted partial RVs, duplicate/conflict rules, Set invalidation, pair separation) apply unchanged; no new read site or descriptor exists. | Raw code `1..=12` in the existing side-row cell and per-view seventh metadata field; scrubbed/deleted on every terminal path like the six existing kinds. Public: the `parameter_set` key (`{status, value}`) in the v5 requested/established/query blocks, and the eighteen `metadata_at_use`/object labels enumerated in `$defs/metadata_label` of [the v5 schema](../schema/inventory-v1-object-observations-v5.schema.json). Concise text spotlights PQC uses (`ML-DSA-65 sign: 12`); `-v` adds failed/active; JSON/JSONL carry every row; dashboard, profile, trace and metrics gain nothing. | Missing key type, valid-code/wrong-family pair (including XMSS/XMSS-MT and vendor objects, whose codes name other parameter sets), incompatible class or conflict: no label (`metadata_unknown`/`metadata_conflicting` as today). The field publishes the classified code `1..=12` whenever the word is in range, whatever the key type; only the combined label needs the same-view PQC key type, a family-valid code and a compatible class. Out-of-range words publish no value (`unsupported`); conflicts publish `conflict`. P0 builds read nothing (`UNINSPECTED`, `not_enabled`). Required evidence: partial-error neighbor preservation, hostile-width (ia32 high-bit, `1<<16`, `1<<32` OR-alias) and secret-alias (`CKA_SEED`/`CKA_VALUE` silence, secret bytes behind the value pointer classify to nothing) twins; `object_producer_compiled_frames_are_bounded` unmodified; a live PQC-provider capture showing one PQC segment with matching v5 JSON. |
+| `CKA_PARAMETER_SET` (P1) | Exact selector 0x061d at full target width before any pointer/length read, on the already template-authorized creation calls (requested) and `C_GetAttributeValue` (established) only; KEM calls gain no read ([superseded: `CKA_PARAMETER_SET` now classifies on KEM output templates](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)). The read is selector-`0x061d`-driven: any authorised slot carrying that selector classifies, not only slots beside PQC key types. One target word (`W` bytes LP64/ia32, `ulValueLen` exact, ia32 zero-extended with high-bit refusal); the word must be `1..=12`. The H7-E4 request/Get protocols (selector-first, capacity, alias/overlap, header recheck, accepted partial RVs, duplicate/conflict rules, Set invalidation, pair separation) apply unchanged; no new read site or descriptor exists. | Raw code `1..=12` in the existing side-row cell and per-view seventh metadata field; scrubbed/deleted on every terminal path like the six existing kinds. Public: the `parameter_set` key (`{status, value}`) in the v5 requested/established/query blocks, and the eighteen `metadata_at_use`/object labels enumerated in `$defs/metadata_label` of [the v5 schema](../schema/inventory-v1-object-observations-v5.schema.json). Concise text spotlights PQC uses (`ML-DSA-65 sign: 12`); `-v` adds failed/active; JSON/JSONL carry every row; dashboard, profile, trace and metrics gain nothing. | Missing key type, valid-code/wrong-family pair (including XMSS/XMSS-MT and vendor objects, whose codes name other parameter sets), incompatible class or conflict: no label (`metadata_unknown`/`metadata_conflicting` as today). The field publishes the classified code `1..=12` whenever the word is in range, whatever the key type; only the combined label needs the same-view PQC key type, a family-valid code and a compatible class. Out-of-range words publish no value (`unsupported`); conflicts publish `conflict`. P0 builds read nothing (`UNINSPECTED`, `not_enabled`). Required evidence: partial-error neighbor preservation, hostile-width (ia32 high-bit, `1<<16`, `1<<32` OR-alias) and secret-alias (`CKA_SEED`/`CKA_VALUE` silence, secret bytes behind the value pointer classify to nothing) twins; `object_producer_compiled_frames_are_bounded` unmodified; a live PQC-provider capture showing one PQC segment with matching v5 JSON. |
 | PQC `CKA_KEY_TYPE` qualifier (P2) | Exact selector 0x0100 (already approved); additionally accepted values `0x49` (`CKK_ML_KEM`), `0x4a` (`CKK_ML_DSA`), `0x4b` (`CKK_SLH_DSA`) from PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1. Same source/ABI/span rules as every key-type value; establishes the key-type field exactly like the nine existing types. | Same retention as the key-type field; public only as the numeric scalar beside `parameter_set` and inside the eighteen combined labels. Never a standalone PQC key-type label, never taken from a mechanism. | Any other key-type value (including XMSS and vendor types) stays refused with no numeric fallback; a PQC type without a valid same-view parameter set labels nothing. The M2 `!is_established(1)` pin for key type 73 is the one superseded assertion (the superseding assertion lives in `key_operation_kem_encapsulate_binds_input_role`). |
 
 `CKA_SEED` (0x637) and `CKA_VALUE` (0x11) — the FIPS 203/204/205 seed
@@ -1821,7 +1834,7 @@ bytes are unchanged.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| Unregistered mechanism id (`registered: false`) | The existing guarded return-time `CK_MECHANISM.mechanism` word, read under `allowlisted` with the same descriptor, span and `return_allows_mechanism` gates as a registered publication; only the membership outcome differs, so no new read exists. Published only when the value is at most `0xFFFFFFFF` (every standard and portable vendor id; `CK_ULONG` is 32-bit on ILP32 and Windows); a wider word stays unpublished. `pParameter` and `ulParameterLen` are never touched for these ids. Mechanism numbers are allowed; parameters, keys, PINs and payloads never. Detailed object only; the journal object keeps withholding (its validator pins the capture transition set). Unsafe diagnostic builds, whose allowlisted return gate is off, flag membership misses at entry; they never carry the journal object. | The id beside `MECHANISM_VALUE` with the `MECHANISM_UNREGISTERED` capture bit, aggregated per id through the existing bounded semantic path (256-id per-id table with its named overflow count, inside the 262,144-key capture budget, event ring), private until publication. Public: `mechanisms[]` rows with `registered: false`, numeric id, hex id, the display-only `name` when the id is a known standard or listed vendor mechanism (else null), calls, errors and null params; `cgroups[].mechanisms[]` rows with `registered: false`, numeric id, hex id, the same display-only `name`, calls and errors (no `params` key); inventory `edges[].mechanisms[]` with the display-only name when listed (else null) and no `registered` key; profile text shows the `CKM_*` name for known standard and listed vendor ids, else `vendor-defined 0x…` (vendor range) or `unknown 0x…` (other unknown ids), with counts; inventory snapshot/dashboard text shows the display-only name beside the hex id when listed, else the bare hex id; trace text shows the bare hex id with counts. Key-operation rows never carry an unregistered id. No name is assigned or guessed from any header: unlisted ids keep the generic number. | An unreadable id stays `MECHANISM_UNREADABLE` with `ARG_READ_FAILURE`. Every occurrence, including wider-than-32-bit values and journal-lane occurrences, counts in `evidence.unregistered_mechanisms` under `allowlisted` (unsafe documents mark rows, total stays 0); ring loss, state-budget refusals and per-id-table overflow disclose through their existing or named `PARTIAL`-forcing evidence (`evidence.mechanism_id_overflow` for the table cap), never silently. Required evidence: unregistered/registered/sticky/overflow twins, a table-cap overflow twin (256 rows plus the named count) and a wider-than-32-bit twin (counted, unpublished) at the semantic seam; journal withholding pins; the bits-aware live canary on 32- and 64-bit targets; a live before/after capture listing every remaining unregistered id. |
+| Unregistered mechanism id (`registered: false`) | The existing guarded return-time `CK_MECHANISM.mechanism` word, read under `allowlisted` with the same descriptor, span and `return_allows_mechanism` gates as a registered publication; only the membership outcome differs, so no new read exists. Published only when the value is at most `0xFFFFFFFF` (every standard and portable vendor id; `CK_ULONG` is 32-bit on ILP32 and Windows); a wider word stays unpublished. `pParameter` and `ulParameterLen` are never touched for these ids. Mechanism numbers are allowed; parameters, keys, PINs and payloads never. Detailed object only; the journal object keeps withholding (its validator pins the capture transition set). Unsafe diagnostic builds, whose allowlisted return gate is off, flag membership misses at entry; they never carry the journal object. | The id beside `MECHANISM_VALUE` with the `MECHANISM_UNREGISTERED` capture bit, aggregated per id through the existing bounded semantic path (256-id per-id table with its named overflow count, inside the 262,144-key capture budget, event ring), private until publication. Public: `mechanisms[]` rows with `registered: false`, numeric id, hex id, the display-only `name` when the id is a known standard or listed vendor mechanism (else null), calls, errors and null params; `cgroups[].mechanisms[]` rows with `registered: false`, numeric id, hex id, the same display-only `name`, calls and errors (no `params` key); inventory `edges[].mechanisms[]` with the display-only name when listed (else null) and no `registered` key; profile text shows the `CKM_*` name for known standard and listed vendor ids, else `vendor-defined 0x…` (vendor range) or `unknown 0x…` (other unknown ids), with counts; inventory snapshot/dashboard text shows the display-only name beside the hex id when listed, else the bare hex id; trace text shows the bare hex id with counts. Key-operation rows never carry an unregistered id ([unknown rows now carry bounded numeric ids under F3](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell); proved rows still carry none). No name is assigned or guessed from any header: unlisted ids keep the generic number. | An unreadable id stays `MECHANISM_UNREADABLE` with `ARG_READ_FAILURE`. Every occurrence, including wider-than-32-bit values and journal-lane occurrences, counts in `evidence.unregistered_mechanisms` under `allowlisted` (unsafe documents mark rows, total stays 0); ring loss, state-budget refusals and per-id-table overflow disclose through their existing or named `PARTIAL`-forcing evidence (`evidence.mechanism_id_overflow` for the table cap), never silently. Required evidence: unregistered/registered/sticky/overflow twins, a table-cap overflow twin (256 rows plus the named count) and a wider-than-32-bit twin (counted, unpublished) at the semantic seam; journal withholding pins; the bits-aware live canary on 32- and 64-bit targets; a live before/after capture listing every remaining unregistered id. |
 
 For a conforming provider the value is one of its mechanism ids.
 Residual risk: a provider that accepts any value, together with a caller
@@ -2344,7 +2357,9 @@ approved finite set` on kinds seen with an unclassifiable value,
 curve — or, on a complete `C_CreateObject` or public-half
 `C_GenerateKeyPair` template seen at creation, an unestablished
 one — and `template partly read` on unknown fields never seen on
-a partly-read template. KEM T0, the terminal states
+a partly-read template. KEM T0 ([superseded in
+part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)),
+the terminal states
 and every other exclusion stay in force. Allowlist-v1 bytes are
 unchanged.
 
@@ -2374,7 +2389,8 @@ results, which the observer already trusts. Labels still join an
 established key type with an established size/curve from the same
 view; a size alone, a curve alone, or a recognized mechanism never
 labels. Printable-string curve names, secp256k1/brainpool curves
-and ChaCha20 key types were not measured and stay refused.
+and ChaCha20 key types were not measured and stay refused
+([superseded in part](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell)).
 Version 6 is emitted exactly when new-site content is present;
 versions 1–5 stay frozen and byte-stable.
 
@@ -2398,7 +2414,9 @@ the R2 promotion (§6, v6); it partially supersedes the F16 rule
 labels" for inferred facts only: a recognized mechanism infers a
 family (§4.2, display "probably …"), never an established label.
 Inferred facts never label `metadata_at_use` and never overwrite
-established facts. KEM T0 stays except the length lift above;
+established facts. KEM T0 stays except the length lift above
+([superseded in part for KEM output
+templates](#kem-output-templates-and-relaxed-provider-dialects-v080-pqc-cell));
 terminal states, `CKA_ID`/payload/PIN prohibitions and every
 other exclusion stay in force. Allowlist-v1 bytes are unchanged.
 
@@ -2497,3 +2515,68 @@ verifier headroom + `bpf loads` (§17.4), full
 `artifact_contracts`, and the Task 5 live positives (SoftHSM
 info calls with parsed fields matching the provider's own
 reports).
+
+## KEM output templates and relaxed provider dialects (v0.8.0 PQC cell)
+
+**Status: APPROVED and IMPLEMENTED (controller ruling fix2,
+2026-11-20, items 1 and 5, plus the owner relaxed-providers rule
+2026-11-20: varied template/attribute input is accepted; an
+unknown value marks one field only, never hides the key or voids
+the view).** This section partially supersedes the KEM T0
+no-template-read clauses, the finite attribute vocabulary sets,
+and the v9/v10 publication rules below; every other exclusion
+stays in force. It scopes section versions 9 and 10 of
+[docs/schema/inventory-v1-object-observations-v9.schema.json](../schema/inventory-v1-object-observations-v9.schema.json)
+and
+[docs/schema/inventory-v1-object-observations-v10.schema.json](../schema/inventory-v1-object-observations-v10.schema.json).
+Allowlist-v1 and allowlist-v2 bytes are unchanged.
+
+The controller ruling, quoted exactly: *"ALLOWED for the
+non-secret attributes of the encapsulate/decapsulate output
+template (`CKA_CLASS`, `CKA_KEY_TYPE`, `CKA_VALUE_LEN` and other
+attributes already in the shipped allowlist), through the same
+bounded template reader as other templates. Never `CKA_VALUE` or
+any secret-bearing attribute."* The NSS vendor key-type mapping
+(ruling item 5) is allowed *"documented as vendor-specific, not
+standard."*
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| KEM output-template slots | `C_EncapsulateKey`/`C_DecapsulateKey` output template pair at args 3/4 (the PKCS #11 template/count positions), through the same selector-first bounded reader as other creation templates: checked `count * 3W` span, first eight slots, exact selector equality before any pointer/length read. The seven allowlisted selectors are unchanged (`CKA_CLASS`, `CKA_TOKEN`, `CKA_KEY_TYPE`, `CKA_MODULUS_BITS`, `CKA_VALUE_LEN`, `CKA_EC_PARAMS`, `CKA_PARAMETER_SET`); `CKA_PARAMETER_SET` (0x061d) classifies on KEM output templates like any authorized slot. | Requested facts per resulting view, promoted on success like other creation templates (`source: creation_success`, except `CKA_TOKEN`); finite omission/read status, never raw pointers or counts. | Unknown selectors are discarded without retaining their raw number or reading their pointer/length; overflow refuses decode; >8 records truncation; a failed header is unknown. The pre-existing span/result guards (disjointness, non-null ciphertext decision, FULL-only gate) apply unchanged. C1/C3/C5/C6. |
+| `CKA_CLASS` value set | Exact selector 0x0000; one target word (or the 4-byte scalar encoding below), full-width equality to 0..=11 (every assigned `CKO_*`: domain parameters and trust/validation objects establish their kind but never form key labels). | Finite class code with source/state; raw unmatched words discarded in probe scratch. | Values outside 0..=11 stay unknown. C5/C6. |
+| `CKA_KEY_TYPE` value set | Exact selector 0x0100; one target word (or the 4-byte scalar encoding), full-width equality to every assigned standard `CKK_*` (`0x00..=0x05 \| 0x10..=0x4b` per OASIS PKCS #11 3.2), plus the two attested NSS vendor spellings, documented as vendor-specific, not standard: `CKK_NSS_ML_KEM` (`0xCE53_4356`, `CKK_NSS + 6`) normalizing to `CKK_ML_KEM` (0x49), and `CKK_NSS_CHACHA20` (`0xCE53_4354`, `CKK_NSS + 4`, predating standard `CKK_CHACHA20`) normalizing to `CKK_CHACHA20` (0x33). Full-width match, no truncation. | Finite key-type code with source/state; labels join a type with a size/curve exactly as before (establishment only — most newly accepted types form no label). | Other values (including the remaining `CKK_NSS_*` spellings, which have no standard meaning) stay refused with the named reason. C5/C6. |
+| `CKA_VALUE_LEN` value set | Exact selector 0x0161; one target word (or the 4-byte scalar encoding) equal to 1..=4096. 0 stays refused (SoftHSM reports 0 for unwrapped keys: provider-unknown, never a size). | Finite byte-size code; labels keep the matching-type guard. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
+| `CKA_MODULUS_BITS` value set | Exact selector 0x0121; one target word (or the 4-byte scalar encoding) equal to 256..=16384 (512/1536 measured live on all RSA providers). | Finite size code; RSA label requires matching RSA type/provenance. | Other values unknown; no modulus or exponent buffer read. C5/C6. |
+| `CKA_EC_PARAMS` value set | Exact selector 0x0180; exact length 5, 7, 10, 11, 12 or 14 and byte-for-byte equality to one complete encoding: the previously listed encodings plus the secp256k1 OID (`06 05 2b 81 04 00 0a`, 7 bytes), the two brainpool OIDs (`06 09 2b 24 03 03 02 08 01 01 07`, `06 09 2b 24 03 03 02 08 01 01 0b`, 11 bytes), and the two SoftHSM PrintableString Edwards spellings (`13 0c "edwards25519"`, 14 bytes; `13 0a "edwards448"`, 12 bytes — same curves as the RFC 8410 OIDs, provider spelling only). At most fourteen bytes in probe scratch. | Only the curve enum; scratch bytes never leave the probe's stack frame and are not copied to any map, record or output, including recognized encodings. The buffer is not explicitly zeroed. Curve/type join rules unchanged. | No hash-only, prefix, permissive DER, explicit-parameter or arbitrary-string fallback. C5/C6. |
+| 4-byte `CK_ULONG` scalar encoding | Every `CK_ULONG` scalar kind above (class, key type, value length, modulus bits, parameter set) additionally accepts a 4-byte encoding — a 32-bit client word or a short provider encoding — read as exactly 4 bytes, zero-extended, never widened in place; ia32 high-bit words refuse. `CK_BBOOL` (`CKA_TOKEN`) stays exactly 1 byte: 4-byte booleans are an app bug with divergent provider semantics. | Same finite codes as the word encoding. | Any other width is unknown. C5/C6. |
+| Relaxed value publication (v9) | No new read: the widened sets above publish through the existing requested/established/query blocks (v9 schema), plus the three new EC metadata labels (`ec_secp256k1`, `ec_brainpoolp256r1`, `ec_brainpoolp384r1`). | Version 9 is emitted exactly when a row or block carries a value outside the v7 enums; versions 1–7 stay frozen and byte-stable. | Values outside the widened sets refuse per field with the named reason, never voiding the row. |
+| Unknown-row mechanism ids (v10) | No new read: the already-captured mechanism id of each unknown terminal publishes bounded — at most eight first-seen ids with per-id terminal counts, further terminals counted exactly. | Version 10 is emitted exactly when an unknown row carries mechanism content; older versions stay frozen and byte-stable. Proved rows still carry no mechanism id. | A v10 section without mechanism content is refused, as are malformed entries, duplicate ids, a ninth listed id, and a zero overflow count. |
+| Creation-family display (ruling item 3) | No new read: a key-pair-generation mechanism that names exactly one family (ruling item 2, keymeta §4.2) infers the family (source: mechanism) on rows with no established label or key type; the parameter set still comes only from lengths or template values. | Display `probably … (from mechanism)` beside the row's own unknown key-type state; never an established label, never taken for the wrapped key from the wrapping mechanism. | A use mechanism that names a family wins; an established label or key type keeps the fallback out. |
+
+`CKA_VALUE` (0x11), `CKA_SEED` (0x637) and every other
+secret-bearing attribute stay excluded: no selector match, no
+pointer/length read, no value retained — on KEM output templates
+exactly as elsewhere. Raw labels, PINs, payloads, environment
+bytes, `CKA_ID` collection, ciphertext bytes, length values used
+as bounds, and the terminal states keep their existing
+prohibitions. The KEM span/result guards, the FULL-only capture
+gate, and the P0 refusals are unchanged.
+
+This supersedes in part: the KEM descriptor table's `None (T0: no
+template read)` cells; the `Template pointer and count` row's KEM
+exclusion; the `KEM template-header span scalars` no-read clause
+(the span guard itself is unchanged); the `CKA_EC_PARAMS`
+eleven-byte maximum; the `KEM length lift` row's `T0 stays for
+template headers, values` clause (ciphertext bytes and bounds
+stay T0); the F16 `KEM T0 stays in force` clause and the P1 `KEM
+calls gain no read` clause (`CKA_PARAMETER_SET` now classifies
+on KEM output templates); the finite-vocabulary Class/KeyType/
+ValueLen/ModulusBits/EC rows and their closed sets; the R2
+promotion paragraph's `0x33`/`0x34` example (both now establish,
+still without a label); the R2 `KEM T0 stays in force` clause;
+the R2 `secp256k1/brainpool curves and ChaCha20 key types stay
+refused` clause; the keymeta §8 `KEM T0 stays except the length
+lift` clause; and the unregistered-mechanism row's
+`Key-operation rows never carry an unregistered id` clause for
+unknown rows only (bounded numeric ids under F3; proved rows
+still carry none).

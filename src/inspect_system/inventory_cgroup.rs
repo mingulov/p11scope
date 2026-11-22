@@ -1094,32 +1094,14 @@ pub(crate) fn collect_with(
                 outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete);
             }
         }
-        selected = select_excluding_kernel_threads(
+        selected = capped_member_selection(
             &sweep,
             &sweep_unavailable,
-            Path::new("/proc"),
             cap,
             &mut budget,
-            // Cgroup transactions carry no cross-pass cursor: one
-            // transaction scans once, so tiers stay empty.
-            &crate::discovery::scan_pass::MemberTiers::default(),
+            &mut |pid| std::fs::read_to_string(format!("/proc/{pid}/stat")),
+            &mut || work.charge(1),
         );
-        // Capped reservation: unfinished members the rarity selection
-        // excluded reclaim slots oldest-first (eligible = swept,
-        // available, non-kernel-thread, like the selection itself),
-        // so a capped pass cannot starve resumed work behind
-        // selection order. Without unfinished cursors a no-op.
-        let excluded = crate::discovery::engine::kernel_thread_exclusions(
-            &sweep,
-            &sweep_unavailable,
-            Path::new("/proc"),
-        );
-        let eligible: BTreeSet<u32> = sweep
-            .iter()
-            .map(|(pid, _)| *pid)
-            .filter(|pid| !excluded.contains(pid) && !sweep_unavailable.contains(pid))
-            .collect();
-        budget.reserve_unfinished_selection(&mut selected, &eligible, cap);
     }
     // Oldest-unfinished-first: members holding unfinished decode
     // cursors scan before new members (stable otherwise), so a busy
@@ -1302,6 +1284,45 @@ pub(crate) fn collect_with(
         timings,
         observer,
     }
+}
+
+
+/// The capped member selection: kernel threads (empty available maps
+/// plus `PF_KTHREAD`) excluded, the rest by provider rarity, then the
+/// capped reservation for unfinished members the rarity selection left
+/// out (eligible = swept, available, non-kernel-thread, like the
+/// selection itself), so a capped pass cannot starve resumed work
+/// behind selection order. `read_stat` reads one member's stat;
+/// `charge` takes one credit of the transaction's shared work.
+/// Cgroup transactions carry no cross-pass member cursor: one
+/// transaction scans once, so tiers stay empty.
+pub(crate) fn capped_member_selection(
+    sweep: &crate::discovery::engine::SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    cap: usize,
+    budget: &mut CaptureWorkBudget,
+    read_stat: &mut dyn FnMut(u32) -> std::io::Result<String>,
+    charge: &mut dyn FnMut() -> bool,
+) -> Vec<u32> {
+    let _ = charge;
+    let excluded =
+        crate::discovery::engine::kernel_thread_exclusions_with(sweep, unavailable, read_stat);
+    let mut selected = crate::discovery::engine::select_excluding_given(
+        sweep,
+        &excluded,
+        cap,
+        budget,
+        &crate::discovery::scan_pass::MemberTiers::default(),
+    );
+    let excluded =
+        crate::discovery::engine::kernel_thread_exclusions_with(sweep, unavailable, read_stat);
+    let eligible: BTreeSet<u32> = sweep
+        .iter()
+        .map(|(pid, _)| *pid)
+        .filter(|pid| !excluded.contains(pid) && !unavailable.contains(pid))
+        .collect();
+    budget.reserve_unfinished_selection(&mut selected, &eligible, cap);
+    selected
 }
 
 #[cfg(test)]
@@ -2372,5 +2393,39 @@ mod tests {
             !reasons(healthy).contains(&REPLACED_PROVIDER_REASON),
             "the gap never leaks to the healthy member"
         );
+    }
+
+    /// Capped selection classifies each kernel-thread candidate once,
+    /// one charged credit per stat read, and reads nothing once the
+    /// shared work is spent: at the 64/65 boundary 64 credits read 64
+    /// stats; with no credit left it reads none.
+    #[test]
+    fn capped_selection_charges_each_stat_read_once() {
+        let sweep: crate::discovery::engine::SweepSnapshots =
+            (1..=65u32).map(|pid| (pid, Vec::new())).collect();
+        for allowed in [64usize, 0] {
+            let mut reads = 0usize;
+            let mut charges = 0usize;
+            let mut budget = CaptureWorkBudget::default();
+            let _ = super::capped_member_selection(
+                &sweep,
+                &BTreeSet::new(),
+                64,
+                &mut budget,
+                &mut |_| {
+                    reads += 1;
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                },
+                &mut || {
+                    if charges < allowed {
+                        charges += 1;
+                        true
+                    } else {
+                        false
+                    }
+                },
+            );
+            assert_eq!(reads, allowed, "one charged read per candidate ({allowed} credits)");
+        }
     }
 }

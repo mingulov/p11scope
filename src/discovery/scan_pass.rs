@@ -1049,6 +1049,16 @@ impl ScanPassOwner {
         crate::process::process_start_time(pid).is_ok_and(|live| live == start_time)
     }
 
+    /// Read the view's executable image for a resumable cursor key
+    /// (one procfs read per view). `None` refuses the read: the object
+    /// then carries no cursor key this pass (no resume, record or drop).
+    pub(crate) fn resume_exec_target(
+        &mut self,
+        read: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Option<Option<Vec<u8>>> {
+        Some(read())
+    }
+
     /// Test-only: process-liveness probes performed for decode-cursor
     /// reclamation on this owner.
     #[cfg(test)]

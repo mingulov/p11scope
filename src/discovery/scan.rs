@@ -2406,6 +2406,16 @@ impl CaptureWorkBudget {
     /// owner, joining the budget's shared retained-byte accounting (see
     /// [`super::scan_pass::ScanPassOwner::record_decode_cursor`]).
     /// Returns whether stored.
+    /// The view's executable image for a resumable cursor key; `None`
+    /// refuses the read (see
+    /// [`super::scan_pass::ScanPassOwner::resume_exec_target`]).
+    pub(crate) fn resume_exec_target(
+        &mut self,
+        read: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Option<Option<Vec<u8>>> {
+        self.pass.resume_exec_target(read)
+    }
+
     pub(crate) fn record_decode_cursor(
         &mut self,
         key: DecodeCursorKey,
@@ -9271,20 +9281,22 @@ fn scan_view_examined_mode(
             (Some(start_time), Some(file)) => {
                 // The executable image disambiguates an in-place exec
                 // (same pid and start time, new address space); read
-                // once per view, only for scans that resume.
+                // once per view, only for scans that resume. A refused
+                // read leaves the object without a key this pass.
                 let exec = if budget.resume_armed() {
-                    view_exec
-                        .get_or_insert_with(|| {
+                    if view_exec.is_none() {
+                        view_exec = budget.resume_exec_target(|| {
                             view.run_while_same(|| io.exe_target(view))
                                 .ok()
                                 .and_then(|result| result.ok())
                                 .map(|target| target.as_os_str().as_bytes().to_vec())
-                        })
-                        .clone()
+                        });
+                    }
+                    view_exec.clone()
                 } else {
-                    None
+                    Some(None)
                 };
-                Some(DecodeCursorKey {
+                exec.map(|exec| DecodeCursorKey {
                     pid,
                     start_time,
                     file,
@@ -23110,6 +23122,86 @@ int main(int argc, char **argv) {
     /// Cursor reclamation under a tight byte ceiling: dead generations
     /// go first, then the oldest completed cursor; a live unfinished
     /// cursor is never evicted, and a refusal keeps the old cursor.
+    /// A completed sweep the cursor cache refuses still covers its
+    /// layout: an admitted object completes under byte pressure (the
+    /// completed cursor alone exceeds the retained ceiling), restarts on
+    /// the same identity and layout behind its old partial frontier, and
+    /// once the independent cursor freezes, the climb through finished
+    /// ground earns no resumed pass. The control restarts a
+    /// never-completed object and its genuine rise still earns one.
+    #[test]
+    fn cache_refused_completion_still_covers_its_layout() {
+        let unit = {
+            let (key, cursor) = decode_cursor_for_test(1, 2, 3, false, 0);
+            decode_cursor_bytes(&key, &cursor)
+        };
+        let limits = || tight_export_limits(unit * 4);
+        let at = |pid: u32, inode: u64, word: u64, complete: bool| {
+            let (key, mut cursor) = decode_cursor_for_test(pid, 9, inode, complete, 0);
+            cursor.tables = SweepFrontier { snapshot: 0, word };
+            if complete {
+                // Larger than the whole retained ceiling: refused.
+                cursor.anchors =
+                    Some((0..4096u64).map(|address| (address, vec![0usize; 4])).collect());
+                assert!(decode_cursor_bytes(&key, &cursor) > unit * 4);
+            }
+            (key, cursor)
+        };
+        for (target, completes, expect) in [(21u64, true, false), (22u64, false, true)] {
+            let mut facts = RetainedFileFacts::default();
+            let mut pass = |records: Vec<(DecodeCursorKey, DecodeCursor)>| {
+                let mut budget = CaptureWorkBudget::for_inventory(limits())
+                    .with_retained_file_facts(std::mem::take(&mut facts));
+                for (key, cursor) in records {
+                    let _ = budget.record_decode_cursor(key, cursor);
+                }
+                facts = budget.take_retained_file_facts();
+                facts.resume_observation().raised
+            };
+            let _ = pass(vec![at(7, 11, 100, false), at(8, 21, 10, false)]);
+            let mut second = vec![at(7, 11, 101, false)];
+            if completes {
+                second.push(at(8, target, 10, true));
+            }
+            assert!(pass(second), "the independent cursor rose");
+            assert!(pass(vec![at(7, 11, 102, false), at(8, target, 5, false)]));
+            assert_eq!(
+                pass(vec![at(7, 11, 102, false), at(8, target, 20, false)]),
+                expect,
+                "only genuine progress earns a pass (target {target})"
+            );
+        }
+    }
+
+    /// A resumable cursor key's executable read waits for the pass: a
+    /// stopped pass refuses it with no procfs read; a running pass reads
+    /// once.
+    #[test]
+    fn resume_exec_read_is_refused_once_the_pass_stops() {
+        let mut budget =
+            CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
+        let mut reads = 0;
+        assert_eq!(
+            budget.resume_exec_target(|| {
+                reads += 1;
+                Some(b"/bin/sh".to_vec())
+            }),
+            Some(Some(b"/bin/sh".to_vec()))
+        );
+        assert_eq!(reads, 1);
+        budget.pass_owner().set_scan_stop(WORK_CEILING_REASON);
+        let mut reads = 0;
+        assert_eq!(
+            budget.resume_exec_target(|| {
+                reads += 1;
+                None
+            }),
+            None,
+            "a stopped pass refuses the read"
+        );
+        assert_eq!(reads, 0, "no procfs read after the stop");
+    }
+
     #[test]
     fn record_decode_cursor_reclaims_dead_then_oldest_completed_never_live_unfinished() {
         let live_pid = std::process::id();

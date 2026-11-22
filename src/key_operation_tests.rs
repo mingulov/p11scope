@@ -1956,6 +1956,123 @@ fn key_operation_abandoned_quantum_replays_s1() {
     assert_eq!((joint.started(), joint.completed()), (1, 0));
 }
 
+/// Exit-during-return row twin: the browser exits between the C_Sign
+/// return and the journal uretprobe result, so the journal result is
+/// abandoned (SYNC_RETURN_RESULT_LOST) while S1 observed the OK
+/// return. The committed sign row must complete from the drained
+/// return instead of routing to key-join loss.
+#[test]
+fn key_operation_exit_return_drain_recovers_sign_row() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Ground the key with its label, then open one proved use.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    // The exit-raced terminal: S1 observed the OK return; the journal
+    // result was lost at exit.
+    let call = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, _) = attest_and_stage(&mut scene, &mut staging, &call);
+    assert_eq!(facts.function, "C_Sign");
+    scene.sequence += 1;
+    let fid = crate::kinds::function_id(call.name).unwrap();
+    let begin = begin_bytes_shaped(
+        scene.thread,
+        scene.sequence,
+        fid,
+        0,
+        (COOKIE, EXEC),
+        SESSION,
+        call.mechanism,
+        call.capture,
+        call.input0,
+        call.input1,
+        call.flags,
+    );
+    assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+    assert_eq!(
+        scene.ingest_ordinary(ordinary_for(&begin, CkRv::OK.0)),
+        JournalDisposition::ReturnObserved
+    );
+    assert_eq!(
+        scene.ingest(&abandon_bytes(
+            scene.thread,
+            scene.sequence,
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+            (COOKIE, EXEC)
+        )),
+        JournalDisposition::AbandonStaged
+    );
+    let success = scene.seal().expect("drained quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1);
+    assert!(
+        !success.prefix.settled()[0].abandoned,
+        "the drained call completes, never abandons"
+    );
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    assert_eq!(refused, 0);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the drained sign rows its completion");
+    assert_eq!(
+        (row.completed, row.key_join_lost),
+        (1, 0),
+        "the exit-raced sign completes: {row:?}"
+    );
+    assert!(
+        committed
+            .unknown_key_operations
+            .iter()
+            .all(|row| !(row.category == "sign" && row.reason == "key_join_lost")),
+        "no key-join loss escapes to unknown-key: {:?}",
+        committed.unknown_key_operations
+    );
+}
+
 /// G29/H9-§2: the S1 matrix (failed Init, size query, too-small
 /// retry, multipart, message context, cancellation) holds
 /// N3: proof-only fallback invalidates before it replays: the

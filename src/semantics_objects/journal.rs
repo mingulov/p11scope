@@ -21707,6 +21707,70 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_exit_return_drain_recovers_tail_free_call() {
+        // Exit-during-return drain: the process exits between the PKCS#11
+        // call return and the journal uretprobe result, so BPF abandons
+        // the START with SYNC_RETURN_RESULT_LOST while the ordinary CALL
+        // already observed the return. A call whose completion needs no
+        // BPF tail (C_Sign: tail-absent ENDs) must complete from the
+        // corroborated return instead of losing its outcome. Tail-needing
+        // calls keep the bounded loss (C_CreateObject twin:
+        // object_journal_bounded_uppers_keep_max_only).
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let proof = scene.attest_function("C_Sign");
+        let begin = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        // The fence sits strictly above the corroborated bound, so the
+        // frontier must cover it: one pad record.
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("drained return seals");
+        assert_eq!(success.prefix.settled().len(), 1);
+        let settled = &success.prefix.settled()[0];
+        assert!(
+            !settled.abandoned,
+            "the drained call completes, never abandons"
+        );
+        assert_eq!(
+            settled.end_cut,
+            Some(3),
+            "the return cut is the corroborated ordinal"
+        );
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "no outcome is lost: {:?}",
+            success.effects.effects
+        );
+        assert!(success.prefix.open_keys().is_empty());
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            None,
+            "a drained return leaves no loss bound"
+        );
+        assert!(scene.model.project().objects.is_empty());
+    }
+
+    #[test]
     fn joint_keepup_seal_validation_census_is_linear_in_retained() {
         // The live-feed seal attributes every converting call: with a
         // full open table the attribution census must visit each

@@ -366,6 +366,8 @@ enum SingleReleaseState<C> {
         result: Option<(usize, C)>,
         other_vacant: bool,
         aliases: [Option<ReservationId>; ROLES],
+        occ_prev: u32,
+        occ_next: u32,
     },
     UnlinkingAliases {
         slot: usize,
@@ -1745,6 +1747,8 @@ impl<C> ReservationTable<C> {
                             result: Some(result),
                             other_vacant: snapshot.other_vacant,
                             aliases: snapshot.aliases,
+                            occ_prev: snapshot.occ_prev,
+                            occ_next: snapshot.occ_next,
                         };
                         continue;
                     }
@@ -1802,11 +1806,13 @@ impl<C> ReservationTable<C> {
                         self.bytes -= member.bytes;
                         let result = (member.bytes, member.charge);
                         if snapshot.other_vacant {
-                            Self::occ_unlink(
+                            Self::occ_unlink_known(
                                 &mut self.occ_head,
                                 &mut self.occ_tail,
                                 &mut self.slots,
                                 at,
+                                snapshot.occ_prev,
+                                snapshot.occ_next,
                             );
                             self.slots[at].operation = None;
                             self.live -= 1;
@@ -1824,6 +1830,8 @@ impl<C> ReservationTable<C> {
                     mut result,
                     other_vacant,
                     aliases,
+                    occ_prev,
+                    occ_next,
                 } => {
                     let target_slot = node_slot(node);
                     let target_lane = node_lane(node);
@@ -1838,6 +1846,8 @@ impl<C> ReservationTable<C> {
                             result,
                             other_vacant,
                             aliases,
+                            occ_prev,
+                            occ_next,
                         };
                         return (false, None);
                     };
@@ -1849,11 +1859,13 @@ impl<C> ReservationTable<C> {
                     }
                     let taken = result.take().expect("pending release keeps its charge");
                     if other_vacant {
-                        Self::occ_unlink(
+                        Self::occ_unlink_known(
                             &mut self.occ_head,
                             &mut self.occ_tail,
                             &mut self.slots,
                             slot,
+                            occ_prev,
+                            occ_next,
                         );
                         self.slots[slot].operation = None;
                         self.live -= 1;
@@ -3197,8 +3209,7 @@ mod tests {
             // direct. Retained `snapshot.occ_*`/`pending.occ_*` and
             // field plumbing carry no `slots[` and stay allowed; a
             // splice write (`=`, not `==`) performs no read.
-            if line.contains("slots[")
-                && (line.contains(".occ_prev") || line.contains(".occ_next"))
+            if line.contains("slots[") && (line.contains(".occ_prev") || line.contains(".occ_next"))
             {
                 let is_write = [".occ_prev", ".occ_next"].iter().any(|marker| {
                     line.find(marker).is_some_and(|at| {

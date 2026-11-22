@@ -2947,4 +2947,73 @@ pub(crate) mod tests {
             "a transient take still ranks below the stale-witness ending"
         );
     }
+
+    /// Seal waits that need future input advance as Future instead of
+    /// retrying until the lane-wide no-progress bound stops every
+    /// caller: claims, floors and corroborating returns can arrive
+    /// in a later quantum, so the immutable frame finishes and the
+    /// next frame retries with new input. Unbound staging stays
+    /// Retry (only a void sheds the barrier).
+    #[test]
+    fn seal_wait_future_input_covers_claims_floors_and_returns() {
+        use super::super::SealWait;
+        use super::seal_wait_advances_as_future;
+        for wait in [
+            SealWait::FreshBirthNoHistory,
+            SealWait::AttributionPending,
+            SealWait::FloorsPastFrontier,
+            SealWait::AbandonReturnPending,
+            SealWait::RefusedReturnPending,
+        ] {
+            assert!(
+                seal_wait_advances_as_future(wait, false),
+                "{wait:?} advances as future input"
+            );
+            assert!(
+                seal_wait_advances_as_future(wait, true),
+                "{wait:?} with terminal still advances"
+            );
+        }
+        assert!(
+            !seal_wait_advances_as_future(SealWait::UnboundStaging, false),
+            "unbound staging stays retry for the void shed"
+        );
+        assert!(
+            seal_wait_advances_as_future(SealWait::UnboundStaging, true),
+            "an awaited terminal still advances past unbound staging"
+        );
+        assert!(
+            !seal_wait_advances_as_future(SealWait::None, false),
+            "no wait never advances as future"
+        );
+        assert!(
+            seal_wait_advances_as_future(SealWait::None, true),
+            "an awaited terminal advances even without a wait"
+        );
+    }
+
+    /// A failure-path yield that spent budget disposed exactly one
+    /// staged head with more remaining: that is progress (the
+    /// per-pass bound resumes next visit), not a stuck visit. A
+    /// yield with no spend is budget starvation and stays stuck.
+    #[test]
+    fn failure_yielded_spend_counts_as_progress() {
+        use super::failure_yielded_is_progress;
+        assert!(
+            failure_yielded_is_progress(10, 9),
+            "one head disposed is progress"
+        );
+        assert!(
+            failure_yielded_is_progress(1, 0),
+            "the last unit spent is still progress"
+        );
+        assert!(
+            !failure_yielded_is_progress(0, 0),
+            "zero budget with no spend stays stuck"
+        );
+        assert!(
+            !failure_yielded_is_progress(10, 10),
+            "no spend stays stuck"
+        );
+    }
 }

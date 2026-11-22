@@ -34446,6 +34446,7 @@ fn keymeta_proved_park_refusal_promotes_to_v7() {
                 length: Some(LengthOutcome::Value(32)),
                 fresh_view: Some(view.as_u64()),
             },
+            false,
             &mut sink,
         )
         .expect("replay");

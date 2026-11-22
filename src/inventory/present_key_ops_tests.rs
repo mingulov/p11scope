@@ -2360,6 +2360,7 @@ fn key_ops_same_thread_nested_row_names_its_reason() {
         cancelled: 0,
         unknown: 0,
         active: 0,
+        mechanisms: Vec::new(),
     });
     let mut presentation = key_ops_presentation(observations);
     presentation.key_sizes_requested = true;

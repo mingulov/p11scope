@@ -1868,6 +1868,232 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertIn("pid_descendant_gaps=0", result["detail"])
         self.assertIn("discovery_skips=1", result["detail"])
 
+    def test_learned_first_use_passes_on_system_in_strict_mode(self):
+        # Fix3 (Codex B2): a file-changed learned pin that the retry
+        # stages files the counted first-use row for its uncovered
+        # provider; with exact owned counts, zero loss and runner
+        # noise the honest disclosure qualifies strict. Shape mirrors
+        # the CI run 44950781943 recovery (lossy [skipped,
+        # pid_descendant_gaps], 1 first-use skip, staged=1, gaps=60).
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system")
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=60", result["detail"])
+        self.assertIn("discovery_skips=0", result["detail"])
+
+    def test_learned_first_use_passes_on_system_when_allowed(self):
+        # Relaxed parity: the hosted public-cli leg runs system
+        # relaxed, so the first-use shape strict accepts must also
+        # pass relaxed with exact owned counts.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=60", result["detail"])
+
+    def test_learned_first_use_passes_on_mt_system_in_strict_mode(self):
+        # The first-use cell disjunct covers mt-system too: the same
+        # counted disclosure qualifies with exact owned counts.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-ambient-gap")
+        self.assertIn("pid_descendant_gaps=60", result["detail"])
+
+    def test_learned_first_use_passes_on_mt_system_when_allowed(self):
+        # Relaxed parity for mt-system with exact owned counts.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case_mt_system(mutate, allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=60", result["detail"])
+
+    def test_learned_first_use_prearm_still_fails_in_strict_mode(self):
+        # The original run 44950781943 refusal stays loud: one folded
+        # prearm skip with zero stagings is a real loss, never the
+        # counted first-use disclosure, and still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "prearm object unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_prearm_still_fails_when_allowed(self):
+        # The original refusal stays loud relaxed too.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "prearm object unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1,
+                               allow_pid_descendant_gaps=True)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_without_staging_fails_in_strict_mode(self):
+        # A first-use row with zero stagings is inconsistent (the row
+        # files only when a file stages) and still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 0
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_two_staged_fails_in_strict_mode(self):
+        # The arm pins exactly one staged file: two stagings behind
+        # one row is a different phenomenon and still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 2
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_two_rows_fails_in_strict_mode(self):
+        # The producer dedupes the fixed row (one per capture): two
+        # identical rows still fail strict.
+        def mutate(d, l, r):
+            row = {
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}
+            d["evidence"]["skipped"] = [dict(row), dict(row)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_event_loss_fails_in_strict_mode(self):
+        # Learning loss behind the row is not a clean disclosure and
+        # still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"]["learned_event_loss"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_cap_skip_fails_in_strict_mode(self):
+        # A cap refusal behind the row is not a clean disclosure and
+        # still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"]["learned_cap_skipped"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_other_class_fails_in_strict_mode(self):
+        # The first-use arm stays narrow: the disclosure bundled with
+        # any other observation class still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy",
+                "causes": ["skipped", "pid_descendant_gaps", "multi_rebuild_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_learned_first_use_with_count_mismatch_fails_in_strict_mode(self):
+        # The first-use arm never waives exact owned counts: the
+        # disclosure with a 499/500 deficit still fails strict.
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [{
+                "name": "learned provider file",
+                "reason": "a provider file was learned after its first use; "
+                          "its earlier calls were not observed"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"]["pid_descendant_gaps"] = 60
+            d["evidence"]["learned_staged_files"] = 1
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+            d["functions"][0]["calls"] = 499
+        result = self.run_case(mutate, cell="system", want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
     def test_attribution_gap_without_noise_passes_in_both_modes(self):
         # The system counts cell never gated attribution/semantics gaps
         # (strict discloses them via PARTIAL); relaxed mode must accept

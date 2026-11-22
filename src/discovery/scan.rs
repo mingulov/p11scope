@@ -26,9 +26,9 @@ use crate::discovery::scan_pass::{
     DecodeCursor, DecodeCursorKey, MappingFingerprintEntry, SweepFrontier,
 };
 use crate::discovery::sweep_attribution::is_caller_range;
-use crate::process::GenerationProof;
 use crate::process::leader_exit::LeaderExitReadBudget;
 use crate::process::metered_io::LinkRead;
+use crate::process::{ClosingProof, GenerationProof};
 use crate::process::{
     MappedOpenError, MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId,
 };
@@ -3442,32 +3442,46 @@ fn span_bytes(layout: LinuxLayout, spans: &[TableSpan]) -> Option<usize> {
     table_bytes(layout, spans.iter().map(|span| span.fields().len()).sum()).ok()
 }
 
+/// The outcome of re-reading one cached table's extent for a replay.
+enum ReplayRead {
+    /// The whole declared extent, read from current memory.
+    Bytes(Vec<u8>),
+    /// The cached row names no layout: it can never re-prove.
+    Divergent,
+    /// A short or failed read: no byte was checked.
+    Unavailable,
+    /// The pass stop or the charge refused the read: nothing was read.
+    Refused,
+}
+
 /// Re-read one cached table's full declared extent from current
-/// memory (charged): `None` on any short read, refusal or stop.
+/// memory, charged one unit after a stop poll.
 fn reread_table_extent(
     layout: LinuxLayout,
     table: &ScannedTable,
     mem: &impl ScanMemory,
     budget: &mut CaptureWorkBudget,
-) -> Result<Option<Vec<u8>>, &'static str> {
+) -> ReplayRead {
     let version_word = u64::from(table.version.0) | (u64::from(table.version.1) << 8);
     let Some((_, spans, _)) = spans_for(version_word) else {
-        return Ok(None);
+        return ReplayRead::Divergent;
     };
     let Some(len) = span_bytes(layout, spans) else {
-        return Ok(None);
+        return ReplayRead::Divergent;
     };
-    if let Some(reason) = budget.stopped_now() {
-        return Err(reason);
+    if budget.stopped_now().is_some() {
+        return ReplayRead::Refused;
     }
-    budget.spend(1)?;
+    if budget.spend(1).is_err() {
+        return ReplayRead::Refused;
+    }
     let mut extent = vec![0u8; len];
     match mem.read_memory_at(&mut extent, table.address) {
         Ok(read) if read == len => {}
-        _ => return Ok(None),
+        _ => return ReplayRead::Unavailable,
     }
     budget.record_io(len);
-    Ok(Some(extent))
+    ReplayRead::Bytes(extent)
 }
 
 /// Re-decode one re-read table extent under the sweep's rules: the
@@ -3478,8 +3492,8 @@ fn decode_reread_table_extent(
     extent: &[u8],
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
-) -> Option<ScannedTable> {
-    match decode_candidate(
+) -> Result<Option<ScannedTable>, ()> {
+    decode_candidate(
         layout,
         extent,
         0,
@@ -3490,10 +3504,8 @@ fn decode_reread_table_extent(
             runtime_view: None,
             strict_tail: true,
         },
-    ) {
-        Ok(Some((fresh, _))) => Some(fresh),
-        _ => None,
-    }
+    )
+    .map(|decoded| decoded.map(|(fresh, _)| fresh))
 }
 
 /// The row one cached table carries after re-proof against a fresh
@@ -3533,9 +3545,34 @@ fn reprove_cached_table(
     extent: &[u8],
     maps: &MapIndex<'_>,
     budget: &mut CaptureWorkBudget,
-) -> Option<ScannedTable> {
-    let fresh = decode_reread_table_extent(layout, table.address, extent, maps, budget)?;
-    carried_replay_row(table, &fresh)
+) -> ReplayProof {
+    match decode_reread_table_extent(layout, table.address, extent, maps, budget) {
+        Err(()) => ReplayProof::Refused,
+        Ok(fresh) => fresh
+            .and_then(|fresh| carried_replay_row(table, &fresh))
+            .map_or(ReplayProof::Divergent, ReplayProof::Carried),
+    }
+}
+
+/// The outcome of re-proving one re-read table against its cached row.
+enum ReplayProof {
+    /// The row to carry.
+    Carried(ScannedTable),
+    /// The fresh decode differs: the row must rescan.
+    Divergent,
+    /// An admission (a stop, the work charge, a retained table key)
+    /// refused the re-decode: nothing was compared.
+    Refused,
+}
+
+#[cfg(test)]
+impl ReplayProof {
+    fn carried(self) -> Option<ScannedTable> {
+        match self {
+            Self::Carried(table) => Some(table),
+            Self::Divergent | Self::Refused => None,
+        }
+    }
 }
 
 /// Whether the cached row is a strict `known_prefix` of the fresh
@@ -6528,10 +6565,10 @@ fn cursor_file_key_for(
     Some(InspectedFileKey::of_stat(&stat, key.device, key.inode))
 }
 
-/// Units one closing generation probe can need: the fallback pin's
-/// `/proc/<pid>/stat` open, its close and one read (a pidfd poll needs
-/// one).
-const CLOSING_GENERATION_UNITS: u64 = 3;
+/// Units one closing generation probe can need: on the fallback pin the
+/// `/proc/<pid>/stat` open, its close, a record read and the end-of-file
+/// read, then a pid probe after a failed read (a pidfd poll needs one).
+const CLOSING_GENERATION_UNITS: u64 = 5;
 
 /// The closing bracket's generation check, bought before the scan's own
 /// work: [`CLOSING_GENERATION_UNITS`] admitted units reserved when the
@@ -6586,12 +6623,11 @@ impl ClosingGeneration {
 /// a generation bracket of metered calls: a generation probe, one
 /// bounded `/proc/<pid>/exe` readlink, and a second probe, each issuing
 /// only admitted native calls. Only a bracket whose probes both prove
-/// the original process current yields a key: `Some(Some(image))`, or
-/// `Some(None)` when the link is provably gone (an exiting process).
-/// `None` gives the object no cursor key this pass, so its carried
-/// cursor is neither used nor retired: a refused admission, a probe
-/// that proved a change or proved nothing, or an unknown or possibly
-/// truncated link.
+/// the original process current and whose link reads whole yields a
+/// key, `Some(Some(image))`. `None` gives the object no cursor key this
+/// pass, so its carried cursor is neither used nor retired: a refused
+/// admission, a probe that proved a change or proved nothing, or a
+/// failed (`ENOENT` included) or possibly truncated link.
 fn resume_view_exec(
     budget: &mut CaptureWorkBudget,
     mut generation: impl FnMut(&mut dyn FnMut() -> bool) -> Option<GenerationProof>,
@@ -6603,7 +6639,6 @@ fn resume_view_exec(
     }
     let image = match read(&mut admit)? {
         LinkRead::Target(image) => Some(image),
-        LinkRead::Missing => None,
         LinkRead::Unknown => return None,
     };
     if generation(&mut admit)? != GenerationProof::Current {
@@ -7999,12 +8034,39 @@ impl ScanIo for ProcScanIo {
             .map_err(std::io::Error::other)?
     }
 
+    /// The closing generation proof. A warm view proves it through the
+    /// metered primitives, one debit (a stop poll plus one charged work
+    /// unit) per native call: its mount namespace, then its generation.
+    /// A view whose leader exited (now or earlier) keeps the cold
+    /// retained-member proof.
     fn final_generation(
         &mut self,
         view: &ProcessView,
         budget: &mut CaptureWorkBudget,
     ) -> Result<(), String> {
-        view.with_filesystem(budget, |_, _| Ok(()))
+        if view.cold_filesystem_observed() {
+            return view.with_filesystem(budget, |_, _| Ok(()));
+        }
+        let mut refusal = None;
+        let proof = view.metered_closing_proof(&mut || {
+            if let Some(reason) = budget.stopped_now() {
+                refusal = Some(reason);
+                return false;
+            }
+            match budget.spend(1) {
+                Ok(()) => true,
+                Err(reason) => {
+                    refusal = Some(reason);
+                    false
+                }
+            }
+        });
+        match proof {
+            None => Err(refusal.unwrap_or(WORK_CEILING_REASON).into()),
+            Some(ClosingProof::Current) => Ok(()),
+            Some(ClosingProof::ColdTransition) => view.with_filesystem(budget, |_, _| Ok(())),
+            Some(ClosingProof::Failed(reason)) => Err(reason),
+        }
     }
 
     fn range_identity(
@@ -8182,6 +8244,10 @@ impl ScanIo for ProcScanIo {
 
 pub(crate) const MAPPING_CHANGED_REASON: &str =
     "memory scan refused: mapping changed during acquisition";
+/// A resumed object whose cached rows could not be re-read or
+/// re-admitted on a running pass: its carried progress is kept.
+const REPLAY_UNPROVEN_REASON: &str = "resume replay could not re-read or re-admit its cached rows; the carried progress is kept and the object rescans on a later pass";
+
 const FINAL_MAPS_UNAVAILABLE_REASON: &str =
     "memory scan refused: final mapping validation unavailable";
 const INITIAL_MAPS_UNAVAILABLE_REASON: &str =
@@ -9528,8 +9594,8 @@ fn scan_view_examined_mode(
             // see fails here into a fresh rescan instead of poisoning
             // the resume.
             let mut proven = true;
-            // A refused read or re-proof checked no bytes: the cursor
-            // stays installed and simply does not resume this pass.
+            // A refused or unavailable read or re-proof checked no
+            // bytes: the cursor stays installed and does not resume.
             let mut refused = false;
             let mut recollected = ScanDependencies {
                 inventory: dependency.inventory.clone(),
@@ -9540,26 +9606,28 @@ fn scan_view_examined_mode(
                 carried_tables.reserve(cursor.cached_tables.len());
                 for table in &cursor.cached_tables {
                     let extent = match reread_table_extent(layout, table, mem, budget) {
-                        Ok(Some(extent)) => extent,
-                        Ok(None) => {
+                        ReplayRead::Bytes(extent) => extent,
+                        ReplayRead::Divergent => {
                             proven = false;
                             break;
                         }
-                        Err(_) => {
+                        ReplayRead::Unavailable | ReplayRead::Refused => {
                             refused = true;
                             break;
                         }
                     };
-                    let Some(carried) =
-                        reprove_cached_table(layout, table, &extent, &map_index, budget)
-                    else {
-                        if budget.stopped_reason().is_some() {
-                            refused = true;
-                        } else {
-                            proven = false;
-                        }
-                        break;
-                    };
+                    let carried =
+                        match reprove_cached_table(layout, table, &extent, &map_index, budget) {
+                            ReplayProof::Carried(carried) => carried,
+                            ReplayProof::Divergent => {
+                                proven = false;
+                                break;
+                            }
+                            ReplayProof::Refused => {
+                                refused = true;
+                                break;
+                            }
+                        };
                     recollected.retain_tables(
                         std::slice::from_ref(&carried),
                         &extent,
@@ -9578,6 +9646,13 @@ fn scan_view_examined_mode(
             }
             if proven && recollected.invalid_span {
                 proven = false;
+            }
+            if refused && budget.stopped_reason().is_none() {
+                // A running pass: a fresh rescan would overwrite the
+                // carried progress with its own unproven result, so the
+                // object waits for a later pass, named.
+                skipped.push(scan_skip(&module.path, REPLAY_UNPROVEN_REASON.into()));
+                continue;
             }
             if refused {
                 dependency.targets.clear();
@@ -9635,27 +9710,35 @@ fn scan_view_examined_mode(
             let mut replay_refused = false;
             for table in &cursor.cached_tables {
                 let extent = match reread_table_extent(layout, table, mem, budget) {
-                    Ok(Some(extent)) => extent,
-                    Ok(None) => {
+                    ReplayRead::Bytes(extent) => extent,
+                    ReplayRead::Divergent => {
                         replay_verified = false;
                         break;
                     }
-                    Err(_) => {
+                    ReplayRead::Unavailable | ReplayRead::Refused => {
                         replay_refused = true;
                         break;
                     }
                 };
-                let Some(carried) =
-                    reprove_cached_table(layout, table, &extent, &map_index, budget)
-                else {
-                    if budget.stopped_reason().is_some() {
-                        replay_refused = true;
-                    } else {
+                let carried = match reprove_cached_table(layout, table, &extent, &map_index, budget)
+                {
+                    ReplayProof::Carried(carried) => carried,
+                    ReplayProof::Divergent => {
                         replay_verified = false;
+                        break;
                     }
-                    break;
+                    ReplayProof::Refused => {
+                        replay_refused = true;
+                        break;
+                    }
                 };
                 carried_tables.push(carried);
+            }
+            if replay_refused && budget.stopped_reason().is_none() {
+                // A running pass: keep the carried cursor and its rows;
+                // the object waits for a later pass, named.
+                skipped.push(scan_skip(&module.path, REPLAY_UNPROVEN_REASON.into()));
+                continue;
             }
             if replay_refused {
                 // A refused re-read checked no bytes: the cursor stays
@@ -23517,9 +23600,8 @@ int main(int argc, char **argv) {
     /// check. With fewer than three units the key is refused, never
     /// built from an unclosed bracket. Only two current probes make a
     /// key: a proved change or an unknown probe on either side refuses
-    /// it (no image read after a failed opening probe), an unknown or
-    /// truncated link refuses it, and a provably missing link keys the
-    /// view with no image.
+    /// it (no image read after a failed opening probe), and an unknown
+    /// or truncated link (`ENOENT` included) refuses it.
     #[test]
     fn resume_exec_bracket_admits_each_generation_check_and_the_read() {
         use std::sync::atomic::Ordering;
@@ -23563,25 +23645,25 @@ int main(int argc, char **argv) {
             (
                 GenerationProof::Changed,
                 GenerationProof::Current,
-                LinkRead::Missing,
+                LinkRead::Target(b"/bin/sh".to_vec()),
                 None,
             ),
             (
                 GenerationProof::Unknown,
                 GenerationProof::Current,
-                LinkRead::Missing,
+                LinkRead::Target(b"/bin/sh".to_vec()),
                 None,
             ),
             (
                 GenerationProof::Current,
                 GenerationProof::Unknown,
-                LinkRead::Missing,
+                LinkRead::Target(b"/bin/sh".to_vec()),
                 None,
             ),
             (
                 GenerationProof::Current,
                 GenerationProof::Changed,
-                LinkRead::Missing,
+                LinkRead::Target(b"/bin/sh".to_vec()),
                 None,
             ),
             (
@@ -23593,8 +23675,8 @@ int main(int argc, char **argv) {
             (
                 GenerationProof::Current,
                 GenerationProof::Current,
-                LinkRead::Missing,
-                Some(None),
+                LinkRead::Target(b"/bin/sh".to_vec()),
+                Some(Some(b"/bin/sh".to_vec())),
             ),
         ] {
             let (mut budget, _) = credited_resume_budget(3);
@@ -23662,7 +23744,7 @@ int main(int argc, char **argv) {
         let start = crate::process::process_start_time(pid).unwrap();
         run(
             "start time",
-            3,
+            4,
             &mut |admit| matches!(crate::process::metered_start_time(pid, admit), Some(Ok(read)) if read == start),
         );
         let exe = std::fs::read_link("/proc/self/exe").unwrap();
@@ -23689,7 +23771,7 @@ int main(int argc, char **argv) {
         });
         assert_eq!(
             metered_io::readlink_once("/proc/self/no-such-link", &mut || true),
-            Some(metered_io::LinkRead::Missing)
+            Some(metered_io::LinkRead::Unknown)
         );
     }
 
@@ -24016,6 +24098,181 @@ int main(int argc, char **argv) {
         assert_eq!(polls, 1, "an interrupted poll is never retried");
     }
 
+    /// Every metered entry point, at every credit count and with `EINTR`
+    /// or `ENOENT` injected at each native call it issues, issues at most
+    /// one native call per debit and never repeats the failed call (no
+    /// hidden retry; a failed stat read may buy one pid probe after it,
+    /// admitted like any call). The calls are counted at the one shim every
+    /// kernel entry goes through; the prepaid close counts against the
+    /// open's second unit.
+    #[test]
+    fn every_metered_entry_point_issues_one_native_call_per_debit() {
+        use crate::process::metered_io::{self, MeteredFile, NativeOp, syscall_test};
+        let pid = std::process::id();
+        let file = File::open("/proc/self/exe").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&file);
+        let view = ProcessView::open(ProcessViewId(98), pid).unwrap();
+        let start = crate::process::process_start_time(pid).unwrap();
+        type Entry<'a> = (&'a str, Box<dyn Fn(&mut dyn FnMut() -> bool) + 'a>);
+        let entries: Vec<Entry<'_>> = vec![
+            (
+                "open, read, close",
+                Box::new(|admit| {
+                    if let Some(Ok(mut opened)) = MeteredFile::open("/proc/self/stat", admit) {
+                        let _ = opened.read(&mut [0u8; 64], admit);
+                    }
+                }),
+            ),
+            (
+                "find_line",
+                Box::new(|admit| {
+                    let _ = metered_io::find_line("/proc/self/mountinfo", admit, |_| None::<()>);
+                }),
+            ),
+            (
+                "read_record",
+                Box::new(|admit| {
+                    let _ = metered_io::read_record("/proc/self/stat", 4096, admit);
+                }),
+            ),
+            (
+                "readlink_once",
+                Box::new(|admit| {
+                    let _ = metered_io::readlink_once("/proc/self/exe", admit);
+                }),
+            ),
+            (
+                "poll_ready_once",
+                Box::new(|admit| {
+                    let _ = view.metered_generation(admit);
+                }),
+            ),
+            (
+                "fstat",
+                Box::new(|admit| {
+                    let _ = metered_io::fstat(fd, admit);
+                }),
+            ),
+            (
+                "fstatfs",
+                Box::new(|admit| {
+                    let _ = metered_io::fstatfs(fd, admit);
+                }),
+            ),
+            (
+                "stat_path",
+                Box::new(|admit| {
+                    let _ = metered_io::stat_path("/proc/self/ns/mnt", admit);
+                }),
+            ),
+            (
+                "pid_absent",
+                Box::new(|admit| {
+                    let _ = metered_io::pid_absent(pid, admit);
+                }),
+            ),
+            (
+                "metered_pid_generation",
+                Box::new(|admit| {
+                    let _ = crate::process::metered_pid_generation(pid, start, admit);
+                }),
+            ),
+            (
+                "metered_closing_proof",
+                Box::new(|admit| {
+                    let _ = view.metered_closing_proof(admit);
+                }),
+            ),
+        ];
+        let measure = |run: &dyn Fn(&mut dyn FnMut() -> bool), credits: u64| {
+            let mut admitted = 0u64;
+            let before = syscall_test::count();
+            run(&mut || {
+                if admitted == credits {
+                    return false;
+                }
+                admitted += 1;
+                true
+            });
+            (syscall_test::since(before), admitted)
+        };
+        let mut exercised = 0usize;
+        for (name, run) in &entries {
+            let (healthy, debits) = measure(run.as_ref(), u64::MAX);
+            assert!(
+                !healthy.is_empty(),
+                "{name}: the healthy run issues native calls"
+            );
+            assert!(
+                healthy.len() as u64 <= debits,
+                "{name}: {} native calls for {debits} debits ({healthy:?})",
+                healthy.len()
+            );
+            for credits in 0..=debits {
+                let (calls, admitted) = measure(run.as_ref(), credits);
+                assert!(
+                    calls.len() as u64 <= admitted,
+                    "{name}, credits {credits}: {calls:?} for {admitted} debits"
+                );
+            }
+            for (position, op) in healthy.iter().enumerate() {
+                if *op == NativeOp::Close {
+                    continue;
+                }
+                let nth = healthy[..position]
+                    .iter()
+                    .filter(|seen| *seen == op)
+                    .count() as u32;
+                for errno in [libc::EINTR, libc::ENOENT] {
+                    syscall_test::fail_nth(*op, nth, errno);
+                    let (calls, admitted) = measure(run.as_ref(), u64::MAX);
+                    syscall_test::disarm();
+                    assert!(
+                        calls.len() as u64 <= admitted,
+                        "{name}: errno {errno} at {op:?} #{nth}: {calls:?} for {admitted} debits (healthy {healthy:?})"
+                    );
+                    let attempts = calls.iter().filter(|seen| *seen == op).count();
+                    assert!(
+                        attempts <= nth as usize + 1,
+                        "{name}: errno {errno} at {op:?} #{nth} was retried ({calls:?})"
+                    );
+                    exercised += 1;
+                }
+            }
+        }
+        assert!(
+            exercised >= 2 * entries.len(),
+            "every entry point met a fault"
+        );
+    }
+
+    /// A task name can hold a newline: the metered start-time reader
+    /// reads the whole stat record and parses past the name, so a live
+    /// task renamed `c2\nworker` still proves its start time.
+    #[test]
+    fn metered_start_time_reads_past_a_newline_in_the_task_name() {
+        let (expected, metered) = std::thread::spawn(|| {
+            let name = std::ffi::CString::new("c2\nworker").unwrap();
+            // SAFETY: PR_SET_NAME reads a NUL-terminated name of this thread.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) }, 0);
+            // SAFETY: gettid has no preconditions.
+            let tid = unsafe { libc::gettid() } as u32;
+            let stat = std::fs::read(format!("/proc/{tid}/stat")).unwrap();
+            assert!(
+                stat.iter().filter(|byte| **byte == b'\n').count() >= 2,
+                "the task name holds a newline"
+            );
+            let expected = crate::process::process_start_time(tid).unwrap();
+            let metered = crate::process::metered_start_time(tid, &mut || true)
+                .expect("an unmetered read is never refused")
+                .ok();
+            (expected, metered)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(metered, Some(expected));
+    }
+
     /// An interrupted open is one attempt: no retry under its two units,
     /// no close for a descriptor that never opened, and an error result.
     #[test]
@@ -24152,7 +24409,7 @@ int main(int argc, char **argv) {
     /// (only the module's errno table maps an error to an outcome).
     const PRIMITIVE_FORBIDDEN: [&str; 7] = [
         "std::fs::",
-        "File::open",
+        "fs::File",
         "io::Read",
         "OpenOptions",
         "read_at",
@@ -25609,6 +25866,7 @@ int main(int argc, char **argv) {
                 &map_index,
                 &mut CaptureWorkBudget::default(),
             )
+            .carried()
         };
         // Stale proof plus extension: rescan to the fresh truth (the
         // end-to-end twin below pins the published surface).

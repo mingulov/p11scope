@@ -37299,20 +37299,411 @@ fn joint_seal_unbound_staging_stays_retry() {
     assert_eq!(gaps.len(), 1, "the stall is named once: {gaps:?}");
 }
 
+/// A clear staging table scans in bounded polls: 97 retained rows on
+/// another image share the frame (above every cut, barring nothing),
+/// and each ten-unit seal examines at most ten rows before yielding
+/// with no decision — LocalPending, zero remaining, no wait, no
+/// advance — until the final poll clears and waits
+/// `AbandonReturnPending` as future input. Total examined rows equal
+/// the staged table; a synchronous walk would decide in one poll
+/// after reading every row uncharged.
+#[test]
+fn joint_seal_barrier_scan_yields_across_bounded_polls_when_clear() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert!(
+        total > 64,
+        "the staging table holds past one credit of rows: {total}"
+    );
+    // Setup may have probed the barrier on its small pre-populated
+    // table; the seals below must visit exactly the populated table
+    // once, measured from here.
+    let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (2, 0, 0),
+        "both consumers start pending"
+    );
+    let mut polls = 0;
+    loop {
+        assert!(
+            polls < 20,
+            "the bounded scan finishes within twenty ten-unit polls"
+        );
+        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_unbound = ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .unbound_staging;
+        let mut remaining = 10;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
+        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        assert!(
+            visits <= 10,
+            "poll {polls} examines at most its ten-unit budget: {visits}"
+        );
+        if progress == Ok(QuantumSealProgress::AwaitFutureInput) {
+            assert_eq!(
+                visits + 1,
+                10 - remaining,
+                "the deciding poll charges its scan plus the one-unit Future advance"
+            );
+            assert_eq!(
+                ports.read().1.adapter().last_seal_wait(),
+                SealWait::AbandonReturnPending,
+                "the wait names its gate"
+            );
+            break;
+        }
+        assert_eq!(
+            progress,
+            Ok(QuantumSealProgress::LocalPending),
+            "poll {polls} yields with no seal decision"
+        );
+        assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
+        assert_eq!(
+            visits, 10,
+            "a yielded poll examines a full slice before yielding"
+        );
+        assert_eq!(
+            ports.read().1.adapter().last_seal_wait(),
+            SealWait::None,
+            "a yielded poll waits on nothing yet"
+        );
+        assert_eq!(
+            ports
+                .read()
+                .1
+                .adapter()
+                .seal_stage_diagnosis()
+                .unbound_staging,
+            before_unbound,
+            "a yielded poll counts no barrier gate"
+        );
+        assert_eq!(
+            frame.consumer_progress_for_test(),
+            (2, 0, 0),
+            "a yielded poll advances no consumer"
+        );
+        assert!(
+            frame.active_seal_for_test().is_none(),
+            "a yielded poll sets no active delivery"
+        );
+    }
+    assert!(
+        polls > 1,
+        "a populated table yields instead of deciding in one poll"
+    );
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
+        total,
+        "the clear scan visits every staged row once across its polls"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .unbound_staging,
+        0,
+        "a clear table never counts the barrier gate"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the consumer advances past the wait"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a Future wait sets no active delivery"
+    );
+}
+
+/// A late barrier scans once and reuses its completed decision: 97
+/// clear rows plus one unbound row at the end of the open table, so
+/// each ten-unit seal yields until the final poll visits the barrier
+/// and waits `UnboundStaging` as a retry (DeliveryReady, no Future
+/// charge, no advance). The next same-frame retry reuses the
+/// completed Barrier with zero new visits and zero spend; restarting
+/// the scan would reread every row on each retry.
+#[test]
+fn joint_seal_barrier_scan_reuses_completed_barrier_across_retries() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    let frontier = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .consumed_through_for_test();
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        adapter.populate_foreign_open_rows_for_test(97);
+        adapter.populate_unbound_barrier_row_for_test(frontier);
+    }
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert!(
+        total > 64,
+        "the staging table holds past one credit of rows: {total}"
+    );
+    let baseline_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let mut polls = 0;
+    loop {
+        assert!(
+            polls < 20,
+            "the bounded scan reaches its late barrier within twenty polls"
+        );
+        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let mut remaining = 10;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
+        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        assert!(
+            visits <= 10,
+            "poll {polls} examines at most its ten-unit budget: {visits}"
+        );
+        if progress == Ok(QuantumSealProgress::DeliveryReady)
+            && ports.read().1.adapter().last_seal_wait() == SealWait::UnboundStaging
+        {
+            assert_eq!(
+                visits,
+                10 - remaining,
+                "the deciding poll charges only its scan (a retry advances nothing)"
+            );
+            assert!(
+                frame.active_seal_for_test().is_some(),
+                "an UnboundStaging wait holds its retry for delivery"
+            );
+            break;
+        }
+        assert_eq!(
+            progress,
+            Ok(QuantumSealProgress::LocalPending),
+            "poll {polls} yields before reaching the late barrier"
+        );
+        assert_eq!(remaining, 0, "a yielded poll spends its whole slice");
+        assert_eq!(
+            ports.read().1.adapter().last_seal_wait(),
+            SealWait::None,
+            "a yielded poll waits on nothing yet"
+        );
+    }
+    assert!(
+        polls > 1,
+        "a late barrier over a populated table yields instead of deciding at once"
+    );
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - baseline_visits,
+        total,
+        "the late barrier visits every staged row once to reach it"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .unbound_staging,
+        1,
+        "the decided barrier counts its gate once"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (2, 0, 0),
+        "a barrier retry advances no consumer"
+    );
+    assert_eq!(
+        frame.deliver_next(&mut ports),
+        Ok(QuantumSealProgress::LocalPending),
+        "the barriered seal retries"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "the retry clears its active delivery"
+    );
+    let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+    let mut remaining = 10;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the same-frame retry re-decides its barrier"
+    );
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::UnboundStaging,
+        "the retry still waits on unbound staging"
+    );
+    assert_eq!(
+        ports.read().1.adapter().barrier_row_visits_for_test() - before_visits,
+        0,
+        "the retry reuses its completed barrier instead of rescanning"
+    );
+    assert_eq!(
+        remaining, 10,
+        "reusing the completed barrier spends no new scan work"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .unbound_staging,
+        2,
+        "each retry still counts its barrier gate"
+    );
+}
+
 /// A failure-path yield that spent budget is progress at the
 /// delivery seam; a yield with no spend stays stuck. A transient
 /// take retry first records a real stale streak (1,
 /// `BootstrapMismatch`) on the head consumer. Starved twin: zero
 /// budget yields with no spend, counting stuck with the streak and
 /// its cause standing. Draining twin: one unit per visit, and the
-/// first spend counts progress, clearing the streak and its cause
-/// and resetting the park cursors — so the watchdog never parks a
-/// feed that is draining. Deleting only the stale-streak clears
-/// leaves the seeded streak standing here.
+/// first spend counts progress, clearing the streak and its cause.
+/// The park-cursor reset has its own unstreaked twin below, since
+/// the broad fault settlement here already resets the park before
+/// any delivery runs. Deleting only the stale-streak clears leaves
+/// the seeded streak standing here.
 #[test]
 fn joint_failure_yielded_spend_counts_progress_at_delivery() {
     use crate::semantics_objects::journal::JournalGap;
-    use crate::semantics_objects::journal::joint_audit::{DeliverDiagnosis, ParkProgress};
+    use crate::semantics_objects::journal::joint_audit::DeliverDiagnosis;
 
     let mut fixture = CanonicalFanoutScene::prior_sealed();
     fixture.push_two("C_SignInit", 2);
@@ -37351,18 +37742,6 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
     assert!(
         takes.inner.seen.is_empty(),
         "the failed take reads no birth"
-    );
-    // Park cursors go nonzero before the progress delivery: a
-    // one-unit park scan examines the unstreaked head and yields
-    // mid-scan, parking nothing.
-    assert_eq!(
-        frame.park_stuck_consumers_bounded(&mut 1),
-        ParkProgress::Yielded
-    );
-    assert_eq!(
-        frame.park_cursors_for_test(),
-        (1, 0),
-        "the yielded scan leaves its resume cursor"
     );
     assert_eq!(
         frame.deliver_next(&mut ports),
@@ -37453,10 +37832,98 @@ fn joint_failure_yielded_spend_counts_progress_at_delivery() {
             .all(|(_, _, streak, parked)| *streak == 0 && !parked),
         "progress resets the streak and parks nothing"
     );
+}
+
+/// A spending failure-path yield resets the watchdog park cursors at
+/// the delivery seam. Unstreaked head: no transient preamble, so a
+/// one-unit park scan after the broad fault has settled examines the
+/// head and yields mid-scan with `(1, 0)`, parking nothing. The
+/// zero-budget visit preserves the cursor (no spend, still stuck);
+/// the first spending yield resets it to `(0, 0)` — so the watchdog
+/// never parks a feed that is draining. Removing only the
+/// spending-yield `reset_park` leaves `(1, 0)` standing here.
+#[test]
+fn joint_failure_yielded_spend_resets_park_cursors_at_delivery() {
+    use crate::semantics_objects::journal::joint_audit::{DeliverDiagnosis, ParkProgress};
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    fixture.push_two("C_SignInit", 3);
+    fixture.push_two("C_SignInit", 4);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(6, 6, &fault);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    // The collection moves before any seal: the next seal fails
+    // closed with a loss both feeds must drain through bounded visits.
+    fault.epoch.set(1);
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    assert_eq!(
+        frame.seal_next(&mut ports, &mut births, &fault),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the moved collection seals its loss for delivery"
+    );
+    // Park cursors go nonzero after the broad settlement (which
+    // already reset them once): a one-unit scan examines the
+    // unstreaked head and yields mid-scan, parking nothing.
+    assert_eq!(
+        frame.park_stuck_consumers_bounded(&mut 1),
+        ParkProgress::Yielded
+    );
+    assert_eq!(
+        frame.park_cursors_for_test(),
+        (1, 0),
+        "the yielded scan leaves its resume cursor"
+    );
+    let mut diagnosis = DeliverDiagnosis::default();
+    // Starved twin: zero budget yields with no spend, preserving the
+    // park cursor.
+    let mut remaining = 0;
+    assert_eq!(
+        frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "a no-spend yield still holds the delivery open"
+    );
+    assert_eq!(diagnosis.f_stuck, 1, "no spend counts stuck");
+    assert_eq!(diagnosis.f_progress, 0, "no spend is not progress");
+    assert_eq!(
+        frame.park_cursors_for_test(),
+        (1, 0),
+        "a no-spend yield preserves the park cursor"
+    );
+    // Draining twin: one unit per visit until the first spend.
+    for _ in 0..8 {
+        if diagnosis.f_progress == 1 {
+            break;
+        }
+        let mut remaining = 1;
+        assert_eq!(
+            frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
+            Ok(QuantumSealProgress::DeliveryReady),
+            "every pre-progress visit yields its delivery open"
+        );
+    }
+    assert_eq!(
+        diagnosis.f_progress, 1,
+        "the first spend counts progress: {diagnosis:?}"
+    );
     assert_eq!(
         frame.park_cursors_for_test(),
         (0, 0),
-        "progress resets the park cursors"
+        "the first spend resets the park cursors"
     );
 }
 

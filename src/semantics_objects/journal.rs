@@ -2246,6 +2246,12 @@ pub(crate) struct JournalAdapter {
     /// settlement must skip it for an already-decided wait.
     #[cfg(test)]
     awaits_terminal_checks: std::cell::Cell<usize>,
+    /// Test-only count of staging rows examined by seal barrier checks.
+    /// Each examined open/refused row costs one budget unit in the
+    /// bounded scan, so a populated table must yield across polls
+    /// instead of reading every row synchronously before charging.
+    #[cfg(test)]
+    barrier_row_visits: std::cell::Cell<usize>,
     /// The inline allowance a deciding call may spend on its own
     /// rejection (at most one credit; a budgeted caller lowers it to
     /// what its service budget has left) and what the last deciding
@@ -2507,6 +2513,8 @@ impl JournalAdapter {
             test_leaf_visits: std::cell::Cell::new(0),
             #[cfg(test)]
             awaits_terminal_checks: std::cell::Cell::new(0),
+            #[cfg(test)]
+            barrier_row_visits: std::cell::Cell::new(0),
             inline_credit: SCOPED_RECOVERY_SLICE,
             inline_spent: 0,
             barrier_scan: None,
@@ -2782,6 +2790,14 @@ impl JournalAdapter {
         self.awaits_terminal_checks.get()
     }
 
+    /// Test-only count of staging rows examined by seal barrier checks
+    /// so far (open plus refused, in scan order, short-circuiting on
+    /// the first barrier when one stands).
+    #[cfg(test)]
+    pub(crate) fn barrier_row_visits_for_test(&self) -> usize {
+        self.barrier_row_visits.get()
+    }
+
     /// Test-only: stage `rows` synthetic unconverted open entries cloned
     /// from a retained one onto an unkeyed foreign image, above every cut
     /// (so they bar nothing), each with its census membership and custody
@@ -2811,6 +2827,41 @@ impl JournalAdapter {
             );
             assert!(self.open.insert(native, entry).is_none());
         }
+    }
+
+    /// Test-only: stage one unbound barrier row at the end of the open
+    /// table (native `(u64::MAX, 0)`, past every
+    /// [`Self::populate_foreign_open_rows_for_test`] clear), on the same
+    /// foreign image but at `frontier` so it bars every seal past it. A
+    /// bounded scan must visit every clear before it; a cached decision
+    /// must spare every same-frame retry the rescan.
+    #[cfg(test)]
+    pub(crate) fn populate_unbound_barrier_row_for_test(&mut self, frontier: u64) {
+        let template = *self.open.values().next().expect("a retained open entry");
+        let native = (u64::MAX, 0);
+        let mut entry = template;
+        entry.image = (template.image.0 ^ 0x5eed_0000, template.image.1);
+        entry.begin_ordinal = frontier;
+        entry.end = None;
+        entry.abandon = None;
+        entry.converted_ticket = None;
+        entry.converted_for = None;
+        entry.end_converted = false;
+        entry.raw_resource = None;
+        entry.collected_origin = None;
+        entry.s1only_subject = None;
+        // The barrier's begin ordinal sits at the sealed frontier, which
+        // real history already charges; custody needs a unique ticket, so
+        // charge a synthetic one past every clear instead of colliding.
+        let custody = u64::MAX / 2 + self.open.len() as u64 + 1_000_000;
+        self.ledger
+            .charge_h8open(custody, 1)
+            .expect("synthetic custody charges");
+        self.retained_member_inc(
+            identity_of_begin(&entry.begin),
+            RetainedMember::Open(native),
+        );
+        assert!(self.open.insert(native, entry).is_none());
     }
 
     /// Test-only read of the adapter invalidation flag; see above.
@@ -9178,13 +9229,18 @@ impl JournalAdapter {
     /// was never attested. Such entries barrier every seal past them.
     fn has_unbound_staging(&self, frontier: u64) -> bool {
         self.open.values().any(|entry| {
+            #[cfg(test)]
+            self.barrier_row_visits
+                .set(self.barrier_row_visits.get().saturating_add(1));
             entry.converted_ticket.is_none()
                 && entry.begin_ordinal <= frontier
                 && !self.image_keys.contains_key(&entry.image)
-        }) || self
-            .refused
-            .iter()
-            .any(|refused| refused.cut <= frontier && !self.image_keys.contains_key(&refused.image))
+        }) || self.refused.iter().any(|refused| {
+            #[cfg(test)]
+            self.barrier_row_visits
+                .set(self.barrier_row_visits.get().saturating_add(1));
+            refused.cut <= frontier && !self.image_keys.contains_key(&refused.image)
+        })
     }
 
     /// Whether every staged entry for one image at or below a frontier

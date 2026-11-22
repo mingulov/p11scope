@@ -754,6 +754,53 @@ impl ProcessView {
         self.pin.original_generation_state()
     }
 
+    /// Whether this view already crossed into the cold retained-member
+    /// filesystem proof (its leader exited).
+    pub(crate) fn cold_filesystem_observed(&self) -> bool {
+        self.cold_filesystem_observed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The closing generation proof of a warm view through the metered
+    /// primitives: one `stat` of the mount-namespace link (compared with
+    /// the namespace retained at admission), then one generation probe
+    /// ([`Self::metered_generation`]), so the namespace read is proven to
+    /// be the original process's. Each native call is one admitted unit
+    /// and none retries. `None` is a refused admission.
+    pub(crate) fn metered_closing_proof(
+        &self,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<ClosingProof> {
+        let namespace = match metered_io::stat_path(&format!("/proc/{}/ns/mnt", self.pid()), admit)?
+        {
+            Ok(stat) => MountNamespaceId {
+                device: stat.st_dev,
+                inode: stat.st_ino,
+            },
+            Err(error) if error.entry_absent() => return Some(ClosingProof::ColdTransition),
+            Err(error) => {
+                if error.denied() {
+                    crate::caps::note_lacking(&crate::caps::TARGET_READ_BITS);
+                }
+                return Some(ClosingProof::Failed(format!(
+                    "cannot identify process mount namespace: {error}"
+                )));
+            }
+        };
+        if let Err(reason) = ensure_same_mount_namespace(self.mount_namespace, namespace) {
+            return Some(ClosingProof::Failed(reason));
+        }
+        Some(match self.metered_generation(admit)? {
+            GenerationProof::Current => ClosingProof::Current,
+            GenerationProof::Changed => {
+                ClosingProof::Failed("original process exited during filesystem access".into())
+            }
+            GenerationProof::Unknown => ClosingProof::Failed(
+                "cannot prove the original process generation during filesystem access".into(),
+            ),
+        })
+    }
+
     /// Whether this view's original thread group has exited or can never
     /// run user code again (see `PidPin::final_exit_in_progress`).
     pub(crate) fn final_exit_in_progress(&self) -> bool {
@@ -968,16 +1015,52 @@ pub(crate) enum GenerationProof {
 pub(crate) fn metered_start_time(
     pid: u32,
     admit: &mut dyn FnMut() -> bool,
-) -> Option<io::Result<u64>> {
+) -> Option<metered_io::Native<u64>> {
+    // The whole record, parsed past the task name's closing parenthesis:
+    // a task name can hold a newline, so no row reader applies.
+    const MAX_STAT_BYTES: usize = 4096;
     Some(
-        match metered_io::find_line(&format!("/proc/{pid}/stat"), admit, |row| {
-            Some(row.to_owned())
-        })? {
-            Ok(Some(row)) => start_time_from_stat(&row),
-            Ok(None) => Err(io::Error::new(io::ErrorKind::InvalidData, "empty stat")),
-            Err(error) => Err(error),
-        },
+        metered_io::read_record(&format!("/proc/{pid}/stat"), MAX_STAT_BYTES, admit)?.and_then(
+            |record| {
+                start_time_from_stat(&String::from_utf8_lossy(&record))
+                    .map_err(metered_io::Unproven::new)
+            },
+        ),
     )
+}
+
+/// One metered generation verdict for `pid` against its retained start
+/// time: the whole `/proc/<pid>/stat` record (open with its close, reads
+/// to end of file: four units), then only on a failed read one pid probe
+/// (one unit). A start time that reads equal is current and a different
+/// one is a reuse; a failed read proves nothing unless the pid probe
+/// proves no process holds the pid (hidepid or a namespace boundary can
+/// hide a live process's stat). `None` is a refused admission.
+pub(crate) fn metered_pid_generation(
+    pid: u32,
+    retained: u64,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<GenerationProof> {
+    Some(match metered_start_time(pid, admit)? {
+        Ok(current) if current == retained => GenerationProof::Current,
+        Ok(_) => GenerationProof::Changed,
+        Err(_) => match metered_io::pid_absent(pid, admit)? {
+            Ok(true) => GenerationProof::Changed,
+            Ok(false) | Err(_) => GenerationProof::Unknown,
+        },
+    })
+}
+
+/// The closing generation proof of a warm view.
+#[derive(Debug)]
+pub(crate) enum ClosingProof {
+    /// Same mount namespace, original process current.
+    Current,
+    /// The namespace link is gone: the leader may have left survivors,
+    /// so only the cold retained-member proof can decide.
+    ColdTransition,
+    /// The proof failed or proved nothing, with its reason.
+    Failed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1604,8 +1687,8 @@ impl PidPin {
     }
 
     /// One metered generation probe through the metered primitives:
-    /// a single pidfd poll (one unit), or on the fallback pin one
-    /// `/proc/<pid>/stat` row read (open with its close, one read: three
+    /// a single pidfd poll (one unit; a readable pidfd proves the exit),
+    /// or on the fallback pin [`metered_pid_generation`] (at most five
     /// units). `None` is a refused admission. A failed or interrupted
     /// call, or a fallback pin with no retained start time, is
     /// [`GenerationProof::Unknown`], never a change.
@@ -1627,14 +1710,7 @@ impl PidPin {
                 let Some(retained) = self.start_time else {
                     return Some(GenerationProof::Unknown);
                 };
-                Some(match metered_start_time(self.pid, admit)? {
-                    Ok(current) if current == retained => GenerationProof::Current,
-                    Ok(_) => GenerationProof::Changed,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        GenerationProof::Changed
-                    }
-                    Err(_) => GenerationProof::Unknown,
-                })
+                metered_pid_generation(self.pid, retained, admit)
             }
         }
     }

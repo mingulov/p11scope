@@ -1090,12 +1090,14 @@ impl ScanPassOwner {
         if let Some(&live) = self.decode.liveness.get(&(pid, start_time)) {
             return Some(live);
         }
-        let read = crate::process::metered_start_time(pid, &mut || self.admit_resume_syscall())?;
+        let proof = crate::process::metered_pid_generation(pid, start_time, &mut || {
+            self.admit_resume_syscall()
+        })?;
         #[cfg(test)]
         {
             self.decode.probes = self.decode.probes.saturating_add(1);
         }
-        let live = generation_live_from(read, start_time);
+        let live = generation_live_from(proof);
         self.decode.liveness.insert((pid, start_time), live);
         Some(live)
     }
@@ -2532,41 +2534,30 @@ impl ScanPassOwner {
     }
 }
 
-/// Whether a start-time read shows `start_time` still live. Dead or
-/// recycled pids sort their cursors as reclaimable: an unfinished cursor
-/// for a dead pid can never resume, so keeping it ahead of live work
-/// would stall churn under cap pressure. Only a proof reclaims: a
-/// different start time or a missing process. Any other failure is
-/// unknown and sorts live (never evict on missing proof).
-fn generation_live_from(read: std::io::Result<u64>, start_time: u64) -> bool {
-    match read {
-        Ok(live) => live == start_time,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-    }
+/// Whether a generation verdict leaves the cursor's process live. Dead
+/// or recycled pids sort their cursors as reclaimable: an unfinished
+/// cursor for a dead pid can never resume, so keeping it ahead of live
+/// work would stall churn under cap pressure. Only a proof reclaims (a
+/// different start time, or no process holding the pid); an unknown
+/// verdict sorts live (never evict on missing proof).
+fn generation_live_from(proof: crate::process::GenerationProof) -> bool {
+    proof != crate::process::GenerationProof::Changed
 }
 
 #[cfg(test)]
 mod tests {
-    /// Cache-victim liveness reclaims only on proof: a different start
-    /// time or a missing process; any other read failure sorts live.
+    /// Cache-victim liveness reclaims only on proof: a proved change
+    /// (a different start time, or no process holding the pid); an
+    /// unknown verdict sorts live.
     #[test]
     fn generation_liveness_reclaims_only_on_proof() {
-        assert!(super::generation_live_from(Ok(7), 7));
-        assert!(!super::generation_live_from(Ok(8), 7));
-        assert!(!super::generation_live_from(
-            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
-            7
-        ));
-        for kind in [
-            std::io::ErrorKind::PermissionDenied,
-            std::io::ErrorKind::Interrupted,
-            std::io::ErrorKind::InvalidData,
-        ] {
-            assert!(
-                super::generation_live_from(Err(std::io::Error::from(kind)), 7),
-                "{kind:?} proves nothing"
-            );
-        }
+        use crate::process::GenerationProof;
+        assert!(super::generation_live_from(GenerationProof::Current));
+        assert!(!super::generation_live_from(GenerationProof::Changed));
+        assert!(
+            super::generation_live_from(GenerationProof::Unknown),
+            "an unknown verdict proves nothing"
+        );
     }
 
     use super::{

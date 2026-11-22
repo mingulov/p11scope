@@ -523,35 +523,51 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   through the lost history. When nothing rises, the
   snapshot stops and the live in-progress gap names the work left.
 - Resume I/O is charged per syscall (owner 2, INV-2), closes
-  included. Every native call the resume, cursor-key, closing-bracket
-  and cache-victim code issues goes through one small set of metered
-  primitives (`process::metered_io`): an open buys two units (itself
-  and its close, issued on drop), each read, `fstat`, `fstatfs`,
-  readlink and pidfd poll one unit, each with a stop check first and
-  no retry under one unit. The row reader reads 4 KiB chunks, buys one
-  more unit per 64 rows and refuses a row over 64 KiB before decoding
-  or matching it. The readlink uses a PATH_MAX buffer and reports a
-  full buffer as unknown, never as a truncated target.
-- Generation checks return a typed proof (current, changed, unknown):
-  a pidfd poll error, a fallback pin with no retained start time and
-  any start-time read failure other than a missing process are
-  unknown. Only two current probes make an executable cursor key; an
-  unknown or changed probe makes no key. The closing check is bought
-  from three units reserved when the view's scan starts (refused
-  before memory is acquired when they cannot be reserved), probed at
-  most once and shared by the keep, staging and retirement decisions:
-  only current keeps or stages, only changed retires, unknown leaves
-  carried cursors untouched. The cache victim sorts live unless the
-  start time differs or the process is missing.
-- A replay read or re-proof target charge refused by the pass stop or
-  by shared credit keeps the carried cursor installed; only a read
-  that succeeds and then fails its bytes check drops it. The stop is polled before each replay
-  charge and inside the triple read.
-- A source guard test collects every site that issues raw I/O (std
-  file opens and reads whose drop closes a descriptor, std readlinks,
-  `libc::` calls, poll and generation retry wrappers) outside the
-  metered primitives in the audited resume code, and checks that the
-  primitives admit before each call and never loop around one.
+  included. Every native call the resume, cursor-key, replay,
+  closing-bracket and cache-victim code issues goes through one module
+  (`process::metered_io`), and every kernel entry there goes through
+  one shim, straight to `libc`: std's wrappers retry `EINTR` or grow
+  buffers under one unit and are not used. An open buys two units
+  (itself and its close, issued on drop); each read, `fstat`, `fstatfs`,
+  `stat`, readlink, pidfd poll and pid probe one unit, each after a
+  stop check, and none retries. The row reader reads 4 KiB chunks, buys
+  one more unit per 64 rows and refuses a row over 64 KiB before
+  decoding or matching it. The stat start time is read as a whole
+  record to end of file (a task name can hold a newline). The readlink
+  uses a PATH_MAX buffer and reports a full buffer as unknown.
+- The errno table: a failed native call proves nothing. Every errno,
+  `ENOENT` (hidepid, a namespace boundary, a racing exit) and `EINTR`
+  included, is unknown; only a successful call proves a value. The one
+  proof from an errno is `kill(pid, 0)` returning `ESRCH`: no process
+  holds the pid. Generation checks return current, changed or unknown:
+  a ready pidfd, a different start time read whole, or a pid no process
+  holds is a change; anything else that is not current is unknown. Only
+  two current probes and a whole link make an executable cursor key.
+- The closing check of a warm view goes through the same primitives,
+  one debit (a stop check plus one charged work unit) per native call:
+  one `stat` of the mount-namespace link, compared with the admitted
+  namespace, then one generation probe. A view whose namespace link is
+  gone, or whose leader already exited, keeps the cold retained-member
+  proof. A failed check is probed again only through the units
+  reserved when the view's scan starts (five, the fallback pin's worst
+  case), at most once, shared by the keep, staging and retirement
+  decisions: only current keeps or stages, only changed retires,
+  unknown leaves carried cursors untouched. The cache victim sorts live
+  unless its generation is proved changed.
+- Replay outcomes are typed: bytes read, divergent, unavailable (a
+  short or failed read) or refused (the pass stop, the work charge, a
+  retained table key or a target charge). Only divergent bytes drop the
+  carried cursor. On a running pass an unavailable or refused replay
+  keeps the cursor and its rows and names the object as waiting for a
+  later pass, rather than letting a fresh rescan overwrite the carried
+  progress; on a stopped pass the stop is named as before.
+- A source guard test forbids std I/O and errno inspection inside the
+  primitives, requires every kernel entry point to sit inside the shim,
+  forbids raw I/O and errno inspection in the audited callers, and
+  requires the production closing proof and the typed replay outcomes.
+  A behaviour test runs every primitive at every credit count and with
+  `EINTR` and `ENOENT` injected at each native call, counting the calls
+  at the shim against the debits.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

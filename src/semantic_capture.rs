@@ -20,7 +20,7 @@ use crate::semantics_objects::journal::{
     BirthKind, BootstrapReceipt, JournalAdapter, JournalBirthCut, JournalDomainProof,
 };
 use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
-use p11scope_ebpf_common::{EventRecord, ImageIdentity, event_type};
+use p11scope_ebpf_common::{EventRecord, ImageIdentity, event_type, instance};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::ControlFlow;
@@ -3973,9 +3973,18 @@ impl SemanticCapture {
                 );
                 continue;
             };
-            if endpoint.is_none_or(|ep| {
-                u32::from(record.base.continuity.entry_stamp.file_slot_plus1) != ep.file_slot + 1
-            }) {
+            // An evicted call carries a zeroed entry stamp (its
+            // INSTANCE_START entry was gone on the return path): it has
+            // no file slot to check against the endpoint, so it must
+            // reach the router (Unstamped) instead of the
+            // endpoint-mismatch arm (NoFile).
+            let stamped = record.base.continuity.entry_stamp.flags & instance::STAMP_VALID != 0;
+            if stamped
+                && endpoint.is_none_or(|ep| {
+                    u32::from(record.base.continuity.entry_stamp.file_slot_plus1)
+                        != ep.file_slot + 1
+                })
+            {
                 self.emit(
                     Some(token),
                     record,

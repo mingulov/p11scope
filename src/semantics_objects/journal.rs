@@ -2137,11 +2137,45 @@ pub(crate) enum BarrierCheck {
 /// Resumable barrier-scan cursors: open resumes by key (valid
 /// across table mutations); refused resumes by index, restarting
 /// when its length moved.
-struct BarrierScan {
+#[derive(Clone, Debug)]
+pub(crate) struct BarrierScan {
     open_after: Option<JournalNativeKey>,
     refused_index: usize,
     refused_len: usize,
     refused_phase: bool,
+}
+
+/// One completed production-seal barrier decision, retained for its
+/// frame while the same frontier and staging/binding membership
+/// stand. Unbound entries never convert (no key names their image),
+/// so conversion alone never flips the answer; any membership change
+/// (ingest, wipe, new attestation) changes a length below and drops
+/// the decision. A new frame starts with no decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SealBarrierDecision {
+    frontier: u64,
+    barrier: bool,
+    open_len: usize,
+    refused_len: usize,
+    image_keys_len: usize,
+}
+
+/// Production-seal barrier work held by its frame: the resumable
+/// cursor while a scan runs, plus the completed decision once it
+/// finishes. Both survive same-frame retries; staging membership
+/// changes invalidate them on next use.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SealBarrierState {
+    cursor: Option<BarrierScan>,
+    decision: Option<SealBarrierDecision>,
+}
+
+/// One production-seal attempt: either a decided seal outcome, or a
+/// yielded barrier scan that spent its slice and must resume with
+/// more budget before the seal can decide.
+pub(crate) enum SealAttempt {
+    Decided(Result<SealSuccess, SealFailure>),
+    Yielded,
 }
 
 /// Resumable scoped-recovery phases in order.
@@ -8850,14 +8884,23 @@ impl JournalAdapter {
             let frontier = frontier.0;
             self.check_seal_entry(audit, frontier)?;
             self.audit_collected(model, audit, fault)?;
-            self.seal_domain_inner(
+            let mut barrier = SealBarrierState::default();
+            let mut budget = usize::MAX;
+            match self.seal_domain_inner(
                 model,
                 audit,
                 bootstrap,
                 ConsumptionOrdinal(frontier),
                 births,
                 None,
-            )
+                &mut barrier,
+                &mut budget,
+            ) {
+                SealAttempt::Decided(outcome) => outcome,
+                SealAttempt::Yielded => {
+                    panic!("test-only seal with unbounded budget yielded its barrier scan")
+                }
+            }
         })();
         outcome.map_err(|failure| self.complete_rejection_now(model, mark, failure))
     }
@@ -8865,6 +8908,10 @@ impl JournalAdapter {
     /// Per-domain conversion under the frame's already adjudicated collection.
     /// The opaque input can only be minted by that frame. A fresh fault read
     /// may add a later broad loss; it never takes or re-audits H3/counters.
+    /// The barrier scan charges `budget` (the frame's shared slice) per
+    /// examined row and resumes from `barrier` across retries; a yielded
+    /// scan decides nothing and keeps `None` as this attempt's wait.
+    #[allow(clippy::too_many_arguments)]
     fn seal_in_audit(
         &mut self,
         model: &mut ObjectSemantics,
@@ -8872,12 +8919,16 @@ impl JournalAdapter {
         births: &mut impl BirthEvidenceSource,
         fault: &impl FaultEpoch,
         replay: ReplayPreparation,
-    ) -> Result<SealSuccess, SealFailure> {
+        barrier: &mut SealBarrierState,
+        budget: &mut usize,
+    ) -> SealAttempt {
         let (audit, bootstrap, frontier) = input.into_parts();
         self.seal_wait.set(SealWait::None);
         let requested = self.retained_failure_domain(bootstrap);
-        let outcome = (|| {
-            self.check_seal_entry(audit, frontier.0)?;
+        let attempt = (|| {
+            if let Err(failure) = self.check_seal_entry(audit, frontier.0) {
+                return SealAttempt::Decided(Err(failure));
+            }
             let reading = fault.fault_epoch();
             let gap = match reading {
                 Err(FaultReadError::Saturated) => Some(JournalGap::FaultSaturated),
@@ -8897,21 +8948,38 @@ impl JournalAdapter {
             if let Some(gap) = gap {
                 // An absorbed post-collection fault returns Ok and the
                 // seal below proceeds; only real voids propagate.
-                self.reject_audit(model, audit, gap, reading)?;
+                if let Err(failure) = self.reject_audit(model, audit, gap, reading) {
+                    return SealAttempt::Decided(Err(failure));
+                }
             }
-            self.seal_domain_inner(model, audit, bootstrap, frontier, births, Some(replay))
+            self.seal_domain_inner(
+                model,
+                audit,
+                bootstrap,
+                frontier,
+                births,
+                Some(replay),
+                barrier,
+                budget,
+            )
         })();
-        outcome.map_err(|mut failure| {
-            if matches!(failure.scope, SealFailureScope::Unqualified)
-                && failure.gap != JournalGap::DrainMismatch
-                && let Some(domain) = requested
-            {
-                failure.scope = SealFailureScope::Domain(domain);
+        match attempt {
+            SealAttempt::Yielded => SealAttempt::Yielded,
+            SealAttempt::Decided(outcome) => {
+                SealAttempt::Decided(outcome.map_err(|mut failure| {
+                    if matches!(failure.scope, SealFailureScope::Unqualified)
+                        && failure.gap != JournalGap::DrainMismatch
+                        && let Some(domain) = requested
+                    {
+                        failure.scope = SealFailureScope::Domain(domain);
+                    }
+                    failure
+                }))
             }
-            failure
-        })
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn seal_domain_inner(
         &mut self,
         model: &mut ObjectSemantics,
@@ -8920,7 +8988,9 @@ impl JournalAdapter {
         frontier: ConsumptionOrdinal,
         births: &mut impl BirthEvidenceSource,
         replay: Option<ReplayPreparation>,
-    ) -> Result<SealSuccess, SealFailure> {
+        barrier: &mut SealBarrierState,
+        budget: &mut usize,
+    ) -> SealAttempt {
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
         // A quarantine evidencing only fenced history lifts here (counted,
@@ -8930,18 +9000,18 @@ impl JournalAdapter {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
             self.note_bootstrap_arm(SealBootstrapArm::Other);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         };
         if state.refused || state.tainted {
             self.note_seal_stage(SealStageGate::DomainTainted);
-            return Err(self.failure(JournalGap::DomainTainted));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::DomainTainted)));
         }
         if self.image_taint_blocks(
             (key.cookie, key.exec),
             state.void_fence.max(self.voided_through),
         ) {
             self.note_seal_stage(SealStageGate::ImageTainted);
-            return Err(self.failure(JournalGap::ImageTainted));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::ImageTainted)));
         }
         // The collection's drain must be the EVENTS-map identity the
         // Session bound to this proof's native domain: one Session's
@@ -8953,11 +9023,11 @@ impl JournalAdapter {
             && self.drain_pins.get(&key.domain_tag) != Some(&drained)
         {
             self.note_seal_stage(SealStageGate::DrainMismatch);
-            return Err(self.failure(JournalGap::DrainMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::DrainMismatch)));
         }
         if state.era_ended {
             self.note_seal_stage(SealStageGate::DomainEnded);
-            return Err(self.failure(JournalGap::DomainEnded));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::DomainEnded)));
         }
         let completed = state.era_completed;
         // Era discipline: the proof carries the live era, or the next era
@@ -8967,13 +9037,13 @@ impl JournalAdapter {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
             self.note_bootstrap_arm(SealBootstrapArm::Other);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
         // The receipt's own generation must be live: a birth verified
         // under a replaced endpoint set proves nothing under this one.
         if bootstrap.closure_generation() != self.closure_generation {
             self.note_seal_stage(SealStageGate::ClosureStale);
-            return Err(self.failure(JournalGap::ClosureStale));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::ClosureStale)));
         }
         if let Some(stream) = bootstrap.grant.stream
             && !self.accepts_birth_cut(&JournalBirthCut {
@@ -8984,7 +9054,7 @@ impl JournalAdapter {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
             self.note_bootstrap_arm(SealBootstrapArm::Other);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
         // Pull one fresh birth observation: the seal never receives a
         // reusable evidence value. A failed take refuses (the next tick
@@ -9004,7 +9074,7 @@ impl JournalAdapter {
                 // watchdog park, like any stuck retry.
                 let mut failure = self.failure(JournalGap::BootstrapMismatch);
                 failure.take_failed = Some(refusal);
-                return Err(failure);
+                return SealAttempt::Decided(Err(failure));
             }
         };
         // Re-verify the birth with fresh Session evidence against
@@ -9032,7 +9102,7 @@ impl JournalAdapter {
             if gap == JournalGap::ImageTainted {
                 self.note_seal_stage(SealStageGate::ImageTainted);
             }
-            return Err(self.failure(gap));
+            return SealAttempt::Decided(Err(self.failure(gap)));
         }
         // The birth cut pins per key-era at first seal: a later seal for
         // the same era must carry the same cut. Rebirth above kept staged
@@ -9043,7 +9113,7 @@ impl JournalAdapter {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
             self.note_bootstrap_arm(SealBootstrapArm::Pin);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
         // The birth covers all retained staged history for the key:
         // conversion proves staged begins, so a cut at or above any of
@@ -9055,17 +9125,17 @@ impl JournalAdapter {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
             self.note_bootstrap_arm(SealBootstrapArm::Covers);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
         if frontier < state.sealed_through {
             self.note_seal_stage(SealStageGate::FrontierRegression);
-            return Err(self.failure(JournalGap::FrontierRegression));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::FrontierRegression)));
         }
         if bootstrap.birth_cut() > frontier {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
             self.note_bootstrap_arm(SealBootstrapArm::Other);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
         // Resumption below the void fence refuses: a fresh birth names
         // the fence it resumes at. At the fence is sound (the fenced
@@ -9077,7 +9147,7 @@ impl JournalAdapter {
             // The refusal below is unchanged.
             self.seal_below_fence = self.seal_below_fence.saturating_add(1);
             self.note_seal_stage(SealStageGate::BelowFence);
-            return Err(self.failure(JournalGap::BootstrapMismatch));
+            return SealAttempt::Decided(Err(self.failure(JournalGap::BootstrapMismatch)));
         }
         // Unclaimed staged history barriers every seal past it: an
         // entry no bound key can account for is never silently
@@ -9085,9 +9155,18 @@ impl JournalAdapter {
         // recorded refusal disposal (image taint, disposed raw, or
         // refused S1-only subjects), each with its gap and ledger
         // accounting.
-        if self.has_unbound_staging(frontier) {
-            self.note_seal_stage(SealStageGate::UnboundStaging);
-            return Err(self.wait(SealWait::UnboundStaging));
+        match self.scan_seal_barrier(barrier, frontier, budget) {
+            BarrierCheck::Barrier => {
+                self.note_seal_stage(SealStageGate::UnboundStaging);
+                return SealAttempt::Decided(Err(self.wait(SealWait::UnboundStaging)));
+            }
+            BarrierCheck::Clear => {
+                // The scan spent from the shared slice; re-bound the
+                // inline allowance to what remains so a later doom or
+                // void never spends past the service budget.
+                self.inline_credit = (*budget).min(SCOPED_RECOVERY_SLICE);
+            }
+            BarrierCheck::Yielded => return SealAttempt::Yielded,
         }
         // With sibling keys, every staged entry for this image needs
         // its attribution: this key's entries convert, a sibling's
@@ -9098,7 +9177,7 @@ impl JournalAdapter {
             AttributionReadiness::Ready => {}
             AttributionReadiness::Pending => {
                 self.note_seal_stage(SealStageGate::AttributionPending);
-                return Err(self.wait(SealWait::AttributionPending));
+                return SealAttempt::Decided(Err(self.wait(SealWait::AttributionPending)));
             }
             AttributionReadiness::Unmatched(evidence) => {
                 // No claim can ever name this staged call: the image's
@@ -9106,7 +9185,7 @@ impl JournalAdapter {
                 // attempt named (like duplicate claims) instead of holding.
                 self.taint_image_at(image, TaintCause::ClaimUnmatched, evidence);
                 self.note_seal_stage(SealStageGate::ClaimUnmatched);
-                return Err(self.failure(JournalGap::ClaimUnmatched));
+                return SealAttempt::Decided(Err(self.failure(JournalGap::ClaimUnmatched)));
             }
         }
         // A fresh birth (no pinned cut for this era) must ground its
@@ -9119,7 +9198,7 @@ impl JournalAdapter {
             && !self.has_staged_history(key, &live, bootstrap.birth_cut(), frontier)
         {
             self.note_seal_stage(SealStageGate::FreshBirthNoHistory);
-            return Err(self.wait(SealWait::FreshBirthNoHistory));
+            return SealAttempt::Decided(Err(self.wait(SealWait::FreshBirthNoHistory)));
         }
         // The model's bootstrap authority is derived, not supplied:
         // strictly above the birth, the last sealed frontier, the void
@@ -9157,18 +9236,20 @@ impl JournalAdapter {
                 pending_bounds.push(at);
             }
         }
-        let floors = derive_model_floors(
+        let floors = match derive_model_floors(
             bootstrap.birth_cut(),
             state.sealed_through,
             state.void_fence,
             state.bounded_upper,
             &pending_bounds,
-        )
-        .map_err(|gap| {
-            debug_assert_eq!(gap, JournalGap::CutExhausted);
-            self.note_seal_stage(SealStageGate::CutExhausted);
-            self.failure(gap)
-        })?;
+        ) {
+            Ok(floors) => floors,
+            Err(gap) => {
+                debug_assert_eq!(gap, JournalGap::CutExhausted);
+                self.note_seal_stage(SealStageGate::CutExhausted);
+                return SealAttempt::Decided(Err(self.failure(gap)));
+            }
+        };
         // Held pin: the earliest staged begin this seal keeps. Bounded
         // losses removed below contribute their bound instead of their
         // begin; everything else convertible here may still apply. A
@@ -9190,7 +9271,7 @@ impl JournalAdapter {
             .min();
         if floors > frontier {
             self.note_seal_stage(SealStageGate::FloorsPastFrontier);
-            return Err(self.wait(SealWait::FloorsPastFrontier));
+            return SealAttempt::Decided(Err(self.wait(SealWait::FloorsPastFrontier)));
         }
         let fence = match held {
             Some(pinned) if pinned < floors => None,
@@ -9203,13 +9284,13 @@ impl JournalAdapter {
         // history after it cannot be proved under the ended domain and
         // keeps the ordinary path's refusal.
         if completed && !self.has_history_through(key, &live, frontier) {
-            return self.seal_completed_era(key, bootstrap, frontier, replay);
+            return SealAttempt::Decided(self.seal_completed_era(key, bootstrap, frontier, replay));
         }
         let outcome = self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay);
         if outcome.is_ok() {
             self.note_seal_stage(SealStageGate::Success);
         }
-        outcome
+        SealAttempt::Decided(outcome)
     }
 
     /// Whether any staged wire truth for one key sits at or below a
@@ -9494,6 +9575,131 @@ impl JournalAdapter {
                 *budget = budget.saturating_sub(examined);
                 if examined < allowance || scan.refused_index >= self.refused.len() {
                     self.barrier_scan = None;
+                    return BarrierCheck::Clear;
+                }
+            }
+        }
+    }
+
+    /// One bounded production-seal barrier scan for a frame's
+    /// frontier, charging the frame's shared slice per examined row
+    /// and resuming from the frame's cursor across retries. A
+    /// completed decision is retained while the same frontier and
+    /// staging/binding membership stand, so same-frame retries reuse
+    /// it with zero new visits; any membership change drops it and
+    /// restarts. Yields (saving its cursor, deciding nothing) when
+    /// the budget exhausts.
+    pub(crate) fn scan_seal_barrier(
+        &self,
+        state: &mut SealBarrierState,
+        frontier: u64,
+        budget: &mut usize,
+    ) -> BarrierCheck {
+        if let Some(decision) = state.decision {
+            if decision.frontier == frontier
+                && decision.open_len == self.open.len()
+                && decision.refused_len == self.refused.len()
+                && decision.image_keys_len == self.image_keys.len()
+            {
+                return if decision.barrier {
+                    BarrierCheck::Barrier
+                } else {
+                    BarrierCheck::Clear
+                };
+            }
+            state.decision = None;
+            state.cursor = None;
+        }
+        let mut scan = state.cursor.take().unwrap_or(BarrierScan {
+            open_after: None,
+            refused_index: 0,
+            refused_len: self.refused.len(),
+            refused_phase: false,
+        });
+        if scan.refused_len != self.refused.len() {
+            scan.refused_index = 0;
+            scan.refused_len = self.refused.len();
+        }
+        loop {
+            if *budget == 0 {
+                state.cursor = Some(scan);
+                return BarrierCheck::Yielded;
+            }
+            let allowance = SCOPED_RECOVERY_SLICE.min(*budget);
+            let mut examined = 0usize;
+            if !scan.refused_phase {
+                let range = match scan.open_after {
+                    None => self.open.range((
+                        std::ops::Bound::<JournalNativeKey>::Unbounded,
+                        std::ops::Bound::<JournalNativeKey>::Unbounded,
+                    )),
+                    Some(last) => self
+                        .open
+                        .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded)),
+                };
+                for (key, entry) in range {
+                    if examined >= allowance {
+                        break;
+                    }
+                    examined += 1;
+                    #[cfg(test)]
+                    self.barrier_row_visits
+                        .set(self.barrier_row_visits.get().saturating_add(1));
+                    scan.open_after = Some(*key);
+                    if entry.converted_ticket.is_none()
+                        && entry.begin_ordinal <= frontier
+                        && !self.image_keys.contains_key(&entry.image)
+                    {
+                        *budget = budget.saturating_sub(examined);
+                        state.decision = Some(SealBarrierDecision {
+                            frontier,
+                            barrier: true,
+                            open_len: self.open.len(),
+                            refused_len: self.refused.len(),
+                            image_keys_len: self.image_keys.len(),
+                        });
+                        state.cursor = None;
+                        return BarrierCheck::Barrier;
+                    }
+                }
+                *budget = budget.saturating_sub(examined);
+                if examined < allowance {
+                    scan.refused_phase = true;
+                    scan.refused_index = 0;
+                    scan.refused_len = self.refused.len();
+                    continue;
+                }
+            } else {
+                while scan.refused_index < self.refused.len() && examined < allowance {
+                    let refused = &self.refused[scan.refused_index];
+                    scan.refused_index += 1;
+                    examined += 1;
+                    #[cfg(test)]
+                    self.barrier_row_visits
+                        .set(self.barrier_row_visits.get().saturating_add(1));
+                    if refused.cut <= frontier && !self.image_keys.contains_key(&refused.image) {
+                        *budget = budget.saturating_sub(examined);
+                        state.decision = Some(SealBarrierDecision {
+                            frontier,
+                            barrier: true,
+                            open_len: self.open.len(),
+                            refused_len: self.refused.len(),
+                            image_keys_len: self.image_keys.len(),
+                        });
+                        state.cursor = None;
+                        return BarrierCheck::Barrier;
+                    }
+                }
+                *budget = budget.saturating_sub(examined);
+                if examined < allowance || scan.refused_index >= self.refused.len() {
+                    state.decision = Some(SealBarrierDecision {
+                        frontier,
+                        barrier: false,
+                        open_len: self.open.len(),
+                        refused_len: self.refused.len(),
+                        image_keys_len: self.image_keys.len(),
+                    });
+                    state.cursor = None;
                     return BarrierCheck::Clear;
                 }
             }

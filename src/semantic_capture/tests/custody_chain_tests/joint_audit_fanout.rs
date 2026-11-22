@@ -39177,11 +39177,11 @@ fn joint_machine_idle_fresh_birth_finish_with_waiting_caller_is_clean() {
 
 /// A seal whose bounded abandonment lacks its corroborating return
 /// waits as future input: the return can only arrive in a later
-/// quantum, so the immutable frame finishes (charging one unit) and
-/// the consumer advances to Future with the wait's stage gate
-/// counted — instead of retrying into the lane-wide no-progress
-/// bound. Reverting the wait to retry returns `DeliveryReady` here
-/// instead.
+/// quantum, so the immutable frame finishes (charging its barrier
+/// scan plus the one-unit Future advance) and the consumer advances
+/// to Future with the wait's stage gate counted — instead of
+/// retrying into the lane-wide no-progress bound. Reverting the wait
+/// to retry returns `DeliveryReady` here instead.
 #[test]
 fn joint_seal_abandon_return_pending_waits_as_future_input() {
     use crate::semantics_objects::journal::SealWait;
@@ -39251,13 +39251,19 @@ fn joint_seal_abandon_return_pending_waits_as_future_input() {
         .adapter()
         .seal_stage_diagnosis()
         .abandon_return_pending;
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
     let mut remaining = 10;
     assert_eq!(
         frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the uncorroborated bound waits as future input"
     );
-    assert_eq!(remaining, 9, "the finished frame charges one unit");
+    assert_eq!(
+        remaining,
+        10 - total - 1,
+        "the finished frame charges its barrier scan plus the one-unit Future advance"
+    );
     assert_eq!(
         ports.read().1.adapter().last_seal_wait(),
         SealWait::AbandonReturnPending,
@@ -39294,7 +39300,8 @@ fn joint_seal_abandon_return_pending_waits_as_future_input() {
 /// A seal at an unchanged frontier (everything already sealed, no new
 /// history) waits as future input instead of succeeding vacuously:
 /// only the caller's future calls can ground new authority. The
-/// repeat counts its floors gate and charges one unit.
+/// repeat counts its floors gate and charges its barrier scan plus
+/// the one-unit Future advance.
 #[test]
 fn joint_seal_floors_past_frontier_waits_as_future_input() {
     use crate::semantics_objects::journal::SealWait;
@@ -39333,13 +39340,19 @@ fn joint_seal_floors_past_frontier_waits_as_future_input() {
         .adapter()
         .seal_stage_diagnosis()
         .floors_past_frontier;
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
     let mut remaining = 10;
     assert_eq!(
         frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the repeat at an unchanged frontier waits as future input"
     );
-    assert_eq!(remaining, 9, "the finished frame charges one unit");
+    assert_eq!(
+        remaining,
+        10 - total - 1,
+        "the finished frame charges its barrier scan plus the one-unit Future advance"
+    );
     assert_eq!(
         ports.read().1.adapter().last_seal_wait(),
         SealWait::FloorsPastFrontier,
@@ -39367,10 +39380,10 @@ fn joint_seal_floors_past_frontier_waits_as_future_input() {
 }
 
 /// A decided future wait settles without re-scanning staging: 97
-/// retained rows on another image share the frame, the seal waits
-/// `AbandonReturnPending`, and settlement advances as future input
-/// with zero terminal checks — an eager check would read every row
-/// (past one 64-unit credit) before the single-unit Future charge.
+/// retained rows on another image share the frame, the seal's
+/// barrier scan visits every row once (past one 64-unit credit,
+/// charged per row) and then waits `AbandonReturnPending`;
+/// settlement advances as future input with zero terminal checks.
 #[test]
 fn joint_seal_future_wait_skips_terminal_scan_with_populated_staging() {
     use crate::semantics_objects::journal::SealWait;
@@ -39444,13 +39457,19 @@ fn joint_seal_future_wait_skips_terminal_scan_with_populated_staging() {
         .joint_frame_ports(&fixture.scene.producers)
         .unwrap();
     frame.bind_targets(&ports).unwrap();
-    let mut remaining = 10;
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let mut remaining = 1000;
     assert_eq!(
         frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
         Ok(QuantumSealProgress::AwaitFutureInput),
         "the uncorroborated bound waits as future input"
     );
-    assert_eq!(remaining, 9, "the finished frame charges one unit");
+    assert_eq!(
+        remaining,
+        1000 - total - 1,
+        "the finished frame charges its barrier scan plus the one-unit Future advance"
+    );
     assert_eq!(
         ports.read().1.adapter().last_seal_wait(),
         SealWait::AbandonReturnPending,
@@ -39851,8 +39870,8 @@ fn joint_seal_barrier_scan_reuses_completed_barrier_across_retries() {
                 "the deciding poll charges only its scan (a retry advances nothing)"
             );
             assert!(
-                frame.active_seal_for_test().is_some(),
-                "an UnboundStaging wait holds its retry for delivery"
+                frame.active_seal_for_test().is_none(),
+                "a retry holds no positive delivery"
             );
             break;
         }

@@ -70,6 +70,13 @@ pub(crate) struct IngestedJointQuantum {
     /// stale cursor never skips a newly stuck consumer.
     park_cursor: usize,
     parked_total: usize,
+    /// Production-seal barrier work for this frame's frontier: the
+    /// resumable scan cursor while it runs, plus the completed
+    /// Barrier/Clear decision once it finishes. Both survive
+    /// same-frame retries; staging/binding membership changes drop
+    /// them on next use. Inline, no heap beyond the frame's prepaid
+    /// storage.
+    seal_barrier: super::SealBarrierState,
     // Nested buffers always drop before their own reservation.
     failure_storage: Option<ResourceLease>,
     targets_storage: Option<ResourceLease>,
@@ -1027,6 +1034,7 @@ impl IngestedJointQuantum {
             active: None,
             park_cursor: 0,
             parked_total: 0,
+            seal_barrier: super::SealBarrierState::default(),
             failure_storage: None,
             targets_storage: None,
             _storage: storage,
@@ -1151,6 +1159,7 @@ impl IngestedJointQuantum {
             active: None,
             park_cursor: 0,
             parked_total: 0,
+            seal_barrier: super::SealBarrierState::default(),
             failure_storage: None,
             targets_storage: None,
             _storage: storage,
@@ -2303,11 +2312,30 @@ impl IngestedJointQuantum {
         };
         let mark = adapter.rejection_mark();
         // A refusal decided by this seal runs its inline rejection work
-        // from this same service budget, never past it.
+        // from this same service budget, never past it. The barrier
+        // scan charges the same slice per examined row before it.
         adapter.bound_inline_credit(*remaining);
-        let outcome = adapter.seal_in_audit(model, input, &mut selected, fault, replay);
+        let attempt = adapter.seal_in_audit(
+            model,
+            input,
+            &mut selected,
+            fault,
+            replay,
+            &mut self.seal_barrier,
+            remaining,
+        );
         let spent = adapter.take_inline_spent();
         *remaining = remaining.saturating_sub(spent);
+        let outcome = match attempt {
+            super::SealAttempt::Yielded => {
+                // The barrier scan spent its slice and saved its
+                // cursor; the same seal resumes next service with
+                // more budget. No decision, no active, no advance.
+                // (`storage` drops here, refunding its reservation.)
+                return Ok(QuantumSealProgress::LocalPending);
+            }
+            super::SealAttempt::Decided(outcome) => outcome,
+        };
         assert!(
             outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
             "retained seal result exceeds its checked preflight bound"

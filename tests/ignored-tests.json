@@ -229,9 +229,12 @@
     {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_instance_small_state_lru_eviction_never_joins",
-      "reason": "privileged: needs a small-state build, run by hand; re-deferred to 0.8.1: zero evictions observed with live 1-entry maps, needs instance-lane triage",
+      "reason": "privileged: needs a small-state build, run by hand (1-entry INSTANCE_START eviction injection; evicted calls surface Unstamped, sequential calls join)",
       "cell": "privileged",
-      "until": "0.8.1"
+      "until": {
+        "item": "small-state build lane in CI",
+        "owner": "maintainer"
+      }
     },
     {
       "file": "src/attach/instance_tests.rs",

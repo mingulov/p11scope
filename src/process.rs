@@ -16,6 +16,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 #[allow(dead_code)]
 pub(crate) mod cgroup_context;
 pub(crate) mod leader_exit;
+pub(crate) mod metered_io;
 mod view_filesystem;
 use std::sync::{Arc, Weak};
 #[cfg(test)]
@@ -740,6 +741,15 @@ impl ProcessView {
         self.pin.original_exited()
     }
 
+    /// One metered generation probe of this view's original process (see
+    /// [`PidPin::metered_generation`]).
+    pub(crate) fn metered_generation(
+        &self,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<GenerationProof> {
+        self.pin.metered_generation(admit)
+    }
+
     pub(crate) fn original_generation_state(&self) -> Result<OriginalGenerationState, String> {
         self.pin.original_generation_state()
     }
@@ -938,6 +948,36 @@ pub(crate) mod generation_probe_test {
     pub(crate) fn count() -> u64 {
         PROBES.with(Cell::get)
     }
+}
+
+/// A metered generation probe's verdict: the original process is still
+/// the same, it provably exited or its pid was reused, or the probe
+/// proved nothing (an error, an interrupted call, an unpinned start
+/// time). Unknown never creates resume state and never retires it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenerationProof {
+    Current,
+    Changed,
+    Unknown,
+}
+
+/// A process start time read through the metered row reader: one
+/// `/proc/<pid>/stat` open (with its close) and one read for the
+/// single-row file. `None` is a refused admission; a missing process
+/// reads `NotFound`.
+pub(crate) fn metered_start_time(
+    pid: u32,
+    admit: &mut dyn FnMut() -> bool,
+) -> Option<io::Result<u64>> {
+    Some(
+        match metered_io::find_line(&format!("/proc/{pid}/stat"), admit, |row| {
+            Some(row.to_owned())
+        })? {
+            Ok(Some(row)) => start_time_from_stat(&row),
+            Ok(None) => Err(io::Error::new(io::ErrorKind::InvalidData, "empty stat")),
+            Err(error) => Err(error),
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1560,6 +1600,42 @@ impl PidPin {
         match &self.pidfd {
             Some(fd) => pidfd_still_same_with(|| pidfd_ready(fd)),
             None => process_start_time(self.pid).ok() == self.start_time,
+        }
+    }
+
+    /// One metered generation probe through the metered primitives:
+    /// a single pidfd poll (one unit), or on the fallback pin one
+    /// `/proc/<pid>/stat` row read (open with its close, one read: three
+    /// units). `None` is a refused admission. A failed or interrupted
+    /// call, or a fallback pin with no retained start time, is
+    /// [`GenerationProof::Unknown`], never a change.
+    pub(crate) fn metered_generation(
+        &self,
+        admit: &mut dyn FnMut() -> bool,
+    ) -> Option<GenerationProof> {
+        #[cfg(test)]
+        generation_probe_test::probe();
+        match &self.pidfd {
+            Some(fd) => Some(
+                match metered_io::poll_ready_once(std::os::fd::AsFd::as_fd(fd), admit)? {
+                    Ok(false) => GenerationProof::Current,
+                    Ok(true) => GenerationProof::Changed,
+                    Err(_) => GenerationProof::Unknown,
+                },
+            ),
+            None => {
+                let Some(retained) = self.start_time else {
+                    return Some(GenerationProof::Unknown);
+                };
+                Some(match metered_start_time(self.pid, admit)? {
+                    Ok(current) if current == retained => GenerationProof::Current,
+                    Ok(_) => GenerationProof::Changed,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        GenerationProof::Changed
+                    }
+                    Err(_) => GenerationProof::Unknown,
+                })
+            }
         }
     }
 

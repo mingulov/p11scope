@@ -13763,7 +13763,7 @@ fn joint_machine_void_staged_disposal_with_long_bucket_is_resumable() {
     );
     assert!(
         saw_partial || sweep_credits > 1,
-        "the 4,096-slot sweep progresses over multiple credits"
+        "the occupied sweep progresses over multiple credits"
     );
     assert_eq!(
         feed_state(&fixture, 1).1,

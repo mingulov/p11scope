@@ -2833,7 +2833,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_reservations_void_credit_counts_every_slot_and_link_read() {
+    fn resource_reservations_void_credit_counts_every_visit_and_link_read() {
         // 512 standalone H8 members in the 4,096 staging table force
         // multi-credit cleanup at 64 units. Each step's independently
         // counted slot visits plus link reads (bucket-head,
@@ -3151,7 +3151,13 @@ mod tests {
     /// subsumes `key_heads[`/`id_heads[` and also catches a real
     /// aliased read (`let heads = &self.key_heads; ... heads[b]`);
     /// plain writes (`] =`, not `] ==`) are allowed (splices perform
-    /// no read); comment lines are skipped.
+    /// no read); comment lines are skipped. Occupied-list loads count
+    /// too: a bare `self.occ_head`/`self.occ_tail` load and a slot-link
+    /// read (`slots[` with `.occ_prev`/`.occ_next`) are direct, while
+    /// the gate call (`budgeted_occ_head`), retained snapshot
+    /// neighbors (`snapshot.occ_*`, `pending.occ_*`), struct field
+    /// plumbing, mutable borrows for the write-only unlink helper
+    /// (`&mut self.occ_head`/`tail`), and splice writes are allowed.
     fn count_direct_reads(body: &str) -> usize {
         let mut direct_reads = 0;
         for line in body.lines() {
@@ -3174,6 +3180,34 @@ mod tests {
                     if !is_write {
                         direct_reads += 1;
                     }
+                }
+            }
+            // Occupied-list head/tail: a bare load reads outside the
+            // gate; mutable borrows pass the links for write-only
+            // splicing and the gate call bills its own load.
+            if !line.contains("budgeted_occ_head")
+                && !line.contains("&mut self.occ_head")
+                && !line.contains("&mut self.occ_tail")
+                && (line.contains("self.occ_head") || line.contains("self.occ_tail"))
+            {
+                direct_reads += 1;
+            }
+            // Occupied-list slot links: a slot read bills through the
+            // snapshot gate, so any slot-link load in a driver is
+            // direct. Retained `snapshot.occ_*`/`pending.occ_*` and
+            // field plumbing carry no `slots[` and stay allowed; a
+            // splice write (`=`, not `==`) performs no read.
+            if line.contains("slots[")
+                && (line.contains(".occ_prev") || line.contains(".occ_next"))
+            {
+                let is_write = [".occ_prev", ".occ_next"].iter().any(|marker| {
+                    line.find(marker).is_some_and(|at| {
+                        let after = line[at + marker.len()..].trim_start();
+                        after.starts_with('=') && !after[1..].starts_with('=')
+                    })
+                });
+                if !is_write {
+                    direct_reads += 1;
                 }
             }
         }
@@ -3269,6 +3303,69 @@ mod tests {
         );
     }
 
+    /// The scanner above must catch a forced extra occupied-list load:
+    /// a fake budgeted body with `black_box(self.occ_head)` and
+    /// unchanged debits fails the same detector, as does a slot-link
+    /// reload — while the gate call, retained snapshot neighbors, and
+    /// write-only unlink borrows stay allowed.
+    #[test]
+    fn budgeted_accessor_scan_catches_a_repeated_occ_read() {
+        let fake_head = r#"
+    fn release_role_step(&mut self) {
+        let _probe = std::hint::black_box(self.occ_head);
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(fake_head),
+            1,
+            "the fake body has one direct occ-head read"
+        );
+        let fake_link = r#"
+    fn release_single_step(&mut self) {
+        let prev = std::hint::black_box(self.slots[at].occ_prev);
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(fake_link),
+            1,
+            "a slot-link reload is still a direct read"
+        );
+        let allowed = r#"
+    fn release_single_step(&mut self) {
+        let Some(head) = self.budgeted_occ_head(gate) else {
+            return false;
+        };
+        Self::occ_unlink_known(
+            &mut self.occ_head,
+            &mut self.occ_tail,
+            &mut self.slots,
+            at,
+            snapshot.occ_prev,
+            snapshot.occ_next,
+        );
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(allowed),
+            0,
+            "the gate, retained neighbors and unlink borrows perform no direct read"
+        );
+        let splice_write = r#"
+    fn occ_unlink_known(head: &mut u32, slots: &mut [TableSlot<()>]) {
+        slots[prev as usize].occ_next = next;
+        spent += 1;
+    }
+"#;
+        assert_eq!(
+            count_direct_reads(splice_write),
+            0,
+            "a splice write performs no read"
+        );
+    }
+
     /// Budgeted release subcursors share one mutable gate: the single
     /// release step must not mint a fresh gate, the ledger step must
     /// take the gate (not a bare budget), and the feed disposal must
@@ -3305,6 +3402,8 @@ mod tests {
     /// Budgeted release drivers must not re-read a slot after its
     /// charged visit: vacancy and alias facts come from the charged
     /// visit's retained snapshot, never from a post-unlink reload.
+    /// Occupied-list neighbors likewise come from the snapshot via
+    /// `occ_unlink_known`, never from the re-reading `occ_unlink`.
     #[test]
     fn budgeted_release_paths_fold_slot_rereads_into_charged_visits() {
         let source = include_str!("reservations.rs");
@@ -3317,6 +3416,11 @@ mod tests {
             assert!(
                 !body.contains(".operation.as_ref()"),
                 "{name} must not reload the slot after its charged visit"
+            );
+            assert!(
+                !body.contains("occ_unlink("),
+                "{name} must not reload occupied links after its charged visit \
+                 (use occ_unlink_known with retained neighbors)"
             );
         }
     }

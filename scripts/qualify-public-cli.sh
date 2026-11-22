@@ -885,21 +885,26 @@ if retained:
 # past the qualifier; a budget or fence interruption without a
 # deadline is a different phenomenon and stays loud.
 # Both rows must carry the producer shape: the fixed subject,
-# unscoped (null caller/module/pid), and a positive integer
-# recording count (open-ended: any repeats>=1 qualifies). The
-# producer dedupes identical rows, so duplicates are malformed.
+# explicitly present null caller/module/pid keys, an explicitly
+# present null budget (neither row records a budget refusal), and
+# a positive integer recording count (open-ended: any repeats>=1
+# qualifies). Absent is not null: the renderer always emits the
+# keys. The producer dedupes identical rows, so duplicates are
+# malformed.
 prep=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup provider input comparison interrupted']
 if prep:
     for g in prep:
         assert g.get('subject')=='cgroup provider preparation incomplete', 'malformed interrupted preparation row: %r' % (g,)
-        assert g.get('caller') is None and g.get('module') is None and g.get('pid') is None, 'malformed interrupted preparation scope: %r' % (g,)
+        assert 'caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed interrupted preparation scope: %r' % (g,)
+        assert 'budget' in g and g['budget'] is None, 'malformed interrupted preparation budget: %r' % (g,)
         assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,)
     assert len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,)
     deadline=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup collection deadline reached']
     assert deadline, 'interrupted preparation without a run deadline: %r' % (prep,)
     for g in deadline:
         assert g.get('subject')=='cgroup scope transaction incomplete', 'malformed run deadline row: %r' % (g,)
-        assert g.get('caller') is None and g.get('module') is None and g.get('pid') is None, 'malformed run deadline scope: %r' % (g,)
+        assert 'caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed run deadline scope: %r' % (g,)
+        assert 'budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,)
         assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,)
     assert len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,)
 if degraded:

@@ -33482,6 +33482,114 @@ pub(crate) mod tests {
         assert_eq!(counts.pin_failed, 0);
     }
 
+    /// Seal-stage diagnostics: every gate counts its own bucket.
+    /// Unit coverage for the counter method (all 17 gates); the
+    /// production-path test below pins counting through real seals.
+    #[test]
+    fn seal_stage_note_covers_every_gate() {
+        let mut scene = Scene::new(image_default());
+        for gate in [
+            SealStageGate::DomainTainted,
+            SealStageGate::ImageTainted,
+            SealStageGate::DrainMismatch,
+            SealStageGate::DomainEnded,
+            SealStageGate::ClosureStale,
+            SealStageGate::FrontierRegression,
+            SealStageGate::BelowFence,
+            SealStageGate::UnboundStaging,
+            SealStageGate::AttributionPending,
+            SealStageGate::ClaimUnmatched,
+            SealStageGate::FreshBirthNoHistory,
+            SealStageGate::FloorsPastFrontier,
+            SealStageGate::AbandonReturnPending,
+            SealStageGate::RefusedReturnPending,
+            SealStageGate::H3Pending,
+            SealStageGate::ModelRefused,
+            SealStageGate::Success,
+        ] {
+            scene.adapter.note_seal_stage(gate);
+        }
+        let counts = scene.adapter.seal_stage_diagnosis();
+        assert_eq!(counts.domain_tainted, 1, "domain_tainted counts");
+        assert_eq!(counts.image_tainted, 1, "image_tainted counts");
+        assert_eq!(counts.drain_mismatch, 1, "drain_mismatch counts");
+        assert_eq!(counts.domain_ended, 1, "domain_ended counts");
+        assert_eq!(counts.closure_stale, 1, "closure_stale counts");
+        assert_eq!(
+            counts.frontier_regression, 1,
+            "frontier_regression counts"
+        );
+        assert_eq!(counts.below_fence, 1, "below_fence counts");
+        assert_eq!(counts.unbound_staging, 1, "unbound_staging counts");
+        assert_eq!(
+            counts.attribution_pending, 1,
+            "attribution_pending counts"
+        );
+        assert_eq!(counts.claim_unmatched, 1, "claim_unmatched counts");
+        assert_eq!(
+            counts.fresh_birth_no_history, 1,
+            "fresh_birth_no_history counts"
+        );
+        assert_eq!(
+            counts.floors_past_frontier, 1,
+            "floors_past_frontier counts"
+        );
+        assert_eq!(
+            counts.abandon_return_pending, 1,
+            "abandon_return_pending counts"
+        );
+        assert_eq!(
+            counts.refused_return_pending, 1,
+            "refused_return_pending counts"
+        );
+        assert_eq!(counts.h3_pending, 1, "h3_pending counts");
+        assert_eq!(counts.model_refused, 1, "model_refused counts");
+        assert_eq!(counts.success, 1, "success counts");
+    }
+
+    /// Seal-stage diagnostics through real seals: a refused key
+    /// counts domain_tainted, a clean seal counts success, and the
+    /// staging gauges report current open/refused/claims. Seal
+    /// outcomes are unchanged.
+    #[test]
+    fn seal_stage_tainted_and_success_count_through_seals() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let create = function_id("C_CreateObject");
+        // Success: clean history seals.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("clean history seals");
+        let counts = scene.adapter.seal_stage_diagnosis();
+        assert_eq!(counts.success, 1, "clean seal counts success");
+        assert_eq!(counts.domain_tainted, 0);
+        // DomainTainted: the same key refused counts its gate.
+        scene.adapter.keys.get_mut(&proof.key).expect("key held").refused = true;
+        let failure = scene.seal(&bootstrap).expect_err("refused key refuses");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        let counts = scene.adapter.seal_stage_diagnosis();
+        assert_eq!(counts.success, 1, "success stays");
+        assert_eq!(counts.domain_tainted, 1, "refused key counts tainted");
+        // Gauges: open/refused/claims reflect retained staging.
+        assert_eq!(
+            counts.open_staged,
+            scene.adapter.open.len() as u64,
+            "open gauge matches"
+        );
+        assert_eq!(
+            counts.refused_staged,
+            scene.adapter.refused.len() as u64,
+            "refused gauge matches"
+        );
+        assert_eq!(
+            counts.claims_held, scene.adapter.claim_counts as u64,
+            "claims gauge matches"
+        );
+    }
+
     /// A failed fresh-evidence take reports its refusal on the
     /// seal failure: the gap stays bootstrap mismatch (the pinned
     /// contract), while the refusal routes delivery (transient takes

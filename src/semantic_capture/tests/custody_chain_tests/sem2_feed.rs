@@ -16,7 +16,8 @@ use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
     image_query_refusal_label, joint_audit_refusal_line, joint_audit_subjects_line,
-    joint_birth_funnel_line, joint_births_line, joint_decoder_line, joint_seals_line,
+    joint_birth_funnel_line, joint_births_line, joint_decoder_line, joint_seal_stages_line,
+    joint_seals_line,
     joint_taints_line, joint_voids_line, scan_refusals_gap_reason, semantic_stop_line,
 };
 
@@ -297,6 +298,50 @@ fn joint_seals_line_format_is_exact() {
          d_entry_zero=9 d_entry_exhausted=10 \
          f_visits=11 f_cleared=12 f_progress=13 f_retried=14 f_stuck=15 \
          f_last_gap=h3_pending d_other=16"
+    );
+}
+
+#[test]
+fn joint_seal_stages_line_format_is_exact() {
+    use crate::semantics_objects::journal::SealStageCounts;
+    assert_eq!(
+        joint_seal_stages_line(&SealStageCounts::default()),
+        "p11scope: joint seal stages: domain_tainted=0 image_tainted=0 \
+         drain_mismatch=0 domain_ended=0 closure_stale=0 frontier_regression=0 \
+         below_fence=0 unbound_staging=0 attribution_pending=0 claim_unmatched=0 \
+         fresh_birth_no_history=0 floors_past_frontier=0 abandon_return_pending=0 \
+         refused_return_pending=0 h3_pending=0 model_refused=0 success=0 \
+         open_staged=0 refused_staged=0 claims_held=0"
+    );
+    assert_eq!(
+        joint_seal_stages_line(&SealStageCounts {
+            domain_tainted: 1,
+            image_tainted: 2,
+            drain_mismatch: 3,
+            domain_ended: 4,
+            closure_stale: 5,
+            frontier_regression: 6,
+            below_fence: 7,
+            unbound_staging: 8,
+            attribution_pending: 9,
+            claim_unmatched: 10,
+            fresh_birth_no_history: 11,
+            floors_past_frontier: 12,
+            abandon_return_pending: 13,
+            refused_return_pending: 14,
+            h3_pending: 15,
+            model_refused: 16,
+            success: 17,
+            open_staged: 18,
+            refused_staged: 19,
+            claims_held: 20,
+        }),
+        "p11scope: joint seal stages: domain_tainted=1 image_tainted=2 \
+         drain_mismatch=3 domain_ended=4 closure_stale=5 frontier_regression=6 \
+         below_fence=7 unbound_staging=8 attribution_pending=9 claim_unmatched=10 \
+         fresh_birth_no_history=11 floors_past_frontier=12 abandon_return_pending=13 \
+         refused_return_pending=14 h3_pending=15 model_refused=16 success=17 \
+         open_staged=18 refused_staged=19 claims_held=20"
     );
 }
 

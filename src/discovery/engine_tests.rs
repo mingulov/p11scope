@@ -87161,6 +87161,198 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
     );
 }
 
+/// A learned pin failure (transient budget exhaustion on a busy host)
+/// requeues for a later tick instead of filing immediately: the scan
+/// may still be catching up, and a retry stages silently once it
+/// does. No gap, no settle, no count on the failed attempt; the
+/// retry stages and files its first-use row once the budget clears.
+#[test]
+fn learned_pin_failure_retries_before_filing() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 0,
+        total_bytes: 0,
+    });
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a retried pin files nothing yet: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        !engine.learned_settled.contains(&(dev, ino)),
+        "a retried pin settles nothing yet"
+    );
+    assert!(
+        !engine.pending_learned.is_empty(),
+        "a retried pin requeues the candidate"
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    engine.budget = CaptureWorkBudget::default();
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the retry stages once the budget clears"
+    );
+    assert!(engine.learned_settled.contains(&(dev, ino)));
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "no prearm gap after a retried pin stages: {public:?}"
+    );
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "the staged file files its first-use row: {public:?}"
+    );
+}
+
+/// A learned pin that keeps failing files after a bounded number of
+/// retries instead of requeueing forever: a persistent failure is a
+/// real loss and must be disclosed, never silently dropped.
+#[test]
+fn learned_pin_failure_files_after_bounded_retries() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 0,
+        total_bytes: 0,
+    });
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    for _ in 0..10 {
+        engine.service_learned_files();
+        assert!(
+            engine.counters.object_skips.is_empty(),
+            "retries file nothing: {:?}",
+            engine.counters.object_skips
+        );
+        assert!(
+            !engine.learned_settled.contains(&(dev, ino)),
+            "retries settle nothing"
+        );
+    }
+    engine.service_learned_files();
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "exhausted retries settle the candidate"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "exhausted retries file the pin failure: {public:?}"
+    );
+}
+
+/// The end-of-capture flush files a failing learned pin immediately
+/// instead of requeueing: past the boundary there is no later tick,
+/// so a retry would vanish silently.
+#[test]
+fn learned_pin_failure_files_immediately_at_flush() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 0,
+        total_bytes: 0,
+    });
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.flush_learned_files_at_capture_end();
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "the flush settles a failing pin"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "the flush requeues nothing"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "the flush files the pin failure: {public:?}"
+    );
+}
+
 /// A run-learned candidate stages despite scan coverage: the proving
 /// mapper is a transient descendant whose scan-owned slots retire with
 /// it, so only the persistent piece covers later mappers. Twin of the

@@ -854,3 +854,71 @@ fn refused_replay_read_keeps_the_carried_cursor() {
     }
     assert!(converged, "with enough credit the resumed pass completes");
 }
+
+/// A roomy first pass on a fresh fixture: one complete, validated
+/// cursor. Returns the fixture (reset for its next pass) and the facts.
+fn roomy_complete_cursor() -> (BracketFixture, RetainedFileFacts) {
+    let mut fixture = BracketFixture::new(8, true);
+    let (outcome, carried) =
+        armed_scan_pass(&mut fixture, ROOMY_LIMITS, RetainedFileFacts::default());
+    outcome.expect("roomy pass");
+    let cursors = carried.decode_cursors_for_test();
+    assert_eq!(cursors.len(), 1, "a roomy pass keeps one cursor");
+    assert!(cursors[0].1.complete, "a roomy pass completes its cursor");
+    fixture.maps_reads = 0;
+    fixture.log.borrow_mut().clear();
+    (fixture, carried)
+}
+
+/// A replay read that cannot complete checks no bytes: after a short
+/// read (memory truncated below the cached row) or a failed read (a
+/// descriptor that cannot read), the carried cursor stays with its row,
+/// on the unvalidated proof path (C2 staging) and on the
+/// validated-complete replay alike.
+#[test]
+fn inconclusive_replay_reads_keep_the_carried_cursor() {
+    for complete in [false, true] {
+        for fault in ["short read", "failed read"] {
+            let (mut fixture, carried) = if complete {
+                roomy_complete_cursor()
+            } else {
+                c2_staged_cursor()
+            };
+            let before = carried.decode_cursors_for_test();
+            assert_eq!(before.len(), 1);
+            let (key, cursor) = before[0].clone();
+            assert_eq!(cursor.complete, complete);
+            let row = cursor
+                .cached_tables
+                .first()
+                .expect("the carried cursor holds a decoded row")
+                .address;
+            if fault == "short read" {
+                fixture.mem.set_len(row + 8).unwrap();
+            } else {
+                fixture.mem = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(format!(
+                        "/proc/self/fd/{}",
+                        std::os::fd::AsRawFd::as_raw_fd(&fixture.mem)
+                    ))
+                    .unwrap();
+            }
+            let (_, after) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+            let kept = after
+                .decode_cursors_for_test()
+                .into_iter()
+                .find(|(held, _)| *held == key)
+                .unwrap_or_else(|| {
+                    panic!("complete {complete}, {fault}: the carried cursor was discarded without a byte check")
+                });
+            assert!(
+                kept.1
+                    .cached_tables
+                    .iter()
+                    .any(|table| table.address == row),
+                "complete {complete}, {fault}: the carried cursor keeps its row"
+            );
+        }
+    }
+}

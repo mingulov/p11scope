@@ -28232,6 +28232,7 @@ exit 0
         let mut row = native.row(41, 1, 7, 40, setup);
         row.entry_count = 44;
         native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, setup, 44)]);
         native.drain();
         native.scene.coordinator.commit_batch(false).unwrap();
         let registry = &native.scene.coordinator.registry;

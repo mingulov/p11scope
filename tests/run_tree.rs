@@ -1844,27 +1844,28 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
     );
 }
 
-/// Arming-exhaustion run: 280 short-lived sleepers in 14 waves of 20
-/// (each `sleep 7`, ~98 s total) to spend the member loader contexts,
-/// then 32 sequential SoftHSM grandchildren (each 1 iteration, 150 ms
-/// linger) with NO prearm hint — all under `--pause never`. Every owned
-/// member arms a loader context (E1, even provider-free sleepers), and
-/// contexts are 256 lifetime IDs never reused, so admissions past the
-/// 248-context reserve line refuse: 8 stay held for the direct child's
-/// exec chain while members name the reserve (`loader contexts 249-256
-/// are reserved for the run's own command; ...`) exactly once (mark
-/// dedupes), the capture stays PARTIAL,
-/// yet the watch still stages the provider by scan (staging needs no
-/// loader context) and the later SoftHSM mappers' calls still land via
-/// the file-identity probes (exact accounting like the twin cells:
-/// every call after the disclosed pre-attach window is observed). Without the watch staging
-/// this cell would see 0 probes; without the honest gap the exhaustion
-/// would be silent. Small waves (20, not 30+) are load-bearing for
-/// admission:
+/// Arming-exhaustion run: 280 sleepers in 14 waves of 20, started 3 s
+/// apart and each living 50 s, so all of them are live together once the
+/// last wave starts; then 32 sequential SoftHSM grandchildren (each 1
+/// iteration, 150 ms linger) with NO prearm hint — all under `--pause
+/// never`. Every owned member arms a loader context (E1, even
+/// provider-free sleepers). Loader slots are recycled once their member
+/// retires, so exhaustion is a count of LIVE contexts: the sleepers must
+/// overlap for members to hold 248 at once. Admissions past the
+/// 248-context reserve line then refuse: 8 stay held for the direct
+/// child's exec chain while members name the reserve (`loader contexts
+/// 249-256 are reserved for the run's own command; ...`) exactly once
+/// (mark dedupes), the capture stays PARTIAL, yet the watch still stages
+/// the provider by scan (staging needs no loader context) and the later
+/// SoftHSM mappers' calls still land via the file-identity probes (exact
+/// accounting like the twin cells: every call after the disclosed
+/// pre-attach window is observed). Without the watch staging this cell
+/// would see 0 probes; without the honest gap the exhaustion would be
+/// silent. Small waves (20, not 30+) are load-bearing for admission:
 /// 30-wide waves admit ~50 total regardless of count (frames miss
-/// retirements under fork load), while 20-wide waves admit ~280
-/// (measured admitted 284, gaps 48, exhaustion 1); the 14th wave is
-/// admission margin (13 waves admit ~260, only 4 past the 256 gate).
+/// retirements under fork load). Sequential waves that each exited before
+/// the next started (the shape before slot recycling) never hold more
+/// than one wave of live contexts, so they can no longer reach the line.
 /// The unit twin `loader_exhaustion_names_once_and_watch_still_stages`
 /// pins the same once-naming + staging logic via direct registry fill.
 #[test]
@@ -1872,7 +1873,8 @@ fn privileged_run_tree_unprearmed_shortlived_parallel_never_pause_covers_waves()
 fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     const SLEEPER_WAVES: u32 = 14;
     const SLEEPERS_PER_WAVE: u32 = 20;
-    const SLEEPER_LIFE_SECS: u32 = 7;
+    const WAVE_GAP_SECS: u32 = 3;
+    const SLEEPER_LIFE_SECS: u32 = 50;
     const PROVIDER_WORKERS: u32 = 32;
     let dir = tempfile::tempdir().expect("cell dir");
     let module = softhsm_path();
@@ -1881,28 +1883,22 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
     open_cell_dir(dir.path());
     let (_outdir, out) = out_dir();
     let mut script = String::new();
-    // Phase 1: 280 sleepers to spend every member loader context. Each
-    // wave's 20 sleepers run concurrently for ~7 s, then join: 14 waves
-    // admit ~280 members and exhaust past the reserve line mid-run. A
-    // member spends its context only once the observer has scanned and
-    // armed it before it exits, so the per-member scan must stay cheap:
-    // the cell's own sleeper maps only libc and ld.so. The system
-    // `sleep` may be a multicall binary mapping a dozen libraries (uutils
-    // on Ubuntu); on a busy host's 4-CPU vng guest with a debug observer
-    // it admitted 73-85 members, the C sleeper 200-224.
-    // Seven-second lives (not five) give slow guests room to admit and
-    // arm each wave before it exits: at five seconds a busy guest converts
-    // ~190/280 and the reserve never names itself, while seven seconds
-    // convert ~260 with the same assertions below. Eight seconds would
-    // push the run past this file's 120 s harness bound, so seven is the
-    // longest life that fits; the reserve, staging and exact-accounting
-    // assertions are unchanged.
+    // Phase 1: 280 overlapping sleepers to hold the member loader
+    // contexts live at once. A member spends its context only once the
+    // observer has scanned and armed it, so the per-member scan must stay
+    // cheap: the cell's own sleeper maps only libc and ld.so (the system
+    // `sleep` may be a multicall binary mapping a dozen libraries). Waves
+    // start 3 s apart (admission keeps up with 20 per gap) and live 50 s,
+    // so every wave is still live when the last one starts; the provider
+    // phase runs inside that window, and the run then waits for the
+    // sleepers so no member outlives the command. The whole run stays
+    // inside this file's 120 s harness bound.
     let sleeper = build_c(dir.path(), "rt-sleeper", SLEEPER_C);
     for _ in 0..SLEEPER_WAVES {
         for _ in 0..SLEEPERS_PER_WAVE {
             script.push_str(&format!("{} {SLEEPER_LIFE_SECS} & ", sleeper.display()));
         }
-        script.push_str("wait; ");
+        script.push_str(&format!("sleep {WAVE_GAP_SECS}; "));
     }
     // Phase 2: 32 sequential provider workers AFTER exhaustion. The first
     // stages via the watch (no context needed); later ones land via the
@@ -1918,7 +1914,7 @@ fn privileged_run_tree_arming_exhaustion_still_stages_and_counts() {
         ));
         ledgers.push(ledger);
     }
-    script.push_str("exec sleep 2");
+    script.push_str("wait; exec sleep 2");
     let mut args = vec![
         "run".to_string(),
         "--pause".to_string(),

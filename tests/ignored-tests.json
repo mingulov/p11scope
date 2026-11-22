@@ -2,7 +2,7 @@
   "schema": "p11scope/ignored-tests/v1",
   "cells": {
     "privileged": "ignored lib test curated in scripts/run-privileged-lib-tests.sh (default, long, btrfs, overlay, expected-failure, skip or alternative list)",
-    "live-kernel": "ignored integration test needing a real kernel/verifier lane outside the lib runner",
+    "live-kernel": "ignored integration test needing a real kernel/verifier lane",
     "feature": "ignored test needing a cargo feature or a dedicated build configuration; `owner` names the lane that runs it",
     "performance": "ignored timing loop with no pass/fail bar, run by hand",
     "helper": "ignored private helper re-executed by its owning test; never a standalone cell"

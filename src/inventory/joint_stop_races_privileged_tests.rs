@@ -1817,10 +1817,23 @@ fn run_stop_case(
 /// The stop cell must evaluate on the linked journal session: pin the
 /// journal request in `start_joint_lane`, so a revert to `None` (which
 /// would seal S1 and preclude every case) fails here instead of
-/// passing dry anywhere.
+/// passing dry anywhere. The pin reads the helper above its own body
+/// (never its own literals) and checks the actual `start_live` call's
+/// journal argument, so a comment mentioning the marker cannot
+/// satisfy it.
 #[test]
 fn joint_lane_requests_the_linked_journal_session() {
-    let body = include_str!("joint_stop_races_privileged_tests.rs")
+    let source = include_str!("joint_stop_races_privileged_tests.rs");
+    let head = source
+        .split_once("fn joint_lane_requests_the_linked_journal_session(")
+        .expect("the pin keeps its name")
+        .0;
+    assert_eq!(
+        head.matches("fn start_joint_lane(").count(),
+        1,
+        "the joint lane starter is defined once above the pin"
+    );
+    let body = head
         .split_once("fn start_joint_lane(")
         .expect("the joint lane starter keeps its name")
         .1
@@ -1831,8 +1844,34 @@ fn joint_lane_requests_the_linked_journal_session() {
         body.contains("JournalSpec { key_sizes: false }"),
         "the lane builds a journal spec: {body}"
     );
-    assert!(
-        body.contains("Some(&journal)"),
+    let call = body
+        .split_once("start_live(")
+        .expect("the lane starts its session")
+        .1;
+    let mut depth = 1u32;
+    let mut end = None;
+    for (at, byte) in call.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(at);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let args = &call[..end.expect("the start_live call closes")];
+    let last = args
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .next_back()
+        .expect("the call takes arguments");
+    assert_eq!(
+        last, "Some(&journal)",
         "the lane requests the linked session: {body}"
     );
 }

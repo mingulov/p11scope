@@ -7803,27 +7803,28 @@ fn held_requeue_advances_past_unbound_dud_to_bound_tail() {
     assert!(capture.jobs.is_empty());
     assert_eq!(held.held_requeue_skips[HELD_REQUEUE_SKIP_UNBOUND], 1);
     // Pins still absent: the pass resumes past the dud and names the
-    // tail's pin-less wait.
+    // tail's pin-less wait. The transient wait does not advance the
+    // cursor, so the next pass retries the tail.
     let absent = capture.tick_with(&mut io).unwrap();
     assert!(absent.calls().next().is_none());
     assert_eq!(absent.held_requeue_skips[HELD_REQUEUE_SKIP_NO_PIN], 1);
     assert_eq!(absent.held_requeue_skips[HELD_REQUEUE_SKIP_UNBOUND], 0);
-    // First pass with pins: the dud consumes the single slot.
+    // First pass with pins: the tail (retried past the dud) joins.
     io.targets_absent = false;
     let first = capture.tick_with(&mut io).unwrap();
-    assert!(first.calls().next().is_none());
-    assert_eq!(capture.router.pending_len(), 2);
-    assert_eq!(first.held_requeue_skips[HELD_REQUEUE_SKIP_UNBOUND], 1);
-    // Second pass resumes past the dud: the tail joins.
-    let second = capture.tick_with(&mut io).unwrap();
-    let joined: Vec<_> = second.calls().collect();
+    let joined: Vec<_> = first.calls().collect();
     assert_eq!(joined.len(), 1);
     assert!(
         matches!(joined[0].route(), Route::Joined(_)),
-        "a serviceable tail behind a dud joins on the resume pass"
+        "a serviceable tail behind a dud joins once its pin arrives"
     );
     assert_eq!(capture.router.pending_len(), 1);
-    assert_eq!(second.held_requeue_skips[HELD_REQUEUE_SKIP_UNBOUND], 0);
+    assert_eq!(first.held_requeue_skips[HELD_REQUEUE_SKIP_UNBOUND], 0);
+    // The dud is still skipped by name on later passes.
+    let second = capture.tick_with(&mut io).unwrap();
+    assert!(second.calls().next().is_none());
+    assert_eq!(capture.router.pending_len(), 1);
+    assert_eq!(second.held_requeue_skips[HELD_REQUEUE_SKIP_UNBOUND], 1);
 }
 #[test]
 fn held_requeue_serves_victim_behind_four_duds_at_default_bound() {

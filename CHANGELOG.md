@@ -269,6 +269,20 @@ versioned separately and are opaque, exact dispatch keys.
 - A run's repeated gaps fold into counted aggregates, so gap
   volume stays flat on long captures while every loss keeps its
   name and exact count.
+- Same-thread nested provider calls no longer mis-bind their keys:
+  a call that starts and ends on one native thread strictly inside
+  another open call on the same session (the known instance is the
+  NSS softoken EC-keygen pairwise self-test) is classified
+  same-thread nested re-entry: the outer creation's outputs still
+  bind, while the inner call's terminal reports on the named
+  `same_thread_nested` unknown row (object-observations section
+  version 9) instead of `unbound`. Cross-thread or otherwise
+  unprovable overlap keeps the conservative shape.
+- Release qualification of exit shapes is stricter and disclosed:
+  the public-CLI oracle accepts the retired-plus-mid-flight exit
+  shape only with disclosure, narrows ambient-exit acceptance to
+  exit-only skips, and no longer qualifies unproven mid-flight
+  exits; mixed shapes stay refused.
 
 ### Known limitations
 

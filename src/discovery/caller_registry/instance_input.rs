@@ -2236,6 +2236,15 @@ impl CallerRegistry {
         semantics.feed.reseed_eligible()
     }
 
+    /// Whether a reseed may arm now: the session published a full
+    /// health window of clean passes since its last stuck-session
+    /// abandon. Reseeds only — first-time arms never wait (F6
+    /// re-scope, round 4): the gate bars re-entry into unauditable
+    /// sessions, never new tracking.
+    fn reseed_session_healthy(&self) -> bool {
+        self.passes_since_session_abandon >= crate::semantics_key_use::RESEED_HEALTH_CLEAN_PASSES
+    }
+
     fn reserve_joint_receipt_at(
         &mut self,
         input: &AdmittedInstanceCall,
@@ -3255,9 +3264,15 @@ impl CallerRegistry {
 
     /// Clear the per-quantum touched set at publish-complete: a
     /// published quantum is sealed history, never abandoned, so its
-    /// feeds leave the stuck-session candidate set.
+    /// feeds leave the stuck-session candidate set. Publishing a
+    /// clean pass also ticks the reseed health gate up toward its
+    /// window (saturating: healthy stays healthy).
     pub(crate) fn reset_quantum_touched_feeds(&mut self) {
         self.quantum_touched_feeds.clear();
+        self.passes_since_session_abandon = self
+            .passes_since_session_abandon
+            .saturating_add(1)
+            .min(crate::semantics_key_use::RESEED_HEALTH_CLEAN_PASSES);
     }
 
     /// Discard the touched feeds' stranded staged calls as watchdog
@@ -3303,12 +3318,17 @@ impl CallerRegistry {
 
     /// Drop whole staged queues for exactly the named feeds by pure
     /// disposal, counting each feed's depth as disposed history.
-    /// Feeds with no row or an empty queue contribute nothing.
+    /// Feeds with no row or an empty queue contribute nothing. The
+    /// discard itself trips the reseed health gate even then: a
+    /// running re-arm abandon is stuckness evidence however little
+    /// it discards (the live abandon before the lethal reseed
+    /// discarded nothing), so reseeds wait out the window.
     fn discard_stuck_feeds(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
         ids: &[RegistryInstanceId],
     ) -> (Vec<RegistryInstanceId>, u64, u64) {
+        self.passes_since_session_abandon = 0;
         let mut stuck = Vec::new();
         let mut calls = 0u64;
         let mut feeds = 0u64;
@@ -3577,42 +3597,59 @@ impl CallerRegistry {
                         self.joint_feeds = self.joint_feeds.saturating_add(1);
                         self.joint_accounting = true;
                     } else if self.joint_reseed_eligible(&input.key) {
-                        // A voided feed reseeds onto the fresh receipt.
-                        let reseed = self
-                            .instance_state
-                            .semantics
-                            .get_mut(&id)
-                            .expect("retained edge")
-                            .feed
-                            .try_reselect_joint(&grant.receipt);
-                        match reseed {
-                            Ok(()) => {
-                                self.joint_feeds = self.joint_feeds.saturating_add(1);
-                                self.joint_accounting = true;
-                                // The voided window stays counted beside
-                                // this recovery: one row per reseed.
-                                self.record_gap(crate::discovery::caller_registry::RegistryGap {
-                                    caller: Some(input.caller),
-                                    module: Some(module),
-                                    pid: None,
-                                    subject: crate::inventory_present::JOINT_REENTRY_SUBJECT.into(),
-                                    reason:
-                                        crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
+                        // Health gate: a reseed that would arm into a
+                        // stuck/unauditable session stays S1Only with
+                        // its wait named; the next fresh proof retries
+                        // once the session proves healthy again.
+                        if !self.reseed_session_healthy() {
+                            self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                                caller: Some(input.caller),
+                                module: Some(module),
+                                pid: None,
+                                subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                                    .into(),
+                                reason: "joint_birth_reseed_session_unhealthy".into(),
+                                budget: None,
+                            });
+                        } else {
+                            // A voided feed reseeds onto the fresh receipt.
+                            let reseed = self
+                                .instance_state
+                                .semantics
+                                .get_mut(&id)
+                                .expect("retained edge")
+                                .feed
+                                .try_reselect_joint(&grant.receipt);
+                            match reseed {
+                                Ok(()) => {
+                                    self.joint_feeds = self.joint_feeds.saturating_add(1);
+                                    self.joint_accounting = true;
+                                    // The voided window stays counted beside
+                                    // this recovery: one row per reseed.
+                                    self
+                                        .record_gap(crate::discovery::caller_registry::RegistryGap {
+                                        caller: Some(input.caller),
+                                        module: Some(module),
+                                        pid: None,
+                                        subject: crate::inventory_present::JOINT_REENTRY_SUBJECT
                                             .into(),
-                                    budget: None,
-                                });
-                            }
-                            Err(refusal)
-                                if self.instance_state.semantics[&id].feed.mode()
-                                    == FeedMode::S1Only =>
-                            {
-                                // The fresh receipt names another
-                                // incarnation, a below-fence cut, or no
-                                // progress — or the ended segment's proof
-                                // is destroyed (a tainted fallback the base
-                                // marks non-resumable): it cannot reseed
-                                // this feed, so name the actual blocker.
-                                let reason = match refusal {
+                                        reason:
+                                            crate::inventory_present::JOINT_REENTRY_COMPLETED_REASON
+                                                .into(),
+                                        budget: None,
+                                    });
+                                }
+                                Err(refusal)
+                                    if self.instance_state.semantics[&id].feed.mode()
+                                        == FeedMode::S1Only =>
+                                {
+                                    // The fresh receipt names another
+                                    // incarnation, a below-fence cut, or no
+                                    // progress — or the ended segment's proof
+                                    // is destroyed (a tainted fallback the base
+                                    // marks non-resumable): it cannot reseed
+                                    // this feed, so name the actual blocker.
+                                    let reason = match refusal {
                                     crate::semantics_key_use::ReselectRefusal::SegmentUnresumable => {
                                         "joint_birth_segment_unresumable"
                                     }
@@ -3621,7 +3658,7 @@ impl CallerRegistry {
                                     }
                                     _ => "joint_birth_original_mismatch",
                                 };
-                                self.record_gap(crate::discovery::caller_registry::RegistryGap {
+                                    self.record_gap(crate::discovery::caller_registry::RegistryGap {
                                     caller: Some(input.caller),
                                     module: Some(module),
                                     pid: None,
@@ -3631,8 +3668,9 @@ impl CallerRegistry {
                                     reason: reason.into(),
                                     budget: None,
                                 });
+                                }
+                                Err(_) => {}
                             }
-                            Err(_) => {}
                         }
                     } else if self.instance_state.semantics[&id].feed.mode() == FeedMode::S1Only {
                         // The validated birth cannot select Joint: the

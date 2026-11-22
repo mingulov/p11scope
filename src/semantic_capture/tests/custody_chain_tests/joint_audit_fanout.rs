@@ -37148,7 +37148,10 @@ fn drive_birth_quantum(
     caller: crate::discovery::caller_registry::CallerId,
     files: &[u32],
     seq_base: u64,
-) -> IngestedRaw {
+) -> (
+    IngestedRaw,
+    crate::semantics_objects::journal::JournalDomainProof,
+) {
     for file in files {
         scene.push(pid, *file, "C_CreateObject", seq_base + u64::from(*file));
     }
@@ -37160,18 +37163,21 @@ fn drive_birth_quantum(
     let raw = scene.real.h0.0.borrow_mut().collected.take().unwrap();
     let (ingested, _, _) = scene.ingest_with_grant(raw);
     let mut count = 0;
-    while scene
+    let mut first_proof = None;
+    while let Some((_, proof)) = scene
         .real
         .scene
         .coordinator
         .claim_next_prepared_admission(&scene.producers, &ingested)
         .unwrap()
-        .is_some()
     {
+        if first_proof.is_none() {
+            first_proof = Some(proof.expect("the claim attests"));
+        }
         count += 1;
     }
     assert_eq!(count, files.len(), "every admission claims");
-    ingested
+    (ingested, first_proof.expect("at least one claim"))
 }
 
 /// Decide births with the real native consume path (validate plus
@@ -37295,7 +37301,7 @@ fn joint_birth_funnel_accounts_every_offer() {
             > 0,
         "Q2 re-arms its keys"
     );
-    let ingested = drive_birth_quantum(&mut scene, pid, caller, &files, 3);
+    let (ingested, _) = drive_birth_quantum(&mut scene, pid, caller, &files, 3);
     let mut births = RetainedJointBirths::new();
     let (_, pending_q2) = decide_and_finish_births(&mut scene, &ingested, &attached, &mut births);
     // Q3: re-armed retry offers (Continued arm) under clamped storage,
@@ -37311,7 +37317,7 @@ fn joint_birth_funnel_accounts_every_offer() {
             > 0,
         "Q3 re-arms its keys"
     );
-    let ingested = drive_birth_quantum(&mut scene, pid, caller, &files, 5);
+    let (ingested, _) = drive_birth_quantum(&mut scene, pid, caller, &files, 5);
     scene
         .real
         .scene
@@ -38132,5 +38138,133 @@ fn joint_reoffer_evicts_unregistered_key() {
             .iter()
             .all(|gap| gap.subject != JOINT_BIRTH_UNAVAILABLE_SUBJECT),
         "an armed re-offer lands no final gap"
+    );
+}
+
+/// A same-proof birth for a fallback-closed proof-destroyed feed
+/// refuses at the association, before any install or witness: the
+/// drain would refuse it as segment-unresumable, so installing
+/// would only churn grants and fill the retained table with
+/// witnesses no staging can ever consume.
+#[test]
+fn joint_birth_refuses_doomed_segment_before_install() {
+    use crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT;
+    use crate::inventory_semantics::RetainedJointBirths;
+    use crate::semantics_objects::journal::{BirthKind, BootstrapReceipt};
+
+    let image = ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    };
+    let (mut scene, ingested_q1, attached, _grant) = prepared_birth_originals(1, false, false);
+    let mut births = RetainedJointBirths::new();
+    let (installed_q1, _) =
+        decide_and_finish_births(&mut scene, &ingested_q1, &attached, &mut births);
+    assert!(installed_q1 > 0, "Q1 installs, pinning a live table");
+    // Apply registrations, then doom the feed's segment with the
+    // same proof lineage Q2 will birth.
+    scene.real.scene.coordinator.registry_mut().publish();
+    let pid = std::process::id();
+    let caller = scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .find_by_image(scene.real.lane.domain(), image)
+        .expect("Q1 bound the image")
+        .caller();
+    let files = vec![0u32];
+    assert!(
+        scene
+            .real
+            .h0
+            .0
+            .borrow_mut()
+            .capture
+            .rearm_image_for_reseed(image)
+            > 0,
+        "Q2 re-arms its key so the doomed birth forms"
+    );
+    let (ingested, proof) = drive_birth_quantum(&mut scene, pid, caller, &files, 3);
+    let key = scene
+        .real
+        .scene
+        .coordinator
+        .prepared_semantic_batch()
+        .expect("Q2 prepared")
+        .admissions()
+        .next()
+        .expect("Q2 admitted")
+        .instance_key_for_test()
+        .clone();
+    let doomed = BootstrapReceipt::scripted(proof, BirthKind::AttachObserved, 7, 0);
+    scene
+        .real
+        .scene
+        .coordinator
+        .registry_mut()
+        .pose_fallback_segment_for_test(&key, false, doomed);
+    let installed_before: usize = scene.real.scene.coordinator.joint_births_installed() as usize;
+    let mut births = RetainedJointBirths::new();
+    let h0 = scene.real.h0.clone();
+    let publisher = NativePublisher::build();
+    let consumed = std::cell::Cell::new(false);
+    let disposition = scene
+        .real
+        .scene
+        .coordinator
+        .prepare_joint_births(
+            &ingested,
+            &scene.producers,
+            &mut births,
+            |candidate, absence, input, binding, proof, adapter| {
+                consumed.set(true);
+                let (row, control, _) =
+                    publisher.publish_stamped(&["0", "0"], attached.generation());
+                let mut rows = NativeBirthRows { row, control };
+                let mut owned = h0.0.borrow_mut();
+                let HeldH0 { capture, io, .. } = &mut *owned;
+                capture.validate_birth_candidate(io, &candidate, false)?;
+                let witness = capture.finish_birth(
+                    candidate, absence, input, binding, &attached, proof, adapter, &mut rows,
+                )?;
+                Ok(witness)
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        disposition.installed, 0,
+        "the doomed birth installs nothing"
+    );
+    assert!(
+        !consumed.get(),
+        "the doomed birth never reaches native consume"
+    );
+    assert_eq!(
+        scene.real.scene.coordinator.joint_births_installed() as usize,
+        installed_before,
+        "no install accumulates for the doomed birth"
+    );
+    assert_eq!(
+        births.ready_for_test().count(),
+        0,
+        "no witness retains for the doomed birth"
+    );
+    let doomed_gaps: Vec<_> = scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_gaps_for_test()
+        .into_iter()
+        .filter(|gap| {
+            gap.subject == JOINT_BIRTH_UNAVAILABLE_SUBJECT
+                && gap.reason == "joint_birth_install_segment_unresumable"
+        })
+        .collect();
+    assert_eq!(
+        doomed_gaps.len(),
+        1,
+        "the doomed birth names its install-time refusal exactly once"
     );
 }

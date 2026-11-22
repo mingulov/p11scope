@@ -2038,18 +2038,24 @@ pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot se
 pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 /// Gap-noise folds: mid-flight changed generations, the live
-/// stale-deferral mark, scan-budget stops and loader-context misses
-/// project to these finite public reasons instead of the generic
-/// redaction. Each folds exact internal pairs only (the ceiling by
-/// its fixed reason sentence, whatever subject filed it); function
-/// subjects always keep their entry row, and folding renames rows,
-/// never drops them. Neither mid-flight row claims an exit: proven
-/// exits are ordinary ends and file no public row.
+/// stale-deferral mark, permission refusals, scan-budget stops and
+/// loader-context misses project to these finite public reasons
+/// instead of the generic redaction. Each folds exact internal pairs
+/// only (the ceiling by its fixed reason sentence, whatever subject
+/// filed it); function subjects always keep their entry row, and
+/// folding renames rows, never drops them. Neither mid-flight row
+/// claims an exit: proven exits are ordinary ends and file no public
+/// row. The permission row claims neither exit nor change: a refused
+/// read proves neither.
 const MID_FLIGHT_REASON: &str = "process exited or changed mid-flight";
 /// The live stale-deferral mark's own public reason: it is filed
 /// for a possibly still-live process with retirement deferred, so
 /// it must never call the process exited.
 const STALE_DEFERRAL_REASON: &str = "stale process report deferred mid-flight";
+/// The permission-refusal mark's own public reason: it is filed for
+/// a possibly still-live, unchanged process whose read was denied,
+/// so it must never call the process exited or changed.
+const PERMISSION_REFUSAL_REASON: &str = "process unreadable mid-flight; permission denied";
 const SCAN_BUDGET_REASON: &str = "scan budget exhausted";
 const LOADER_CONTEXT_REASON: &str = "no unique attached loader context";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
@@ -2248,6 +2254,19 @@ fn is_stale_deferral_pair(subject: &str, reason: &str) -> bool {
         )
 }
 
+/// Whether an internal skip is the permission-refusal pair: a scope
+/// member's read failed with EACCES/EPERM while the process may be
+/// live and unchanged. Exact subject and reason, never prefix or
+/// substring: near misses stay generic. It must never fold into the
+/// changed row: a refused read proves neither exit nor change.
+fn is_permission_refusal_pair(subject: &str, reason: &str) -> bool {
+    (subject, reason)
+        == (
+            "process view",
+            "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered",
+        )
+}
+
 /// Whether an internal skip is one of the two no-unique-loader-context
 /// pairs (exact): kept distinct from the ceiling row, a different
 /// operator action.
@@ -2357,6 +2376,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         MID_FLIGHT_REASON
     } else if is_stale_deferral_pair(&s.subject, &s.reason) {
         STALE_DEFERRAL_REASON
+    } else if is_permission_refusal_pair(&s.subject, &s.reason) {
+        PERMISSION_REFUSAL_REASON
     } else if s
         .reason
         .contains(crate::discovery::scan::WORK_CEILING_REASON)
@@ -4874,6 +4895,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     if skip.name == DISCOVERY_SUBJECT {
                         if skip.reason != MID_FLIGHT_REASON
                             && skip.reason != STALE_DEFERRAL_REASON
+                            && skip.reason != PERMISSION_REFUSAL_REASON
                             && skip.reason != SCAN_BUDGET_REASON
                             && skip.reason != LOADER_CONTEXT_REASON
                         {
@@ -4914,6 +4936,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LOADER_ARM_LEDGER_FULL,
                     MID_FLIGHT_REASON,
                     STALE_DEFERRAL_REASON,
+                    PERMISSION_REFUSAL_REASON,
                     SCAN_BUDGET_REASON,
                     LOADER_CONTEXT_REASON,
                     LEARNED_FIRST_RUN_REASON,
@@ -11231,6 +11254,7 @@ pub(crate) mod tests {
             "process exited or changed mid-flight",
             "process exited or changed mid-flight",
             "stale process report deferred mid-flight",
+            "process unreadable mid-flight; permission denied",
             "scan budget exhausted",
             "scan budget exhausted",
             "no unique attached loader context",
@@ -11254,6 +11278,7 @@ pub(crate) mod tests {
                 "loader context capacity 256 is exhausted: 1",
                 "process exited or changed mid-flight: 4",
                 "stale process report deferred mid-flight: 1",
+                "process unreadable mid-flight; permission denied: 1",
                 "scan budget exhausted: 2",
                 "no unique attached loader context: 1",
             ] {

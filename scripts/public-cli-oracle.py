@@ -78,19 +78,22 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
 # discovery reason) is a different family and still fails.
 DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
 # Mid-flight rows: the render layer folds the five changed-generation
-# pairs to the changed reason and the live stale-deferral mark to its
-# own deferral reason (never dropped, never a pid). Neither row
-# proves an exit — the changed row covers exit-or-change without
-# proof, and the deferral row is filed for a possibly still-live
-# process — so an exit excuse requires proof the process actually
-# exited, which no public row carries. The oracle therefore never
-# qualifies either row: any report containing one fails closed at the
-# gap gate, in every mode. Kept as named constants so the vocabulary
-# pin (test_skip_reason_vocabulary.py) keeps them tied to the
-# producer. (Historical constant name: the changed row no longer
-# claims an exit.)
+# pairs to the changed reason, the live stale-deferral mark to its
+# own deferral reason, and the permission-refusal mark to its own
+# permission row (never dropped, never a pid). No row proves an
+# exit — the changed row covers exit-or-change without proof, the
+# deferral row is filed for a possibly still-live process, and the
+# permission row for a possibly still-live, unchanged process whose
+# read was denied — so an exit excuse requires proof the process
+# actually exited, which no public row carries. The oracle therefore
+# never qualifies any of these rows: any report containing one fails
+# closed at the gap gate, in every mode. Kept as named constants so
+# the vocabulary pin (test_skip_reason_vocabulary.py) keeps them tied
+# to the producer. (Historical constant name: the changed row no
+# longer claims an exit.)
 EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited or changed mid-flight"}
 STALE_DEFERRAL_SKIP = {"name": "discovery subject", "reason": "stale process report deferred mid-flight"}
+PERMISSION_REFUSAL_SKIP = {"name": "discovery subject", "reason": "process unreadable mid-flight; permission denied"}
 # R1 fixed row: live attached counting slots a mid-capture global
 # retirement detached with no same-apply reattach. The affected-slot
 # count rides in evidence.coverage_retired_slots, never in the reason.

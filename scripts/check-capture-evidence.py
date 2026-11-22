@@ -662,18 +662,20 @@ MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
 PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
 DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
 # Gap-noise folds: mid-flight changed generations, the live
-# stale-deferral mark, scan-budget stops and loader-context misses
-# project to these finite reasons instead of the generic redaction
-# (render.rs `capture_skipped_out` fold arms). Each folds exact
-# internal pairs only; folding renames rows, never drops them. The
-# validator must accept what the producer emits. Neither mid-flight
-# row claims an exit: proven exits are ordinary ends and file no
-# public row.
+# stale-deferral mark, permission refusals, scan-budget stops and
+# loader-context misses project to these finite reasons instead of
+# the generic redaction (render.rs `capture_skipped_out` fold arms).
+# Each folds exact internal pairs only; folding renames rows, never
+# drops them. The validator must accept what the producer emits.
+# Neither mid-flight row claims an exit: proven exits are ordinary
+# ends and file no public row. The permission row claims neither
+# exit nor change: a refused read proves neither.
 MID_FLIGHT_REASON = "process exited or changed mid-flight"
 STALE_DEFERRAL_REASON = "stale process report deferred mid-flight"
-# Retired by the mid-flight split: v0.7.2 captures fold all six
-# pairs to this one row. Still accepted so archived captures keep
-# validating; the producer no longer emits it.
+PERMISSION_REFUSAL_REASON = "process unreadable mid-flight; permission denied"
+# Retired by the mid-flight split: earlier candidates fold every
+# mid-flight pair to this one row. Still accepted so archived
+# captures keep validating; the producer no longer emits it.
 RETIRED_MID_FLIGHT_EXIT_REASON = "process exited mid-flight"
 RETIRED_DISCOVERY_REASONS = {RETIRED_MID_FLIGHT_EXIT_REASON}
 SCAN_BUDGET_REASON = "scan budget exhausted"
@@ -865,6 +867,7 @@ DISCOVERY_REASONS = {
     DISCOVERY_TRANSPORT_UNAVAILABLE,
     MID_FLIGHT_REASON,
     STALE_DEFERRAL_REASON,
+    PERMISSION_REFUSAL_REASON,
     RETIRED_MID_FLIGHT_EXIT_REASON,
     SCAN_BUDGET_REASON,
     LOADER_CONTEXT_REASON,

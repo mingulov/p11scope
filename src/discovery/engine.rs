@@ -10779,6 +10779,23 @@ const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
 const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
      only that generation mapped was never discovered";
 
+/// The one published record for scope members discovery could not
+/// read because permission was denied (EACCES/EPERM). The process may
+/// be live and unchanged — a refusal proves neither exit nor change —
+/// so it files its own pair, never the changed-generation pair.
+const UNREADABLE_PERMISSION_SUBJECT: &str = "process view";
+const UNREADABLE_PERMISSION_REASON: &str = "a process in scope could not be retained or scanned; permission was denied, and a provider \
+     only that process mapped was never discovered";
+
+/// Whether a discovery-read failure detail reports a permission
+/// refusal (EACCES "Permission denied", EPERM "Operation not
+/// permitted"). Same markers the inspect layer already uses for its
+/// sudo hint: the process may be live and unchanged, so the refusal
+/// is never evidence of exit or change.
+fn is_permission_denial(detail: &str) -> bool {
+    detail.contains("Permission denied") || detail.contains("not permitted")
+}
+
 /// Pinned by `scan_pin_diagnostics_escape_target_controls`. Production stderr
 /// now aggregates through `DiscoveryNoiseAggregator` (Task 3.2); this format
 /// survives only as the oracle for the escaping contract.
@@ -10866,8 +10883,10 @@ fn format_slot_sizing_summary(sizing: &crate::capacity::SlotSizing) -> Option<St
 /// nothing a capture that keeps running can still observe. Loss stays loss,
 /// and loud, whenever the end cannot be proven. Loud means aggregated (Task
 /// 3.2): the detail is noted to `noise` scrubbed of PIDs, never printed raw.
-/// Shared with `inspect --system`, which pairs the deduped record with a
-/// per-pid status in its process table.
+/// A permission refusal (EACCES/EPERM) files the permission pair: the
+/// process may be live and unchanged, so the refusal is never evidence
+/// of exit or change. Shared with `inspect --system`, which pairs the
+/// deduped record with a per-pid status in its process table.
 pub(crate) fn unreadable_member_skip(
     pid: u32,
     gone: bool,
@@ -10878,6 +10897,12 @@ pub(crate) fn unreadable_member_skip(
         return None;
     }
     noise.note_unreadable(pid, detail);
+    if is_permission_denial(detail) {
+        return Some(Skipped {
+            subject: UNREADABLE_PERMISSION_SUBJECT.into(),
+            reason: UNREADABLE_PERMISSION_REASON.into(),
+        });
+    }
     Some(Skipped {
         subject: UNREADABLE_MEMBER_SUBJECT.into(),
         reason: UNREADABLE_MEMBER_REASON.into(),

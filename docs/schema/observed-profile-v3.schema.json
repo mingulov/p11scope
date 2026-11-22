@@ -604,6 +604,7 @@
                   "discovery transport unavailable",
                   "process exited or changed mid-flight",
                   "stale process report deferred mid-flight",
+                  "process unreadable mid-flight; permission denied",
                   "process exited mid-flight",
                   "scan budget exhausted",
                   "no unique attached loader context",

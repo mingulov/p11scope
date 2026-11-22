@@ -1193,7 +1193,7 @@ exactly:
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
 
-Gap-noise folds file under the discovery subject with four finite
+Gap-noise folds file under the discovery subject with five finite
 reasons (in addition to the v2 list and the reasons above). Each
 record is `{name: "discovery subject", reason}` with `reason` exactly
 one of:
@@ -1209,6 +1209,10 @@ one of:
   stale-deferral mark — the pin recheck contradicted the loss
   report or could not judge it, so retirement was deferred and the
   process may still be running. This row never claims an exit.
+- `process unreadable mid-flight; permission denied`: a scope
+  member whose read failed with EACCES/EPERM — the process may be
+  live and unchanged, so the refusal proves neither exit nor
+  change. This row never claims either event.
 - `scan budget exhausted`: a work-ceiling stop, bare or wrapped in
   a scan refusal, whatever subject filed it. Function subjects keep
   their entry row instead — the fold never redacts a function name.
@@ -1216,11 +1220,15 @@ one of:
   context could not be uniquely attached. Distinct from the ceiling
   row: a different operator action.
 
-Upgrade note: v0.7.2 folds all six pairs to the single reason
-`process exited mid-flight`, which claimed an exit even for a
-still-live process. The producer no longer emits that reason; the
-schema and the evidence checker still accept it, so archived v0.7.2
-captures keep validating.
+Upgrade note: earlier candidates fold every mid-flight pair to the
+single reason `process exited mid-flight`, which claimed an exit
+even for a still-live process (and, for a refused read, an exit or
+change even for a live, unchanged one). v0.8.0 emits the split
+vocabulary instead: the changed row above, the deferral row, and
+the permission row. The producer no longer emits the single row;
+the schema and the evidence checker still accept it, so archived
+captures keep validating. Validators pinned to the old vocabulary
+need the revised one.
 
 Folding renames rows, never drops them: JSON keeps one row per
 underlying internal record. The text names each folded row with its

@@ -233,7 +233,8 @@ class CiStopRacesTests(unittest.TestCase):
 
     def test_preclusion_tag_maps_environment_precluded(self):
         log = ("P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
-               "wp7-stop0: no joint feeds: not attempted\n")
+               "wp7-stop0: no joint feeds with S1 seal "
+               "(producers unlinked, zero installs); not attempted\n")
         self.assertNotIn(wedge_signature(), log)
         proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=True)
         self.assertIsNotNone(joint, rows)
@@ -292,8 +293,8 @@ class CiStopRacesTests(unittest.TestCase):
 
     def test_unattributed_no_feed_run_fails_with_its_cause(self):
         log = ("P11SCOPE_CELL_BRANCH=wp7-stop4:no-feeds-unattributed\n"
-               "wp7-stop4: no joint feeds and no S1 seal "
-               "(unattributed linkage default); not attempted\n")
+               "wp7-stop4: no joint feeds without S1 seal "
+               "(producers linked, zero installs unexplained); not attempted\n")
         self.assertNotIn(wedge_signature(), log)
         self.assertNotIn("s1-precluded", log)
         proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)

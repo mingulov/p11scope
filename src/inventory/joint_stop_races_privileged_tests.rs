@@ -802,14 +802,15 @@ fn no_feed_branch_tag(branch: &JointBranch) -> Option<&'static str> {
     }
 }
 
-/// Reason fragment for a stop case that produced no Joint feeds, naming
-/// the established cause (or its absence) for the bail message.
+/// Reason fragment for a stop case that produced no Joint feeds,
+/// reporting what the cell sampled: the latched producer linkage
+/// and the installed-feed count behind the branch decision.
 fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
     match branch {
         JointBranch::Linked => None,
-        JointBranch::S1 => Some("no joint feeds from the linked session"),
+        JointBranch::S1 => Some("no joint feeds with S1 seal (producers unlinked, zero installs)"),
         JointBranch::Unattributed => {
-            Some("no joint feeds and no S1 seal (unattributed linkage default)")
+            Some("no joint feeds without S1 seal (producers linked, zero installs unexplained)")
         }
     }
 }
@@ -1769,8 +1770,10 @@ fn run_stop_offset(
 /// no-feeds-unattributed tag.
 /// Last-waiter disposition: a live last waiter before stop is unreachable
 /// (collected ticks resolve waiters same tick; 1,390 slice samples,
-/// 0 waiters: 352 linked plus 1,038 micro-slice S1-precluded probe), so
-/// this matrix never stages the twins' refresh-to-stash handoff. The
+/// 0 waiters: 352 linked plus 1,038 micro-slice no-feed probe with
+/// unresolved seal, whose historical tag covered S1 and unattributed
+/// alike), so this matrix never stages the twins' refresh-to-stash
+/// handoff. The
 /// invariant is carried by the machine twins
 /// `joint_machine_finish_after_pass_refresh_resolution_publishes_linked`,
 /// `joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked`

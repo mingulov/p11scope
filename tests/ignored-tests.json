@@ -2120,7 +2120,7 @@
     {
       "file": "src/inventory/joint_stop_races_privileged_tests.rs",
       "path": "inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64",
-      "reason": "privileged: 12-case linked Joint stop coverage over a linked journal session (3 preps x 4 offsets, both qualifying entries force the full matrix; weekly long campaign; S3 suite row via scripts/ci/stop-races.sh); last-waiter disposition: live last waiter before stop unreachable: collected ticks resolve waiters same tick (1,390 slice samples, 0 waiters: 352 linked healthy runs + 1,038 micro-slice S1-precluded probe); invariant carried by machine twins joint_machine_finish_after_pass_refresh_resolution_publishes_linked, joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked, joint_machine_finish_at_q_expiry_storage_refusal_still_latches (each mutation-proven)",
+      "reason": "privileged: 12-case linked Joint stop coverage over a linked journal session (3 preps x 4 offsets, both qualifying entries force the full matrix; weekly long campaign; S3 suite row via scripts/ci/stop-races.sh); last-waiter disposition: live last waiter before stop unreachable: collected ticks resolve waiters same tick (1,390 slice samples, 0 waiters: 352 linked healthy runs + 1,038 micro-slice no-feed probe with unresolved seal (the historical s1-precluded tag covered S1 and unattributed alike); invariant carried by machine twins joint_machine_finish_after_pass_refresh_resolution_publishes_linked, joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked, joint_machine_finish_at_q_expiry_storage_refusal_still_latches (each mutation-proven)",
       "cell": "privileged"
     },
     {

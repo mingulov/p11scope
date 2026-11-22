@@ -33098,6 +33098,334 @@ fn joint_replay_steps_drained_conversion_completes_tail_free_call() {
     );
 }
 
+/// Held-drain twin of
+/// joint_replay_steps_drained_conversion_completes_tail_free_call:
+/// the first drained completion stays held past its conversion seal
+/// (the second call's still-open BEGIN keeps the settlement
+/// watermark below its cut), so the deferred End replays from the
+/// third seal alongside the second drain. That seal must not re-mint
+/// the settled row, its frozen table must describe the held
+/// completion (end cut, never abandoned), and the deferred End must
+/// replay end to end instead of stalling the feed head.
+#[test]
+fn joint_replay_steps_held_drain_defers_end_past_conversion() {
+    use crate::semantics_objects::journal::SealReplayPhase;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+    // Two exit-raced calls on the same key: both BEGINs and ordinary
+    // returns land here, the abandonments one quantum apart. A
+    // healthy END-closed holder would double-admit (its END's H0 copy
+    // is a second admission for the same invocation), so the holder
+    // is a second drain instead.
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 2);
+    let (held, held_ordinary) = fixture.scene.encoded(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.drain.source_mut().push_record(open.to_vec());
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(ordinary[24..392].to_vec());
+    fixture.scene.drain.source_mut().push_record(held.to_vec());
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(held_ordinary[24..392].to_vec());
+    let mut q1 = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        q1.failure_for_test().is_none(),
+        "q1 must have an actual clean audit: {:?}",
+        q1.failure_for_test()
+    );
+    fixture.seal_replay_head(&mut q1, &BirthFault);
+    let first = q1.active_seal_for_test().unwrap();
+    assert_eq!(first.prefix.domain(), target.bootstrap().domain());
+    assert_eq!(first.prefix.settled().len(), 2);
+    // Settled rows are begin-cut ordered: the first drain staged first.
+    let drained_open = first.prefix.settled()[0];
+    let holder_open = first.prefix.settled()[1];
+    assert!(drained_open.end_cut.is_none() && holder_open.end_cut.is_none());
+    assert!(!drained_open.abandoned && !holder_open.abandoned);
+    assert!(drained_open.begin_cut < holder_open.begin_cut);
+    // Each abandonment is the sole record its quantum consumes, so
+    // its ordinal is that quantum's first fresh cut; each drained
+    // completion cuts there, like an END conversion cuts at its END.
+    let recovered_cut = first.prefix.frontier_cut() + 1;
+    assert!(drained_open.key.admission() < holder_open.key.admission());
+    assert!(
+        first.effects.effects.is_empty(),
+        "the real open holds the watermark"
+    );
+    assert_original_replay_partition(first);
+    assert!(
+        !first
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::End)
+    );
+    fixture.scene.assert_claims(&[]);
+    let before_roles = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .ledger()
+        .roles_for_test();
+    assert_eq!(before_roles[..4], [0, 2, 2, 2]);
+
+    // The second quantum converts the first drain; the holder keeps
+    // the settlement watermark, so the drained End defers past it.
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(abandon.to_vec());
+    let mut q2 = fixture.audited(0, 0, &BirthFault);
+    assert!(
+        q2.failure_for_test().is_none(),
+        "q2 drained ABANDON must preserve resource custody: {:?}",
+        q2.failure_for_test()
+    );
+    fixture.seal_replay_head(&mut q2, &BirthFault);
+    let second = q2.active_seal_for_test().unwrap();
+    assert_eq!(second.prefix.settled().len(), 1);
+    let drained = second.prefix.settled()[0];
+    assert_eq!(drained.ticket, drained_open.ticket);
+    assert!(
+        !drained.abandoned,
+        "the drained call completes, never abandons"
+    );
+    assert_eq!(
+        drained.end_cut,
+        Some(recovered_cut),
+        "the completion cut is the abandonment ordinal"
+    );
+    assert_eq!(second.prefix.replay_calls().len(), 2);
+    assert_eq!(
+        second.prefix.replay_calls()[0],
+        drained,
+        "the conversion seal carries the completed row"
+    );
+    assert_original_replay_partition(second);
+    assert!(
+        !second
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::End),
+        "the holder keeps the drained End deferred"
+    );
+    assert!(
+        !second
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::BoundedLoss),
+        "a drained return mints no loss"
+    );
+    let conversions: Vec<_> = second
+        .prefix
+        .replay_steps()
+        .iter()
+        .filter(|step| step.phase() == SealReplayPhase::Conversion)
+        .collect();
+    assert_eq!(conversions.len(), 1);
+    assert_eq!(conversions[0].cut(), Some(recovered_cut));
+    assert!(conversions[0].effect_range().is_empty());
+    fixture.scene.assert_claims(&[]);
+    let before_feeds = fixture.feeds();
+    let holder_cut = second.prefix.frontier_cut() + 1;
+
+    // The third quantum drains the holder: the watermark releases and
+    // the deferred End mints alongside the fresh one.
+    let mut holder_abandon = abandon_bytes(
+        u64::from(pid),
+        3,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    holder_abandon[24..32].copy_from_slice(&held[24..32]);
+    holder_abandon[48..52].copy_from_slice(&held[104..108]);
+    holder_abandon[56..64].copy_from_slice(&held[48..56]);
+    fixture
+        .scene
+        .drain
+        .source_mut()
+        .push_record(holder_abandon.to_vec());
+    let mut q3 = fixture.audited(0, 0, &BirthFault);
+    assert!(
+        q3.failure_for_test().is_none(),
+        "q3 drained ABANDON must preserve resource custody: {:?}",
+        q3.failure_for_test()
+    );
+    fixture.seal_replay_head(&mut q3, &BirthFault);
+    let third = q3.active_seal_for_test().unwrap();
+    assert_eq!(
+        third.prefix.settled().len(),
+        1,
+        "a converted drain never re-mints on a later seal: {:?}",
+        third.prefix.settled()
+    );
+    let holder_done = third.prefix.settled()[0];
+    assert_eq!(holder_done.ticket, holder_open.ticket);
+    assert!(
+        !holder_done.abandoned,
+        "the second drain completes, never abandons"
+    );
+    assert_eq!(
+        holder_done.end_cut,
+        Some(holder_cut),
+        "the completion cut is the abandonment ordinal"
+    );
+    let frozen = *third
+        .prefix
+        .replay_calls()
+        .iter()
+        .find(|call| call.ticket == drained.ticket)
+        .expect("the held completion stays frozen");
+    assert_eq!(
+        frozen.end_cut,
+        Some(recovered_cut),
+        "the frozen row keeps the completion cut"
+    );
+    assert!(!frozen.abandoned, "the frozen row never abandons");
+    assert_original_replay_partition(third);
+    for foreign in second.prefix.replay_steps() {
+        assert!(third.prefix.call_for_step(foreign).is_none());
+        assert!(third.effects_for_step(foreign).is_none());
+    }
+    assert!(
+        !third
+            .prefix
+            .replay_steps()
+            .iter()
+            .any(|step| step.phase() == SealReplayPhase::BoundedLoss),
+        "a drained return mints no loss"
+    );
+    let terminal: Vec<_> = third
+        .prefix
+        .replay_steps()
+        .iter()
+        .filter(|step| step.phase() == SealReplayPhase::End)
+        .collect();
+    assert_eq!(
+        terminal.len(),
+        2,
+        "the held drain settles alongside the second drain"
+    );
+    for step in &terminal {
+        let call = third.prefix.call_for_step(step).unwrap();
+        if call.ticket == drained.ticket {
+            assert_eq!((*call, step.cut()), (frozen, Some(recovered_cut)));
+        } else {
+            assert_eq!((*call, step.cut()), (holder_done, Some(holder_cut)));
+        }
+        assert!(
+            step.effect_range().is_empty(),
+            "a drained Update completes with no fabricated effects"
+        );
+    }
+    // No loss, no contradiction, no malformation anywhere in the seal:
+    // completing at a stale cut voids the domain instead of recovering.
+    assert!(
+        !third.effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::AccessEnded {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Retired {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::MetadataInvalidated {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Downgraded {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Unresolved {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+                ..
+            } | ObjectEffect::Gap {
+                reason: ObjectGap::OutcomeLost
+                    | ObjectGap::PrefixContradiction
+                    | ObjectGap::MalformedFact,
+            } | ObjectEffect::SessionEnded {
+                end: crate::semantics_objects::SessionEnd::Uncertain(
+                    ObjectGap::OutcomeLost
+                        | ObjectGap::PrefixContradiction
+                        | ObjectGap::MalformedFact,
+                ),
+                ..
+            }
+        )),
+        "no outcome is lost and no prefix is contradicted: {:?}",
+        third.effects.effects
+    );
+    // Seal-time custody matches the conversion twin: the drain changes
+    // only the terminal disposition, not staging retention.
+    assert_eq!(
+        fixture.feeds(),
+        before_feeds,
+        "representation activates no H9 replay"
+    );
+    fixture.scene.assert_claims(&[]);
+    // Both genuine completions replay end to end; nothing disposes.
+    let target_before = before_feeds
+        .iter()
+        .find(|feed| feed.id == target.id())
+        .unwrap();
+    let base = (target_before.reduced, target_before.disposed);
+    let counts = fixture.s1_counts(target.id());
+    fixture.finish_bounded_batch(q3, false);
+    let feed = fixture
+        .feeds()
+        .into_iter()
+        .find(|feed| feed.id == target.id())
+        .unwrap();
+    assert_eq!(
+        (feed.reduced - base.0, feed.disposed - base.1, feed.staged),
+        (2, 0, 0)
+    );
+    let current = fixture.s1_counts(target.id());
+    assert_eq!(
+        current.0 - counts.0,
+        2,
+        "the drained completion is S1-positive replay, never disposal"
+    );
+}
+
 #[test]
 fn joint_replay_step_capacity_refusal_preserves_original() {
     let mut fixture = CanonicalFanoutScene::prior_sealed();

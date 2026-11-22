@@ -21894,6 +21894,82 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_held_drain_does_not_remint_settled_row() {
+        // Held-drain twin of
+        // object_journal_exit_return_drain_recovers_tail_free_call: a
+        // drained completion held past its conversion seal (the open
+        // holder keeps the prune watermark below its cut) must not
+        // re-mint its settled row on a later seal. Converted calls
+        // settle once: only the fresh call appears in the later delta,
+        // and every terminal converts exactly once.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let proof = scene.attest_function_n("C_Sign", 3);
+        let holder = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&holder), JournalDisposition::BeginAdmitted);
+        let begin = begin_bytes(1, 2, sign, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        // The fence sits strictly above the corroborated bound, so the
+        // frontier must cover it: one pad record.
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let first = scene.seal(&bootstrap).expect("first seal passes");
+        assert_eq!(first.prefix.settled().len(), 2);
+        let drained = *first
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 2)
+            .expect("the drained call settles in its conversion seal");
+        assert!(
+            !drained.abandoned,
+            "the drained call completes, never abandons"
+        );
+        assert_eq!(
+            drained.end_cut,
+            Some(4),
+            "the completion cut is the abandonment ordinal"
+        );
+        // A fresh call completes on the second seal while the holder
+        // stays open.
+        let fresh = begin_bytes(1, 3, sign, 0);
+        assert_eq!(scene.ingest(&fresh), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&fresh, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let second = scene.seal(&bootstrap).expect("second seal passes");
+        assert_eq!(
+            second.prefix.settled().len(),
+            1,
+            "a converted drain never re-mints on a later seal: {:?}",
+            second.prefix.settled()
+        );
+        let settled = &second.prefix.settled()[0];
+        assert_eq!(settled.begin_cut, 6);
+        assert_eq!(settled.end_cut, Some(7));
+        assert!(!settled.abandoned);
+        assert!(
+            !second.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::DuplicateCompletion
+                }
+            )),
+            "no duplicate completion"
+        );
+    }
+
+    #[test]
     fn joint_keepup_seal_validation_census_is_linear_in_retained() {
         // The live-feed seal attributes every converting call: with a
         // full open table the attribution census must visit each

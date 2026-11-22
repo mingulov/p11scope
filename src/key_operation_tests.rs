@@ -27214,6 +27214,53 @@ fn key_operation_schema_v9_pins_relaxed_metadata_contract() {
     }
 }
 
+/// The v9 producer arm is pinned, not just its consumers: a scene
+/// with relaxed-dialect content (and no unknown-mechanism content)
+/// emits section version 9, while the same scene with a v7 label
+/// emits 7. Forcing `has_relaxed_content` false must fail the v9
+/// half while the v7 control stays green.
+#[test]
+fn key_operation_relaxed_label_selects_v9_without_unknown_content() {
+    use crate::key_operation_projection::producer::commit;
+    use p11scope_ebpf_common::object_policy::SafeCurve;
+    for (curve, label, want) in [
+        (SafeCurve::Secp256k1, "ec_secp256k1", 9u8),
+        (SafeCurve::Secp256r1, "ec_p256", 7u8),
+    ] {
+        let ids = KeymetaCtx::object_ids(1);
+        let mut ctx = KeymetaCtx::new();
+        let receipt = KeymetaCtx::receipt(
+            ids[0],
+            "C_SignInit",
+            0,
+            KeyRole::OperationKey,
+            Some(KeyLabel::Ec { curve }),
+        );
+        ctx.start("C_SignInit", 7, Some(0x1044), &[receipt], 100);
+        ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+        let scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let staging = JointStaging::select_joint(Some(&bootstrap));
+        let committed = commit(1, &[&staging], &scene.model.project(), &ctx.keyuse);
+        assert!(
+            committed
+                .unknown_key_operations
+                .iter()
+                .all(|row| row.mechanisms.is_empty() && row.further_mechanism_terminals == 0),
+            "{label}: no unknown-mechanism content"
+        );
+        assert_eq!(committed.key_operations.len(), 1, "{label}: one proved row");
+        assert_eq!(committed.key_operations[0].metadata_at_use, label);
+        assert_eq!(
+            crate::key_operation_projection::observations_version(&committed),
+            want,
+            "{label}: producer version"
+        );
+        let section = crate::key_operation_projection::object_observations_json(&committed);
+        assert_eq!(section["version"], want, "{label}: section version");
+    }
+}
+
 /// Controller ruling fix2 (F3): the v10 schema pins the unknown-row
 /// mechanism contract — the section version constant (10), the nine
 /// required unknown-row keys (the frozen eight plus `mechanisms`),
@@ -29017,6 +29064,10 @@ fn key_operation_creation_family_seeds_row_without_key_type() {
     let inferred = row.inferred.as_ref().expect("the row infers");
     assert_eq!(inferred.family.status, InferredStatus::Inferred);
     assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        inferred.family.completions, 1,
+        "one completion counts once when the creation seed fires"
+    );
 }
 
 /// F4 negative control: an established key type keeps creation
@@ -29059,6 +29110,108 @@ fn key_operation_creation_family_yields_to_use_family() {
     assert_eq!(inferred.family.status, InferredStatus::Inferred);
     assert_eq!(inferred.family.value, Some(KeyFamily::Rsa));
     assert_eq!(inferred.family.completions, 1);
+}
+
+/// F4 on the direct path: a creation-seeded operation key (here a
+/// derive base key used under an unlisted mechanism) counts its one
+/// completion once — the firing seed subsumes the use-side
+/// increment instead of adding a second.
+#[test]
+fn key_operation_creation_family_seeds_direct_operation_once() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let mut receipt = KeymetaCtx::receipt(ids[0], "C_DeriveKey", 0, KeyRole::BaseKey, None);
+    receipt.creation_mechanism = Some(0x0f);
+    ctx.direct("C_DeriveKey", 7, Some(0x0500), &[receipt], 100, None, None)
+        .expect("derive completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "derive", "base_key", "unknown")
+        .expect("the derive row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        inferred.family.completions, 1,
+        "one completion counts once when the creation seed fires"
+    );
+}
+
+/// F4 on the wrapped-key path: a wrapped key minted by a
+/// single-family keygen shows the creation family with one
+/// completion — the firing seed subsumes the operation-key-only
+/// increment instead of adding a second.
+#[test]
+fn key_operation_creation_family_seeds_wrapped_key_once() {
+    let ids = KeymetaCtx::object_ids(2);
+    let mut ctx = KeymetaCtx::new();
+    let wrapping = KeymetaCtx::receipt(ids[0], "C_WrapKey", 0, KeyRole::WrappingKey, None);
+    let mut wrapped = KeymetaCtx::receipt(ids[1], "C_WrapKey", 1, KeyRole::WrappedKey, None);
+    wrapped.creation_mechanism = Some(0x0f);
+    ctx.direct(
+        "C_WrapKey",
+        7,
+        Some(0x0001),
+        &[wrapping, wrapped],
+        100,
+        None,
+        None,
+    )
+    .expect("wrap completes");
+    let inferred = ctx
+        .inference(ids[1].as_u64(), "wrap", "wrapped_object", "unknown")
+        .expect("the wrapped row infers");
+    assert_eq!(inferred.family.status, InferredStatus::Inferred);
+    assert_eq!(inferred.family.value, Some(KeyFamily::MlKem));
+    assert_eq!(
+        inferred.family.completions, 1,
+        "one completion counts once when the creation seed fires"
+    );
+}
+
+/// F4 negative control for an admitted but unmapped key type
+/// (`CKK_HSS`, 0x46): the established type stands against the
+/// creation fallback even though no inference kind represents it —
+/// the row keeps the use-side unknown reason, never the creation
+/// family.
+#[test]
+fn key_operation_creation_family_stays_out_with_unmapped_key_type() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let mut receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    receipt.key_type = Some(0x46);
+    receipt.creation_mechanism = Some(0x0f);
+    ctx.start("C_SignInit", 7, Some(0x0500), &[receipt], 100);
+    ctx.end("C_Sign", 7, CkRv::OK.0, op_capture(), 200, None, None);
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "sign", "key", "unknown")
+        .expect("the sign row exists");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    assert_eq!(inferred.family.value, None);
+}
+
+/// F4 negative control on the direct path: an admitted but unmapped
+/// key type keeps creation seeding out, like the open path.
+#[test]
+fn key_operation_creation_family_stays_out_direct_with_unmapped_key_type() {
+    let ids = KeymetaCtx::object_ids(1);
+    let mut ctx = KeymetaCtx::new();
+    let mut receipt = KeymetaCtx::receipt(ids[0], "C_DeriveKey", 0, KeyRole::BaseKey, None);
+    receipt.key_type = Some(0x46);
+    receipt.creation_mechanism = Some(0x0f);
+    ctx.direct("C_DeriveKey", 7, Some(0x0500), &[receipt], 100, None, None)
+        .expect("derive completes");
+    let inferred = ctx
+        .inference(ids[0].as_u64(), "derive", "base_key", "unknown")
+        .expect("the derive row exists");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(
+        inferred.family.reason,
+        Some(crate::keymeta::REASON_UNLISTED_MECHANISM)
+    );
+    assert_eq!(inferred.family.value, None);
 }
 
 /// Two distinct specific families conflict with both sides listed;
@@ -33564,6 +33717,139 @@ fn keymeta_gap_promotes_blank_row_to_v7_with_shape() {
     assert!(
         validator.is_valid(rendered),
         "the gap-driven v7 row validates against the v7 key-row schema"
+    );
+}
+
+/// A proved row with blank inference beside unknown-row mechanism
+/// content — but no v7 gap and no relaxed metadata: the section
+/// still promotes to v10, and the proved row keeps (and renders)
+/// its blank inferred blocks, which the v10 schema requires on
+/// every proved row. Snapshot, marker and stream share the one
+/// version decision.
+#[test]
+fn key_operation_v10_gap_free_blank_row_keeps_inferred_keys() {
+    use crate::key_operation_projection::OBSERVATIONS_VERSION_V10;
+    use crate::key_operation_projection::contract::KEY_ROW_KEYS_V7;
+    use crate::key_operation_projection::producer::commit;
+    let ids = KeymetaCtx::object_ids(1);
+    let scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut ledger = StagingLedger::new();
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    // The proved row: a sign still active, no completion, hence no
+    // inferred evidence either way.
+    let receipt = KeymetaCtx::receipt(ids[0], "C_SignInit", 0, KeyRole::OperationKey, None);
+    let start = init("C_SignInit", 7, RSA_PKCS, 50);
+    let origin = EffectOrigin::from(&start);
+    let before = sink.len();
+    edge.observe_joint(&start, &origin, &[receipt], &mut sink);
+    assert_eq!(sink.len(), before + 1, "the sign starts");
+    for effect in &sink[before..] {
+        keyuse.observe_effect(instance, effect, Some(&mut ledger), None);
+    }
+    // The v10 trigger: one completed key generation with no
+    // receipt, hence an unknown row carrying its mechanism id.
+    let mut keygen = op("C_GenerateKeyPair", 9, 700_002);
+    keygen.mechanism = 0x0f;
+    keygen.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    for effect in feed(&mut edge, &mut sink, &keygen) {
+        keyuse.observe_effect(instance, &effect, Some(&mut ledger), None);
+    }
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Populated);
+    assert!(
+        !committed
+            .gaps
+            .iter()
+            .any(|gap| gap.subject == "key_operation"
+                && matches!(
+                    gap.reason,
+                    "corroboration_mismatch" | "wrapped_park_refused"
+                )),
+        "no v7-only gap promotes this section"
+    );
+    let unknown = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key_pair")
+        .expect("the keygen row projects");
+    assert_eq!(
+        unknown
+            .mechanisms
+            .iter()
+            .map(|entry| (entry.id, entry.count))
+            .collect::<Vec<_>>(),
+        vec![(0x0f, 1)],
+        "the keygen id is the v10 trigger"
+    );
+    assert_eq!(committed.key_operations.len(), 1);
+    let row = &committed.key_operations[0];
+    assert_eq!((row.started, row.active), (1, 1));
+    let inferred = row
+        .inferred
+        .as_ref()
+        .expect("v10 keeps blank inferred blocks");
+    assert_eq!(inferred.family.status, InferredStatus::Unknown);
+    assert_eq!(inferred.family.completions, 0);
+    assert_eq!(inferred.size.status, InferredStatus::Unknown);
+    assert_eq!(inferred.size.completions, 0);
+    assert_eq!(
+        crate::key_operation_projection::observations_version(&committed),
+        OBSERVATIONS_VERSION_V10,
+        "mechanism content alone promotes to v10"
+    );
+    let section = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(section["version"], OBSERVATIONS_VERSION_V10);
+    let rendered = &section["key_operations"][0];
+    let mut keys: Vec<String> = rendered
+        .as_object()
+        .expect("row object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    let mut want: Vec<String> = KEY_ROW_KEYS_V7.iter().map(|key| key.to_string()).collect();
+    want.sort();
+    assert_eq!(keys, want, "v10 proved rows carry all 15 keys");
+    assert_eq!(rendered["inferred_family"]["status"], "unknown");
+    assert_eq!(rendered["inferred_size"]["status"], "unknown");
+    // The stream binds the same version and carries the same blank
+    // blocks on its known row.
+    let dir = private_tempdir();
+    let mut emitter = KeyOperationEmitter::new();
+    let path = dir.path().join("v10.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    loop {
+        let out = emitter.emit(&mut writer, &committed, 1_000).unwrap();
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    drop(writer);
+    let lines = read_stream(dir.path(), "v10.jsonl");
+    let known: Vec<_> = lines
+        .iter()
+        .filter(|line| {
+            line["kind"] == "key_operations_observed" && line["event"]["bucket"] == "known"
+        })
+        .collect();
+    assert_eq!(known.len(), 1, "the proved row streams once");
+    assert_eq!(
+        known[0]["event"]["version"], OBSERVATIONS_VERSION_V10,
+        "the known row binds v10"
+    );
+    assert!(
+        known[0]["event"]["row"].get("inferred_family").is_some(),
+        "the stream carries inferred_family"
+    );
+    assert!(
+        known[0]["event"]["row"].get("inferred_size").is_some(),
+        "the stream carries inferred_size"
     );
 }
 

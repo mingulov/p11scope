@@ -2289,6 +2289,77 @@ fn key_ops_unknown_bucket_names_mechanism_ids_verbose_only() {
     );
 }
 
+/// F3 merge across rows: two same-category unknown rows with
+/// disjoint id sets merge their ids on the category tally (the
+/// per-row cap is 8, the merged set is unbounded), the tally line
+/// still caps at 100 chars with the tally intact, and each row's
+/// full ids read on its own detail line. The merged `+N further`
+/// trailer itself is asserted on the suffix builder: it cannot
+/// survive the tally-line truncation it exists beside.
+#[test]
+fn key_ops_unknown_bucket_merges_further_trailer_across_rows() {
+    use crate::key_operation_projection::UnknownMechRow;
+    // The merged trailer, on the suffix builder directly: sixteen
+    // merged ids (by count then id) read eight plus `+8 further`.
+    let merged: std::collections::BTreeMap<u64, u64> = (1u64..=16).map(|id| (id, 1)).collect();
+    assert_eq!(
+        unknown_mechs_suffix(&merged, 0).as_deref(),
+        Some("; mechs 0x1: 1, 0x2: 1, 0x3: 1, 0x4: 1, 0x5: 1, 0x6: 1, 0x7: 1, 0x8: 1, +8 further"),
+        "sixteen merged ids trailer past the eight shown"
+    );
+    // Counts sort before ids; the trailer counts the hidden tail.
+    let merged: std::collections::BTreeMap<u64, u64> = (1u64..=9)
+        .map(|id| (id, if id == 9 { 5 } else { 1 }))
+        .collect();
+    assert_eq!(
+        unknown_mechs_suffix(&merged, 0).as_deref(),
+        Some("; mechs 0x9: 5, 0x1: 1, 0x2: 1, 0x3: 1, 0x4: 1, 0x5: 1, 0x6: 1, 0x7: 1, +1 further"),
+        "the trailer counts the hidden tail past the top eight"
+    );
+    // Present level: two `sign` rows with disjoint ids merge on the
+    // tally, which caps at 100 chars with the tally intact.
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    let mut first = unknown_row("sign", 3, 0, 1, "operations");
+    first.mechanisms = (1u64..=8)
+        .map(|id| UnknownMechRow { id, count: 1 })
+        .collect();
+    observations.unknown_key_operations.push(first);
+    let mut second = unknown_row("sign", 3, 0, 0, "operations");
+    second.reason = "metadata_unknown";
+    second.mechanisms = (17u64..=24)
+        .map(|id| UnknownMechRow { id, count: 1 })
+        .collect();
+    observations.unknown_key_operations.push(second);
+    let mut presentation = key_ops_presentation(observations);
+    presentation.key_sizes_requested = true;
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert!(
+        block[1].len() <= 100,
+        "merged tally caps at 100 chars:\n{verbose}"
+    );
+    assert!(
+        block[1].starts_with(
+            "  unknown keys: sign 6 completed, 0 returned errors, 1 active operations ("
+        ),
+        "merged tally stays intact under truncation:\n{verbose}"
+    );
+    assert!(
+        block.iter().any(|line| line == &"  unknown row sign (unbound): mechs 0x1: 1, 0x2: 1, 0x3: 1, 0x4: 1, 0x5: 1, 0x6: 1, 0x7: 1, 0x8: 1"),
+        "first row ids read on its detail line:\n{verbose}"
+    );
+    assert!(
+        block.iter().any(|line| line == &"  unknown row sign (metadata_unknown): mechs 0x11: 1, 0x12: 1, 0x13: 1, 0x14: 1, 0x15: 1, 0x16: 1, 0x17: 1, 0x18: 1"),
+        "second row ids read on its detail line:\n{verbose}"
+    );
+}
+
 /// A very long provider file name truncates to keep the provider line
 /// at most 100 chars; the tally itself is never truncated.
 #[test]

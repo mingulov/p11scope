@@ -2442,6 +2442,43 @@ fn s2s3_same_thread_nested_zero_thread_halves_stay_uncertain() {
     }
 }
 
+/// Same-thread nested re-entry with a session-closing inner call.
+/// The outer-side exemption covers only inner calls that change no
+/// objects or sessions (the sign/verify/digest/encrypt/decrypt
+/// class: neutral S1 operations and `Access`/`OperationImport`
+/// joins), so a nested `C_CloseSession` keeps the conservative
+/// same-session gap on the outer call and nothing binds. The close
+/// fails here, so the session stays live and the outer's gap comes
+/// purely from the narrowed exemption (a successful close would end
+/// the session, which the session-liveness check already refuses
+/// either way). Before the narrowing the outer bound with no gap.
+/// RED twin for the exemption narrowing.
+#[test]
+fn s2s3_same_thread_nested_session_closing_inner_stays_uncertain() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let outer = h.begin(3, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(4, close(SA).thread(THREAD_A), 5, rv(CkRv::FUNCTION_FAILED));
+    h.done(outer, 6, ok().result(0, H1).result(1, H2));
+    let effects = h.settle(6);
+    assert_eq!(
+        created(&effects, outer, 0),
+        None,
+        "a session-closing inner call obstructs the outer outputs"
+    );
+    assert_eq!(
+        unresolved(&effects, outer),
+        Some(ObjectGap::SameSessionOverlap),
+        "a non-neutral nested inner keeps the conservative gap"
+    );
+    assert_eq!(
+        unresolved(&effects, inner),
+        None,
+        "the failed close itself applies no effect and names no gap"
+    );
+    assert!(h.project().objects.is_empty());
+}
+
 #[test]
 fn s2s3_concurrent_session_contract_cross_session_equal_outputs_collide() {
     let mut h = Hist::qualified();

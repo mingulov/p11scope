@@ -3616,6 +3616,9 @@ impl CallerRegistry {
                                     crate::semantics_key_use::ReselectRefusal::SegmentUnresumable => {
                                         "joint_birth_segment_unresumable"
                                     }
+                                    crate::semantics_key_use::ReselectRefusal::StuckBarred => {
+                                        "joint_birth_reseed_stuck_barred"
+                                    }
                                     _ => "joint_birth_original_mismatch",
                                 };
                                 self.record_gap(crate::discovery::caller_registry::RegistryGap {

@@ -269,10 +269,11 @@ Amendment (controller ruling fix2, 2026-11-21, owner rules): the
 two infer-nothing sentences above are superseded in part. (1) Two
 attested NSS vendor ids infer: `CKM_NSS_ML_KEM` (`0xCE53_4381`)
 names `ml_kem` exactly like standard `CKM_ML_KEM` (softokn
-exposes it with encapsulate/decapsulate flags and NSS TLS uses
-it on non-FIPS softoken), and its keygen twin
-`CKM_NSS_ML_KEM_KEY_PAIR_GEN` (`0xCE53_4380`) infers likewise,
-family-only. Every other vendor id still infers nothing
+exposes it with encapsulate/decapsulate flags; the id is latent —
+NSS TLS itself operates through the standard id), and its keygen
+twin `CKM_NSS_ML_KEM_KEY_PAIR_GEN` (`0xCE53_4380`), which NSS TLS
+uses on non-FIPS softoken, infers likewise, family-only. Every
+other vendor id still infers nothing
 (legacy Kyber is not ML-KEM; no `kyber` family exists). (2) A
 key-pair-generation mechanism that names exactly one family
 infers it (source: mechanism), family-only — never consulted by
@@ -772,9 +773,10 @@ Amendment (relaxed-dialect fix1, 2026-11-20, owner rule): the
 "Generic unlisted-type creation row" premise above is superseded.
 The KeyType set is no longer R2's thirteen ids: every assigned
 standard `CKK_*` (`0x00..=0x05 | 0x10..=0x4b` per OASIS PKCS #11
-3.2, including `0x33`/`0x34`) plus the one attested vendor
-spelling (`CKK_NSS_ML_KEM`, normalizing to `0x49`) now
-establishes; `CKO_*` 0..=11, `CKA_VALUE_LEN` 1..=4096,
+3.2, including `0x33`/`0x34`) plus the two attested vendor
+spellings (`CKK_NSS_ML_KEM`, normalizing to `0x49`, and
+`CKK_NSS_CHACHA20`, normalizing to `0x33`) now establish;
+`CKO_*` 0..=11, `CKA_VALUE_LEN` 1..=4096,
 `CKA_MODULUS_BITS` 256..=16384, secp256k1/brainpool curves, the
 two SoftHSM PrintableString Edwards spellings, 4-byte `CK_ULONG`
 scalars and the 0x362/0x363 concat derives join likewise. A

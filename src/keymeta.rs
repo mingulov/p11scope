@@ -96,10 +96,11 @@ const ML_KEM_IDS: &[u64] = &[0x00000017];
 /// operates through the standard id (the vendor id is latent), but
 /// its documented semantics are ML-KEM, so when it is used it must
 /// attribute as ML-KEM. Same family and length map as the standard
-/// id; the vendor keygen id (`0xCE53_4380`) stays silent under the
-/// creation rule, and legacy Kyber (`0xCE53_437D/0xCE53_437E`) stays
-/// silent (Kyber is not ML-KEM). De-facto NSS block ownership is the
-/// same reliance the display-only vendor table already takes.
+/// id; the vendor keygen twin (`0xCE53_4380`) infers ML-KEM
+/// family-only via `NSS_ML_KEM_KEYGEN_IDS`, and legacy Kyber
+/// (`0xCE53_437D/0xCE53_437E`) stays silent (Kyber is not ML-KEM).
+/// De-facto NSS block ownership is the same reliance the
+/// display-only vendor table already takes.
 const NSS_ML_KEM_IDS: &[u64] = &[0xCE53_4381];
 const ML_DSA_IDS: &[u64] = &[
     0x0000001d, 0x0000001f, 0x00000023, 0x00000024, 0x00000025, 0x00000026, 0x00000027, 0x00000028,

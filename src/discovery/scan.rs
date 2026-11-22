@@ -23883,6 +23883,161 @@ int main(int argc, char **argv) {
         }
     }
 
+    /// A failed native call proves nothing: procfs `ENOENT` (hidepid, a
+    /// namespace boundary, a racing exit) on a live process neither
+    /// retires its generation, keys its view without an image, nor
+    /// reclaims its unfinished cursor. Only a positive proof does: a
+    /// different start time, a ready pidfd, or no such pid (the control:
+    /// a reaped child on the fallback pin is still a proved change).
+    #[test]
+    fn procfs_enoent_on_a_live_process_proves_nothing() {
+        use crate::process::metered_io::{self, NativeOp, syscall_test};
+        let pid = std::process::id();
+        let pinned =
+            crate::process::start_time_pinned_process_view_for_test(ProcessViewId(95), pid)
+                .unwrap();
+        syscall_test::fail_nth(NativeOp::Open, 0, libc::ENOENT);
+        let verdict = pinned.metered_generation(&mut || true);
+        syscall_test::disarm();
+        assert_eq!(
+            verdict,
+            Some(GenerationProof::Unknown),
+            "a hidden stat on a live pid is no exit"
+        );
+        syscall_test::fail_nth(NativeOp::Readlink, 0, libc::ENOENT);
+        let link = metered_io::readlink_once("/proc/self/exe", &mut || true);
+        syscall_test::disarm();
+        assert_eq!(
+            link,
+            Some(metered_io::LinkRead::Unknown),
+            "a hidden executable link is no image-less state"
+        );
+
+        // Control: a reaped child is a proved change.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let reaped =
+            crate::process::start_time_pinned_process_view_for_test(ProcessViewId(96), child.id())
+                .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            reaped.metered_generation(&mut || true),
+            Some(GenerationProof::Changed),
+            "a reaped child is a proved change"
+        );
+
+        // Cache victim: two live unfinished cursors fill the cache; a
+        // hidden liveness read must not reclaim either for a third.
+        let start = crate::process::process_start_time(pid).unwrap();
+        let cursor = |inode: u64, seq: u64| {
+            let (key, mut cursor) = decode_cursor_for_test(pid, start, inode, false, seq);
+            cursor.fingerprint = vec![
+                MappingFingerprintEntry {
+                    start: 0,
+                    end: 0x1000,
+                    file_offset: 0,
+                    permissions: *b"rw-p",
+                };
+                16
+            ];
+            (key, cursor)
+        };
+        let one = {
+            let (key, cursor) = cursor(3, 0);
+            decode_cursor_bytes(&key, &cursor)
+        };
+        let mut budget = CaptureWorkBudget::for_inventory(tight_export_limits(one * 2 + one / 2))
+            .with_retained_file_facts(RetainedFileFacts::default());
+        let (first_key, first) = cursor(41, 0);
+        let (second_key, second) = cursor(42, 1);
+        assert!(budget.record_decode_cursor(first_key.clone(), first));
+        assert!(budget.record_decode_cursor(second_key.clone(), second));
+        let (third_key, third) = cursor(43, 2);
+        syscall_test::fail_nth(NativeOp::Open, 0, libc::ENOENT);
+        let _ = budget.record_decode_cursor(third_key, third);
+        syscall_test::disarm();
+        assert!(
+            budget.decode_cursor(&first_key).is_some()
+                && budget.decode_cursor(&second_key).is_some(),
+            "a hidden liveness read reclaims no live unfinished cursor"
+        );
+    }
+
+    /// The production closing generation proof of a warm view issues
+    /// only metered native calls, one per debit, at every credit count:
+    /// a healthy view proves current with the namespace and generation
+    /// checks, and an interrupted pidfd poll is one attempt that proves
+    /// nothing (no retry, no current).
+    #[test]
+    fn production_closing_proof_issues_one_native_call_per_debit() {
+        use crate::process::metered_io::{NativeOp, syscall_test};
+        use std::sync::atomic::Ordering;
+        let view = ProcessView::open(ProcessViewId(97), std::process::id()).unwrap();
+        for credits in 0..=4u64 {
+            let (mut budget, admitted) = credited_resume_budget(credits);
+            let before = syscall_test::count();
+            let proof = ProcScanIo::new().final_generation(&view, &mut budget);
+            let calls = syscall_test::count() - before;
+            let debits = admitted.load(Ordering::SeqCst);
+            assert!(
+                calls <= debits,
+                "credits {credits}: {calls} native calls for {debits} debits"
+            );
+            if credits >= 2 {
+                assert_eq!(
+                    proof,
+                    Ok(()),
+                    "credits {credits}: a healthy view proves current"
+                );
+                assert!(
+                    calls >= 2,
+                    "credits {credits}: the healthy proof issues its namespace and generation checks through the metered primitives, got {calls}"
+                );
+            } else {
+                assert!(proof.is_err(), "credits {credits}: an unbought proof fails");
+            }
+        }
+        let (mut budget, _) = credited_resume_budget(8);
+        let before = syscall_test::count();
+        syscall_test::fail_nth(NativeOp::Poll, 0, libc::EINTR);
+        let proof = ProcScanIo::new().final_generation(&view, &mut budget);
+        syscall_test::disarm();
+        let polls = syscall_test::since(before)
+            .into_iter()
+            .filter(|op| *op == NativeOp::Poll)
+            .count();
+        assert!(
+            proof.is_err(),
+            "an interrupted poll is unknown, not current"
+        );
+        assert_eq!(polls, 1, "an interrupted poll is never retried");
+    }
+
+    /// An interrupted open is one attempt: no retry under its two units,
+    /// no close for a descriptor that never opened, and an error result.
+    #[test]
+    fn metered_open_interrupted_is_one_attempt() {
+        use crate::process::metered_io::{MeteredFile, NativeOp, syscall_test};
+        let before = syscall_test::count();
+        let mut admitted = 0u64;
+        syscall_test::fail_nth(NativeOp::Open, 0, libc::EINTR);
+        let opened = MeteredFile::open("/proc/self/stat", &mut || {
+            admitted += 1;
+            true
+        });
+        syscall_test::disarm();
+        assert!(
+            matches!(opened, Some(Err(_))),
+            "an interrupted open is an error"
+        );
+        drop(opened);
+        assert_eq!(syscall_test::since(before), vec![NativeOp::Open]);
+        assert_eq!(admitted, 2, "the open bought its close");
+    }
+
     /// Source text with `//` comment lines dropped and string and char
     /// literals blanked, so a scan sees code only.
     fn code_only(source: &str) -> String {
@@ -23963,15 +24118,81 @@ int main(int argc, char **argv) {
         "drop(",
     ];
 
-    /// The native calls the metered primitives may issue, one per unit.
-    const METERED_OPERATIONS: [&str; 6] = [
-        "std::fs::File::open(",
-        "Read::read(",
+    /// The admitted native calls the metered primitives issue, each
+    /// through the one counting shim (`native`), one per unit. The
+    /// prepaid close (`NativeOp::Close`) is bought by its open.
+    const METERED_OPERATIONS: [&str; 8] = [
+        "native(NativeOp::Open,",
+        "native(NativeOp::Read,",
+        "native(NativeOp::Readlink,",
+        "native(NativeOp::Poll,",
+        "native(NativeOp::Fstat,",
+        "native(NativeOp::Fstatfs,",
+        "native(NativeOp::Stat,",
+        "native(NativeOp::Kill,",
+    ];
+
+    /// The kernel entry points the primitives may reach, only inside a
+    /// `native(..)` call: std's wrappers retry (`File::open` loops on
+    /// `EINTR`, `read_link` grows its buffer) and so never appear.
+    const NATIVE_SYSCALLS: [&str; 9] = [
+        "libc::open(",
+        "libc::read(",
+        "libc::close(",
         "libc::readlink(",
         "libc::poll(",
         "libc::fstat(",
         "libc::fstatfs(",
+        "libc::stat(",
+        "libc::kill(",
     ];
+
+    /// Std I/O and errno inspection the primitives may not use: the
+    /// std wrappers retry under one unit, and an errno kind is no proof
+    /// (only the module's errno table maps an error to an outcome).
+    const PRIMITIVE_FORBIDDEN: [&str; 7] = [
+        "std::fs::",
+        "File::open",
+        "io::Read",
+        "OpenOptions",
+        "read_at",
+        "ErrorKind",
+        ".kind()",
+    ];
+
+    /// Errno inspection an audited caller may not use: a failed call is
+    /// unknown, never a proof that a process or link is gone.
+    const PROOF_FORBIDDEN: [&str; 3] = ["ErrorKind", ".kind()", "raw_os_error"];
+
+    /// Byte spans of every `native(` call's argument list in `code`.
+    fn native_spans(code: &str) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        for (at, _) in code.match_indices("native(") {
+            if code[..at]
+                .chars()
+                .last()
+                .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+            {
+                continue;
+            }
+            let open = at + "native".len();
+            let mut depth = 0usize;
+            for (offset, ch) in code[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            spans.push((open, open + offset));
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        spans
+    }
 
     /// Every `fn` body (name, body) in `code`, in source order.
     fn all_fn_bodies(code: &str) -> Vec<(String, &str)> {
@@ -24090,6 +24311,15 @@ int main(int argc, char **argv) {
                 }
             }
         };
+        let proof_free = |what: &str, body: &str, violations: &mut Vec<String>| {
+            for token in PROOF_FORBIDDEN {
+                if body.contains(token) {
+                    violations.push(format!(
+                        "{what}: `{token}` reads an errno as proof outside the errno table"
+                    ));
+                }
+            }
+        };
 
         // 1. The metered primitives.
         match production_code("process/metered_io.rs") {
@@ -24097,6 +24327,28 @@ int main(int argc, char **argv) {
                 violations.push("process/metered_io.rs: the metered primitives are missing".into())
             }
             Some(primitives) => {
+                for token in PRIMITIVE_FORBIDDEN {
+                    if primitives.contains(token) {
+                        violations.push(format!(
+                            "metered_io: `{token}` (a retrying std wrapper or an errno read as proof)"
+                        ));
+                    }
+                }
+                let spans = native_spans(&primitives);
+                for syscall in NATIVE_SYSCALLS {
+                    for (at, _) in primitives.match_indices(syscall) {
+                        if !spans.iter().any(|(start, end)| *start < at && at < *end) {
+                            violations.push(format!(
+                                "metered_io: `{syscall}` at byte {at} bypasses the counting shim"
+                            ));
+                        }
+                    }
+                }
+                for op in METERED_OPERATIONS {
+                    if !primitives.contains(op) {
+                        violations.push(format!("metered_io: no `{op}` primitive"));
+                    }
+                }
                 let mut covered = 0usize;
                 for (name, body) in all_fn_bodies(&primitives) {
                     let operations: usize = METERED_OPERATIONS
@@ -24123,7 +24375,11 @@ int main(int argc, char **argv) {
                     if name == "open" && body.matches("admit()").count() != 2 {
                         violations.push("metered_io::open must buy its open and its close".into());
                     }
-                    if name == "drop" && (operations > 0 || body.contains("admit()")) {
+                    if name == "drop"
+                        && (operations > 0
+                            || body.contains("admit()")
+                            || !body.contains("native(NativeOp::Close,"))
+                    {
                         violations
                             .push("metered_io: the close in drop is prepaid by the open".into());
                     }
@@ -24145,7 +24401,7 @@ int main(int argc, char **argv) {
                         total - covered
                     ));
                 }
-                if covered < 6 {
+                if covered < METERED_OPERATIONS.len() {
                     violations.push(format!("metered_io: only {covered} native calls found"));
                 }
             }
@@ -24170,7 +24426,15 @@ int main(int argc, char **argv) {
                     "metered_find_line",
                 ],
             ),
-            ("process.rs", &["metered_generation", "metered_start_time"]),
+            (
+                "process.rs",
+                &[
+                    "metered_generation",
+                    "metered_start_time",
+                    "metered_pid_generation",
+                    "metered_closing_proof",
+                ],
+            ),
             (
                 "discovery/scan_pass.rs",
                 &["decode_generation_live_cached", "admit_resume_syscall"],
@@ -24193,6 +24457,7 @@ int main(int argc, char **argv) {
                 }
                 for body in found {
                     raw_free(&format!("{file}::{name}"), body, &mut violations);
+                    proof_free(&format!("{file}::{name}"), body, &mut violations);
                 }
             }
         }
@@ -24200,6 +24465,9 @@ int main(int argc, char **argv) {
         if let Some(pass) = production_code("discovery/scan_pass.rs") {
             for (name, body) in all_fn_bodies(&pass) {
                 raw_free(&format!("scan_pass::{name}"), body, &mut violations);
+                if name.contains("live") || name.contains("generation") {
+                    proof_free(&format!("scan_pass::{name}"), body, &mut violations);
+                }
             }
             let admission = fn_body(&pass, "admit_resume_syscall");
             if !(admission.contains("self.stopped_now().is_none()")
@@ -24251,6 +24519,38 @@ int main(int argc, char **argv) {
             }
         } else {
             violations.push("closing bracket missing".into());
+        }
+        // The production closing proof: warm views through the metered
+        // primitives, the cold retained-member proof kept as it was.
+        match scan_code
+            .find("impl ScanIo for ProcScanIo")
+            .map(|at| &scan_code[at..])
+            .and_then(|code| bodies_named(code, "final_generation"))
+        {
+            Some(body) => {
+                if !(body.contains("metered_closing_proof(")
+                    && body.contains("view.cold_filesystem_observed()"))
+                {
+                    violations.push(
+                        "ProcScanIo::final_generation: the warm proof goes through metered_closing_proof"
+                            .into(),
+                    );
+                }
+                proof_free("ProcScanIo::final_generation", body, &mut violations);
+            }
+            None => violations.push("ProcScanIo::final_generation missing".into()),
+        }
+        // Replay outcomes are typed: an unavailable read or a refused
+        // re-proof is never read as divergent bytes.
+        for (name, required) in [
+            ("reread_table_extent", "ReplayRead::Unavailable"),
+            ("reprove_cached_table", "ReplayProof::Refused"),
+        ] {
+            match bodies_named(&scan_code, name) {
+                Some(body) if body.contains(required) && !body.contains("Ok(None)") => {}
+                Some(_) => violations.push(format!("{name}: typed outcome `{required}`")),
+                None => violations.push(format!("{name} missing")),
+            }
         }
         match bodies_named(&scan_code, "reread_table_extent") {
             Some(body) => {

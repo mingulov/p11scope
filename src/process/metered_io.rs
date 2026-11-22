@@ -15,28 +15,82 @@
 use std::io;
 use std::os::fd::{AsRawFd as _, BorrowedFd, RawFd};
 
-/// Test-only count of native calls the primitives issued on this
-/// thread (opens, reads, closes, polls, readlinks, fstat and fstatfs).
+/// The native calls the primitives issue. Every one goes through
+/// [`native`] exactly once, so the test counter sees each attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeOp {
+    Open,
+    Read,
+    Close,
+    Readlink,
+    Poll,
+    Fstat,
+    Fstatfs,
+}
+
+/// Test-only record of the native calls the primitives issued on this
+/// thread, with errno injection: an armed fault makes the `n`th later
+/// call of one operation fail with that errno instead of reaching the
+/// kernel (a close still closes, then reports the error).
 #[cfg(test)]
 pub(crate) mod syscall_test {
-    use std::cell::Cell;
+    use super::NativeOp;
+    use std::cell::{Cell, RefCell};
 
     thread_local! {
-        static ISSUED: Cell<u64> = const { Cell::new(0) };
+        static CALLS: RefCell<Vec<NativeOp>> = const { RefCell::new(Vec::new()) };
+        static FAULT: Cell<Option<(NativeOp, u32, i32)>> = const { Cell::new(None) };
     }
 
-    pub(crate) fn issued() {
-        ISSUED.with(|issued| issued.set(issued.get() + 1));
+    /// Record one call of `op`; `Some(errno)` when an armed fault fires.
+    pub(crate) fn issue(op: NativeOp) -> Option<i32> {
+        CALLS.with(|calls| calls.borrow_mut().push(op));
+        FAULT.with(|fault| match fault.get() {
+            Some((armed, 0, errno)) if armed == op => {
+                fault.set(None);
+                Some(errno)
+            }
+            Some((armed, n, errno)) if armed == op => {
+                fault.set(Some((armed, n - 1, errno)));
+                None
+            }
+            _ => None,
+        })
     }
 
+    /// Native calls issued so far on this thread.
     pub(crate) fn count() -> u64 {
-        ISSUED.with(Cell::get)
+        CALLS.with(|calls| calls.borrow().len() as u64)
+    }
+
+    /// The calls issued since the count was `from`, in order.
+    pub(crate) fn since(from: u64) -> Vec<NativeOp> {
+        CALLS.with(|calls| calls.borrow()[from as usize..].to_vec())
+    }
+
+    /// Fail the `nth` (0-based) next call of `op` with `errno`.
+    pub(crate) fn fail_nth(op: NativeOp, nth: u32, errno: i32) {
+        FAULT.with(|fault| fault.set(Some((op, nth, errno))));
+    }
+
+    pub(crate) fn disarm() {
+        FAULT.with(|fault| fault.set(None));
     }
 }
 
-fn issued() {
+/// Issue one native call: the single place every primitive reaches the
+/// kernel, once per admitted unit (a close once per open).
+fn native<R>(op: NativeOp, call: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
     #[cfg(test)]
-    syscall_test::issued();
+    if let Some(errno) = syscall_test::issue(op) {
+        if op == NativeOp::Close {
+            let _ = call();
+        }
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+    #[cfg(not(test))]
+    let _ = op;
+    call()
 }
 
 /// One open file whose close was bought with its open.
@@ -52,8 +106,7 @@ impl MeteredFile {
         if !admit() {
             return None;
         }
-        issued();
-        Some(std::fs::File::open(path).map(Self))
+        Some(native(NativeOp::Open, || std::fs::File::open(path)).map(Self))
     }
 
     /// One `read(2)` into `buf`: one unit, no retry.
@@ -65,8 +118,7 @@ impl MeteredFile {
         if !admit() {
             return None;
         }
-        issued();
-        Some(io::Read::read(&mut self.0, buf))
+        Some(native(NativeOp::Read, || io::Read::read(&mut self.0, buf)))
     }
 }
 
@@ -74,7 +126,7 @@ impl Drop for MeteredFile {
     fn drop(&mut self) {
         // The field's own drop closes the descriptor; its unit was
         // bought by the open.
-        issued();
+        let _ = native(NativeOp::Close, || Ok(()));
     }
 }
 
@@ -173,19 +225,20 @@ pub(crate) fn readlink_once(path: &str, admit: &mut dyn FnMut() -> bool) -> Opti
     if !admit() {
         return None;
     }
-    issued();
-    // SAFETY: `path` is NUL-terminated and `buf` is writable for its length.
-    let read = unsafe { libc::readlink(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-    if read < 0 {
-        return Some(
-            if io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
-                LinkRead::Missing
-            } else {
-                LinkRead::Unknown
-            },
-        );
-    }
-    let read = read as usize;
+    let read = native(NativeOp::Readlink, || {
+        // SAFETY: `path` is NUL-terminated and `buf` is writable for its length.
+        let read = unsafe { libc::readlink(path.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if read < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(read as usize)
+        }
+    });
+    let read = match read {
+        Ok(read) => read,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Some(LinkRead::Missing),
+        Err(_) => return Some(LinkRead::Unknown),
+    };
     if read >= buf.len() {
         return Some(LinkRead::Unknown);
     }
@@ -208,18 +261,24 @@ pub(crate) fn poll_ready_once(
     if !admit() {
         return None;
     }
-    issued();
-    // SAFETY: one valid pollfd, zero timeout.
-    let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
-    Some(if result < 0 {
-        Err(io::Error::last_os_error())
+    let result = native(NativeOp::Poll, || {
+        // SAFETY: one valid pollfd, zero timeout.
+        let result = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result)
+        }
+    });
+    Some(if let Err(error) = result {
+        Err(error)
     } else if pollfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
         Err(io::Error::other(format!(
             "pidfd poll failed: revents={:#x}",
             pollfd.revents
         )))
     } else {
-        Ok(result > 0 && pollfd.revents & libc::POLLIN != 0)
+        Ok(pollfd.revents & libc::POLLIN != 0)
     })
 }
 
@@ -229,12 +288,18 @@ pub(crate) fn fstat(fd: RawFd, admit: &mut dyn FnMut() -> bool) -> Option<io::Re
     if !admit() {
         return None;
     }
-    issued();
     #[cfg(test)]
     crate::discovery::identity::provider_metadata_read_test::metadata_read();
-    // SAFETY: `fstat` fills `stat` for a valid fd; it is read only on success.
-    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
-        return Some(Err(io::Error::last_os_error()));
+    let result = native(NativeOp::Fstat, || {
+        // SAFETY: `fstat` fills `stat` for a valid fd; it is read only on success.
+        if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = result {
+        return Some(Err(error));
     }
     // SAFETY: initialized by the successful call above.
     Some(Ok(unsafe { stat.assume_init() }))
@@ -249,12 +314,18 @@ pub(crate) fn fstatfs(
     if !admit() {
         return None;
     }
-    issued();
     #[cfg(test)]
     crate::discovery::identity::provider_metadata_read_test::metadata_read();
-    // SAFETY: `fstatfs` fills `stat` for a valid fd; it is read only on success.
-    if unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) } != 0 {
-        return Some(Err(io::Error::last_os_error()));
+    let result = native(NativeOp::Fstatfs, || {
+        // SAFETY: `fstatfs` fills `stat` for a valid fd; it is read only on success.
+        if unsafe { libc::fstatfs(fd, stat.as_mut_ptr()) } != 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    });
+    if let Err(error) = result {
+        return Some(Err(error));
     }
     // SAFETY: initialized by the successful call above.
     Some(Ok(unsafe { stat.assume_init() }))

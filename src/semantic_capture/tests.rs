@@ -7527,6 +7527,54 @@ fn exit_tick_collected_call_joins_before_terminal_retirement() {
     );
 }
 #[test]
+fn exit_tick_keeps_never_scanned_key_pending_until_expiry() {
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    prime(&mut capture, &mut io);
+    // A second key of the same task never scans: its job keeps failing.
+    io.fail_file = Some(1);
+    io.semantic_call("C_Sign", 1, 0);
+    let pending_tick = capture.tick_with(&mut io).unwrap();
+    assert!(
+        pending_tick.calls().next().is_none(),
+        "the unscanned key stays pending"
+    );
+    assert_eq!(capture.router.pending_len(), 1);
+    // The task exits before the key's first scan admits it: swap its
+    // binding pin for one on an exited process.
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn true");
+    let pid = child.id();
+    let exited_pin = Arc::new(PidPin::test_pidfd_only(pid));
+    child.wait().expect("reap true");
+    assert!(
+        exited_pin.wait_ready(Some(Duration::ZERO)).unwrap_or(false),
+        "exited pin must read ready"
+    );
+    capture.bindings.get_mut(&1).expect("primed binding").pin = exited_pin;
+    let exit_tick = capture.tick_with(&mut io).unwrap();
+    assert!(
+        exit_tick.outcomes().iter().any(|o| matches!(
+            o,
+            TickOutcome::Invalidation(i)
+                if matches!(i.scope(), InvalidationScope::TaskRetired(1))
+        )),
+        "the exit still retires the task"
+    );
+    assert!(
+        exit_tick.calls().next().is_none(),
+        "a never-scanned key stays pending across retirement, never sheds as retired"
+    );
+    assert_eq!(capture.router.pending_len(), 1);
+    // Past its job deadline the kept call ends as a counted refusal.
+    io.advance_now(Duration::from_secs(3));
+    let shed_tick = capture.tick_with(&mut io).unwrap();
+    let shed: Vec<_> = shed_tick.calls().collect();
+    assert_eq!(shed.len(), 1);
+    assert_eq!(shed[0].route(), Route::Unknown(UnknownReason::Unobserved));
+}
+#[test]
 fn pump_miss_invalidates_before_next_semantic_join_even_when_raise_fails() {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);

@@ -483,6 +483,118 @@ mod full_image {
     }
 
     #[test]
+    fn task_retirement_keeps_never_observed_pending_until_counted_refusal() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(r.route(facts(1, domain(), identity, 1, 0)), Route::Pending);
+        // The task retired before any scan admitted it: the call stays
+        // pending instead of shedding as retired.
+        assert_eq!(r.retire_process(COOKIE), Vec::new());
+        assert_eq!(r.pending_len(), 1);
+        assert!(
+            !r.unknown_counts().contains_key(&UnknownReason::Retired),
+            "nothing sheds at retirement: {:?}",
+            r.unknown_counts()
+        );
+        // The retirement still marks: late observations refuse and
+        // newcomers fail fast.
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+        assert_eq!(
+            r.route(facts(2, domain(), identity, 1, 0)),
+            Route::Unknown(UnknownReason::Retired)
+        );
+        // The kept call ends as a counted unobserved refusal, never retired.
+        assert_eq!(
+            r.expire_image(identity),
+            vec![(1, Route::Unknown(UnknownReason::Unobserved))]
+        );
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn task_retirement_sheds_observed_keys_and_keeps_never_observed_keys() {
+        let mut r = router();
+        let old = image(COOKIE, 10);
+        r.observe(seal(domain(), old, 1, 0, 0));
+        // Newer epochs on the observed key: pending, admitted key.
+        assert_eq!(r.route(facts(1, domain(), old, 2, 0)), Route::Pending);
+        // Never-observed exec of the same task: pending, unadmitted key.
+        let successor = image(COOKIE, 11);
+        assert_eq!(r.route(facts(2, domain(), successor, 2, 0)), Route::Pending);
+        // Never-observed file of the admitted image: pending, unadmitted key.
+        let mut other_file = facts(3, domain(), old, 2, 0);
+        other_file.entry.file_slot_plus1 = (FILE + 2) as u16;
+        other_file.ret = other_file.entry;
+        assert_eq!(r.route(other_file), Route::Pending);
+        // Only the admitted key's pending sheds as retired.
+        assert_eq!(
+            r.retire_process(COOKIE),
+            vec![(1, Route::Unknown(UnknownReason::Retired))]
+        );
+        assert_eq!(r.pending_len(), 2);
+        // The kept calls end as counted unobserved refusals.
+        assert_eq!(
+            r.expire_image(successor),
+            vec![(2, Route::Unknown(UnknownReason::Unobserved))]
+        );
+        assert_eq!(
+            r.expire_image(old),
+            vec![(3, Route::Unknown(UnknownReason::Unobserved))]
+        );
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn image_retirement_keeps_never_observed_pending_but_still_marks() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(r.route(facts(1, domain(), identity, 1, 0)), Route::Pending);
+        // No observation exists: the pending call stays instead of shedding.
+        assert_eq!(r.retire_image(identity), Vec::new());
+        assert_eq!(r.pending_len(), 1);
+        // The retirement still marks: the image can never be admitted late.
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::Retired
+        );
+        assert_eq!(
+            r.route(facts(2, domain(), identity, 1, 0)),
+            Route::Unknown(UnknownReason::Retired)
+        );
+        // The kept call ends as a counted unobserved refusal.
+        assert_eq!(
+            r.expire_image(identity),
+            vec![(1, Route::Unknown(UnknownReason::Unobserved))]
+        );
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
+    fn image_retirement_sheds_observed_key_pending_and_keeps_never_observed_file() {
+        let mut r = router();
+        let old = image(COOKIE, 10);
+        r.observe(seal(domain(), old, 1, 0, 0));
+        assert_eq!(r.route(facts(1, domain(), old, 2, 0)), Route::Pending);
+        let mut other_file = facts(2, domain(), old, 2, 0);
+        other_file.entry.file_slot_plus1 = (FILE + 2) as u16;
+        other_file.ret = other_file.entry;
+        assert_eq!(r.route(other_file), Route::Pending);
+        assert_eq!(
+            r.retire_image(old),
+            vec![(1, Route::Unknown(UnknownReason::Retired))]
+        );
+        assert_eq!(r.pending_len(), 1);
+        assert_eq!(
+            r.expire_image(old),
+            vec![(2, Route::Unknown(UnknownReason::Unobserved))]
+        );
+        assert_eq!(r.pending_len(), 0);
+    }
+
+    #[test]
     fn pending_expiry_and_retirement_are_image_scoped() {
         let mut r = router();
         let old = image(COOKIE, 10);

@@ -783,6 +783,7 @@ enum BirthRefusal {
     Native(crate::attach::BirthObservationRefusal),
     OriginalMismatch,
     Install(crate::discovery::caller_registry::instance_input::JointReceiptInstallRefusal),
+    SegmentUnresumable,
 }
 
 impl BirthRefusal {
@@ -822,6 +823,7 @@ impl BirthRefusal {
             Self::Native(reason) => format!("joint_birth_native_{reason:?}"),
             Self::OriginalMismatch => "joint_birth_original_mismatch".into(),
             Self::Install(refusal) => format!("joint_birth_install_{refusal:?}"),
+            Self::SegmentUnresumable => "joint_birth_install_segment_unresumable".into(),
         }
     }
 }
@@ -1777,6 +1779,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 association[first].deferred = Some(reoffer_key);
                 continue;
             };
+            // Computed before the reservation borrows the plan: no
+            // feed mutation happens between here and the consume
+            // gate below, so the verdict cannot go stale.
+            let segment_doomed = registrations.joint_reselect_segment_doomed(input, &proof);
             let reservation = match registrations.reserve(input, &batch.registrations) {
                 Ok(reservation) => reservation,
                 Err(refusal) => {
@@ -1806,6 +1812,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     continue;
                 }
             };
+            // Last gate before native consume: a same-proof birth for
+            // a fallback-closed proof-destroyed feed would install a
+            // grant and retain a witness only for the drain to
+            // refuse it as segment-unresumable, so it refuses here
+            // instead — final, never deferred (no fresh instance
+            // escapes its own proof's doom). Worst case the probe
+            // misses and the drain refuses as before.
+            if segment_doomed {
+                drop(reservation);
+                drop(slot);
+                association[first].refusal = Some((caller, BirthRefusal::SegmentUnresumable));
+                continue;
+            }
             let absence = slot.take_absence();
             let witness = match consume(candidate, absence, input, binding, &proof, adapter) {
                 Ok(witness) => witness,

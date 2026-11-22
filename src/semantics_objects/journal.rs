@@ -735,6 +735,40 @@ impl JournalDomainProof {
             self.key.incarnation,
         )
     }
+
+    /// The sealed domain identity for cross-module proof comparison
+    /// (the birth association's drain-doom pre-check mirrors the
+    /// drain's same-domain gate through this).
+    pub(crate) fn object_domain(&self) -> ObjectDomain {
+        self.domain()
+    }
+
+    /// Tests-only proof: the birth association's drain-doom decision
+    /// table pins same, superseding, foreign and era-moved proofs
+    /// through this. Production proofs come only from H3 admission
+    /// evidence.
+    #[cfg(test)]
+    pub(crate) fn scripted_for_test(
+        cookie: u64,
+        exec: u64,
+        router: u64,
+        caller: u32,
+        domain_tag: u64,
+        incarnation: u32,
+        era: u64,
+    ) -> Self {
+        Self {
+            key: JournalDomainKey {
+                domain_tag,
+                caller,
+                cookie,
+                exec,
+                router,
+                incarnation,
+            },
+            era,
+        }
+    }
 }
 
 /// One image's birth evidence: its first consumed ordinal in any form

@@ -296,6 +296,17 @@ impl JointRegistrationPlan<'_> {
     pub(crate) fn admitted_feed_is_s1only(&self, input: &AdmittedInstanceCall) -> bool {
         self.registry.admitted_feed_is_s1only(input)
     }
+
+    /// Route the drain-doom probe through the live plan (same
+    /// borrow rule as above).
+    pub(crate) fn joint_reselect_segment_doomed(
+        &self,
+        input: &AdmittedInstanceCall,
+        new_proof: &crate::semantics_objects::journal::JournalDomainProof,
+    ) -> bool {
+        self.registry
+            .joint_reselect_segment_doomed(input, new_proof)
+    }
 }
 
 impl crate::discovery::caller_registry::CallerRegistry {
@@ -2723,6 +2734,37 @@ impl CallerRegistry {
                 && key.image.exec_id == image.exec_id
                 && routers.contains(&key.router)
         })
+    }
+
+    /// Whether the drain would refuse a reseed onto this key's feed
+    /// as segment-unresumable for a birth carrying this proof (see
+    /// the feed predicate). Unregistered keys have no feed to doom.
+    pub(crate) fn joint_reselect_segment_doomed(
+        &self,
+        input: &AdmittedInstanceCall,
+        new_proof: &crate::semantics_objects::journal::JournalDomainProof,
+    ) -> bool {
+        self.instance_state
+            .by_key
+            .get(&input.key)
+            .and_then(|id| self.instance_state.semantics.get(id))
+            .is_some_and(|record| record.feed.reselect_segment_doomed(new_proof))
+    }
+
+    /// Tests-only fallback segment pose for one applied key's feed.
+    pub(crate) fn pose_fallback_segment_for_test(
+        &mut self,
+        key: &InstanceKey,
+        resumable: bool,
+        receipt: crate::semantics_objects::journal::BootstrapReceipt,
+    ) {
+        if let Some(id) = self.instance_state.by_key.get(key).copied()
+            && let Some(record) = self.instance_state.semantics.get_mut(&id)
+        {
+            record
+                .feed
+                .pose_fallback_segment_for_test(resumable, receipt);
+        }
     }
 
     pub(crate) fn joint_staged_count(&self, target: &JointFeedTarget) -> Option<usize> {

@@ -983,6 +983,17 @@ pub(crate) struct InspectedFileKey {
 }
 
 impl InspectedFileKey {
+    /// The key for one held fd from a single `fstat` of it: the pin and
+    /// the fd's own `st_dev` come from the same metadata.
+    pub(crate) fn of_metadata(metadata: &std::fs::Metadata, device: Device, inode: u64) -> Self {
+        Self {
+            device,
+            inode,
+            pin: crate::discovery::identity::pin_from_metadata(metadata),
+            fd_dev: metadata.dev(),
+        }
+    }
+
     /// The cache key for one opened file: the maps-comparable (device,
     /// inode) the caller validated, the pin the inspection was read
     /// under, and the held fd's own `st_dev`.
@@ -2435,14 +2446,10 @@ impl CaptureWorkBudget {
     /// owner, joining the budget's shared retained-byte accounting (see
     /// [`super::scan_pass::ScanPassOwner::record_decode_cursor`]).
     /// Returns whether stored.
-    /// The view's executable image for a resumable cursor key; `None`
-    /// refuses the read (see
-    /// [`super::scan_pass::ScanPassOwner::resume_exec_target`]).
-    pub(crate) fn resume_exec_target(
-        &mut self,
-        read: impl FnOnce() -> Option<Vec<u8>>,
-    ) -> Option<Option<Vec<u8>>> {
-        self.pass.resume_exec_target(read)
+    /// Admit one resume-side syscall (see
+    /// [`super::scan_pass::ScanPassOwner::admit_resume_syscall`]).
+    pub(crate) fn admit_resume_syscall(&mut self) -> bool {
+        self.pass.admit_resume_syscall()
     }
 
     pub(crate) fn record_decode_cursor(
@@ -6480,43 +6487,95 @@ pub(crate) fn witness_join_with_copyup(
 }
 
 /// The decode-cursor file key for one opened file under its current
-/// pin: `None` when the pin cannot be read or the filesystem cannot name
-/// one file (the same cacheability rule as the export facts) — the
-/// object then scans fresh every pass, never worse than no cursor. A pin
-/// read here that races the facts read simply misses next pass (a
-/// changed file is re-read, never trusted stale).
+/// pin: `None` when the pass does not resume, an admission is refused,
+/// the pin cannot be read or the filesystem cannot name one file (the
+/// same cacheability rule as the export facts) — the object then scans
+/// fresh this pass and its carried cursor stays as it was, never worse
+/// than no cursor. Every syscall is admitted first: the inode
+/// classification (`fstatfs`, and on tmpfs the fdinfo and mount-table
+/// reads in bounded chunks) and one `fstat` that yields both the pin and
+/// the held fd's device. A pin read here that races the facts read
+/// simply misses next pass (a changed file is re-read, never trusted
+/// stale).
 fn cursor_file_key_for(
     file: &File,
     key: ObjectKey,
-    _budget: &mut CaptureWorkBudget,
+    budget: &mut CaptureWorkBudget,
 ) -> Option<InspectedFileKey> {
-    if !file_inodes_are_unique(file) {
+    if !budget.resume_armed() {
         return None;
     }
-    let pin = pin_of(file).ok()?;
-    InspectedFileKey::for_open_file(file, key.device, key.inode, pin).ok()
+    let unique = crate::discovery::identity::file_inodes_are_unique_metered(file, &mut || {
+        budget.admit_resume_syscall()
+    })?;
+    if !unique || !budget.admit_resume_syscall() {
+        return None;
+    }
+    #[cfg(test)]
+    crate::discovery::identity::provider_metadata_read_test::metadata_read();
+    let metadata = file.metadata().ok()?;
+    Some(InspectedFileKey::of_metadata(
+        &metadata, key.device, key.inode,
+    ))
+}
+
+/// The closing bracket's generation check, bought before the scan's own
+/// work: one admitted probe reserved when the view's scan starts, spent
+/// at most once and shared by the keep, staging and retirement decisions
+/// of a failed bracket (a stopped pass admits nothing new, yet staging a
+/// starved bracket needs the live pin). `None` is an unknown generation
+/// (the reservation was refused): it neither keeps, stages nor retires,
+/// so the carried cursor stays as it was.
+struct ClosingGeneration {
+    reserved: Option<()>,
+    verdict: Option<bool>,
+}
+
+impl ClosingGeneration {
+    fn reserve(budget: &mut CaptureWorkBudget) -> Self {
+        Self {
+            reserved: budget.admit_resume_syscall().then_some(()),
+            verdict: None,
+        }
+    }
+
+    fn still_the_same(&mut self, probe: impl FnOnce() -> bool) -> Option<bool> {
+        if self.verdict.is_none() && self.reserved.take().is_some() {
+            self.verdict = Some(probe());
+        }
+        self.verdict
+    }
 }
 
 /// The view's executable image for a resumable cursor key, read inside
 /// a generation bracket: a generation check, the `/proc/<pid>/exe`
-/// readlink, and a second generation check. `None` refuses the read (the
-/// object carries no cursor key this pass); `Some(None)` is a read that
-/// failed or saw the generation change.
+/// readlink, and a second generation check, each admitted with its own
+/// unit first. `None` refuses the read (the object carries no cursor key
+/// this pass, so its carried cursor stays as it was), including when the
+/// closing check cannot be bought; `Some(None)` is a read that failed or
+/// saw the generation change.
 fn resume_view_exec(
     budget: &mut CaptureWorkBudget,
     mut still_the_same: impl FnMut() -> bool,
     read: impl FnOnce() -> Option<Vec<u8>>,
 ) -> Option<Option<Vec<u8>>> {
-    budget.resume_exec_target(|| {
-        if !still_the_same() {
-            return None;
-        }
-        let image = read();
-        if !still_the_same() {
-            return None;
-        }
-        image
-    })
+    if !budget.admit_resume_syscall() {
+        return None;
+    }
+    if !still_the_same() {
+        return Some(None);
+    }
+    if !budget.admit_resume_syscall() {
+        return None;
+    }
+    let image = read();
+    if !budget.admit_resume_syscall() {
+        return None;
+    }
+    if !still_the_same() {
+        return Some(None);
+    }
+    Some(image)
 }
 
 /// Whether two decoded interfaces are the same triple, ignoring the
@@ -8752,6 +8811,9 @@ fn scan_view_examined_mode(
     if let Err(reason) = budget.spend(maps.len() as u64) {
         return Ok(refused_initial(reason.into()));
     }
+    // The closing bracket's generation check is bought now, before the
+    // scan's work can spend the allowance it would need.
+    let mut closing = ClosingGeneration::reserve(budget);
     // `/proc/<pid>/mem` is gated by PTRACE_MODE_ATTACH and Yama; losing it costs the
     // tables, never the object inventory (spec §4.1 step 3). Only an access refusal is
     // a ptrace refusal — a pid that died mid-scan gets its own label.
@@ -10120,7 +10182,7 @@ fn scan_view_examined_mode(
                     .as_ref()
                     .err()
                     .is_none_or(|reason| bracket_keep_exhaustion(reason));
-            if resource_starved && view.still_the_same() {
+            if resource_starved && closing.still_the_same(|| view.still_the_same()) == Some(true) {
                 // A module the check PROVED changed is dropped with its
                 // mapping-changed row, like the healthy arm; only passed
                 // and never-validated modules keep. Kept modules never
@@ -10170,7 +10232,8 @@ fn scan_view_examined_mode(
                         .as_ref()
                         .err()
                         .is_none_or(|reason| bracket_budget_exhaustion(reason));
-                if budget_starved && view.still_the_same() {
+                if budget_starved && closing.still_the_same(|| view.still_the_same()) == Some(true)
+                {
                     for (index, module) in modules.iter().enumerate() {
                         let verdict = bracket_verdicts.get(index).copied().flatten();
                         record_pending_cursor_uncompleted(
@@ -10184,7 +10247,10 @@ fn scan_view_examined_mode(
                 modules.clear();
                 let generation_proven_lost =
                     matches!(&generation, Err(reason) if !bracket_budget_exhaustion(reason));
-                if budget.resume_armed() && (generation_proven_lost || !view.still_the_same()) {
+                if budget.resume_armed()
+                    && (generation_proven_lost
+                        || closing.still_the_same(|| view.still_the_same()) == Some(false))
+                {
                     budget.drop_decode_cursors_for_pid(pid);
                 }
             }
@@ -23276,20 +23342,28 @@ int main(int argc, char **argv) {
             CaptureWorkBudget::default().with_retained_file_facts(RetainedFileFacts::default());
         let mut reads = 0;
         assert_eq!(
-            budget.resume_exec_target(|| {
-                reads += 1;
-                Some(b"/bin/sh".to_vec())
-            }),
+            resume_view_exec(
+                &mut budget,
+                || true,
+                || {
+                    reads += 1;
+                    Some(b"/bin/sh".to_vec())
+                }
+            ),
             Some(Some(b"/bin/sh".to_vec()))
         );
         assert_eq!(reads, 1);
         budget.pass_owner().set_scan_stop(WORK_CEILING_REASON);
         let mut reads = 0;
         assert_eq!(
-            budget.resume_exec_target(|| {
-                reads += 1;
-                None
-            }),
+            resume_view_exec(
+                &mut budget,
+                || true,
+                || {
+                    reads += 1;
+                    None
+                }
+            ),
             None,
             "a stopped pass refuses the read"
         );

@@ -1867,8 +1867,7 @@ fn joint_lane_requests_the_linked_journal_session() {
     let last = args
         .split(',')
         .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .next_back()
+        .rfind(|part| !part.is_empty())
         .expect("the call takes arguments");
     assert_eq!(
         last, "Some(&journal)",

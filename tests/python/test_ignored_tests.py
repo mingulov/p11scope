@@ -1697,7 +1697,7 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertIn("verdict=PASS", lines[0], lines)
         self.assertIn("note=@@>", lines[0], lines)
         self.assertIn("verdict=FAIL", lines[1], lines)
-        self.assertIn("[sequence]", lines[1], lines)
+        self.assertIn("[text-binding]", lines[1], lines)
         self.assertIn("wp7-stop7", lines[1], lines)
         self.assertIn("verdict=FAIL", lines[2], lines)
         self.assertIn("[record-malformed]", lines[2], lines)
@@ -1748,6 +1748,17 @@ class IgnoredTestsTests(unittest.TestCase):
              "garbage\n", 0, False),
             ("generic-prefix", "\nrunning 1 test\ntest x ... ok\n\n"
              "test result: ok. 1 passed\n", 0, False),
+            ("generic-then-error", "\nrunning 1 test\ntest x ... ok\n\n"
+             + ok + "\nError: fixture cleanup failed\n", 0, False),
+            ("generic-two-summaries", "\nrunning 1 test\n" + FAILED_SUMMARY
+             + "\ntest x ... ok\n\n" + ok + "\n", 0, False),
+            ("branch-stem-colon", frame(
+                matrix_body()
+                + ["P11SCOPE_CELL_BRANCH:wp7-stop0:no-feeds-unattributed"],
+                True, threaded=False), 0, True),
+            ("branch-stem-bare", frame(
+                matrix_body() + ["P11SCOPE_CELL_BRANCHwp7-stop0:s1-precluded"],
+                True, threaded=False), 0, True),
         ]
         lines = self._run_verdict_block(cases)
         want = {
@@ -1762,6 +1773,10 @@ class IgnoredTestsTests(unittest.TestCase):
             "signal": ("FAIL", "exit-status"),
             "generic-ok": ("PASS", None), "generic-garbage": ("FAIL", None),
             "generic-prefix": ("FAIL", None),
+            "generic-then-error": ("FAIL", None),
+            "generic-two-summaries": ("FAIL", None),
+            "branch-stem-colon": ("FAIL", "record-malformed"),
+            "branch-stem-bare": ("FAIL", "record-malformed"),
         }
         for (label, _body, _rc, _full), line in zip(cases, lines):
             verdict, reason = want[label]

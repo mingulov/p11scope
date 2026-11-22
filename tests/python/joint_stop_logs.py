@@ -47,11 +47,24 @@ def case_head(k):
             "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked" % k]
 
 
+def outcome_record(ms, finish="published", latched=True, wound="joined",
+                   taken=True):
+    """The Rust StopOutcome Display for one case."""
+    return ("offset=%d begin=polling finish=%s (3 polls) first_error=None "
+            "latched=%s latch=%s h0=committed wound=%s (2 polls) taken=%s "
+            "minted=true stash=None stop_counts=Some((2, 0)) api_a=2 "
+            "a_sem=2 shed=0 reconciled=true abandon_gap=%s branch=linked"
+            % (ms, finish, "true" if latched else "false",
+               'Some("latched")' if latched else "None", wound,
+               "true" if taken else "false",
+               'Some("latched")' if latched else "None"))
+
+
 def case_outcome(k, finish="published", latch="latched", offset=None):
     """Outcome print plus the offset branch diagnostic of case k."""
     ms = offset_of(k) if offset is None else offset
-    return ["JOINT_STOP outcome: offset=%d begin=polling finish=%s (3 polls) "
-            "first_error=None latched=true" % (ms, finish),
+    return ["JOINT_STOP outcome: " + outcome_record(
+                ms, finish, latched=latch == "latched"),
             "P11SCOPE_CELL_BRANCH=offset%d:%s:%s" % (ms, latch, finish)]
 
 
@@ -81,11 +94,12 @@ def unattributed_body(k=0):
                UNATTRIBUTED_ERROR.format(k=k)])
 
 
-def wedge_error(ms, finish="unpublished", own=None):
+def wedge_error(ms, finish="unpublished", own=None, latched=False,
+                wound="unwound", taken=False):
     return ("Error: offset %d: the finish must reach Published then "
-            "WoundDown: offset=%d begin=polling finish=%s (1000 polls) "
-            "first_error=None latched=false" % (ms, ms if own is None else own,
-                                               finish))
+            "WoundDown: %s" % (ms, outcome_record(
+                ms if own is None else own, finish, latched=latched,
+                wound=wound, taken=taken)))
 
 
 def wedge_body(k=5, finish="unpublished"):

@@ -34,8 +34,8 @@ HARNESS = ROOT / "scripts/qualify-stop-races.sh"
 sys.path.insert(0, str(ROOT / "tests/python"))
 from joint_stop_logs import (  # noqa: E402
     FAILED_SUMMARY, S1_ERROR, UNATTRIBUTED_ERROR, case_head,
-    case_outcome, frame, matrix_body, s1_body, unattributed_body,
-    wedge_body,
+    case_outcome, frame, matrix_body, offset_of, s1_body, unattributed_body,
+    wedge_body, wedge_error,
 )
 
 # The Rust cell's terminal wedge text (src/inventory/
@@ -279,7 +279,7 @@ class CiStopRacesTests(unittest.TestCase):
     def test_linked_but_incomplete_case_does_not_qualify(self):
         proc, rows, joint = run_mapping(
             log=linked_but_incomplete_log(), rc=0, expect_fail=False)
-        self.assert_row(proc, rows, joint, "failed", "sequence")
+        self.assert_row(proc, rows, joint, "failed", "text-binding")
         self.assertIn("wp7-stop", joint["detail"])
         self.assertIn("7", joint["detail"])
 
@@ -368,7 +368,7 @@ class CiStopRacesTests(unittest.TestCase):
         log = failed_log(s1_body() + [
             "JOINT_STOP wp7-stop0: finish wedges: %s" % WEDGE_TEXT])
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
-        self.assert_row(proc, rows, joint, "failed", "error-not-terminal")
+        self.assert_row(proc, rows, joint, "failed", "text-reserved")
 
     def test_pass_with_s1_tag_fails(self):
         log = frame(matrix_body() + [
@@ -451,7 +451,7 @@ class CiStopRacesTests(unittest.TestCase):
             "JOINT_STOP wp7-stop4: diagnostic %s seen" % WEDGE_TEXT,
             UNATTRIBUTED_ERROR.format(k=4)])
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
-        self.assert_row(proc, rows, joint, "failed", "no-feed-unattributed")
+        self.assert_row(proc, rows, joint, "failed", "text-reserved")
 
     def test_malformed_pass_summary_fails(self):
         # Full 12-case matrix but a malformed libtest summary: the
@@ -530,7 +530,59 @@ class CiStopRacesTests(unittest.TestCase):
             "JOINT_STOP wp7-stop0: diagnostic %s" % WEDGE_TEXT,
             "Error: wp7-stop0: q1 fixture failed"])
         proc, rows, joint = run_mapping(log=log, rc=101, expect_fail=True)
-        self.assert_row(proc, rows, joint, "failed", "case-failed")
+        self.assert_row(proc, rows, joint, "failed", "text-reserved")
+
+    def test_wedge_evidence_anywhere_in_an_s1_log_refuses(self):
+        # Contradictory wedge evidence before the tag, between the tag
+        # and its receipt, or after the receipt: a preclusion log holds
+        # nothing but the case-0 tag and its receipt.
+        diag = "JOINT_STOP wp7-stop0: finish wedges: %s" % WEDGE_TEXT
+        body = s1_body()
+        for label, lines, reason in (
+                ("before-tag", body[:-2] + [diag] + body[-2:],
+                 "text-reserved"),
+                ("between", body[:-1] + [diag] + body[-1:], "text-reserved"),
+                ("after", body + [diag], "text-reserved"),
+                ("plain-between",
+                 body[:-1] + ["JOINT_STOP wp7-stop0: late"] + body[-1:],
+                 "evidence-after-preclusion")):
+            for expect in (False, True):
+                with self.subTest(position=label, expect=expect):
+                    proc, rows, joint = run_mapping(
+                        log=failed_log(lines), rc=101, expect_fail=expect)
+                    self.assert_row(proc, rows, joint, "failed", reason)
+
+    def test_wedge_arm_refuses_a_successful_or_malformed_terminal(self):
+        k = 5
+        head = matrix_body(range(k)) + case_head(k)
+        cases = (
+            ("success", head + case_outcome(k, "published") + [
+                wedge_error(offset_of(k), "published", latched=True,
+                            wound="joined", taken=True)], "wedge-success"),
+            ("truncated", wedge_body()[:-1] + [
+                "Error: offset %d: the finish must reach Published then "
+                "WoundDown: offset=%d begin=polling finish=unpublished "
+                % (offset_of(k), offset_of(k))],
+             "wedge-record"),
+            ("marker", wedge_body()[:-1] + [
+                wedge_error(offset_of(k)) + " P11SCOPE_STOP_COMPLETE=wp7-stop5"],
+             "terminal-reserved"))
+        for label, lines, reason in cases:
+            with self.subTest(case=label):
+                proc, rows, joint = run_mapping(
+                    log=failed_log(lines), rc=101, expect_fail=True)
+                self.assert_row(proc, rows, joint, "failed", reason)
+
+    def test_malformed_no_feed_branch_record_on_a_pass_refuses(self):
+        for line in ("P11SCOPE_CELL_BRANCH:wp7-stop0:no-feeds-unattributed",
+                     "P11SCOPE_CELL_BRANCHwp7-stop0:s1-precluded",
+                     "JOINT_STOP note: no-feeds-unattributed"):
+            with self.subTest(line=line):
+                proc, rows, joint = run_mapping(
+                    log=frame(matrix_body() + [line], True), rc=0,
+                    expect_fail=False)
+                self.assert_row(proc, rows, joint, "failed",
+                                "record-malformed")
 
     def test_missing_validator_fails_the_joint_row(self):
         proc, rows, joint = run_mapping(

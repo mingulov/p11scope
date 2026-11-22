@@ -7833,8 +7833,8 @@ fn held_requeue_serves_victim_behind_four_duds_at_default_bound() {
     assert_eq!(capture.limits.scans, 4);
     prime(&mut capture, &mut io);
     // Four never-bound duds (lower tokens) plus a bound victim hold
-    // while the scan bound is zero, so the resume cursor stays put.
-    capture.limits.scans = 0;
+    // pin-less. The cursor is reset to the pass start so the first
+    // pass meets the duds before the victim (the adversarial order).
     io.targets_absent = true;
     io.call(10, 0);
     io.call(11, 0);
@@ -7844,7 +7844,7 @@ fn held_requeue_serves_victim_behind_four_duds_at_default_bound() {
     let held = capture.tick_with(&mut io).unwrap();
     assert!(held.calls().next().is_none());
     assert_eq!(capture.router.pending_len(), 5);
-    capture.limits.scans = 4;
+    capture.held_requeue_cursor = 0;
     io.targets_absent = false;
     // First pass spends its whole budget on duds; the victim waits.
     let first = capture.tick_with(&mut io).unwrap();
@@ -7866,19 +7866,11 @@ fn held_requeue_skips_retired_rebound_exec_and_admits_live() {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);
     capture.retention_attach_ticks = Some(0);
-    // Bind three tasks under distinct pins.
+    // Bind two tasks under distinct pins.
     let pin_a = io.pin.clone();
-    let pin_b = Arc::new(PidPin::open(std::process::id()).unwrap());
     let pin_c = Arc::new(PidPin::open(std::process::id()).unwrap());
     io.pin = pin_a.clone();
     io.call(1, 0);
-    let primed = capture.tick_with(&mut io).unwrap();
-    assert!(matches!(
-        primed.calls().next().unwrap().route(),
-        Route::Joined(_)
-    ));
-    io.pin = pin_b.clone();
-    io.call(2, 0);
     let primed = capture.tick_with(&mut io).unwrap();
     assert!(matches!(
         primed.calls().next().unwrap().route(),
@@ -7891,42 +7883,38 @@ fn held_requeue_skips_retired_rebound_exec_and_admits_live() {
         primed.calls().next().unwrap().route(),
         Route::Joined(_)
     ));
-    assert_eq!(capture.bindings.len(), 3);
-    // A second key of task 1 and task 2 holds pin-less.
+    assert_eq!(capture.bindings.len(), 2);
+    // A second key of each task holds pin-less, jobless.
     io.targets_absent = true;
     io.semantic_call("C_Sign", 1, 0);
-    call_file(&mut io, 2, 1);
+    call_file(&mut io, 3, 1);
     let held = capture.tick_with(&mut io).unwrap();
     assert!(held.calls().next().is_none());
     assert_eq!(capture.router.pending_len(), 2);
-    // Task 1 exec-rebinds: a call under a new exec id scans under the
-    // same pin, retiring the old exec image while the cookie stays bound.
-    io.targets_absent = false;
-    io.pin = pin_a.clone();
-    io.call_image(1, 2, 0);
-    let rebind = capture.tick_with(&mut io).unwrap();
-    assert!(
-        rebind.outcomes().iter().any(|o| matches!(
-            o,
-            TickOutcome::Invalidation(i)
-                if matches!(i.scope(), InvalidationScope::ImageRetired(_))
-        )),
-        "the rebind retires the old exec image"
-    );
+    assert!(capture.jobs.is_empty());
+    // Task 1 exec-rebinds away from its held key: the router retires
+    // the old exec image (the held key is never-observed, so it stays
+    // pending under the hold) while the cookie stays bound under the
+    // successor. This is the accept path's rebind outcome
+    // (`retire_image` plus a successor binding); set up directly so the
+    // held key stays jobless, isolating the gate's case (a key queued
+    // before retirement would skip as already-queued instead).
     let old = ImageIdentity {
         task_cookie: 1,
         exec_id: 1,
     };
+    let shed = capture.router.retire_image(old);
+    assert!(shed.is_empty(), "never-observed held calls stay pending");
+    capture.bindings.get_mut(&1).expect("primed binding").image = ImageIdentity {
+        task_cookie: 1,
+        exec_id: 2,
+    };
     assert!(
         capture.router.is_image_retired(old),
-        "the old exec stays retired after the rebind"
+        "the old exec is retired while its cookie stays bound"
     );
-    assert_eq!(capture.bindings.get(&1).unwrap().image.exec_id, 2);
-    // A live key of task 3 holds pin-less.
-    io.targets_absent = true;
-    call_file(&mut io, 3, 1);
-    let held = capture.tick_with(&mut io).unwrap();
-    assert!(held.calls().next().is_none());
+    assert!(capture.bindings.contains_key(&1));
+    assert_eq!(capture.router.pending_len(), 2);
     // Final pass with pins: the retired old-exec key gets no job while
     // the live key joins; only the live key scans.
     io.targets_absent = false;
@@ -7955,41 +7943,25 @@ fn held_requeue_counts_key_with_queued_job() {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);
     capture.retention_attach_ticks = Some(0);
-    capture.limits.scans = 1;
-    let pin_a = io.pin.clone();
-    let pin_b = Arc::new(PidPin::open(std::process::id()).unwrap());
-    io.pin = pin_a.clone();
-    io.call(1, 0);
-    let primed = capture.tick_with(&mut io).unwrap();
-    assert!(matches!(
-        primed.calls().next().unwrap().route(),
-        Route::Joined(_)
-    ));
-    io.pin = pin_b.clone();
-    io.call(2, 0);
-    let primed = capture.tick_with(&mut io).unwrap();
-    assert!(matches!(
-        primed.calls().next().unwrap().route(),
-        Route::Joined(_)
-    ));
-    // Two new calls queue two jobs; the sweep scans one, leaving one
-    // job queued. The requeue names the already-queued key.
+    prime(&mut capture, &mut io);
+    // A new key queues its job while the scan bound is zero, so the
+    // job waits unscanned.
+    capture.limits.scans = 0;
     io.semantic_call("C_Sign", 1, 0);
-    call_file(&mut io, 2, 1);
-    let first = capture.tick_with(&mut io).unwrap();
-    assert_eq!(
-        first
-            .calls()
-            .filter(|call| matches!(call.route(), Route::Joined(_)))
-            .count(),
-        1
-    );
+    let queued = capture.tick_with(&mut io).unwrap();
+    assert!(queued.calls().next().is_none());
     assert_eq!(capture.router.pending_len(), 1);
-    assert_eq!(first.held_requeue_skips[HELD_REQUEUE_SKIP_HAS_JOB], 1);
-    // Next pass the queued job scans and joins.
-    let second = capture.tick_with(&mut io).unwrap();
+    assert_eq!(capture.jobs.len(), 1);
+    // Next pass the requeue names the already-queued key and the sweep
+    // scans it.
+    capture.limits.scans = 4;
+    let scanned = capture.tick_with(&mut io).unwrap();
+    assert_eq!(
+        scanned.held_requeue_skips[HELD_REQUEUE_SKIP_HAS_JOB], 1,
+        "an already-queued key is counted by name, not requeued"
+    );
     assert!(
-        second
+        scanned
             .calls()
             .any(|call| matches!(call.route(), Route::Joined(_))),
         "the queued key joins on the next sweep"

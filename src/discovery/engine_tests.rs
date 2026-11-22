@@ -87161,11 +87161,14 @@ fn learned_scan_covered_file_stays_unstaged_and_silent() {
     );
 }
 
-/// A learned pin failure (transient budget exhaustion on a busy host)
-/// requeues for a later tick instead of filing immediately: the scan
-/// may still be catching up, and a retry stages silently once it
-/// does. No gap, no settle, no count on the failed attempt; the
-/// retry stages and files its first-use row once the budget clears.
+/// A learned pin that hits the file-changed race (the file was
+/// modified mid-identify) requeues for a later tick instead of filing
+/// immediately. No gap, no settle, no count on the failed attempt; the
+/// retry re-proves the settled file through the production pin path and
+/// stages with its first-use row. The budget is the `profile --system`
+/// lifecycle (`Engine::empty` plus `Scope::System`, default allowance,
+/// never replaced): recovery comes from the settled file, not from a
+/// hand-fed budget.
 #[test]
 fn learned_pin_failure_retries_before_filing() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
@@ -87188,12 +87191,9 @@ fn learned_pin_failure_retries_before_filing() {
     .unwrap();
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
-    engine.budget = CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: 0,
-        total_bytes: 0,
-    });
     engine.set_learned_rx_for_test(rx);
     let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
     engine.service_learned_files();
     assert!(
         engine.counters.object_skips.is_empty(),
@@ -87209,12 +87209,11 @@ fn learned_pin_failure_retries_before_filing() {
         "a retried pin requeues the candidate"
     );
     assert_eq!(engine.learned_staged_files_for_test(), 0);
-    engine.budget = CaptureWorkBudget::default();
     engine.service_learned_files();
     assert_eq!(
         engine.learned_staged_files_for_test(),
         1,
-        "the retry stages once the budget clears"
+        "the retry stages once the file settles"
     );
     assert!(engine.learned_settled.contains(&(dev, ino)));
     let public: Vec<_> = engine
@@ -87237,9 +87236,10 @@ fn learned_pin_failure_retries_before_filing() {
     );
 }
 
-/// A learned pin that keeps failing files after a bounded number of
-/// retries instead of requeueing forever: a persistent failure is a
-/// real loss and must be disclosed, never silently dropped.
+/// A learned pin that keeps hitting the file-changed race files after
+/// a bounded number of retries instead of requeueing forever: a
+/// persistent failure is a real loss and must be disclosed, never
+/// silently dropped.
 #[test]
 fn learned_pin_failure_files_after_bounded_retries() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
@@ -87262,13 +87262,10 @@ fn learned_pin_failure_files_after_bounded_retries() {
     .unwrap();
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
-    engine.budget = CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: 0,
-        total_bytes: 0,
-    });
     engine.set_learned_rx_for_test(rx);
     let _drain_alive = &tx;
     for _ in 0..10 {
+        crate::discovery::identity::prearm_pin_test::inject_file_change_once();
         engine.service_learned_files();
         assert!(
             engine.counters.object_skips.is_empty(),
@@ -87280,6 +87277,7 @@ fn learned_pin_failure_files_after_bounded_retries() {
             "retries settle nothing"
         );
     }
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
     engine.service_learned_files();
     assert!(
         engine.learned_settled.contains(&(dev, ino)),
@@ -87299,9 +87297,9 @@ fn learned_pin_failure_files_after_bounded_retries() {
     );
 }
 
-/// The end-of-capture flush files a failing learned pin immediately
-/// instead of requeueing: past the boundary there is no later tick,
-/// so a retry would vanish silently.
+/// The end-of-capture flush files a file-changed learned pin
+/// immediately instead of requeueing: past the boundary there is no
+/// later tick, so a retry would vanish silently.
 #[test]
 fn learned_pin_failure_files_immediately_at_flush() {
     let (fixture, _view, _module, _pins) = loaded_seed_provider();
@@ -87324,12 +87322,9 @@ fn learned_pin_failure_files_immediately_at_flush() {
     .unwrap();
     let mut engine = Engine::empty();
     engine.scope = Scope::System;
-    engine.budget = CaptureWorkBudget::new(ScanLimits {
-        per_object_bytes: 0,
-        total_bytes: 0,
-    });
     engine.set_learned_rx_for_test(rx);
     let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
     engine.flush_learned_files_at_capture_end();
     assert!(
         engine.learned_settled.contains(&(dev, ino)),
@@ -87350,6 +87345,135 @@ fn learned_pin_failure_files_immediately_at_flush() {
             .iter()
             .any(|skip| skip.reason == "prearm object unavailable"),
         "the flush files the pin failure: {public:?}"
+    );
+}
+
+/// A learned pin that hits capture exhaustion files immediately instead
+/// of retrying: the capture budget never renews, so a retry would only
+/// re-prove the same refusal with the same exhausted budget. The
+/// exhaustion is a spent capture window (the production-reachable
+/// attempted-I/O ceiling via charged reads), not the zero-limits branch
+/// production defaults never reach.
+#[test]
+fn learned_pin_failure_files_immediately_when_capture_exhausted() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    // Spend the whole capture I/O allowance the way production scans do
+    // (charged reads), so the mandatory observer mountinfo read refuses
+    // with the attempted-I/O ceiling.
+    engine.budget.record_io(512 * 1024 * 1024);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    engine.service_learned_files();
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "an exhausted pin settles at once"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "an exhausted pin requeues nothing"
+    );
+    assert!(
+        !engine.learned_pin_retries.contains_key(&(dev, ino)),
+        "an exhausted pin leaves no retry count"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "an exhausted pin files its failure at once: {public:?}"
+    );
+}
+
+/// Past the retry-map cap a file-changed pin files at once instead of
+/// requeueing: the map is bounded like the load tally, so a new identity
+/// past the cap cannot take another retry slot.
+#[test]
+fn learned_pin_failure_files_immediately_past_retry_map_cap() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    // Fill the retry map with foreign identities up to its cap; the new
+    // candidate's identity is not among them.
+    for index in 0u64..128 {
+        let foreign = (u64::MAX - index, u64::MAX - 1000 - index);
+        assert_ne!(foreign, (dev, ino));
+        engine.learned_pin_retries.insert(foreign, 1);
+    }
+    assert_eq!(engine.learned_pin_retries.len(), 128);
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_learned_files();
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "a past-cap pin settles at once"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "a past-cap pin requeues nothing"
+    );
+    assert!(
+        !engine.learned_pin_retries.contains_key(&(dev, ino)),
+        "a past-cap pin takes no retry slot"
+    );
+    assert_eq!(
+        engine.learned_pin_retries.len(),
+        128,
+        "a past-cap pin evicts nothing"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "a past-cap pin files its failure at once: {public:?}"
     );
 }
 

@@ -2479,6 +2479,61 @@ fn s2s3_same_thread_nested_session_closing_inner_stays_uncertain() {
     assert!(h.project().objects.is_empty());
 }
 
+/// Same-thread nested re-entry with an inner call that fails with an
+/// object-handle error. The inner `C_SignInit` returns
+/// `CKR_KEY_HANDLE_INVALID`, which retires the settled binding it
+/// named — an effect on object state — so the outer-side exemption
+/// (effect-neutral inners only) does not apply: the outer creation
+/// keeps the conservative same-session gap and binds nothing, while
+/// the inner still applies its own retirement. Before the terminal
+/// guard the outer bound with no gap. RED twin for the narrowed
+/// exemption.
+#[test]
+fn s2s3_same_thread_nested_invalid_handle_inner_obstructs_outer() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    // Settle H1 before the outer call starts.
+    h.run(3, create(SA), 4, ok().result(0, H1));
+    let outer = h.begin(5, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
+    let inner = h.run(
+        6,
+        sign_init(SA, H1)
+            .thread(THREAD_A)
+            .mech(MechanismEvidence::Value(ECDSA)),
+        7,
+        rv(CkRv::KEY_HANDLE_INVALID).mech(MechanismEvidence::Value(ECDSA)),
+    );
+    h.done(outer, 8, ok().result(0, H2).result(1, H3));
+    let effects = h.settle(8);
+    // The invalid-handle return retired the binding it named.
+    assert!(
+        effects.effects.iter().any(|effect| matches!(
+            effect,
+            ObjectEffect::AccessEnded {
+                reason: ObjectGap::InvalidHandle,
+                ..
+            }
+        )),
+        "the inner invalid-handle return retires its binding: {:?}",
+        effects.effects
+    );
+    assert_eq!(
+        created(&effects, outer, 0),
+        None,
+        "an effectful nested inner obstructs the outer outputs"
+    );
+    assert_eq!(
+        unresolved(&effects, outer),
+        Some(ObjectGap::SameSessionOverlap),
+        "a non-neutral nested inner keeps the conservative gap"
+    );
+    assert_eq!(
+        unresolved(&effects, inner),
+        None,
+        "the failed inner itself applies its retirement and names no gap"
+    );
+}
+
 #[test]
 fn s2s3_concurrent_session_contract_cross_session_equal_outputs_collide() {
     let mut h = Hist::qualified();

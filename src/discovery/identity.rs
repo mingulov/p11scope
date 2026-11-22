@@ -9619,11 +9619,11 @@ fn prove_prearm_requests_in_views(
         // Test-only: drive the real file-changed race once (mtime bump
         // between the pins, no budget touched). Production never sets it.
         #[cfg(test)]
-        if crate::discovery::identity::prearm_pin_test::take_injected_file_change() {
-            if let Ok(mtime) = file.metadata().and_then(|md| md.modified()) {
-                let bumped = mtime + std::time::Duration::from_secs(2);
-                let _ = file.set_modified(bumped);
-            }
+        if crate::discovery::identity::prearm_pin_test::take_injected_file_change()
+            && let Ok(mtime) = file.metadata().and_then(|md| md.modified())
+        {
+            let bumped = mtime + std::time::Duration::from_secs(2);
+            let _ = file.set_modified(bumped);
         }
         match pin_of(&file) {
             Ok(after) if after == pin => {}

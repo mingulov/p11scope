@@ -758,36 +758,104 @@ fn count_callerless_gap_entries(
         .count()
 }
 
-/// Parse one counted shed reason to its disclosed total, requiring the
-/// label breakdown inside parens to sum to that total. Accepts the two
-/// counted templates for `semantic calls unrouted`: the aggregated
+/// Whether a shed breakdown label names a producer route-loss reason:
+/// the finite router vocabulary plus the pending-join state. Both
+/// counted producers disclose only these names.
+fn is_shed_label(label: &str) -> bool {
+    matches!(
+        label,
+        "foreign_domain"
+            | "authority_exhausted"
+            | "invalid_image"
+            | "unstamped"
+            | "no_file"
+            | "shared_mm"
+            | "overflow"
+            | "local_fault"
+            | "straddle"
+            | "fault_era"
+            | "sticky"
+            | "coverage_fault"
+            | "unobserved"
+            | "evicted"
+            | "ip_outside"
+            | "not_executable"
+            | "offset_mismatch"
+            | "unpartitionable"
+            | "instance_capacity"
+            | "range_capacity"
+            | "pending_capacity"
+            | "binding_capacity"
+            | "retired"
+            | "pending"
+    )
+}
+
+/// Whether a dropped-batch word names a producer batch: the five
+/// stash/drop sites that disclose through the dropped template.
+fn is_drop_word(word: &str) -> bool {
+    matches!(
+        word,
+        "ended_domain" | "backpressure" | "abandoned" | "no_lane" | "oversized"
+    )
+}
+
+/// Parse one counted shed reason to its disclosed total, requiring an
+/// exact producer template, a canonical binding count, and named
+/// recognized breakdown entries that sum to the total. Accepts only the
+/// two counted templates for `semantic calls unrouted`: the aggregated
 /// `{total} calls shed without a route ({labels}) with {N} bindings`
 /// and the dropped-batch `{total} calls shed from a dropped {drop}
 /// batch ({labels}) with {N} bindings`. Returns None on any other
-/// shape, an unparsable count, or a breakdown mismatch.
+/// shape, an unparsable or non-canonical count, an empty or unknown
+/// label, a duplicate label, an unknown drop word, or a breakdown
+/// mismatch.
 fn parse_unrouted_gap_total(reason: &str) -> Option<u64> {
     let (total_str, rest) = reason.split_once(" calls shed ")?;
-    let total: u64 = total_str.trim().parse().ok()?;
-    if reason.contains("from callers other") {
+    let total: u64 = total_str.parse().ok()?;
+    if total == 0 || total_str != total.to_string() {
         return None;
     }
-    if !rest.contains(" with ") || !rest.contains("bindings") {
+    let (labels_part, bindings_part) = if let Some(after) = rest.strip_prefix("without a route (") {
+        let (labels, after_labels) = after.split_once(") with ")?;
+        (labels, after_labels)
+    } else {
+        let after = rest.strip_prefix("from a dropped ")?;
+        let (drop, after_drop) = after.split_once(" batch (")?;
+        if !is_drop_word(drop) {
+            return None;
+        }
+        let (labels, after_labels) = after_drop.split_once(") with ")?;
+        (labels, after_labels)
+    };
+    let bindings_str = bindings_part.strip_suffix(" bindings")?;
+    let bindings: usize = bindings_str.parse().ok()?;
+    if bindings_str != bindings.to_string() {
         return None;
     }
-    let start = rest.find('(')?;
-    let end = rest.find(')')?;
-    if end <= start {
+    if labels_part.is_empty() || labels_part != labels_part.trim() || labels_part.contains("  ") {
         return None;
     }
     let mut sum = 0u64;
-    let mut labels = 0u32;
-    for part in rest[start + 1..end].split_whitespace() {
-        let (_, count_str) = part.split_once('=')?;
+    let mut seen = std::collections::BTreeSet::new();
+    for part in labels_part.split(' ') {
+        let (label, count_str) = part.split_once('=')?;
+        if label.is_empty() || count_str.is_empty() || count_str.contains('=') {
+            return None;
+        }
+        if !is_shed_label(label) {
+            return None;
+        }
         let count: u64 = count_str.parse().ok()?;
+        if count == 0 || count_str != count.to_string() {
+            return None;
+        }
+        if !seen.insert(label) {
+            return None;
+        }
         sum = sum.saturating_add(count);
-        labels += 1;
     }
-    if labels == 0 || sum != total {
+    if seen.is_empty() || sum != total {
         return None;
     }
     Some(total)
@@ -2049,15 +2117,17 @@ fn stop_case_emits_a_completion_marker_after_its_checks() {
     let checks = code.find("stop_completion_line(&outcome, offset_ms, index)?");
     let marker = code.find("P11SCOPE_STOP_COMPLETE=wp7-stop");
     // The helper formats the marker; the case prints the returned
-    // line. Either the helper call or a direct propagated check plus
-    // a formatted emission satisfies the order; a discarded error
-    // (no `?`) or a comment-only marker never does.
+    // line exactly. Either the helper call plus the exact print of
+    // its returned line, or a direct propagated check plus a
+    // formatted emission, satisfies the order; a discarded error
+    // (no `?`), a comment-only marker, or an unrelated print after
+    // the check never does.
     let direct_checks = code.find("check_stop_outcome(&outcome, offset_ms)?");
     let direct_emit = code.find("eprintln!(\"P11SCOPE_STOP_COMPLETE=wp7-stop");
     match (checks, marker, direct_checks, direct_emit) {
         (Some(helper_at), _, _, _) => assert!(
-            code[helper_at..].contains("eprintln!"),
-            "the helper line is printed: {code}"
+            code[helper_at..].contains("eprintln!(\"{marker}\")"),
+            "the helper line is printed exactly: {code}"
         ),
         (_, _, Some(checks_at), Some(emit_at)) => assert!(
             emit_at > checks_at,

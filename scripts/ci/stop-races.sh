@@ -27,19 +27,30 @@
 #     expectation if the wedge returns. An unexpected pass (under 1),
 #     or a failure without the wedge signature, fails the run. A
 #     zero-test run (exit 0 without a passing test) fails the row too:
-#     the cell must execute and pass, never merely list. A failure
-#     carrying a full-line S1-preclusion tag for a valid case plus the
-#     current unlinked-producer/zero-install receipt is recorded
-#     environment-precluded instead: without joint feeds the cell
-#     cannot evaluate either way. This holds whatever
-#     JOINT_EXPECTED_FAILURE says. Preclusion holds only before any
-#     linked case: a linked tag, a completion marker, a wedge
-#     signature, or an unattributed tag beside the S1 tag fails the
-#     row as mixed/ambiguous, as does an S1 tag without the receipt
+#     the cell must execute and pass, never merely list. The pass
+#     verdict follows the terminal libtest result line only: it must
+#     read `test result: ok. 1 passed; 0 failed; 0 ignored;` exactly;
+#     a malformed summary or an earlier pass followed by a failed
+#     terminal fails the row. A failure carrying exactly the first
+#     case's full-line S1-preclusion tag plus its matching full
+#     terminal error (`wp7-stop0: no joint feeds with S1 seal
+#     (producers unlinked, zero installs); not attempted`, optionally
+#     prefixed by `Error: `) is recorded environment-precluded
+#     instead: without joint feeds the cell cannot evaluate either
+#     way. This holds whatever JOINT_EXPECTED_FAILURE says.
+#     Preclusion holds only before any linked case and only for the
+#     first case: a linked tag, a completion marker, a wedge
+#     signature, an unattributed tag or receipt, another S1 tag or
+#     receipt, or a duplicate receipt beside the pair fails the row
+#     as mixed/ambiguous, as does a tag without its matching receipt
 #     (the old collapsed tag, an embedded lookalike, a suffixed
-#     diagnostic). A failure carrying the full-line unattributed
-#     no-feed tag plus its receipt (no feeds, no S1 seal) fails the
-#     row with its cause: only the proven S1 pair is environmental.
+#     diagnostic, a mismatched case, or an impossible later
+#     preclusion). Explicit unattributed evidence is classified
+#     before the wedge override: unattributed plus wedge is mixed,
+#     never expected-failure. A failure carrying the full-line
+#     unattributed no-feed tag plus its receipt (no feeds, no S1
+#     seal) fails the row with its cause: only the proven S1 pair is
+#     environmental.
 #   The entry forces the full 12-case matrix: inherited WP7_STOP_PREPS /
 #     WP7_STOP_OFFSETS narrowing is unset for the cell (direct libtest
 #     runs keep narrowing for exploration), the cell runs with
@@ -124,50 +135,79 @@ else
       i=$((i + 1))
     done
   fi
+  # Terminal libtest result: the verdict follows the last result line
+  # only, and it must read ok with one pass and zero failures.
+  joint_result_ok=0
+  joint_result_line=$(grep '^test result:' joint-cell.log | tail -n 1 || true)
+  if [ -n "$joint_result_line" ] \
+      && printf '%s\n' "$joint_result_line" | grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored;'; then
+    joint_result_ok=1
+  fi
   # No-feed evidence, full-line valid tags only: an embedded tag, a
-  # suffixed diagnostic, or an out-of-range case never counts.
-  s1_tag=0; s1_receipt=0; linked_tag=0; complete_tag=0
-  unattributed_tag=0; unattributed_receipt=0
-  if grep -qE '^P11SCOPE_CELL_BRANCH=wp7-stop(0|1|2|3|4|5|6|7|8|9|10|11):s1-precluded$' joint-cell.log; then s1_tag=1; fi
-  if grep -qF 'no joint feeds with S1 seal (producers unlinked, zero installs)' joint-cell.log; then s1_receipt=1; fi
+  # suffixed diagnostic, or an out-of-range case never counts. S1
+  # preclusion needs exactly the first case's tag and its matching
+  # full terminal error, with no contradictory records.
+  s1_tag0=0; s1_tag_other=0; s1_tag_any=0
+  s1_receipt0=0; s1_receipt_other=0
+  s1_tag0_count=0; s1_sub_count=0
+  linked_tag=0; complete_tag=0
+  unattributed_tag=0; unattributed_receipt=0; wedge_any=0
+  if grep -qxF 'P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded' joint-cell.log; then s1_tag0=1; fi
+  if grep -qE '^P11SCOPE_CELL_BRANCH=wp7-stop(1|2|3|4|5|6|7|8|9|10|11):s1-precluded$' joint-cell.log; then s1_tag_other=1; fi
+  if [ "$s1_tag0" = 1 ] || [ "$s1_tag_other" = 1 ]; then s1_tag_any=1; fi
+  if grep -qE '^(Error: )?wp7-stop0: no joint feeds with S1 seal \(producers unlinked, zero installs\); not attempted$' joint-cell.log; then s1_receipt0=1; fi
+  if grep -qE 'wp7-stop(1|2|3|4|5|6|7|8|9|10|11): no joint feeds with S1 seal \(producers unlinked, zero installs\); not attempted' joint-cell.log; then s1_receipt_other=1; fi
+  s1_tag0_count=$(grep -cxF 'P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded' joint-cell.log || true)
+  s1_sub_count=$(grep -cF 'no joint feeds with S1 seal (producers unlinked, zero installs)' joint-cell.log || true)
   if grep -qE '^P11SCOPE_CELL_BRANCH=wp7-stop(0|1|2|3|4|5|6|7|8|9|10|11):linked$' joint-cell.log; then linked_tag=1; fi
   if grep -qE '^P11SCOPE_STOP_COMPLETE=wp7-stop(0|1|2|3|4|5|6|7|8|9|10|11)$' joint-cell.log; then complete_tag=1; fi
   if grep -qE '^P11SCOPE_CELL_BRANCH=wp7-stop(0|1|2|3|4|5|6|7|8|9|10|11):no-feeds-unattributed$' joint-cell.log; then unattributed_tag=1; fi
   if grep -qF 'no joint feeds without S1 seal (producers linked, zero installs unexplained)' joint-cell.log; then unattributed_receipt=1; fi
-  if [ "$joint_rc" = 0 ] && { [ "$s1_tag" = 1 ] || [ "$unattributed_tag" = 1 ]; }; then
+  if grep -qF "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then wedge_any=1; fi
+  s1_precluded_ok=0
+  if [ "$s1_tag0" = 1 ] && [ "$s1_tag0_count" = 1 ] && [ "$s1_tag_other" = 0 ] \
+      && [ "$s1_receipt0" = 1 ] && [ "$s1_receipt_other" = 0 ] && [ "$s1_sub_count" = 1 ] \
+      && [ "$linked_tag" = 0 ] && [ "$complete_tag" = 0 ] \
+      && [ "$unattributed_tag" = 0 ] && [ "$unattributed_receipt" = 0 ] \
+      && [ "$wedge_any" = 0 ]; then
+    s1_precluded_ok=1
+  fi
+  if [ "$joint_rc" = 0 ] && { [ "$s1_tag_any" = 1 ] || [ "$unattributed_tag" = 1 ]; }; then
     joint_detail='joint cell exited 0 with a no-feed preclusion tag (regression); a pass never precludes; see joint-cell.log'
   elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ] \
-      && grep -q '^test result: ok\. 1 passed' joint-cell.log \
+      && [ "$joint_result_ok" = 1 ] \
       && [ -z "$joint_matrix_missing" ] \
-      && [ "$s1_tag" = 0 ] && [ "$unattributed_tag" = 0 ]; then
+      && [ "$s1_tag_any" = 0 ] && [ "$unattributed_tag" = 0 ]; then
     joint_pass=1; joint_qual='qualified'; joint_detail='linked joint stop reaches Published then WoundDown (12-case matrix)'
   elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 1 ]; then
     joint_detail='joint cell unexpectedly passed under JOINT_EXPECTED_FAILURE=1; set 0 once the wedge is gone for good'
   elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ] \
-      && grep -q '^test result: ok\. 1 passed' joint-cell.log; then
+      && [ "$joint_result_ok" = 1 ]; then
     joint_detail="joint cell passed without the full stop matrix (missing completed cases:$joint_matrix_missing); the qualifying entry forces all 12 wp7-stop cases"
   elif [ "$joint_rc" = 0 ]; then
-    joint_detail='joint cell exited 0 without a passing test (zero selected or unmapped output); see joint-cell.log'
-  elif [ "$s1_tag" = 1 ] && { [ "$linked_tag" = 1 ] || [ "$complete_tag" = 1 ]; }; then
+    joint_detail='joint cell exited 0 without a passing test (zero selected, malformed summary, or unmapped output); see joint-cell.log'
+  elif [ "$s1_tag_any" = 1 ] && { [ "$linked_tag" = 1 ] || [ "$complete_tag" = 1 ]; }; then
     joint_detail='joint cell mixed linked operation with an S1 preclusion tag (regression); preclusion holds only before any linked case; see joint-cell.log'
-  elif [ "$s1_tag" = 1 ] && [ "$unattributed_tag" = 1 ]; then
-    joint_detail='joint cell mixed S1 and unattributed no-feed tags (regression); see joint-cell.log'
-  elif [ "$s1_tag" = 1 ] && grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
+  elif [ "$s1_tag_any" = 1 ] && { [ "$unattributed_tag" = 1 ] || [ "$unattributed_receipt" = 1 ]; }; then
+    joint_detail='joint cell mixed S1 and unattributed no-feed evidence (regression); see joint-cell.log'
+  elif [ "$s1_tag_any" = 1 ] && [ "$wedge_any" = 1 ]; then
     joint_detail='joint cell mixed wedge evidence with an S1 preclusion tag (regression); see joint-cell.log'
-  elif [ "$s1_tag" = 1 ] && [ "$s1_receipt" = 0 ]; then
-    joint_detail='joint cell S1 tag without the current unlinked-producer/zero-install receipt (ambiguous, possibly the old collapsed tag); see joint-cell.log'
-  elif [ "$EXPECT_JOINT_FAIL" = 1 ] && grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
-    joint_detail='expected failure: joint finish wedges (task/v060-joint-wedge owns the fix); see joint-cell.log'
-    joint_qual='expected-failure'
-  elif grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
-    joint_detail='wedge reproduced under JOINT_EXPECTED_FAILURE=0 (regression); set 1 to re-arm the expectation; see joint-cell.log'
-  elif [ "$s1_tag" = 1 ] && [ "$s1_receipt" = 1 ]; then
-    joint_detail='environment-precluded: S1 seal without joint feeds (producers unlinked, zero installs); see joint-cell.log'
-    joint_qual='environment-precluded'
+  elif [ "$s1_tag_any" = 1 ] && [ "$s1_precluded_ok" = 0 ]; then
+    joint_detail='joint cell S1 evidence without the exact first-case tag and matching terminal error (ambiguous, mismatched, or impossible later preclusion); see joint-cell.log'
+  elif { [ "$unattributed_tag" = 1 ] || [ "$unattributed_receipt" = 1 ]; } && [ "$wedge_any" = 1 ]; then
+    joint_detail='joint cell mixed unattributed no-feed evidence with wedge evidence (regression); see joint-cell.log'
   elif [ "$unattributed_tag" = 1 ] && [ "$unattributed_receipt" = 1 ]; then
     joint_detail='joint cell produced no feeds without an S1 seal (unattributed: producers linked, zero installs unexplained); not environmental; see joint-cell.log'
   elif [ "$unattributed_tag" = 1 ]; then
     joint_detail='joint cell unattributed tag without the current linked-producer/zero-install receipt (ambiguous); see joint-cell.log'
+  elif [ "$EXPECT_JOINT_FAIL" = 1 ] && [ "$wedge_any" = 1 ]; then
+    joint_detail='expected failure: joint finish wedges (task/v060-joint-wedge owns the fix); see joint-cell.log'
+    joint_qual='expected-failure'
+  elif [ "$wedge_any" = 1 ]; then
+    joint_detail='wedge reproduced under JOINT_EXPECTED_FAILURE=0 (regression); set 1 to re-arm the expectation; see joint-cell.log'
+  elif [ "$s1_precluded_ok" = 1 ]; then
+    joint_detail='environment-precluded: S1 seal without joint feeds (producers unlinked, zero installs); see joint-cell.log'
+    joint_qual='environment-precluded'
   else
     joint_detail='joint cell failed without the wedge signature (regression or new failure); see joint-cell.log'
   fi

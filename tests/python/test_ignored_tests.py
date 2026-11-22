@@ -1616,7 +1616,9 @@ class IgnoredTestsTests(unittest.TestCase):
         # post-stop completion lines, each matched as a full line: a
         # pre-stop linkage tag (or a completion marker embedded in
         # another line) must never qualify its case. A no-feed
-        # preclusion tag on a passing matrix fails it as mixed.
+        # preclusion tag on a passing matrix fails it as mixed. The
+        # pass verdict follows the terminal libtest result line only,
+        # with one pass and zero failures.
         text = RUNNER.read_text(encoding="utf-8")
         self.assertIn(
             'command grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" "$log"',
@@ -1625,7 +1627,10 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertNotIn("P11SCOPE_CELL_BRANCH=wp7-stop$i:linked", text)
         self.assertIn("s1-precluded|no-feeds-unattributed", text)
         self.assertIn("a pass never precludes", text)
-        self.assertIn("command grep -q '^test result: ok\\. 1 passed'", text)
+        self.assertIn("command grep '^test result:'", text)
+        self.assertIn("1 passed; 0 failed; 0 ignored;", text)
+        self.assertIn('printf \'%s\\n\' "$result_line" | command grep -qE', text)
+        self.assertNotIn("command grep -q '^test result: ok\\. 1 passed' \"$log\"", text)
 
     def test_full_matrix_gate_verbatim_block_judges_completion_fixtures(self):
         # Drive the runner's shipped full-matrix block verbatim (the

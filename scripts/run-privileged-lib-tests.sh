@@ -2138,11 +2138,11 @@ main() {
         end=$(date +%s)
         seconds=$((end - start))
         seq=$((seq + 1))
-        result_line=$(command grep -F 'test result:' "$log" | tail -n 1 || true)
+        result_line=$(command grep '^test result:' "$log" | tail -n 1 || true)
         [ -n "$result_line" ] || result_line="(no test result line)"
         verdict=FAIL
         if [ "$rc" -eq 0 ] \
-            && command grep -q '^test result: ok\. 1 passed' "$log"; then
+            && printf '%s\n' "$result_line" | command grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored;'; then
             verdict=PASS
         fi
         matrix_note=

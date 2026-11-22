@@ -4,10 +4,10 @@
  * single use against a PQC-capable provider (kryoptic), with exact known
  * counts for the observer to attribute.
  *
- *   pqc-workload --module P --ready F --go G [--pin P] [--slot N]
+ *   pqc-workload --module P --ready F --go G [--slot N]
  *                  [--post-sleep S] [--pace S] [--settle S]
- * The user PIN comes from --pin, else $P11TEST_PIN, else the default
- * throwaway 1234.
+ * The user PIN comes from $P11TEST_PIN, else the default throwaway
+ * 1234 (never argv: a --pin value would show in ps output).
  *
  * Sequence: dlopen the provider first (mapped, but zero PKCS#11 calls),
  * write READY so the observer attaches to the already-mapped provider,
@@ -178,12 +178,11 @@ int main(int argc, char**argv){
     if(!strcmp(argv[i],"--module")&&i+1<argc) module=argv[++i];
     else if(!strcmp(argv[i],"--ready")&&i+1<argc) ready=argv[++i];
     else if(!strcmp(argv[i],"--go")&&i+1<argc) go=argv[++i];
-    else if(!strcmp(argv[i],"--pin")&&i+1<argc) pin=argv[++i];
     else if(!strcmp(argv[i],"--slot")&&i+1<argc) slot_arg=atol(argv[++i]);
     else if(!strcmp(argv[i],"--post-sleep")&&i+1<argc) post_sleep=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--pace")&&i+1<argc) pace=atoi(argv[++i]);
     else if(!strcmp(argv[i],"--settle")&&i+1<argc) settle=atoi(argv[++i]);
-    else {fprintf(stderr,"usage: %s --module P --ready F --go G [--pin P] [--slot N] [--post-sleep S] [--pace S] [--settle S]\n",argv[0]); return 2;}
+    else {fprintf(stderr,"usage: %s --module P --ready F --go G [--slot N] [--post-sleep S] [--pace S] [--settle S]\n",argv[0]); return 2;}
   }
   if(!module||!ready||!go){fprintf(stderr,"need --module, --ready and --go\n"); return 2;}
   if(!pin) pin=getenv("P11TEST_PIN");
@@ -224,7 +223,10 @@ int main(int argc, char**argv){
       if(!best) for(CK_ULONG i=0;i<n&&rv==0;i++){
         if(!ifs[i].pFunctionList) continue;
         unsigned char*maj=(unsigned char*)ifs[i].pFunctionList;
-        if(maj[0]==3&&(maj[1]==1||maj[1]==0)) best=ifs[i].pFunctionList;
+        /* 3.1+ only: the KEM slots below (indices 92/93) exist
+           from the 3.1 list; a 3.0 list is shorter and reading
+           them would run past it. */
+        if(maj[0]==3&&maj[1]==1) best=ifs[i].pFunctionList;
       }
       if(best){
         void*p1=*(void**)((char*)best + 8 + 92*8);

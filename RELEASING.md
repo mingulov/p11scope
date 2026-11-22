@@ -196,6 +196,14 @@ is no automatic search for a different run. The complete `ci` workflow remains
 the ordinary and coverage entry point. Dispatch `package-preview` from the
 release tag or `main` so the file attestations name that ref, not a `tmp/ci` branch.
 
+A FULL `pkcs11-check` green on the exact candidate SHA gates release
+tags: dispatch `privileged-tests` on the candidate with the
+`pkcs11_check_full` input and require `pkcs11-check-full` green before
+tagging. The scheduled FULL run covers `main` only, never a release
+branch, so a candidate staged off `main` always needs this dispatch.
+`package-preview` validates the covering run
+(`accepted_pkcs11_full_run_id`).
+
 Each selected package mode gets its own ordinary `ubuntu-26.04` runner,
 official `build-release.sh --capture-mode MODE --jobs N`, successful receipt,
 source export, notices and package validation before its own public upload.
@@ -522,8 +530,9 @@ On the commit to tag: the candidate from steps 3–6, or under REL-1 the
 
 1. Check that the tag commit's tree equals the `tree` fact in the receipt's
    `facts.log` and the source export's recorded tree, that the packaged
-   `head` is an ancestor of the tag commit, and that the green CI run from
-   step 3 passed on the packaged `head` SHA. Verify the package bundles
+   `head` is an ancestor of the tag commit, that the green CI run from
+   step 3 passed on the packaged `head` SHA, and that `pkcs11-check-full`
+   is green on that SHA. Verify the package bundles
    contain the binaries from that receipt and that `SHA256SUMS` matches
    the files to upload.
 2. Create an annotated (optionally signed) tag and push `main` and the tag:

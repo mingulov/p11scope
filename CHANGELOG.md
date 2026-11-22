@@ -6,7 +6,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.7.2] - 2026-11-22
+## [0.7.2] - UNRELEASED
 
 ### Added
 
@@ -276,7 +276,8 @@ versioned separately and are opaque, exact dispatch keys.
 - A run's repeated gaps fold into counted aggregates, so gap
   volume stays flat on long captures while every loss keeps its
   name and exact count.
-- Same-thread nested provider calls no longer mis-bind their keys:
+- Same-thread nested provider calls now bind the outer creation's
+  outputs (previously reported unbound):
   a call that starts and ends on one native thread strictly inside
   another open call on the same session (the known instance is the
   NSS softoken EC-keygen pairwise self-test) is classified
@@ -285,11 +286,8 @@ versioned separately and are opaque, exact dispatch keys.
   `same_thread_nested` unknown row (object-observations section
   version 9) instead of `unbound`. Cross-thread or otherwise
   unprovable overlap keeps the conservative shape.
-- Release qualification of exit shapes is stricter and disclosed:
-  the public-CLI oracle accepts the retired-plus-mid-flight exit
-  shape only with disclosure, narrows ambient-exit acceptance to
-  exit-only skips, and no longer qualifies unproven mid-flight
-  exits; mixed shapes stay refused.
+- Release qualification never accepts the folded mid-flight row as
+  proof of an exit; mixed shapes stay refused.
 
 ### Known limitations
 
@@ -308,13 +306,14 @@ versioned separately and are opaque, exact dispatch keys.
   3 MiB/h on a busy host), even though exited callers now fold
   into exact per-module aggregates and retained callers plateau:
   the run-wide unbound-image census, the ever-enumerated set and
-  other saturating structures keep climbing toward their caps. A
-  bound on the remainder is planned for 0.8.0.
+  other saturating structures keep climbing toward their caps. That
+  rate was measured on glibc; the shipped static musl build has not
+  been measured. A bound on the remainder is planned for 0.8.0.
 - Getter-only manifests stay `PARTIAL` (see 0.7.1): the window
   before the run-time table attaches is always named, and names
   are not layout-proved.
 - Of the earlier remaining limits, the late-provider admission
-  delay is fixed in 0.7.2 (late providers attach promptly under
+  delay is fixed (late providers attach promptly under
   churn) and the RSS-growth bound is partially shipped (retained
   callers plateau, see above); silent stderr diagnostics in three
   cases and exact per-call rows above 6,250 key operations/s

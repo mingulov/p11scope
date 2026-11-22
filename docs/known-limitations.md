@@ -231,7 +231,9 @@ by the lifetime twin and fold cells, not by that plateau. The remaining slope is
 accounted saturating structures (unbound-image census +1.03 MiB/h
 toward its cap, ever-enumerated set +0.18 MiB/h), not caller or edge
 retention, which stay flat. A 5000-exited-callers-with-calls lifetime
-twin holds 0 refusals with a flat census past the budget.
+twin holds 0 refusals with a flat census past the budget. That soak
+ran the glibc observer; the shipped static musl build has not been
+measured.
 
 ### Short-lived processes never scanned
 
@@ -939,6 +941,11 @@ spends its first pool mint on the 68-slot table, so its second-table
 v3-only calls land on stubs the manifest never recorded and stay
 unattached. Static providers return the same tables whatever the
 order, so their manifests are unchanged.
+
+### Firefox RSA client-certificate rows can be lost
+
+A Firefox run that presents an RSA client certificate can lose those
+per-key rows while call counts stay exact. A fix is planned for 0.8.0.
 
 ## Known limitations in 0.6.0
 

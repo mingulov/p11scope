@@ -28833,6 +28833,299 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_quarantine_end_mint_inherits_parent_fence() {
+        // Fence inheritance: a post-void mint carries its parent's
+        // void fence, so a capable doom before the next void still
+        // mints on new proof instead of stranding unfenced. K0
+        // exit-doomed by a void mints K1; K1 tracks, then dooms
+        // capably at seal time with no further void; new proof
+        // mints K2 on the inherited fence.
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_REASON_EXEC_EXIT, JOURNAL_REASON_SCOPE_LOST,
+        };
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 2, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        // K1 mints on the exit doom and tracks.
+        let second = begin_bytes(1, 3, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        let (staged_cut, staged_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence)
+                .expect("post-void staged entry");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", staged_event);
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("an exit doom mints");
+        assert_ne!(reborn.key, proof.key, "K1 mints past the exit doom");
+        assert!(
+            scene.adapter.keys[&reborn.key].void_fence > 0,
+            "the mint inherits its parent's fence"
+        );
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene.seal_at(&rebirth, 8).expect("K1 tracks past the void");
+        // K1 dooms capably at seal time, with no further void.
+        scene.attest_session_function(SESSION, "C_GetAttributeValue");
+        let outer = begin_bytes(1, 4, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 4, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let doom = scene
+            .seal_at(&rebirth, 8)
+            .expect_err("seal-time doom refuses");
+        assert_eq!(doom.gap, JournalGap::DomainTainted);
+        // New proof mints K2 on the inherited fence.
+        let third = begin_bytes(1, 5, create, 0);
+        scene.ingest(&third);
+        scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 80));
+        let (staged_cut, staged_event) = scene
+            .adapter
+            .open
+            .values()
+            .filter(|entry| entry.begin_ordinal > fence && entry.function == create)
+            .map(|entry| {
+                (
+                    entry.begin_ordinal,
+                    entry.end.expect("staged END").end.payload_base().event,
+                )
+            })
+            .max_by_key(|(cut, _)| *cut)
+            .expect("newest staged creation");
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", staged_event);
+        let reborn2 = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("new proof mints past a fenced capable doom");
+        assert_ne!(reborn2.key, reborn.key, "K2 mints past K1's doom");
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
+        let grant = SessionBirthGrant::scripted(
+            reborn2,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth2 =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene
+            .seal_at(&rebirth2, 8)
+            .expect("K2 tracks past the doom");
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_sibling_bind_inherits_fenced_sibling_fence() {
+        // An F1-born sibling inherits the authorizing sibling's
+        // fence, so its own capable doom before the next void still
+        // mints on new proof. K0 fenced by a void authorizes S0;
+        // S0 tracks, then dooms capably at seal time with no
+        // further void; new proof mints S0's next incarnation.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        // S0 binds past the fenced key and tracks.
+        let staged = begin_bytes(2, 1, create, 0);
+        scene.ingest(&staged);
+        scene.ingest(&end_bytes(&staged, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let mut other = AttestationFixture::new(image_default());
+        let (sibling_cut, sibling_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence)
+                .expect("post-void staged sibling entry");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = other.admit_original_event("C_CreateObject", sibling_event);
+        let sibling = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("a sibling binds past a void-fenced sibling");
+        assert!(
+            scene.adapter.keys[&sibling.key].void_fence > 0,
+            "the sibling bind inherits the authorizing fence"
+        );
+        scene
+            .paired_admissions
+            .insert(sibling_cut, admitted.h0_ordinal());
+        let grant = SessionBirthGrant::scripted(
+            sibling,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let born = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence birth attests");
+        scene.seal_at(&born, 8).expect("the sibling tracks");
+        // S0 dooms capably at seal time, with no further void. The
+        // doom admission pairs to the staged BEGIN through S0's own
+        // fixture (abandoned calls never complete, so the BEGIN's
+        // derived event pairs, as prepare_claims does).
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(9, 1, getattr, 0);
+        scene.ingest(&outer);
+        let record =
+            p11scope_ebpf_common::object_journal::decode_journal_record(&outer, &scene.descriptors)
+                .expect("doom BEGIN decodes");
+        let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) = record else {
+            panic!("doom BEGIN input");
+        };
+        let doom_admitted = other
+            .admit_original_event("C_GetAttributeValue", original_for_validated_begin(&native));
+        scene
+            .adapter
+            .attest_key(&doom_admitted)
+            .expect("doom groundwork attests");
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let doom = scene.seal_at(&born, 8).expect_err("seal-time doom refuses");
+        assert_eq!(doom.gap, JournalGap::DomainTainted);
+        // New proof for S0's binding mints its next incarnation.
+        let third = begin_bytes(2, 2, create, 0);
+        scene.ingest(&third);
+        scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 80));
+        let (staged_cut, staged_event) = scene
+            .adapter
+            .open
+            .values()
+            .filter(|entry| entry.begin_ordinal > fence && entry.function == create)
+            .map(|entry| {
+                (
+                    entry.begin_ordinal,
+                    entry.end.expect("staged END").end.payload_base().event,
+                )
+            })
+            .max_by_key(|(cut, _)| *cut)
+            .expect("newest staged creation");
+        let admitted = other.admit_original_event("C_CreateObject", staged_event);
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("new proof mints past a fenced capable doom");
+        assert_ne!(
+            reborn.key, sibling.key,
+            "S0's binding mints a fresh incarnation"
+        );
+        // Production H0 tokens come from one global allocator; the two
+        // test fixtures split the space, so advance the scene
+        // watermark past the sibling's admissions for H3 coverage.
+        for _ in 0..3 {
+            scene.fixture.admit_function("C_Sign");
+        }
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene
+            .seal_at(&rebirth, 8)
+            .expect("the incarnation tracks past the doom");
+    }
+
+    #[test]
     fn seal_abandoned_getattributes_disposes_per_call_and_key_continues() {
         // Fix7: an exit-time unbounded abandonment of an effect-free
         // GetAttributes read disposes per-call with a named loss gap

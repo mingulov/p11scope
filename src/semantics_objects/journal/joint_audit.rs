@@ -10,7 +10,7 @@ use super::joint_driver::{
 use super::seal_replay::{ReplayBounds, ReplayPreparation, SealBatchDelivery, SealReplayCursor};
 use super::{
     BirthEvidenceSource, BootstrapReceipt, H3DispositionEvidence, H3FinalizerPort,
-    H3VoidAcknowledgement, JournalGap, SealSuccess, SealWait, SealedCall, SessionBirthEvidence,
+    H3VoidAcknowledgement, JournalGap, SealSuccess, SealedCall, SessionBirthEvidence,
     StagingLedger,
 };
 use super::{
@@ -514,6 +514,34 @@ fn failure_rank(failure: &SealFailure) -> u8 {
         SealFailureDisposition::Fallback => 1,
         SealFailureDisposition::HistoryLoss => 2,
     }
+}
+
+/// Whether a seal wait advances as future input instead of retrying:
+/// claims, floors and corroborating returns can arrive in a later
+/// quantum, so the immutable frame finishes and the next frame
+/// retries with new input, instead of retrying until the lane-wide
+/// no-progress bound stops every caller. Unbound staging stays retry
+/// (only a void sheds the barrier); an awaited terminal advances
+/// regardless of the wait.
+pub(crate) fn seal_wait_advances_as_future(wait: super::SealWait, awaits_terminal: bool) -> bool {
+    use super::SealWait;
+    awaits_terminal
+        || matches!(
+            wait,
+            SealWait::FreshBirthNoHistory
+                | SealWait::AttributionPending
+                | SealWait::FloorsPastFrontier
+                | SealWait::AbandonReturnPending
+                | SealWait::RefusedReturnPending
+        )
+}
+
+/// Whether a failure-path yield made progress: it spent budget, so
+/// it disposed exactly one staged head with more remaining (the
+/// per-pass bound resumes next visit). A yield with no spend is
+/// budget starvation and stays stuck.
+pub(crate) fn failure_yielded_is_progress(before: usize, remaining: usize) -> bool {
+    remaining < before
 }
 
 impl<'q> AuditedFailure<'q> {
@@ -2329,15 +2357,18 @@ impl IngestedJointQuantum {
                 self.reset_park();
                 return QuantumSealProgress::DeliveryReady;
             }
-            // A fresh birth with no staged call of its own inside this
-            // frontier (late attach, an idle caller) can only be grounded
-            // by the caller's future calls: this immutable frame never
-            // seals it, so it waits as future input exactly like an
-            // awaited terminal, instead of retrying until the lane-wide
-            // no-progress bound stops every caller.
+            // A wait that needs future input (claims, floors,
+            // corroborating returns, or a fresh birth's first history)
+            // can only be grounded by the caller's future calls: this
+            // immutable frame never seals it, so it waits as future
+            // input exactly like an awaited terminal, instead of
+            // retrying until the lane-wide no-progress bound stops
+            // every caller.
             if failure.gap == JournalGap::BoundNotReady
-                && (adapter.last_seal_wait() == SealWait::FreshBirthNoHistory
-                    || adapter.awaits_future_terminal(target.bootstrap(), self.frontier))
+                && seal_wait_advances_as_future(
+                    adapter.last_seal_wait(),
+                    adapter.awaits_future_terminal(target.bootstrap(), self.frontier),
+                )
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's
@@ -2700,7 +2731,18 @@ impl IngestedJointQuantum {
                 Ok(QuantumSealProgress::LocalPending)
             }
             FailureBatchProgress::Yielded => {
-                diagnosis.note_failure_stuck();
+                if failure_yielded_is_progress(before, *remaining) {
+                    // One staged head disposed with more remaining:
+                    // the per-pass bound resumes next visit. Progress
+                    // resets the streak (like any advance) so the
+                    // watchdog does not park a feed that is draining.
+                    self.consumers[index].stuck_streak = 0;
+                    self.consumers[index].last_stuck_gap = None;
+                    self.reset_park();
+                    diagnosis.note_failure_progress();
+                } else {
+                    diagnosis.note_failure_stuck();
+                }
                 Ok(QuantumSealProgress::DeliveryReady)
             }
         }
@@ -3052,9 +3094,6 @@ pub(crate) mod tests {
             !failure_yielded_is_progress(0, 0),
             "zero budget with no spend stays stuck"
         );
-        assert!(
-            !failure_yielded_is_progress(10, 10),
-            "no spend stays stuck"
-        );
+        assert!(!failure_yielded_is_progress(10, 10), "no spend stays stuck");
     }
 }

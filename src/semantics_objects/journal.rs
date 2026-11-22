@@ -1329,6 +1329,10 @@ pub(crate) enum SealWait {
     FloorsPastFrontier,
     AbandonReturnPending,
     RefusedReturnPending,
+    /// The drain order-proof derivation spent its slice budget: partial
+    /// dispositions are cached and the next seal resumes after the cursor,
+    /// never discarding progress.
+    DrainProofPending,
 }
 
 /// Finite seal/audit refusal.
@@ -1497,6 +1501,15 @@ struct OpenEntry {
     /// held sibling keeps the entry staged past its first seal, and
     /// the terminal must not complete twice.
     drained_converted: bool,
+    /// The committed completion cut of a converted drain (its
+    /// abandonment ordinal, set together with `drained_converted`).
+    /// Prune, frozen replay, fence and later terminals reuse this
+    /// committed result instead of re-running the order proof, whose
+    /// sealed-frontier check flips once this seal advances. Retention
+    /// follows the model need (single owner): a converted drain retires
+    /// at the settlement watermark like an END, never via the raw
+    /// abandonment arm, and never mints a second loss.
+    drained_cut: Option<u64>,
     converted_ticket: Option<CallToken>,
     converted_for: Option<JournalDomainKey>,
     end_converted: bool,
@@ -2116,6 +2129,26 @@ pub(crate) struct JournalAdapter {
     /// instrumentation only, never authority.
     seal_bootstrap: SealBootstrapCounts,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
+    /// Per-image ordinal index over staged open calls (BEGIN plus staged
+    /// END/ABANDON ordinals): the drain order proof queries adjacent
+    /// transitions via ranges instead of scanning the whole open table
+    /// per candidate. Maintained incrementally at staging and removal
+    /// (one indexed insert/remove per record, alongside the open-table
+    /// write it mirrors), so proof queries cost one indexed range probe
+    /// per candidate rather than one full scan.
+    drain_ordinals: BTreeSet<((u64, u64), u64)>,
+    /// Derived drain window dispositions for one frontier (candidate ->
+    /// whether its causal window holds no same-image ordinal): derived
+    /// once per frontier in budgeted slices and reused through fencing,
+    /// conversion, replay and prune, instead of re-proving per site.
+    drain_proof_cache: BTreeMap<JournalNativeKey, bool>,
+    /// Frontier the proof cache was derived for (`None` before the first
+    /// derivation): a new frontier clears the cache and restarts.
+    drain_proof_cache_frontier: Option<u64>,
+    /// Resume cursor for the budgeted derivation: the next candidate to
+    /// derive (`None` starts at the first). Preserved across slice
+    /// yields so resumption never discards derived prefix progress.
+    drain_proof_cursor: Option<JournalNativeKey>,
     floors: BTreeMap<u64, u64>,
     /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
     /// physical-thread return fences complement native sequence floors:
@@ -2326,6 +2359,10 @@ impl JournalAdapter {
             voids_ended_joint_feed: 0,
             seal_bootstrap: SealBootstrapCounts::default(),
             open: BTreeMap::new(),
+            drain_ordinals: BTreeSet::new(),
+            drain_proof_cache: BTreeMap::new(),
+            drain_proof_cache_frontier: None,
+            drain_proof_cursor: None,
             floors: BTreeMap::new(),
             physical_return_floors: BTreeMap::new(),
             refused: Vec::new(),
@@ -2580,6 +2617,9 @@ impl JournalAdapter {
             entry.converted_ticket = None;
             entry.converted_for = None;
             entry.end_converted = false;
+            entry.drained_converted = false;
+            entry.drained_cut = None;
+            entry.corroborated_return = None;
             entry.raw_resource = None;
             entry.collected_origin = None;
             entry.s1only_subject = None;
@@ -2591,6 +2631,8 @@ impl JournalAdapter {
                 RetainedMember::Open(native),
             );
             assert!(self.open.insert(native, entry).is_none());
+            self.drain_ordinals
+                .insert((entry.image, entry.begin_ordinal));
         }
     }
 
@@ -3119,6 +3161,7 @@ impl JournalAdapter {
                 corroborated_returned: ReturnedWords::default(),
                 negative_return: false,
                 drained_converted: false,
+                drained_cut: None,
                 converted_ticket: None,
                 converted_for: None,
                 end_converted: false,
@@ -3126,10 +3169,19 @@ impl JournalAdapter {
                 collected_origin: None,
                 s1only_subject: None,
             },
-        ) && old.converted_ticket.is_none()
-        {
-            self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
+        ) {
+            self.drain_ordinals.remove(&(old.image, old.begin_ordinal));
+            if let Some(staged) = old.end {
+                self.drain_ordinals.remove(&(old.image, staged.ordinal));
+            }
+            if let Some(staged) = old.abandon {
+                self.drain_ordinals.remove(&(old.image, staged.ordinal));
+            }
+            if old.converted_ticket.is_none() {
+                self.retained_member_dec(identity_of_begin(&old.begin), RetainedMember::Open(key));
+            }
         }
+        self.drain_ordinals.insert((image, ordinal));
         self.retained_member_inc(inserted, RetainedMember::Open(key));
         JournalDisposition::BeginAdmitted
     }
@@ -3281,7 +3333,9 @@ impl JournalAdapter {
             );
             return JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch);
         }
+        let image = entry.image;
         self.open.get_mut(&key).expect("open entry").end = Some(StagedEnd { ordinal, end });
+        self.drain_ordinals.insert((image, ordinal));
         JournalDisposition::EndStaged
     }
 
@@ -3329,8 +3383,10 @@ impl JournalAdapter {
             );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateTerminal);
         }
+        let image = entry.image;
         self.open.get_mut(&key).expect("open entry").abandon =
             Some(StagedAbandon { ordinal, abandon });
+        self.drain_ordinals.insert((image, ordinal));
         JournalDisposition::AbandonStaged
     }
 
@@ -3970,6 +4026,14 @@ impl JournalAdapter {
         if removed.s1only_subject.is_some() {
             self.s1only_open.remove(&native);
         }
+        self.drain_ordinals
+            .remove(&(removed.image, removed.begin_ordinal));
+        if let Some(staged) = removed.end {
+            self.drain_ordinals.remove(&(removed.image, staged.ordinal));
+        }
+        if let Some(staged) = removed.abandon {
+            self.drain_ordinals.remove(&(removed.image, staged.ordinal));
+        }
         Some(removed)
     }
 
@@ -3977,6 +4041,7 @@ impl JournalAdapter {
     fn clear_open(&mut self) {
         self.open.clear();
         self.s1only_open.clear();
+        self.drain_ordinals.clear();
     }
 
     /// Whether every queued claim on this identity reports a return that
@@ -4763,6 +4828,19 @@ fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> C
 /// the bounded loss: its result, find or attribute tail is truly gone.
 fn return_drains_without_tail(function: u32) -> bool {
     p11scope_ebpf_common::object_policy::object_descriptor(function).is_none()
+}
+
+/// Whether one drained return must prove its causal window before
+/// completing at the abandonment cut: lifecycle functions always (a
+/// session effect applied out of order diverges), and any function
+/// whose actual return carries lifecycle authority under the model's
+/// single return rule (invalid handles/sessions, pending or ambiguous
+/// outcomes such as device removal, which retire compatible sessions).
+/// Effect-free neutral returns (`Ok`, `Partial`, plain `Failed`) apply
+/// no effect and replay anywhere, preserving converted neutral recovery.
+fn drained_needs_order_proof(function: u32, rv: u64) -> bool {
+    super::state::is_lifecycle_function(function)
+        || !super::state::return_leaves_no_lifecycle_effect(function, rv)
 }
 
 /// One recovered completion from a drained corroborated return: the
@@ -7952,6 +8030,10 @@ impl JournalAdapter {
     ) -> Result<SealSuccess, SealFailure> {
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
+        // Drain window dispositions derive here, once per frontier in
+        // budgeted slices, before any site reads them: a yielded slice
+        // waits with its prefix cached and resumes next seal.
+        self.ensure_drain_proofs(frontier)?;
         let Some(state) = self.keys.get(&key) else {
             // Diagnostic-only (bootstrap arms): count the refusing arm. The
             // refusal below is unchanged.
@@ -8146,7 +8228,7 @@ impl JournalAdapter {
         // this seal removes never apply, so they leave the held pin
         // alone. A sibling key's bounds belong to its own fence.
         let mut pending_bounds = Vec::new();
-        for entry in self.open.values() {
+        for (native, entry) in &self.open {
             if self.abandons_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && let Some(staged) = entry.abandon
@@ -8155,7 +8237,7 @@ impl JournalAdapter {
                 && let Some(at) = entry.corroborated_return
                 && at <= frontier
                 && self
-                    .drained_return_cut(key, &live, entry, frontier)
+                    .drained_return_cut(key, *native, entry, frontier)
                     .is_none()
             {
                 pending_bounds.push(at);
@@ -8188,18 +8270,18 @@ impl JournalAdapter {
         // floors as new authority.
         let held = self
             .open
-            .values()
-            .filter(|entry| {
+            .iter()
+            .filter(|(native, entry)| {
                 (self.converts_here(key, &live, entry) || entry.converted_for == Some(key))
                     && (!entry.abandon.is_some_and(|staged| {
                         staged.ordinal <= frontier
                             && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
                             && entry.corroborated_return.is_some_and(|at| at <= frontier)
                     }) || self
-                        .drained_return_cut(key, &live, entry, frontier)
+                        .drained_return_cut(key, **native, entry, frontier)
                         .is_some())
             })
-            .map(|entry| entry.begin_ordinal)
+            .map(|(_, entry)| entry.begin_ordinal)
             .min();
         if floors > frontier {
             return Err(self.wait(SealWait::FloorsPastFrontier));
@@ -9407,26 +9489,46 @@ impl JournalAdapter {
     /// contradicts the covered prefix (the model voids the domain); the
     /// abandonment is always fresh.
     ///
-    /// Lifecycle drains additionally prove causal order: the completion
-    /// applies session effects at the abandonment cut, but the call
-    /// truly returned at the corroborated ordinal. Replay diverges from
-    /// truth when dependent history was covered past the observed
-    /// return (a sibling close-all between the two would close a
-    /// session the replay then re-opens). Neutral completions apply no
-    /// effect and replay anywhere, so they skip the proof. A lifecycle
-    /// drain without the proof keeps the bounded loss.
+    /// A converted drain reuses its committed cut instead of re-running
+    /// the proof: the sealed-frontier check flips once the conversion
+    /// seal advances, and re-proving would drop a recovered call the
+    /// model still needs for deferred replay, then reconsider it as
+    /// Ticket loss. Retention follows the model need (single owner).
     ///
-    /// The settled table, the frozen retained table, the terminal
-    /// conversion, the model fence and the prune rule share this one
-    /// predicate: a drained call completes, fences and prunes as a
-    /// completion everywhere, or keeps the loss everywhere.
+    /// Drains with effects additionally prove causal order: the
+    /// completion applies its effects at the abandonment cut, but the
+    /// call truly returned at the corroborated ordinal. Replay diverges
+    /// from truth when dependent history was covered past the observed
+    /// return (a sibling close-all between the two would close a
+    /// session the replay then re-opens; a close BEGIN there snapshots
+    /// before the moved completion and misses it; an earlier device
+    /// error moved past a later opener retires that later session).
+    /// Lifecycle functions always prove; neutral functions prove when
+    /// the actual return carries lifecycle authority (negative returns,
+    /// pending or ambiguous outcomes), and effect-free neutral returns
+    /// replay anywhere. A drain without its proof keeps the bounded loss.
+    /// An empty window orders the replay by the proven drain order with
+    /// session incarnations allocating in true order.
+    ///
+    /// Window dispositions derive once per frontier (see
+    /// [`Self::ensure_drain_proofs`]) from the incremental per-image
+    /// ordinal index, and every site below reuses the cached result
+    /// instead of re-scanning. The settled table, the frozen retained
+    /// table, the terminal conversion, the model fence and the prune rule
+    /// share this one predicate: a drained call completes, fences and
+    /// prunes as a completion everywhere, or keeps the loss everywhere.
     fn drained_return_cut(
         &self,
         key: JournalDomainKey,
-        live: &[JournalDomainKey],
+        native: JournalNativeKey,
         entry: &OpenEntry,
         frontier: u64,
     ) -> Option<u64> {
+        if entry.drained_converted {
+            return entry
+                .drained_cut
+                .or_else(|| entry.abandon.map(|staged| staged.ordinal));
+        }
         let staged = entry.abandon.filter(|staged| {
             staged.ordinal <= frontier
                 && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
@@ -9435,51 +9537,106 @@ impl JournalAdapter {
             return None;
         }
         let returned = entry.corroborated_return.filter(|at| *at <= frontier)?;
-        if super::state::is_lifecycle_function(entry.function)
-            && !self.drain_order_proven(key, live, returned, staged.ordinal)
-        {
-            return None;
+        if drained_needs_order_proof(entry.function, entry.corroborated_returned.rv) {
+            if !self
+                .drain_proof_cache
+                .get(&native)
+                .copied()
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            let sealed_through = self.keys.get(&key).expect("sealed key").sealed_through;
+            if returned <= sealed_through {
+                return None;
+            }
         }
         Some(staged.ordinal)
     }
 
-    /// Whether one lifecycle drain's window is empty: the observed
-    /// return is newer than this key's last sealed frontier (no prior
-    /// seal applied past it: settlement applies at most through its
-    /// frontier), and no sibling terminal of this key sits covered
-    /// strictly between the observed return and the abandonment. Ends
-    /// and abandonments apply (or lose) in ordinal order, so anything
-    /// in the window replays before this completion where truth ran it
-    /// after the return. Begins apply no effect, and refused begins
-    /// only move fences the drain already cleared, so both stay out of
-    /// the window. The drained entry needs no exclusion: its own
-    /// abandonment is the window's edge, never inside it.
-    fn drain_order_proven(
-        &self,
-        key: JournalDomainKey,
-        live: &[JournalDomainKey],
-        returned: u64,
-        abandoned: u64,
-    ) -> bool {
-        let sealed_through = self.keys.get(&key).expect("sealed key").sealed_through;
-        if returned <= sealed_through {
-            return false;
+    /// Whether one image holds no staged ordinal strictly between two
+    /// cuts, via the incremental per-image index (one range probe, no
+    /// table scan). Conservative: any same-image BEGIN, END or
+    /// abandonment in the window blocks, including entries that would
+    /// not convert here; lone drains carry consecutive cuts with no
+    /// integer between them, so they always pass. Refused begins live
+    /// outside the open table and stay out of the window, as do
+    /// ordinary CALL ordinals (observations, not Begin/End events).
+    fn drain_window_empty(&self, image: (u64, u64), returned: u64, abandoned: u64) -> bool {
+        use std::ops::Bound::Excluded;
+        self.drain_ordinals
+            .range((Excluded((image, returned)), Excluded((image, abandoned))))
+            .next()
+            .is_none()
+    }
+
+    /// Derive drain window dispositions for one frontier in budgeted
+    /// slices of at most one credit ([`SCOPED_RECOVERY_SLICE`] units, one
+    /// per candidate range probe): each candidate's window emptiness is
+    /// computed once from the per-image index and cached for every seal
+    /// of this frontier to reuse. A slice that exhausts its budget
+    /// yields [`SealWait::DrainProofPending`] with the derived prefix
+    /// cached and the cursor on the last derived candidate, so the next
+    /// seal resumes after it and never discards progress. A new frontier
+    /// clears the cache and restarts. Converted drains and effect-free
+    /// neutral drains need no proof and cost nothing here.
+    fn ensure_drain_proofs(&mut self, frontier: u64) -> Result<(), SealFailure> {
+        if self.drain_proof_cache_frontier != Some(frontier) {
+            self.drain_proof_cache.clear();
+            self.drain_proof_cursor = None;
+            self.drain_proof_cache_frontier = Some(frontier);
         }
-        !self.open.values().any(|sibling| {
+        let candidates: Vec<JournalNativeKey> = self
+            .open
+            .iter()
+            .filter_map(|(native, entry)| {
+                let staged = entry.abandon.filter(|staged| {
+                    staged.ordinal <= frontier
+                        && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+                })?;
+                if !return_drains_without_tail(entry.function) {
+                    return None;
+                }
+                entry.corroborated_return.filter(|at| *at <= frontier)?;
+                if entry.drained_converted {
+                    return None;
+                }
+                if !drained_needs_order_proof(entry.function, entry.corroborated_returned.rv) {
+                    return None;
+                }
+                let _ = staged;
+                Some(*native)
+            })
+            .collect();
+        let start = match self.drain_proof_cursor {
+            None => 0,
+            Some(cursor) => match candidates.binary_search(&cursor) {
+                Ok(index) => index + 1,
+                Err(index) => index,
+            },
+        };
+        let mut credit = self.inline_credit.min(SCOPED_RECOVERY_SLICE);
+        let allowance = credit;
+        for native in candidates.iter().skip(start) {
+            if credit == 0 {
+                self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
+                return Err(self.wait(SealWait::DrainProofPending));
+            }
+            credit -= 1;
             #[cfg(test)]
             {
                 self.test_drain_proof_visits
                     .set(self.test_drain_proof_visits.get() + 1);
             }
-            if !(self.converts_here(key, live, sibling) || sibling.converted_for == Some(key)) {
-                return false;
-            }
-            let in_window = |ordinal: u64| ordinal > returned && ordinal < abandoned;
-            sibling.end.is_some_and(|staged| in_window(staged.ordinal))
-                || sibling
-                    .abandon
-                    .is_some_and(|staged| in_window(staged.ordinal))
-        })
+            let entry = self.open.get(native).expect("candidate entry");
+            let returned = entry.corroborated_return.expect("candidate return");
+            let abandoned = entry.abandon.expect("candidate abandon").ordinal;
+            let empty = self.drain_window_empty(entry.image, returned, abandoned);
+            self.drain_proof_cache.insert(*native, empty);
+            self.drain_proof_cursor = Some(*native);
+        }
+        self.inline_spent = self.inline_spent.saturating_add(allowance - credit);
+        Ok(())
     }
 
     /// Conversion and settlement after every structural rule passed. The
@@ -9925,7 +10082,7 @@ impl JournalAdapter {
             });
             // A drained return settles as a completion at its
             // abandonment cut, never as an abandonment.
-            let drained = self.drained_return_cut(key, &live, entry, frontier);
+            let drained = self.drained_return_cut(key, *native, entry, frontier);
             if end.is_none() && !abandoned {
                 continue;
             }
@@ -9957,15 +10114,15 @@ impl JournalAdapter {
         if let Some(replay) = &mut replay {
             let retained = self
                 .open
-                .values()
-                .filter(|entry| entry.converted_for == Some(key))
-                .map(|entry| {
+                .iter()
+                .filter(|(_, entry)| entry.converted_for == Some(key))
+                .map(|(native, entry)| {
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     // A held drained completion keeps its completion
                     // cut here too: the deferred End step matches this
                     // row by (phase, cut), and an abandoned-looking row
                     // would stall the feed head instead of replaying.
-                    let drained = self.drained_return_cut(key, &live, entry, frontier);
+                    let drained = self.drained_return_cut(key, *native, entry, frontier);
                     SealedCall {
                         ticket: entry.converted_ticket.expect("converted original"),
                         key: entry.call_key.expect("converted original key"),
@@ -10043,7 +10200,7 @@ impl JournalAdapter {
                 // ordinary facts, exactly once (a held sibling keeps the
                 // entry staged past its first seal); anything else keeps
                 // the bounded loss below.
-                if let Some(at) = self.drained_return_cut(key, &live, &entry, frontier) {
+                if let Some(at) = self.drained_return_cut(key, native, &entry, frontier) {
                     if !entry.drained_converted {
                         let completed = completed_from_drained_return(
                             at,
@@ -10057,10 +10214,9 @@ impl JournalAdapter {
                         if let Some(replay) = &mut replay {
                             replay.conversion(at, start..effects.effects.len());
                         }
-                        self.open
-                            .get_mut(&native)
-                            .expect("staged terminal")
-                            .drained_converted = true;
+                        let staged_entry = self.open.get_mut(&native).expect("staged terminal");
+                        staged_entry.drained_converted = true;
+                        staged_entry.drained_cut = Some(at);
                     }
                     // A drained return is a completion, not a loss: no
                     // bounded upper is retained for it.
@@ -10279,13 +10435,12 @@ impl JournalAdapter {
         // The removal closure cannot borrow the adapter (the table is
         // mutably borrowed), so the shared drain predicate runs up
         // front: a drained entry retires at the watermark like an END.
-        let live = self.live_keys_for_image((key.cookie, key.exec));
         let drained: BTreeMap<JournalNativeKey, u64> = self
             .open
             .iter()
             .filter(|(_, entry)| entry.converted_for == Some(key))
             .filter_map(|(native, entry)| {
-                self.drained_return_cut(key, &live, entry, frontier)
+                self.drained_return_cut(key, *native, entry, frontier)
                     .map(|at| (*native, at))
             })
             .collect();
@@ -22735,26 +22890,48 @@ pub(crate) mod tests {
         // its cut. The converted opener must remain staged while the
         // holder pins the watermark; pruning must follow the model
         // need (single owner), never drop a recovered call whose
-        // deferred End still needs its original.
+        // deferred End still needs its original. Closing the holder in
+        // a later seal delivers exactly one deferred End with the
+        // original call and session incarnation, then releases both.
+        // Producer-shaped words (absent entry session, return-only
+        // handle, H0 claims from the return): a BEGIN-word substitution
+        // mints nothing, so the deferred mint proves the return words.
+        use crate::semantics_objects::SessionOrigin;
+        use crate::semantics_objects::SessionState;
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        const RETURNED_HANDLE: u64 = 0x9090;
         let mut scene = Scene::new(image_default());
         let sign = function_id("C_Sign");
-        let open = function_id("C_OpenSession");
         scene.attest_function("C_Sign");
-        let proof = scene.attest_function("C_OpenSession");
-        let holder = begin_bytes(1, 1, sign, 0);
+        let holder = begin_bytes(2, 1, sign, 0);
         assert_eq!(scene.ingest(&holder), JournalDisposition::BeginAdmitted);
-        let begin = begin_bytes(1, 2, open, 0);
+        let (begin, end) = producer_agreement_pair("C_OpenSession", |_, _| {});
+        let JournalRecord::End(lost) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END");
+        };
+        let ordinary = lost.payload_base().event;
+        assert_eq!(
+            ordinary.session, RETURNED_HANDLE,
+            "the return carries the only handle"
+        );
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         assert_eq!(
-            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            scene.ingest_ordinary(ordinary),
             JournalDisposition::ReturnObserved
         );
-        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
         assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
         let mut pad = ordinary_for(&begin, 0);
         pad.slot = 99;
         scene.ingest_ordinary(pad);
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_OpenSession", ordinary);
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the paired return attests");
         let bootstrap = scene.bootstrap(proof, 0);
         let first = scene.seal(&bootstrap).expect("first seal passes");
         assert_eq!(first.prefix.settled().len(), 2);
@@ -22774,12 +22951,64 @@ pub(crate) mod tests {
             "the completion cut is the abandonment ordinal"
         );
         assert!(
-            scene.adapter.open.contains_key(&(1, 2)),
+            scene.adapter.open.contains_key(&(1, 1)),
             "converted opener must remain staged while the holder pins the watermark"
         );
         assert!(
-            scene.adapter.open.contains_key(&(1, 1)),
+            scene.adapter.open.contains_key(&(2, 1)),
             "the holder stays staged"
+        );
+        // Closing the holder releases the watermark: the deferred End
+        // delivers exactly once with the drained session incarnation.
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&holder, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let second = scene.seal(&bootstrap).expect("second seal passes");
+        assert_eq!(
+            second.prefix.settled().len(),
+            1,
+            "a converted drain never re-mints on a later seal: {:?}",
+            second.prefix.settled()
+        );
+        assert_eq!(second.prefix.settled()[0].begin_cut, 1);
+        let opened: Vec<_> = second
+            .effects
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                ObjectEffect::SessionOpened { session, .. } => Some(*session),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            opened.len(),
+            1,
+            "exactly one deferred End delivery opens one incarnation: {:?}",
+            second.effects.effects
+        );
+        assert!(
+            !second.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::SessionEnded { .. }
+                    | ObjectEffect::Unresolved { .. }
+                    | ObjectEffect::Gap {
+                        reason: super::ObjectGap::OutcomeLost,
+                        ..
+                    }
+            )),
+            "the deferred End resolves cleanly with no loss: {:?}",
+            second.effects.effects
+        );
+        let sessions = scene.model.project().sessions;
+        let live: Vec<_> = sessions
+            .iter()
+            .filter(|view| view.origin == SessionOrigin::Opened && view.state == SessionState::Live)
+            .collect();
+        assert_eq!(live.len(), 1, "one live incarnation from the drained words");
+        assert!(
+            scene.adapter.open.is_empty(),
+            "both calls release once the model need is served"
         );
     }
 
@@ -22880,11 +23109,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn object_journal_drained_device_error_keeps_later_opener_live() {
+    fn object_journal_drained_device_error_refuses_to_retire_later_opener() {
         // A neutral drain carrying device-error authority must not retire
-        // a session opened after its true return. The opener's BEGIN/END
-        // sit between the Sign's observed return and its abandonment, so
-        // the drain keeps the counted loss and the later session stays live.
+        // a session opened after its true return. The opener's END sits
+        // between the Sign's observed return and its abandonment, so the
+        // drain keeps the counted Ticket loss instead of ending the later
+        // session. The unfenced Ticket voids through the sibling's higher
+        // cut, so this seal refuses (pre-existing Ticket mechanics, as the
+        // close-snapshot twin); the joint feed dispositions the refusal as
+        // fallback with segment resumption, and the later opener stays live
+        // there (pinned by the audited pair).
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         let mut scene = Scene::new(image_default());
         let sign = function_id("C_Sign");
@@ -22911,27 +23145,40 @@ pub(crate) mod tests {
         pad.slot = 99;
         scene.ingest_ordinary(pad);
         let bootstrap = scene.bootstrap(proof, 0);
-        let success = scene.seal(&bootstrap).expect("refused drain seals");
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("unproven order keeps the loss, never completes");
+        assert_eq!(
+            failure.gap,
+            JournalGap::ModelRefused,
+            "unproven order keeps the loss, never completes"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(2),
+            "the Ticket bound names the observed return"
+        );
         assert!(
-            !success.effects.effects.iter().any(|effect| matches!(
+            !failure.effects.effects.iter().any(|effect| matches!(
                 effect,
                 ObjectEffect::SessionEnded { .. }
+                    | ObjectEffect::SessionOpened { .. }
                     | ObjectEffect::Gap {
                         reason: super::ObjectGap::DeviceLoss,
                         ..
                     }
             )),
-            "the earlier device error must not end the later session: {:?}",
-            success.effects.effects
+            "the earlier device error never applies: {:?}",
+            failure.effects.effects
         );
         assert!(
-            scene
-                .model
-                .project()
-                .sessions
-                .iter()
-                .any(|view| view.state == crate::semantics_objects::SessionState::Live),
-            "the later opener stays live"
+            scene.model.project().sessions.is_empty(),
+            "no session mints or retires on the refused drain"
         );
     }
 
@@ -22977,9 +23224,11 @@ pub(crate) mod tests {
     #[test]
     fn object_journal_drain_order_proof_visits_are_bounded() {
         // Many empty-window lifecycle drains must not scan the whole open
-        // table per candidate. Each proof visits at most one slice of rows;
-        // the fixed test stages 70 drains over 70 opens (140 rows counting
-        // holders) and requires the total proof visits to stay linear.
+        // table per candidate. Dispositions derive once per frontier from
+        // the ordinal index in slices of one credit (64 units): the fixed
+        // test stages 70 drains, yields at the slice boundary with the
+        // prefix cached, and resumes to derive only the remainder — never
+        // discarding progress — with every drain completing.
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         const DRAINS: u64 = 70;
         let mut scene = Scene::new(image_default());
@@ -23003,11 +23252,41 @@ pub(crate) mod tests {
         }
         let bootstrap = scene.bootstrap(proof, 0);
         scene.adapter.test_drain_proof_visits.set(0);
-        let _ = scene.seal(&bootstrap);
-        let visits = scene.adapter.test_drain_proof_visits.get();
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the first slice yields at the budget boundary");
+        assert_eq!(failure.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::DrainProofPending,
+            "the yield names its resume cause"
+        );
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            64,
+            "one slice derives one credit, no more"
+        );
+        let success = scene.seal(&bootstrap).expect("resumption completes");
+        assert_eq!(
+            scene.adapter.test_drain_proof_visits.get(),
+            DRAINS as usize,
+            "resumption derives only the remainder, never discards"
+        );
+        assert_eq!(success.prefix.settled().len(), DRAINS as usize);
         assert!(
-            visits <= 64 * 5,
-            "70 empty-window proofs must stay bounded, visited {visits}"
+            success.prefix.settled().iter().all(|call| !call.abandoned),
+            "every empty-window drain completes: {:?}",
+            success.prefix.settled()
+        );
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "no outcome is lost: {:?}",
+            success.effects.effects
         );
     }
 

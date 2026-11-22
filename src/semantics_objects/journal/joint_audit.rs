@@ -2210,52 +2210,68 @@ impl IngestedJointQuantum {
         let binding = bindings
             .get(target.caller())
             .ok_or(RawQuantumRefusal::Admission)?;
-        let bounds = ReplayBounds::sample(owner.adapter(), owner.model())
-            .ok_or(RawQuantumRefusal::Capacity)?;
-        let bytes = result_storage_bound(owner.adapter(), owner.model())
-            .and_then(|base| base.checked_add(bounds.retained_bytes()?))
-            .ok_or(RawQuantumRefusal::Capacity)?;
-        let temporary = bounds
-            .temporary_bytes()
-            .ok_or(RawQuantumRefusal::Capacity)?;
-        let reserver = owner
-            .ledger()
-            .resource_reserver()
-            .ok_or(RawQuantumRefusal::ForeignLedger)?;
-        let storage = reserver
-            .reserve(bytes)
-            .map_err(RawQuantumRefusal::Resource)?;
-        let locator_storage = reserver
-            .reserve(temporary)
-            .map_err(RawQuantumRefusal::Resource)?;
-        let replay = ReplayPreparation::allocate(bounds, locator_storage)
-            .ok_or(RawQuantumRefusal::Capacity)?;
+        // Drain proof slices yield with their prefix cached: retry with a
+        // fresh slice while service budget remains, never discarding. Each
+        // retry derives at least one candidate, so the loop terminates.
+        let (outcome, storage, bytes, mark) = loop {
+            if *remaining == 0 {
+                return Ok(self.progress());
+            }
+            let bounds = ReplayBounds::sample(owner.adapter(), owner.model())
+                .ok_or(RawQuantumRefusal::Capacity)?;
+            let bytes = result_storage_bound(owner.adapter(), owner.model())
+                .and_then(|base| base.checked_add(bounds.retained_bytes()?))
+                .ok_or(RawQuantumRefusal::Capacity)?;
+            let temporary = bounds
+                .temporary_bytes()
+                .ok_or(RawQuantumRefusal::Capacity)?;
+            let reserver = owner
+                .ledger()
+                .resource_reserver()
+                .ok_or(RawQuantumRefusal::ForeignLedger)?;
+            let storage = reserver
+                .reserve(bytes)
+                .map_err(RawQuantumRefusal::Resource)?;
+            let locator_storage = reserver
+                .reserve(temporary)
+                .map_err(RawQuantumRefusal::Resource)?;
+            let replay = ReplayPreparation::allocate(bounds, locator_storage)
+                .ok_or(RawQuantumRefusal::Capacity)?;
+            let (adapter, model) = owner.parts();
+            let input = AuditedDomainInput {
+                audit: &self.audit,
+                receipt: target.bootstrap(),
+                frontier: self.frontier,
+            };
+            let mut selected = SelectedBirth {
+                source: &mut *births,
+                target: &target,
+                binding,
+            };
+            let mark = adapter.rejection_mark();
+            // A refusal decided by this seal runs its inline rejection work
+            // from this same service budget, never past it.
+            adapter.bound_inline_credit(*remaining);
+            let outcome = adapter.seal_in_audit(model, input, &mut selected, fault, replay);
+            let spent = adapter.take_inline_spent();
+            *remaining = remaining.saturating_sub(spent);
+            assert!(
+                outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
+                "retained seal result exceeds its checked preflight bound"
+            );
+            assert!(
+                lookup_storage(&outcome).is_some_and(|actual| actual <= temporary),
+                "retained original lookup exceeds its original preflight lease"
+            );
+            if outcome.as_ref().is_err_and(|failure| {
+                failure.gap == JournalGap::BoundNotReady
+                    && adapter.last_seal_wait() == SealWait::DrainProofPending
+            }) {
+                continue;
+            }
+            break (outcome, storage, bytes, mark);
+        };
         let (adapter, model) = owner.parts();
-        let input = AuditedDomainInput {
-            audit: &self.audit,
-            receipt: target.bootstrap(),
-            frontier: self.frontier,
-        };
-        let mut selected = SelectedBirth {
-            source: births,
-            target: &target,
-            binding,
-        };
-        let mark = adapter.rejection_mark();
-        // A refusal decided by this seal runs its inline rejection work
-        // from this same service budget, never past it.
-        adapter.bound_inline_credit(*remaining);
-        let outcome = adapter.seal_in_audit(model, input, &mut selected, fault, replay);
-        let spent = adapter.take_inline_spent();
-        *remaining = remaining.saturating_sub(spent);
-        assert!(
-            outcome_storage(&outcome).is_some_and(|actual| actual <= bytes),
-            "retained seal result exceeds its checked preflight bound"
-        );
-        assert!(
-            lookup_storage(&outcome).is_some_and(|actual| actual <= temporary),
-            "retained original lookup exceeds its original preflight lease"
-        );
         if outcome.is_err()
             && let Some(ticket) = adapter.rejection_issued_since(mark)
         {

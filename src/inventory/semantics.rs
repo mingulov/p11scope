@@ -2021,18 +2021,21 @@ pub(crate) fn joint_decoder_line(raw_malformed: Option<u64>) -> String {
 
 /// One stderr line for the diagnostic Joint re-entry summary: new
 /// keys bound past void-fenced siblings, fresh incarnations minted
-/// for dead fenced bindings, and fenced taint quarantines lifted.
-/// Counts only; no identities, paths or payloads. Diagnostic-only:
-/// printed beside the Joint-void summary only when verbose text is
-/// requested, never a contract and never in reports.
+/// for dead fenced bindings, fenced taint quarantines lifted, and
+/// quarantines ended on new object proof. Counts only; no
+/// identities, paths or payloads. Diagnostic-only: printed beside
+/// the Joint-void summary only when verbose text is requested, never
+/// a contract and never in reports.
 pub(crate) fn joint_reentry_line(
     sibling_binds: u64,
     incarnations: u64,
     taint_lifts: u64,
+    quarantine_ends: u64,
 ) -> String {
     format!(
         "p11scope: joint re-entry: sibling_binds={sibling_binds} \
-         incarnations={incarnations} taint_lifts={taint_lifts}"
+         incarnations={incarnations} taint_lifts={taint_lifts} \
+         quarantine_ends={quarantine_ends}"
     )
 }
 

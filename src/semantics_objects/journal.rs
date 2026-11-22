@@ -270,6 +270,29 @@ pub(crate) fn endpoint_class(function: u32) -> Option<EndpointClass> {
     Some(EndpointClass::NegativeOnlyAffecting)
 }
 
+/// Whether one canonical function ordinal carries new object proof:
+/// creations and generations mint result handles, Find returns found
+/// handles, and attribute reads establish metadata — each observed
+/// post-fence call of these re-proves objects. Uses, destroys,
+/// mutations, scalar KEM results and non-catalog lifecycle carry no
+/// object proof and never end a quarantine on their own.
+fn call_establishes_object_proof(function: u32) -> bool {
+    use p11scope_ebpf_common::object_policy::ObjectAction;
+    p11scope_ebpf_common::object_policy::object_descriptor(function).is_some_and(|descriptor| {
+        matches!(
+            descriptor.action,
+            ObjectAction::Create
+                | ObjectAction::Copy
+                | ObjectAction::Generate
+                | ObjectAction::GeneratePair
+                | ObjectAction::Derive
+                | ObjectAction::Unwrap
+                | ObjectAction::Find
+                | ObjectAction::GetAttributes
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Finite ABANDON reason-to-disposition matrix
 // ---------------------------------------------------------------------------
@@ -1194,6 +1217,10 @@ pub(crate) struct JointReentryCounts {
     pub(crate) incarnations: u64,
     /// Fenced taint quarantines lifted for fresh births.
     pub(crate) taint_lifts: u64,
+    /// Quarantines ended on new object proof: mints the death rule
+    /// alone would refuse (a capable-grounded doom, a permanent
+    /// taint) or could not reach past an image taint.
+    pub(crate) quarantine_ends: u64,
 }
 
 /// Diagnostic-only Joint void telemetry (Task 0): where stream breaks
@@ -2208,11 +2235,13 @@ pub(crate) struct JournalAdapter {
     voids_ended_joint_feed: u64,
     /// Diagnostic-only Joint re-entry counts: new keys bound past
     /// void-fenced siblings, fresh incarnations minted for dead fenced
-    /// bindings, and fenced taint quarantines lifted. Saturating;
-    /// instrumentation only, never authority.
+    /// bindings, fenced taint quarantines lifted, and quarantines
+    /// ended on new object proof. Saturating; instrumentation only,
+    /// never authority.
     reentry_sibling_binds: u64,
     reentry_incarnations: u64,
     reentry_taint_lifts: u64,
+    reentry_quarantine_ends: u64,
     /// Diagnostic-only seal bootstrap refusal arms: which
     /// bootstrap check refused a seal, by arm. Saturating;
     /// instrumentation only, never authority.
@@ -2442,6 +2471,7 @@ impl JournalAdapter {
             reentry_sibling_binds: 0,
             reentry_incarnations: 0,
             reentry_taint_lifts: 0,
+            reentry_quarantine_ends: 0,
             seal_bootstrap: SealBootstrapCounts::default(),
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
@@ -3648,6 +3678,7 @@ impl JournalAdapter {
             sibling_binds: self.reentry_sibling_binds,
             incarnations: self.reentry_incarnations,
             taint_lifts: self.reentry_taint_lifts,
+            quarantine_ends: self.reentry_quarantine_ends,
         }
     }
 
@@ -3655,6 +3686,7 @@ impl JournalAdapter {
         self.reentry_sibling_binds = carried.sibling_binds;
         self.reentry_incarnations = carried.incarnations;
         self.reentry_taint_lifts = carried.taint_lifts;
+        self.reentry_quarantine_ends = carried.quarantine_ends;
     }
 
     pub(crate) fn carry_joint_void_counts(&mut self, carried: &JointVoidCounts) {
@@ -12158,7 +12190,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 32] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 33] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -12209,6 +12241,9 @@ pub(crate) mod tests {
         "C_GetObjectSize",
         "C_SetOperationState",
         "C_DigestKey",
+        // Quarantine-end: the session/logout twin drives a logout
+        // through the joint scene, appended for the same reason.
+        "C_Logout",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface

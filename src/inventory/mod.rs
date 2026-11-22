@@ -2204,6 +2204,7 @@ fn run_with_terminal_budget(
             reentry.sibling_binds,
             reentry.incarnations,
             reentry.taint_lifts,
+            reentry.quarantine_ends,
         ));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         inventory_diagnostic(&crate::inventory_semantics::joint_audit_subjects_line(
@@ -10022,6 +10023,7 @@ fn run_dashboard(
             reentry.sibling_binds,
             reentry.incarnations,
             reentry.taint_lifts,
+            reentry.quarantine_ends,
         ));
         let subjects = coordinator.joint_audit_subject_diagnosis();
         display.notice(&crate::inventory_semantics::joint_audit_subjects_line(

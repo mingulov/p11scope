@@ -39175,6 +39175,362 @@ fn joint_machine_idle_fresh_birth_finish_with_waiting_caller_is_clean() {
     );
 }
 
+/// A seal whose bounded abandonment lacks its corroborating return
+/// waits as future input: the return can only arrive in a later
+/// quantum, so the immutable frame finishes (charging one unit) and
+/// the consumer advances to Future with the wait's stage gate
+/// counted — instead of retrying into the lane-wide no-progress
+/// bound. Reverting the wait to retry returns `DeliveryReady` here
+/// instead.
+#[test]
+fn joint_seal_abandon_return_pending_waits_as_future_input() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    // One open call plus a healthy pair. The open call carries a
+    // pending return: enough evidence for H0 to form the call, but a
+    // pending return never corroborates — so the abandonment stages
+    // uncorroborated.
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let before = ports
+        .read()
+        .1
+        .adapter()
+        .seal_stage_diagnosis()
+        .abandon_return_pending;
+    let mut remaining = 10;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "the uncorroborated bound waits as future input"
+    );
+    assert_eq!(remaining, 9, "the finished frame charges one unit");
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::AbandonReturnPending,
+        "the wait names its gate"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .abandon_return_pending,
+        before + 1,
+        "the wait counts its stage gate"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the consumer advances past the wait"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a Future wait sets no active delivery"
+    );
+    let waiting = frame
+        .consumer_states_for_test()
+        .into_iter()
+        .find(|(id, _, _, _)| *id == target.id())
+        .expect("the abandoned key stays bound");
+    assert_eq!(waiting.1, "Future");
+    assert_eq!(waiting.2, 0, "no stuck streak on a wait");
+}
+
+/// A seal at an unchanged frontier (everything already sealed, no new
+/// history) waits as future input instead of succeeding vacuously:
+/// only the caller's future calls can ground new authority. The
+/// repeat counts its floors gate and charges one unit.
+#[test]
+fn joint_seal_floors_past_frontier_waits_as_future_input() {
+    use crate::semantics_objects::journal::SealWait;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    fixture.seal_replay_head(&mut frame, &BirthFault);
+    fixture.finish_bounded_batch(frame, false);
+    // No new records: the next frame seals at the unchanged frontier.
+    let mut frame = fixture.audited(0, 0, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let before = ports
+        .read()
+        .1
+        .adapter()
+        .seal_stage_diagnosis()
+        .floors_past_frontier;
+    let mut remaining = 10;
+    assert_eq!(
+        frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining),
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "the repeat at an unchanged frontier waits as future input"
+    );
+    assert_eq!(remaining, 9, "the finished frame charges one unit");
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::FloorsPastFrontier,
+        "the wait names its gate"
+    );
+    assert_eq!(
+        ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .floors_past_frontier,
+        before + 1,
+        "the wait counts its stage gate"
+    );
+    assert_eq!(
+        frame.consumer_progress_for_test(),
+        (1, 1, 1),
+        "the consumer advances past the wait"
+    );
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a Future wait sets no active delivery"
+    );
+}
+
+/// Unbound staging stays retry (the control twin of the future-wait
+/// seals): a seal barriered by history no bound key can account for
+/// keeps retrying instead of advancing as future input — only a void
+/// sheds the barrier — so the lane stays Pending and the lane-wide
+/// no-progress bound trips past its deadline instead of publishing.
+/// The wait names its gate and counts its stage counter. (A finished
+/// foreign call is shed by S1 before any seal, so only the machine
+/// layer — record-level collection — can stage the barrier; the
+/// frame-level fixture collects call-level H0 only.)
+#[test]
+fn joint_seal_unbound_staging_stays_retry() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::SealWait;
+
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    // The foreign child starts well after the lane attached.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // A foreign call still in flight: no S1 call to shed, so the journal
+    // keeps unbound staging that no bound key can account for.
+    let _foreign = push_unbound_foreign_call(&mut fixture, 2, false);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.reach_phase("Audited");
+    for n in 0..8 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Pending) => {}
+            other => panic!("the blocked seal stays Pending (poll {n}): {other:?}"),
+        }
+    }
+    assert_eq!(
+        unbound_staging(&fixture),
+        std::collections::BTreeSet::from([(184, 0)]),
+        "the foreign call is the only unbound staging"
+    );
+    let adapter = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter();
+    assert_eq!(
+        adapter.last_seal_wait(),
+        SealWait::UnboundStaging,
+        "the blocked seal waits on unbound staging"
+    );
+    assert!(
+        adapter.seal_stage_diagnosis().unbound_staging >= 1,
+        "the wait counts its stage gate"
+    );
+    // Past the bound the retry-only seal refuses: it never publishes
+    // as a future wait would.
+    fixture.machine.set_finish_no_progress_since_for_test(Some(
+        std::time::Instant::now() - std::time::Duration::from_millis(6_100),
+    ));
+    match fixture.service(1024) {
+        Err(SemanticRefusal::Unavailable) => {}
+        other => panic!("a retry-only seal past the bound must refuse: {other:?}"),
+    }
+    let gaps = audit_no_progress_gaps(&fixture);
+    assert_eq!(gaps.len(), 1, "the stall is named once: {gaps:?}");
+}
+
+/// A failure-path yield that spent budget is progress at the
+/// delivery seam; a yield with no spend stays stuck. Starved twin:
+/// zero budget yields with no spend, counting stuck with the streak
+/// standing. Draining twin: one unit per visit, and the first spend
+/// counts progress, resetting the streak and the park cursors — so
+/// the watchdog never parks a feed that is draining. Reverting the
+/// arm to unconditional stuck leaves progress at zero here.
+#[test]
+fn joint_failure_yielded_spend_counts_progress_at_delivery() {
+    use crate::semantics_objects::journal::joint_audit::{DeliverDiagnosis, ParkProgress};
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    fixture.push_two("C_SignInit", 2);
+    fixture.push_two("C_SignInit", 3);
+    fixture.push_two("C_SignInit", 4);
+    let fault = FrameFault::clean();
+    let mut frame = fixture.audited(6, 6, &fault);
+    // The collection moves after the audit: the seal fails closed
+    // with a loss both feeds must drain through bounded visits.
+    fault.epoch.set(1);
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    assert_eq!(
+        frame.seal_next(&mut ports, &mut births, &fault),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "the moved collection seals its loss for delivery"
+    );
+    // Park cursors go nonzero before the progress delivery: a
+    // one-unit park scan examines the unstreaked head and yields
+    // mid-scan, parking nothing.
+    assert_eq!(
+        frame.park_stuck_consumers_bounded(&mut 1),
+        ParkProgress::Yielded
+    );
+    assert_eq!(
+        frame.park_cursors_for_test(),
+        (1, 0),
+        "the yielded scan leaves its resume cursor"
+    );
+    let mut diagnosis = DeliverDiagnosis::default();
+    // Starved twin: zero budget yields with no spend.
+    let mut remaining = 0;
+    assert_eq!(
+        frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
+        Ok(QuantumSealProgress::DeliveryReady),
+        "a no-spend yield still holds the delivery open"
+    );
+    assert_eq!(diagnosis.f_stuck, 1, "no spend counts stuck");
+    assert_eq!(diagnosis.f_progress, 0, "no spend is not progress");
+    // Draining twin: one unit per visit until the first spend.
+    for _ in 0..8 {
+        if diagnosis.f_progress == 1 {
+            break;
+        }
+        let mut remaining = 1;
+        assert_eq!(
+            frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
+            Ok(QuantumSealProgress::DeliveryReady),
+            "every pre-progress visit yields its delivery open"
+        );
+    }
+    assert_eq!(
+        diagnosis.f_progress, 1,
+        "the first spend counts progress: {diagnosis:?}"
+    );
+    assert!(
+        diagnosis.f_stuck >= 1,
+        "the starved visit stays counted: {diagnosis:?}"
+    );
+    assert_eq!(
+        diagnosis.f_visits,
+        diagnosis.f_stuck + diagnosis.f_progress,
+        "every visit yielded: stuck or progress, nothing else"
+    );
+    assert!(
+        frame
+            .consumer_states_for_test()
+            .iter()
+            .all(|(_, _, streak, parked)| *streak == 0 && !parked),
+        "progress resets the streak and parks nothing"
+    );
+    assert_eq!(
+        frame.park_cursors_for_test(),
+        (0, 0),
+        "progress resets the park cursors"
+    );
+}
+
 /// Observer-first twin of the idle fresh birth: the caller is born
 /// from its exec marker (not a late attach) but is seen only through
 /// a non-key record and then stays idle. Its fresh seal has no staged

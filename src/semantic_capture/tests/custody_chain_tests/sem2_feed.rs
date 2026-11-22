@@ -311,6 +311,7 @@ fn joint_seal_stages_line_format_is_exact() {
          below_fence=0 unbound_staging=0 attribution_pending=0 claim_unmatched=0 \
          fresh_birth_no_history=0 floors_past_frontier=0 abandon_return_pending=0 \
          refused_return_pending=0 h3_pending=0 model_refused=0 success=0 \
+         stopped=0 adapter_invalidated=0 resource_unavailable=0 cut_exhausted=0 \
          open_staged=0 refused_staged=0 claims_held=0"
     );
     assert_eq!(
@@ -332,16 +333,21 @@ fn joint_seal_stages_line_format_is_exact() {
             h3_pending: 15,
             model_refused: 16,
             success: 17,
-            open_staged: 18,
-            refused_staged: 19,
-            claims_held: 20,
+            stopped: 18,
+            adapter_invalidated: 19,
+            resource_unavailable: 20,
+            cut_exhausted: 21,
+            open_staged: 22,
+            refused_staged: 23,
+            claims_held: 24,
         }),
         "p11scope: joint seal stages: domain_tainted=1 image_tainted=2 \
          drain_mismatch=3 domain_ended=4 closure_stale=5 frontier_regression=6 \
          below_fence=7 unbound_staging=8 attribution_pending=9 claim_unmatched=10 \
          fresh_birth_no_history=11 floors_past_frontier=12 abandon_return_pending=13 \
          refused_return_pending=14 h3_pending=15 model_refused=16 success=17 \
-         open_staged=18 refused_staged=19 claims_held=20"
+         stopped=18 adapter_invalidated=19 resource_unavailable=20 cut_exhausted=21 \
+         open_staged=22 refused_staged=23 claims_held=24"
     );
 }
 

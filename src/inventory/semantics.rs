@@ -2161,6 +2161,7 @@ pub(crate) fn joint_seal_stages_line(
          below_fence={} unbound_staging={} attribution_pending={} claim_unmatched={} \
          fresh_birth_no_history={} floors_past_frontier={} abandon_return_pending={} \
          refused_return_pending={} h3_pending={} model_refused={} success={} \
+         stopped={} adapter_invalidated={} resource_unavailable={} cut_exhausted={} \
          open_staged={} refused_staged={} claims_held={}",
         counts.domain_tainted,
         counts.image_tainted,
@@ -2179,6 +2180,10 @@ pub(crate) fn joint_seal_stages_line(
         counts.h3_pending,
         counts.model_refused,
         counts.success,
+        counts.stopped,
+        counts.adapter_invalidated,
+        counts.resource_unavailable,
+        counts.cut_exhausted,
         counts.open_staged,
         counts.refused_staged,
         counts.claims_held,

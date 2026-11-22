@@ -248,8 +248,9 @@ impl DeliverDiagnosis {
         self.f_retried = self.f_retried.saturating_add(1);
     }
 
-    /// The visit kept the active with no advance (held, yielded, or
-    /// a completeness hold that did not qualify).
+    /// The visit kept the active with no advance (held, a no-spend
+    /// yield, or a completeness hold that did not qualify). A yield
+    /// that spent budget counts progress, not stuck.
     pub(crate) fn note_failure_stuck(&mut self) {
         self.f_stuck = self.f_stuck.saturating_add(1);
     }
@@ -536,10 +537,11 @@ pub(crate) fn seal_wait_advances_as_future(wait: super::SealWait, awaits_termina
         )
 }
 
-/// Whether a failure-path yield made progress: it spent budget, so
-/// it disposed exactly one staged head with more remaining (the
-/// per-pass bound resumes next visit). A yield with no spend is
-/// budget starvation and stays stuck.
+/// Whether a failure-path yield made progress: it spent budget on
+/// resumable work — effect spans, loss invalidation, a completed
+/// census scan, or one staged-head disposition with more remaining —
+/// so the per-pass bound resumes next visit. A yield with no spend
+/// is budget starvation and stays stuck.
 pub(crate) fn failure_yielded_is_progress(before: usize, remaining: usize) -> bool {
     remaining < before
 }
@@ -1343,6 +1345,14 @@ impl IngestedJointQuantum {
     #[cfg(test)]
     pub(crate) fn consumer_progress_for_test(&self) -> (usize, usize, usize) {
         (self.pending, self.future, self.cursor)
+    }
+
+    /// Watchdog park cursors (resume index, parked total) for
+    /// delivery tests. Reset on any frame advance and when a park
+    /// run completes.
+    #[cfg(test)]
+    pub(crate) fn park_cursors_for_test(&self) -> (usize, usize) {
+        (self.park_cursor, self.parked_total)
     }
 
     /// Consumer states for provenance tests: (feed id, state label,
@@ -2315,9 +2325,10 @@ impl IngestedJointQuantum {
     }
 
     /// Settle one selected seal outcome (filled): a broad failure
-    /// requeues every consumer it affects; a fresh birth with no history
-    /// of its own waits as future input; anything else becomes the
-    /// active delivery.
+    /// requeues every consumer it affects; a wait that needs future
+    /// input (claims, floors, corroborating returns, a fresh birth's
+    /// first history, or an awaited terminal) waits as future input;
+    /// anything else becomes the active delivery.
     fn settle_outcome(
         &mut self,
         ports: &mut JointPublicationPorts<'_>,
@@ -2732,10 +2743,13 @@ impl IngestedJointQuantum {
             }
             FailureBatchProgress::Yielded => {
                 if failure_yielded_is_progress(before, *remaining) {
-                    // One staged head disposed with more remaining:
-                    // the per-pass bound resumes next visit. Progress
-                    // resets the streak (like any advance) so the
-                    // watchdog does not park a feed that is draining.
+                    // Spent budget on this delivery, so its persistent
+                    // cursor advanced (effect spans, loss invalidation,
+                    // census, or one staged head disposed/replayed with
+                    // more remaining): the per-pass bound resumes next
+                    // visit. Progress resets the streak (like any
+                    // advance) so the watchdog does not park a feed
+                    // that is draining.
                     self.consumers[index].stuck_streak = 0;
                     self.consumers[index].last_stuck_gap = None;
                     self.reset_park();
@@ -3075,16 +3089,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// A failure-path yield that spent budget disposed exactly one
-    /// staged head with more remaining: that is progress (the
-    /// per-pass bound resumes next visit), not a stuck visit. A
+    /// A failure-path yield that spent budget advanced resumable
+    /// work (effect spans, loss invalidation, census, or one
+    /// staged-head disposition with more remaining): that is progress
+    /// (the per-pass bound resumes next visit), not a stuck visit. A
     /// yield with no spend is budget starvation and stays stuck.
     #[test]
     fn failure_yielded_spend_counts_as_progress() {
         use super::failure_yielded_is_progress;
         assert!(
             failure_yielded_is_progress(10, 9),
-            "one head disposed is progress"
+            "spent budget is progress"
         );
         assert!(
             failure_yielded_is_progress(1, 0),

@@ -482,14 +482,14 @@ pub struct Engine {
     /// into the bounded `pending_learned` (or settles straight out
     /// past the bound) and leaves at settle.
     learned_waited: BTreeMap<(u64, u64), ObjectKey>,
-    /// Learned pin-failure retries per identity: a transiently failing
-    /// pin (budget exhaustion on a busy host) requeues for a later
-    /// tick instead of filing immediately, so the scan can catch up
-    /// and the retry stages silently. Bounded like the load tally;
-    /// past the cap a failure files at once, past the per-identity
-    /// retry bound it files as a persistent loss, and at the
-    /// end-of-capture flush it files at once (no later tick exists).
-    /// Entries leave at settle.
+    /// Learned pin-failure retries per identity: a file-changed pin
+    /// (the file was modified mid-identify) requeues for a later tick
+    /// instead of filing immediately, so the retry re-proves the
+    /// settled file and stages. Bounded like the load tally; past the
+    /// cap a failure files at once, past the per-identity retry bound
+    /// it files as a persistent loss, and at the end-of-capture flush
+    /// it files at once (no later tick exists). Capture exhaustion
+    /// never retries (the budget never renews). Entries leave at settle.
     learned_pin_retries: BTreeMap<(u64, u64), u8>,
     /// End-of-capture flush is running: failing learned pins file
     /// immediately instead of requeueing. Set once by the flush;
@@ -24529,32 +24529,39 @@ impl Engine {
                 self.requeue_learned_candidate(candidate);
                 return;
             }
-            // A budget-exhausted pin is not yet a refusal: on a busy
-            // host the budget a tick grants can be exhausted before
-            // this candidate proves, while the scan is still catching
-            // up to the same file. Requeue for a later tick without
-            // filing; the retry stages (silently, if the scan won)
-            // once the pressure clears. Past the retry bound, past
-            // the retry-map cap, or at the end-of-capture flush (no
-            // later tick exists) the failure files as a persistent
-            // loss, never silently. The discarded batch below is
-            // re-proved on the retry, so a persistent failure
-            // re-files its own row then. A refusal that is not
-            // budget pressure (an unparseable file, an unnormalizable
-            // path) files at once below, as before: retrying it
-            // would only re-prove the same refusal.
+            // A file-changed pin is not yet a refusal: the file was
+            // modified between the pre-hash pin and the post-hash
+            // verification, so the hashed bytes are not the pinned
+            // bytes. Requeue for a later tick without filing; the
+            // retry re-proves the settled file and stages (silently,
+            // if the scan won). Past the retry bound, past the
+            // retry-map cap, or at the end-of-capture flush (no later
+            // tick exists) the failure files as a persistent loss,
+            // never silently. The discarded batch below is re-proved
+            // on the retry, so a persistent failure re-files its own
+            // row then. Capture exhaustion (any ceiling) files at once
+            // below: the capture budget never renews, so retrying it
+            // would only re-prove the same refusal with the same
+            // exhausted budget. Any other refusal (an unparseable
+            // file, an unnormalizable path, an I/O error) also files
+            // at once: retrying it would only re-prove the same refusal.
             const LEARNED_PIN_RETRIES: u8 = 10;
             const LEARNED_PIN_RETRY_CAP: usize = 128;
-            let budget_pressure = pinning
+            // Anchored to the full prearm file-changed phrase: the bare
+            // "retry" substring also matches the terminal-wait tail
+            // ("the run does not retry"), which must never trigger a retry.
+            const LEARNED_PIN_RETRY_REASON: &str =
+                "file changed while it was being identified - retry";
+            let transient = pinning
                 .skipped
                 .iter()
-                .any(|skip| skip.reason.contains("ceiling") || skip.reason.contains("retry"));
+                .any(|skip| skip.reason.contains(LEARNED_PIN_RETRY_REASON));
             let retries = self
                 .learned_pin_retries
                 .get(&identity)
                 .copied()
                 .unwrap_or(0);
-            let retry = budget_pressure
+            let retry = transient
                 && !self.learned_finalize
                 && retries < LEARNED_PIN_RETRIES
                 && (self.learned_pin_retries.contains_key(&identity)

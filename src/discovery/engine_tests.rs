@@ -14761,14 +14761,11 @@ fn live_unchanged_member_work_ceiling_names_the_refusal() {
         "the test process is live and unchanged"
     );
     let mut budget = CaptureWorkBudget::with_work_ceiling(0);
-    let error = match crate::process::ProcessView::open_with_budget(
-        ProcessViewId(0),
-        pid,
-        &mut budget,
-    ) {
-        Ok(_) => panic!("an exhausted budget refuses the open"),
-        Err(error) => error,
-    };
+    let error =
+        match crate::process::ProcessView::open_with_budget(ProcessViewId(0), pid, &mut budget) {
+            Ok(_) => panic!("an exhausted budget refuses the open"),
+            Err(error) => error,
+        };
     assert_eq!(
         error, WORK_CEILING_REASON,
         "the refusal carries the real work-ceiling reason"
@@ -15699,7 +15696,8 @@ fn initial_scan_zombie_member_is_silent_like_a_reaped_exit() {
     );
     assert!(
         !engine.base_counters.object_skips.iter().any(|skip| {
-            skip.subject == UNREADABLE_UNCHECKED_SUBJECT && skip.reason == UNREADABLE_UNCHECKED_REASON
+            skip.subject == UNREADABLE_UNCHECKED_SUBJECT
+                && skip.reason == UNREADABLE_UNCHECKED_REASON
         }),
         "a zombie member earns silence, not an unreadable-member skip: {:?}",
         engine.base_counters.object_skips
@@ -17500,7 +17498,8 @@ fn refresh_newcomer_zombie_is_silent_like_a_reaped_exit() {
     refresh_inventory_once(&mut engine);
     assert!(
         !engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == UNREADABLE_UNCHECKED_SUBJECT && skip.reason == UNREADABLE_UNCHECKED_REASON
+            skip.subject == UNREADABLE_UNCHECKED_SUBJECT
+                && skip.reason == UNREADABLE_UNCHECKED_REASON
         }),
         "a zombie newcomer earns silence, not an unreadable-member skip: {:?}",
         engine.counters.object_skips
@@ -55763,7 +55762,8 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
             .object_skips
             .iter()
             .filter(|skip| {
-                skip.subject == UNREADABLE_UNCHECKED_SUBJECT && skip.reason == UNREADABLE_UNCHECKED_REASON
+                skip.subject == UNREADABLE_UNCHECKED_SUBJECT
+                    && skip.reason == UNREADABLE_UNCHECKED_REASON
             })
             .count(),
         1,

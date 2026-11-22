@@ -2603,12 +2603,7 @@ fn s2s3_same_thread_nested_neutral_ok_inner_stays_exempt() {
     // Settle H1 before the outer call starts.
     h.run(3, create(SA), 4, ok().result(0, H1));
     let outer = h.begin(5, call("C_GenerateKeyPair").on(SA).thread(THREAD_A));
-    let inner = h.run(
-        6,
-        call("C_DigestUpdate").on(SA).thread(THREAD_A),
-        7,
-        ok(),
-    );
+    let inner = h.run(6, call("C_DigestUpdate").on(SA).thread(THREAD_A), 7, ok());
     h.done(outer, 8, ok().result(0, H2).result(1, H3));
     let effects = h.settle(8);
     let public = created(&effects, outer, 0).expect("outer public binds");

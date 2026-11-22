@@ -482,6 +482,19 @@ pub struct Engine {
     /// into the bounded `pending_learned` (or settles straight out
     /// past the bound) and leaves at settle.
     learned_waited: BTreeMap<(u64, u64), ObjectKey>,
+    /// Learned pin-failure retries per identity: a transiently failing
+    /// pin (budget exhaustion on a busy host) requeues for a later
+    /// tick instead of filing immediately, so the scan can catch up
+    /// and the retry stages silently. Bounded like the load tally;
+    /// past the cap a failure files at once, past the per-identity
+    /// retry bound it files as a persistent loss, and at the
+    /// end-of-capture flush it files at once (no later tick exists).
+    /// Entries leave at settle.
+    learned_pin_retries: BTreeMap<(u64, u64), u8>,
+    /// End-of-capture flush is running: failing learned pins file
+    /// immediately instead of requeueing. Set once by the flush;
+    /// the engine is discarded after it.
+    learned_finalize: bool,
     /// Candidates past the per-tick pin bound: staged first next tick.
     /// Queue entries, not library handles: fanotify event fds stay
     /// outside the table by design (D2) and only file a row once
@@ -14152,6 +14165,8 @@ impl Engine {
             learned_load_tally: BTreeMap::new(),
             learned_settled: BTreeSet::new(),
             learned_waited: BTreeMap::new(),
+            learned_pin_retries: BTreeMap::new(),
+            learned_finalize: false,
             pending_learned: Vec::new(),
             run_learned_modules: Vec::new(),
             learned_staged_files: 0,
@@ -24125,6 +24140,9 @@ impl Engine {
     /// stragglers the live drain sends mid-flush; anything after that
     /// is post-scope and correctly excluded.
     pub(crate) fn flush_learned_files_at_capture_end(&mut self) {
+        // Past the boundary there is no later tick: failing pins file
+        // at once instead of requeueing.
+        self.learned_finalize = true;
         self.service_learned_files_inner(usize::MAX);
         self.service_learned_files_inner(usize::MAX);
     }
@@ -24287,6 +24305,9 @@ impl Engine {
         // A settled wait is over: the retry pre-check below must not
         // treat a later staging of this identity as a deferral retry.
         self.learned_waited.remove(&identity);
+        // A settled pin retry is over too: its count must not leak
+        // into a later candidate for a recycled identity.
+        self.learned_pin_retries.remove(&identity);
     }
 
     /// Re-queues one candidate into `pending_learned` under the staging
@@ -24486,16 +24507,15 @@ impl Engine {
             .skipped
             .iter()
             .any(|skip| skip.reason == crate::fd_budget::LIBRARY_HANDLE_BUDGET_REASON_LEARNED);
-        self.note_object_skips(std::mem::take(&mut pinning.skipped));
         if pinning.inputs.is_empty() {
             // A budget wait is not a refusal: the candidate stays
             // learnable and rides the next drain instead of settling.
-            // The learned gap above already filed through the merge.
-            // Past the pending bound the requeue refuses loudly instead
-            // (never an unbounded queue, never a silent close).
+            // The first deferral files its wait row through the merge
+            // below. Past the pending bound the requeue refuses loudly
+            // instead (never an unbounded queue, never a silent close).
             if learned_wait {
-                // The first deferral files the wait row above; remember
-                // the filed maps key so retries requeue without
+                self.note_object_skips(std::mem::take(&mut pinning.skipped));
+                // Remember the filed maps key so retries requeue without
                 // re-proving while the table stays full, and share a
                 // lendable resident row first. Settle (or the pending
                 // bound's loud refusal) clears the entry.
@@ -24509,11 +24529,45 @@ impl Engine {
                 self.requeue_learned_candidate(candidate);
                 return;
             }
+            // A budget-exhausted pin is not yet a refusal: on a busy
+            // host the budget a tick grants can be exhausted before
+            // this candidate proves, while the scan is still catching
+            // up to the same file. Requeue for a later tick without
+            // filing; the retry stages (silently, if the scan won)
+            // once the pressure clears. Past the retry bound, past
+            // the retry-map cap, or at the end-of-capture flush (no
+            // later tick exists) the failure files as a persistent
+            // loss, never silently. The discarded batch below is
+            // re-proved on the retry, so a persistent failure
+            // re-files its own row then. A refusal that is not
+            // budget pressure (an unparseable file, an unnormalizable
+            // path) files at once below, as before: retrying it
+            // would only re-prove the same refusal.
+            const LEARNED_PIN_RETRIES: u8 = 10;
+            const LEARNED_PIN_RETRY_CAP: usize = 128;
+            let budget_pressure = pinning.skipped.iter().any(|skip| {
+                skip.reason.contains("ceiling") || skip.reason.contains("retry")
+            });
+            let retries = self.learned_pin_retries.get(&identity).copied().unwrap_or(0);
+            let retry = budget_pressure
+                && !self.learned_finalize
+                && retries < LEARNED_PIN_RETRIES
+                && (self.learned_pin_retries.contains_key(&identity)
+                    || self.learned_pin_retries.len() < LEARNED_PIN_RETRY_CAP);
+            if retry {
+                self.learned_pin_retries.insert(identity, retries + 1);
+                drop(std::mem::take(&mut pinning.skipped));
+                self.requeue_learned_candidate(candidate);
+                return;
+            }
+            self.learned_pin_retries.remove(&identity);
+            self.note_object_skips(std::mem::take(&mut pinning.skipped));
             self.note_learned_settled(identity);
             self.member_stops.note_refused(identity);
             self.learned_load_tally.remove(&identity);
             return;
         }
+        self.note_object_skips(std::mem::take(&mut pinning.skipped));
         let loads = self
             .learned_load_tally
             .remove(&identity)

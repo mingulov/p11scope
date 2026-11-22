@@ -25160,6 +25160,404 @@ fn key_operation_reseeded_segment_watchdog_trip_unmarks() {
     );
 }
 
+/// A fresh proof never reseeds onto a stuck-degraded feed until a
+/// void opens a new era: piling a fresh segment onto stuck audits
+/// re-arms the stuck session and spends the lane's interruption
+/// budget (seen live: Staging lane stops within ~2 s of such a
+/// reseed, while identical stuck pressure rides S1-forever without
+/// one). Same-proof F6 behavior is untouched (see the pin below).
+#[test]
+fn key_operation_reseed_fresh_barred_after_stuck_degrade_until_void() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_REASON_EXEC_EXIT, JOURNAL_REASON_SCOPE_LOST,
+    };
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    // K0 exit-doomed by a void; K1 mints and reseeds fresh.
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    scene.ingest(&outer);
+    scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0));
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+    scene.ingest(&abandon);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    let admitted = scene.fixture.admit_function("C_CreateObject");
+    let k1 = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("a dead fenced binding rebinds");
+    assert_ne!(k1, scene.proof, "K1 mints past the exit doom");
+    let grant = SessionBirthGrant::scripted(
+        k1,
+        BirthKind::AbsenceAppearance,
+        fence,
+        scene.fixture.attachment().generation(),
+    );
+    let receipt1 = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+    assert!(staging.reselect_joint(&receipt1), "the fresh birth reseeds");
+    // Four chained stuck passes degrade it.
+    for i in 0..4u64 {
+        assert_eq!(
+            staging.note_reseeded_stuck_pass(i * 1_000_000_000),
+            i == 3,
+            "pass {i} degrades only at four"
+        );
+    }
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+    for _ in 0..crate::semantics_key_use::RESEED_COOLDOWN_PASSES {
+        staging.tick_reseed_cooldown();
+    }
+    // K1 dooms capably at seal time, with no further void; new proof
+    // mints K2 — whose reseed is barred (stuck, no new era).
+    // Paired doom admission (the staged BEGIN matches it exactly,
+    // so the seal dooms on it instead of waiting).
+    let mut doom_get = ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0);
+    doom_get.session = Some(SESSION);
+    doom_get.input0 = Some((0xBEEF_BEEF_BEEF_BEEF, 1));
+    let admitted = admit_call_input(&mut scene, &doom_get);
+    scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("doom admission attests");
+    let doom_begin = scene
+        .paired_begins
+        .remove(&admitted.h0_ordinal())
+        .expect("paired BEGIN");
+    scene.ingest(&doom_begin);
+    scene.ingest_ordinary(ordinary_for(&doom_begin, CkRv::SESSION_HANDLE_INVALID.0));
+    let record =
+        decode_journal_record(&doom_begin, &scene.descriptors).expect("paired BEGIN decodes");
+    let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) = record else {
+        panic!("BEGIN input")
+    };
+    let abandon = abandon_bytes(
+        scene.thread,
+        native.sequence(),
+        JOURNAL_REASON_SCOPE_LOST,
+        (COOKIE, EXEC),
+    );
+    scene.ingest(&abandon);
+    scene.install_closure();
+    let doom_audit = JournalAuditReceipt::scripted(
+        8,
+        8,
+        None,
+        0,
+        H3DispositionEvidence::scripted_clean(scene.fixture.h0_allocated_below() - 1),
+        scene.fixture.attachment().generation(),
+    );
+    let doom_evidence = SessionBirthEvidence::scripted_for_receipt(&receipt1);
+    let mut doom_births = ScriptedBirthSource::once(doom_evidence);
+    let doom_cell = SteadyFaultCell(8);
+    let doom = scene
+        .adapter
+        .seal(
+            &mut scene.model,
+            &doom_audit,
+            &receipt1,
+            scene.adapter.consumed_frontier(),
+            &mut doom_births,
+            &doom_cell,
+        )
+        .expect_err("seal-time doom refuses");
+    assert_eq!(doom.gap, JournalGap::DomainTainted);
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(SESSION);
+    let (_, _, k2) = ingest_and_attest(&mut scene, &create);
+    assert_ne!(k2, k1, "new proof mints K2 past the capable doom");
+    let grant2 = SessionBirthGrant::scripted(
+        k2,
+        BirthKind::AbsenceAppearance,
+        fence + 1,
+        scene.fixture.attachment().generation(),
+    );
+    let receipt2 = BootstrapReceipt::attest(&scene.adapter, &grant2).expect("fence birth attests");
+    assert_eq!(
+        staging.try_reselect_joint(&receipt2),
+        Err(crate::semantics_key_use::ReselectRefusal::StuckBarred),
+        "a fresh reseed onto stuck audits refuses, cooldown served or not"
+    );
+    assert!(
+        !staging.reselect_joint(&receipt2),
+        "the bool mirror refuses too"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only, "S1 rides it out");
+}
+
+/// A void opens a new era: the stuck bar lifts and the waiting fresh
+/// proof reseeds. Same pose as the barred twin through the degrade,
+/// then a void delivers to the feed before K2's reseed.
+#[test]
+fn key_operation_reseed_fresh_allowed_after_void_clears_bar() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_REASON_EXEC_EXIT, JOURNAL_REASON_SCOPE_LOST,
+    };
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    scene.ingest(&outer);
+    scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0));
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+    scene.ingest(&abandon);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    let admitted = scene.fixture.admit_function("C_CreateObject");
+    let k1 = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("a dead fenced binding rebinds");
+    let grant = SessionBirthGrant::scripted(
+        k1,
+        BirthKind::AbsenceAppearance,
+        fence,
+        scene.fixture.attachment().generation(),
+    );
+    let receipt1 = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+    assert!(staging.reselect_joint(&receipt1), "the fresh birth reseeds");
+    for i in 0..4u64 {
+        assert_eq!(
+            staging.note_reseeded_stuck_pass(i * 1_000_000_000),
+            i == 3,
+            "pass {i} degrades only at four"
+        );
+    }
+    for _ in 0..crate::semantics_key_use::RESEED_COOLDOWN_PASSES {
+        staging.tick_reseed_cooldown();
+    }
+    // Paired doom admission (the staged BEGIN matches it exactly,
+    // so the seal dooms on it instead of waiting).
+    let mut doom_get = ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0);
+    doom_get.session = Some(SESSION);
+    doom_get.input0 = Some((0xBEEF_BEEF_BEEF_BEEF, 1));
+    let admitted = admit_call_input(&mut scene, &doom_get);
+    scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("doom admission attests");
+    let doom_begin = scene
+        .paired_begins
+        .remove(&admitted.h0_ordinal())
+        .expect("paired BEGIN");
+    scene.ingest(&doom_begin);
+    scene.ingest_ordinary(ordinary_for(&doom_begin, CkRv::SESSION_HANDLE_INVALID.0));
+    let record =
+        decode_journal_record(&doom_begin, &scene.descriptors).expect("paired BEGIN decodes");
+    let p11scope_ebpf_common::object_journal::JournalRecord::Begin(native) = record else {
+        panic!("BEGIN input")
+    };
+    let abandon = abandon_bytes(
+        scene.thread,
+        native.sequence(),
+        JOURNAL_REASON_SCOPE_LOST,
+        (COOKIE, EXEC),
+    );
+    scene.ingest(&abandon);
+    scene.install_closure();
+    let doom_audit = JournalAuditReceipt::scripted(
+        8,
+        8,
+        None,
+        0,
+        H3DispositionEvidence::scripted_clean(scene.fixture.h0_allocated_below() - 1),
+        scene.fixture.attachment().generation(),
+    );
+    let doom_evidence = SessionBirthEvidence::scripted_for_receipt(&receipt1);
+    let mut doom_births = ScriptedBirthSource::once(doom_evidence);
+    let doom_cell = SteadyFaultCell(8);
+    scene
+        .adapter
+        .seal(
+            &mut scene.model,
+            &doom_audit,
+            &receipt1,
+            scene.adapter.consumed_frontier(),
+            &mut doom_births,
+            &doom_cell,
+        )
+        .expect_err("seal-time doom refuses");
+    // A new void delivers to the feed: the bar lifts.
+    staging.record_fence_for_test(Some(fence + 1));
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(SESSION);
+    let (_, _, k2) = ingest_and_attest(&mut scene, &create);
+    assert_ne!(k2, k1, "new proof mints K2 past the capable doom");
+    let grant2 = SessionBirthGrant::scripted(
+        k2,
+        BirthKind::AbsenceAppearance,
+        fence + 1,
+        scene.fixture.attachment().generation(),
+    );
+    let receipt2 = BootstrapReceipt::attest(&scene.adapter, &grant2).expect("fence birth attests");
+    assert!(
+        staging.reselect_joint(&receipt2),
+        "a void clears the bar: the fresh birth reseeds"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+}
+
+/// Same-proof F6 behavior is untouched by the fresh-proof bar: after
+/// a stuck-degrade and a served cooldown, the same proof reseeds
+/// exactly as before (pin — passes with and without the bar).
+#[test]
+fn key_operation_reseed_same_proof_allowed_after_cooldown_despite_degrade() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(staging.reselect_joint(&fresh), "the loss reseeds");
+    for i in 0..4u64 {
+        assert_eq!(
+            staging.note_reseeded_stuck_pass(i * 1_000_000_000),
+            i == 3,
+            "pass {i} degrades only at four"
+        );
+    }
+    for _ in 0..crate::semantics_key_use::RESEED_COOLDOWN_PASSES {
+        staging.tick_reseed_cooldown();
+    }
+    let retry = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        2,
+        bootstrap.closure_generation(),
+    );
+    assert!(
+        staging.reselect_joint(&retry),
+        "same proof retries after cooldown, bar or no bar"
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+}
+
 /// A voided feed reseeds onto a fresh incarnation's domain too: the new
 /// receipt names a strictly newer incarnation of the same binding
 /// with a strictly newer cut at/above the fence, starting a new Joint

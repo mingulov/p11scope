@@ -26,7 +26,9 @@
 #     journal session, so 0 is the default; set 1 to re-arm the
 #     expectation if the wedge returns. An unexpected pass (under 1),
 #     or a failure without the wedge signature, fails the run. A
-#     failure carrying the S1-preclusion tag is recorded
+#     zero-test run (exit 0 without a passing test) fails the row too:
+#     the cell must execute and pass, never merely list. A failure
+#     carrying the S1-preclusion tag is recorded
 #     environment-precluded instead: without joint feeds the cell
 #     cannot evaluate either way. This holds whatever
 #     JOINT_EXPECTED_FAILURE says.
@@ -92,18 +94,23 @@ if [ -z "$LIBTEST" ]; then
   joint_detail='harness: P11SCOPE_LIBTEST not provided'
 elif [ ! -x "$LIBTEST" ]; then
   joint_detail="harness: library test binary not executable: $LIBTEST"
-elif ! "$LIBTEST" --list 2>/dev/null | grep -qx "$JOINT_CELL: test"; then
+elif ! "$LIBTEST" --list --ignored --exact "$JOINT_CELL" 2>/dev/null | grep -qx "$JOINT_CELL: test"; then
   joint_detail="harness: joint cell missing from test binary: $JOINT_CELL"
 else
   joint_rc=0
   "$LIBTEST" --exact "$JOINT_CELL" --ignored > joint-cell.log 2>&1 || joint_rc=$?
-  if [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ]; then
+  if [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 0 ] \
+      && grep -q '^test result: ok\. [1-9][0-9]* passed' joint-cell.log; then
     joint_pass=1; joint_qual='qualified'; joint_detail='joint stop after last waiter resolves reaches Published then WoundDown'
-  elif [ "$joint_rc" = 0 ]; then
+  elif [ "$joint_rc" = 0 ] && [ "$EXPECT_JOINT_FAIL" = 1 ]; then
     joint_detail='joint cell unexpectedly passed under JOINT_EXPECTED_FAILURE=1; set 0 once the wedge is gone for good'
+  elif [ "$joint_rc" = 0 ]; then
+    joint_detail='joint cell exited 0 without a passing test (zero selected or unmapped output); see joint-cell.log'
   elif [ "$EXPECT_JOINT_FAIL" = 1 ] && grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
     joint_detail='expected failure: joint finish wedges (task/v060-joint-wedge owns the fix); see joint-cell.log'
     joint_qual='expected-failure'
+  elif grep -q "$JOINT_WEDGE_SIGNATURE" joint-cell.log; then
+    joint_detail='wedge reproduced under JOINT_EXPECTED_FAILURE=0 (regression); set 1 to re-arm the expectation; see joint-cell.log'
   elif grep -q 'P11SCOPE_CELL_BRANCH=.*:s1-precluded' joint-cell.log; then
     joint_detail='environment-precluded: S1 seal without joint feeds; the linked session produced no births; see joint-cell.log'
     joint_qual='environment-precluded'

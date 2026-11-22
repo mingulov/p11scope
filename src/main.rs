@@ -16,6 +16,11 @@ use p11scope::{
 };
 
 fn main() {
+    // Glibc arena cap before anything can spawn a thread (quiet-host
+    // legs: unbounded arenas grew RSS +2.6 MiB/h with every counted
+    // structure flat; an explicit MALLOC_ARENA_MAX wins). Fail-open:
+    // every outcome continues into the command.
+    let _ = p11scope::allocator::apply_allocator_tuning();
     // `p11scope run`'s own member-stop watchdog, never a user command.
     if let Some(code) = p11scope::member_stop_watchdog_entry() {
         std::process::exit(code);

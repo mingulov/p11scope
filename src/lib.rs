@@ -51,6 +51,7 @@ macro_rules! progress {
     };
 }
 
+pub mod allocator;
 pub(crate) mod app_hint;
 pub mod attach;
 // DR04's private parser/acquisition packet is staged; the opt-in coordinator

@@ -9390,9 +9390,6 @@ impl JournalAdapter {
         failure
     }
 
-    /// Conversion and settlement after every structural rule passed. The
-    /// only remaining failures are model surprises, which fail closed.
-    #[allow(clippy::too_many_arguments)] // One validated domain keeps its original audit and prepaid replay storage.
     /// The drained-return completion cut for one converted entry, or
     /// `None`: the abandonment is reason-9 within the frontier, the
     /// function drains without a tail, and the corroborated return sits
@@ -9473,6 +9470,9 @@ impl JournalAdapter {
         })
     }
 
+    /// Conversion and settlement after every structural rule passed. The
+    /// only remaining failures are model surprises, which fail closed.
+    #[allow(clippy::too_many_arguments)] // One validated domain keeps its original audit and prepaid replay storage.
     fn seal_validated(
         &mut self,
         model: &mut ObjectSemantics,

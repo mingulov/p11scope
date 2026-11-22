@@ -762,6 +762,54 @@ impl JointStaging {
     }
 
     /// [`Self::reselect_joint`] with the refusal cause for gap naming.
+    /// Whether the drain would refuse a reseed onto this feed as
+    /// segment-unresumable for a birth carrying this proof: a
+    /// fallback-closed proof-destroyed segment with the same domain
+    /// lineage. The birth association consults this before native
+    /// consume so drain-doomed births refuse early instead of
+    /// installing grants and retaining witnesses no staging can ever
+    /// consume. Mirrors [`Self::try_reselect_joint`]'s segment gate
+    /// exactly (same inputs, same verdict): superseding
+    /// incarnations, foreign lineages, loss-closed or resumable
+    /// segments, feeds without a selected receipt, and feeds that
+    /// are not reseedable yet all proceed to the drain's own
+    /// decision. Read-only: the drain still decides.
+    pub(crate) fn reselect_segment_doomed(
+        &self,
+        new_proof: &crate::semantics_objects::journal::JournalDomainProof,
+    ) -> bool {
+        let Some(old) = self.selected_receipt.as_ref() else {
+            return false;
+        };
+        if !self.reseed_eligible() {
+            return false;
+        }
+        if !matches!(self.degraded_window, Some(DegradedWindow::Fallback)) || self.segment_resumable
+        {
+            return false;
+        }
+        let same_domain = new_proof.object_domain() == old.domain();
+        let superseding = !same_domain && new_proof.reseed_supersedes(&old.proof());
+        same_domain && !superseding
+    }
+
+    /// Tests-only fallback segment pose: the association's
+    /// drain-doom integration test dooms a feed directly (driving a
+    /// real seal-failure doom needs machine choreography). Replicates
+    /// a fallback close: S1Only with the ended receipt kept.
+    pub(crate) fn pose_fallback_segment_for_test(
+        &mut self,
+        resumable: bool,
+        receipt: crate::semantics_objects::journal::BootstrapReceipt,
+    ) {
+        self.mode = FeedMode::S1Only;
+        self.selected_receipt = Some(receipt);
+        self.degraded_window = Some(DegradedWindow::Fallback);
+        self.segment_resumable = resumable;
+        self.reseeded_segment = false;
+        self.reseeded_stuck_streak = 0;
+    }
+
     pub(crate) fn try_reselect_joint(
         &mut self,
         receipt: &crate::semantics_objects::journal::BootstrapReceipt,

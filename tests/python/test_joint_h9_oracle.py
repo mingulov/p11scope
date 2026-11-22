@@ -667,6 +667,140 @@ class CompareTwins(unittest.TestCase):
             with self.assertRaises(oracle.LedgerError):
                 oracle.validate_snapshot(snapshot)
 
+    def test_h9_v9_snapshot_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+
+        def inferred_pair():
+            return (
+                {"status": "inferred", "value": "rsa", "completions": 1},
+                {"status": "inferred",
+                 "detail": {"kind": "rsa", "size_class": 2048,
+                            "modulus_bytes": 256,
+                            "evidence": "sign_output"},
+                 "completions": 1},
+            )
+
+        def v9_snapshot():
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 9
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                family, size = inferred_pair()
+                row["inferred_family"] = family
+                row["inferred_size"] = size
+            return snapshot
+
+        with self.subTest("v9 relaxed key and object labels validate"):
+            snapshot = v9_snapshot()
+            snapshot["key_operations"][0]["metadata_at_use"] = \
+                "ec_secp256k1"
+            snapshot["objects"][0]["label"] = "ec_brainpoolp384r1"
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("relaxed key label before v9 refused"):
+            snapshot = v9_snapshot()
+            snapshot["version"] = 7
+            snapshot["key_operations"][0]["metadata_at_use"] = \
+                "ec_secp256k1"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("relaxed object label before v9 refused"):
+            snapshot = v9_snapshot()
+            snapshot["version"] = 7
+            snapshot["objects"][0]["label"] = "ec_secp256k1"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v8 snapshot refused"):
+            snapshot = v9_snapshot()
+            snapshot["version"] = 8
+            del snapshot["unattributed"]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "version mismatch"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v9 without unattributed refused"):
+            snapshot = v9_snapshot()
+            del snapshot["unattributed"]
+            with self.assertRaises(oracle.LedgerError):
+                oracle.validate_snapshot(snapshot)
+
+    def test_h9_v10_snapshot_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "loss")
+
+        def v10_snapshot():
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 10
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                row["inferred_family"] = {"status": "unknown",
+                                          "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown",
+                                        "detail": None,
+                                        "completions": 0}
+            snapshot["unknown_key_operations"][0]["mechanisms"] = [
+                {"id": 15, "count": 3}, {"id": 28, "count": 3}]
+            return snapshot
+
+        with self.subTest("v10 unknown mechanisms validate"):
+            oracle.validate_snapshot(v10_snapshot())
+        with self.subTest("v10 missing mechanisms refused"):
+            snapshot = v10_snapshot()
+            del snapshot["unknown_key_operations"][0]["mechanisms"]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unexpected fields"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v10 malformed mechanism entry refused"):
+            snapshot = v10_snapshot()
+            snapshot["unknown_key_operations"][0]["mechanisms"][0] = \
+                {"id": 15}
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "mechanism entry invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v10 duplicate mechanism id refused"):
+            snapshot = v10_snapshot()
+            snapshot["unknown_key_operations"][0]["mechanisms"].append(
+                {"id": 15, "count": 1})
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "duplicate.*mechanism id"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v10 ninth mechanism refused"):
+            snapshot = v10_snapshot()
+            snapshot["unknown_key_operations"][0]["mechanisms"] = [
+                {"id": ident, "count": 1} for ident in range(9)]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "mechanisms invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v10 zero further count refused"):
+            snapshot = v10_snapshot()
+            snapshot["unknown_key_operations"][0][
+                "further_mechanism_terminals"] = 0
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "further.*nonzero"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v10 without mechanism content refused"):
+            snapshot = v10_snapshot()
+            snapshot["unknown_key_operations"][0]["mechanisms"] = []
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "without unknown-row "
+                                        "mechanism content"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("mechanisms below v10 refused"):
+            snapshot = v10_snapshot()
+            snapshot["version"] = 9
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unexpected fields"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v8 snapshot refused"):
+            snapshot = v10_snapshot()
+            snapshot["version"] = 8
+            del snapshot["unattributed"]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "version mismatch"):
+                oracle.validate_snapshot(snapshot)
+
     def test_healthy_same_scope_handle_joins_one_row(self):
         oracle = require_oracle(self)
         cfg_b = dict(MODES["loss"][0], feed="B")
@@ -1001,6 +1135,148 @@ class StreamTwins(unittest.TestCase):
             oracle.validate_snapshot(snapshot)
             with self.assertRaisesRegex(oracle.LedgerError,
                                         "object label invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+
+    def test_h9_v9_stream_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+
+        def inferred_pair():
+            return (
+                {"status": "inferred", "value": "rsa", "completions": 1},
+                {"status": "inferred",
+                 "detail": {"kind": "rsa", "size_class": 2048,
+                            "modulus_bytes": 256,
+                            "evidence": "sign_output"},
+                 "completions": 1},
+            )
+
+        def relaxed_pair(key_version, object_version):
+            """Healthy stream with one relaxed row pair, at versions."""
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            target = snapshot["key_operations"][0]
+            old_key = (target["instance"], target["object"],
+                       target["category"], target["role"],
+                       target["metadata_at_use"])
+            target["metadata_at_use"] = "ec_secp256k1"
+            obj_row = next(row for row in snapshot["objects"]
+                           if row["object"] == target["object"])
+            obj_row["label"] = "ec_secp256k1"
+            snapshot["version"] = 9
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                family, size = inferred_pair()
+                row["inferred_family"] = family
+                row["inferred_size"] = size
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    if line["event"]["row"]["object"] == target["object"]:
+                        line["event"]["row"]["label"] = "ec_secp256k1"
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known":
+                        if (row["instance"], row["object"],
+                                row["category"], row["role"],
+                                row["metadata_at_use"]) == old_key:
+                            row["metadata_at_use"] = "ec_secp256k1"
+                        family, size = inferred_pair()
+                        row["inferred_family"] = family
+                        row["inferred_size"] = size
+                    line["event"]["version"] = key_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 9
+            return snapshot, stream
+
+        with self.subTest("v9 relaxed stream validates"):
+            snapshot, stream = relaxed_pair(9, 9)
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("relaxed key label on a v7 row refused"
+                          " from stream authority"):
+            snapshot, stream = relaxed_pair(7, 9)
+            oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("relaxed object label on a v7 row refused"
+                          " from stream authority"):
+            snapshot, stream = relaxed_pair(9, 7)
+            oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+
+    def test_h9_v10_stream_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "loss")
+
+        def v10_pair(known_version, unknown_version,
+                     object_version=10, marker=10):
+            """Healthy v10 stream; per-bucket row versions, one marker."""
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 10
+            snapshot["unattributed"] = []
+            for row in snapshot["key_operations"]:
+                row["inferred_family"] = {"status": "unknown",
+                                          "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown",
+                                        "detail": None,
+                                        "completions": 0}
+            snapshot["unknown_key_operations"][0]["mechanisms"] = [
+                {"id": 15, "count": 3}]
+            stream = healthy_stream([first, second], snapshot)
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    if line["event"]["bucket"] == "known":
+                        line["event"]["version"] = known_version
+                    else:
+                        line["event"]["version"] = unknown_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = marker
+            return snapshot, stream
+
+        with self.subTest("mixed v7 known and v10 unknown validates"):
+            snapshot, stream = v10_pair(7, 10, 7, 10)
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("v10 unknown row on a v7 row refused"
+                          " from stream authority"):
+            snapshot, stream = v10_pair(7, 7, 7, 10)
+            oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unexpected fields"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("malformed mechanisms refused"
+                          " from stream authority"):
+            snapshot, stream = v10_pair(10, 10, 10, 10)
+            oracle.validate_snapshot(snapshot)
+            for line in stream:
+                if (line["kind"] == "key_operations_observed"
+                        and line["event"]["bucket"] == "unknown"):
+                    line["event"]["row"]["mechanisms"][0] = {"id": 15}
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "mechanism entry invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("row version 8 refused"):
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            stream[0]["event"]["version"] = 8
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unsupported H9 row version"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("marker version 8 refused"):
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            marker["event"]["object_version"] = 8
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unsupported H9 marker version"):
                 oracle.compare_stream(stream, [first, second], snapshot)
 
     def test_h9_v7_stream_dispatch(self):

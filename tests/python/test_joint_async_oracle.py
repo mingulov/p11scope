@@ -1799,6 +1799,57 @@ class AsyncVersionDispatchTwins(unittest.TestCase):
         completed = self.run_cli(joint, single, joint_stream, single_stream)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
+    def test_cli_v10_mixed_versions_accepted(self):
+        require_oracle(self)
+        oracle = ORACLE
+        collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 10
+        joint["unattributed"] = []
+        for row in joint["key_operations"]:
+            row["inferred_family"] = {"status": "unknown",
+                                      "value": None,
+                                      "completions": 0}
+            row["inferred_size"] = {"status": "unknown",
+                                    "detail": None,
+                                    "completions": 0}
+        joint["unknown_key_operations"][0]["mechanisms"] = [
+            {"id": 15, "count": 3}]
+        single["version"] = 10
+        single["unattributed"] = []
+        single["unknown_key_operations"][0]["mechanisms"] = [
+            {"id": 28, "count": 2}]
+        joint_stream = healthy_stream(collision, joint)
+        for line in joint_stream:
+            # Mixed row versions in one stream: known rows ride v7
+            # (their inferred blocks need it) while the unknown row
+            # rides v10 (its mechanisms need it).
+            if line["kind"] == "object_observed":
+                line["event"]["version"] = 7
+            elif line["kind"] == "key_operations_observed":
+                if line["event"]["bucket"] == "known":
+                    line["event"]["version"] = 7
+                else:
+                    line["event"]["version"] = 10
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 10
+        single_stream = healthy_s1only_stream(collision, single)
+        for line in single_stream:
+            if line["kind"] == "key_operations_observed":
+                line["event"]["version"] = 10
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 10
+        completed = self.run_cli(joint, single, joint_stream, single_stream)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_cli_v8_snapshot_refused(self):
+        require_oracle(self)
+        oracle = ORACLE
+        _collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 8
+        completed = self.run_cli(joint, single)
+        self.assertEqual(completed.returncode, 1)
+        self.assertRegex(completed.stderr, r"snapshot version mismatch")
+
 
 class AsyncV5PqcTwins(unittest.TestCase):
     """H9 section version 5 through the async oracle, direct calls."""
@@ -2362,6 +2413,276 @@ class AsyncV6NewsiteTwins(unittest.TestCase):
             collision, joint, stream = v7_pair(7)
             stream[0]["event"]["version"] = 8
             with self.assertRaisesRegex(oracle.LedgerError, "version"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+
+
+class AsyncV9RelaxedTwins(unittest.TestCase):
+    """H9 section version 9 through the async oracle, direct calls."""
+
+    def test_v9_relaxed_snapshot_validates_and_v7_refuses(self):
+        oracle = require_oracle(self)
+        _collision, joint, _single = paired(oracle, "poll_msg")
+        key_label = joint["key_operations"][0]["metadata_at_use"]
+        obj_label = joint["objects"][0]["label"]
+        joint["version"] = 9
+        joint["unattributed"] = []
+        for row in joint["key_operations"]:
+            row["inferred_family"] = {"status": "inferred",
+                                      "value": "rsa",
+                                      "completions": 1}
+            row["inferred_size"] = {
+                "status": "inferred",
+                "detail": {"kind": "rsa", "size_class": 2048,
+                           "modulus_bytes": 256,
+                           "evidence": "sign_output"},
+                "completions": 1}
+        with self.subTest("v9 relaxed key and object labels validate"):
+            joint["key_operations"][0]["metadata_at_use"] = \
+                "ec_secp256k1"
+            joint["objects"][0]["label"] = "ec_brainpoolp256r1"
+            oracle.validate_snapshot(joint, "joint")
+        with self.subTest("relaxed key label before v9 refused"):
+            joint["version"] = 7
+            joint["objects"][0]["label"] = obj_label
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.validate_snapshot(joint, "joint")
+        with self.subTest("relaxed object label before v9 refused"):
+            joint["key_operations"][0]["metadata_at_use"] = key_label
+            joint["objects"][0]["label"] = "ec_secp256k1"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.validate_snapshot(joint, "joint")
+        with self.subTest("v8 snapshot refused"):
+            joint["version"] = 8
+            del joint["unattributed"]
+            joint["key_operations"][0]["metadata_at_use"] = key_label
+            joint["objects"][0]["label"] = obj_label
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "snapshot version mismatch"):
+                oracle.validate_snapshot(joint, "joint")
+
+    def test_v9_relaxed_stream_dispatch(self):
+        oracle = require_oracle(self)
+
+        def relaxed_pair(key_version, object_version):
+            """Fresh pair with one relaxed row pair, at row versions."""
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            target = joint["key_operations"][0]
+            old_key = (target["instance"], target["object"],
+                       target["category"], target["role"],
+                       target["metadata_at_use"])
+            target["metadata_at_use"] = "ec_secp256k1"
+            obj_row = next(row for row in joint["objects"]
+                           if row["object"] == target["object"])
+            obj_row["label"] = "ec_secp256k1"
+            joint["version"] = 9
+            joint["unattributed"] = []
+
+            def inferred_pair():
+                return (
+                    {"status": "inferred", "value": "rsa",
+                     "completions": 1},
+                    {"status": "inferred",
+                     "detail": {"kind": "rsa", "size_class": 2048,
+                                "modulus_bytes": 256,
+                                "evidence": "sign_output"},
+                     "completions": 1},
+                )
+
+            for row in joint["key_operations"]:
+                family, size = inferred_pair()
+                row["inferred_family"] = family
+                row["inferred_size"] = size
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    if line["event"]["row"]["object"] == target["object"]:
+                        line["event"]["row"]["label"] = "ec_secp256k1"
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if line["event"]["bucket"] == "known":
+                        if (row["instance"], row["object"],
+                                row["category"], row["role"],
+                                row["metadata_at_use"]) == old_key:
+                            row["metadata_at_use"] = "ec_secp256k1"
+                        family, size = inferred_pair()
+                        row["inferred_family"] = family
+                        row["inferred_size"] = size
+                    line["event"]["version"] = key_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 9
+            return collision, joint, stream
+
+        with self.subTest("v9 relaxed stream validates"):
+            collision, joint, stream = relaxed_pair(9, 9)
+            oracle.validate_snapshot(joint, "joint")
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("relaxed key label on a v7 row refused"
+                          " from stream authority"):
+            collision, joint, stream = relaxed_pair(7, 9)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("relaxed object label on a v7 row refused"
+                          " from stream authority"):
+            collision, joint, stream = relaxed_pair(9, 7)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+
+
+class AsyncV10MechTwins(unittest.TestCase):
+    """H9 section version 10 through the async oracle, direct calls."""
+
+    def test_v10_snapshot_validates_and_mutations_refuse(self):
+        oracle = require_oracle(self)
+        _collision, joint, _single = paired(oracle, "poll_msg")
+
+        def v10_joint():
+            joint["version"] = 10
+            joint["unattributed"] = []
+            for row in joint["key_operations"]:
+                row["inferred_family"] = {"status": "unknown",
+                                          "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown",
+                                        "detail": None,
+                                        "completions": 0}
+            unknown = joint["unknown_key_operations"][0]
+            unknown.pop("further_mechanism_terminals", None)
+            unknown["mechanisms"] = [{"id": 15, "count": 3},
+                                     {"id": 28, "count": 3}]
+            return joint
+
+        with self.subTest("v10 unknown mechanisms validate"):
+            oracle.validate_snapshot(v10_joint(), "joint")
+        with self.subTest("v10 missing mechanisms refused"):
+            snapshot = v10_joint()
+            del snapshot["unknown_key_operations"][0]["mechanisms"]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unexpected fields"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v10 malformed mechanism entry refused"):
+            snapshot = v10_joint()
+            snapshot["unknown_key_operations"][0]["mechanisms"][0] = \
+                {"id": 15}
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "mechanism entry invalid"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v10 duplicate mechanism id refused"):
+            snapshot = v10_joint()
+            snapshot["unknown_key_operations"][0]["mechanisms"].append(
+                {"id": 15, "count": 1})
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "duplicate.*mechanism id"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v10 ninth mechanism refused"):
+            snapshot = v10_joint()
+            snapshot["unknown_key_operations"][0]["mechanisms"] = [
+                {"id": ident, "count": 1} for ident in range(9)]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "mechanisms invalid"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v10 zero further count refused"):
+            snapshot = v10_joint()
+            snapshot["unknown_key_operations"][0][
+                "further_mechanism_terminals"] = 0
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "further.*nonzero"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v10 without mechanism content refused"):
+            snapshot = v10_joint()
+            snapshot["unknown_key_operations"][0]["mechanisms"] = []
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "without unknown-row "
+                                        "mechanism content"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("mechanisms below v10 refused"):
+            snapshot = v10_joint()
+            snapshot["version"] = 9
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unexpected fields"):
+                oracle.validate_snapshot(snapshot, "joint")
+        with self.subTest("v8 snapshot refused"):
+            snapshot = v10_joint()
+            snapshot["version"] = 8
+            del snapshot["unattributed"]
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "snapshot version mismatch"):
+                oracle.validate_snapshot(snapshot, "joint")
+
+    def test_v10_stream_dispatch(self):
+        oracle = require_oracle(self)
+
+        def v10_pair(known_version, unknown_version,
+                     object_version=10, marker=10):
+            """Fresh v10 pair; per-bucket row versions, one marker."""
+            collision, joint, _single = paired(oracle, "poll_msg")
+            joint["version"] = 10
+            joint["unattributed"] = []
+            for row in joint["key_operations"]:
+                row["inferred_family"] = {"status": "unknown",
+                                          "value": None,
+                                          "completions": 0}
+                row["inferred_size"] = {"status": "unknown",
+                                        "detail": None,
+                                        "completions": 0}
+            joint["unknown_key_operations"][0]["mechanisms"] = [
+                {"id": 15, "count": 3}]
+            stream = healthy_stream(collision, joint)
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    if line["event"]["bucket"] == "known":
+                        line["event"]["version"] = known_version
+                    else:
+                        line["event"]["version"] = unknown_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = marker
+            return collision, joint, stream
+
+        with self.subTest("mixed v7 known and v10 unknown validates"):
+            collision, joint, stream = v10_pair(7, 10, 7, 10)
+            oracle.validate_snapshot(joint, "joint")
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("v10 unknown row on a v7 row refused"
+                          " from stream authority"):
+            collision, joint, stream = v10_pair(7, 7, 7, 10)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unexpected fields"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("malformed mechanisms refused"
+                          " from stream authority"):
+            collision, joint, stream = v10_pair(10, 10, 10, 10)
+            oracle.validate_snapshot(joint, "joint")
+            for line in stream:
+                if (line["kind"] == "key_operations_observed"
+                        and line["event"]["bucket"] == "unknown"):
+                    line["event"]["row"]["mechanisms"][0] = {"id": 15}
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "mechanism entry invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("row version 8 refused"):
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            stream[0]["event"]["version"] = 8
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unsupported H9 row version"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("marker version 8 refused"):
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            marker = next(line for line in stream
+                          if line["kind"] == "pass_committed")
+            marker["event"]["object_version"] = 8
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "unsupported H9 marker version"):
                 oracle.compare_stream(stream, collision, joint, "joint")
 
 

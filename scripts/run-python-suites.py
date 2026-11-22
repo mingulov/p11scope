@@ -169,6 +169,7 @@ RUN = [
     ("test_public_cli_oracle.py", []),
     ("test_public_cli_qualifier.py", []),
     ("test_p11kit_transparency_oracle.py", []),
+    ("test_pqc_cell_judge.py", []),
     ("test_real_provider_oracle.py", []),
     ("test_python_suite_registry.py", []),
     ("test_qualify_inventory_judge.py", []),

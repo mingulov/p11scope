@@ -33694,7 +33694,7 @@ mod seal_readiness_tests {
             );
         }
         assert!(
-            gaps[0].1.contains("without sizes"),
+            gaps[0].1.contains("without operation-length sizes"),
             "the degraded mode is named: {}",
             gaps[0].1
         );
@@ -33717,11 +33717,11 @@ mod seal_readiness_tests {
     }
 
     /// Sizes and base journal refusals fall through to the ordinary
-    /// retry: the ordinary lane seats with the `key operations
-    /// unavailable` gap and no `key sizes unavailable` gap (sizes
-    /// degrade only when the base journal seats). The recorded start
-    /// modes prove the sizes start, its base retry, and the ordinary
-    /// fallback each ran in its own journal mode.
+    /// retry: the ordinary lane seats behind both named gaps (the
+    /// sizes failure keeps its own gap naming the retry refusal, and
+    /// the key-operations gap carries the retry refusal). The
+    /// recorded start modes prove the sizes start, its base retry,
+    /// and the ordinary fallback each ran in its own journal mode.
     #[test]
     fn key_sizes_double_journal_refusal_falls_back_to_ordinary() {
         take_sealed_for_test();
@@ -33791,9 +33791,17 @@ mod seal_readiness_tests {
             [1],
             "the operations gap is one emission, not an aggregated repeat"
         );
+        let sizes_gaps = gaps_for_subject(&mut coordinator, "key sizes unavailable");
+        assert_eq!(sizes_gaps.len(), 1, "the sizes failure keeps its own gap");
         assert!(
-            gaps_for_subject(&mut coordinator, "key sizes unavailable").is_empty(),
-            "no sizes gap without a seated base journal"
+            sizes_gaps[0].1.contains("sizes-off retry also refused"),
+            "the double-refusal names the retry refusal: {}",
+            sizes_gaps[0].1
+        );
+        assert!(
+            !sizes_gaps[0].1.contains("key operations continue without"),
+            "the double-refusal must not promise continued key operations: {}",
+            sizes_gaps[0].1
         );
     }
 
@@ -33801,7 +33809,9 @@ mod seal_readiness_tests {
     /// ordinary lane discloses no subset refusal: the arm's mint is
     /// provisional (the ordinary path re-mints authoritatively), so a
     /// `semantic subset refused ... without instance semantics` gap
-    /// beside a seated lane would lie about the seated lane.
+    /// beside a seated lane would lie about the seated lane. The
+    /// failed sizes attempt still keeps its own `key sizes
+    /// unavailable` gap naming the retry refusal.
     #[test]
     fn key_sizes_provisional_mint_refusal_seats_without_subset_gap() {
         take_sealed_for_test();
@@ -33860,9 +33870,21 @@ mod seal_readiness_tests {
             1,
             "the sizes-start refusal is still named"
         );
+        let sizes_gaps = gaps_for_subject(&mut coordinator, "key sizes unavailable");
+        assert_eq!(
+            sizes_gaps.len(),
+            1,
+            "the failed sizes attempt keeps its own gap"
+        );
         assert!(
-            gaps_for_subject(&mut coordinator, "key sizes unavailable").is_empty(),
-            "no sizes gap without a seated base journal"
+            sizes_gaps[0].1.contains("sizes-off retry also refused"),
+            "the mint refusal names the retry refusal: {}",
+            sizes_gaps[0].1
+        );
+        assert!(
+            !sizes_gaps[0].1.contains("key operations continue without"),
+            "the mint refusal must not promise continued key operations: {}",
+            sizes_gaps[0].1
         );
     }
 

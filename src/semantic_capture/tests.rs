@@ -11805,3 +11805,56 @@ fn joint_void_break_ingest_ignores_clean_bounded_ingest() {
         "a clean ingest counts no breaks"
     );
 }
+
+#[test]
+fn evicted_zero_stamp_call_routes_unstamped_not_nofile() {
+    // An evicted call carries a zeroed entry stamp (its INSTANCE_START
+    // entry was gone on the return path): it has no file slot to check
+    // against the endpoint, so it must reach the router (Unstamped)
+    // instead of the endpoint-mismatch arm (NoFile).
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    io.semantic_call("C_Sign", 0, 0);
+    let record = io.records.back_mut().unwrap();
+    record.base.continuity.entry_stamp.flags = 0;
+    record.base.continuity.entry_stamp.file_slot_plus1 = 0;
+    let report = capture.tick_with(&mut io).unwrap();
+    assert_eq!(report.collected_calls, 1);
+    assert_eq!(report.calls().count(), 1);
+    let call = report.calls().next().unwrap();
+    assert_eq!(call.route(), Route::Unknown(UnknownReason::Unstamped));
+    assert!(capture.awaiting.is_empty());
+}
+
+#[test]
+fn stamped_wrong_slot_call_still_routes_nofile() {
+    // Stamped control: a VALID stamp for the wrong file slot still takes
+    // the endpoint-mismatch arm (NoFile), never the router.
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    io.semantic_call("C_Sign", 0, 0);
+    let record = io.records.back_mut().unwrap();
+    record.base.continuity.entry_stamp.file_slot_plus1 = 2;
+    let report = capture.tick_with(&mut io).unwrap();
+    assert_eq!(report.collected_calls, 1);
+    assert_eq!(report.calls().count(), 1);
+    let call = report.calls().next().unwrap();
+    assert_eq!(call.route(), Route::Unknown(UnknownReason::NoFile));
+    assert!(capture.awaiting.is_empty());
+}
+
+#[test]
+fn stamped_matching_slot_calls_join() {
+    // Positive control: correctly stamped calls on an owned endpoint join.
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    io.semantic_call("C_SignInit", 0, 0);
+    io.semantic_call("C_Sign", 0, 0);
+    let report = capture.tick_with(&mut io).unwrap();
+    assert_eq!(report.calls().count(), 2);
+    assert!(
+        report
+            .calls()
+            .all(|call| matches!(call.route(), Route::Joined(_)))
+    );
+}

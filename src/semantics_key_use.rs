@@ -7473,3 +7473,72 @@ mod disposal_tests {
         assert_eq!(fallback.census(), 0, "{tag}: nothing minted");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantics_objects::journal::{BirthKind, JournalDomainProof};
+
+    fn proof(cookie: u64, incarnation: u32, era: u64) -> JournalDomainProof {
+        JournalDomainProof::scripted_for_test(cookie, 0, 0, 0, 0, incarnation, era)
+    }
+
+    fn receipt(proof: JournalDomainProof) -> BootstrapReceipt {
+        BootstrapReceipt::scripted(proof, BirthKind::AttachObserved, 7, 0)
+    }
+
+    fn fallen_back(old: BootstrapReceipt) -> JointStaging {
+        let mut feed = JointStaging::select_s1_only();
+        feed.selected_receipt = Some(old);
+        feed.degraded_window = Some(DegradedWindow::Fallback);
+        feed.segment_resumable = false;
+        feed
+    }
+
+    /// The association refuses early exactly the births the drain
+    /// would refuse as segment-unresumable: same-domain births onto
+    /// a fallback-closed proof-destroyed segment. Everything else
+    /// proceeds to the drain's own decision.
+    #[test]
+    fn reselect_segment_doomed_names_only_drain_refused_births() {
+        let old_proof = proof(71, 3, 9);
+        let old = receipt(old_proof);
+        // Same proof lineage onto a destroyed segment: doomed.
+        let feed = fallen_back(old);
+        assert!(feed.reselect_segment_doomed(&old_proof));
+        // A superseding incarnation reseeds past the destroyed
+        // segment: allowed.
+        let feed = fallen_back(old);
+        assert!(!feed.reselect_segment_doomed(&proof(71, 4, 9)));
+        // A foreign lineage refuses Foreign at the drain, not
+        // segment: allowed here.
+        let feed = fallen_back(old);
+        assert!(!feed.reselect_segment_doomed(&proof(72, 3, 9)));
+        // Same incarnation but another era is another domain (also
+        // Foreign at the drain): allowed here.
+        let feed = fallen_back(old);
+        assert!(!feed.reselect_segment_doomed(&proof(71, 3, 10)));
+        // A loss-closed segment reseeds: allowed.
+        let mut feed = fallen_back(old);
+        feed.degraded_window = Some(DegradedWindow::Loss);
+        assert!(!feed.reselect_segment_doomed(&old_proof));
+        // A resumable fallback segment reseeds: allowed.
+        let mut feed = fallen_back(old);
+        feed.segment_resumable = true;
+        assert!(!feed.reselect_segment_doomed(&old_proof));
+        // No selected receipt: nothing to reseed onto (the drain
+        // refuses NoSegment instead): allowed here.
+        let mut feed = fallen_back(old);
+        feed.selected_receipt = None;
+        assert!(!feed.reselect_segment_doomed(&old_proof));
+        // No degraded window (pristine feed): allowed.
+        let mut feed = fallen_back(old);
+        feed.degraded_window = None;
+        assert!(!feed.reselect_segment_doomed(&old_proof));
+        // A cooling feed is not reseedable yet (the drain refuses
+        // NoSegment instead): allowed here.
+        let mut feed = fallen_back(old);
+        feed.reseeded_cooldown = 3;
+        assert!(!feed.reselect_segment_doomed(&old_proof));
+    }
+}

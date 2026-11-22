@@ -6370,9 +6370,12 @@ fn retry_journal_without_sizes(
         match seal_mint_start_subsets(coordinator, scan_subset, false) {
             Ok(pair) => pair,
             Err(refusals) => {
-                return RetryWithoutSizes::Refused(refusals.into_iter().next().unwrap_or(
-                    crate::inventory_semantics::SemanticRefusal::Unavailable,
-                ));
+                return RetryWithoutSizes::Refused(
+                    refusals
+                        .into_iter()
+                        .next()
+                        .unwrap_or(crate::inventory_semantics::SemanticRefusal::Unavailable),
+                );
             }
         };
     if stopped() {

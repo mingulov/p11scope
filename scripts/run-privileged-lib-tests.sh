@@ -799,6 +799,17 @@ manifest_getter_privileged_tests::privileged_getter_only_manifest_calls_inside_t
 manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_counts_static_program_exactly
 )
 
+# Full-matrix membership: the LONG_TESTS members whose qualification
+# requires every matrix case (not a campaign list: every member also
+# runs as a long cell). The runner unsets the cell's narrowing
+# selectors for exactly these cells and fails a pass that lacks any
+# linked case tag, so inherited WP7_STOP_PREPS / WP7_STOP_OFFSETS
+# narrowing can never qualify as the full matrix. Direct libtest runs
+# keep narrowing for exploration.
+FULL_MATRIX_TESTS=(
+inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
+)
+
 # Feature-alternative load gates: exactly one exists per binary. Default
 # builds carry the FULL refusal classifier; stub-object-attributes builds
 # carry the stubbed load pin. The drift check tolerates a curated-but-absent
@@ -824,7 +835,9 @@ attach::inventory::activation::privileged_tests::privileged_inventory_multi_n819
 # journal session (~3 min, gcc + SoftHSM2); the S3 suite also rows it
 # through scripts/ci/stop-races.sh. A live last waiter before stop is
 # unreachable (collected ticks resolve waiters same tick); the invariant
-# lives in the machine twins named in tests/ignored-tests.json.
+# lives in the machine twins named in tests/ignored-tests.json. The
+# runner unsets WP7_STOP_PREPS / WP7_STOP_OFFSETS for this cell and
+# requires all 12 linked case tags for a pass (FULL_MATRIX_TESTS).
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 # G21 default-ring wrap needs 266 changing observed rounds per leg (532 per
 # two-leg cell; 260 counted + 4 shared + fence + proof per leg, 264 without
@@ -1626,7 +1639,7 @@ main() {
     local selected_runnable=() selected_skipped=()
     local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
-    local result_line verdict branch_suffix sig_line
+    local result_line verdict branch_suffix sig_line matrix_note matrix_missing
     local m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
     local need_ext4loop=0 ext4loop_skip=
     local need_counter=0 counter_skip=
@@ -1638,7 +1651,8 @@ main() {
     local cell_tmpdir
     local -A counter_fixture_set=() wrap_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
     local -A owned_child_tmp_set=() getter_static_set=() btrfs_pair_set=()
-    local -a cell_env=()
+    local -A full_matrix_set=()
+    local -a cell_env=() matrix_env=()
 
     if [ $# -eq 0 ]; then
         usage >&2
@@ -1884,6 +1898,7 @@ main() {
     for name in "${BTRFS_PAIR_TESTS[@]}"; do btrfs_pair_set[$name]=1; done
     for name in "${OWNED_CHILD_TMP_TESTS[@]}"; do owned_child_tmp_set[$name]=1; done
     for name in "${GETTER_STATIC_TESTS[@]}"; do getter_static_set[$name]=1; done
+    for name in "${FULL_MATRIX_TESTS[@]}"; do full_matrix_set[$name]=1; done
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
         xfail_sig[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_SIGNATURES[$i]}
@@ -2110,8 +2125,12 @@ main() {
         mkdir -p "$evdir" || { echo "$PROG: cannot create $evdir" >&2; return 1; }
         echo "RUN $name [case_index=$seq]"
         start=$(date +%s)
+        matrix_env=()
+        if [ -n "${full_matrix_set[$name]+present}" ]; then
+            matrix_env=(-u WP7_STOP_PREPS -u WP7_STOP_OFFSETS)
+        fi
         P11SCOPE_TASK4_EVIDENCE_DIR=$evdir P11SCOPE_TASK4_CASE_INDEX=$seq TMPDIR=$cell_tmpdir \
-            env ${cell_env[@]+"${cell_env[@]}"} \
+            env ${matrix_env[@]+"${matrix_env[@]}"} ${cell_env[@]+"${cell_env[@]}"} \
             "$bin" --exact "$name" --ignored --test-threads=1 --nocapture \
             >"$log" 2>&1
         rc=$?
@@ -2124,6 +2143,21 @@ main() {
         if [ "$rc" -eq 0 ] \
             && command grep -qF 'test result: ok. 1 passed' "$log"; then
             verdict=PASS
+        fi
+        matrix_note=
+        matrix_missing=
+        if [ -n "${full_matrix_set[$name]+present}" ] && [ "$verdict" = PASS ]; then
+            i=0
+            while [ "$i" -lt 12 ]; do
+                if ! command grep -qF "P11SCOPE_CELL_BRANCH=wp7-stop$i:linked" "$log"; then
+                    matrix_missing="$matrix_missing $i"
+                fi
+                i=$((i + 1))
+            done
+            if [ -n "$matrix_missing" ]; then
+                verdict=FAIL
+                matrix_note=" (MATRIX SHORT: missing linked cases:$matrix_missing; want wp7-stop0..wp7-stop11)"
+            fi
         fi
         branch_suffix=$(cell_branch_suffix "$log")
         if [ -n "${xfail_reason[$name]+present}" ]; then
@@ -2144,7 +2178,7 @@ main() {
             else
                 fail=$((fail + 1))
             fi
-            echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix" | tee -a "$results"
+            echo "$verdict $name rc=$rc seconds=$seconds :: $result_line$branch_suffix$matrix_note" | tee -a "$results"
         fi
     done
 

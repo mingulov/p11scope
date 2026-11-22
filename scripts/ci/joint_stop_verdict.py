@@ -44,12 +44,28 @@ glued to the `test NAME ... ` prefix and the verdict stands alone):
               P11SCOPE_STOP_COMPLETE=wp7-stopK
               Error: MESSAGE  [backtrace block]   (terminal only)
 
-Any line carrying a record prefix that is not a full record, a no-feed
-receipt outside the terminal error, a second summary, stray libtest
-framing, or any content after the terminal error other than a
-backtrace block fails. Each check has a name (the reason it reports);
-the table-driven suite tests/python/test_joint_stop_verdict.py disables
-each check in turn and requires some row to turn red.
+Position rules (evidence is judged where it stands, before or after
+the deciding record):
+  - any line carrying a record stem (P11SCOPE_CELL_BRANCH,
+    P11SCOPE_STOP_COMPLETE, whatever separator follows) or a no-feed
+    word (s1-precluded, no-feeds-unattributed) must be a full record;
+  - the no-feed receipt text and the wedge phrase belong only to the
+    terminal error; a summary only to the trailer;
+  - a no-feed tag is followed directly by its receipt: a preclusion
+    log holds nothing but setup output, the case-0 tag and its receipt;
+  - diagnostics naming wp7-stopN sit inside case N (its prep before
+    the tag, or its linked stage); stop outcome and check diagnostics
+    sit in their case's linked or offset stage, bound to its offset;
+    nothing names a case after the full matrix;
+  - the terminal error carries no reserved record; only a backtrace
+    block follows it, itself free of records and receipts;
+  - a wedge terminal is one whole linked StopOutcome record (each field
+    once), bound to the case's offset, finish and latch, and describing
+    a failed stop (not published+joined+taken).
+Stray libtest framing, competing errors and a second summary fail too.
+Each check has a name (the reason it reports); the table-driven suite
+tests/python/test_joint_stop_verdict.py disables each check in turn
+and requires some row to turn red.
 
 Usage:
   python3 -I scripts/ci/joint_stop_verdict.py --cell NAME --status RC

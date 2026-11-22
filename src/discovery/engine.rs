@@ -41,9 +41,9 @@ use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
     ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
-    exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
-    index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
+    ScannedTable, Skipped, WORK_CEILING_REASON, decode_exact_table, decode_observed_words,
+    decoded_table_addresses, exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes,
+    export_agreement, index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
     read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
     scan_process_view_examined, scan_process_view_without_memory, scan_skip_truncates,
     table_evidence_score, table_has_only_opaque_interfaces, table_linkage, target_layout,
@@ -10770,14 +10770,18 @@ const DISCOVERY_CAPACITY_BLOCKED_REASON: &str =
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
      tombstoned for retry";
 
-/// The one published record for scope members discovery could not read.
-/// Deduplication is per exact `(subject, reason)` pair, so the pid, the view
-/// and the error text are diagnostics and must stay out of both: carrying them
-/// there gave a `--cgroup` capture one public record per short-lived
-/// subprocess, a count that tracks the workload's fork rate and no loss.
-const UNREADABLE_MEMBER_SUBJECT: &str = "process view";
-const UNREADABLE_MEMBER_REASON: &str = "a process in scope could not be retained or scanned before it changed; a provider \
-     only that generation mapped was never discovered";
+/// The one published record for scope members discovery could not read
+/// for an unclassified reason. Deduplication is per exact `(subject,
+/// reason)` pair, so the pid, the view and the error text are
+/// diagnostics and must stay out of both: carrying them there gave a
+/// `--cgroup` capture one public record per short-lived subprocess, a
+/// count that tracks the workload's fork rate and no loss. The
+/// process may be live and unchanged — a failed read proves neither
+/// exit nor change — so the pair claims neither event, never the
+/// changed-generation pair.
+const UNREADABLE_UNCHECKED_SUBJECT: &str = "process view";
+const UNREADABLE_UNCHECKED_REASON: &str = "a process in scope could not be retained or scanned; a provider \
+     only that process mapped was never discovered";
 
 /// The one published record for scope members discovery could not
 /// read because permission was denied (EACCES/EPERM). The process may
@@ -10794,6 +10798,15 @@ const UNREADABLE_PERMISSION_REASON: &str = "a process in scope could not be reta
 /// is never evidence of exit or change.
 fn is_permission_denial(detail: &str) -> bool {
     detail.contains("Permission denied") || detail.contains("not permitted")
+}
+
+/// Whether a discovery-read failure detail reports the scan work
+/// ceiling: the member was never read, so the stop is a named "not
+/// checked this pass" state, never exit/change evidence. The member
+/// keeps the ceiling reason itself so the row projects to the
+/// scan-budget row, whatever the refusal wrapped.
+fn is_work_ceiling_refusal(detail: &str) -> bool {
+    detail.contains(WORK_CEILING_REASON)
 }
 
 /// Pinned by `scan_pin_diagnostics_escape_target_controls`. Production stderr
@@ -10883,10 +10896,18 @@ fn format_slot_sizing_summary(sizing: &crate::capacity::SlotSizing) -> Option<St
 /// nothing a capture that keeps running can still observe. Loss stays loss,
 /// and loud, whenever the end cannot be proven. Loud means aggregated (Task
 /// 3.2): the detail is noted to `noise` scrubbed of PIDs, never printed raw.
-/// A permission refusal (EACCES/EPERM) files the permission pair: the
-/// process may be live and unchanged, so the refusal is never evidence
-/// of exit or change. Shared with `inspect --system`, which pairs the
-/// deduped record with a per-pid status in its process table.
+/// A work-ceiling refusal keeps the ceiling reason: the member was
+/// never read, so the stop is a named "not checked this pass" state,
+/// never exit/change evidence. A permission refusal (EACCES/EPERM)
+/// files the permission pair: the process may be live and unchanged,
+/// so the refusal is never evidence of exit or change. Anything else
+/// files the unreadable pair, which claims neither event. No member
+/// path proves exit or change — open failures hold no birth to
+/// compare, and scan failures on a live generation read the same
+/// one — so the changed-generation pair is never filed here; it is
+/// reserved for the pin-currency branches that prove the generation
+/// is no longer current. Shared with `inspect --system`, which pairs
+/// the deduped record with a per-pid status in its process table.
 pub(crate) fn unreadable_member_skip(
     pid: u32,
     gone: bool,
@@ -10897,6 +10918,12 @@ pub(crate) fn unreadable_member_skip(
         return None;
     }
     noise.note_unreadable(pid, detail);
+    if is_work_ceiling_refusal(detail) {
+        return Some(Skipped {
+            subject: UNREADABLE_UNCHECKED_SUBJECT.into(),
+            reason: WORK_CEILING_REASON.into(),
+        });
+    }
     if is_permission_denial(detail) {
         return Some(Skipped {
             subject: UNREADABLE_PERMISSION_SUBJECT.into(),
@@ -10904,8 +10931,8 @@ pub(crate) fn unreadable_member_skip(
         });
     }
     Some(Skipped {
-        subject: UNREADABLE_MEMBER_SUBJECT.into(),
-        reason: UNREADABLE_MEMBER_REASON.into(),
+        subject: UNREADABLE_UNCHECKED_SUBJECT.into(),
+        reason: UNREADABLE_UNCHECKED_REASON.into(),
     })
 }
 
@@ -28424,9 +28451,15 @@ impl Engine {
                     if self.record_generation_ended(origin) {
                         self.invalidate_causal_timing();
                     } else {
+                        // A dispatch error with no exit proof is not
+                        // evidence the generation exited or changed —
+                        // the error is discarded, so nothing proves
+                        // either — and files the same pair as the
+                        // live record-resolution arm, never the
+                        // changed-generation row.
                         self.mark_live_loss(
                             "live discovery record",
-                            "a structurally valid private terminal record failed exact live resolution",
+                            "a structurally valid private record failed exact live resolution",
                         );
                     }
                 }

@@ -7050,16 +7050,16 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
             "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
         ),
         (
-            "live discovery record",
-            "a structurally valid private terminal record failed exact live resolution",
-        ),
-        (
-            "process view",
-            "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
-        ),
-        (
             "process view",
             "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered",
+        ),
+        (
+            "process view",
+            "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered",
+        ),
+        (
+            "process view",
+            "capture discovery work ceiling reached; remaining provider bytes were not scanned",
         ),
         (
             "capture discovery",
@@ -7104,7 +7104,7 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
             .iter()
             .filter(|reason| **reason == "process exited or changed mid-flight")
             .count(),
-        5,
+        3,
         "{reasons:?}"
     );
     assert_eq!(
@@ -7126,9 +7126,17 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     assert_eq!(
         reasons
             .iter()
+            .filter(|reason| **reason == "process unreadable mid-flight; not checked this pass")
+            .count(),
+        1,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
             .filter(|reason| **reason == "scan budget exhausted")
             .count(),
-        3,
+        4,
         "{reasons:?}"
     );
     assert_eq!(
@@ -7147,17 +7155,17 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for all nine folded gap-noise pairs (five mid-flight
-/// changed, one stale-deferral, one permission-refusal, two
-/// loader-context): filing sites without a cheap live seam pin
-/// their exact strings in source, so a reword must update the
-/// projection allowlist in the same patch instead of silently
-/// unfolding back to generic. Each pair also asserts its
+/// Drift guard for all eight folded gap-noise pairs (three mid-flight
+/// changed, one stale-deferral, one permission-refusal, one
+/// unreadable-member, two loader-context): filing sites without a
+/// cheap live seam pin their exact strings in source, so a reword
+/// must update the projection allowlist in the same patch instead of
+/// silently unfolding back to generic. Each pair also asserts its
 /// `capture_skipped_out` projection.
 #[test]
 fn folded_gap_noise_pairs_match_their_filing_sites() {
     let source = include_str!("engine.rs");
-    // (subject, reason, public reason): the seven pairs filed as
+    // (subject, reason, public reason): the six pairs filed as
     // quoted literals in `engine.rs` source.
     let pairs: &[(&str, &str, &str)] = &[
         (
@@ -7179,11 +7187,6 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "live discovery generation",
             "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
             "stale process report deferred mid-flight",
-        ),
-        (
-            "live discovery record",
-            "a structurally valid private terminal record failed exact live resolution",
-            "process exited or changed mid-flight",
         ),
         (
             "live export hook",
@@ -7216,15 +7219,15 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "folded pair ({subject}, {reason})"
         );
     }
-    // The eighth pair lives in split `UNREADABLE_MEMBER_*` constants,
-    // so its filing site pins the constant definitions instead of one
-    // quoted literal (the joined reason still asserts its projection).
+    // The seventh pair lives in split `UNREADABLE_UNCHECKED_*`
+    // constants, so its filing site pins the constant definitions
+    // instead of one quoted literal (the joined reason still asserts
+    // its projection).
     for marker in [
-        "UNREADABLE_MEMBER_SUBJECT",
-        "UNREADABLE_MEMBER_REASON",
-        "\"process view\"",
-        "\"a process in scope could not be retained or scanned before it changed; a provider",
-        "only that generation mapped was never discovered",
+        "UNREADABLE_UNCHECKED_SUBJECT",
+        "UNREADABLE_UNCHECKED_REASON",
+        "\"a process in scope could not be retained or scanned; a provider",
+        "only that process mapped was never discovered",
     ] {
         assert!(
             source.contains(marker),
@@ -7233,10 +7236,13 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
     }
     let projected = crate::render::capture_skipped_out(&Skipped {
         subject: "process view".into(),
-        reason: "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered".into(),
+        reason: "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered".into(),
     });
-    assert_eq!(projected.reason, "process exited or changed mid-flight");
-    // The ninth pair lives in split `UNREADABLE_PERMISSION_*`
+    assert_eq!(
+        projected.reason,
+        "process unreadable mid-flight; not checked this pass"
+    );
+    // The eighth pair lives in split `UNREADABLE_PERMISSION_*`
     // constants, pinned the same way.
     for marker in [
         "UNREADABLE_PERMISSION_SUBJECT",
@@ -7257,6 +7263,27 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         projected.reason,
         "process unreadable mid-flight; permission denied"
     );
+    // Retired changed-generation pairs never come back: no member
+    // path and no terminal record proves exit or change, so their
+    // strings stay out of the filing source. A reintroduction fails
+    // here instead of silently refolding into the changed row.
+    for retired in [
+        "before it changed",
+        "private terminal record failed exact live resolution",
+    ] {
+        assert!(
+            !source.contains(retired),
+            "the retired changed-generation mark must stay out of the filing source: {retired}"
+        );
+    }
+    // The terminal and live record-resolution arms file one shared
+    // pair, which stays generic: an unresolvable record proves
+    // neither exit nor change.
+    let projected = crate::render::capture_skipped_out(&Skipped {
+        subject: "live discovery record".into(),
+        reason: "a structurally valid private record failed exact live resolution".into(),
+    });
+    assert_eq!(projected.reason, "discovery unavailable");
 }
 
 /// Poll real /proc until `pid` reads zombie (state Z), bounded; panics past
@@ -14667,7 +14694,7 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
     );
     assert_eq!(
         render::capture_skipped_out(&engine.counters.object_skips[0]).reason,
-        "process exited or changed mid-flight"
+        "process unreadable mid-flight; not checked this pass"
     );
     assert!(
         unreadable_member_skip(11, true, "scripted, proven gone", &mut noise).is_none(),
@@ -15672,7 +15699,7 @@ fn initial_scan_zombie_member_is_silent_like_a_reaped_exit() {
     );
     assert!(
         !engine.base_counters.object_skips.iter().any(|skip| {
-            skip.subject == UNREADABLE_MEMBER_SUBJECT && skip.reason == UNREADABLE_MEMBER_REASON
+            skip.subject == UNREADABLE_UNCHECKED_SUBJECT && skip.reason == UNREADABLE_UNCHECKED_REASON
         }),
         "a zombie member earns silence, not an unreadable-member skip: {:?}",
         engine.base_counters.object_skips
@@ -17473,7 +17500,7 @@ fn refresh_newcomer_zombie_is_silent_like_a_reaped_exit() {
     refresh_inventory_once(&mut engine);
     assert!(
         !engine.counters.object_skips.iter().any(|skip| {
-            skip.subject == UNREADABLE_MEMBER_SUBJECT && skip.reason == UNREADABLE_MEMBER_REASON
+            skip.subject == UNREADABLE_UNCHECKED_SUBJECT && skip.reason == UNREADABLE_UNCHECKED_REASON
         }),
         "a zombie newcomer earns silence, not an unreadable-member skip: {:?}",
         engine.counters.object_skips
@@ -55736,7 +55763,7 @@ fn refresh_tick_cancellation_defers_new_work_with_evidence() {
             .object_skips
             .iter()
             .filter(|skip| {
-                skip.subject == UNREADABLE_MEMBER_SUBJECT && skip.reason == UNREADABLE_MEMBER_REASON
+                skip.subject == UNREADABLE_UNCHECKED_SUBJECT && skip.reason == UNREADABLE_UNCHECKED_REASON
             })
             .count(),
         1,

@@ -2038,15 +2038,16 @@ pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot se
 pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 /// Gap-noise folds: mid-flight changed generations, the live
-/// stale-deferral mark, permission refusals, scan-budget stops and
-/// loader-context misses project to these finite public reasons
-/// instead of the generic redaction. Each folds exact internal pairs
-/// only (the ceiling by its fixed reason sentence, whatever subject
-/// filed it); function subjects always keep their entry row, and
-/// folding renames rows, never drops them. Neither mid-flight row
-/// claims an exit: proven exits are ordinary ends and file no public
-/// row. The permission row claims neither exit nor change: a refused
-/// read proves neither.
+/// stale-deferral mark, permission refusals, unreadable members,
+/// scan-budget stops and loader-context misses project to these
+/// finite public reasons instead of the generic redaction. Each
+/// folds exact internal pairs only (the ceiling by its fixed reason
+/// sentence, whatever subject filed it); function subjects always
+/// keep their entry row, and folding renames rows, never drops them.
+/// Neither mid-flight row claims an exit: proven exits are ordinary
+/// ends and file no public row. The permission and unreadable rows
+/// claim neither exit nor change: a refused or failed read proves
+/// neither.
 const MID_FLIGHT_REASON: &str = "process exited or changed mid-flight";
 /// The live stale-deferral mark's own public reason: it is filed
 /// for a possibly still-live process with retirement deferred, so
@@ -2056,6 +2057,11 @@ const STALE_DEFERRAL_REASON: &str = "stale process report deferred mid-flight";
 /// a possibly still-live, unchanged process whose read was denied,
 /// so it must never call the process exited or changed.
 const PERMISSION_REFUSAL_REASON: &str = "process unreadable mid-flight; permission denied";
+/// The unreadable-member mark's own public reason: it is filed for
+/// a possibly still-live, unchanged process whose read failed for
+/// an unclassified reason, so it must never call the process exited
+/// or changed.
+const UNREADABLE_NOT_CHECKED_REASON: &str = "process unreadable mid-flight; not checked this pass";
 const SCAN_BUDGET_REASON: &str = "scan budget exhausted";
 const LOADER_CONTEXT_REASON: &str = "no unique attached loader context";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
@@ -2212,13 +2218,15 @@ fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether an internal skip is one of the five mid-flight
+/// Whether an internal skip is one of the three mid-flight
 /// changed-generation pairs: a short-lived process exited or
-/// changed while discovery was mid-read (candidate, preflight,
-/// terminal record, or an unreadable member). Exact subject and
-/// reason, never prefix or substring: near misses stay generic. The
-/// stale-deferral pair has its own matcher below: it is filed for a
-/// possibly still-live process, so it must never fold into this row.
+/// changed while discovery was mid-read (candidate or inventory
+/// preflight), each backed by a pin-currency check that the
+/// generation is no longer current. Exact subject and reason, never
+/// prefix or substring: near misses stay generic. The
+/// stale-deferral, permission-refusal and unreadable-member pairs
+/// have their own matchers below: each is filed for a possibly
+/// still-live process, so none must ever fold into this row.
 fn is_mid_flight_pair(subject: &str, reason: &str) -> bool {
     matches!(
         (subject, reason),
@@ -2231,12 +2239,6 @@ fn is_mid_flight_pair(subject: &str, reason: &str) -> bool {
         ) | (
             "live inventory generation",
             "an exact retained or newly opened process generation changed during post-retirement preflight",
-        ) | (
-            "live discovery record",
-            "a structurally valid private terminal record failed exact live resolution",
-        ) | (
-            "process view",
-            "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
         )
     )
 }
@@ -2264,6 +2266,20 @@ fn is_permission_refusal_pair(subject: &str, reason: &str) -> bool {
         == (
             "process view",
             "a process in scope could not be retained or scanned; permission was denied, and a provider only that process mapped was never discovered",
+        )
+}
+
+/// Whether an internal skip is the unreadable-member pair: a scope
+/// member's read failed for an unclassified reason while the
+/// process may be live and unchanged. Exact subject and reason,
+/// never prefix or substring: near misses stay generic. It must
+/// never fold into the changed row: a failed read proves neither
+/// exit nor change.
+fn is_unreadable_not_checked_pair(subject: &str, reason: &str) -> bool {
+    (subject, reason)
+        == (
+            "process view",
+            "a process in scope could not be retained or scanned; a provider only that process mapped was never discovered",
         )
 }
 
@@ -2378,6 +2394,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         STALE_DEFERRAL_REASON
     } else if is_permission_refusal_pair(&s.subject, &s.reason) {
         PERMISSION_REFUSAL_REASON
+    } else if is_unreadable_not_checked_pair(&s.subject, &s.reason) {
+        UNREADABLE_NOT_CHECKED_REASON
     } else if s
         .reason
         .contains(crate::discovery::scan::WORK_CEILING_REASON)
@@ -4896,6 +4914,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                         if skip.reason != MID_FLIGHT_REASON
                             && skip.reason != STALE_DEFERRAL_REASON
                             && skip.reason != PERMISSION_REFUSAL_REASON
+                            && skip.reason != UNREADABLE_NOT_CHECKED_REASON
                             && skip.reason != SCAN_BUDGET_REASON
                             && skip.reason != LOADER_CONTEXT_REASON
                         {
@@ -4937,6 +4956,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     MID_FLIGHT_REASON,
                     STALE_DEFERRAL_REASON,
                     PERMISSION_REFUSAL_REASON,
+                    UNREADABLE_NOT_CHECKED_REASON,
                     SCAN_BUDGET_REASON,
                     LOADER_CONTEXT_REASON,
                     LEARNED_FIRST_RUN_REASON,
@@ -11255,6 +11275,7 @@ pub(crate) mod tests {
             "process exited or changed mid-flight",
             "stale process report deferred mid-flight",
             "process unreadable mid-flight; permission denied",
+            "process unreadable mid-flight; not checked this pass",
             "scan budget exhausted",
             "scan budget exhausted",
             "no unique attached loader context",
@@ -11279,6 +11300,7 @@ pub(crate) mod tests {
                 "process exited or changed mid-flight: 4",
                 "stale process report deferred mid-flight: 1",
                 "process unreadable mid-flight; permission denied: 1",
+                "process unreadable mid-flight; not checked this pass: 1",
                 "scan budget exhausted: 2",
                 "no unique attached loader context: 1",
             ] {
@@ -20090,14 +20112,15 @@ pub(crate) mod tests {
         assert!(text.contains("10 discovery steps unavailable"), "{text}");
     }
 
-    /// Gap-noise fold: the five changed-generation mid-flight pairs
+    /// Gap-noise fold: the three changed-generation mid-flight pairs
     /// project to the changed reason, while the live stale-deferral
     /// pair projects to its own deferral reason, which never claims
     /// the process exited, and the permission-refusal pair projects
     /// to its own permission row, which claims neither exit nor
-    /// change. Folding renames, never drops: JSON keeps one row per
-    /// underlying record, and the text names each folded row with its
-    /// count instead of the generic bucket.
+    /// change. (The unreadable-member pair has its own projection
+    /// test below.) Folding renames, never drops: JSON keeps one row
+    /// per underlying record, and the text names each folded row
+    /// with its count instead of the generic bucket.
     #[test]
     fn mid_flight_generation_pairs_project_to_split_public_reasons() {
         use crate::discovery::scan::Skipped;
@@ -20113,14 +20136,6 @@ pub(crate) mod tests {
             (
                 "live inventory generation",
                 "an exact retained or newly opened process generation changed during post-retirement preflight",
-            ),
-            (
-                "live discovery record",
-                "a structurally valid private terminal record failed exact live resolution",
-            ),
-            (
-                "process view",
-                "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
             ),
         ];
         for (subject, reason) in &changed {
@@ -20181,17 +20196,17 @@ pub(crate) mod tests {
             .collect();
         ev.verdict();
         // One JSON row per underlying record: folding renames, never drops.
-        assert_eq!(ev.skipped.len(), 7);
+        assert_eq!(ev.skipped.len(), 5);
         let document = profile_json(
             &reports_fixture(),
             VersionedEvidence::wrap(&ev),
             &state_fixture(),
             &capture_fixture(),
         );
-        assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 7);
+        assert_eq!(document["evidence"]["skipped"].as_array().unwrap().len(), 5);
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            text.contains("process exited or changed mid-flight: 5"),
+            text.contains("process exited or changed mid-flight: 3"),
             "{text}"
         );
         assert!(
@@ -20415,6 +20430,10 @@ pub(crate) mod tests {
                 "a process in scope could not be retained or scanned before it changed",
             ),
             (
+                "live discovery record",
+                "a structurally valid private record failed exact live resolution",
+            ),
+            (
                 "live discovery generation",
                 "a stale generation report was contradicted or unprovable on pin recheck",
             ),
@@ -20490,7 +20509,7 @@ pub(crate) mod tests {
             .collect();
         ev.verdict();
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("18 discovery steps unavailable"), "{text}");
+        assert!(text.contains("19 discovery steps unavailable"), "{text}");
     }
 
     /// View-collapse fix1 (RED): the deep-scan selection cap projects to

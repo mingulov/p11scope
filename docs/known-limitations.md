@@ -2905,7 +2905,8 @@ The old bounds are measurements, not a product startup SLA.
 - Kernels/conditions: all; `--system` scope (for `--pid`
   see DR-C3-2).
 - Disclosure: the pid-less `process view` gap ("a process in scope could
-  not be retained or scanned before it changed"), `modules[].unbound_use`
+  not be retained or scanned; a provider only that process mapped was never
+  discovered"), `modules[].unbound_use`
   (`rows`, `reasons`, `images`, `pids`), `observation.native_witnesses`
   (`unbound_reasons`, `unbound_images`), and the per-pass `unbound_rows`
   of the event stream. The gap names no pid; `pids` lists historical

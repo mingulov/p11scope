@@ -1193,18 +1193,21 @@ exactly:
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
 
-Gap-noise folds file under the discovery subject with five finite
+Gap-noise folds file under the discovery subject with six finite
 reasons (in addition to the v2 list and the reasons above). Each
 record is `{name: "discovery subject", reason}` with `reason` exactly
 one of:
 
-- `process exited or changed mid-flight`: one of five mid-flight
+- `process exited or changed mid-flight`: one of three mid-flight
   changed-generation pairs — a short-lived process exited or
-  changed while discovery was mid-read (candidate, inventory
-  preflight, terminal record, or an unreadable member). Exact
-  internal pairs only; near misses stay generic. The row covers
-  exit-or-change without proving either: a process that exec'd, or
-  whose pid was reused, is still running.
+  changed while discovery was mid-read (candidate or inventory
+  preflight), each backed by a pin-currency check that the
+  generation is no longer current. Exact internal pairs only; near
+  misses stay generic. The row covers exit-or-change without
+  naming which: a process whose pid was reused is still running.
+  Unreadable members and unresolvable terminal records never file
+  this row: without proof of exit or change they file the
+  unreadable row below (or the generic redaction for records).
 - `stale process report deferred mid-flight`: the live
   stale-deferral mark — the pin recheck contradicted the loss
   report or could not judge it, so retirement was deferred and the
@@ -1213,8 +1216,14 @@ one of:
   member whose read failed with EACCES/EPERM — the process may be
   live and unchanged, so the refusal proves neither exit nor
   change. This row never claims either event.
+- `process unreadable mid-flight; not checked this pass`: a scope
+  member whose read failed for any other reason — an I/O error, a
+  failed scan, or any unclassified failure — while the process may
+  be live and unchanged. This row never claims exit or change; a
+  work-ceiling stop files the scan-budget row instead.
 - `scan budget exhausted`: a work-ceiling stop, bare or wrapped in
-  a scan refusal, whatever subject filed it. Function subjects keep
+  a scan refusal, whatever subject filed it — including a member
+  the exhausted budget never read. Function subjects keep
   their entry row instead — the fold never redacts a function name.
 - `no unique attached loader context`: a provider whose loader
   context could not be uniquely attached. Distinct from the ceiling
@@ -1224,11 +1233,11 @@ Upgrade note: earlier candidates fold every mid-flight pair to the
 single reason `process exited mid-flight`, which claimed an exit
 even for a still-live process (and, for a refused read, an exit or
 change even for a live, unchanged one). v0.8.0 emits the split
-vocabulary instead: the changed row above, the deferral row, and
-the permission row. The producer no longer emits the single row;
-the schema and the evidence checker still accept it, so archived
-captures keep validating. Validators pinned to the old vocabulary
-need the revised one.
+vocabulary instead: the changed row above, the deferral row, the
+permission row, and the unreadable row. The producer no longer emits
+the single row; the schema and the evidence checker still accept it,
+so archived captures keep validating. Validators pinned to the old
+vocabulary need the revised one.
 
 Folding renames rows, never drops them: JSON keeps one row per
 underlying internal record. The text names each folded row with its

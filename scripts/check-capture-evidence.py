@@ -662,17 +662,19 @@ MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
 PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
 DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
 # Gap-noise folds: mid-flight changed generations, the live
-# stale-deferral mark, permission refusals, scan-budget stops and
-# loader-context misses project to these finite reasons instead of
-# the generic redaction (render.rs `capture_skipped_out` fold arms).
-# Each folds exact internal pairs only; folding renames rows, never
-# drops them. The validator must accept what the producer emits.
-# Neither mid-flight row claims an exit: proven exits are ordinary
-# ends and file no public row. The permission row claims neither
-# exit nor change: a refused read proves neither.
+# stale-deferral mark, permission refusals, unreadable members,
+# scan-budget stops and loader-context misses project to these
+# finite reasons instead of the generic redaction (render.rs
+# `capture_skipped_out` fold arms). Each folds exact internal pairs
+# only; folding renames rows, never drops them. The validator must
+# accept what the producer emits. Neither mid-flight row claims an
+# exit: proven exits are ordinary ends and file no public row. The
+# permission and unreadable rows claim neither exit nor change: a
+# refused or failed read proves neither.
 MID_FLIGHT_REASON = "process exited or changed mid-flight"
 STALE_DEFERRAL_REASON = "stale process report deferred mid-flight"
 PERMISSION_REFUSAL_REASON = "process unreadable mid-flight; permission denied"
+UNREADABLE_NOT_CHECKED_REASON = "process unreadable mid-flight; not checked this pass"
 # Retired by the mid-flight split: earlier candidates fold every
 # mid-flight pair to this one row. Still accepted so archived
 # captures keep validating; the producer no longer emits it.
@@ -868,6 +870,7 @@ DISCOVERY_REASONS = {
     MID_FLIGHT_REASON,
     STALE_DEFERRAL_REASON,
     PERMISSION_REFUSAL_REASON,
+    UNREADABLE_NOT_CHECKED_REASON,
     RETIRED_MID_FLIGHT_EXIT_REASON,
     SCAN_BUDGET_REASON,
     LOADER_CONTEXT_REASON,

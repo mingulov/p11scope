@@ -8,7 +8,7 @@
 //! mappings on Btrfs.
 
 use super::*;
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 /// A thread group whose leader is an unreaped zombie with one live
@@ -1849,19 +1849,62 @@ struct HelperHeldZombie {
 
 impl HelperHeldZombie {
     fn spawn() -> Self {
-        let (mut pipes, mut report) = ([0; 2], [0u8; 8]);
-        // SAFETY: two valid two-element arrays for pipe2.
+        let (mut outer, mut inner, mut report) = ([0; 2], [0; 2], [0u8; 8]);
+        // SAFETY: valid two-element arrays for pipe2.
         assert_eq!(
-            unsafe { libc::pipe2(pipes.as_mut_ptr(), libc::O_CLOEXEC) },
+            unsafe { libc::pipe2(outer.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
-        // SAFETY: the child only runs the fork-safe group spawn, one
-        // pipe write, and `pause()`; no pthread, no locks.
-        let owner = std::process::id();
+        assert_eq!(
+            unsafe { libc::pipe2(inner.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        // SAFETY: pipe2 just returned these owned fds; owned from creation
+        // so a fork failure or report-read panic cannot strand them.
+        let outer_read = unsafe { OwnedFd::from_raw_fd(outer[0]) };
+        let outer_write = unsafe { OwnedFd::from_raw_fd(outer[1]) };
+        let inner_read = unsafe { OwnedFd::from_raw_fd(inner[0]) };
+        let inner_write = unsafe { OwnedFd::from_raw_fd(inner[1]) };
+        // The inner leader bundle is fully built before the outer fork:
+        // the outer child must not allocate after forking the
+        // multi-threaded harness (its allocator may hold another
+        // thread's lock), so it only patches the placeholder owner,
+        // forks the inner child, forwards the TID report with raw
+        // syscalls, and parks.
+        let bundle = HelperExec::with_vars(&[
+            b"P11SCOPE_D4Z_MODE=leader".to_vec(),
+            format!("P11SCOPE_D4Z_WFD={}", inner_write.as_raw_fd()).into_bytes(),
+            b"P11SCOPE_D4Z_COUNT=1".to_vec(),
+            format!("P11SCOPE_D4Z_OWNER={:010}", 0).into_bytes(),
+        ]);
+        let owner_value_ptr = {
+            let prefix = b"P11SCOPE_D4Z_OWNER=".len();
+            // SAFETY: the bundle just built the placeholder owner var at index 3.
+            unsafe { bundle.env[3].as_ptr().add(prefix) as *mut u8 }
+        };
+        let owner_outer = std::process::id();
+        let outer_read_fd = outer_read.as_raw_fd();
+        let outer_write_fd = outer_write.as_raw_fd();
+        let inner_read_fd = inner_read.as_raw_fd();
+        let inner_write_fd = inner_write.as_raw_fd();
+        // SAFETY: the outer child below only uses async-signal-safe calls
+        // (getpid, prctl, getppid, close, fork, read, write, kill,
+        // waitpid, pause, exec, _exit) on the copied fd numbers and the
+        // pre-built bundle; it never allocates, never panics, never returns.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "helper fork failed");
         if pid == 0 {
             unsafe {
+                // Our own pid becomes the inner group's carried owner.
+                let me = libc::getpid() as u32;
+                let mut digits = [b'0'; 10];
+                let mut value = me;
+                for slot in digits.iter_mut().rev() {
+                    *slot = b'0' + (value % 10) as u8;
+                    value /= 10;
+                }
+                core::ptr::copy_nonoverlapping(digits.as_ptr(), owner_value_ptr, 10);
+                let holder = me;
                 // Parent-death guard (same body as
                 // `crate::fixture_guard::DieWithParent`): the helper
                 // parks in `pause()` below, and a spawner already gone
@@ -1869,44 +1912,102 @@ impl HelperHeldZombie {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
                     libc::_exit(127);
                 }
-                if libc::getppid() != owner as libc::pid_t {
+                if libc::getppid() != owner_outer as libc::pid_t {
                     libc::_exit(127);
                 }
-                libc::close(pipes[0]);
-            }
-            let (tgid, survivors) = ZombieLeaderGroup::spawn_inner(1);
-            let mut report = [0u8; 8];
-            report[0..4].copy_from_slice(&tgid.to_ne_bytes());
-            report[4..8].copy_from_slice(&survivors[0].to_ne_bytes());
-            let mut written = 0;
-            while written < report.len() {
-                // SAFETY: writing the stack bytes to the pipe.
-                let done = unsafe {
-                    libc::write(
-                        pipes[1],
-                        report.as_ptr().add(written).cast(),
-                        report.len() - written,
-                    )
-                };
-                assert!(done > 0, "helper never reported its group");
-                written += done as usize;
-            }
-            loop {
-                unsafe {
+                libc::close(outer_read_fd);
+                let inner_pid = libc::fork();
+                if inner_pid < 0 {
+                    libc::close(outer_write_fd);
+                    libc::close(inner_read_fd);
+                    libc::close(inner_write_fd);
+                    libc::_exit(90);
+                }
+                if inner_pid == 0 {
+                    let keep = [inner_write_fd];
+                    let drop_ends = [inner_read_fd];
+                    bundle.exec_child(holder, &keep, &drop_ends);
+                }
+                // Parent side of the inner spawn: close the write copy so
+                // a dead inner reads as EOF, then forward its TID.
+                libc::close(inner_write_fd);
+                let mut tid = [0u8; 4];
+                let mut done = 0;
+                while done < tid.len() {
+                    let got = libc::read(
+                        inner_read_fd,
+                        tid.as_mut_ptr().add(done).cast(),
+                        tid.len() - done,
+                    );
+                    if got <= 0 {
+                        // Inner startup failed (an exec failure reads as
+                        // EOF): reap it so no child strands, then exit
+                        // before parking anything.
+                        libc::kill(inner_pid, libc::SIGKILL);
+                        let mut status = 0;
+                        loop {
+                            if libc::waitpid(inner_pid, &mut status, 0) >= 0 {
+                                break;
+                            }
+                            if *libc::__errno_location() != libc::EINTR {
+                                break;
+                            }
+                        }
+                        libc::close(inner_read_fd);
+                        libc::close(outer_write_fd);
+                        libc::_exit(127);
+                    }
+                    done += got as usize;
+                }
+                libc::close(inner_read_fd);
+                let mut out = [0u8; 8];
+                let tgid_bytes = (inner_pid as u32).to_ne_bytes();
+                core::ptr::copy_nonoverlapping(tgid_bytes.as_ptr(), out.as_mut_ptr(), 4);
+                core::ptr::copy_nonoverlapping(tid.as_ptr(), out.as_mut_ptr().add(4), 4);
+                let mut written = 0;
+                while written < out.len() {
+                    let done = libc::write(
+                        outer_write_fd,
+                        out.as_ptr().add(written).cast(),
+                        out.len() - written,
+                    );
+                    if done <= 0 {
+                        // The test parent is gone: kill and reap the
+                        // inner group so no survivor parks, then exit.
+                        libc::kill(inner_pid, libc::SIGKILL);
+                        let mut status = 0;
+                        loop {
+                            if libc::waitpid(inner_pid, &mut status, 0) >= 0 {
+                                break;
+                            }
+                            if *libc::__errno_location() != libc::EINTR {
+                                break;
+                            }
+                        }
+                        libc::close(outer_write_fd);
+                        libc::_exit(92);
+                    }
+                    written += done as usize;
+                }
+                loop {
                     libc::pause();
                 }
             }
         }
-        // SAFETY: the parent keeps the read end and closes its write copy.
-        unsafe {
-            libc::close(pipes[1]);
-        }
+        // The test parent owns neither inner end: drop both so only the
+        // helper holds them.
+        drop(inner_read);
+        drop(inner_write);
+        let mut guard = D4ChildGuard { pid, armed: true };
+        // The parent keeps the read end and closes its write copy so
+        // a dead helper reads as EOF instead of hanging the read below.
+        drop(outer_write);
         let mut done = 0;
         while done < report.len() {
             // SAFETY: reading into a valid stack buffer.
             let got = unsafe {
                 libc::read(
-                    pipes[0],
+                    outer_read.as_raw_fd(),
                     report.as_mut_ptr().add(done).cast(),
                     report.len() - done,
                 )
@@ -1914,10 +2015,8 @@ impl HelperHeldZombie {
             assert!(got > 0, "helper never reported its group");
             done += got as usize;
         }
-        // SAFETY: the read end served its single report.
-        unsafe {
-            libc::close(pipes[0]);
-        }
+        drop(outer_read);
+        guard.armed = false;
         Self {
             helper: pid as u32,
             tgid: u32::from_ne_bytes(report[0..4].try_into().expect("tgid bytes")),
@@ -2674,6 +2773,12 @@ impl BlockedChild {
         // SAFETY: two valid two-element arrays for pipe2.
         assert_eq!(unsafe { libc::pipe2(go.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
         assert_eq!(unsafe { libc::pipe2(tid.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: pipe2 just returned these owned fds; owned from creation
+        // so a fork failure cannot strand them.
+        let go_read = unsafe { OwnedFd::from_raw_fd(go[0]) };
+        let go_write = unsafe { OwnedFd::from_raw_fd(go[1]) };
+        let tid_read = unsafe { OwnedFd::from_raw_fd(tid[0]) };
+        let tid_write = unsafe { OwnedFd::from_raw_fd(tid[1]) };
         // The survivor's parent-death owner, stored before the fork it
         // inherits (see `SURVIVOR_OWNER_PID`) and carried explicitly
         // across the exec (the exec wipes the store, so the helper must
@@ -2682,10 +2787,14 @@ impl BlockedChild {
         crate::fixture_guard::SURVIVOR_OWNER_PID.store(owner, std::sync::atomic::Ordering::Release);
         let bundle = HelperExec::with_vars(&[
             b"P11SCOPE_D4Z_MODE=blocked".to_vec(),
-            format!("P11SCOPE_D4Z_GOFD={}", go[0]).into_bytes(),
-            format!("P11SCOPE_D4Z_TIDFD={}", tid[1]).into_bytes(),
+            format!("P11SCOPE_D4Z_GOFD={}", go_read.as_raw_fd()).into_bytes(),
+            format!("P11SCOPE_D4Z_TIDFD={}", tid_write.as_raw_fd()).into_bytes(),
             format!("P11SCOPE_D4Z_OWNER={owner}").into_bytes(),
         ]);
+        let go_read_fd = go_read.as_raw_fd();
+        let go_write_fd = go_write.as_raw_fd();
+        let tid_read_fd = tid_read.as_raw_fd();
+        let tid_write_fd = tid_write.as_raw_fd();
         // SAFETY: the child only arms parent death, closes pipe ends,
         // clears CLOEXEC on its inherited copies, and execs the helper
         // bundle; no allocator, no pthread, no locks.
@@ -2694,18 +2803,21 @@ impl BlockedChild {
         if pid == 0 {
             // SAFETY: post-fork child state for `exec_child`.
             unsafe {
-                bundle.exec_child(owner, &[go[0], tid[1]], &[go[1], tid[0]]);
+                bundle.exec_child(
+                    owner,
+                    &[go_read_fd, tid_write_fd],
+                    &[go_write_fd, tid_read_fd],
+                );
             }
         }
-        // SAFETY: the parent keeps one end of each pipe.
-        unsafe {
-            libc::close(go[0]);
-            libc::close(tid[1]);
-        }
+        // The parent keeps one end of each pipe; the struct takes them raw
+        // (its Drop closes exactly these on every path).
+        drop(go_read);
+        drop(tid_write);
         Self {
             tgid: pid as u32,
-            go_write: go[1],
-            tid_read: tid[0],
+            go_write: go_write.into_raw_fd(),
+            tid_read: tid_read.into_raw_fd(),
         }
     }
 

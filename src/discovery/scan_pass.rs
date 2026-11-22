@@ -1018,18 +1018,6 @@ impl ScanPassOwner {
         self.decode.cursors.get(key)
     }
 
-    /// Whether `pid`/`start_time` still names a live process generation.
-    /// Dead or recycled pids sort their cursors as reclaimable: an
-    /// unfinished cursor for a dead pid can never resume, so keeping it
-    /// ahead of live work would stall churn under cap pressure.
-    fn decode_cursor_pid_live(&mut self, pid: u32, start_time: u64) -> bool {
-        #[cfg(test)]
-        {
-            self.decode.probes = self.decode.probes.saturating_add(1);
-        }
-        crate::process::process_start_time(pid).is_ok_and(|live| live == start_time)
-    }
-
     /// Admit one resume-side syscall: a generation probe (a pidfd poll
     /// or one `/proc/<pid>/stat` read), the `/proc/<pid>/exe` readlink,
     /// an `fstat`/`fstatfs`, one small procfs file read, or one bounded
@@ -1059,10 +1047,12 @@ impl ScanPassOwner {
         if let Some(&live) = self.decode.liveness.get(&(pid, start_time)) {
             return Some(live);
         }
-        if !self.admit_resume_syscall() {
-            return None;
+        let read = crate::process::metered_start_time(pid, &mut || self.admit_resume_syscall())?;
+        #[cfg(test)]
+        {
+            self.decode.probes = self.decode.probes.saturating_add(1);
         }
-        let live = self.decode_cursor_pid_live(pid, start_time);
+        let live = generation_live_from(read, start_time);
         self.decode.liveness.insert((pid, start_time), live);
         Some(live)
     }
@@ -2489,8 +2479,43 @@ impl ScanPassOwner {
     }
 }
 
+/// Whether a start-time read shows `start_time` still live. Dead or
+/// recycled pids sort their cursors as reclaimable: an unfinished cursor
+/// for a dead pid can never resume, so keeping it ahead of live work
+/// would stall churn under cap pressure. Only a proof reclaims: a
+/// different start time or a missing process. Any other failure is
+/// unknown and sorts live (never evict on missing proof).
+fn generation_live_from(read: std::io::Result<u64>, start_time: u64) -> bool {
+    match read {
+        Ok(live) => live == start_time,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Cache-victim liveness reclaims only on proof: a different start
+    /// time or a missing process; any other read failure sorts live.
+    #[test]
+    fn generation_liveness_reclaims_only_on_proof() {
+        assert!(super::generation_live_from(Ok(7), 7));
+        assert!(!super::generation_live_from(Ok(8), 7));
+        assert!(!super::generation_live_from(
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            7
+        ));
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            assert!(
+                super::generation_live_from(Err(std::io::Error::from(kind)), 7),
+                "{kind:?} proves nothing"
+            );
+        }
+    }
+
     use super::{
         BUDGET_STOP_DEMOTE_AFTER, ChargeOutcome, MemberOutcome, ScanPassOwner, demotion_gap_subject,
     };

@@ -495,6 +495,16 @@ pub(crate) fn learned_pin_stage(reason: &str) -> &'static str {
     "other"
 }
 
+/// The pin of one `fstat` result: the same `(ino, size, ctime)` as
+/// [`pin_from_metadata`].
+pub(crate) fn pin_from_stat(stat: &libc::stat) -> Pin {
+    Pin {
+        ino: stat.st_ino,
+        size: stat.st_size as u64,
+        ctime: (stat.st_ctime, stat.st_ctime_nsec),
+    }
+}
+
 pub(crate) fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
     Pin {
         ino: md.ino(),
@@ -1193,23 +1203,17 @@ fn filesystem_without_unique_inodes_metered(
     fd: RawFd,
     admit: &mut dyn FnMut() -> bool,
 ) -> Option<Result<Option<&'static str>, String>> {
-    if !admit() {
-        return None;
-    }
-    #[cfg(test)]
-    provider_metadata_read_test::metadata_read();
-    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
-    if unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) } != 0 {
-        return Some(Err(format!(
-            "fstatfs failed while classifying inode uniqueness: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: the successful `fstatfs` above initialized `buf`. `f_type` is
-    // signed on some ABIs; the magic numbers are 32-bit values.
+    let stat = match crate::process::metered_io::fstatfs(fd, admit)? {
+        Ok(stat) => stat,
+        Err(error) => {
+            return Some(Err(format!(
+                "fstatfs failed while classifying inode uniqueness: {error}"
+            )));
+        }
+    };
+    // `f_type` is signed on some ABIs; the magic numbers are 32-bit values.
     #[allow(clippy::unnecessary_cast)]
-    let f_type = unsafe { buf.assume_init().f_type } as u64 & 0xffff_ffff;
+    let f_type = stat.f_type as u64 & 0xffff_ffff;
     if let Some(kind) = nonunique_inode_kind(f_type) {
         return Some(Ok(Some(kind)));
     }
@@ -1238,75 +1242,17 @@ fn filesystem_without_unique_inodes_metered(
     Some(Ok(tmpfs_nonunique_kind(super_options.as_deref())))
 }
 
-/// The first row of a procfs file that `find` accepts, read in bounded
-/// chunks: `admit()` is asked before the open, before every chunk read
-/// and before every 64 rows examined; `None` is a refusal. The search
-/// stops at the first match, so an early row never costs the whole
-/// table; a row longer than 64 KiB, or one that is not UTF-8, fails
-/// closed.
+/// The first row of a procfs file that `find` accepts, read through the
+/// metered row reader ([`crate::process::metered_io::find_line`]): the
+/// open with its close, each chunk read and each 64 rows are admitted
+/// first; `None` is a refusal, and an over-long row fails closed.
 fn metered_find_line<T>(
     path: &str,
     admit: &mut dyn FnMut() -> bool,
-    mut find: impl FnMut(&str) -> Option<T>,
+    find: impl FnMut(&str) -> Option<T>,
 ) -> Option<Result<Option<T>, String>> {
-    use std::io::Read as _;
-    const CHUNK_BYTES: usize = 4096;
-    const MAX_ROW_BYTES: usize = 64 * 1024;
-    if !admit() {
-        return None;
-    }
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) => return Some(Err(error.to_string())),
-    };
-    let mut pending: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; CHUNK_BYTES];
-    let mut rows = 0u64;
-    loop {
-        if !admit() {
-            return None;
-        }
-        #[cfg(test)]
-        provider_metadata_read_test::metadata_read();
-        let count = match file.read(&mut chunk) {
-            Ok(count) => count,
-            Err(error) => return Some(Err(error.to_string())),
-        };
-        let eof = count == 0;
-        // The carried partial row holds no newline: search the new bytes.
-        let mut search = pending.len();
-        pending.extend_from_slice(&chunk[..count]);
-        let mut start = 0;
-        loop {
-            let end = match pending[search..].iter().position(|byte| *byte == b'\n') {
-                Some(offset) => search + offset,
-                None if eof && start < pending.len() => pending.len(),
-                None => break,
-            };
-            rows += 1;
-            if rows.is_multiple_of(64) && !admit() {
-                return None;
-            }
-            let Ok(row) = std::str::from_utf8(&pending[start..end]) else {
-                return Some(Err("procfs row is not UTF-8".into()));
-            };
-            if let Some(found) = find(row) {
-                return Some(Ok(Some(found)));
-            }
-            start = (end + 1).min(pending.len());
-            search = start;
-            if end == pending.len() {
-                break;
-            }
-        }
-        pending.drain(..start);
-        if eof {
-            return Some(Ok(None));
-        }
-        if pending.len() > MAX_ROW_BYTES {
-            return Some(Err("procfs row exceeds 64 KiB".into()));
-        }
-    }
+    crate::process::metered_io::find_line(path, admit, find)
+        .map(|read| read.map_err(|error| error.to_string()))
 }
 
 /// Whether identity decisions may treat this fd's `(st_dev, st_ino)` as
@@ -21127,7 +21073,7 @@ mod tests {
             }
             std::fs::write(&path, &text).unwrap();
             let found = metered_find_line(path.to_str().unwrap(), &mut || true, |line| {
-                line.starts_with("match").then(|| line.len())
+                line.starts_with("match").then_some(line.len())
             })
             .expect("an unmetered read is never refused");
             if accepted {

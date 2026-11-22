@@ -1827,6 +1827,20 @@ class IgnoredTestsTests(unittest.TestCase):
                 else:
                     self.assertNotIn("until", entry)
 
+    def test_joint_stop_entry_names_the_probe_seal_as_unresolved(self):
+        # The 1,038-sample micro-slice probe ran under the collapsed
+        # no-feed tag (S1 and unattributed shared one tag and bail),
+        # so its log proves no S1 seal: the entry must call it a
+        # no-feed probe with an unresolved seal, never S1-precluded.
+        entries = json.loads(INVENTORY.read_text())["sites"]
+        joint = next(
+            entry for entry in entries
+            if entry["path"] == "inventory::joint_stop_races_privileged_tests::"
+            "privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64")
+        self.assertNotIn("S1-precluded probe", joint["reason"])
+        self.assertIn("no-feed probe", joint["reason"])
+        self.assertIn("unresolved seal", joint["reason"])
+
     def test_skip_entry_without_until_fails(self):
         sources = {
             "src/lib.rs": "mod a;\n",

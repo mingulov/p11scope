@@ -2156,12 +2156,12 @@ fn no_feed_tags_name_each_branch_cause() {
     assert_eq!(no_feed_reason(&JointBranch::Linked), None);
     assert_eq!(
         no_feed_reason(&JointBranch::S1),
-        Some("no joint feeds from the linked session")
+        Some("no joint feeds with S1 seal (producers unlinked, zero installs)")
     );
     let unattributed = no_feed_reason(&JointBranch::Unattributed).expect("a cause");
     assert!(
-        unattributed.contains("no S1 seal"),
-        "the unattributed cause names the missing seal: {unattributed}"
+        unattributed.contains("producers linked, zero installs unexplained"),
+        "the unattributed cause reports what the cell sampled: {unattributed}"
     );
 }
 

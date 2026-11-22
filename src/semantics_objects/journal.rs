@@ -1398,9 +1398,19 @@ impl SealBootstrapCounts {
     }
 }
 
-/// Diagnostic-only per-stage seal counts: which gate refused or
-/// waited a seal, plus successes and current staging gauges. Counts
-/// only; no identities, paths or payloads. Disclosed on stderr when
+/// Diagnostic-only per-stage seal counts: which gate refused,
+/// waited, passed or stopped a seal, plus successes and current
+/// staging gauges. Every seal attempt that reaches staging
+/// adjudication lands in exactly one gate; attempts refused before
+/// it are counted elsewhere, never here: collection-audit voids
+/// (`Fault*`, `Malformed`, `CounterUnprovable`, `H3Loss`,
+/// `H3Exhausted`, `Discarded`, `IngestBreakLoss`, plus audit-level
+/// `H3Pending`, `ClosureStale` and `ResourceUnavailable` — whose
+/// staging-adjudication twins count stage gates instead) in the
+/// void/failure telemetry, and bootstrap mismatches per arm in
+/// `SealBootstrapCounts` (a below-fence resumption carries the
+/// `BootstrapMismatch` gap but has its own stage gate). Counts only;
+/// no identities, paths or payloads. Disclosed on stderr when
 /// verbose text is requested, never a contract and never part of
 /// reports. Instrumentation only: it changes no Joint decision,
 /// seal, fence or gap.
@@ -1423,6 +1433,10 @@ pub(crate) struct SealStageCounts {
     pub(crate) h3_pending: u64,
     pub(crate) model_refused: u64,
     pub(crate) success: u64,
+    pub(crate) stopped: u64,
+    pub(crate) adapter_invalidated: u64,
+    pub(crate) resource_unavailable: u64,
+    pub(crate) cut_exhausted: u64,
     pub(crate) open_staged: u64,
     pub(crate) refused_staged: u64,
     pub(crate) claims_held: u64,
@@ -1449,6 +1463,16 @@ pub(crate) enum SealStageGate {
     H3Pending,
     ModelRefused,
     Success,
+    Stopped,
+    AdapterInvalidated,
+    /// A seal-time convert shortfall (missing H8 reservation), not an
+    /// audit-void resource refusal (which stays in void telemetry).
+    ResourceUnavailable,
+    /// A `u64::MAX` floor increment with no successor. The seal's
+    /// floor inputs never exceed the consumed frontier, so this is
+    /// unreachable end to end; the gate exists so the line stays
+    /// exhaustive.
+    CutExhausted,
 }
 
 /// One seal bootstrap refusal arm (diagnostic-only): counted by
@@ -3834,6 +3858,18 @@ impl JournalAdapter {
             }
             SealStageGate::Success => {
                 counts.success = counts.success.saturating_add(1);
+            }
+            SealStageGate::Stopped => {
+                counts.stopped = counts.stopped.saturating_add(1);
+            }
+            SealStageGate::AdapterInvalidated => {
+                counts.adapter_invalidated = counts.adapter_invalidated.saturating_add(1);
+            }
+            SealStageGate::ResourceUnavailable => {
+                counts.resource_unavailable = counts.resource_unavailable.saturating_add(1);
+            }
+            SealStageGate::CutExhausted => {
+                counts.cut_exhausted = counts.cut_exhausted.saturating_add(1);
             }
         }
     }
@@ -8433,9 +8469,24 @@ impl JournalAdapter {
     ) -> Result<SealSuccess, SealFailure> {
         let mark = self.rejection_mark();
         let outcome = (|| {
-            self.check_collection_owner(audit)?;
+            if let Err(failure) = self.check_collection_owner(audit) {
+                match failure.gap {
+                    JournalGap::DrainMismatch => {
+                        self.note_seal_stage(SealStageGate::DrainMismatch);
+                    }
+                    JournalGap::Stopped => {
+                        self.note_seal_stage(SealStageGate::Stopped);
+                    }
+                    JournalGap::AdapterInvalidated => {
+                        self.note_seal_stage(SealStageGate::AdapterInvalidated);
+                    }
+                    _ => {}
+                }
+                return Err(failure);
+            }
             let frontier = frontier.0;
             if frontier > self.consumed_through {
+                self.note_seal_stage(SealStageGate::FrontierRegression);
                 return Err(self.failure(JournalGap::FrontierRegression));
             }
             self.audit_collected(model, audit, fault)?;
@@ -8467,8 +8518,17 @@ impl JournalAdapter {
         let requested = self.retained_failure_domain(bootstrap);
         let outcome = (|| {
             if let Err(failure) = self.check_collection_owner(audit) {
-                if failure.gap == JournalGap::DrainMismatch {
-                    self.note_seal_stage(SealStageGate::DrainMismatch);
+                match failure.gap {
+                    JournalGap::DrainMismatch => {
+                        self.note_seal_stage(SealStageGate::DrainMismatch);
+                    }
+                    JournalGap::Stopped => {
+                        self.note_seal_stage(SealStageGate::Stopped);
+                    }
+                    JournalGap::AdapterInvalidated => {
+                        self.note_seal_stage(SealStageGate::AdapterInvalidated);
+                    }
+                    _ => {}
                 }
                 return Err(failure);
             }
@@ -8752,7 +8812,11 @@ impl JournalAdapter {
             state.bounded_upper,
             &pending_bounds,
         )
-        .map_err(|gap| self.failure(gap))?;
+        .map_err(|gap| {
+            debug_assert_eq!(gap, JournalGap::CutExhausted);
+            self.note_seal_stage(SealStageGate::CutExhausted);
+            self.failure(gap)
+        })?;
         // Held pin: the earliest staged begin this seal keeps. Bounded
         // losses removed below contribute their bound instead of their
         // begin; everything else convertible here may still apply. A
@@ -10123,10 +10187,19 @@ impl JournalAdapter {
             replay,
             &disposable,
         );
-        if let Err(failure) = &outcome
-            && failure.gap == JournalGap::ModelRefused
-        {
-            self.note_seal_stage(SealStageGate::ModelRefused);
+        if let Err(failure) = &outcome {
+            match failure.gap {
+                JournalGap::ModelRefused => {
+                    self.note_seal_stage(SealStageGate::ModelRefused);
+                }
+                JournalGap::ResourceUnavailable => {
+                    self.note_seal_stage(SealStageGate::ResourceUnavailable);
+                }
+                JournalGap::DomainEnded => {
+                    self.note_seal_stage(SealStageGate::DomainEnded);
+                }
+                _ => {}
+            }
         }
         outcome
     }
@@ -31467,8 +31540,8 @@ pub(crate) mod tests {
     }
 
     /// Seal-stage diagnostics: every gate counts its own bucket.
-    /// Unit coverage for the counter method (all 17 gates); the
-    /// production-path test below pins counting through real seals.
+    /// Unit coverage for the counter method (all 21 gates); the
+    /// production-path tests below pin counting through real seals.
     #[test]
     fn seal_stage_note_covers_every_gate() {
         let mut scene = Scene::new(image_default());
@@ -31490,6 +31563,10 @@ pub(crate) mod tests {
             SealStageGate::H3Pending,
             SealStageGate::ModelRefused,
             SealStageGate::Success,
+            SealStageGate::Stopped,
+            SealStageGate::AdapterInvalidated,
+            SealStageGate::ResourceUnavailable,
+            SealStageGate::CutExhausted,
         ] {
             scene.adapter.note_seal_stage(gate);
         }
@@ -31523,6 +31600,13 @@ pub(crate) mod tests {
         assert_eq!(counts.h3_pending, 1, "h3_pending counts");
         assert_eq!(counts.model_refused, 1, "model_refused counts");
         assert_eq!(counts.success, 1, "success counts");
+        assert_eq!(counts.stopped, 1, "stopped counts");
+        assert_eq!(counts.adapter_invalidated, 1, "adapter_invalidated counts");
+        assert_eq!(
+            counts.resource_unavailable, 1,
+            "resource_unavailable counts"
+        );
+        assert_eq!(counts.cut_exhausted, 1, "cut_exhausted counts");
     }
 
     /// Seal-stage diagnostics through real seals: a refused key
@@ -31570,6 +31654,765 @@ pub(crate) mod tests {
         assert_eq!(
             counts.claims_held, scene.adapter.claim_counts as u64,
             "claims gauge matches"
+        );
+    }
+
+    /// Seal-stage counter profile: exactly `gate` counted once, every
+    /// other gate zero (gauges excluded: they report live staging).
+    /// A deleted note site fails here; a double-count fails here too.
+    fn assert_stage_profile(counts: &SealStageCounts, gate: SealStageGate) {
+        let profile = [
+            (SealStageGate::DomainTainted, counts.domain_tainted),
+            (SealStageGate::ImageTainted, counts.image_tainted),
+            (SealStageGate::DrainMismatch, counts.drain_mismatch),
+            (SealStageGate::DomainEnded, counts.domain_ended),
+            (SealStageGate::ClosureStale, counts.closure_stale),
+            (
+                SealStageGate::FrontierRegression,
+                counts.frontier_regression,
+            ),
+            (SealStageGate::BelowFence, counts.below_fence),
+            (SealStageGate::UnboundStaging, counts.unbound_staging),
+            (
+                SealStageGate::AttributionPending,
+                counts.attribution_pending,
+            ),
+            (SealStageGate::ClaimUnmatched, counts.claim_unmatched),
+            (
+                SealStageGate::FreshBirthNoHistory,
+                counts.fresh_birth_no_history,
+            ),
+            (
+                SealStageGate::FloorsPastFrontier,
+                counts.floors_past_frontier,
+            ),
+            (
+                SealStageGate::AbandonReturnPending,
+                counts.abandon_return_pending,
+            ),
+            (
+                SealStageGate::RefusedReturnPending,
+                counts.refused_return_pending,
+            ),
+            (SealStageGate::H3Pending, counts.h3_pending),
+            (SealStageGate::ModelRefused, counts.model_refused),
+            (SealStageGate::Success, counts.success),
+            (SealStageGate::Stopped, counts.stopped),
+            (
+                SealStageGate::AdapterInvalidated,
+                counts.adapter_invalidated,
+            ),
+            (
+                SealStageGate::ResourceUnavailable,
+                counts.resource_unavailable,
+            ),
+            (SealStageGate::CutExhausted, counts.cut_exhausted),
+        ];
+        for (candidate, count) in profile {
+            assert_eq!(count, u64::from(candidate == gate), "{candidate:?} profile");
+        }
+    }
+
+    /// Seal-stage diagnostics through a real seal: unknown staged
+    /// entries barrier the seal, which waits `UnboundStaging` and
+    /// counts exactly that gate. No awaited terminal exists under
+    /// unbound staging, so the frame keeps retrying (the void sheds
+    /// the barrier).
+    #[test]
+    fn seal_stage_unbound_staging_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let strange = begin_bytes_image(2, 1, create, 0, (COOKIE + 9, EXEC));
+        scene.ingest(&strange);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let blocked = scene
+            .seal(&bootstrap)
+            .expect_err("unknown staged entries barrier");
+        assert_eq!(blocked.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::UnboundStaging,
+            "the wait names its gate"
+        );
+        assert!(
+            !scene
+                .adapter
+                .awaits_future_terminal(&bootstrap, scene.adapter.consumed_frontier()),
+            "no terminal waits past unbound staging"
+        );
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::UnboundStaging,
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: an unclaimed staged
+    /// call waits `AttributionPending` and counts exactly that gate;
+    /// its admission then lets the same seal convert (the healthy
+    /// twin), counting success. The unclaimed call is itself an
+    /// awaited terminal, so this shape advanced as future input even
+    /// before the wait-half change (which the abandon/floors frame
+    /// seam tests pin with no terminal waiting). No frame seam test
+    /// stages this wait: the frame fixture admits and claims every
+    /// staged call, so unclaimed shaping stays at this layer.
+    #[test]
+    fn seal_stage_attribution_pending_counts_through_seal() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        scene.ingest(&begin_bytes(1, 2, create, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let blocked = scene
+            .seal(&bootstrap)
+            .expect_err("unclaimed staged call waits");
+        assert_eq!(blocked.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::AttributionPending,
+            "the wait names its gate"
+        );
+        assert!(
+            scene
+                .adapter
+                .awaits_future_terminal(&bootstrap, scene.adapter.consumed_frontier()),
+            "the unclaimed call is itself the awaited terminal"
+        );
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::AttributionPending,
+        );
+        scene.attest();
+        scene.seal(&bootstrap).expect("claimed calls seal");
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::AttributionPending, 1),
+                (SealStageGate::Success, 1),
+            ],
+        );
+    }
+
+    /// Seal-stage diagnostics through a real seal: a resumption that
+    /// names the void fence with no new staged history waits
+    /// `FreshBirthNoHistory` and counts exactly that gate; genuinely
+    /// new history above the fence recovers (the healthy twin).
+    #[test]
+    fn seal_stage_fresh_birth_no_history_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let waiting = scene
+            .seal_at(&resume, 8)
+            .expect_err("empty resumption waits for history");
+        assert_eq!(waiting.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::FreshBirthNoHistory,
+            "the wait names its gate"
+        );
+        // The voiding seal above counted no stage gate (audit voids
+        // stay in void telemetry), so the profile holds exactly.
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::FreshBirthNoHistory,
+        );
+        // Genuinely new staged history above the fence recovers. The
+        // void cleared admission claims: re-attest for the new history.
+        scene.attest();
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.seal_at(&resume, 8).expect("new history recovers");
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::FreshBirthNoHistory, 1),
+                (SealStageGate::Success, 1),
+            ],
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: the first seal pins
+    /// the birth, a repeat at the unchanged frontier waits
+    /// `FloorsPastFrontier` (never succeeding vacuously) and counts
+    /// exactly that gate, and new history re-seals under the same
+    /// pinned birth (the healthy twin).
+    #[test]
+    fn seal_stage_floors_past_frontier_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal passes");
+        let counts = scene.adapter.seal_stage_diagnosis();
+        assert_eq!(counts.success, 1, "first seal counts success");
+        let repeat = scene.seal(&bootstrap).expect_err("repeat waits");
+        assert_eq!(repeat.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::FloorsPastFrontier,
+            "the wait names its gate"
+        );
+        assert!(
+            !scene
+                .adapter
+                .awaits_future_terminal(&bootstrap, scene.adapter.consumed_frontier()),
+            "no terminal waits past converted history"
+        );
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::Success, 1),
+                (SealStageGate::FloorsPastFrontier, 1),
+            ],
+        );
+        scene.ingest(&begin_bytes(1, 2, create, 0));
+        scene.seal(&bootstrap).expect("new history re-seals");
+    }
+
+    /// Seal-stage counter profile over several seals: exactly the
+    /// named gates counted, every other gate zero.
+    fn assert_stage_profile_after(counts: &SealStageCounts, expected: &[(SealStageGate, u64)]) {
+        let profile = [
+            (SealStageGate::DomainTainted, counts.domain_tainted),
+            (SealStageGate::ImageTainted, counts.image_tainted),
+            (SealStageGate::DrainMismatch, counts.drain_mismatch),
+            (SealStageGate::DomainEnded, counts.domain_ended),
+            (SealStageGate::ClosureStale, counts.closure_stale),
+            (
+                SealStageGate::FrontierRegression,
+                counts.frontier_regression,
+            ),
+            (SealStageGate::BelowFence, counts.below_fence),
+            (SealStageGate::UnboundStaging, counts.unbound_staging),
+            (
+                SealStageGate::AttributionPending,
+                counts.attribution_pending,
+            ),
+            (SealStageGate::ClaimUnmatched, counts.claim_unmatched),
+            (
+                SealStageGate::FreshBirthNoHistory,
+                counts.fresh_birth_no_history,
+            ),
+            (
+                SealStageGate::FloorsPastFrontier,
+                counts.floors_past_frontier,
+            ),
+            (
+                SealStageGate::AbandonReturnPending,
+                counts.abandon_return_pending,
+            ),
+            (
+                SealStageGate::RefusedReturnPending,
+                counts.refused_return_pending,
+            ),
+            (SealStageGate::H3Pending, counts.h3_pending),
+            (SealStageGate::ModelRefused, counts.model_refused),
+            (SealStageGate::Success, counts.success),
+            (SealStageGate::Stopped, counts.stopped),
+            (
+                SealStageGate::AdapterInvalidated,
+                counts.adapter_invalidated,
+            ),
+            (
+                SealStageGate::ResourceUnavailable,
+                counts.resource_unavailable,
+            ),
+            (SealStageGate::CutExhausted, counts.cut_exhausted),
+        ];
+        for (candidate, count) in profile {
+            let want = expected
+                .iter()
+                .find(|(gate, _)| *gate == candidate)
+                .map(|(_, count)| *count)
+                .unwrap_or(0);
+            assert_eq!(count, want, "{candidate:?} profile");
+        }
+    }
+
+    /// Seal-stage diagnostics through a real seal: a bounded
+    /// abandonment without its corroborating return waits
+    /// `AbandonReturnPending` and counts exactly that gate; staged
+    /// inputs are kept for the later corroborated seal.
+    #[test]
+    fn seal_stage_abandon_return_pending_counts_through_seal() {
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        // A pending return never corroborates.
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, rv_pending())),
+            JournalDisposition::OrdinaryCounted
+        );
+        scene.ingest(&abandon_bytes(
+            1,
+            1,
+            JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+            (COOKIE, EXEC),
+        ));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("uncorroborated bound waits");
+        assert_eq!(failure.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::AbandonReturnPending,
+            "the wait names its gate"
+        );
+        assert!(
+            !scene
+                .adapter
+                .awaits_future_terminal(&bootstrap, scene.adapter.consumed_frontier()),
+            "the corroborating return is input, not a terminal"
+        );
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::AbandonReturnPending,
+        );
+    }
+
+    /// Seal-stage diagnostics through a real seal: a refused begin
+    /// whose bound lacks its corroborating return waits
+    /// `RefusedReturnPending` and counts exactly that gate. No
+    /// terminal waits here, so the frame advances this wait purely
+    /// on its wait half. No frame seam test stages this wait:
+    /// refused begins need capacity overflow (policy: 4,096 open
+    /// calls), unreachable in the frame fixture.
+    #[test]
+    fn seal_stage_refused_return_pending_counts_through_seal() {
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 1,
+                thread_floors: 8,
+                refused_begins: 8,
+                domain_keys: 4,
+                image_sightings: 8,
+            },
+        );
+        let proof = scene.attest();
+        scene.attest_session_function(0x1111_1111_1111_1111, "C_CreateObject");
+        let create = function_id("C_CreateObject");
+        let mut first = begin_bytes(1, 1, create, 0);
+        put_u64(&mut first, 80, 0x1111_1111_1111_1111);
+        scene.ingest(&first);
+        let second = begin_bytes(1, 2, create, 0);
+        assert_eq!(
+            scene.ingest(&second),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        // A foreign return never corroborates this invocation.
+        let mut foreign = ordinary_for(&second, 0);
+        foreign.image.exec_id ^= 0x0F0F_0F0F_0F0F_0F0F;
+        assert_eq!(
+            scene.ingest_ordinary(foreign),
+            JournalDisposition::OrdinaryCounted
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let unready = scene
+            .seal(&bootstrap)
+            .expect_err("foreign witness leaves the bound unready");
+        assert_eq!(unready.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.adapter.last_seal_wait(),
+            SealWait::RefusedReturnPending,
+            "the wait names its gate"
+        );
+        assert!(
+            !scene
+                .adapter
+                .awaits_future_terminal(&bootstrap, scene.adapter.consumed_frontier()),
+            "a refused bound is input, not a terminal"
+        );
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::RefusedReturnPending,
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: a stopped adapter
+    /// never seals (counts `Stopped`), and an invalidated adapter
+    /// refuses (counts `AdapterInvalidated`).
+    #[test]
+    fn seal_stage_stopped_and_invalidated_count_through_seals() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let create = function_id("C_CreateObject");
+        // Stopped: a healthy seal first (pairing its claims), then
+        // the adapter stops and every later seal refuses. The
+        // refusing seals go through `seal_explicit` with a
+        // pre-stop audit: pairing new claims on a stopped adapter
+        // refuses before any seal runs.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("healthy history seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        scene.adapter.stop(&mut scene.model);
+        let retry = scene
+            .seal_explicit(&audit, &bootstrap, frontier, fresh)
+            .expect_err("stopped adapter never seals");
+        assert_eq!(retry.gap, JournalGap::Stopped);
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[(SealStageGate::Success, 1), (SealStageGate::Stopped, 1)],
+        );
+        // Invalidated: a healthy seal first, then the adapter
+        // invalidates and every later seal refuses.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("healthy history seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        scene.adapter.invalidated = true;
+        let refused = scene
+            .seal_explicit(&audit, &bootstrap, frontier, fresh)
+            .expect_err("invalidated adapter refuses");
+        assert_eq!(refused.gap, JournalGap::AdapterInvalidated);
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::Success, 1),
+                (SealStageGate::AdapterInvalidated, 1),
+            ],
+        );
+    }
+
+    /// Seal-stage diagnostics through a real seal: a frontier past
+    /// the consumed history refuses `FrontierRegression` at the
+    /// wrapper and counts exactly that gate.
+    #[test]
+    fn seal_stage_frontier_regression_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let beyond = ConsumptionOrdinal(frontier.0 + 10);
+        let refused = scene
+            .seal_explicit(&audit, &bootstrap, beyond, fresh)
+            .expect_err("frontier past consumed history refuses");
+        assert_eq!(refused.gap, JournalGap::FrontierRegression);
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::FrontierRegression,
+        );
+    }
+
+    /// Seal-stage diagnostics through a real seal: a foreign drain
+    /// presented first refuses `DrainMismatch` and counts exactly
+    /// that gate, consuming nothing.
+    #[test]
+    fn seal_stage_drain_mismatch_counts_through_seal() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let fault = ScriptedFaultCell::steady(7);
+        let bootstrap = scene.bootstrap(proof, 0);
+        // FOREIGN FIRST with no setup at all: EVENTS 9 presented before
+        // any grant mints refuses and consumes nothing.
+        let foreign = begin_bytes(1, 2, create, 0);
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(vec![foreign.to_vec()], 1),
+            9,
+        );
+        let refused =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
+        assert_eq!((refused.ingested, refused.ordinary), (0, 0));
+        let mut source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(0));
+        let audit = JournalAuditReceipt::collect(&refused, &mut source, scene.closure_generation());
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let failure = scene
+            .seal_explicit(&audit, &bootstrap, frontier, fresh)
+            .expect_err("first-presented foreign drain refuses");
+        assert_eq!(failure.gap, JournalGap::DrainMismatch);
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::DrainMismatch,
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: a forged return on
+    /// a call's own entry-time identity (the session is enrichment,
+    /// not identity) ends the seal named (`ClaimUnmatched`, tainting
+    /// the image) and counts its gate; the next seal then refuses on
+    /// the tainted image, counting `ImageTainted`.
+    #[test]
+    fn seal_stage_claim_unmatched_and_image_tainted_count_through_seals() {
+        let (mut scene, proof) =
+            begin_only_claim_scene("C_SignInit", |_, _| {}, |event| event.session ^= 1);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let ended = scene
+            .seal(&bootstrap)
+            .expect_err("a forged return ends the seal named");
+        assert_eq!(ended.gap, JournalGap::ClaimUnmatched);
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::ClaimUnmatched,
+        );
+        let refused = scene
+            .seal(&bootstrap)
+            .expect_err("the tainted image refuses the next seal");
+        assert_eq!(refused.gap, JournalGap::ImageTainted);
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::ClaimUnmatched, 1),
+                (SealStageGate::ImageTainted, 1),
+            ],
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: a model capacity
+    /// refusal on the conversion path fails the seal closed as
+    /// `ModelRefused` and counts its gate after the earlier success.
+    #[test]
+    fn seal_stage_model_refused_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        // Shrink ONLY the model: the journal stages every begin, the
+        // model holds two pending calls.
+        scene.model = ObjectSemantics::with_limits(crate::semantics_objects::ObjectLimits {
+            pending_calls: 2,
+            ..crate::semantics_objects::ObjectLimits::policy()
+        });
+        let proof = scene.attest_calls(4);
+        let create = function_id("C_CreateObject");
+        // One creation settles first: its live view is what the later
+        // refusal retires.
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("creation seals");
+        // Three opens convert into two model slots: the third begin
+        // refuses capacity on the conversion path.
+        scene.ingest(&begin_bytes(1, 2, create, 0));
+        scene.ingest(&begin_bytes(1, 3, create, 0));
+        scene.ingest(&begin_bytes(1, 4, create, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("model capacity refuses the seal");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::Success, 1),
+                (SealStageGate::ModelRefused, 1),
+            ],
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: a receipt cut below
+    /// the void fence refuses `BootstrapMismatch` through the fence
+    /// arm and counts the `BelowFence` gate (the voiding seal itself
+    /// counts no stage gate: audit voids stay in void telemetry).
+    #[test]
+    fn seal_stage_below_fence_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let y_proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let y_begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&y_begin);
+        scene.ingest(&end_bytes(&y_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let x_image = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        let shed_begin = begin_bytes_image(9, 9, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest_ordinary(ordinary_for(&shed_begin, 0));
+        assert_eq!(scene.adapter.consumed_through, 3);
+        let y_bootstrap = scene.bootstrap(y_proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted_h0(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            scene.closure_generation(),
+            6,
+        );
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &y_bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&y_bootstrap),
+            )
+            .expect_err("H3 loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        let x_begin = begin_bytes_image(2, 1, create, 0, (x_image.task_cookie, x_image.exec_id));
+        scene.ingest(&x_begin);
+        let x_end = end_bytes(&x_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        assert_eq!(scene.ingest(&x_end), JournalDisposition::EndStaged);
+        let mut x_fixture = AttestationFixture::new(x_image);
+        let x_proof = scene.admit_other_end(&mut x_fixture, "C_CreateObject", &x_end);
+        let scripted = BootstrapReceipt::scripted(
+            x_proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        let refused = scene
+            .seal_explicit(
+                &audit,
+                &scripted,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&scripted),
+            )
+            .expect_err("seal below the fence refuses");
+        assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        assert_stage_profile(
+            &scene.adapter.seal_stage_diagnosis(),
+            SealStageGate::BelowFence,
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: a receipt from a
+    /// retired closure generation refuses `ClosureStale` and counts
+    /// its gate after the earlier success.
+    #[test]
+    fn seal_stage_closure_stale_counts_through_seal() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // Healthy history seals under the observed sealing generation.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal(&bootstrap)
+            .expect("observed-closure seal passes");
+        // A later sealing advances the closure, retiring old audits
+        // and old receipts alike.
+        let aux = AttestationFixture::new(image_default());
+        let advanced = aux.attachment().generation();
+        assert!(
+            scene
+                .adapter
+                .install_closure_grant(&SessionClosureGrant::observe(aux.attachment()))
+        );
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh_audit = JournalAuditReceipt::scripted(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            advanced,
+        );
+        let refused = scene
+            .seal_explicit(
+                &fresh_audit,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("stale receipt refuses");
+        assert_eq!(refused.gap, JournalGap::ClosureStale);
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[
+                (SealStageGate::Success, 1),
+                (SealStageGate::ClosureStale, 1),
+            ],
+        );
+    }
+
+    /// Seal-stage diagnostics through real seals: an ambiguous
+    /// `C_Finalize` ends its era without proving completion, so the
+    /// later seal refuses `DomainEnded` and counts its gate after the
+    /// earlier success.
+    #[test]
+    fn seal_stage_domain_ended_counts_through_seal() {
+        let (scene, _, later) = finalize_then_later_seal(pkcs11_types::CkRv::GENERAL_ERROR.0);
+        let failure = later.expect_err("an ambiguous Finalize is no completed history");
+        assert_eq!(failure.gap, JournalGap::DomainEnded);
+        assert_stage_profile_after(
+            &scene.adapter.seal_stage_diagnosis(),
+            &[(SealStageGate::Success, 1), (SealStageGate::DomainEnded, 1)],
         );
     }
 

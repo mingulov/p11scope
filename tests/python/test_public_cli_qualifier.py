@@ -437,7 +437,7 @@ class InventoryOverlayTests(unittest.TestCase):
         # shape must survive that reason and still qualify.
         report = overlay_published_report()
         report["gaps"].append(
-            {"caller": None, "module": None, "pid": None,
+            {"caller": None, "module": None, "pid": None, "budget": None,
              "reason": "cgroup collection deadline reached",
              "subject": "cgroup scope transaction incomplete",
              "repeats": 2})

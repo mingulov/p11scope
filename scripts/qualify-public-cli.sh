@@ -873,9 +873,34 @@ unproven=[]
 # owning caller. This runs outside the degraded branch so a
 # witness-available report cannot smuggle a lone or duplicated
 # retained row past the qualifier.
+# The run-deadline row carries the same producer shape with or
+# without a companion gap: a clean preparation pass can still hit
+# the run deadline (the retained-refresh shape proves it), so the
+# row is validated whenever present, independently of the
+# preparation-interruption row. The fixed subject, explicitly
+# present null caller/module/pid keys, an explicitly present null
+# budget (the row records no budget refusal), and a positive
+# integer recording count (open-ended: any repeats>=1 qualifies).
+# Absent is not null: the renderer always emits the keys. The
+# producer dedupes identical rows, so duplicates are malformed. A
+# lone valid row qualifies (deadline-only positive).
+deadline=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup collection deadline reached']
+if deadline:
+    for g in deadline:
+        assert g.get('subject')=='cgroup scope transaction incomplete', 'malformed run deadline row: %r' % (g,)
+        assert 'caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed run deadline scope: %r' % (g,)
+        assert 'budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,)
+        assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,)
+    assert len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,)
+# The facts-retained refresh refusal only comes with a
+# run-deadline straddle on every substrate: the deadline gap must
+# be present in the same run, and at most one retained row per
+# owning caller. This runs outside the degraded branch so a
+# witness-available report cannot smuggle a lone or duplicated
+# retained row past the qualifier.
 retained=[g for g in report.get('gaps',[]) if g.get('reason')=='the final-sample permit was not granted; prior owner facts retained']
 if retained:
-    assert any(g.get('reason')=='cgroup collection deadline reached' for g in report.get('gaps',[])), 'retained refresh without a run deadline: %r' % (retained,)
+    assert deadline, 'retained refresh without a run deadline: %r' % (retained,)
     assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
 # The interrupted provider-input comparison only comes with a
 # run-deadline straddle on every substrate: the pass was cancelled
@@ -884,13 +909,8 @@ if retained:
 # witness-available report cannot smuggle a lone interrupted row
 # past the qualifier; a budget or fence interruption without a
 # deadline is a different phenomenon and stays loud.
-# Both rows must carry the producer shape: the fixed subject,
-# explicitly present null caller/module/pid keys, an explicitly
-# present null budget (neither row records a budget refusal), and
-# a positive integer recording count (open-ended: any repeats>=1
-# qualifies). Absent is not null: the renderer always emits the
-# keys. The producer dedupes identical rows, so duplicates are
-# malformed.
+# The prep row carries the same producer shape as the deadline row
+# above (fixed subject, explicit nulls, positive count, deduped).
 prep=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup provider input comparison interrupted']
 if prep:
     for g in prep:
@@ -899,14 +919,7 @@ if prep:
         assert 'budget' in g and g['budget'] is None, 'malformed interrupted preparation budget: %r' % (g,)
         assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,)
     assert len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,)
-    deadline=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup collection deadline reached']
     assert deadline, 'interrupted preparation without a run deadline: %r' % (prep,)
-    for g in deadline:
-        assert g.get('subject')=='cgroup scope transaction incomplete', 'malformed run deadline row: %r' % (g,)
-        assert 'caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed run deadline scope: %r' % (g,)
-        assert 'budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,)
-        assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,)
-    assert len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the

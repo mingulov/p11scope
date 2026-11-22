@@ -7575,6 +7575,139 @@ fn exit_tick_keeps_never_scanned_key_pending_until_expiry() {
     assert_eq!(shed[0].route(), Route::Unknown(UnknownReason::Unobserved));
 }
 #[test]
+fn held_key_scans_once_its_pin_arrives() {
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    // Every process counts as post-attach: pin-less calls hold for the
+    // imminent binding instead of shedding.
+    capture.retention_attach_ticks = Some(0);
+    // First burst with no pin: held, no job queued.
+    io.targets_absent = true;
+    io.call(1, 0);
+    let held = capture.tick_with(&mut io).unwrap();
+    assert!(held.calls().next().is_none());
+    assert_eq!(capture.router.pending_len(), 1);
+    assert!(capture.jobs.is_empty());
+    // The pin arrives with no new calls: the held key still scans.
+    io.targets_absent = false;
+    let admitted = capture.tick_with(&mut io).unwrap();
+    let joined: Vec<_> = admitted.calls().collect();
+    assert_eq!(joined.len(), 1);
+    assert!(
+        matches!(joined[0].route(), Route::Joined(_)),
+        "a held key scans once its pin arrives, without waiting for new calls"
+    );
+}
+#[test]
+fn held_requeue_is_bounded_per_pass_and_resumes() {
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    capture.retention_attach_ticks = Some(0);
+    io.targets_absent = true;
+    for cookie in 1..=10u64 {
+        io.call(cookie, 0);
+    }
+    let held = capture.tick_with(&mut io).unwrap();
+    assert!(held.calls().next().is_none());
+    assert_eq!(capture.router.pending_len(), 10);
+    assert!(capture.jobs.is_empty());
+    io.targets_absent = false;
+    // Four admissions per pass (the scan bound), resuming across passes.
+    let mut joined_total = 0;
+    let mut scans_total = 0;
+    for (pass, expected) in [4, 4, 2].into_iter().enumerate() {
+        let report = capture.tick_with(&mut io).unwrap();
+        let joined = report
+            .calls()
+            .filter(|call| matches!(call.route(), Route::Joined(_)))
+            .count();
+        assert_eq!(joined, expected, "pass {pass} admits a bounded share");
+        joined_total += joined;
+        scans_total += report.scans;
+    }
+    assert_eq!(joined_total, 10);
+    assert_eq!(capture.router.pending_len(), 0);
+    assert_eq!(
+        scans_total, 10,
+        "each held key scans exactly once (no double queueing)"
+    );
+}
+#[test]
+fn held_requeue_skips_retired_keys_and_admits_live_ones() {
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    capture.retention_attach_ticks = Some(0);
+    prime(&mut capture, &mut io);
+    // A second key of task 1 and a key of task 2 both hold pin-less.
+    io.targets_absent = true;
+    io.semantic_call("C_Sign", 1, 0);
+    io.call(2, 0);
+    let held = capture.tick_with(&mut io).unwrap();
+    assert!(held.calls().next().is_none());
+    assert_eq!(capture.router.pending_len(), 2);
+    // Task 1 exits before its held key scans: swap its binding pin for
+    // one on an exited process.
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn true");
+    let pid = child.id();
+    let exited_pin = Arc::new(PidPin::test_pidfd_only(pid));
+    child.wait().expect("reap true");
+    assert!(
+        exited_pin.wait_ready(Some(Duration::ZERO)).unwrap_or(false),
+        "exited pin must read ready"
+    );
+    capture.bindings.get_mut(&1).expect("primed binding").pin = exited_pin;
+    io.targets_absent = false;
+    let exit_tick = capture.tick_with(&mut io).unwrap();
+    assert!(
+        exit_tick.outcomes().iter().any(|o| matches!(
+            o,
+            TickOutcome::Invalidation(i)
+                if matches!(i.scope(), InvalidationScope::TaskRetired(1))
+        )),
+        "the exit still retires the task"
+    );
+    // The live task's held key scans and joins; the retired task's held
+    // key stays pending with no wasted scan job.
+    assert!(
+        exit_tick
+            .calls()
+            .any(|call| call.image().task_cookie == 2 && matches!(call.route(), Route::Joined(_))),
+        "the live held key joins once its pin arrives"
+    );
+    assert_eq!(capture.router.pending_len(), 1);
+    assert!(
+        capture.jobs.is_empty(),
+        "no scan job is queued for a retired held key"
+    );
+}
+#[test]
+fn held_requeue_waits_when_bindings_are_full() {
+    let mut io = ScriptIo::new(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    capture.retention_attach_ticks = Some(0);
+    prime(&mut capture, &mut io);
+    // A second task's burst holds pin-less.
+    io.targets_absent = true;
+    io.call(2, 0);
+    let held = capture.tick_with(&mut io).unwrap();
+    assert!(held.calls().next().is_none());
+    assert_eq!(capture.router.pending_len(), 1);
+    // Bindings fill while the key waits (another task binds).
+    capture.limits.bindings = 1;
+    // The pin arrives but no binding slot is free: the held call keeps
+    // waiting for a slot (or its horizon), never sheds here.
+    io.targets_absent = false;
+    let full = capture.tick_with(&mut io).unwrap();
+    assert!(
+        full.calls().next().is_none(),
+        "a held call waits out full bindings, never sheds on requeue"
+    );
+    assert_eq!(capture.router.pending_len(), 1);
+    assert!(capture.jobs.is_empty());
+}
+#[test]
 fn pump_miss_invalidates_before_next_semantic_join_even_when_raise_fails() {
     let mut io = ScriptIo::new(NativeDomainId::mint());
     let mut capture = capture(&io);

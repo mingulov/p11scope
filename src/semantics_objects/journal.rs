@@ -8752,6 +8752,38 @@ impl JournalAdapter {
         Err(failure)
     }
 
+    /// Shared seal entry guard for both seal wrappers: the collection
+    /// owner check and the consumed-frontier check, with their stage
+    /// notes. The notes are diagnostic-only; the refusals below are
+    /// unchanged. The wrappers keep their distinct audit and fault
+    /// handling after this guard.
+    fn check_seal_entry(
+        &mut self,
+        audit: &JournalAuditReceipt,
+        frontier: u64,
+    ) -> Result<(), SealFailure> {
+        if let Err(failure) = self.check_collection_owner(audit) {
+            match failure.gap {
+                JournalGap::DrainMismatch => {
+                    self.note_seal_stage(SealStageGate::DrainMismatch);
+                }
+                JournalGap::Stopped => {
+                    self.note_seal_stage(SealStageGate::Stopped);
+                }
+                JournalGap::AdapterInvalidated => {
+                    self.note_seal_stage(SealStageGate::AdapterInvalidated);
+                }
+                _ => {}
+            }
+            return Err(failure);
+        }
+        if frontier > self.consumed_through {
+            self.note_seal_stage(SealStageGate::FrontierRegression);
+            return Err(self.failure(JournalGap::FrontierRegression));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn seal_inner(
         &mut self,
@@ -8764,26 +8796,8 @@ impl JournalAdapter {
     ) -> Result<SealSuccess, SealFailure> {
         let mark = self.rejection_mark();
         let outcome = (|| {
-            if let Err(failure) = self.check_collection_owner(audit) {
-                match failure.gap {
-                    JournalGap::DrainMismatch => {
-                        self.note_seal_stage(SealStageGate::DrainMismatch);
-                    }
-                    JournalGap::Stopped => {
-                        self.note_seal_stage(SealStageGate::Stopped);
-                    }
-                    JournalGap::AdapterInvalidated => {
-                        self.note_seal_stage(SealStageGate::AdapterInvalidated);
-                    }
-                    _ => {}
-                }
-                return Err(failure);
-            }
             let frontier = frontier.0;
-            if frontier > self.consumed_through {
-                self.note_seal_stage(SealStageGate::FrontierRegression);
-                return Err(self.failure(JournalGap::FrontierRegression));
-            }
+            self.check_seal_entry(audit, frontier)?;
             self.audit_collected(model, audit, fault)?;
             self.seal_domain_inner(
                 model,
@@ -8812,25 +8826,7 @@ impl JournalAdapter {
         self.seal_wait.set(SealWait::None);
         let requested = self.retained_failure_domain(bootstrap);
         let outcome = (|| {
-            if let Err(failure) = self.check_collection_owner(audit) {
-                match failure.gap {
-                    JournalGap::DrainMismatch => {
-                        self.note_seal_stage(SealStageGate::DrainMismatch);
-                    }
-                    JournalGap::Stopped => {
-                        self.note_seal_stage(SealStageGate::Stopped);
-                    }
-                    JournalGap::AdapterInvalidated => {
-                        self.note_seal_stage(SealStageGate::AdapterInvalidated);
-                    }
-                    _ => {}
-                }
-                return Err(failure);
-            }
-            if frontier.0 > self.consumed_through {
-                self.note_seal_stage(SealStageGate::FrontierRegression);
-                return Err(self.failure(JournalGap::FrontierRegression));
-            }
+            self.check_seal_entry(audit, frontier.0)?;
             let reading = fault.fault_epoch();
             let gap = match reading {
                 Err(FaultReadError::Saturated) => Some(JournalGap::FaultSaturated),

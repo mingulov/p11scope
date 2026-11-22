@@ -2396,12 +2396,18 @@ impl IngestedJointQuantum {
             // immutable frame never seals it, so it waits as future
             // input exactly like an awaited terminal, instead of
             // retrying until the lane-wide no-progress bound stops
-            // every caller.
+            // every caller. The seal just adjudicated this wait on
+            // staging nothing has touched since (a wait issues no
+            // rejection, so no fill ran between the seal and this
+            // settle): remember its decision instead of re-scanning
+            // staging. Only an undecided wait consults the terminal
+            // fallback, and a decided UnboundStaging barrier is still
+            // present, so no terminal is awaited past it.
+            let wait = adapter.last_seal_wait();
             if failure.gap == JournalGap::BoundNotReady
-                && seal_wait_advances_as_future(
-                    adapter.last_seal_wait(),
-                    adapter.awaits_future_terminal(target.bootstrap(), self.frontier),
-                )
+                && (seal_wait_advances_as_future(wait, false)
+                    || (wait != super::SealWait::UnboundStaging
+                        && adapter.awaits_future_terminal(target.bootstrap(), self.frontier)))
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's

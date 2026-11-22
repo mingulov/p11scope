@@ -1193,22 +1193,34 @@ exactly:
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
 
-Gap-noise folds file under the discovery subject with three finite
+Gap-noise folds file under the discovery subject with four finite
 reasons (in addition to the v2 list and the reasons above). Each
 record is `{name: "discovery subject", reason}` with `reason` exactly
 one of:
 
-- `process exited mid-flight`: one of six mid-flight generation
-  pairs — a short-lived process exited or changed while discovery
-  was mid-read (candidate, inventory preflight, stale report,
-  terminal record, or an unreadable member). Exact internal pairs
-  only; near misses stay generic.
+- `process exited or changed mid-flight`: one of five mid-flight
+  changed-generation pairs — a short-lived process exited or
+  changed while discovery was mid-read (candidate, inventory
+  preflight, terminal record, or an unreadable member). Exact
+  internal pairs only; near misses stay generic. The row covers
+  exit-or-change without proving either: a process that exec'd, or
+  whose pid was reused, is still running.
+- `stale process report deferred mid-flight`: the live
+  stale-deferral mark — the pin recheck contradicted the loss
+  report or could not judge it, so retirement was deferred and the
+  process may still be running. This row never claims an exit.
 - `scan budget exhausted`: a work-ceiling stop, bare or wrapped in
   a scan refusal, whatever subject filed it. Function subjects keep
   their entry row instead — the fold never redacts a function name.
 - `no unique attached loader context`: a provider whose loader
   context could not be uniquely attached. Distinct from the ceiling
   row: a different operator action.
+
+Upgrade note: v0.7.2 folds all six pairs to the single reason
+`process exited mid-flight`, which claimed an exit even for a
+still-live process. The producer no longer emits that reason; the
+schema and the evidence checker still accept it, so archived v0.7.2
+captures keep validating.
 
 Folding renames rows, never drops them: JSON keeps one row per
 underlying internal record. The text names each folded row with its

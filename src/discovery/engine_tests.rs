@@ -7135,8 +7135,9 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for all eight folded gap-noise pairs (six mid-flight,
-/// two loader-context): filing sites without a cheap live seam pin
+/// Drift guard for all eight folded gap-noise pairs (five mid-flight
+/// changed, one stale-deferral, two loader-context): filing sites
+/// without a cheap live seam pin
 /// their exact strings in source, so a reword must update the
 /// projection allowlist in the same patch instead of silently
 /// unfolding back to generic. Each pair also asserts its

@@ -77,16 +77,20 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
 # this generic redacted pair; any other skip (entry loss, another
 # discovery reason) is a different family and still fails.
 DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
-# Exit-ambient row: the render layer folds every mid-flight
-# generation pair to this finite reason (never dropped, never a pid).
-# The fold is ambiguous — it also projects the engine's live
-# stale-deferral mark, filed for a still-live process — so an exit
-# excuse requires proof the process actually exited, which no public
-# row carries. The oracle therefore never qualifies this row: any
-# report containing it fails closed at the gap gate, in every mode.
-# Kept as a named constant so the vocabulary pin
-# (test_skip_reason_vocabulary.py) keeps it tied to the producer.
-EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited mid-flight"}
+# Mid-flight rows: the render layer folds the five changed-generation
+# pairs to the changed reason and the live stale-deferral mark to its
+# own deferral reason (never dropped, never a pid). Neither row
+# proves an exit — the changed row covers exit-or-change without
+# proof, and the deferral row is filed for a possibly still-live
+# process — so an exit excuse requires proof the process actually
+# exited, which no public row carries. The oracle therefore never
+# qualifies either row: any report containing one fails closed at the
+# gap gate, in every mode. Kept as named constants so the vocabulary
+# pin (test_skip_reason_vocabulary.py) keeps them tied to the
+# producer. (Historical constant name: the changed row no longer
+# claims an exit.)
+EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited or changed mid-flight"}
+STALE_DEFERRAL_SKIP = {"name": "discovery subject", "reason": "stale process report deferred mid-flight"}
 # R1 fixed row: live attached counting slots a mid-capture global
 # retirement detached with no same-apply reattach. The affected-slot
 # count rides in evidence.coverage_retired_slots, never in the reason.
@@ -764,13 +768,14 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         and skip_entries == [DISCLOSABLE_DISCOVERY_SKIP]
         and evidence.get("modules_skipped") == []
         and evidence.get("pid_descendant_gaps", 0) == 0)
-    # No exit-ambient arm: the public mid-flight row also projects
-    # the engine's live stale-deferral mark (filed for a still-live
-    # process with the view retained), so it proves no exit. An exit
-    # excuse requires proof the process actually exited; until the
-    # producer publishes per-row proof, every report carrying the row
-    # fails closed at the gap gate, in every mode. The quiet arm above
-    # keeps the pure single-deferral shape.
+    # No mid-flight arm: neither public mid-flight row proves an
+    # exit — the changed row covers exit-or-change without proof,
+    # and the deferral row is filed for a possibly still-live
+    # process. An exit excuse requires proof the process actually
+    # exited; until the producer publishes per-row proof, every
+    # report carrying either row fails closed at the gap gate, in
+    # every mode. The quiet arm above keeps the pure
+    # single-deferral shape.
     # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient
     # ruling to the system and mt-system cells): quiet VNG guests
     # disclose exactly one ambient descendant exit with no skip

@@ -602,6 +602,8 @@
                   "manifest object unavailable",
                   "prearm object unavailable",
                   "discovery transport unavailable",
+                  "process exited or changed mid-flight",
+                  "stale process report deferred mid-flight",
                   "process exited mid-flight",
                   "scan budget exhausted",
                   "no unique attached loader context",

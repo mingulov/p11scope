@@ -2202,9 +2202,7 @@ impl ModelState {
                 if Self::strictly_nested_same_thread(y, x)
                     && matches!(
                         y.kind,
-                        CallKind::Object(
-                            ObjectAction::Access | ObjectAction::OperationImport
-                        )
+                        CallKind::Object(ObjectAction::Access | ObjectAction::OperationImport)
                     )
                 {
                     continue;

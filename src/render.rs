@@ -2037,13 +2037,19 @@ pub(crate) const LEARNED_DISABLED_REASON: &str = "file learning was disabled by 
 pub(crate) const LEARNED_MOUNT_NAMESPACE_REASON: &str = "file learning cannot see filesystems outside the observer's mount namespace; provider files opened only there were not learned";
 pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not marked for file learning, or a re-mark pass was still pending or could not start; short-lived first loads of new provider files opened only there were not learned";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
-/// Gap-noise folds: mid-flight exits, scan-budget stops and
-/// loader-context misses project to these finite public reasons
-/// instead of the generic redaction. Each folds exact internal pairs
-/// only (the ceiling by its fixed reason sentence, whatever subject
-/// filed it); function subjects always keep their entry row, and
-/// folding renames rows, never drops them.
-const MID_FLIGHT_REASON: &str = "process exited mid-flight";
+/// Gap-noise folds: mid-flight changed generations, the live
+/// stale-deferral mark, scan-budget stops and loader-context misses
+/// project to these finite public reasons instead of the generic
+/// redaction. Each folds exact internal pairs only (the ceiling by
+/// its fixed reason sentence, whatever subject filed it); function
+/// subjects always keep their entry row, and folding renames rows,
+/// never drops them. Neither mid-flight row claims an exit: proven
+/// exits are ordinary ends and file no public row.
+const MID_FLIGHT_REASON: &str = "process exited or changed mid-flight";
+/// The live stale-deferral mark's own public reason: it is filed
+/// for a possibly still-live process with retirement deferred, so
+/// it must never call the process exited.
+const STALE_DEFERRAL_REASON: &str = "stale process report deferred mid-flight";
 const SCAN_BUDGET_REASON: &str = "scan budget exhausted";
 const LOADER_CONTEXT_REASON: &str = "no unique attached loader context";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
@@ -2200,11 +2206,13 @@ fn limit_skip_reason(subject: &str, reason: &str) -> Option<&'static str> {
     None
 }
 
-/// Whether an internal skip is one of the six mid-flight generation
-/// pairs: a short-lived process exited or changed while discovery was
-/// mid-read (candidate, preflight, stale report, terminal record, or
-/// an unreadable member). Exact subject and reason, never prefix or
-/// substring: near misses stay generic.
+/// Whether an internal skip is one of the five mid-flight
+/// changed-generation pairs: a short-lived process exited or
+/// changed while discovery was mid-read (candidate, preflight,
+/// terminal record, or an unreadable member). Exact subject and
+/// reason, never prefix or substring: near misses stay generic. The
+/// stale-deferral pair has its own matcher below: it is filed for a
+/// possibly still-live process, so it must never fold into this row.
 fn is_mid_flight_pair(subject: &str, reason: &str) -> bool {
     matches!(
         (subject, reason),
@@ -2218,9 +2226,6 @@ fn is_mid_flight_pair(subject: &str, reason: &str) -> bool {
             "live inventory generation",
             "an exact retained or newly opened process generation changed during post-retirement preflight",
         ) | (
-            "live discovery generation",
-            "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
-        ) | (
             "live discovery record",
             "a structurally valid private terminal record failed exact live resolution",
         ) | (
@@ -2228,6 +2233,19 @@ fn is_mid_flight_pair(subject: &str, reason: &str) -> bool {
             "a process in scope could not be retained or scanned before it changed; a provider only that generation mapped was never discovered",
         )
     )
+}
+
+/// Whether an internal skip is the live stale-deferral pair: the
+/// pin recheck contradicted the loss report or could not judge it,
+/// so retirement was deferred and the process may still be running.
+/// Exact subject and reason, never prefix or substring: near misses
+/// stay generic.
+fn is_stale_deferral_pair(subject: &str, reason: &str) -> bool {
+    (subject, reason)
+        == (
+            "live discovery generation",
+            "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
+        )
 }
 
 /// Whether an internal skip is one of the two no-unique-loader-context
@@ -2337,6 +2355,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
     // text can leak through the fold.
     } else if is_mid_flight_pair(&s.subject, &s.reason) {
         MID_FLIGHT_REASON
+    } else if is_stale_deferral_pair(&s.subject, &s.reason) {
+        STALE_DEFERRAL_REASON
     } else if s
         .reason
         .contains(crate::discovery::scan::WORK_CEILING_REASON)
@@ -4853,6 +4873,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                 {
                     if skip.name == DISCOVERY_SUBJECT {
                         if skip.reason != MID_FLIGHT_REASON
+                            && skip.reason != STALE_DEFERRAL_REASON
                             && skip.reason != SCAN_BUDGET_REASON
                             && skip.reason != LOADER_CONTEXT_REASON
                         {
@@ -4892,6 +4913,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     LOADER_SCAN_LEDGER_EXCEEDED,
                     LOADER_ARM_LEDGER_FULL,
                     MID_FLIGHT_REASON,
+                    STALE_DEFERRAL_REASON,
                     SCAN_BUDGET_REASON,
                     LOADER_CONTEXT_REASON,
                     LEARNED_FIRST_RUN_REASON,
@@ -20094,9 +20116,7 @@ pub(crate) mod tests {
                 .into(),
         });
         assert_eq!(deferred.name, "discovery subject");
-        assert_eq!(
-            deferred.reason, "stale process report deferred mid-flight"
-        );
+        assert_eq!(deferred.reason, "stale process report deferred mid-flight");
         assert!(
             !deferred.reason.contains("exited"),
             "a live process is never called exited: {}",

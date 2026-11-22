@@ -919,6 +919,27 @@ pub(crate) fn start_time_pinned_process_view_for_test(
     Ok(view)
 }
 
+/// Test-only observer for live generation probes (`PidPin::still_the_same`:
+/// one pidfd poll, or one `/proc/<pid>/stat` read on the fallback pin), so
+/// twins can count the probes a code path issues.
+#[cfg(test)]
+pub(crate) mod generation_probe_test {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PROBES: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn probe() {
+        PROBES.with(|probes| probes.set(probes.get() + 1));
+    }
+
+    /// Probes issued on this thread so far.
+    pub(crate) fn count() -> u64 {
+        PROBES.with(Cell::get)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OriginalGenerationState {
     Current,
@@ -1543,6 +1564,8 @@ impl PidPin {
 
     /// False when the process exited or the pid was reused since `open`.
     pub fn still_the_same(&self) -> bool {
+        #[cfg(test)]
+        generation_probe_test::probe();
         match &self.pidfd {
             Some(fd) => pidfd_still_same_with(|| pidfd_ready(fd)),
             None => process_start_time(self.pid).ok() == self.start_time,

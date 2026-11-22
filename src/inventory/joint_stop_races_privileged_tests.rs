@@ -820,13 +820,18 @@ fn no_feed_reason(branch: &JointBranch) -> Option<&'static str> {
 /// or unbound instance (`inst`, counted per call), or shed in the
 /// named caller-less route-loss gap whose total the lane counts
 /// (`shed`). Only fixtures call into the providers, so the lane shed
-/// total is all fixture calls. Per-owner api/slot never exceed their
-/// ledger splits (no over-attribution, no over-refusal); the global
-/// entered equation then subsumes strict per-owner exactness when
-/// nothing sheds, and accepts exactly the disclosed outcome
-/// otherwise. A silent drop breaks the equation. Capacity shed has
-/// no counter, so any capacity gap fails; shed without a printed
-/// named gap (or with suppressed disclosure) fails too.
+/// total is all fixture calls. Each caller's api/slot/inst never
+/// exceed its ledger splits (no over-attribution, no over-refusal);
+/// each caller's residual deficit is then nonnegative, so no
+/// caller's surplus can hide another caller's loss. With no shed
+/// every deficit is zero; with shed the deficits sum to the counted,
+/// disclosed shed. An instance refusal needs its retained named
+/// reason for that caller's edge (the per-call counter carries the
+/// arithmetic per R-59; gap rows only prove disclosure, never count
+/// calls). A silent drop breaks its caller's equation. Capacity shed
+/// has no counter, so any capacity gap fails; shed without a printed
+/// named gap (or with suppressed disclosure) fails too, as does any
+/// instance refusal under suppression.
 ///
 /// One owner's measured populations for stop reconciliation: the ledger
 /// splits (`sem`/`count_only`/`entered`), the edge attribution (`api`),
@@ -852,17 +857,18 @@ fn assert_semantic_reconciled(
     owners: &[StopOwnerLedger],
 ) -> Result<()> {
     let mut parts = Vec::new();
-    let (mut entered_sum, mut api_sum, mut slot_sum, mut inst_sum) = (0u64, 0u64, 0u64, 0u64);
+    let (mut deficit_sum, mut inst_sum) = (0u64, 0u64);
     for owner in owners {
         let StopOwnerLedger {
             name,
+            caller,
+            module,
             sem,
             count_only,
             entered,
             api,
             slot,
             inst,
-            ..
         } = owner;
         ensure!(
             api <= sem,
@@ -872,20 +878,43 @@ fn assert_semantic_reconciled(
             slot <= count_only,
             "{tag}: {name} never over-refuses: slot {slot} <= count-only {count_only}"
         );
+        let sem_remaining = sem.saturating_sub(*api);
+        ensure!(
+            inst <= &sem_remaining,
+            "{tag}: {name} never over-refuses instances: inst {inst} <= sem-api {sem_remaining} \
+             (sem {sem} api {api})"
+        );
+        let accounted = api.saturating_add(*slot).saturating_add(*inst);
+        ensure!(
+            &accounted <= entered,
+            "{tag}: {name} never over-accounts: api {api} + slot {slot} + inst {inst} <= entered {entered}"
+        );
+        let deficit = entered.saturating_sub(accounted);
         parts.push(format!(
-            "{name}(entered={entered} sem={sem} api={api} co={count_only} slot={slot} inst={inst})"
+            "{name}(entered={entered} sem={sem} api={api} co={count_only} slot={slot} \
+             inst={inst} deficit={deficit})"
         ));
-        entered_sum += entered;
-        api_sum += api;
-        slot_sum += slot;
-        inst_sum += inst;
+        deficit_sum = deficit_sum.saturating_add(deficit);
+        inst_sum = inst_sum.saturating_add(*inst);
+        if *inst > 0 {
+            let disclosed = coordinator.registry().gaps().iter().any(|gap| {
+                gap.subject == "instance semantics refused"
+                    && gap.caller == Some(*caller)
+                    && gap.module == Some(*module)
+            });
+            ensure!(
+                disclosed,
+                "{tag}: {name} instance refusals carry a retained named reason for their edge: \
+                 inst {inst} caller {caller:?} module {module:?}"
+            );
+        }
     }
     let unrouted_entries = count_callerless_gap_entries(coordinator, "semantic calls unrouted");
     let capacity_entries =
         count_callerless_gap_entries(coordinator, "semantic call outcome capacity");
     let suppressed = coordinator.registry().gaps_suppressed();
     eprintln!(
-        "JOINT_R16 {tag}-reconcile {} shed={lane_shed} \
+        "JOINT_R16 {tag}-reconcile {} shed={lane_shed} deficits={deficit_sum} \
          unrouted_entries={unrouted_entries} capacity_entries={capacity_entries} \
          suppressed={suppressed}",
         parts.join(" ")
@@ -900,10 +929,23 @@ fn assert_semantic_reconciled(
          entries {unrouted_entries}, suppressed {suppressed}"
     );
     ensure!(
-        entered_sum == api_sum + lane_shed + slot_sum + inst_sum,
-        "{tag}: every entered call is attributed, slot-refused, instance-refused or disclosed-shed: \
-         entered {entered_sum} vs api {api_sum} + shed {lane_shed} + slot {slot_sum} + inst {inst_sum}"
+        inst_sum == 0 || suppressed == 0,
+        "{tag}: instance refusals need unsuppressed disclosure: inst {inst_sum}, \
+         suppressed {suppressed}"
     );
+    if lane_shed == 0 {
+        ensure!(
+            deficit_sum == 0,
+            "{tag}: every entered call is attributed or refused on its own caller with no shed: \
+             caller deficits sum {deficit_sum}"
+        );
+    } else {
+        ensure!(
+            deficit_sum == lane_shed,
+            "{tag}: nonnegative caller deficits sum to the disclosed shed: \
+             deficits {deficit_sum} vs shed {lane_shed}"
+        );
+    }
     Ok(())
 }
 
@@ -2021,10 +2063,10 @@ fn stop_outcome_refuses_a_b_side_silent_loss() {
     // B loses one call with no matching named gap: the equation names
     // the shortfall, while A and the stop state stay healthy.
     outcome.reconciled = false;
-    outcome.reconcile_detail = "wp7-stop0-stop: every entered call is attributed, slot-refused, \
-         instance-refused or disclosed-shed: entered 2 vs api 1 + shed 0 + \
-         slot 0 + inst 0"
-        .to_string();
+    outcome.reconcile_detail =
+        "wp7-stop0-stop: every entered call is attributed or refused on its own \
+         caller with no shed: caller deficits sum 1"
+            .to_string();
     let error = check_stop_outcome(&outcome, outcome.offset_ms)
         .expect_err("a B-side silent loss must fail the case");
     let text = format!("{error:?}");
@@ -2033,7 +2075,7 @@ fn stop_outcome_refuses_a_b_side_silent_loss() {
         "the failure names reconciliation: {text}"
     );
     assert!(
-        text.contains("entered 2 vs api 1"),
+        text.contains("caller deficits sum 1"),
         "the failure carries the equation diagnostic: {text}"
     );
 }
@@ -2173,6 +2215,28 @@ fn stop_reconciliation_refuses_cross_caller_compensation() {
     assert!(
         text.contains('a') || text.contains('b'),
         "the failure names the offending caller: {text}"
+    );
+}
+
+#[test]
+fn stop_reconciliation_refuses_a_b_side_silent_loss_without_refusals() {
+    // B loses one call with no refusal anywhere: no cap trips, so
+    // only the caller-deficit equation can catch the shortfall.
+    let coordinator = reconciliation_test_coordinator();
+    let error = assert_semantic_reconciled(
+        &coordinator,
+        0,
+        "wp7-stop0-stop",
+        &[
+            stop_owner("a", 1, 1, 2, 0, 2, 0, 0),
+            stop_owner("b", 2, 2, 15, 1, 14, 1, 0),
+        ],
+    )
+    .expect_err("a B-side silent loss with no refusals must fail");
+    let text = format!("{error:?}");
+    assert!(
+        text.contains("deficit"),
+        "the failure names the caller deficit: {text}"
     );
 }
 

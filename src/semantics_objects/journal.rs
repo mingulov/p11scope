@@ -4791,8 +4791,10 @@ fn completed_from_drained_return(
 /// is stale once a prior seal settled past it, and completing there
 /// contradicts the covered prefix (the model voids the domain); the
 /// abandonment is always fresh. The settled table, the frozen
-/// retained table and the terminal conversion share this one
-/// predicate, so a drained call completes in all three or none.
+/// retained table, the terminal conversion, the model fence and
+/// the prune rule share this one predicate: a drained call
+/// completes, fences and prunes as a completion everywhere, or
+/// keeps the loss everywhere.
 fn drained_return_cut(entry: &OpenEntry, frontier: u64) -> Option<u64> {
     let staged = entry.abandon.filter(|staged| {
         staged.ordinal <= frontier

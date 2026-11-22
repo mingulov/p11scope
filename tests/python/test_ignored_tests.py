@@ -1611,6 +1611,84 @@ class IgnoredTestsTests(unittest.TestCase):
             text,
         )
 
+    def test_full_matrix_gate_matches_stop_completion_lines_exactly(self):
+        # The full-matrix gate qualifies a pass only on the twelve
+        # post-stop completion lines, each matched as a full line: a
+        # pre-stop linkage tag (or a completion marker embedded in
+        # another line) must never qualify its case.
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn(
+            'command grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" "$log"',
+            text,
+        )
+        self.assertNotIn("P11SCOPE_CELL_BRANCH=wp7-stop$i:linked", text)
+
+    def test_full_matrix_gate_verbatim_block_judges_completion_fixtures(self):
+        # Drive the runner's shipped full-matrix block verbatim (the
+        # exact lines between its guard and its closing fi) against
+        # fixture logs: a full matrix passes, a linked-but-incomplete
+        # one (case 7 linked, never completed) fails naming 7, and a
+        # diagnostic-embedded completion line fails too.
+        text = RUNNER.read_text(encoding="utf-8")
+        guard = ('if [ -n "${full_matrix_set[$name]+present}" ]'
+                 ' && [ "$verdict" = PASS ]; then')
+        start = text.index(guard)
+        end = text.index("\n        fi\n", start) + len("\n        fi\n")
+        block = text[start:end]
+        self.assertIn("matrix_missing", block)
+        self.assertIn("MATRIX SHORT", block)
+
+        def linkage(i):
+            return "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i
+
+        def complete(i):
+            return "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i
+
+        full = "".join(linkage(i) for i in range(12))
+        full += "".join(complete(i) for i in range(12))
+        incomplete = "".join(linkage(i) for i in range(12))
+        incomplete += "".join(complete(i) for i in range(12) if i != 7)
+        embedded = "".join(linkage(i) for i in range(12))
+        embedded += "".join(complete(i) for i in range(7))
+        embedded += ("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
+                     "emitted late\n")
+        embedded += "".join(complete(i) for i in range(8, 12))
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {}
+            for name, body in (("full.log", full),
+                               ("incomplete.log", incomplete),
+                               ("embedded.log", embedded)):
+                path = Path(tmp) / name
+                path.write_text(body, encoding="utf-8")
+                paths[name] = path
+            script = ""
+            for name, path in paths.items():
+                script += (
+                    'name="probe-cell"; verdict=PASS; matrix_note=; '
+                    'matrix_missing=; '
+                    'declare -A full_matrix_set=([probe-cell]=1); '
+                    'log="%s"; ' % path +
+                    block + "\n" +
+                    'printf "<@@%s verdict=%%s missing=%%s note=%%s@@>\\n" '
+                    '"$verdict" "$matrix_missing" "$matrix_note"; ' % name
+                )
+            result = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, cwd=ROOT,
+            )
+        self.assertEqual(result.returncode, 0,
+                         result.stdout + result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(len(lines), 3, lines)
+        self.assertIn("verdict=PASS", lines[0], lines)
+        self.assertNotIn("MATRIX SHORT", lines[0], lines)
+        self.assertIn("verdict=FAIL", lines[1], lines)
+        self.assertIn("7", lines[1], lines)
+        self.assertIn("MATRIX SHORT", lines[1], lines)
+        self.assertIn("verdict=FAIL", lines[2], lines)
+        self.assertIn("7", lines[2], lines)
+        self.assertIn("MATRIX SHORT", lines[2], lines)
+
     def test_btrfs_pair_staging_surfaces_tool_stderr(self):
         # A hosted pair-staging failure must print the tool's
         # reason, not just the generic "cannot ..." line: stderr

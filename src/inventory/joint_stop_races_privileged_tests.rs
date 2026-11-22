@@ -1876,6 +1876,43 @@ fn run_stop_case(
     check_stop_outcome(&outcome, offset_ms)
 }
 
+/// The stop cell must prove each case finished its stop: pin the
+/// completion marker in `run_stop_case`, emitted only after
+/// `check_stop_outcome` succeeds, so a path that returns early after
+/// the pre-stop linkage diagnostic cannot qualify. The pin reads the
+/// case body above its own body (never its own literals) and checks
+/// the marker follows the checks, so a comment mentioning the marker
+/// cannot satisfy it.
+#[test]
+fn stop_case_emits_a_completion_marker_after_its_checks() {
+    let source = include_str!("joint_stop_races_privileged_tests.rs");
+    let head = source
+        .split_once("fn stop_case_emits_a_completion_marker_after_its_checks(")
+        .expect("the pin keeps its name")
+        .0;
+    assert_eq!(
+        head.matches("fn run_stop_case(").count(),
+        1,
+        "the stop case is defined once above the pin"
+    );
+    let body = head
+        .split_once("fn run_stop_case(")
+        .expect("the stop case keeps its name")
+        .1
+        .split_once("\n}\n")
+        .expect("top-level fns close at column 0")
+        .0;
+    let checks = body.find("check_stop_outcome(&outcome, offset_ms)");
+    let marker = body.find("P11SCOPE_STOP_COMPLETE=wp7-stop");
+    match (checks, marker) {
+        (Some(checks_at), Some(marker_at)) => assert!(
+            marker_at > checks_at,
+            "the completion marker follows the stop checks: {body}"
+        ),
+        _ => panic!("run_stop_case checks the outcome then marks completion: {body}"),
+    }
+}
+
 /// Full assert set for one stop case, over its collected outcome: the
 /// at-Q publication (or disclosed shed), the latch double-naming, the
 /// abandon accounting and the Published-then-WoundDown terminal. The

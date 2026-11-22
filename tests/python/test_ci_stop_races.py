@@ -5,7 +5,8 @@
 Exercises `scripts/ci/stop-races.sh` without privileged runs: the
 joint-row mapping (wedge signature, single-seal preclusion tag,
 unattributed no-feed tag, full-matrix clean pass, one-case short
-matrix, inherited narrowing, unexpected pass, unmapped failure,
+matrix, linked-but-incomplete case, malformed completion marker,
+inherited narrowing, unexpected pass, unmapped failure,
 missing test binary) via a verbatim copy of the entry with stubbed
 qualify/id/library-test, and the early prerequisite rows (non-root,
 missing observer) via the real entry. The harness must also flag a
@@ -115,11 +116,14 @@ exit "$STUB_RC"
 
 
 def full_matrix_log():
-    """A passing 12-case matrix log: every linked case tag by exact name."""
+    """A passing 12-case matrix log: every pre-stop linkage tag plus
+    its post-stop completion marker, each by exact name."""
     tags = "".join(
         "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
-    return tags + ("test result: ok. 1 passed; 0 failed; 0 ignored; "
-                   "0 measured; 0 filtered out; finished in 180.00s\n")
+    done = "".join(
+        "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(12))
+    return tags + done + ("test result: ok. 1 passed; 0 failed; 0 ignored; "
+                          "0 measured; 0 filtered out; finished in 180.00s\n")
 
 
 def one_case_log():
@@ -127,6 +131,32 @@ def one_case_log():
     return ("P11SCOPE_CELL_BRANCH=wp7-stop0:linked\n"
             "test result: ok. 1 passed; 0 failed; 0 ignored; "
             "0 measured; 0 filtered out; finished in 15.00s\n")
+
+
+def linked_but_incomplete_log():
+    """Twelve linkage tags, but case 7 never completed its stop."""
+    tags = "".join(
+        "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
+    done = "".join(
+        "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(12)
+        if i != 7)
+    return tags + done + ("test result: ok. 1 passed; 0 failed; 0 ignored; "
+                          "0 measured; 0 filtered out; finished in 180.00s\n")
+
+
+def malformed_completion_log():
+    """Twelve linkage tags, but case 7's completion line is embedded
+    in a diagnostic instead of standing as an exact line."""
+    tags = "".join(
+        "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
+    done = "".join(
+        "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(7))
+    done += ("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
+             "emitted late\n")
+    done += "".join(
+        "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i for i in range(8, 12))
+    return tags + done + ("test result: ok. 1 passed; 0 failed; 0 ignored; "
+                          "0 measured; 0 filtered out; finished in 180.00s\n")
 
 
 def run_mapping(*, log, rc, expect_fail, libtest=True, list_mode="always",
@@ -228,6 +258,26 @@ class CiStopRacesTests(unittest.TestCase):
         self.assertFalse(joint["pass"])
         self.assertEqual(joint["qualification"], "failed")
         self.assertIn("wp7-stop", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_linked_but_incomplete_case_does_not_qualify(self):
+        proc, rows, joint = run_mapping(
+            log=linked_but_incomplete_log(), rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("wp7-stop", joint["detail"])
+        self.assertIn("7", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_malformed_completion_marker_does_not_qualify(self):
+        proc, rows, joint = run_mapping(
+            log=malformed_completion_log(), rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("wp7-stop", joint["detail"])
+        self.assertIn("7", joint["detail"])
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
 
     def test_qualifying_entry_ignores_inherited_matrix_narrowing(self):

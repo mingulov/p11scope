@@ -522,20 +522,36 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   the continuation was consumed), so no later pass can re-earn ground
   through the lost history. When nothing rises, the
   snapshot stops and the live in-progress gap names the work left.
-- Resume I/O is charged per syscall (owner 2, INV-2): every syscall or
-  file read the resume, cursor-key and closing-bracket code issues is
-  admitted first through one admission (stop check plus one unit of
-  shared collection work). The cursor file key admits its `fstatfs`,
-  its single `fstat` (pin and fd device together) and, on tmpfs, the
-  fdinfo and mount-table reads in 4 KiB chunks with one more unit per
-  64 rows, stopping at the matching row. The executable-image bracket
-  admits its opening generation check, readlink and closing check
-  separately and refuses the key when the closing check cannot be
-  bought. A failed closing bracket probes its live pin at most once,
-  through a check reserved when the view's scan starts, shared by the
-  keep, staging and retirement decisions; an unknown generation
-  neither stages nor retires, so the carried cursor stays. A source
-  guard test pins these sites and fails on a new unadmitted read.
+- Resume I/O is charged per syscall (owner 2, INV-2), closes
+  included. Every native call the resume, cursor-key, closing-bracket
+  and cache-victim code issues goes through one small set of metered
+  primitives (`process::metered_io`): an open buys two units (itself
+  and its close, issued on drop), each read, `fstat`, `fstatfs`,
+  readlink and pidfd poll one unit, each with a stop check first and
+  no retry under one unit. The row reader reads 4 KiB chunks, buys one
+  more unit per 64 rows and refuses a row over 64 KiB before decoding
+  or matching it. The readlink uses a PATH_MAX buffer and reports a
+  full buffer as unknown, never as a truncated target.
+- Generation checks return a typed proof (current, changed, unknown):
+  a pidfd poll error, a fallback pin with no retained start time and
+  any start-time read failure other than a missing process are
+  unknown. Only two current probes make an executable cursor key; an
+  unknown or changed probe makes no key. The closing check is bought
+  from three units reserved when the view's scan starts (refused
+  before memory is acquired when they cannot be reserved), probed at
+  most once and shared by the keep, staging and retirement decisions:
+  only current keeps or stages, only changed retires, unknown leaves
+  carried cursors untouched. The cache victim sorts live unless the
+  start time differs or the process is missing.
+- A replay read refused by the pass stop or by shared credit keeps the
+  carried cursor installed; only a read that succeeds and then fails
+  its bytes check drops it. The stop is polled before each replay
+  charge and inside the triple read.
+- A source guard test collects every site that issues raw I/O (std
+  file opens and reads whose drop closes a descriptor, std readlinks,
+  `libc::` calls, poll and generation retry wrappers) outside the
+  metered primitives in the audited resume code, and checks that the
+  primitives admit before each call and never loop around one.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom
   proof (L1-5 disclosure until the per-pass I/O owner lands).

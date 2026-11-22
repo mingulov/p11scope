@@ -4822,15 +4822,19 @@ impl SemanticCapture {
         self.prune_jobs();
     }
 
-    /// Queue admission jobs for held keys whose pins have since arrived.
-    /// A record collected while its task had no pin waits with no job, and
-    /// no later batch revisits it; without this pass it never scans even
-    /// after the coordinator admits its task. Visits at most `scans`
-    /// distinct keys per pass from the resume cursor (wrapping), queueing
-    /// only keys with a live pin, no existing job, no retirement and room
-    /// to bind; every other key keeps waiting for a later pass, its
-    /// horizon, or stop. Queued jobs join the sweep below, so no new
-    /// budget is spent: the sweep's own bound paces them. Never sheds.
+    /// Queue admission jobs for held keys of bound tasks whose pins have
+    /// since arrived. A record collected while its task had no pin waits
+    /// with no job, and no later batch revisits it; without this pass it
+    /// never scans even after the coordinator admits its task. Only keys
+    /// whose task already holds a semantic binding requeue: the binding
+    /// proves the pin-to-task link a held record alone cannot carry, so a
+    /// never-bound burst (pid reuse, exec) is never scanned under another
+    /// task's pin. Visits at most `scans` distinct keys per pass from the
+    /// resume cursor (wrapping), queueing only keys with a live pin, no
+    /// existing job and no retirement; every other key keeps waiting for
+    /// a later pass, its horizon, or stop. Queued jobs join the sweep
+    /// below, so no new budget is spent: the sweep's own bound paces
+    /// them. Never sheds.
     fn requeue_held_admissions(
         &mut self,
         io: &mut impl CaptureIo,
@@ -4877,12 +4881,16 @@ impl SemanticCapture {
         }
         self.held_requeue_cursor = last;
         for (image, endpoint, slot, pid) in candidates {
+            // Retired images never requeue (a rebound exec keeps its
+            // binding slot under the successor, so retirement is
+            // checked before the binding gate below).
             if self.router.is_image_retired(image) {
                 continue;
             }
-            if !self.bindings.contains_key(&image.task_cookie)
-                && self.bindings.len() >= self.limits.bindings
-            {
+            // Only bound tasks requeue (see above); the binding also
+            // answers the capacity question, since the accept path skips
+            // its bindings check for an already-bound task.
+            if !self.bindings.contains_key(&image.task_cookie) {
                 continue;
             }
             let Some(pin) = io.target(pid) else {

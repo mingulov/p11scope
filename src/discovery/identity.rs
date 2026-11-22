@@ -1284,7 +1284,7 @@ fn metered_find_line<T>(
                 None => break,
             };
             rows += 1;
-            if rows % 64 == 0 && !admit() {
+            if rows.is_multiple_of(64) && !admit() {
                 return None;
             }
             let Ok(row) = std::str::from_utf8(&pending[start..end]) else {

@@ -24466,19 +24466,23 @@ impl Engine {
         // Pin-failure retries re-prove against a fresh per-pass budget
         // instead of the capture budget: a transient race under capture
         // pressure must still recover, and the re-proof must not spend
-        // capture credit. The allowance covers one mountinfo re-read
-        // plus the pin-time maps probe (measured ~9.6 KiB per re-proof;
-        // 1 MiB holds it with wide margin) and dies with the attempt —
-        // no charge-back, like the identify batch allowance, with each
-        // retry recorded on the operator channel. First attempts keep
-        // the capture budget (normal accounting).
-        const LEARNED_RETRY_PASS_IO_BYTES: u64 = 1 << 20;
+        // capture credit. The re-proof runs only two bounded operations
+        // (the mountinfo re-read and the pin-time maps probe), so the
+        // budget keeps the normal per-operation proof limits with a
+        // total derived from their joint worst case — the same
+        // per-pass resumable semantics as the initial pin, never a
+        // smaller fixed cap: any table the initial pin accepts the
+        // retry also accepts, with room for EOF proof, and over-limit
+        // tables refuse identically on both paths. The budget dies
+        // with the attempt — no charge-back, like the identify batch
+        // allowance, with each retry recorded on the operator channel.
+        // First attempts keep the capture budget (normal accounting).
         let retrying = self.learned_pin_retries.contains_key(&identity);
         let mut retry_budget;
         let budget = if retrying {
             retry_budget = CaptureWorkBudget::new(ScanLimits {
-                per_object_bytes: LEARNED_RETRY_PASS_IO_BYTES,
-                total_bytes: LEARNED_RETRY_PASS_IO_BYTES,
+                per_object_bytes: ScanLimits::default().per_object_bytes,
+                total_bytes: crate::discovery::scan::LEARNED_RETRY_TOTAL_IO_BYTES,
             });
             &mut retry_budget
         } else {

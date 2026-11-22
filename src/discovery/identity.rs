@@ -222,7 +222,8 @@ fn read_mountinfo_for_prearm<R: std::io::Read>(
 ) -> Result<String, String> {
     #[cfg(test)]
     if let Some(append_bytes) = prearm_pin_test::take_mountinfo_append() {
-        use std::io::Read as _;
+        // No `Read` import: `R: std::io::Read` resolves `chain`
+        // through the generic bound alone.
         let synthetic = synthetic_mountinfo_append(append_bytes);
         return read_mountinfo(reader.chain(synthetic.as_bytes()), budget);
     }

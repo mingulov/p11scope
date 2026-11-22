@@ -2183,17 +2183,10 @@ fn reconciliation_test_coordinator() -> InventoryCoordinator<OsProcessSource> {
     .expect("a test coordinator builds")
 }
 
-fn stop_owner(
-    name: &'static str,
-    caller: u32,
-    module: u32,
-    sem: u64,
-    count_only: u64,
-    api: u64,
-    slot: u64,
-    inst: u64,
-) -> StopOwnerLedger {
+/// Twin owner ledger: `counts` is (sem, count_only, api, slot, inst).
+fn stop_owner(name: &'static str, caller: u32, module: u32, counts: [u64; 5]) -> StopOwnerLedger {
     use crate::discovery::caller_registry::{CallerId, ModuleId};
+    let [sem, count_only, api, slot, inst] = counts;
     StopOwnerLedger {
         name,
         caller: CallerId(caller),
@@ -2234,8 +2227,8 @@ fn stop_reconciliation_accepts_healthy_two_owner_counts() {
         0,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 2, 0, 0),
-            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
         ],
     )
     .expect("healthy A=2/2 and B=15+1/16 reconcile");
@@ -2252,8 +2245,8 @@ fn stop_reconciliation_refuses_cross_caller_compensation() {
         0,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 2, 0, 1),
-            stop_owner("b", 2, 2, 15, 1, 14, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
         ],
     )
     .expect_err("an A-side extra refusal hiding a B-side loss must fail");
@@ -2274,8 +2267,8 @@ fn stop_reconciliation_refuses_a_b_side_silent_loss_without_refusals() {
         0,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 2, 0, 0),
-            stop_owner("b", 2, 2, 15, 1, 14, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
         ],
     )
     .expect_err("a B-side silent loss with no refusals must fail");
@@ -2296,8 +2289,8 @@ fn stop_reconciliation_refuses_instance_refusal_without_retained_reason() {
         0,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 1, 0, 1),
-            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 1, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
         ],
     )
     .expect_err("an undisclosed instance refusal must fail");
@@ -2323,8 +2316,8 @@ fn stop_reconciliation_accepts_instance_refusal_with_retained_reason() {
         0,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 1, 0, 1),
-            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 1, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
         ],
     )
     .expect("a disclosed instance refusal reconciles");
@@ -2348,8 +2341,8 @@ fn stop_reconciliation_accepts_disclosed_shed_per_caller() {
         1,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 2, 0, 0),
-            stop_owner("b", 2, 2, 15, 1, 14, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 2, 0, 0]),
+            stop_owner("b", 2, 2, [15, 1, 14, 1, 0]),
         ],
     )
     .expect("a counted and disclosed shed reconciles per caller");
@@ -2393,8 +2386,8 @@ fn stop_reconciliation_refuses_instance_refusal_when_disclosure_suppressed() {
         0,
         "wp7-stop0-stop",
         &[
-            stop_owner("a", 1, 1, 2, 0, 1, 0, 1),
-            stop_owner("b", 2, 2, 15, 1, 15, 1, 0),
+            stop_owner("a", 1, 1, [2, 0, 1, 0, 1]),
+            stop_owner("b", 2, 2, [15, 1, 15, 1, 0]),
         ],
     )
     .expect_err("a suppressed disclosure with instance refusals must fail");

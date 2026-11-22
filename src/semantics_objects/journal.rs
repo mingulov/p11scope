@@ -8157,9 +8157,10 @@ impl JournalAdapter {
         // succeeds vacuously. Staged inputs are kept for a later seal.
         // Pending loss bounds: this key's staged bounded abandonments
         // and refused begins with their corroborating returns in the
-        // frontier. Calls this seal removes never apply, so they leave
-        // the held pin alone. A sibling key's bounds belong to its own
-        // fence.
+        // frontier. A drained return is a completion, not a loss
+        // bound: its corroborated return contributes no floor. Calls
+        // this seal removes never apply, so they leave the held pin
+        // alone. A sibling key's bounds belong to its own fence.
         let mut pending_bounds = Vec::new();
         for entry in self.open.values() {
             if self.abandons_here(key, &live, entry)
@@ -8169,6 +8170,7 @@ impl JournalAdapter {
                 && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
                 && let Some(at) = entry.corroborated_return
                 && at <= frontier
+                && drained_return_cut(entry, frontier).is_none()
             {
                 pending_bounds.push(at);
             }
@@ -8192,20 +8194,22 @@ impl JournalAdapter {
         .map_err(|gap| self.failure(gap))?;
         // Held pin: the earliest staged begin this seal keeps. Bounded
         // losses removed below contribute their bound instead of their
-        // begin; everything else convertible here may still apply. A
-        // sibling key's held calls pin its own fence, never this one. A
-        // pin below the floors continues without claiming; at or above
-        // them the seal claims the floors as new authority.
+        // begin; drained returns are completions applying here, so
+        // they pin like ends instead. Everything else convertible
+        // here may still apply. A sibling key's held calls pin its own
+        // fence, never this one. A pin below the floors continues
+        // without claiming; at or above them the seal claims the
+        // floors as new authority.
         let held = self
             .open
             .values()
             .filter(|entry| {
                 (self.converts_here(key, &live, entry) || entry.converted_for == Some(key))
-                    && !(entry.abandon.is_some_and(|staged| {
+                    && (!entry.abandon.is_some_and(|staged| {
                         staged.ordinal <= frontier
                             && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
                             && entry.corroborated_return.is_some_and(|at| at <= frontier)
-                    }))
+                    }) || drained_return_cut(entry, frontier).is_some())
             })
             .map(|entry| entry.begin_ordinal)
             .min();
@@ -22022,10 +22026,11 @@ pub(crate) mod tests {
             "the completion cut is the abandonment ordinal"
         );
         assert!(
-            success.effects.effects.iter().any(|effect| matches!(
-                effect,
-                ObjectEffect::SessionOpened { .. }
-            )),
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
             "the drained handle opens its session: {:?}",
             success.effects.effects
         );
@@ -22087,10 +22092,11 @@ pub(crate) mod tests {
             "the completion cut is the abandonment ordinal"
         );
         assert!(
-            !success.effects.effects.iter().any(|effect| matches!(
-                effect,
-                ObjectEffect::SessionOpened { .. }
-            )),
+            !success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
             "a failed open mints no session: {:?}",
             success.effects.effects
         );

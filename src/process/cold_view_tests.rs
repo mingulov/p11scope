@@ -17,7 +17,7 @@ pub(crate) struct ColdLeaderSubject {
     pub(crate) tids: Vec<u32>,
     pub(crate) table_address: u64,
     pub(crate) callback_address: u64,
-    _directory: tempfile::TempDir,
+    _directory: std::rc::Rc<tempfile::TempDir>,
 }
 
 impl ColdLeaderSubject {
@@ -46,6 +46,20 @@ impl ColdLeaderSubject {
                 .unwrap()
                 .success()
         );
+        Self::start(program, std::rc::Rc::new(directory), workers)
+    }
+
+    /// Another subject from the same compiled fixture (no recompilation).
+    pub(crate) fn sibling(&self, workers: u32) -> Self {
+        assert!(workers <= 129);
+        Self::start(self.program.clone(), self._directory.clone(), workers)
+    }
+
+    fn start(
+        program: std::path::PathBuf,
+        directory: std::rc::Rc<tempfile::TempDir>,
+        workers: u32,
+    ) -> Self {
         let mut child = Command::new(&program)
             .arg(workers.to_string())
             .stdin(Stdio::piped())

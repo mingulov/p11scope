@@ -24154,8 +24154,9 @@ int main(int argc, char **argv) {
     /// `ENOENT` takes only the cold retained-member proof, which needs
     /// the original leader at Z, so it fails closed. It never re-enters
     /// the warm leader route (whose namespace lookup and pidfd poll would
-    /// run outside the metered primitives and prove the view current),
-    /// and its only metered call is the failed stat. The positive: a warm
+    /// run outside the metered primitives and prove the view current):
+    /// the failed stat is its only stat, and the metered cold proof that
+    /// follows stops at the live leader. The positive: a warm
     /// view whose leader then exits proves current through its retained
     /// live member.
     #[test]
@@ -24177,9 +24178,14 @@ int main(int argc, char **argv) {
                 "credits {credits}: a hidden namespace link on a live leader proves nothing, got {proof:?}"
             );
             assert_eq!(
-                calls,
-                vec![NativeOp::Stat],
-                "credits {credits}: the failed stat is the only metered call"
+                calls.first(),
+                Some(&NativeOp::Stat),
+                "credits {credits}: the failed stat comes first ({calls:?})"
+            );
+            assert_eq!(
+                calls.iter().filter(|op| **op == NativeOp::Stat).count(),
+                1,
+                "credits {credits}: the warm route's namespace stat is never retried ({calls:?})"
             );
             assert!(
                 calls.len() as u64 <= debits,
@@ -24210,6 +24216,127 @@ int main(int argc, char **argv) {
         );
         assert!(warm.cold_filesystem_observed());
         group.call_three();
+    }
+
+    /// Read syscalls this thread has issued (per-task I/O accounting:
+    /// `read`, `pread` and their vector forms).
+    fn thread_read_syscalls() -> u64 {
+        std::fs::read_to_string("/proc/thread-self/io")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("syscr: "))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    /// The cold closing proof makes only metered native calls, one per
+    /// debit, on a real group whose leader exited: through the warm view's
+    /// transition and through an already-cold view, at every credit count
+    /// and with `EINTR` injected at each native call (one attempt, then a
+    /// failed proof). Reads outside the counting shim are caught by the
+    /// thread's own read-syscall counter.
+    #[test]
+    fn cold_closing_proof_issues_only_metered_calls_per_debit() {
+        use crate::process::cold_view_tests::ColdLeaderSubject;
+        use crate::process::metered_io::{NativeOp, syscall_test};
+        use std::sync::atomic::Ordering;
+        let overhead = {
+            let first = thread_read_syscalls();
+            let second = thread_read_syscalls();
+            second - first
+        };
+        let template = ColdLeaderSubject::spawn(1);
+        // A fresh subject and view per measurement: a warm view turns cold
+        // on its first transition, so reusing it would measure the cold
+        // route under the warm label.
+        let fresh = |warm: bool| {
+            let mut group = template.sibling(1);
+            let view = if warm {
+                let view = ProcessView::open(ProcessViewId(101), group.pid()).unwrap();
+                assert!(!view.cold_filesystem_observed());
+                group.leave_leader();
+                view
+            } else {
+                group.leave_leader();
+                ProcessView::open(ProcessViewId(102), group.pid()).unwrap()
+            };
+            (group, view)
+        };
+        // One measured closing proof: the outcome, the shim calls, the
+        // debits and the read syscalls issued outside the shim.
+        let measure = |view: &ProcessView, credits: u64| {
+            let (mut budget, admitted) = credited_resume_budget(credits);
+            let before = syscall_test::count();
+            let reads_before = thread_read_syscalls();
+            let proof = ProcScanIo::new().final_generation(view, &mut budget);
+            let reads = thread_read_syscalls() - reads_before - overhead;
+            let calls = syscall_test::since(before);
+            let shim_reads = calls
+                .iter()
+                .filter(|op| matches!(op, NativeOp::Read | NativeOp::Pread))
+                .count() as u64;
+            (
+                proof,
+                calls,
+                admitted.load(Ordering::SeqCst),
+                reads.saturating_sub(shim_reads),
+            )
+        };
+        for (name, warm) in [("warm transition", true), ("cold", false)] {
+            let (mut group, view) = fresh(warm);
+            let (proof, healthy, debits, unmetered) = measure(&view, u64::MAX);
+            assert_eq!(
+                proof,
+                Ok(()),
+                "{name}: a cold group with a live member proves current"
+            );
+            assert!(view.cold_filesystem_observed(), "{name}: the view is cold");
+            assert_eq!(unmetered, 0, "{name}: {unmetered} reads outside the shim");
+            assert!(
+                !healthy.is_empty() && healthy.len() as u64 <= debits,
+                "{name}: {healthy:?} for {debits} debits"
+            );
+            group.call_three();
+            for credits in 0..debits {
+                let (_group, view) = fresh(warm);
+                let (proof, calls, admitted, unmetered) = measure(&view, credits);
+                assert!(
+                    proof.is_err(),
+                    "{name}, credits {credits}: an unbought proof fails"
+                );
+                assert!(
+                    calls.len() as u64 <= admitted && unmetered == 0,
+                    "{name}, credits {credits}: {calls:?} for {admitted} debits, {unmetered} unmetered reads"
+                );
+            }
+            for (position, op) in healthy.iter().enumerate() {
+                if *op == NativeOp::Close {
+                    continue;
+                }
+                let nth = healthy[..position]
+                    .iter()
+                    .filter(|seen| *seen == op)
+                    .count() as u32;
+                let (_group, view) = fresh(warm);
+                syscall_test::fail_nth(*op, nth, libc::EINTR);
+                let (proof, calls, admitted, unmetered) = measure(&view, u64::MAX);
+                syscall_test::disarm();
+                assert!(
+                    proof.is_err(),
+                    "{name}: EINTR at {op:?} #{nth} proves nothing"
+                );
+                assert!(
+                    calls.len() as u64 <= admitted && unmetered == 0,
+                    "{name}: EINTR at {op:?} #{nth}: {calls:?} for {admitted} debits"
+                );
+                assert!(
+                    calls.iter().filter(|seen| *seen == op).count() <= nth as usize + 1,
+                    "{name}: EINTR at {op:?} #{nth} was retried ({calls:?})"
+                );
+            }
+        }
     }
 
     /// The replay's positioned read on the process memory file is one
@@ -24549,7 +24676,7 @@ int main(int argc, char **argv) {
     /// The admitted native calls the metered primitives issue, each
     /// through the one counting shim (`native`), one per unit. The
     /// prepaid close (`NativeOp::Close`) is bought by its open.
-    const METERED_OPERATIONS: [&str; 9] = [
+    const METERED_OPERATIONS: [&str; 11] = [
         "native(NativeOp::Open,",
         "native(NativeOp::Read,",
         "native(NativeOp::Pread,",
@@ -24558,13 +24685,15 @@ int main(int argc, char **argv) {
         "native(NativeOp::Fstat,",
         "native(NativeOp::Fstatfs,",
         "native(NativeOp::Stat,",
+        "native(NativeOp::Statx,",
+        "native(NativeOp::Getdents,",
         "native(NativeOp::Kill,",
     ];
 
     /// The kernel entry points the primitives may reach, only inside a
     /// `native(..)` call: std's wrappers retry (`File::open` loops on
     /// `EINTR`, `read_link` grows its buffer) and so never appear.
-    const NATIVE_SYSCALLS: [&str; 10] = [
+    const NATIVE_SYSCALLS: [&str; 12] = [
         "libc::open(",
         "libc::read(",
         "libc::pread(",
@@ -24574,6 +24703,8 @@ int main(int argc, char **argv) {
         "libc::fstat(",
         "libc::fstatfs(",
         "libc::stat(",
+        "libc::statx(",
+        "libc::syscall(",
         "libc::kill(",
     ];
 
@@ -24802,8 +24933,12 @@ int main(int argc, char **argv) {
                             }
                         }
                     }
-                    if name == "open" && body.matches("admit()").count() != 2 {
-                        violations.push("metered_io::open must buy its open and its close".into());
+                    if (name == "open" || name == "directory")
+                        && body.matches("admit()").count() != 2
+                    {
+                        violations.push(format!(
+                            "metered_io::{name} must buy its open and its close"
+                        ));
                     }
                     if name == "drop"
                         && (operations > 0
@@ -24838,7 +24973,7 @@ int main(int argc, char **argv) {
         }
 
         // 2. Callers: no raw token at all.
-        let audited: [(&str, &[&str]); 4] = [
+        let audited: [(&str, &[&str]); 5] = [
             (
                 "discovery/scan.rs",
                 &[
@@ -24869,6 +25004,16 @@ int main(int argc, char **argv) {
             (
                 "discovery/scan_pass.rs",
                 &["decode_generation_live_cached", "admit_resume_syscall"],
+            ),
+            (
+                "process/view_filesystem.rs",
+                &[
+                    "metered_cold_closing_proof",
+                    "metered_task",
+                    "metered_task_ids",
+                    "metered_leader_at_z",
+                    "metered_group_current",
+                ],
             ),
         ];
         for (file, names) in audited {
@@ -25022,13 +25167,13 @@ int main(int argc, char **argv) {
         {
             Some(body) => {
                 let compact: String = body.split_whitespace().collect();
-                if !compact.contains("ViewFilesystem::open_for_view(&self.pin,true,")
+                if !compact.contains("view_filesystem::metered_cold_closing_proof(&self.pin,")
+                    || compact.contains("open_for_view")
                     || compact.contains("with_filesystem")
                     || compact.contains("self.filesystem(")
                 {
                     violations.push(
-                        "ProcessView::cold_closing_proof: opens only cold custody (require_cold)"
-                            .into(),
+                        "ProcessView::cold_closing_proof: only the metered cold proof".into(),
                     );
                 }
             }

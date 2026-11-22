@@ -1111,3 +1111,130 @@ fn readable_v32_prefix_with_unmapped_extension_replays_the_prefix() {
         );
     }
 }
+
+/// Where [`v32_full_fixture`] puts its table: a complete 3.2 row inside
+/// the data mapping.
+const V32_FULL_TABLE: u64 = 0x4800;
+
+/// The bracket fixture with its table replaced by a complete 3.2 row
+/// (header word plus 104 pointers), its whole declared extent readable.
+fn v32_full_fixture() -> BracketFixture {
+    use std::os::unix::fs::FileExt as _;
+    let fixture = BracketFixture::new(8, true);
+    let mut table = vec![0u8; 105 * 8];
+    table[..2].copy_from_slice(&[3, 2]);
+    for slot in 0..104 {
+        let pointer: u64 = match slot {
+            0 => 0x1100,
+            1 => 0,
+            _ => 0x9100,
+        };
+        table[(slot + 1) * 8..(slot + 2) * 8].copy_from_slice(&pointer.to_le_bytes());
+    }
+    fixture.mem.write_all_at(&table, V32_FULL_TABLE).unwrap();
+    fixture
+}
+
+/// A cached full 3.2 row whose 68-slot prefix is re-read unchanged but
+/// whose tail is unreadable proves nothing about its tail entries: the
+/// replay waits, named, and the carried cursor keeps its rows and its
+/// frontier exactly, on the unvalidated (C2 staging) and the
+/// validated-complete replay alike. Control: with the tail readable the
+/// same cursor replays.
+#[test]
+fn unreadable_tail_of_a_full_v32_row_keeps_the_cursor_unchanged() {
+    for complete in [false, true] {
+        let staged = || {
+            if complete {
+                roomy_complete_cursor_with(v32_full_fixture)
+            } else {
+                c2_staged_cursor_with(v32_full_fixture)
+            }
+        };
+        let (mut fixture, carried) = staged();
+        let cursors = carried.decode_cursors_for_test();
+        assert_eq!(cursors.len(), 1);
+        let (key, cursor) = cursors[0].clone();
+        let row = cursor
+            .cached_tables
+            .iter()
+            .find(|table| table.address == V32_FULL_TABLE)
+            .cloned()
+            .expect("the cursor carries the full 3.2 row");
+        assert!(
+            row.version == (3, 2) && row.decoded_slot_count() > LEGACY_PREFIX_SLOTS,
+            "calibration: a full 3.2 row is cached ({:?}, {} slots)",
+            row.version,
+            row.decoded_slot_count()
+        );
+        fixture.hole = Some((V32_FULL_TABLE + 69 * 8, 0x7000));
+        let (outcome, after) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+        let outcome = outcome.expect("unreadable-tail pass");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .any(|skip| skip.reason == REPLAY_UNPROVEN_REASON),
+            "complete {complete}: the unread tail waits, named: {:?}",
+            outcome.skipped()
+        );
+        let kept = after
+            .decode_cursors_for_test()
+            .into_iter()
+            .find(|(held, _)| *held == key)
+            .unwrap_or_else(|| panic!("complete {complete}: the cursor is kept"))
+            .1;
+        assert_eq!(
+            kept.cached_tables, cursor.cached_tables,
+            "complete {complete}: the cached rows are unchanged"
+        );
+        assert_eq!(
+            (kept.tables, kept.interfaces, kept.complete, kept.validated),
+            (
+                cursor.tables,
+                cursor.interfaces,
+                cursor.complete,
+                cursor.validated
+            ),
+            "complete {complete}: the frontier is unchanged"
+        );
+
+        // Control: the readable tail replays the same cursor.
+        let (mut fixture, carried) = staged();
+        let (outcome, _) = armed_scan_pass(&mut fixture, ROOMY_LIMITS, carried);
+        let outcome = outcome.expect("readable-tail pass");
+        assert!(
+            outcome
+                .skipped()
+                .iter()
+                .all(|skip| skip.reason != REPLAY_UNPROVEN_REASON),
+            "complete {complete}: a readable row replays: {:?}",
+            outcome.skipped()
+        );
+    }
+}
+
+/// A replay read that returns fewer bytes than the legacy prefix still
+/// charges every byte the kernel returned before it is classified.
+#[test]
+fn a_short_replay_read_charges_its_returned_bytes() {
+    let (fixture, carried) = roomy_complete_cursor_with(v32_prefix_fixture);
+    let (_, row) = v32_cached_row(&carried);
+    let memory = BracketMemory {
+        file: fixture.mem.try_clone().unwrap(),
+        log: Default::default(),
+        hole: Some((V32_TABLE + 100, 0x7000)),
+    };
+    let mut budget = CaptureWorkBudget::new(ROOMY_LIMITS);
+    let before = budget.attempted_io_bytes();
+    let read = reread_table_extent(LinuxLayout::Lp64, &row, &memory, &mut budget);
+    assert!(
+        matches!(read, ReplayRead::Unavailable),
+        "a short read is unavailable"
+    );
+    assert_eq!(
+        budget.attempted_io_bytes() - before,
+        100,
+        "the 100 returned bytes are charged"
+    );
+}

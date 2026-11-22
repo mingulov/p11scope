@@ -25593,6 +25593,58 @@ exit 0
     }
 
     #[test]
+    fn counts_for_a_retried_setup_first_row_base_past_the_seed() {
+        // The retry places the fresh absolute like an on-time bind:
+        // the member's first recorded entry passed through the setup
+        // endpoint (live since tick 300, caller spawned after the
+        // initial attach), so the re-observed bind bases past exactly
+        // the setup seed and refresh to 44 reads 43 — uniform with
+        // on-time binds.
+        let (mut native, _, setup, _ordinary) = watched_native_with_setup();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        native.scene.coordinator.attach_ticks = Some(400);
+        let endpoint = native.scene.delta.endpoints[setup].id;
+        native
+            .scene
+            .coordinator
+            .capture
+            .as_mut()
+            .expect("capture began")
+            .attached_ticks
+            .insert(endpoint, 300);
+        let mut row = native.row(41, 1, 9, 40, setup);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 44)]);
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+        assert_eq!(
+            native.module_unbound(),
+            None,
+            "the stale seed fold retracts once the edge carries it"
+        );
+    }
+
+    #[test]
     fn a_reused_pid_never_inherits_a_witness_by_pid() {
         let (mut native, caller) = NativeScene::new();
         // pid 7 now holds ticket 99; the row's ticket 41 was its previous

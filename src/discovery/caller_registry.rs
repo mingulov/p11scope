@@ -4344,6 +4344,13 @@ pub(crate) struct CallerRegistry {
     /// and consumed (taken) by the re-arm. A latch blocks the next
     /// demand until re-arm or hold, so no stale read is possible.
     quantum_touched_feeds: BTreeSet<instance_input::RegistryInstanceId>,
+    /// Clean passes published since the last stuck-session abandon
+    /// (the reseed health gate): every running re-arm discard trips
+    /// it to zero, each publish-complete ticks it up, saturating at
+    /// the health window. A reseed arms only at the cap; first-time
+    /// arms never consult it. Starts healthy: a capture with no
+    /// abandon yet has nothing to wait out.
+    passes_since_session_abandon: u32,
     /// Why an edge no producer covered reads unknown: `ScanOnly` until a
     /// native usage producer runs (Task 6 C5 sets `NotAttached`).
     uncovered_reason: UnknownReason,
@@ -4726,6 +4733,7 @@ impl CallerRegistry {
             staged: Vec::new(),
             joint_publication: None,
             quantum_touched_feeds: BTreeSet::new(),
+            passes_since_session_abandon: crate::semantics_key_use::RESEED_HEALTH_CLEAN_PASSES,
             uncovered_reason: UnknownReason::ScanOnly,
             last_health_regression_ns: None,
             watches_ended_ns: None,

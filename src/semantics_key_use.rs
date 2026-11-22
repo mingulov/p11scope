@@ -427,6 +427,16 @@ pub(crate) const RESEED_STUCK_DEGRADE_STREAK: u8 = 4;
 /// lets back-pressured pools drain before the retry re-arms.
 pub(crate) const RESEED_COOLDOWN_PASSES: u32 = 20;
 
+/// Clean passes a session must publish after its last stuck-session
+/// abandon before any reseed may arm into it again (the registry's
+/// health gate; first-time arms never wait). Three passes cover one
+/// full 6 s wedge horizon at the documented ~2 s pass cadence, so a
+/// reseed arms only after the session survives a whole no-progress
+/// horizon without abandoning: the live kill armed ~2 s after its
+/// abandon, inside this window. A refused reseed stays S1Only with
+/// its health gap named and retries from the next fresh proof.
+pub(crate) const RESEED_HEALTH_CLEAN_PASSES: u32 = 3;
+
 impl std::fmt::Debug for JointStaging {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JointStaging")

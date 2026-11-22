@@ -1726,8 +1726,8 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 275 + 2.
-        self.assertIn("default (277)", result.stdout)
+        # exactly one), so the default section shows 276 + 2.
+        self.assertIn("default (278)", result.stdout)
         self.assertIn("btrfs (18, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (14, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
@@ -2359,11 +2359,11 @@ class Full512CurationTests(unittest.TestCase):
             result = run_runner("--list", "--full-512", str(binary))
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
-        # DEFAULT 275 minus the 17 wide members, plus both load-gate
+        # DEFAULT 276 minus the 17 wide members, plus both load-gate
         # alternatives the fake lists (a real binary has exactly one);
-        # LONG 17 minus the 4 wide members.
-        self.assertIn("default (260)", result.stdout)
-        self.assertIn("long (13, --include-long only)", result.stdout)
+        # LONG 18 minus the 4 wide members.
+        self.assertIn("default (261)", result.stdout)
+        self.assertIn("long (14, --include-long only)", result.stdout)
         for name in WIDE_ONLY_EXPECTED:
             self.assertNotIn(name, result.stdout)
         self.assertIn("verify: full-512 curation matches the binary",

@@ -30545,7 +30545,8 @@ exit 0
         // re-refusal, finish flush, finish clear, endpoint-loss release —
         // and pins the counters it touches plus the four exactly-once
         // equations (census, placement, rows sum, calls).
-        let cases: Vec<(&str, fn() -> (NativeScene, RetryMachineExpect))> = vec![
+        type RetryMachineCase = (&'static str, fn() -> (NativeScene, RetryMachineExpect));
+        let cases: Vec<RetryMachineCase> = vec![
             ("initial_bind", machine_initial_bind),
             ("initial_mismatch", machine_initial_mismatch),
             ("retain", machine_retain),

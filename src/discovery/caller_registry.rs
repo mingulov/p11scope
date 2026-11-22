@@ -5608,6 +5608,7 @@ impl CallerRegistry {
     /// insert landed in each image set; unlanded calls subtract
     /// nowhere. `fold_id` names the fold for a same-publication
     /// insert receipt, which overrides the flags when present.
+    #[allow(clippy::too_many_arguments)] // The fold id joins the existing explicit retract seam; bundling would churn the coordinator call site for no gain.
     pub(crate) fn retract_unbound_fold(
         &mut self,
         module: ModuleKey,

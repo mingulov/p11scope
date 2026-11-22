@@ -21845,17 +21845,22 @@ pub(crate) mod tests {
 
     #[test]
     fn object_journal_exit_return_drain_recovers_tail_free_call() {
-        // Exit-during-return drain: the process exits between the PKCS#11
-        // call return and the journal uretprobe result, so BPF abandons
-        // the START with SYNC_RETURN_RESULT_LOST while the ordinary CALL
-        // already observed the return. A call whose completion needs no
-        // BPF tail (C_Sign: tail-absent ENDs) must complete from the
-        // corroborated return instead of losing its outcome. The
-        // completion cuts at the abandonment's own ordinal (the
-        // terminal record of the seal, like an END conversion cuts at
-        // its END): the corroborated return's ordinal is stale once a
-        // prior seal settled past it, and completing there contradicts
-        // the covered prefix. Tail-needing calls keep the bounded loss
+        // Drained-return recovery: BPF abandoned the START with
+        // SYNC_RETURN_RESULT_LOST while the ordinary CALL already
+        // observed the return (the producer pairs these when the
+        // begun commit fails at entry and the return submits
+        // UNJOURNALED, re-routing its base as the ordinary). Exit
+        // cleanup instead emits EXEC_EXIT with no return observation
+        // and keeps the loss (control:
+        // object_journal_exit_reason_keeps_loss_despite_corroborated_return).
+        // A call whose completion needs no BPF tail (C_Sign:
+        // tail-absent ENDs) must complete from the corroborated
+        // return instead of losing its outcome. The completion cuts
+        // at the abandonment's own ordinal (the terminal record of
+        // the seal, like an END conversion cuts at its END): the
+        // corroborated return's ordinal is stale once a prior seal
+        // settled past it, and completing there contradicts the
+        // covered prefix. Tail-needing calls keep the bounded loss
         // (C_CreateObject twin:
         // object_journal_bounded_uppers_keep_max_only).
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
@@ -21993,18 +21998,31 @@ pub(crate) mod tests {
         // C_OpenSession drain twin of
         // object_journal_exit_return_drain_recovers_tail_free_call:
         // the only tail-free function whose drained completion mints
-        // something extra. The recovered session word must open the
-        // returned session, proving the drained value words (not just
-        // the disposition) flow from the corroborating return.
+        // something extra. Producer-shaped words (absent entry
+        // session, nonzero return-only handle from the shared return
+        // constructor) with the H0 claim filed from the corroborating
+        // return. The recovered handle must open its session, and a
+        // follow-up close on that handle must find the opened
+        // incarnation: a BEGIN-word substitution mints nothing (the
+        // entry word is 0, not a handle), so the follow-up misses.
         use crate::semantics_objects::SessionOrigin;
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        const RETURNED_HANDLE: u64 = 0x9090;
         let mut scene = Scene::new(image_default());
-        let open = function_id("C_OpenSession");
-        let proof = scene.attest_function("C_OpenSession");
-        let begin = begin_bytes(1, 1, open, 0);
+        let close = function_id("C_CloseSession");
+        let (begin, end) = producer_agreement_pair("C_OpenSession", |_, _| {});
+        let JournalRecord::End(lost) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END");
+        };
+        let ordinary = lost.payload_base().event;
+        assert_eq!(
+            ordinary.session, RETURNED_HANDLE,
+            "the return carries the only handle"
+        );
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         assert_eq!(
-            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            scene.ingest_ordinary(ordinary),
             JournalDisposition::ReturnObserved
         );
         let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
@@ -22014,10 +22032,43 @@ pub(crate) mod tests {
         let mut pad = ordinary_for(&begin, 0);
         pad.slot = 99;
         scene.ingest_ordinary(pad);
+        // Follow-up close on the returned handle.
+        let mut close_begin = begin_bytes(1, 2, close, 0);
+        put_u64(&mut close_begin, 80, RETURNED_HANDLE);
+        assert_eq!(
+            scene.ingest(&close_begin),
+            JournalDisposition::BeginAdmitted
+        );
+        let close_end = end_bytes_absent(&close_begin, 0, ENTRY_NS + 80);
+        assert_eq!(scene.ingest(&close_end), JournalDisposition::EndStaged);
+        let JournalRecord::End(close_staged) =
+            decode_journal_record(&close_end, &scene.descriptors).unwrap()
+        else {
+            panic!("close END");
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_OpenSession", ordinary);
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the paired return attests");
+        let close_admitted = scene
+            .fixture
+            .admit_original_event("C_CloseSession", close_staged.payload_base().event);
+        scene
+            .adapter
+            .attest_key(&close_admitted)
+            .expect("the follow-up attests");
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("drained return seals");
-        assert_eq!(success.prefix.settled().len(), 1);
-        let settled = &success.prefix.settled()[0];
+        assert_eq!(success.prefix.settled().len(), 2);
+        let settled = success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles");
         assert!(
             !settled.abandoned,
             "the drained call completes, never abandons"
@@ -22027,23 +22078,35 @@ pub(crate) mod tests {
             Some(3),
             "the completion cut is the abandonment ordinal"
         );
-        assert!(
-            success
-                .effects
-                .effects
-                .iter()
-                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
-            "the drained handle opens its session: {:?}",
-            success.effects.effects
+        let opened = success
+            .effects
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ObjectEffect::SessionOpened { session, .. } => Some(*session),
+                _ => None,
+            })
+            .expect("the drained handle opens its session");
+        let ended = success
+            .effects
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                ObjectEffect::SessionEnded { session, .. } => Some(*session),
+                _ => None,
+            })
+            .expect("the follow-up close ends a session");
+        assert_eq!(
+            opened, ended,
+            "the follow-up using the returned handle finds the opened incarnation"
         );
-        let opened = scene
-            .model
-            .project()
+        let projected = scene.model.project();
+        let opened_views = projected
             .sessions
             .iter()
             .filter(|view| view.origin == SessionOrigin::Opened)
             .count();
-        assert_eq!(opened, 1, "one session opens from the drained words");
+        assert_eq!(opened_views, 1, "one session opens from the drained words");
         assert!(
             !success.effects.effects.iter().any(|effect| matches!(
                 effect,
@@ -22060,17 +22123,32 @@ pub(crate) mod tests {
     fn object_journal_exit_return_drain_failed_open_mints_no_session() {
         // Value twin of the C_OpenSession drain: a failed (non-OK)
         // drained return still completes (never abandons), but mints
-        // no session. The recovered rv flows from the corroborating
-        // return; a drained OK and a drained failure stay distinct.
+        // no session. Producer-shaped words (absent entry session,
+        // no out-read on failure) with the H0 claim filed from the
+        // corroborating return: the entry and return words diverge,
+        // so the no-mint proves rv-gating, not equality-by-copy. A
+        // drained OK and a drained failure stay distinct.
         use crate::semantics_objects::SessionOrigin;
+        use p11scope_ebpf_common::SESSION_NONE;
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
         let mut scene = Scene::new(image_default());
-        let open = function_id("C_OpenSession");
-        let proof = scene.attest_function("C_OpenSession");
-        let begin = begin_bytes(1, 1, open, 0);
+        let (begin, end) = producer_agreement_pair("C_OpenSession", |_, facts| {
+            facts.rv = 5;
+            facts.session = SESSION_NONE;
+        });
+        let JournalRecord::End(lost) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END");
+        };
+        let ordinary = lost.payload_base().event;
+        assert_eq!(
+            (ordinary.rv, ordinary.session),
+            (5, SESSION_NONE),
+            "the failed return carries no handle"
+        );
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         assert_eq!(
-            scene.ingest_ordinary(ordinary_for(&begin, 5)),
+            scene.ingest_ordinary(ordinary),
             JournalDisposition::ReturnObserved
         );
         let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
@@ -22080,6 +22158,13 @@ pub(crate) mod tests {
         let mut pad = ordinary_for(&begin, 0);
         pad.slot = 99;
         scene.ingest_ordinary(pad);
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_OpenSession", ordinary);
+        let proof = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the paired return attests");
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("drained return seals");
         assert_eq!(success.prefix.settled().len(), 1);
@@ -22110,6 +22195,443 @@ pub(crate) mod tests {
             .filter(|view| view.origin == SessionOrigin::Opened)
             .count();
         assert_eq!(opened, 0, "a failed open mints no session");
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "no outcome is lost: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_exit_reason_keeps_loss_despite_corroborated_return() {
+        // Exit-path loss control for the drained-return recovery: BPF
+        // exit cleanup abandons the START with EXEC_EXIT (reason 6),
+        // never SYNC_RETURN_RESULT_LOST (reason 9: the settle
+        // coercion fires only for return-path removals of unsettled
+        // rows). Even with a corroborating ordinary return staged, a
+        // reason-6 abandonment keeps the counted loss path (per-call
+        // disposal for this neutral call): the drain predicate is
+        // reason-9 only, so the exit path can never complete from
+        // held words. Deltas vs the disposal twin
+        // (seal_exit_abandoned_sign_disposes_per_call_and_later_sign_binds):
+        // the corroborating ordinary alone.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT;
+        let mut scene = Scene::new(image_default());
+        let sign = function_id("C_Sign");
+        let proof = scene.attest_function_n("C_Sign", 2);
+        let begin = begin_bytes(1, 1, sign, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_EXEC_EXIT, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("exit abandonment seals");
+        assert_eq!(
+            success.prefix.settled().len(),
+            1,
+            "a per-call disposal settles nothing: {:?}",
+            success.prefix.settled()
+        );
+        assert_eq!(success.prefix.settled()[0].begin_cut, 4);
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the exit loss stays counted: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            !scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused,
+            "the key keeps sealing after a neutral exit loss"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            None,
+            "a disposal leaves no loss bound"
+        );
+    }
+
+    #[test]
+    fn object_journal_drained_lifecycle_refuses_sibling_close_all() {
+        // Causal-order twin: the opener returns (ordinary @2) before
+        // its sibling C_CloseAllSessions ends (@4), but the opener's
+        // abandonment (@5) certifies later. Completing at the
+        // abandonment cut would open the session AFTER the close-all
+        // applied, leaving it live where the true order (returned
+        // before the close) closed it. A lifecycle drain with a
+        // sibling terminal covered past its observed return keeps
+        // the counted Ticket loss instead of replaying out of order.
+        // The unfenced Ticket voids through the sibling's higher cut,
+        // invalidating the pre-computed fence, so this seal refuses
+        // (pre-existing Ticket mechanics: an object function staged
+        // identically refuses the same way) with the Ticket bound
+        // retained; the joint feed dispositions the refusal as
+        // fallback with segment resumption, never a bricked key.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close_all = function_id("C_CloseAllSessions");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseAllSessions");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let sibling = begin_bytes(1, 2, close_all, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the voided fence refuses the seal");
+        assert_eq!(
+            failure.gap,
+            JournalGap::ModelRefused,
+            "unproven order keeps the loss, never completes"
+        );
+        assert!(
+            failure.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::BootstrapRefused
+                }
+            )),
+            "the refusal names its cause: {:?}",
+            failure.effects.effects
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(2),
+            "the Ticket bound names the observed return"
+        );
+        assert!(
+            !failure
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "no session opens out of order: {:?}",
+            failure.effects.effects
+        );
+        assert!(
+            scene.model.project().sessions.is_empty(),
+            "no session survives the refused drain"
+        );
+    }
+
+    #[test]
+    fn object_journal_ticket_voids_seal_on_higher_sibling_end() {
+        // Pre-existing Ticket-mechanics control for the causal-order
+        // twin: an object function (always-Ticket, never drained)
+        // staged identically — corroborated return @2, sibling END
+        // @4, abandonment @5 — refuses the seal the same way. The
+        // unfenced Ticket voids through the sibling's higher cut,
+        // invalidating the pre-computed fence; the bound is
+        // retained. The refused lifecycle drain inherits exactly
+        // this path, nothing new.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let init = function_id("C_SignInit");
+        let close_all = function_id("C_CloseAllSessions");
+        scene.attest_function("C_SignInit");
+        let proof = scene.attest_function("C_CloseAllSessions");
+        let begin = begin_bytes(1, 1, init, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let sibling = begin_bytes(1, 2, close_all, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("the voided fence refuses the seal");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(2),
+            "the Ticket bound names the observed return"
+        );
+    }
+
+    #[test]
+    fn object_journal_healthy_open_close_all_lifecycle_closes_session() {
+        // Healthy control for the causal-order twin above: with a real
+        // OpenSession END at cut 2 (instead of a return observed at 2
+        // and certified at 5), the session opens before the sibling
+        // close-all and the ordinary lifecycle closes it. Same final
+        // state as the refused drain (no live session) via the clean
+        // path: no loss, no bound.
+        use crate::semantics_objects::SessionState;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close_all = function_id("C_CloseAllSessions");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseAllSessions");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 60)),
+            JournalDisposition::EndStaged
+        );
+        let sibling = begin_bytes(1, 2, close_all, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("healthy lifecycle seals");
+        assert!(
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "the healthy open mints its session: {:?}",
+            success.effects.effects
+        );
+        assert!(
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionEnded { .. })),
+            "the close-all ends it through the ordinary lifecycle: {:?}",
+            success.effects.effects
+        );
+        let sessions = scene.model.project().sessions;
+        let opened: Vec<_> = sessions
+            .iter()
+            .filter(|view| view.origin == crate::semantics_objects::SessionOrigin::Opened)
+            .collect();
+        assert_eq!(opened.len(), 1, "one opened incarnation");
+        assert!(
+            opened.iter().all(|view| view.state != SessionState::Live),
+            "the ordinary lifecycle leaves nothing live: {:?}",
+            sessions.iter().map(|view| view.state).collect::<Vec<_>>()
+        );
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::OutcomeLost
+                }
+            )),
+            "the healthy path loses nothing: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
+    fn object_journal_drained_lifecycle_refuses_across_seals() {
+        // Multi-seal causal-order twin: the opener returns in the
+        // first seal while the sibling close-all stages its END
+        // there, and the abandonment certifies in the second seal.
+        // The sibling terminal sits covered past the observed
+        // return (staged, held unapplied by the open drain call),
+        // so the lifecycle drain keeps the counted loss in the
+        // second seal instead of replaying after the close. The
+        // second seal continues under its raised fence (no new
+        // bootstrap to refuse), so it succeeds with the Ticket
+        // bound retained and no session minted; the audited path
+        // names the same loss with its bounded-loss replay step
+        // (the kept-loss twin pins that step for Tickets).
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close_all = function_id("C_CloseAllSessions");
+        scene.attest_function("C_OpenSession");
+        let proof = scene.attest_function("C_CloseAllSessions");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let sibling = begin_bytes(1, 2, close_all, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 70)),
+            JournalDisposition::EndStaged
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let first = scene.seal(&bootstrap).expect("first seal passes");
+        assert_eq!(first.prefix.settled().len(), 2);
+        assert!(
+            first.effects.effects.is_empty(),
+            "the open drain call holds the application watermark: {:?}",
+            first.effects.effects
+        );
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let second = scene.seal(&bootstrap).expect("second seal passes");
+        let drained = *second
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles in its certification seal");
+        assert!(
+            drained.abandoned,
+            "unproven order keeps the loss across seals"
+        );
+        assert_eq!(
+            drained.end_cut, None,
+            "no completion without the order proof"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(2),
+            "the Ticket bound names the observed return"
+        );
+        assert!(
+            !second
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "no session opens out of order: {:?}",
+            second.effects.effects
+        );
+        assert!(
+            scene.model.project().sessions.is_empty(),
+            "no session survives the refused drain"
+        );
+    }
+
+    #[test]
+    fn object_journal_drained_lifecycle_recovers_when_sibling_precedes_return() {
+        // Order-proof pass guard: a sibling close-all fully before
+        // the observed return (both its cuts below the return
+        // ordinal) leaves the lifecycle drain's window empty, so
+        // the true order (close, then the returned open) replays
+        // exactly and the drain recovers. The proof refuses only
+        // covered history past the return, never benign order.
+        use crate::semantics_objects::SessionOrigin;
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let close_all = function_id("C_CloseAllSessions");
+        scene.attest_function("C_CloseAllSessions");
+        let proof = scene.attest_function("C_OpenSession");
+        let sibling = begin_bytes(1, 1, close_all, 0);
+        assert_eq!(scene.ingest(&sibling), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&sibling, 0, ENTRY_NS + 60)),
+            JournalDisposition::EndStaged
+        );
+        let begin = begin_bytes(1, 2, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("ordered drain seals");
+        let drained = *success
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 3)
+            .expect("the drained call settles");
+        assert!(
+            !drained.abandoned,
+            "benign order recovers: {:?}",
+            success.prefix.settled()
+        );
+        assert_eq!(drained.end_cut, Some(5));
+        assert!(
+            success
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "the ordered drain opens its session: {:?}",
+            success.effects.effects
+        );
+        let opened = scene
+            .model
+            .project()
+            .sessions
+            .iter()
+            .filter(|view| view.origin == SessionOrigin::Opened)
+            .count();
+        assert_eq!(opened, 1, "one session opens from the drained words");
         assert!(
             !success.effects.effects.iter().any(|effect| matches!(
                 effect,

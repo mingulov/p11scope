@@ -32802,7 +32802,7 @@ fn joint_replay_steps_keep_prior_terminal_after_conversion_loss() {
 }
 
 /// Drained twin of joint_replay_steps_keep_prior_terminal_after_conversion_loss:
-/// the same exit-during-return staging (BEGIN + corroborated ordinary OK
+/// the same drained-return staging (BEGIN + corroborated ordinary OK
 /// return + ABANDON(9)) on a tail-free call (C_SignUpdate) completes from
 /// the drained return instead of losing its outcome, while the retained
 /// prior terminal still replays exactly once.

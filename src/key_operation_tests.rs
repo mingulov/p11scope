@@ -1956,11 +1956,13 @@ fn key_operation_abandoned_quantum_replays_s1() {
     assert_eq!((joint.started(), joint.completed()), (1, 0));
 }
 
-/// Exit-during-return row twin: the browser exits between the C_Sign
-/// return and the journal uretprobe result, so the journal result is
-/// abandoned (SYNC_RETURN_RESULT_LOST) while S1 observed the OK
-/// return. The committed sign row must complete from the drained
-/// return instead of routing to key-join loss.
+/// Drained-return row twin: the journal result is abandoned
+/// (SYNC_RETURN_RESULT_LOST) while S1 observed the OK return (the
+/// producer pairs these when the begun commit fails at entry and the
+/// return submits UNJOURNALED). The committed sign row must complete
+/// from the drained return instead of routing to key-join loss. Exit
+/// cleanup instead emits EXEC_EXIT with no return observation and
+/// keeps the loss.
 #[test]
 fn key_operation_exit_return_drain_recovers_sign_row() {
     let instance =
@@ -2000,8 +2002,8 @@ fn key_operation_exit_return_drain_recovers_sign_row() {
         &mut sink,
         &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
-    // The exit-raced terminal: S1 observed the OK return; the journal
-    // result was lost at exit.
+    // The drained terminal: S1 observed the OK return; the journal
+    // abandoned the START with the return already observed.
     let call = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
     let (facts, _) = attest_and_stage(&mut scene, &mut staging, &call);
     assert_eq!(facts.function, "C_Sign");
@@ -2061,7 +2063,7 @@ fn key_operation_exit_return_drain_recovers_sign_row() {
     assert_eq!(
         (row.completed, row.key_join_lost),
         (1, 0),
-        "the exit-raced sign completes: {row:?}"
+        "the drained sign completes: {row:?}"
     );
     assert!(
         committed

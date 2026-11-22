@@ -3152,11 +3152,17 @@ impl JournalAdapter {
                 return JournalDisposition::Contradiction(JournalContradiction::UnclosedEndpoint);
             }
         }
-        if self.image_taint_blocks(image, self.voided_through) {
+        if self.image_taint_blocks(image, self.voided_through)
+            && !(call_establishes_object_proof(function)
+                && self.quarantine_recovery_candidate(image))
+        {
             // Its terminal will arrive unmatched: expected-absent
             // because of this refusal, never a promotion. A taint
             // evidencing only fenced history does not refuse fresh
             // records: they ingest for the rebirth above the fence.
+            // Quarantine-end admits establishing calls for void-fenced
+            // blocked images, so their proof can stage and end the
+            // quarantine; uses still refuse.
             self.note_derived_absence(image, key, function);
             return JournalDisposition::Refused;
         }
@@ -3377,9 +3383,17 @@ impl JournalAdapter {
             );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.image_taint_blocks(entry.image, self.voided_through) {
+        if self.image_taint_blocks(entry.image, self.voided_through)
+            && !call_establishes_object_proof(entry.function)
+        {
             return JournalDisposition::Refused;
         }
+        // Terminals for staged establishing calls ingest past a taint:
+        // their BEGIN admitted above only for a fenced blocked image
+        // (or staged before the taint landed), and staging the
+        // terminal completes the proof a quarantine-end mint needs.
+        // Abandons still refuse: a failed establishing call is not
+        // proof, and its BEGIN sits open until a void wipes it.
         if entry.end.is_some() || entry.abandon.is_some() {
             let image = entry.image;
             let evidence = self.contradiction_evidence(key);
@@ -6582,7 +6596,9 @@ impl JournalAdapter {
             .map(|state| state.void_fence)
             .unwrap_or(0)
             .max(self.voided_through);
-        if self.image_taint_blocks((key.cookie, key.exec), fenced_through) {
+        if self.image_taint_blocks((key.cookie, key.exec), fenced_through)
+            && self.quarantine_end_applies(admitted).is_none()
+        {
             return Err(AttestationRefusal::ImageTainted);
         }
         if fresh
@@ -6604,9 +6620,11 @@ impl JournalAdapter {
     /// every retained incarnation is permanently dead
     /// (refused/tainted/ended, never merely image-quarantined) and the
     /// latest is void-fenced past everything it sealed with every
-    /// recorded death inside the fence; else the latest retained
-    /// incarnation (dead: binds keep returning it and its seals keep
-    /// refusing). At most one incarnation per binding is ever live.
+    /// recorded death inside the fence, or when the admission ends the
+    /// binding's quarantine with new post-fence object proof; else the
+    /// latest retained incarnation (dead: binds keep returning it and
+    /// its seals keep refusing). At most one incarnation per binding
+    /// is ever live.
     /// Retained incarnations of one admission binding: the live one
     /// when any is live, and the latest minted. The per-image list
     /// appends in mint order, so one pass finds both.
@@ -6651,7 +6669,16 @@ impl JournalAdapter {
             .keys
             .get(&last)
             .is_some_and(|state| state.refused || state.tainted || state.era_ended);
-        if permanently_dead && self.incarnation_mint_eligible(last) {
+        // No live incarnation exists here, so quarantine-end needs no
+        // separate liveness check: the death rule mints for recorded
+        // dead-frame dooms, and quarantine-end mints for anything
+        // blocked (image-tainted or dead with recorded grounding)
+        // when this admission carries new post-fence object proof.
+        let blocked = permanently_dead
+            || self.image_taint_blocks((last.cookie, last.exec), self.voided_through);
+        if (permanently_dead && self.incarnation_mint_eligible(last))
+            || (blocked && self.quarantine_end_eligible(admitted, last))
+        {
             JournalDomainKey {
                 incarnation: last.incarnation.saturating_add(1),
                 ..last
@@ -6663,9 +6690,10 @@ impl JournalAdapter {
 
     /// Whether an abandonment reason proves its provider frame dead
     /// (an exec or exit teardown): only a dead frame's doom mints a
-    /// fresh incarnation. Every other unbounded reason leaves a
-    /// capable frame whose unknown effects could interact with any
-    /// future history, so its doom never mints.
+    /// fresh incarnation under the death rule. Every other unbounded
+    /// reason leaves a capable frame whose unknown effects could
+    /// interact with any future history, so its doom mints only on
+    /// new post-fence object proof (quarantine-end).
     fn abandon_proves_frame_dead(reason: u32) -> bool {
         reason == p11scope_ebpf_common::object_journal::JOURNAL_REASON_EXEC_EXIT
     }
@@ -6893,14 +6921,17 @@ impl JournalAdapter {
     /// Bind one H3-admitted call's incarnation to a journal key without
     /// claiming the invocation before its original START is ingested: the
     /// binding's live incarnation, or a fresh incarnation when every
-    /// retained one is permanently dead and void-fenced, plus the
-    /// adapter-tracked era. Re-attestation after a fault-void returns
-    /// the live key; a tainted image or a full key table refuses. A
-    /// second live key for an image whose key already converted
-    /// refuses: sole-key attributions cannot be re-examined — unless
-    /// every live registered sibling is void-fenced past its sealed
-    /// history, in which case the new key re-enters Joint past the
-    /// void (counted). Birth and closure are verified on top of this
+    /// retained one is permanently dead and void-fenced, or when the
+    /// admission ends the binding's quarantine with new post-fence
+    /// object proof (the blocked incarnation retires and its image
+    /// taint lifts, counted), plus the adapter-tracked era.
+    /// Re-attestation after a fault-void returns the live key; a
+    /// tainted image or a full key table refuses. A second live key
+    /// for an image whose key already converted refuses: sole-key
+    /// attributions cannot be re-examined — unless every live
+    /// registered sibling is void-fenced past its sealed history, in
+    /// which case the new key re-enters Joint past the void
+    /// (counted). Birth and closure are verified on top of this
     /// binding by [`BootstrapReceipt::attest`].
     pub(crate) fn bind_admitted_key(
         &mut self,
@@ -6912,6 +6943,39 @@ impl JournalAdapter {
         // (counted, idempotent) so later strict reads see clean proof.
         self.lift_fenced_image_taint((image.task_cookie, image.exec_id));
         let key = self.resolve_binding_key(admitted);
+        // Quarantine-end: new object proof retires the blocked
+        // incarnation (when still live-flagged) and lifts its image
+        // taint, so the fresh incarnation below binds clean proof.
+        // The old proof keeps refusing and the voided window stays
+        // fenced. Counts when quarantine mattered: the death rule
+        // alone would refuse, or it could not reach past the image
+        // taint. Decided before the lift clears the block.
+        let quarantined = self.quarantine_end_applies(admitted);
+        let quarantine_mint = quarantined.is_some_and(|last| {
+            key.incarnation == last.incarnation.saturating_add(1) && !self.keys.contains_key(&key)
+        });
+        let quarantine_matters = quarantine_mint
+            && quarantined.is_some_and(|last| {
+                let dead_alone = self
+                    .keys
+                    .get(&last)
+                    .is_some_and(|state| state.refused || state.tainted || state.era_ended)
+                    && self.incarnation_mint_eligible(last);
+                !dead_alone || self.image_taint_blocks((key.cookie, key.exec), self.voided_through)
+            });
+        if quarantine_mint
+            && let Some(last) = quarantined
+            && self
+                .keys
+                .get(&last)
+                .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
+        {
+            self.keys.get_mut(&last).expect("quarantined key").era_ended = true;
+            self.note_ended_mark(last);
+        }
+        if quarantine_mint {
+            self.lift_quarantine_ended_taint((key.cookie, key.exec));
+        }
         // Re-entry mints count once: a fresh incarnation of a dead
         // fenced binding, or a fresh binding beside void-fenced live
         // registered siblings (the probe already refused unfenced
@@ -6937,6 +7001,9 @@ impl JournalAdapter {
         if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.entry(key) {
             if minted_incarnation {
                 self.reentry_incarnations = self.reentry_incarnations.saturating_add(1);
+                if quarantine_matters {
+                    self.reentry_quarantine_ends = self.reentry_quarantine_ends.saturating_add(1);
+                }
             } else if fenced_siblings {
                 self.reentry_sibling_binds = self.reentry_sibling_binds.saturating_add(1);
             }

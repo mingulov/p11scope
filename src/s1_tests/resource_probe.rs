@@ -791,7 +791,10 @@ fn native_semantic_resource_final_types_pinned() {
     // cd44b5f7 adds the no-progress guard's pending_scans counter (+8 B).
     // cc63de8a publishes the B17 reload disclosure through the report
     // (+40 B: one drained disclosures Vec plus two u64 router totals).
-    pin!(crate::semantic_capture::TickReport, 208);
+    // The held-admission requeue counts evaluated-but-unqueued keys by
+    // named reason (+40 B: five u64 skip slots); the per-tick report is
+    // the only channel that names them without new output fields.
+    pin!(crate::semantic_capture::TickReport, 248);
     pin!(
         crate::semantic_capture::RoutedCall,
         752 + size_of::<Option<CollectedCallOrigin>>()

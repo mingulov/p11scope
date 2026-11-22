@@ -239,6 +239,18 @@ pub(super) fn is_modeled_function(function: u32) -> bool {
     call_kind(function).is_some()
 }
 
+/// Whether one canonical function ordinal is a session-lifecycle call
+/// (open/close/find/login/init and their finals): the journal's
+/// drained-return order gate. A lifecycle completion applies
+/// session effects at its cut, so replaying it after dependent
+/// history covered past its observed return diverges from the true
+/// order; neutral completions apply no effect and replay anywhere.
+/// Unknown ordinals are not lifecycle (the drain gate already
+/// decides them by tail shape alone).
+pub(super) fn is_lifecycle_function(function: u32) -> bool {
+    matches!(call_kind(function), Some(CallKind::Lifecycle(_)))
+}
+
 fn call_kind(function: u32) -> Option<CallKind> {
     if let Some(descriptor) = object_descriptor(function) {
         return Some(CallKind::Object(descriptor.action));

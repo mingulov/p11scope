@@ -4782,31 +4782,6 @@ fn completed_from_drained_return(
     }
 }
 
-/// The drained-return completion cut for one converted entry, or
-/// `None`: the abandonment is reason-9 within the frontier, the
-/// function drains without a tail, and the corroborated return sits
-/// within the frontier. The cut is the abandonment's own ordinal —
-/// the terminal record of this seal, exactly like an END conversion
-/// completes at its END's ordinal. The corroborated return's ordinal
-/// is stale once a prior seal settled past it, and completing there
-/// contradicts the covered prefix (the model voids the domain); the
-/// abandonment is always fresh. The settled table, the frozen
-/// retained table, the terminal conversion, the model fence and
-/// the prune rule share this one predicate: a drained call
-/// completes, fences and prunes as a completion everywhere, or
-/// keeps the loss everywhere.
-fn drained_return_cut(entry: &OpenEntry, frontier: u64) -> Option<u64> {
-    let staged = entry.abandon.filter(|staged| {
-        staged.ordinal <= frontier
-            && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
-    })?;
-    if !return_drains_without_tail(entry.function) {
-        return None;
-    }
-    entry.corroborated_return.filter(|at| *at <= frontier)?;
-    Some(staged.ordinal)
-}
-
 fn tail_u64(tail: &[u8; 240], offset: usize) -> u64 {
     u64::from_le_bytes([
         tail[offset],
@@ -8172,7 +8147,9 @@ impl JournalAdapter {
                 && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
                 && let Some(at) = entry.corroborated_return
                 && at <= frontier
-                && drained_return_cut(entry, frontier).is_none()
+                && self
+                    .drained_return_cut(key, &live, entry, frontier)
+                    .is_none()
             {
                 pending_bounds.push(at);
             }
@@ -8211,7 +8188,9 @@ impl JournalAdapter {
                         staged.ordinal <= frontier
                             && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
                             && entry.corroborated_return.is_some_and(|at| at <= frontier)
-                    }) || drained_return_cut(entry, frontier).is_some())
+                    }) || self
+                        .drained_return_cut(key, &live, entry, frontier)
+                        .is_some())
             })
             .map(|entry| entry.begin_ordinal)
             .min();
@@ -9414,6 +9393,86 @@ impl JournalAdapter {
     /// Conversion and settlement after every structural rule passed. The
     /// only remaining failures are model surprises, which fail closed.
     #[allow(clippy::too_many_arguments)] // One validated domain keeps its original audit and prepaid replay storage.
+    /// The drained-return completion cut for one converted entry, or
+    /// `None`: the abandonment is reason-9 within the frontier, the
+    /// function drains without a tail, and the corroborated return sits
+    /// within the frontier. The cut is the abandonment's own ordinal —
+    /// the terminal record of this seal, exactly like an END conversion
+    /// completes at its END's ordinal. The corroborated return's ordinal
+    /// is stale once a prior seal settled past it, and completing there
+    /// contradicts the covered prefix (the model voids the domain); the
+    /// abandonment is always fresh.
+    ///
+    /// Lifecycle drains additionally prove causal order: the completion
+    /// applies session effects at the abandonment cut, but the call
+    /// truly returned at the corroborated ordinal. Replay diverges from
+    /// truth when dependent history was covered past the observed
+    /// return (a sibling close-all between the two would close a
+    /// session the replay then re-opens). Neutral completions apply no
+    /// effect and replay anywhere, so they skip the proof. A lifecycle
+    /// drain without the proof keeps the bounded loss.
+    ///
+    /// The settled table, the frozen retained table, the terminal
+    /// conversion, the model fence and the prune rule share this one
+    /// predicate: a drained call completes, fences and prunes as a
+    /// completion everywhere, or keeps the loss everywhere.
+    fn drained_return_cut(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        entry: &OpenEntry,
+        frontier: u64,
+    ) -> Option<u64> {
+        let staged = entry.abandon.filter(|staged| {
+            staged.ordinal <= frontier
+                && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+        })?;
+        if !return_drains_without_tail(entry.function) {
+            return None;
+        }
+        let returned = entry.corroborated_return.filter(|at| *at <= frontier)?;
+        if super::state::is_lifecycle_function(entry.function)
+            && !self.drain_order_proven(key, live, returned, staged.ordinal)
+        {
+            return None;
+        }
+        Some(staged.ordinal)
+    }
+
+    /// Whether one lifecycle drain's window is empty: the observed
+    /// return is newer than this key's last sealed frontier (no prior
+    /// seal applied past it: settlement applies at most through its
+    /// frontier), and no sibling terminal of this key sits covered
+    /// strictly between the observed return and the abandonment. Ends
+    /// and abandonments apply (or lose) in ordinal order, so anything
+    /// in the window replays before this completion where truth ran it
+    /// after the return. Begins apply no effect, and refused begins
+    /// only move fences the drain already cleared, so both stay out of
+    /// the window. The drained entry needs no exclusion: its own
+    /// abandonment is the window's edge, never inside it.
+    fn drain_order_proven(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        returned: u64,
+        abandoned: u64,
+    ) -> bool {
+        let sealed_through = self.keys.get(&key).expect("sealed key").sealed_through;
+        if returned <= sealed_through {
+            return false;
+        }
+        !self.open.values().any(|sibling| {
+            if !(self.converts_here(key, live, sibling) || sibling.converted_for == Some(key)) {
+                return false;
+            }
+            let in_window = |ordinal: u64| ordinal > returned && ordinal < abandoned;
+            sibling.end.is_some_and(|staged| in_window(staged.ordinal))
+                || sibling
+                    .abandon
+                    .is_some_and(|staged| in_window(staged.ordinal))
+        })
+    }
+
     fn seal_validated(
         &mut self,
         model: &mut ObjectSemantics,
@@ -9854,7 +9913,7 @@ impl JournalAdapter {
             });
             // A drained return settles as a completion at its
             // abandonment cut, never as an abandonment.
-            let drained = drained_return_cut(entry, frontier);
+            let drained = self.drained_return_cut(key, &live, entry, frontier);
             if end.is_none() && !abandoned {
                 continue;
             }
@@ -9894,7 +9953,7 @@ impl JournalAdapter {
                     // cut here too: the deferred End step matches this
                     // row by (phase, cut), and an abandoned-looking row
                     // would stall the feed head instead of replaying.
-                    let drained = drained_return_cut(entry, frontier);
+                    let drained = self.drained_return_cut(key, &live, entry, frontier);
                     SealedCall {
                         ticket: entry.converted_ticket.expect("converted original"),
                         key: entry.call_key.expect("converted original key"),
@@ -9972,7 +10031,7 @@ impl JournalAdapter {
                 // ordinary facts, exactly once (a held sibling keeps the
                 // entry staged past its first seal); anything else keeps
                 // the bounded loss below.
-                if let Some(at) = drained_return_cut(&entry, frontier) {
+                if let Some(at) = self.drained_return_cut(key, &live, &entry, frontier) {
                     if !entry.drained_converted {
                         let completed = completed_from_drained_return(
                             at,
@@ -10205,12 +10264,25 @@ impl JournalAdapter {
         let Some(watermark) = watermark else {
             return;
         };
-        self.remove_open_where(|_, entry| {
+        // The removal closure cannot borrow the adapter (the table is
+        // mutably borrowed), so the shared drain predicate runs up
+        // front: a drained entry retires at the watermark like an END.
+        let live = self.live_keys_for_image((key.cookie, key.exec));
+        let drained: BTreeMap<JournalNativeKey, u64> = self
+            .open
+            .iter()
+            .filter(|(_, entry)| entry.converted_for == Some(key))
+            .filter_map(|(native, entry)| {
+                self.drained_return_cut(key, &live, entry, frontier)
+                    .map(|at| (*native, at))
+            })
+            .collect();
+        self.remove_open_where(|native, entry| {
             if entry.converted_for != Some(key) {
                 return false;
             }
-            if let Some(at) = drained_return_cut(entry, frontier) {
-                return at <= watermark;
+            if let Some(at) = drained.get(native) {
+                return *at <= watermark;
             }
             entry
                 .abandon

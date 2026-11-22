@@ -37014,10 +37014,32 @@ fn prefault_manifest_getter_data_reads_the_sites_data_ranges_not_code() {
         data <= maps_bytes + 2 * span,
         "the pre-fault reads only the sites' span: {data} > {maps_bytes} + 2 * {span}"
     );
+    // Exact offsets: every candidate range reads once from its base, never
+    // twice (a duplicate-read mutant trips the count, not just the bound).
+    let attempts = engine.prefault_attempts_for_test();
+    let candidates = prefault_candidate_ranges(&engine, object);
+    assert_eq!(
+        attempts.len(),
+        candidates.len(),
+        "each candidate reads exactly once: {attempts:?} vs {candidates:?}"
+    );
+    for (attempt, candidate) in attempts.iter().zip(candidates.iter()) {
+        assert_eq!(attempt.0, candidate.0, "reads from the range base");
+        assert_eq!(
+            attempt.1 as u64,
+            candidate.1 - candidate.0,
+            "reads the range length"
+        );
+        assert!(attempt.2, "the read succeeds");
+    }
     assert_eq!(
         engine.counters.object_skips.len(),
         skips,
         "a healthy pre-fault files no gap"
+    );
+    assert_eq!(
+        engine.getter_prefault_refused_ranges, 0,
+        "a healthy pre-fault refuses nothing"
     );
     // SAFETY: a private read-execute mapping of the held fixture file,
     // unmapped below before the fixture drops.
@@ -37412,6 +37434,11 @@ fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
             engine.prefault_attempts_for_test().is_empty(),
             "{label}: a refused warmup attempts zero reads"
         );
+        assert_eq!(
+            engine.getter_prefault_refused_ranges,
+            ranges.len() as u64,
+            "{label}: the exact refused count"
+        );
     }
     // Overlay equality still refuses: the held identity matches the maps
     // rendering exactly, but equality cannot prove an overlay file.
@@ -37479,6 +37506,11 @@ fn prefault_manifest_getter_data_refuses_ranges_whose_identity_is_unproven() {
     assert!(
         engine.prefault_attempts_for_test().is_empty(),
         "overlay: a refused warmup attempts zero reads"
+    );
+    assert_eq!(
+        engine.getter_prefault_refused_ranges,
+        ranges.len() as u64,
+        "overlay: the exact refused count"
     );
 }
 
@@ -38154,9 +38186,9 @@ fn prefault_manifest_getter_data_never_rereads_a_range_whose_file_changed_under_
     );
 }
 
-/// Range proofs are bounded per pass too: with one proof per pass, three
-/// ranges prove and warm over three passes, each pass leaving the rest
-/// pending.
+/// Range proofs are bounded per pass too: with three proof credits per
+/// pass (one held lookup plus two range stats), four ranges prove and
+/// warm over two passes, each pass leaving the rest pending.
 #[test]
 fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass() {
     use crate::discovery::identity::{FileIdentity, MappedFile};
@@ -38170,14 +38202,14 @@ fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass(
     // SAFETY: private read-only mappings of the held fixture file,
     // unmapped below before the fixture drops.
     let mut mappings = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         mappings.push(map_fixture_readonly(&fixture.file, padded));
     }
     // A tmpfs identity no maps key renders: every range takes the slow
     // path and proves per range.
     let identity = FileIdentity { dev: 7, ino: 7 };
     let ranges = prefault_candidate_ranges(&engine, object);
-    assert_eq!(ranges.len(), 3, "premise: exactly three chunks");
+    assert_eq!(ranges.len(), 4, "premise: exactly four chunks");
     let scripted: Vec<((u64, u64), Option<FileIdentity>)> = ranges
         .iter()
         .map(|range| (*range, Some(identity)))
@@ -38190,38 +38222,37 @@ fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass(
         },
         scripted,
     );
-    engine.set_prefault_caps_for_test(None, Some(1));
+    engine.set_prefault_caps_for_test(None, Some(3));
     let maps_len = std::fs::read("/proc/self/maps").unwrap().len() as u64;
     let skips = engine.counters.object_skips.len();
     let lens: Vec<u64> = ranges.iter().map(|range| range.1 - range.0).collect();
-    for (pass, proven) in [(1usize, 0usize), (2, 1)].into_iter() {
-        let before = engine.budget.attempted_io_bytes();
-        let outcome = engine.prefault_manifest_getter_data(id, &sites);
-        assert_eq!(
-            outcome,
-            GetterPrefaultOutcome::Deferred { frame_spent: false },
-            "pass {pass} defers on its spent proof credit"
-        );
-        let cursor = engine
-            .getter_prefault_cursors
-            .get(&id)
-            .expect("a deferred pass saves its cursor")
-            .clone();
-        assert!(
-            cursor.ranges[proven].proven && !cursor.ranges[proven + 1].proven,
-            "pass {pass} proves exactly one more range"
-        );
-        let delta = engine.budget.attempted_io_bytes() - before;
-        assert!(
-            delta > maps_len,
-            "pass {pass} warms its proven range: {delta} <= {maps_len}"
-        );
-        assert!(
-            delta < maps_len + lens[proven] + 8192,
-            "pass {pass} warms only its proven range: {delta} >= {maps_len} + {} + 8192",
-            lens[proven]
-        );
-    }
+    let before = engine.budget.attempted_io_bytes();
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 defers on its spent proof credits"
+    );
+    let cursor = engine
+        .getter_prefault_cursors
+        .get(&id)
+        .expect("a deferred pass saves its cursor")
+        .clone();
+    assert!(
+        cursor.ranges[0].proven && cursor.ranges[1].proven && !cursor.ranges[2].proven,
+        "pass 1 proves exactly two ranges under the shared cap"
+    );
+    let delta = engine.budget.attempted_io_bytes() - before;
+    assert!(
+        delta > maps_len,
+        "pass 1 warms its proven ranges: {delta} <= {maps_len}"
+    );
+    assert!(
+        delta < maps_len + lens[0] + lens[1] + 16384,
+        "pass 1 warms only its proven ranges: {delta} >= {maps_len} + {} + {} + 16384",
+        lens[0],
+        lens[1]
+    );
     let before = engine.budget.attempted_io_bytes();
     let outcome = engine.prefault_manifest_getter_data(id, &sites);
     assert_eq!(outcome, GetterPrefaultOutcome::Complete);
@@ -38232,12 +38263,13 @@ fn prefault_manifest_getter_data_proves_only_a_bounded_batch_of_ranges_per_pass(
     let delta = engine.budget.attempted_io_bytes() - before;
     assert!(
         delta > maps_len,
-        "the last pass warms its proven range: {delta} <= {maps_len}"
+        "the last pass warms its proven ranges: {delta} <= {maps_len}"
     );
     assert!(
-        delta < maps_len + lens[2] + 8192,
-        "the last pass warms only its proven range: {delta} >= {maps_len} + {} + 8192",
-        lens[2]
+        delta < maps_len + lens[2] + lens[3] + 16384,
+        "the last pass warms only its proven ranges: {delta} >= {maps_len} + {} + {} + 16384",
+        lens[2],
+        lens[3]
     );
     for mapping in mappings {
         // SAFETY: each successful mapping above, released once.
@@ -38363,6 +38395,10 @@ fn prefault_manifest_getter_data_reproves_a_stable_range_whose_slow_identity_cha
         gap.reason,
         "a manifest getter warmup range refused: range identity mismatch"
     );
+    assert_eq!(
+        engine.getter_prefault_refused_ranges, 1,
+        "the exact refused count"
+    );
 }
 
 /// A range remapped between proof and read is re-proved before its first
@@ -38428,6 +38464,10 @@ fn prefault_manifest_getter_data_refuses_a_range_remapped_between_proof_and_read
         engine.counters.object_skips.len(),
         skips + 1,
         "the refusal files its named gap"
+    );
+    assert_eq!(
+        engine.getter_prefault_refused_ranges, 1,
+        "the exact refused count"
     );
 }
 

@@ -845,7 +845,7 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # (tick-quantum deferral, exact counts). Either skip order
     # qualifies; the cause pair is unchanged (the quiet row adds no
     # cause beyond "skipped"). Shape mirrors run 44798792754
-    # (v7.4-rc2: lossy [skipped, coverage_retired_slots],
+    # (v7.4-rc3: lossy [skipped, coverage_retired_slots],
     # [discovery, R1] skips, slots=68, gaps=0, exact 64065).
     # Accepted strict and relaxed alike (the host twin is the same
     # shape); a further gap or cause stays a new shape.

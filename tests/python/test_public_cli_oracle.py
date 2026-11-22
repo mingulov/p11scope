@@ -1275,7 +1275,7 @@ class RunnerNoiseTests(unittest.TestCase):
     def test_coverage_retired_quiet_passes_in_strict_mode(self):
         # Quiet composition: the fixed R1 disclosure plus the lone
         # quiet discovery skip qualifies strict with exact counts.
-        # Shape mirrors run 44798792754 (v7.4-rc2: lossy [skipped,
+        # Shape mirrors run 44798792754 (v7.4-rc3: lossy [skipped,
         # coverage_retired_slots], [discovery, R1] skips, slots=68,
         # gaps=0).
         def mutate(d, l, r):

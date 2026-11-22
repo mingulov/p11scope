@@ -25717,6 +25717,848 @@ fn key_operation_reentry_old_handles_stay_unknown() {
     );
 }
 
+/// Admit + ingest + attest one call in production order (H8 stages
+/// before the claim step attests). The standard helpers attest
+/// before ingest; quarantine-end needs the staged original present
+/// at bind. Staging stays separate: the minting call stages only
+/// after its fresh birth reseeds the feed.
+fn ingest_and_attest(
+    scene: &mut JointScene,
+    call: &ShapedS1,
+) -> (AdmittedInstanceCall, u64, JournalDomainProof) {
+    let admitted = admit_call_input(scene, call);
+    let position = admitted.h0_ordinal();
+    ingest_call(scene, call, position);
+    let proof = scene.adapter.attest_key(&admitted).expect("call attests");
+    (admitted, position, proof)
+}
+
+/// Stage one admitted call's S1 onto the feed.
+fn stage_admitted(
+    scene: &mut JointScene,
+    staging: &mut JointStaging,
+    admitted: &AdmittedInstanceCall,
+) {
+    let facts = admitted.s1_facts().clone();
+    let origin = EffectOrigin::from(&facts);
+    let position = admitted.h0_ordinal();
+    staging
+        .stage(facts, origin, position, scene.adapter.ledger_mut())
+        .expect("call stages");
+}
+
+/// Seal one staged call under a post-void receipt at the post-void
+/// epoch and replay it onto the feed.
+#[allow(clippy::too_many_arguments)]
+fn seal_reentered(
+    scene: &mut JointScene,
+    staging: &mut JointStaging,
+    joint: &mut EdgeSemantics,
+    keyuse: &mut KeyUseReducer,
+    sink: &mut Vec<OperationEffect>,
+    call: &ShapedS1,
+    receipt: &BootstrapReceipt,
+) {
+    scene.install_closure();
+    let frontier = scene.adapter.consumed_frontier();
+    let audit = JournalAuditReceipt::scripted(
+        8,
+        8,
+        None,
+        0,
+        H3DispositionEvidence::scripted_clean(scene.fixture.h0_allocated_below() - 1),
+        scene.fixture.attachment().generation(),
+    );
+    let evidence = SessionBirthEvidence::scripted_for_receipt(receipt);
+    let cell = SteadyFaultCell(8);
+    let mut births = ScriptedBirthSource::once(evidence);
+    let success = scene
+        .adapter
+        .seal(
+            &mut scene.model,
+            &audit,
+            receipt,
+            frontier,
+            &mut births,
+            &cell,
+        )
+        .expect("re-entered seals flow");
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        joint,
+        keyuse,
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3),
+        sink,
+        None,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
+    assert_eq!(refused, 0);
+}
+
+/// Quarantine-end end to end: a capable doom plus a void ends the
+/// feed, and a post-fence re-find (FindObjects plus attribute
+/// reads) mints a fresh incarnation that tracks again. The voided
+/// window stays counted loss, the voided row freezes, and the
+/// re-proven signs attribute onto fresh rows.
+#[test]
+fn key_operation_quarantine_end_refind_recovers_after_capable_doom() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+
+    const OLD_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const OLD_SESSION: u64 = 7;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    // Healthy: create, learn, sign attributed.
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(OLD_SESSION);
+    create.result = Some(OLD_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        input0: Some((OLD_KEY, 1)),
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let old_row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the healthy sign attributes");
+    assert_eq!(old_row.completed, 1);
+    let old_object = old_row.object;
+
+    // One more sign stages across the void (its proof voids with it).
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    let (_, init_position) = attest_and_stage(&mut scene, &mut staging, &init);
+    ingest_call(&mut scene, &init, init_position);
+
+    // Capable doom groundwork on its own thread, then the moved
+    // seal-time fault cell voids and dooms.
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    assert_eq!(
+        scene.ingest(&outer),
+        JournalDisposition::BeginAdmitted,
+        "doom groundwork stages"
+    );
+    assert_eq!(
+        scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+        JournalDisposition::ReturnObserved
+    );
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+    assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the void ends the segment: {outcome:?}"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+
+    // Post-fence re-find of the same key: FindObjects plus fresh
+    // attribute reads mint a fresh incarnation and reseed.
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, query_capture());
+    find.session = Some(OLD_SESSION);
+    find.find_handles = Some((vec![OLD_KEY], false));
+    let (find_admitted, _, fresh_proof) = ingest_and_attest(&mut scene, &find);
+    assert_ne!(
+        fresh_proof, scene.proof,
+        "the re-find mints a fresh incarnation"
+    );
+    let grant = SessionBirthGrant::scripted(
+        fresh_proof,
+        BirthKind::AbsenceAppearance,
+        fence,
+        scene.fixture.attachment().generation(),
+    );
+    let fresh = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence birth attests");
+    assert!(staging.reselect_joint(&fresh), "the fresh birth reseeds");
+    stage_admitted(&mut scene, &mut staging, &find_admitted);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+        &fresh,
+    );
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        input0: Some((OLD_KEY, 1)),
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.session = Some(OLD_SESSION);
+    prepare_call(&mut scene, &mut staging, &get);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+        &fresh,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    prepare_call(&mut scene, &mut staging, &init);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+        &fresh,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    prepare_call(&mut scene, &mut staging, &sign);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+        &fresh,
+    );
+
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let unattributed = crate::key_operation_projection::producer::unattributed(&[&staging]);
+    assert_eq!(
+        unattributed
+            .iter()
+            .map(|row| (row.reason, row.count))
+            .collect::<Vec<_>>(),
+        [("record_lost", 1)],
+        "the voided window counts its loss"
+    );
+    let sign_rows: Vec<_> = committed
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .collect();
+    assert_eq!(
+        sign_rows.iter().map(|row| row.completed).sum::<u64>(),
+        2,
+        "healthy and re-proven signs attribute: {:?}",
+        committed.key_operations
+    );
+    let mut objects: Vec<_> = sign_rows.iter().map(|row| row.object).collect();
+    objects.sort_unstable();
+    objects.dedup();
+    assert_eq!(
+        objects.len(),
+        2,
+        "the re-proven sign binds its own fresh row: {:?}",
+        committed.key_operations
+    );
+    let frozen = sign_rows
+        .iter()
+        .find(|row| row.object == old_object)
+        .expect("the voided row stands");
+    assert_eq!(frozen.completed, 1, "the voided row freezes");
+}
+
+/// Handle reuse during the void: the provider recycles the same
+/// numeric handle for a post-fence creation. The re-created object
+/// re-proves onto its own fresh row; the voided row freezes with
+/// its pre-void count, never joined by handle number.
+#[test]
+fn key_operation_quarantine_end_handle_reuse_binds_fresh_row() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+
+    const OLD_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const OLD_SESSION: u64 = 7;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(OLD_SESSION);
+    create.result = Some(OLD_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let old_object = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the healthy sign attributes")
+        .object;
+
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    scene.ingest(&outer);
+    scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0));
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+    scene.ingest(&abandon);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the void ends the segment: {outcome:?}"
+    );
+
+    // Post-fence creation recycles the same numeric handle.
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(OLD_SESSION);
+    create.result = Some(OLD_KEY);
+    let (create_admitted, _, fresh_proof) = ingest_and_attest(&mut scene, &create);
+    assert_ne!(
+        fresh_proof, scene.proof,
+        "the re-creation mints a fresh incarnation"
+    );
+    let grant = SessionBirthGrant::scripted(
+        fresh_proof,
+        BirthKind::AbsenceAppearance,
+        fence,
+        scene.fixture.attachment().generation(),
+    );
+    let fresh = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence birth attests");
+    assert!(staging.reselect_joint(&fresh), "the fresh birth reseeds");
+    stage_admitted(&mut scene, &mut staging, &create_admitted);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+        &fresh,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    prepare_call(&mut scene, &mut staging, &init);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+        &fresh,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    prepare_call(&mut scene, &mut staging, &sign);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+        &fresh,
+    );
+
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let sign_rows: Vec<_> = committed
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .collect();
+    assert_eq!(
+        sign_rows.iter().map(|row| row.completed).sum::<u64>(),
+        2,
+        "healthy and recycled-handle signs attribute: {:?}",
+        committed.key_operations
+    );
+    let mut objects: Vec<_> = sign_rows.iter().map(|row| row.object).collect();
+    objects.sort_unstable();
+    objects.dedup();
+    assert_eq!(
+        objects.len(),
+        2,
+        "the recycled handle binds its own fresh row: {:?}",
+        committed.key_operations
+    );
+    let frozen = sign_rows
+        .iter()
+        .find(|row| row.object == old_object)
+        .expect("the voided row stands");
+    assert_eq!(frozen.completed, 1, "the voided row freezes");
+}
+
+/// Session and logout changes across the void: post-fence use of
+/// the same numeric session first-observes a fresh session
+/// incarnation, and a post-fence logout plus re-find binds yet
+/// another fresh row. Pre-void rows freeze; nothing joins across
+/// the fence by handle number.
+#[test]
+fn key_operation_quarantine_end_session_reuse_binds_fresh_rows() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+
+    const OLD_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const OLD_SESSION: u64 = 7;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(OLD_SESSION);
+    create.result = Some(OLD_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let old_object = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the healthy sign attributes")
+        .object;
+
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    scene.ingest(&outer);
+    scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0));
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+    scene.ingest(&abandon);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let fence = failure.fence.expect("a void fences");
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the void ends the segment: {outcome:?}"
+    );
+
+    // Re-find in the same numeric session: a fresh session
+    // incarnation binds fresh rows.
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, query_capture());
+    find.session = Some(OLD_SESSION);
+    find.find_handles = Some((vec![OLD_KEY], false));
+    let (find_admitted, _, fresh_proof) = ingest_and_attest(&mut scene, &find);
+    assert_ne!(
+        fresh_proof, scene.proof,
+        "the re-find mints a fresh incarnation"
+    );
+    let grant = SessionBirthGrant::scripted(
+        fresh_proof,
+        BirthKind::AbsenceAppearance,
+        fence,
+        scene.fixture.attachment().generation(),
+    );
+    let fresh = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence birth attests");
+    assert!(staging.reselect_joint(&fresh), "the fresh birth reseeds");
+    stage_admitted(&mut scene, &mut staging, &find_admitted);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+        &fresh,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    prepare_call(&mut scene, &mut staging, &init);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+        &fresh,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    prepare_call(&mut scene, &mut staging, &sign);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+        &fresh,
+    );
+
+    // A post-fence logout retires the fresh views; the re-find after
+    // it binds yet another fresh row.
+    let mut logout = ShapedS1::shaped("C_Logout", CkRv::OK.0, 0, 0);
+    logout.session = Some(OLD_SESSION);
+    prepare_call(&mut scene, &mut staging, &logout);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &logout,
+        &fresh,
+    );
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, query_capture());
+    find.session = Some(OLD_SESSION);
+    find.find_handles = Some((vec![OLD_KEY], false));
+    prepare_call(&mut scene, &mut staging, &find);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+        &fresh,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    prepare_call(&mut scene, &mut staging, &init);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+        &fresh,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    prepare_call(&mut scene, &mut staging, &sign);
+    seal_reentered(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+        &fresh,
+    );
+
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let sign_rows: Vec<_> = committed
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .collect();
+    assert_eq!(
+        sign_rows.iter().map(|row| row.completed).sum::<u64>(),
+        3,
+        "healthy, re-found and post-logout signs attribute: {:?}",
+        committed.key_operations
+    );
+    let mut objects: Vec<_> = sign_rows.iter().map(|row| row.object).collect();
+    objects.sort_unstable();
+    objects.dedup();
+    assert_eq!(
+        objects.len(),
+        3,
+        "every era binds its own row: {:?}",
+        committed.key_operations
+    );
+    let frozen = sign_rows
+        .iter()
+        .find(|row| row.object == old_object)
+        .expect("the voided row stands");
+    assert_eq!(frozen.completed, 1, "the voided row freezes");
+}
+
+/// Without a re-find the signer stays honestly unknown: steady
+/// post-void Signs never mint, never reseed, and reduce as
+/// unknown-key rows with the void gap named.
+#[test]
+fn key_operation_quarantine_end_without_refind_stays_unknown() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::key_operation_projection::producer::commit;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+
+    const OLD_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const OLD_SESSION: u64 = 7;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    let mut create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    create.session = Some(OLD_SESSION);
+    create.result = Some(OLD_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create,
+    );
+    let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init.session = Some(OLD_SESSION);
+    init.input0 = Some((OLD_KEY, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &init,
+    );
+    let mut sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign.session = Some(OLD_SESSION);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign,
+    );
+
+    let getattr = crate::kinds::function_id("C_GetAttributeValue").unwrap();
+    let admitted = scene
+        .fixture
+        .admit_session_function(SESSION, "C_GetAttributeValue");
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let outer = begin_bytes(9, 1, getattr, 0);
+    scene.ingest(&outer);
+    scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0));
+    let abandon = abandon_bytes(9, 1, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+    scene.ingest(&abandon);
+    let failure = scene
+        .seal_with_fault(7, 8)
+        .expect_err("the moved cell voids");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut clean,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+                | crate::semantics_key_use::FailureApplyOutcome::FellBack { .. }
+        ),
+        "the void ends the segment: {outcome:?}"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
+
+    // Steady post-void Signs: no mint, no reseed.
+    for _ in 0..2 {
+        let mut init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        init.session = Some(OLD_SESSION);
+        init.input0 = Some((OLD_KEY, 1));
+        let admitted = admit_call_input(&mut scene, &init);
+        let bound = scene.adapter.attest_key(&admitted).expect("call attests");
+        assert_eq!(bound, scene.proof, "steady Signs rebind the dead key");
+    }
+    assert_eq!(staging.mode(), FeedMode::S1Only, "no reseed without proof");
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let sign_rows: Vec<_> = committed
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .collect();
+    assert_eq!(
+        sign_rows.iter().map(|row| row.completed).sum::<u64>(),
+        1,
+        "only the healthy sign attributes: {:?}",
+        committed.key_operations
+    );
+}
+
 /// A fault-voided feed reseeds too: fault changes never resume onto the
 /// old receipt (no clean point on the fenced segment), but a fresh birth
 /// at the fence starts a new Joint segment. Only a new birth recovers.

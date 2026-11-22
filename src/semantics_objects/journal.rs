@@ -6872,6 +6872,173 @@ impl JournalAdapter {
         })
     }
 
+    /// Whether a dead key's deaths are all recorded (capable
+    /// grounding allowed): the recording rule quarantine-end shares
+    /// with the death rule. Unrecorded (test-posed) deaths never
+    /// mint under either rule.
+    fn quarantine_death_recorded(&self, key: JournalDomainKey) -> bool {
+        let Some(state) = self.keys.get(&key) else {
+            return false;
+        };
+        (!state.refused
+            || self
+                .death_marks
+                .get(&key)
+                .is_some_and(|marks| marks.refused_capable.is_some()))
+            && (!state.tainted
+                || self
+                    .death_marks
+                    .get(&key)
+                    .is_some_and(|marks| marks.tainted))
+            && (!state.era_ended || self.death_marks.get(&key).is_some_and(|marks| marks.ended))
+    }
+
+    /// Whether one image holds a void-fenced key a quarantine-end
+    /// mint could recover: a fenced key that is image-blocked but
+    /// live-flagged, or dead with recorded (possibly capable)
+    /// grounding. Ingest admits establishing calls for such images
+    /// so their proof can stage; every other tainted image keeps
+    /// refusing. Shed-tainted images hold no keys by construction
+    /// (the shed refusal no-ops once any key binds), so they never
+    /// offer a candidate; their own lift owns them.
+    fn quarantine_recovery_candidate(&self, image: (u64, u64)) -> bool {
+        if !self.tainted_images.contains(&image) {
+            return false;
+        }
+        self.image_keys.get(&image).is_some_and(|siblings| {
+            siblings.iter().any(|key| {
+                self.keys.get(key).is_some_and(|state| {
+                    state.void_fence > 0
+                        && ((state.refused || state.tainted || state.era_ended)
+                            && self.quarantine_death_recorded(*key)
+                            || (!state.refused
+                                && !state.tainted
+                                && !state.era_ended
+                                && self.image_taint_blocks(image, self.voided_through)))
+                })
+            })
+        })
+    }
+
+    /// Whether one admission ends its binding's quarantine: the
+    /// binding's latest incarnation is void-fenced and blocked
+    /// (image-tainted with live flags, or dead with recorded
+    /// grounding, capable allowed), and this admission carries new
+    /// object proof entirely after the void fence — an establishing
+    /// call whose retained staged original sits above the global
+    /// fence. The caller has already established that no live
+    /// incarnation exists. The mint itself certifies nothing: the
+    /// fresh incarnation converts only its own claimed post-fence
+    /// calls in a fresh model domain, while seals keep refusing the
+    /// old proof and births keep refusing below the fence.
+    fn quarantine_end_eligible(
+        &self,
+        admitted: &AdmittedInstanceCall,
+        latest: JournalDomainKey,
+    ) -> bool {
+        let Some(state) = self.keys.get(&latest) else {
+            return false;
+        };
+        if state.void_fence == 0 || self.voided_through == 0 {
+            return false;
+        }
+        let image = (latest.cookie, latest.exec);
+        if state.refused || state.tainted || state.era_ended {
+            if !self.quarantine_death_recorded(latest) {
+                return false;
+            }
+        } else if !self.image_taint_blocks(image, self.voided_through) {
+            return false;
+        }
+        let Some(fingerprint) = admitted.journal_call_fingerprint() else {
+            return false;
+        };
+        if !call_establishes_object_proof(fingerprint.function) {
+            return false;
+        }
+        self.post_fence_claimable_proof(admitted)
+    }
+
+    /// Whether this admission's own staged proof sits retained above
+    /// the void fence: a completed, unconverted staged original this
+    /// admission's claim names (the production claim predicate),
+    /// with its BEGIN above the global fence. The exact retained
+    /// match needs the production origin transfer, which test
+    /// ingress and pre-ingest bind phases never stamp; claims gate
+    /// conversion anyway, so naming under the claim this admission
+    /// is about to file is the binding's proof.
+    fn post_fence_claimable_proof(&self, admitted: &AdmittedInstanceCall) -> bool {
+        let Some(fingerprint) = admitted.journal_call_fingerprint() else {
+            return false;
+        };
+        let Some(return_ns) = admitted.journal_return_ns() else {
+            return false;
+        };
+        let claim = AdmittedJournalClaim {
+            admission: admitted.h0_ordinal(),
+            return_ns,
+            returned: fingerprint,
+            rv: admitted.s1_facts().rv,
+        };
+        self.open.values().any(|entry| {
+            entry.begin_ordinal > self.voided_through
+                && entry.end.is_some()
+                && entry.abandon.is_none()
+                && entry.converted_ticket.is_none()
+                && entry.converted_for.is_none()
+                && !entry.end_converted
+                && entry.call_key.is_none()
+                && claim_names_shape(&shape_of_entry(entry), &claim)
+        })
+    }
+
+    /// The latest retained incarnation when this admission ends its
+    /// binding's quarantine (no live incarnation exists and
+    /// [`Self::quarantine_end_eligible`] holds), else `None`. The
+    /// single source for resolve/probe/bind agreement: resolve mints
+    /// on it, probe bypasses the taint refusal on it, bind ends the
+    /// old incarnation and lifts the taint on it.
+    fn quarantine_end_applies(&self, admitted: &AdmittedInstanceCall) -> Option<JournalDomainKey> {
+        let (domain, image, router, caller) = admitted.journal_binding();
+        let base = JournalDomainKey {
+            domain_tag: domain.journal_tag(),
+            caller: caller.0,
+            cookie: image.task_cookie,
+            exec: image.exec_id,
+            router: router.get(),
+            incarnation: 0,
+        };
+        let (live, latest) = self.binding_incarnations(base);
+        if live.is_some() {
+            return None;
+        }
+        let last = latest?;
+        self.quarantine_end_eligible(admitted, last).then_some(last)
+    }
+
+    /// Drop an image taint a quarantine-end mint supersedes (counted,
+    /// idempotent): permanent taints lift here, on new object proof,
+    /// because the fresh incarnation converts only its own claimed
+    /// post-fence calls in a fresh model domain. The old incarnation
+    /// is already ended or dead, so nothing resumes on confused
+    /// history; live siblings resume same-domain under seal gating
+    /// (their seals fail closed on any confusion). Shed-tainted
+    /// images hold no keys and never reach this path.
+    fn lift_quarantine_ended_taint(&mut self, image: (u64, u64)) -> bool {
+        if !self.tainted_images.contains(&image) {
+            return false;
+        }
+        if !self.image_taint_blocks(image, self.voided_through) {
+            return false;
+        }
+        self.tainted_images.remove(&image);
+        self.taint_evidence.remove(&image);
+        self.shed_only_taints.remove(&image);
+        self.reentry_taint_lifts = self.reentry_taint_lifts.saturating_add(1);
+        self.claims_prune_dirty = true;
+        true
+    }
+
     /// Latest retained incarnation of one admission binding for void
     /// scoping (the live one when any is live): scoped breaks name
     /// bindings, and the scope covers the binding's current key.
@@ -27844,6 +28011,758 @@ pub(crate) mod tests {
         scene
             .seal_at(&rebirth, epoch)
             .expect("the run recovers after the storm");
+    }
+
+    #[test]
+    fn quarantine_end_establishing_function_set() {
+        // Quarantine-end trigger set: creations, Find and attribute
+        // reads carry new object proof; uses, destroys, mutations and
+        // non-catalog lifecycle never mint.
+        for name in [
+            "C_CreateObject",
+            "C_CopyObject",
+            "C_GenerateKey",
+            "C_GenerateKeyPair",
+            "C_DeriveKey",
+            "C_UnwrapKey",
+            "C_FindObjects",
+            "C_GetAttributeValue",
+        ] {
+            assert!(
+                call_establishes_object_proof(function_id(name)),
+                "{name} establishes object proof"
+            );
+        }
+        for name in [
+            "C_DestroyObject",
+            "C_SignInit",
+            "C_Sign",
+            "C_GetObjectSize",
+            "C_WrapKey",
+            "C_SetAttributeValue",
+            "C_SetOperationState",
+            "C_EncapsulateKey",
+            "C_DecapsulateKey",
+            "C_OpenSession",
+            "C_CloseSession",
+            "C_FindObjectsInit",
+            "C_FindObjectsFinal",
+            "C_Login",
+        ] {
+            assert!(
+                !call_establishes_object_proof(function_id(name)),
+                "{name} never mints on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_permanent_taint_mints_on_post_fence_create() {
+        // Quarantine-end (image-level taint vs object-level proof): a
+        // fault void fences the tracked key without dooming it, then a
+        // genuine post-void contradiction (an END without a BEGIN)
+        // taints the image permanently. A bare post-fence Sign still
+        // refuses without minting, but a post-fence creation stages
+        // (ingest admits establishing calls for fenced blocked
+        // images) and mints a fresh incarnation: the old incarnation
+        // ends at the mint, the taint lifts, the fresh birth at the
+        // fence tracks in its own domain. The old proof keeps
+        // refusing and below-fence births keep refusing: nothing
+        // before the fence is re-proved.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        let fence = scene.adapter.consumed_through;
+        // Genuine post-void contradiction: an END for a never-begun
+        // invocation taints permanently (no void-release record).
+        let ghost = begin_bytes(9, 9, create, 0);
+        assert_eq!(
+            scene.ingest(&end_bytes(&ghost, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 90)),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin),
+            "an END without a BEGIN contradicts"
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "the contradiction taints the image"
+        );
+        // A bare Sign refuses without minting: uses never end the
+        // quarantine.
+        let sign = begin_bytes(9, 10, function_id("C_Sign"), 0);
+        assert_eq!(
+            scene.ingest(&sign),
+            JournalDisposition::Refused,
+            "uses still refuse on a tainted image"
+        );
+        let admitted = scene.fixture.admit_function("C_Sign");
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted),
+            "a bare Sign never mints past a permanent taint"
+        );
+        assert_eq!(scene.adapter.keys.len(), 1, "no mint without new proof");
+        // A post-fence creation stages and mints.
+        let second = begin_bytes(1, 2, create, 0);
+        assert_eq!(
+            scene.ingest(&second),
+            JournalDisposition::BeginAdmitted,
+            "establishing calls stage for a fenced blocked image"
+        );
+        assert_eq!(
+            scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60)),
+            JournalDisposition::EndStaged,
+            "their terminals stage too"
+        );
+        let (staged_cut, staged_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence)
+                .expect("post-void staged entry");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", staged_event);
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("new proof mints past a permanent taint");
+        assert_ne!(
+            reborn.key, proof.key,
+            "quarantine-end mints a fresh incarnation, never the blocked key"
+        );
+        assert_ne!(
+            reborn.domain(),
+            proof.domain(),
+            "the incarnation tracks its own model domain"
+        );
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
+        let counts = scene.adapter.joint_reentry_counts();
+        assert_eq!(
+            counts.quarantine_ends, 1,
+            "one quarantine ended on new proof"
+        );
+        assert_eq!(counts.incarnations, 1, "the mint counts as an incarnation");
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let success = scene
+            .seal_at(&rebirth, 8)
+            .expect("the incarnation tracks past the void");
+        assert_eq!(success.prefix.settled().len(), 1);
+        assert_eq!(success.prefix.domain(), reborn.domain());
+        let stale = scene
+            .seal_at(&bootstrap, 8)
+            .expect_err("the ended proof keeps refusing");
+        assert_eq!(stale.gap, JournalGap::DomainEnded);
+        let low = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence - 1,
+            scene.closure_generation(),
+        );
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &low),
+            Err(BirthRefusal::BelowVoidFence),
+            "nothing before the fence is re-proved"
+        );
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_capable_doom_mints_on_post_fence_create() {
+        // Quarantine-end past a capable doom: a void dooms the tracked
+        // key on negative evidence grounded in a capable frame (a
+        // non-exit abandonment), which the death rule never mints
+        // past. A post-fence creation mints a fresh incarnation that
+        // tracks in its own domain; the doomed proof keeps refusing.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 2, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("voided key")
+                .refused,
+            "the void dooms the key on negative evidence"
+        );
+        let fence = scene.adapter.consumed_through;
+        let second = begin_bytes(1, 3, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        let (staged_cut, staged_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence)
+                .expect("post-void staged entry");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", staged_event);
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("new proof mints past a capable doom");
+        assert_ne!(
+            reborn.key, proof.key,
+            "quarantine-end mints a fresh incarnation, never the doomed key"
+        );
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
+        assert_eq!(
+            scene.adapter.joint_reentry_counts().quarantine_ends,
+            1,
+            "one quarantine ended on new proof"
+        );
+        let grant = SessionBirthGrant::scripted(
+            reborn,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let success = scene
+            .seal_at(&rebirth, 8)
+            .expect("the incarnation tracks past the void");
+        assert_eq!(success.prefix.settled().len(), 1);
+        assert_eq!(success.prefix.domain(), reborn.domain());
+        let stale = scene
+            .seal_at(&bootstrap, 8)
+            .expect_err("the doomed proof keeps refusing");
+        assert_eq!(stale.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_sign_never_mints_without_new_proof() {
+        // The honest-unknown shape: a capable doom plus a void, then
+        // steady Signs only. Every bind returns the same dead key,
+        // seals keep refusing, nothing mints, nothing lifts.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 2, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        for sequence in 3..6 {
+            let sign = begin_bytes(1, sequence, function_id("C_Sign"), 0);
+            scene.ingest(&sign);
+            let again = scene.attest_function("C_Sign");
+            assert_eq!(
+                again.key, proof.key,
+                "steady Signs rebind the dead key, never a mint"
+            );
+        }
+        assert_eq!(scene.adapter.keys.len(), 1, "no mint without new proof");
+        assert_eq!(
+            scene.adapter.joint_reentry_counts().quarantine_ends,
+            0,
+            "uses never end a quarantine"
+        );
+        let stale = scene
+            .seal_at(&bootstrap, 8)
+            .expect_err("the doomed proof keeps refusing");
+        assert_eq!(stale.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_destroy_alone_never_mints() {
+        // Destroy proves nothing: a post-fence destroy alone never
+        // mints, while the follow-up creation does. Destroyed objects
+        // stay destroyed; only re-created ones re-prove.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+        use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY};
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 2, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        let destroy = function_id("C_DestroyObject");
+        let mut gone = begin_bytes(1, 3, destroy, 0);
+        put_u64(&mut gone, 88, 0x9090_9090_9090_9090);
+        gone[126] = 1;
+        scene.ingest(&gone);
+        scene.ingest(&end_bytes(&gone, OBJECT_ACTION_DESTROY, 0, ENTRY_NS + 70));
+        let (_, destroy_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence)
+                .expect("post-void staged destroy");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_DestroyObject", destroy_event);
+        let bound = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("a destroy binds its key");
+        assert_eq!(
+            bound.key, proof.key,
+            "a destroy alone never mints, even with staged proof"
+        );
+        assert_eq!(
+            scene.adapter.joint_reentry_counts().quarantine_ends,
+            0,
+            "destroys never end a quarantine"
+        );
+        let second = begin_bytes(1, 4, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 80));
+        let (staged_cut, staged_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence && entry.function == create)
+                .expect("post-void staged creation");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", staged_event);
+        let reborn = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("the re-creation mints");
+        assert_ne!(reborn.key, proof.key, "re-created objects re-prove");
+        scene
+            .paired_admissions
+            .insert(staged_cut, admitted.h0_ordinal());
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_requires_void_fence() {
+        // No void, no quarantine-end: a permanent taint with nothing
+        // fenced stays stuck even for establishing calls.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let ghost = begin_bytes(9, 9, create, 0);
+        assert_eq!(
+            scene.ingest(&end_bytes(&ghost, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 90)),
+            JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin),
+        );
+        assert!(
+            scene.adapter.image_refused((COOKIE, EXEC)),
+            "the contradiction taints the image"
+        );
+        let second = begin_bytes(1, 2, create, 0);
+        assert_eq!(
+            scene.ingest(&second),
+            JournalDisposition::Refused,
+            "nothing stages without a void fence"
+        );
+        let admitted = scene.fixture.admit_function("C_CreateObject");
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted),
+            "no void, no mint"
+        );
+        assert_eq!(scene.adapter.keys.len(), 1);
+        let stale = scene
+            .seal(&bootstrap)
+            .expect_err("the tainted proof keeps refusing");
+        assert_eq!(stale.gap, JournalGap::ImageTainted);
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_live_sibling_blocks_mint() {
+        // Uniform sibling rule: a capable-doomed binding beside a live
+        // unfenced registered sibling refuses its establishing mint
+        // as ImageSealed, so the fresh incarnation never coexists
+        // with a sibling still sealing sole-key history.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SCOPE_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use pkcs11_types::CkRv;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            scene.closure_generation(),
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        // A sibling binds past the fenced key and seals: live,
+        // registered, unfenced.
+        let staged = begin_bytes(2, 1, create, 0);
+        scene.ingest(&staged);
+        scene.ingest(&end_bytes(&staged, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let mut other = AttestationFixture::new(image_default());
+        let (sibling_cut, sibling_event) = {
+            let staged = scene
+                .adapter
+                .open
+                .values()
+                .find(|entry| entry.begin_ordinal > fence)
+                .expect("post-void staged sibling entry");
+            (
+                staged.begin_ordinal,
+                staged.end.expect("staged END").end.payload_base().event,
+            )
+        };
+        let admitted = other.admit_original_event("C_CreateObject", sibling_event);
+        let sibling = scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("a sibling binds past a void-fenced sibling");
+        assert_ne!(sibling.key, proof.key);
+        scene
+            .paired_admissions
+            .insert(sibling_cut, admitted.h0_ordinal());
+        let grant = SessionBirthGrant::scripted(
+            sibling,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let born = BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence birth attests");
+        scene.seal_at(&born, 8).expect("the sibling seals");
+        // The fenced key rebirths, then dooms capable at seal time.
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene.attest();
+        let second = begin_bytes(1, 2, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        scene
+            .seal_at(&rebirth, 8)
+            .expect("same-key rebirth seals past the void");
+        scene.attest_session_function(SESSION, "C_GetAttributeValue");
+        let getattr = function_id("C_GetAttributeValue");
+        let outer = begin_bytes(1, 3, getattr, 0);
+        scene.ingest(&outer);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&outer, CkRv::SESSION_HANDLE_INVALID.0)),
+            JournalDisposition::ReturnObserved
+        );
+        let abandon = abandon_bytes(1, 3, JOURNAL_REASON_SCOPE_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let doom = scene
+            .seal_at(&rebirth, 8)
+            .expect_err("seal-time doom refuses");
+        assert_eq!(doom.gap, JournalGap::DomainTainted);
+        // New proof for the doomed binding refuses: the live
+        // unfenced sibling holds the image. The newest staged
+        // creation pairs (older staged creations belong to earlier
+        // seals).
+        let third = begin_bytes(1, 4, create, 0);
+        scene.ingest(&third);
+        scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 80));
+        let newest = scene
+            .adapter
+            .open
+            .values()
+            .filter(|entry| entry.begin_ordinal > fence && entry.function == create)
+            .map(|entry| {
+                (
+                    entry.begin_ordinal,
+                    entry.end.expect("staged END").end.payload_base().event,
+                )
+            })
+            .max_by_key(|(cut, _)| *cut)
+            .expect("newest staged creation");
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", newest.1);
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageSealed),
+            "a live unfenced sibling blocks the quarantine mint"
+        );
+        assert!(
+            !scene.adapter.keys.keys().any(|key| {
+                key.incarnation > 0
+                    && key.caller == proof.key.caller
+                    && key.router == proof.key.router
+            }),
+            "no incarnation mints beside a live sibling"
+        );
+    }
+
+    #[test]
+    fn object_journal_quarantine_end_storm_stays_bounded() {
+        // Repeated void + permanent-taint + establishing cycles mint
+        // exactly one incarnation each, keep exactly one live, and
+        // track after every cycle.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let mut prev = proof;
+        for round in 0..5 {
+            let epoch = 7 + round as u64;
+            let thread = 10 + round as u64;
+            let frontier = scene.adapter.consumed_frontier();
+            let faulted = JournalAuditReceipt::scripted(
+                epoch,
+                epoch + 1,
+                None,
+                0,
+                H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+                scene.closure_generation(),
+            );
+            scene
+                .seal_explicit(
+                    &faulted,
+                    &bootstrap,
+                    frontier,
+                    SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                )
+                .expect_err("storm void voids");
+            let fence = scene.adapter.consumed_through;
+            let ghost = begin_bytes(thread + 20, 1, create, 0);
+            assert_eq!(
+                scene.ingest(&end_bytes(&ghost, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 90)),
+                JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin),
+                "round {round} taints permanently"
+            );
+            let staged = begin_bytes(thread, 1, create, 0);
+            assert_eq!(
+                scene.ingest(&staged),
+                JournalDisposition::BeginAdmitted,
+                "round {round} stages its proof"
+            );
+            scene.ingest(&end_bytes(&staged, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+            let (staged_cut, staged_event) = {
+                let staged = scene
+                    .adapter
+                    .open
+                    .values()
+                    .find(|entry| entry.begin_ordinal > fence)
+                    .expect("post-void staged entry");
+                (
+                    staged.begin_ordinal,
+                    staged.end.expect("staged END").end.payload_base().event,
+                )
+            };
+            let admitted = scene
+                .fixture
+                .admit_original_event("C_CreateObject", staged_event);
+            let minted = scene
+                .adapter
+                .attest_key(&admitted)
+                .expect("round mints on new proof");
+            assert_ne!(
+                minted.key, prev.key,
+                "round {round} mints a fresh incarnation"
+            );
+            prev = minted;
+            scene
+                .paired_admissions
+                .insert(staged_cut, admitted.h0_ordinal());
+            let grant = SessionBirthGrant::scripted(
+                minted,
+                BirthKind::AbsenceAppearance,
+                fence,
+                scene.closure_generation(),
+            );
+            let rebirth =
+                BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence birth attests");
+            scene
+                .seal_at(&rebirth, epoch + 1)
+                .expect("the round tracks after its mint");
+        }
+        assert_eq!(
+            scene.adapter.keys.len(),
+            6,
+            "one incarnation per void, never more"
+        );
+        assert_eq!(
+            scene.adapter.joint_reentry_counts().quarantine_ends,
+            5,
+            "every round ended its quarantine on new proof"
+        );
     }
 
     #[test]

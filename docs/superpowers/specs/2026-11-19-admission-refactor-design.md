@@ -485,7 +485,11 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   store's `ResumeHistory` (scan_pass) keeps covered ground per
   (work identity, layout) pair — the furthest lexicographic sweep
   position, the most decoded tables and completion — and is updated
-  where each cursor is recorded, inside the credited scan
+  where each cursor is recorded (every bracket-accepted record, whether
+  or not the cache retains the cursor: a refused completion still
+  covers its layout for good without earning a pass; a refused partial
+  record keeps nothing resumable and neither rises nor seeds), inside
+  the credited scan
   (`O(log n)` per record); publication reads an `O(1)`
   `ResumeObservation` (unfinished, risen past covered ground, history
   refusals), and the cursor totals are kept incrementally, so no

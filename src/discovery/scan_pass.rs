@@ -461,13 +461,39 @@ impl ResumeHistory {
 
     /// Fold one recorded cursor's committed progress into the history.
     pub(crate) fn record(&mut self, key: &DecodeCursorKey, progress: &CommittedCursorProgress) {
+        self.fold(key, progress, true);
+    }
+
+    /// Fold a bracket-accepted completion whose cursor the cache refused:
+    /// the pair's ground becomes covered and complete exactly like a
+    /// retained completion, but without earning a pass (nothing
+    /// resumable was kept). A completion that cannot be remembered at the
+    /// bound is harmless: the completion record is then full, so the
+    /// pair can only return as a newcomer, and newcomers at the bound
+    /// are refused and counted.
+    pub(crate) fn record_unretained_completion(
+        &mut self,
+        key: &DecodeCursorKey,
+        progress: &CommittedCursorProgress,
+    ) {
+        debug_assert!(progress.complete);
+        self.fold(key, progress, false);
+    }
+
+    fn fold(&mut self, key: &DecodeCursorKey, progress: &CommittedCursorProgress, resumable: bool) {
         let pair = (key.clone(), progress.layout);
         if let Some(covered) = self.covered.get_mut(&pair) {
             if covered.passed_by(progress) {
-                self.raised = true;
-                if !covered.protected {
-                    covered.protected = true;
-                    self.evictable.remove(&covered.seq);
+                if resumable {
+                    self.raised = true;
+                    if !covered.protected {
+                        covered.protected = true;
+                        self.evictable.remove(&covered.seq);
+                    }
+                } else if !covered.protected && progress.complete {
+                    // Complete and never risen: evictable into the
+                    // completion record, which keeps it covered.
+                    self.evictable.insert(covered.seq, pair.clone());
                 }
             }
             covered.raise(progress);
@@ -570,11 +596,9 @@ impl DecodeCursorStore {
         self.tables += cursor.cached_tables.len();
     }
 
-    /// Store one recorded cursor and fold its committed progress into
-    /// the resume history.
+    /// Store one recorded cursor (its committed progress is folded into
+    /// the resume history by the recorder, which sees every record).
     fn insert(&mut self, key: DecodeCursorKey, cursor: DecodeCursor) {
-        self.history
-            .record(&key, &CommittedCursorProgress::of(&cursor));
         self.count_in(&cursor);
         if let Some(old) = self.cursors.insert(key, cursor) {
             self.count_out(&old);
@@ -1056,6 +1080,11 @@ impl ScanPassOwner {
         &mut self,
         read: impl FnOnce() -> Option<Vec<u8>>,
     ) -> Option<Option<Vec<u8>>> {
+        // One procfs read: never after the pass stops, and charged one
+        // unit of shared collection work like a liveness probe.
+        if self.stopped_now().is_some() || !self.collection_checkpoint(1) {
+            return None;
+        }
         Some(read())
     }
 
@@ -1117,6 +1146,35 @@ impl ScanPassOwner {
         if !self.decode.resume_armed {
             return false;
         }
+        // The resume history decides from the bracket-accepted progress,
+        // independently of whether the cache keeps the cursor: a stored
+        // record folds normally (a rise earns a pass, because the work
+        // stays resumable); a refused completion still covers its layout
+        // for good; a refused partial record keeps nothing resumable, so
+        // it neither rises nor seeds.
+        let progress = CommittedCursorProgress::of(&cursor);
+        let history_key = key.clone();
+        let stored = self.retain_decode_cursor(key, cursor, retained, limit);
+        if stored {
+            self.decode.cursors.history.record(&history_key, &progress);
+        } else if progress.complete {
+            self.decode
+                .cursors
+                .history
+                .record_unretained_completion(&history_key, &progress);
+        }
+        stored
+    }
+
+    /// The cursor cache's retention decision for one record (see
+    /// [`Self::record_decode_cursor`]).
+    fn retain_decode_cursor(
+        &mut self,
+        key: DecodeCursorKey,
+        cursor: DecodeCursor,
+        retained: &mut u64,
+        limit: u64,
+    ) -> bool {
         let bytes = decode_cursor_bytes(&key, &cursor);
         if bytes > limit {
             return false;

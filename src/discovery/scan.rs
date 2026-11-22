@@ -23141,8 +23141,11 @@ int main(int argc, char **argv) {
             cursor.tables = SweepFrontier { snapshot: 0, word };
             if complete {
                 // Larger than the whole retained ceiling: refused.
-                cursor.anchors =
-                    Some((0..4096u64).map(|address| (address, vec![0usize; 4])).collect());
+                cursor.anchors = Some(
+                    (0..4096u64)
+                        .map(|address| (address, vec![0usize; 4]))
+                        .collect(),
+                );
                 assert!(decode_cursor_bytes(&key, &cursor) > unit * 4);
             }
             (key, cursor)

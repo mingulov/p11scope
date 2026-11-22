@@ -1981,7 +1981,10 @@ fn cgroup_snapshot_resume_keeps_direct_completion_arrivals_covered() {
         let (_fixture, _child, mut coordinator) = cgroup_provider_scene();
         let mut driver = ObservedDriver::new(&mut coordinator, CollectionControl::new(None));
         driver.inner.cgroup.as_mut().unwrap().last_outcome = Some(work_limit);
-        let mut first = vec![(fixed.clone(), resume_progress(100, (0, 100), (0, 0), 4, false))];
+        let mut first = vec![(
+            fixed.clone(),
+            resume_progress(100, (0, 100), (0, 0), 4, false),
+        )];
         first.extend((0..cap - 1).map(|index| {
             (
                 resume_key(8, 9, 1_000_000 + index),
@@ -1992,23 +1995,41 @@ fn cgroup_snapshot_resume_keeps_direct_completion_arrivals_covered() {
         assert!(pass_resume(
             &mut driver.inner,
             resume_position(vec![
-                (fixed.clone(), resume_progress(100, (0, 101), (0, 0), 4, false)),
-                (arrival.clone(), resume_progress(300, (2, 0), (2, 0), 1, true)),
+                (
+                    fixed.clone(),
+                    resume_progress(100, (0, 101), (0, 0), 4, false)
+                ),
+                (
+                    arrival.clone(),
+                    resume_progress(300, (2, 0), (2, 0), 1, true)
+                ),
             ])
         ));
         assert!(pass_resume(
             &mut driver.inner,
             resume_position(vec![
-                (fixed.clone(), resume_progress(100, (0, 102), (0, 0), 4, false)),
-                (arrival.clone(), resume_progress(restart_layout, (0, 5), (0, 0), 1, false)),
+                (
+                    fixed.clone(),
+                    resume_progress(100, (0, 102), (0, 0), 4, false)
+                ),
+                (
+                    arrival.clone(),
+                    resume_progress(restart_layout, (0, 5), (0, 0), 1, false)
+                ),
             ])
         ));
         assert_eq!(
             pass_resume(
                 &mut driver.inner,
                 resume_position(vec![
-                    (fixed.clone(), resume_progress(100, (0, 102), (0, 0), 4, false)),
-                    (arrival.clone(), resume_progress(restart_layout, (0, 20), (0, 0), 1, false)),
+                    (
+                        fixed.clone(),
+                        resume_progress(100, (0, 102), (0, 0), 4, false)
+                    ),
+                    (
+                        arrival.clone(),
+                        resume_progress(restart_layout, (0, 20), (0, 0), 1, false)
+                    ),
                 ])
             ),
             expect_grant,

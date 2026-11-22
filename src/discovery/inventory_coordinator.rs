@@ -28449,6 +28449,974 @@ exit 0
         assert_eq!(gaps[0].caller, Some(caller));
     }
 
+    /// A capture scene holding two providers with disjoint objects:
+    /// `a.so` with two endpoints (members 0-1) and `b.so` with one
+    /// (member 2). Nothing is spawned, admitted, or mapped: each twin
+    /// drives that.
+    fn capture_scene_two_module() -> CaptureScene {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let b = fx::provider(&dir, "b.so", "provider-b");
+        let pins = fx::pass_pins(&[(&a, "sha-a"), (&b, "sha-b")]);
+        let source = crate::discovery::caller_registry::tests::ScriptedSource::default();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            source.clone(),
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.exit_clocks_comparable = true;
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                &[
+                    fx::module(&pins, &a, &fx::offsets(2)),
+                    fx::module(&pins, &b, &fx::offsets(1)),
+                ],
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        CaptureScene {
+            _dir: dir,
+            source,
+            coordinator,
+            delta: absorbed.delta,
+            verdicts: absorbed.verdicts,
+            pins,
+            path: a,
+        }
+    }
+
+    /// A capture scene where two modules claim one endpoint: `a.so`
+    /// holds two endpoints and `b.so` forwards `a.so`'s first offset,
+    /// so member 0 is shared and member 1 is single. Nothing is
+    /// spawned, admitted, or mapped: each twin drives that.
+    fn capture_scene_shared_endpoint() -> CaptureScene {
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let dir = tempfile::tempdir().unwrap();
+        let a = fx::provider(&dir, "a.so", "provider-a");
+        let b = fx::provider(&dir, "b.so", "provider-b");
+        let pins = fx::pass_pins(&[(&a, "sha-a"), (&b, "sha-b")]);
+        let source = crate::discovery::caller_registry::tests::ScriptedSource::default();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            source.clone(),
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.exit_clocks_comparable = true;
+        let policy = crate::plan::AdmissionPolicy::Inventory(coordinator.attach_set.budget());
+        let shared_offset = fx::offsets(2)[0];
+        let absorbed = coordinator.attach_set.absorb(
+            &fx::lower_named(
+                &[
+                    fx::module(&pins, &a, &fx::offsets(2)),
+                    fx::module_with_targets(&pins, &b, &[(&a, shared_offset)]),
+                ],
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        CaptureScene {
+            _dir: dir,
+            source,
+            coordinator,
+            delta: absorbed.delta,
+            verdicts: absorbed.verdicts,
+            pins,
+            path: a,
+        }
+    }
+
+    #[test]
+    fn a_retry_bind_after_a_readded_endpoint_moves_the_unresolved_placement() {
+        // Unresolved-first placement, admitted-late twin: the endpoint
+        // leaves the module's demand before the drop (the row stages
+        // unresolved — no admitted module names it), then rejoins
+        // before the re-sight. The rebind meets the retry rule and
+        // stages its edge; the first placement moves, so the
+        // twice-staged row still lands in exactly one bucket.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        // The endpoint leaves the demand: kept in the set, claimed by
+        // no module.
+        let pins = native.scene.pins.clone();
+        let path = native.scene.path.clone();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &path, &fx::offsets(1))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        native.scene.verdicts.extend(absorbed.verdicts);
+        let target = native.scene.delta.endpoints[1];
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            0,
+            "the endpoint names no module at the drop"
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, unresolved exactly once, no
+        // fold lands on this path.
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!((placement.total(), placement.unresolved), (1, 1));
+        assert_eq!(native.module_unbound(), None);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 0, 1, 0)
+        );
+        // The member keeps calling while still unadmitted; the endpoint
+        // rejoins the demand before the re-sight.
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &path, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        native.scene.verdicts.extend(absorbed.verdicts);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            1,
+            "the endpoint names its module at the rebind"
+        );
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.edge, placement.unresolved), (1, 0));
+    }
+
+    #[test]
+    fn a_retry_bind_on_a_still_shared_endpoint_keeps_one_ambiguous_placement() {
+        // Shared-first placement, still-shared twin: two modules claim
+        // the endpoint at the drop and at the re-sight, and the caller
+        // never gains an edge to either, so the rebind keeps ordinary
+        // revival semantics. The row keeps its first placement: no
+        // second bucket stages.
+        let scene = capture_scene_shared_endpoint();
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let target = native.scene.delta.endpoints[0];
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            2,
+            "two modules claim the endpoint"
+        );
+        let mut row = native.row(41, 1, 9, 40, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, ambiguous exactly once, no
+        // fold on a shared endpoint.
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!((placement.total(), placement.ambiguous), (1, 1));
+        assert_eq!(native.module_unbound(), None);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.ambiguous, placement.edge), (1, 0));
+        assert_eq!(
+            registry.edges().count(),
+            0,
+            "no edge without a mapping"
+        );
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject
+                    == crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED),
+            "the rejected demoted count discloses under its own subject: {:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_retry_bind_after_a_forwarder_leaves_moves_the_ambiguous_placement() {
+        // Shared-first placement, single-late twin: the forwarder drops
+        // its claim between the drop and the re-sight, so the rebind
+        // meets the retry rule and stages its edge; the first placement
+        // moves.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let scene = capture_scene_shared_endpoint();
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let target = native.scene.delta.endpoints[0];
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            2,
+            "two modules claim the endpoint at the drop"
+        );
+        let mut row = native.row(41, 1, 9, 40, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!((placement.total(), placement.ambiguous), (1, 1));
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 43)]);
+        // The forwarder keeps only a private endpoint: the witness
+        // endpoint goes single.
+        let pins = native.scene.pins.clone();
+        let path = native.scene.path.clone();
+        let other = native.scene._dir.path().join("b.so");
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                &[
+                    fx::module(&pins, &path, &fx::offsets(2)),
+                    fx::module_with_targets(&pins, &other, &[(&other, 0x4000)]),
+                ],
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        native.scene.verdicts.extend(absorbed.verdicts);
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            1,
+            "one module claims the endpoint at the rebind"
+        );
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.edge, placement.ambiguous), (1, 0));
+    }
+
+    #[test]
+    fn a_retry_bind_after_a_late_mapping_registration_moves_the_unresolved_placement() {
+        // Unregistered-single-first placement: the endpoint names its
+        // module, but no mapping note registered it when the row drops,
+        // so the row stages unresolved. The scan registers the mapping
+        // before the re-sight; the rebind meets the retry rule and its
+        // edge stages; the first placement moves.
+        let scene = CaptureScene::new(2);
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let target = native.scene.delta.endpoints[0];
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            1,
+            "the endpoint names one module"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.modules().count(),
+            0,
+            "no mapping registered at the drop"
+        );
+        let mut row = native.row(41, 1, 9, 40, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, unresolved exactly once, no
+        // fold without a registered module.
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!((placement.total(), placement.unresolved), (1, 1));
+        assert_eq!(native.module_unbound(), None);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 43)]);
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.edge, placement.unresolved), (1, 0));
+    }
+
+    #[test]
+    fn a_retry_bind_after_a_forwarder_joins_keeps_its_first_placement() {
+        // Module-first placement, shared-late twin: the drop folds to
+        // the single module, then a forwarder claims the endpoint
+        // before the re-sight. The rebind keeps ordinary revival
+        // semantics with the fold standing — and keeps the row's first
+        // placement: no second bucket stages.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, folded to the single module.
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.entries, 3);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 43)]);
+        // Mid-scene a forwarder joins the witness endpoint.
+        let other = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let path = native.scene.path.clone();
+        let pins = fx::pass_pins(&[(path.as_path(), "sha-a"), (other.as_path(), "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let shared_offset = fx::offsets(2)[0];
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                &[
+                    fx::module(&pins, &path, &fx::offsets(2)),
+                    fx::module_with_targets(&pins, &other, &[(&path, shared_offset)]),
+                ],
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        native.scene.pins = pins;
+        native.scene.verdicts.extend(absorbed.verdicts);
+        let target = native.scene.delta.endpoints[0];
+        assert_eq!(
+            native
+                .scene
+                .coordinator
+                .attach_set
+                .modules_with_member(target.id)
+                .count(),
+            2,
+            "two modules claim the endpoint at the rebind"
+        );
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.module, placement.ambiguous), (1, 0));
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert!(
+            registry.edges().all(|edge| edge.entry_count == 0),
+            "no counted edge without a mapping"
+        );
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject
+                    == crate::discovery::caller_registry::DEMOTED_COUNT_REJECTED),
+            "the rejected demoted count discloses under its own subject: {:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_retry_bind_without_a_mapping_edge_keeps_its_first_placement() {
+        // Module-first placement, edgeless-rebind twin: the drop folds
+        // to the single module, but the admitted caller never gains a
+        // mapping edge, so the rebind keeps ordinary revival semantics
+        // with the fold standing — and keeps the row's first placement:
+        // no second bucket stages.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, folded to the single module.
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.entries, 3);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!(placement.module, 1);
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(unbound.reasons.get("no_live_caller"), Some(&1));
+        assert_eq!(
+            unbound.reasons.get("no_mapping_edge"),
+            None,
+            "no second placement stages a mapping row: {:?}",
+            unbound.reasons
+        );
+        assert!(
+            registry.edges().all(|edge| edge.entry_count == 0),
+            "no counted edge without a mapping"
+        );
+    }
+
+    #[test]
+    fn a_retry_bind_with_a_window_reuse_keeps_revival_with_the_fold_standing() {
+        // Retry-path window proof, reuse twin: the re-observed bind
+        // meets the single-edge rule but a pid reuse sits inside the
+        // seed-to-admission window, so the bind keeps ordinary revival
+        // semantics — the fold stands, the edge carries post-drop
+        // growth only, and no new gap stages (the standing fold plus
+        // the drop diagnostic already count and name the subtotal).
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        // Mid-state: decided NoLiveCaller, seed folded.
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.entries, 3);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        // A turnover strictly inside the row-to-admission window: the
+        // live cookie still binds, but the window is unproven.
+        native.scene.coordinator.binder.note_pid_reuse(9, 45);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(
+            edge.entry_count, 40,
+            "revival carries post-drop growth only"
+        );
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 1);
+        assert_eq!((placement.module, placement.edge), (1, 0));
+        assert!(
+            registry.gaps().iter().all(
+                |gap| gap.subject != crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+            ),
+            "revival needs no new gap: {:?}",
+            registry.gaps()
+        );
+    }
+
+    #[test]
+    fn a_saturated_image_fold_retraction_keeps_the_standing_fold_calls() {
+        // Saturation-aware fold retraction (image limits shrunk to 1):
+        // X's fold fills the run-wide image set's single slot, so B's
+        // insert drops; X rebinds and its fold retracts, freeing the
+        // slot; C (B's cookie on the other object) inserts; then B
+        // rebinds and its fold retracts — without eating C's standing
+        // calls. Pid 7 is admitted and mapped first so the drops fold
+        // to a registered module; pids 9-11 stay unadmitted until
+        // their rebinds.
+        let mut scene = capture_scene_two_module();
+        for (pid, start) in [(7, 500), (9, 600), (10, 601), (11, 602)] {
+            scene.source.spawn(pid, start);
+            scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene.project(7, 60);
+        scene.coordinator.commit_batch(false).unwrap();
+        let mut native = NativeScene::over(scene, 0);
+        native
+            .scene
+            .coordinator
+            .registry
+            .unbound_image_limits = crate::discovery::caller_registry::UnboundImageLimits {
+            per_module: 1,
+            global: 1,
+        };
+        // X drops on object A: its image fills the single slots.
+        let mut row_x = native.row(41, 1, 9, 40, 0);
+        row_x.entry_count = 5;
+        native.witness(vec![row_x]);
+        // B drops on object A: the full sets drop its image insert.
+        let mut row_b = native.row(42, 1, 10, 40, 0);
+        row_b.entry_count = 7;
+        native.witness(vec![row_b]);
+        // X rebinds: its fold retracts and frees the slots.
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let other = native.scene._dir.path().join("b.so");
+        let path = native.scene.path.clone();
+        native.scene.project_paths(9, &[&path, &other], 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        // C drops on object B with B's cookie: it inserts into the
+        // freed run-wide slot.
+        let mut row_c = native.row(42, 1, 11, 40, 2);
+        row_c.entry_count = 11;
+        native.witness(vec![row_c]);
+        // B rebinds: its fold retracts, and C's standing calls keep
+        // their exact sum.
+        let caller_b = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(10, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(10, 70);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(10, 601, 42);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller_b)
+            .expect("the rebound member has an edge");
+        assert_eq!(edge.entry_count, 7);
+        let cookie = crate::attach::capture::DomainCookie::scripted(native.domain, 42);
+        assert_eq!(
+            registry.unidentified_image_calls_for_test(cookie),
+            Some(11),
+            "the standing fold keeps its exact calls"
+        );
+        let census = registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (3, 2, 1, 0)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(placement.total(), 3);
+        assert_eq!((placement.edge, placement.module), (2, 1));
+    }
+
+    /// A watched two-provider scene over [`capture_scene_two_module`]:
+    /// pid 7 admitted at 50 and mapped to both providers, exec coverage
+    /// from `coverage_ns`.
+    fn watched_native_two_module(coverage_ns: u64) -> (NativeScene, CallerId) {
+        let mut scene = capture_scene_two_module();
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut native = NativeScene::over(scene, coverage_ns);
+        native.scene.attach_all(100, ScopeCustody::System);
+        let other = native.scene._dir.path().join("b.so");
+        let path = native.scene.path.clone();
+        native.scene.project_paths(7, &[&path, &other], 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(watched(&native.scene.coverage(caller)));
+        (native, caller)
+    }
+
+    #[test]
+    fn a_cached_late_bind_with_an_exec_in_its_window_rebases_and_discloses() {
+        // Count-proof Exec arm, cached-bind twin: the image binds on
+        // time through object A (installing the exact-image cache),
+        // then the tgid execs, then a late row of the same image
+        // through object B binds from the cache — skipping the §3.3
+        // window rules for its own instant. The count base re-proves
+        // the window itself: the exec sits at or after the row, so the
+        // bind rebases past the sight and the excluded absolute
+        // discloses as the named counted gap. The held predecessor
+        // waits for row-proof of its end; the arm needs only the
+        // recorded exec.
+        let (mut native, caller) = watched_native_two_module(0);
+        native.answer(7, 500, 41);
+        let mut first = native.row(41, 1, 7, 100, 0);
+        first.entry_count = 2;
+        native.witness(vec![first]);
+        // The tgid execs after the on-time bind.
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = at;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        native.stage(NativeBatch::Lifecycle(drain));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.binder.exec_instants_for_test(),
+            1,
+            "the exec is recorded"
+        );
+        assert_eq!(
+            native.scene.coordinator.adapter.live_id(7),
+            Some(caller),
+            "the held predecessor waits for row-proof of its end"
+        );
+        // The late row of the same image binds from the cache; its
+        // window holds the exec, so it rebases and discloses.
+        let mut row = native.row(41, 1, 7, 40, 2);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 2, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let mut counts: Vec<u64> = registry
+            .edges()
+            .filter(|edge| edge.caller == caller)
+            .map(|edge| edge.entry_count)
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![2, 3], "on-time whole, cached-late rebased");
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller && edge.entry_count == 3)
+            .expect("the rebased edge");
+        assert_eq!(
+            native.scene.coordinator.presented_coverage(edge),
+            UseCoverage::Counted {
+                since_ns: 40,
+                lossy: false,
+                pid_exit: false
+            }
+        );
+        let gaps: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the excluded sight discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(gaps[0].caller, Some(caller));
+        assert!(
+            gaps[0].reason.contains("(0, 2]"),
+            "the gap counts the excluded absolute: {}",
+            gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn a_cached_late_bind_with_a_loss_in_its_window_rebases_and_discloses() {
+        // Count-proof Loss arm, cached-bind twin: same shape as the
+        // Exec twin, but lifecycle evidence is lost after the on-time
+        // bind instead of an exec recorded. The cached late bind
+        // rebases past the sight and discloses the excluded absolute.
+        let (mut native, caller) = watched_native_two_module(0);
+        native.answer(7, 500, 41);
+        let mut first = native.row(41, 1, 7, 100, 0);
+        first.entry_count = 2;
+        native.witness(vec![first]);
+        let at = native.stamps.tick();
+        let mut drain = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        drain.failure = Some("scripted lifecycle loss".to_string());
+        native.stage(NativeBatch::Lifecycle(drain));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let mut row = native.row(41, 1, 7, 40, 2);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 2, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let mut counts: Vec<u64> = registry
+            .edges()
+            .filter(|edge| edge.caller == caller)
+            .map(|edge| edge.entry_count)
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![2, 3], "on-time whole, cached-late rebased");
+        let gaps: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the excluded sight discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(gaps[0].caller, Some(caller));
+        assert!(
+            gaps[0].reason.contains("(0, 2]"),
+            "the gap counts the excluded absolute: {}",
+            gaps[0].reason
+        );
+    }
+
+    #[test]
+    fn a_cached_late_bind_predating_coverage_rebases_and_discloses() {
+        // Count-proof Coverage arm, cached-bind twin: exec coverage
+        // starts at 45 — after the late row's instant (40) but at the
+        // admission's (50) — so the on-time row binds (no revalidation
+        // needed) and installs the cache, while the cached late row's
+        // window predates coverage. It rebases past the sight and the
+        // excluded absolute discloses as the named counted gap.
+        let (mut native, caller) = watched_native_two_module(45);
+        native.answer(7, 500, 41);
+        let mut first = native.row(41, 1, 7, 100, 0);
+        first.entry_count = 2;
+        native.witness(vec![first]);
+        let mut row = native.row(41, 1, 7, 40, 2);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 2, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let mut counts: Vec<u64> = registry
+            .edges()
+            .filter(|edge| edge.caller == caller)
+            .map(|edge| edge.entry_count)
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![2, 3], "on-time whole, cached-late rebased");
+        let gaps: Vec<_> = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING)
+            .collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "the excluded sight discloses its window: {:?}",
+            registry.gaps()
+        );
+        assert_eq!(gaps[0].caller, Some(caller));
+        assert!(
+            gaps[0].reason.contains("(0, 2]"),
+            "the gap counts the excluded absolute: {}",
+            gaps[0].reason
+        );
+    }
+
     /// The prepared cgroup commit preserves counts for unnamed slots:
     /// one real cgroup pass over the provider fixture absorbs
     /// endpoints through the no-read commit, and its plan slots all

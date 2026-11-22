@@ -7601,6 +7601,15 @@ impl CallerRegistry {
         self.unidentified_images.contains_key(&cookie)
     }
 
+    /// Test-only: run-wide folded calls for `cookie`, when the image
+    /// set holds it.
+    #[cfg(test)]
+    pub(crate) fn unidentified_image_calls_for_test(&self, cookie: DomainCookie) -> Option<u64> {
+        self.unidentified_images
+            .get(&cookie)
+            .map(|known| known.calls_at_least)
+    }
+
     /// Backfill one joined executable into every image set holding
     /// `cookie` (the EXEC arrived after the row staged). Unknown
     /// cookies attach nowhere and refuse nothing.

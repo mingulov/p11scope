@@ -74,10 +74,12 @@
 #     Session::start may raise soft to hard at attach; wide cells attach
 #     thousands of links, hence `ulimit -n 65536` before the campaign.
 #
-# Pass criterion: a test PASSES only if its log contains
-#   "test result: ok. 1 passed"
-# (exactly one test ran) and the harness exited 0. An exit code alone is not
-# accepted, and "0 passed" (renamed/missing test) is a FAIL.
+# Pass criterion: a test PASSES only if the harness exited 0 and its last
+# libtest summary is, as a full line,
+#   "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; N filtered out; finished in S.SSs"
+# (exactly one test ran). An exit code alone is not accepted, and "0 passed"
+# (renamed/missing test) or a malformed summary is a FAIL. FULL_MATRIX_TESTS
+# cells are judged by scripts/ci/joint_stop_verdict.py instead.
 #
 # Dual-outcome cells print one `P11SCOPE_CELL_BRANCH=<name>` line for the
 # arm they took; the runner appends ` branch=<name>` to that cell's
@@ -140,6 +142,7 @@ set -uo pipefail
 
 PROG=${0##*/}
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+JOINT_VERDICT=$REPO_ROOT/scripts/ci/joint_stop_verdict.py
 
 # Default campaign: every ignored test except the long cells and the static
 # skips. Order is the binary's --list order; each runs in its own process.
@@ -802,9 +805,11 @@ manifest_getter_privileged_tests::privileged_getter_only_manifest_function_list_
 # Full-matrix membership: the LONG_TESTS members whose qualification
 # requires every matrix case (not a campaign list: every member also
 # runs as a long cell). The runner unsets the cell's narrowing
-# selectors for exactly these cells and fails a pass that lacks any
-# post-stop completion line (matched as a full line), so inherited
-# WP7_STOP_PREPS / WP7_STOP_OFFSETS narrowing can never qualify as
+# selectors for exactly these cells and judges their logs with the
+# shared fail-closed validator scripts/ci/joint_stop_verdict.py (exit
+# status, strict terminal summary, all 12 cases in order with exact
+# records), so inherited WP7_STOP_PREPS / WP7_STOP_OFFSETS narrowing,
+# a malformed summary or a contradictory record can never qualify as
 # the full matrix. Direct libtest runs keep narrowing for
 # exploration.
 FULL_MATRIX_TESTS=(
@@ -1640,7 +1645,8 @@ main() {
     local selected_runnable=() selected_skipped=()
     local arg name i pass=0 fail=0 skipped=0 xfail=0 xpass=0 seq=0
     local tmpdir logdir eviddir results log evdir short start end seconds rc
-    local result_line verdict branch_suffix sig_line matrix_note matrix_missing
+    local result_line verdict branch_suffix sig_line matrix_note verdict_rc
+    local -a joint_verdict=()
     local m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
     local need_ext4loop=0 ext4loop_skip=
     local need_counter=0 counter_skip=
@@ -2141,27 +2147,34 @@ main() {
         result_line=$(command grep '^test result:' "$log" | tail -n 1 || true)
         [ -n "$result_line" ] || result_line="(no test result line)"
         verdict=FAIL
-        if [ "$rc" -eq 0 ] \
-            && printf '%s\n' "$result_line" | command grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored;'; then
-            verdict=PASS
-        fi
         matrix_note=
-        matrix_missing=
-        if [ -n "${full_matrix_set[$name]+present}" ] && [ "$verdict" = PASS ]; then
-            i=0
-            while [ "$i" -lt 12 ]; do
-                if ! command grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" "$log"; then
-                    matrix_missing="$matrix_missing $i"
+        if [ -n "${full_matrix_set[$name]+present}" ]; then
+            # Full-matrix cells: the shared fail-closed validator
+            # (scripts/ci/joint_stop_verdict.py, also the S3 judge)
+            # parses the whole log: exit status, strict framing and
+            # terminal summary, and all 12 cases in order, each exactly
+            # once as linked tag, bound offset diagnostic and completion
+            # marker, with no error, no-feed or stray record. Only its
+            # qualified verdict passes; anything else fails with the
+            # validator's named reason.
+            joint_verdict=()
+            verdict_rc=0
+            python3 -I "$JOINT_VERDICT" --cell "$name" --status "$rc" \
+                --format lines "$log" >"$log.verdict" 2>&1 || verdict_rc=$?
+            mapfile -t joint_verdict <"$log.verdict"
+            if [ "$verdict_rc" = 0 ] && [ "${#joint_verdict[@]}" = 4 ]; then
+                [ -z "${joint_verdict[2]}" ] || result_line=${joint_verdict[2]}
+                if [ "${joint_verdict[0]}" = qualified ]; then
+                    verdict=PASS
+                else
+                    matrix_note=" (JOINT ${joint_verdict[0]} [${joint_verdict[1]}]: ${joint_verdict[3]})"
                 fi
-                i=$((i + 1))
-            done
-            if [ -n "$matrix_missing" ]; then
-                verdict=FAIL
-                matrix_note=" (MATRIX SHORT: missing completed cases:$matrix_missing; want wp7-stop0..wp7-stop11)"
-            elif command grep -qE '^P11SCOPE_CELL_BRANCH=wp7-stop(0|1|2|3|4|5|6|7|8|9|10|11):(s1-precluded|no-feeds-unattributed)$' "$log"; then
-                verdict=FAIL
-                matrix_note=" (MIXED: no-feed preclusion tag on a passing matrix; a pass never precludes)"
+            else
+                matrix_note=" (JOINT: the verdict validator produced no verdict; see $log.verdict)"
             fi
+        elif [ "$rc" -eq 0 ] \
+            && printf '%s\n' "$result_line" | command grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]{2}s$'; then
+            verdict=PASS
         fi
         branch_suffix=$(cell_branch_suffix "$log")
         branch_suffix="$branch_suffix$matrix_note"

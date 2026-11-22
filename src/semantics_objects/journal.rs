@@ -2173,6 +2173,7 @@ pub(crate) struct SealBarrierState {
 /// One production-seal attempt: either a decided seal outcome, or a
 /// yielded barrier scan that spent its slice and must resume with
 /// more budget before the seal can decide.
+#[allow(clippy::large_enum_variant)] // Seal attempts stay allocation-free; Yielded is a transient fuel signal, Decided moves its large outcome once per seal.
 pub(crate) enum SealAttempt {
     Decided(Result<SealSuccess, SealFailure>),
     Yielded,

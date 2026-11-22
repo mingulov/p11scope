@@ -3,12 +3,13 @@
 """CI entry mapping for the stop-race cells (synthetic, no root).
 
 Exercises `scripts/ci/stop-races.sh` without privileged runs: the
-joint-row mapping (wedge signature, single-seal preclusion tag, clean
-pass, unexpected pass, unmapped failure, missing test binary) via a
-verbatim copy of the entry with stubbed qualify/id/library-test, and
-the early prerequisite rows (non-root, missing observer) via the real
-entry. The harness must also flag a ledger that appears between the
-pre-kill check and the signal.
+joint-row mapping (wedge signature, single-seal preclusion tag,
+unattributed no-feed tag, full-matrix clean pass, one-case short
+matrix, inherited narrowing, unexpected pass, unmapped failure,
+missing test binary) via a verbatim copy of the entry with stubbed
+qualify/id/library-test, and the early prerequisite rows (non-root,
+missing observer) via the real entry. The harness must also flag a
+ledger that appears between the pre-kill check and the signal.
 """
 
 import json
@@ -95,13 +96,48 @@ printf '%s' "$STUB_LOG"
 exit "$STUB_RC"
 """
 
+STUB_LIBTEST_MATRIX_GUARD = """#!/bin/sh
+# A joint cell that proves the entry forced the full matrix: it fails
+# loudly when an inherited narrowing selector reaches it, else replays
+# the fixture log.
+set -u
+if [ "${1:-}" = --list ]; then
+  echo "$JOINT_CELL_STUB: test"
+  exit 0
+fi
+if [ -n "${WP7_STOP_PREPS:-}" ] || [ -n "${WP7_STOP_OFFSETS:-}" ]; then
+  echo "narrowing leaked into the qualifying entry"
+  exit 1
+fi
+printf '%s' "$STUB_LOG"
+exit "$STUB_RC"
+"""
 
-def run_mapping(*, log, rc, expect_fail, libtest=True, list_mode="always"):
+
+def full_matrix_log():
+    """A passing 12-case matrix log: every linked case tag by exact name."""
+    tags = "".join(
+        "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i for i in range(12))
+    return tags + ("test result: ok. 1 passed; 0 failed; 0 ignored; "
+                   "0 measured; 0 filtered out; finished in 180.00s\n")
+
+
+def one_case_log():
+    """A passing one-case log: only the first linked case tag is present."""
+    return ("P11SCOPE_CELL_BRANCH=wp7-stop0:linked\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; "
+            "0 measured; 0 filtered out; finished in 15.00s\n")
+
+
+def run_mapping(*, log, rc, expect_fail, libtest=True, list_mode="always",
+                extra_env=None, stub_body=None):
     """Run a verbatim copy of the entry with stubbed qualify/id/libtest.
 
     expect_fail None leaves JOINT_EXPECTED_FAILURE unset (the default
     path); list_mode "unignored" hides the cell from the ignored
-    listing while plain --list still advertises it.
+    listing while plain --list still advertises it; extra_env adds
+    inherited variables (matrix narrowing); stub_body overrides the
+    replay stub (the matrix guard).
     """
     cell = joint_cell()
     with tempfile.TemporaryDirectory() as raw:
@@ -125,9 +161,14 @@ def run_mapping(*, log, rc, expect_fail, libtest=True, list_mode="always"):
             env["JOINT_EXPECTED_FAILURE"] = "1" if expect_fail else "0"
         env["STOP_RACES_TRIALS"] = "2"
         env["STOP_RACES_BURST_TRIALS"] = "1"
+        for key, value in (extra_env or {}).items():
+            env[key] = value
         if libtest:
             stub = tmp / "libtest"
-            write_exe(stub, STUB_LIBTEST_UNIGNORED if list_mode == "unignored" else STUB_LIBTEST)
+            if stub_body is None:
+                stub_body = (STUB_LIBTEST_UNIGNORED if list_mode == "unignored"
+                             else STUB_LIBTEST)
+            write_exe(stub, stub_body)
             env["P11SCOPE_LIBTEST"] = str(stub)
             env["JOINT_CELL_STUB"] = cell
             env["STUB_LOG"] = log
@@ -173,11 +214,44 @@ class CiStopRacesTests(unittest.TestCase):
 
     def test_clean_pass_with_expect_zero_maps_qualified(self):
         proc, rows, joint = run_mapping(
-            log="test result: ok. 1 passed\n", rc=0, expect_fail=False)
+            log=full_matrix_log(), rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertTrue(joint["pass"])
+        self.assertEqual(joint["qualification"], "qualified")
+        self.assertIn("linked joint stop", joint["detail"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_one_case_pass_does_not_qualify_as_the_full_matrix(self):
+        proc, rows, joint = run_mapping(
+            log=one_case_log(), rc=0, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("wp7-stop", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_qualifying_entry_ignores_inherited_matrix_narrowing(self):
+        proc, rows, joint = run_mapping(
+            log=full_matrix_log(), rc=0, expect_fail=False,
+            extra_env={"WP7_STOP_PREPS": "0", "WP7_STOP_OFFSETS": "0"},
+            stub_body=STUB_LIBTEST_MATRIX_GUARD)
         self.assertIsNotNone(joint, rows)
         self.assertTrue(joint["pass"])
         self.assertEqual(joint["qualification"], "qualified")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_unattributed_no_feed_run_fails_with_its_cause(self):
+        log = ("P11SCOPE_CELL_BRANCH=wp7-stop4:no-feeds-unattributed\n"
+               "wp7-stop4: no joint feeds and no S1 seal "
+               "(unattributed linkage default); not attempted\n")
+        self.assertNotIn(wedge_signature(), log)
+        self.assertNotIn("s1-precluded", log)
+        proc, rows, joint = run_mapping(log=log, rc=1, expect_fail=False)
+        self.assertIsNotNone(joint, rows)
+        self.assertFalse(joint["pass"])
+        self.assertEqual(joint["qualification"], "failed")
+        self.assertIn("unattributed", joint["detail"])
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
 
     def test_unexpected_pass_with_expect_one_fails(self):
         proc, rows, joint = run_mapping(
@@ -219,9 +293,7 @@ class CiStopRacesTests(unittest.TestCase):
 
     def test_unset_expected_failure_defaults_to_clean_pass_qualified(self):
         proc, rows, joint = run_mapping(
-            log=("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
-                 "0 filtered out; finished in 1.00s\n"),
-            rc=0, expect_fail=None)
+            log=full_matrix_log(), rc=0, expect_fail=None)
         self.assertIsNotNone(joint, rows)
         self.assertTrue(joint["pass"])
         self.assertEqual(joint["qualification"], "qualified")

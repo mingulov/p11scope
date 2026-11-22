@@ -8687,12 +8687,24 @@ pub(crate) fn kernel_thread_exclusions(
     unavailable: &BTreeSet<u32>,
     proc_root: &Path,
 ) -> BTreeSet<u32> {
+    kernel_thread_exclusions_with(sweep, unavailable, &mut |pid| {
+        std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"))
+    })
+}
+
+/// [`kernel_thread_exclusions`] over an injected stat reader: one
+/// `read_stat` call per candidate (an empty, available maps snapshot).
+pub(crate) fn kernel_thread_exclusions_with(
+    sweep: &SweepSnapshots,
+    unavailable: &BTreeSet<u32>,
+    read_stat: &mut dyn FnMut(u32) -> std::io::Result<String>,
+) -> BTreeSet<u32> {
     let mut excluded = BTreeSet::new();
     for (pid, entries) in sweep {
         if !entries.is_empty() || unavailable.contains(pid) {
             continue;
         }
-        let stat = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat"));
+        let stat = read_stat(*pid);
         let is_kthread = stat.is_ok_and(|text| {
             process::stat_flags_from_stat_text(&text)
                 .is_some_and(|flags| flags & process::PF_KTHREAD != 0)
@@ -9034,7 +9046,21 @@ pub(crate) fn select_excluding_kernel_threads(
     tiers: &crate::discovery::scan_pass::MemberTiers,
 ) -> Vec<u32> {
     let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
-    for _ in &excluded {
+    select_excluding_given(sweep, &excluded, cap, budget, tiers)
+}
+
+/// The selection half of [`select_excluding_kernel_threads`] over an
+/// already-classified exclusion set: each excluded pid is counted on the
+/// budget's kernel-thread note, the rest select by rarity (tiered when
+/// the cursor recorded any member).
+pub(crate) fn select_excluding_given(
+    sweep: &SweepSnapshots,
+    excluded: &BTreeSet<u32>,
+    cap: usize,
+    budget: &mut CaptureWorkBudget,
+    tiers: &crate::discovery::scan_pass::MemberTiers,
+) -> Vec<u32> {
+    for _ in excluded {
         budget.note_kernel_thread_absence();
     }
     let eligible: SweepSnapshots = sweep

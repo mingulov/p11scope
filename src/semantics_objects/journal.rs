@@ -584,7 +584,7 @@ impl EntryWords {
 /// The return-time words of one completed invocation (END, preserved
 /// CALL or H0 admission) that the producer may have rewritten, plus the
 /// return value that decides which rewrites it may make.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ReturnedWords {
     session: u64,
     mechanism: u64,
@@ -1476,6 +1476,15 @@ struct OpenEntry {
     end: Option<StagedEnd>,
     abandon: Option<StagedAbandon>,
     corroborated_return: Option<u64>,
+    /// The corroborating ordinary CALL's return, drained before
+    /// abandonment: its return timestamp plus the returned session,
+    /// mechanism, capture and rv words. Valid only while
+    /// `corroborated_return` is `Some` (set together at corroboration,
+    /// read only under it). A reason-9 abandonment on a call whose
+    /// completion needs no BPF tail completes from these instead of
+    /// losing its outcome; anything else keeps the bounded loss.
+    corroborated_ts_ns: u64,
+    corroborated_returned: ReturnedWords,
     /// Whether a return already observed for this invocation (the
     /// corroborating ordinary CALL, or the admitted claim at conversion,
     /// where the claim leaves the store) carried negative authority:
@@ -1483,6 +1492,11 @@ struct OpenEntry {
     /// [`JournalAdapter::abandonment_disposes_here`]). A flag, so the
     /// retained entry keeps its charged layout.
     negative_return: bool,
+    /// Whether a drained corroborated return already converted (the
+    /// `end_converted` twin for abandonment-carried completions): a
+    /// held sibling keeps the entry staged past its first seal, and
+    /// the terminal must not complete twice.
+    drained_converted: bool,
     converted_ticket: Option<CallToken>,
     converted_for: Option<JournalDomainKey>,
     end_converted: bool,
@@ -3094,7 +3108,10 @@ impl JournalAdapter {
                 end: None,
                 abandon: None,
                 corroborated_return: None,
+                corroborated_ts_ns: 0,
+                corroborated_returned: ReturnedWords::default(),
                 negative_return: false,
+                drained_converted: false,
                 converted_ticket: None,
                 converted_for: None,
                 end_converted: false,
@@ -3383,6 +3400,8 @@ impl JournalAdapter {
         if let Some((key, _, _)) = matches.first() {
             let entry = self.open.get_mut(key).expect("matched open entry");
             entry.corroborated_return = Some(ordinal);
+            entry.corroborated_ts_ns = event.ts_ns;
+            entry.corroborated_returned = ReturnedWords::of_event(event);
             entry.negative_return |=
                 !super::state::return_leaves_no_lifecycle_effect(entry.function, event.rv);
             return JournalDisposition::ReturnObserved;
@@ -4728,6 +4747,57 @@ fn completed_of(end_ordinal: u64, function: u32, end: &ValidatedJournalEnd) -> C
     }
 }
 
+/// Whether a reason-9 abandonment on this function drains its
+/// corroborated ordinary return into a completion instead of losing
+/// the outcome: exactly the functions whose BPF completion carries no
+/// tail (non-object functions emit tail-absent ENDs, refused otherwise
+/// by [`end_agrees_with_begin`]), so [`completed_of`] on their END
+/// reads nothing the corroborated return lacks. Anything else keeps
+/// the bounded loss: its result, find or attribute tail is truly gone.
+fn return_drains_without_tail(function: u32) -> bool {
+    p11scope_ebpf_common::object_policy::object_descriptor(function).is_none()
+}
+
+/// One recovered completion from a drained corroborated return: the
+/// [`completed_of`] shape for a tail-absent END (results, find and
+/// attributes uncaptured), with the cut, return time, rv, return
+/// mechanism and session output of the corroborating ordinary CALL.
+/// Call only under [`return_drains_without_tail`].
+fn completed_from_drained_return(
+    at: u64,
+    ts_ns: u64,
+    returned: ReturnedWords,
+    function: u32,
+) -> CompletedFact {
+    CompletedFact {
+        cut: RefCut::sealed(ConsumptionOrdinal(at)),
+        end_ns: ts_ns,
+        rv: returned.rv,
+        return_mechanism: mechanism_evidence(returned.capture, returned.mechanism),
+        results: [ResultSlot::NotCaptured, ResultSlot::NotCaptured],
+        session_out: session_output_of_words(function, returned.rv, returned.session),
+        found: FindResult::NotCaptured,
+        attributes: None,
+    }
+}
+
+/// The drained-return cut for one converted entry, or `None`: the
+/// abandonment is reason-9 within the frontier, the function drains
+/// without a tail, and the corroborated return sits within the
+/// frontier. The settled table and the terminal conversion share this
+/// one predicate, so a drained call completes in both or neither.
+fn drained_return_cut(entry: &OpenEntry, frontier: u64) -> Option<u64> {
+    if entry.abandon.is_some_and(|staged| {
+        staged.ordinal <= frontier
+            && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
+    }) && return_drains_without_tail(entry.function)
+    {
+        entry.corroborated_return.filter(|at| *at <= frontier)
+    } else {
+        None
+    }
+}
+
 fn tail_u64(tail: &[u8; 240], offset: usize) -> u64 {
     u64::from_le_bytes([
         tail[offset],
@@ -4750,12 +4820,18 @@ fn session_output_of(
     function: u32,
     event: &p11scope_ebpf_common::Event,
 ) -> HandleInput<SessionHandle> {
+    session_output_of_words(function, event.rv, event.session)
+}
+
+/// [`session_output_of`] over retained return words: a drained
+/// corroboration carries no event, only its words.
+fn session_output_of_words(function: u32, rv: u64, session: u64) -> HandleInput<SessionHandle> {
     if Some(function) != crate::kinds::function_id("C_OpenSession") {
         return HandleInput::Absent;
     }
-    if event.rv == pkcs11_types::CkRv::OK.0
-        && event.session != p11scope_ebpf_common::SESSION_NONE
-        && let Some(handle) = SessionHandle::new(event.session)
+    if rv == pkcs11_types::CkRv::OK.0
+        && session != p11scope_ebpf_common::SESSION_NONE
+        && let Some(handle) = SessionHandle::new(session)
     {
         HandleInput::Value(handle)
     } else {
@@ -9757,14 +9833,17 @@ impl JournalAdapter {
                 staged.ordinal <= frontier
                     && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
             });
+            // A drained return settles as a completion at its
+            // corroborated cut, never as an abandonment.
+            let drained = drained_return_cut(entry, frontier);
             if end.is_none() && !abandoned {
                 continue;
             }
             if let Ok(index) = settled[..converted_begins]
                 .binary_search_by_key(&entry.begin_ordinal, |summary| summary.begin_cut)
             {
-                settled[index].end_cut = end.map(|staged| staged.ordinal);
-                settled[index].abandoned = abandoned;
+                settled[index].end_cut = end.map(|staged| staged.ordinal).or(drained);
+                settled[index].abandoned = abandoned && drained.is_none();
                 settled[index].length = sealed_length(end);
             } else {
                 let (session, mechanism) = sealed_fingerprint(&entry.begin);
@@ -9773,8 +9852,8 @@ impl JournalAdapter {
                     key: entry.call_key.expect("converted original key"),
                     function: entry.function,
                     begin_cut: entry.begin_ordinal,
-                    end_cut: end.map(|staged| staged.ordinal),
-                    abandoned,
+                    end_cut: end.map(|staged| staged.ordinal).or(drained),
+                    abandoned: abandoned && drained.is_none(),
                     session,
                     mechanism,
                     length: sealed_length(end),
@@ -9863,36 +9942,63 @@ impl JournalAdapter {
                 && staged.ordinal <= frontier
                 && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
             {
-                let Some(at) = entry.corroborated_return else {
-                    let lived = self.key_is_live(key);
-                    self.keys.get_mut(&key).expect("sealed key").tainted = true;
-                    self.claims_prune_dirty |= lived;
-                    return Err(SealFailure {
-                        take_failed: None,
-                        gap: JournalGap::ModelRefused,
-                        effects,
-                        h3_voided: None,
-                        fence: None,
-                        scope: SealFailureScope::Unqualified,
-                    });
-                };
-                let start = effects.effects.len();
-                let lost = model.outcome_lost(
-                    super::LostOutcome::Ticket(token, RefCut::sealed(ConsumptionOrdinal(at))),
-                    &mut self.ledger,
-                );
-                effects.effects.extend(lost.effects);
-                if let Some(replay) = &mut replay {
-                    replay.bounded_loss(
-                        entry.call_key.expect("converted loss subject"),
-                        token,
-                        at,
-                        start..effects.effects.len(),
+                // A drained return completes from its corroborated
+                // ordinary facts, exactly once (a held sibling keeps the
+                // entry staged past its first seal); anything else keeps
+                // the bounded loss below.
+                if let Some(at) = drained_return_cut(&entry, frontier) {
+                    if !entry.drained_converted {
+                        let completed = completed_from_drained_return(
+                            at,
+                            entry.corroborated_ts_ns,
+                            entry.corroborated_returned,
+                            entry.function,
+                        );
+                        let start = effects.effects.len();
+                        let applied = model.complete(token, completed, &mut self.ledger);
+                        effects.effects.extend(applied.effects);
+                        if let Some(replay) = &mut replay {
+                            replay.conversion(at, start..effects.effects.len());
+                        }
+                        self.open
+                            .get_mut(&native)
+                            .expect("staged terminal")
+                            .drained_converted = true;
+                    }
+                    // A drained return is a completion, not a loss: no
+                    // bounded upper is retained for it.
+                } else {
+                    let Some(at) = entry.corroborated_return else {
+                        let lived = self.key_is_live(key);
+                        self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                        self.claims_prune_dirty |= lived;
+                        return Err(SealFailure {
+                            take_failed: None,
+                            gap: JournalGap::ModelRefused,
+                            effects,
+                            h3_voided: None,
+                            fence: None,
+                            scope: SealFailureScope::Unqualified,
+                        });
+                    };
+                    let start = effects.effects.len();
+                    let lost = model.outcome_lost(
+                        super::LostOutcome::Ticket(token, RefCut::sealed(ConsumptionOrdinal(at))),
+                        &mut self.ledger,
                     );
+                    effects.effects.extend(lost.effects);
+                    if let Some(replay) = &mut replay {
+                        replay.bounded_loss(
+                            entry.call_key.expect("converted loss subject"),
+                            token,
+                            at,
+                            start..effects.effects.len(),
+                        );
+                    }
+                    let retained = self.keys.get_mut(&key).expect("sealed key");
+                    retained.bounded_upper =
+                        Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
                 }
-                let retained = self.keys.get_mut(&key).expect("sealed key");
-                retained.bounded_upper =
-                    Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
             }
             // An effect-free unbounded abandonment the partition cleared
             // disposes here, per call: the model releases its ticket with
@@ -10048,10 +10154,12 @@ impl JournalAdapter {
 
     /// Drop this key's staged entries the settlement applied:
     /// completed ends at or below the watermark (the model's own rule,
-    /// mirrored on identical staged data), bounded abandonments the
-    /// lost-outcome bound removed, and converted begins the model
-    /// pruned. A sibling key's staging is never pruned here; staged
-    /// inputs above the watermark stay for the next seal.
+    /// mirrored on identical staged data), drained returns at or below
+    /// the watermark like ends (their completion applies under the same
+    /// held-sibling rule), bounded abandonments the lost-outcome bound
+    /// removed, and converted begins the model pruned. A sibling key's
+    /// staging is never pruned here; staged inputs above the watermark
+    /// stay for the next seal.
     fn prune_settled(&mut self, key: JournalDomainKey, frontier: u64) {
         let earliest_open = self
             .open
@@ -10074,6 +10182,9 @@ impl JournalAdapter {
         self.remove_open_where(|_, entry| {
             if entry.converted_for != Some(key) {
                 return false;
+            }
+            if let Some(at) = drained_return_cut(entry, frontier) {
+                return at <= watermark;
             }
             entry
                 .abandon

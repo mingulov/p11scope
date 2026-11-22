@@ -778,9 +778,13 @@ fn native_semantic_resource_final_types_pinned() {
     // padding; population and pool caps stay fixed.
     // v0.8.0 keymeta Task 2 grows the validated END by the 16-byte length
     // trailer (632 to 648, spec section 8.3); the retained END grows with it.
+    // The exit-return drain retains the corroborated return beside its
+    // ordinal (+40 B: return timestamp plus the ReturnedWords session,
+    // mechanism, capture and rv); the drained-converted flag packs with
+    // the existing bool flags (+0 B).
     let open_bytes = crate::semantics_objects::journal::JournalAdapter::open_entry_size_for_test();
-    if open_bytes != 1160 + 48 + 16 {
-        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48 + 16));
+    if open_bytes != 1160 + 48 + 16 + 40 {
+        mismatches.push(("journal::OpenEntry", open_bytes, 1160 + 48 + 16 + 40));
     }
     pin!(
         crate::semantic_capture::TickOutcome,

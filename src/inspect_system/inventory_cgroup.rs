@@ -1068,7 +1068,12 @@ pub(crate) fn collect_with(
     {
         outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::DeepScanLimit);
     }
-    let cap_hit = census_over_cap(&pids, Path::new("/proc"), cap);
+    let cap_hit = charged_census_over_cap(
+        &pids,
+        cap,
+        &mut |pid| crate::discovery::engine::pid_is_user_process(Path::new("/proc"), pid),
+        &mut || work.charge(1),
+    );
     let mut timings = StageTimings::new();
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
@@ -1286,6 +1291,36 @@ pub(crate) fn collect_with(
     }
 }
 
+/// Whether more than `cap` of `pids` are user processes, with each
+/// stat read charged one credit first (`is_user` reads one member's
+/// stat). Under the cap on the raw count it reads nothing; it stops
+/// reading as soon as the verdict is known (more than `cap` users seen).
+/// When the shared work refuses a credit mid-census it reads no further
+/// stat and answers over-cap, the bounded capped path (the refusal
+/// latched on the shared work keeps the transaction incomplete).
+pub(crate) fn charged_census_over_cap(
+    pids: &[u32],
+    cap: usize,
+    is_user: &mut dyn FnMut(u32) -> bool,
+    charge: &mut dyn FnMut() -> bool,
+) -> bool {
+    if pids.len() <= cap {
+        return false;
+    }
+    let mut users = 0usize;
+    for &pid in pids {
+        if users > cap {
+            return true;
+        }
+        if !charge() {
+            return true;
+        }
+        if is_user(pid) {
+            users += 1;
+        }
+    }
+    users > cap
+}
 
 /// The capped member selection: kernel threads (empty available maps
 /// plus `PF_KTHREAD`) excluded, the rest by provider rarity, then the
@@ -1304,9 +1339,20 @@ pub(crate) fn capped_member_selection(
     read_stat: &mut dyn FnMut(u32) -> std::io::Result<String>,
     charge: &mut dyn FnMut() -> bool,
 ) -> Vec<u32> {
-    let _ = charge;
+    // One classification, shared by selection and reservation: each
+    // stat read takes one credit first; once the shared work refuses,
+    // no further stat is read and the unread candidates stay eligible
+    // (fail-closed, like an unreadable stat). The refusal latched on the
+    // shared work keeps the transaction incomplete.
+    let mut spent = false;
     let excluded =
-        crate::discovery::engine::kernel_thread_exclusions_with(sweep, unavailable, read_stat);
+        crate::discovery::engine::kernel_thread_exclusions_with(sweep, unavailable, &mut |pid| {
+            if spent || !charge() {
+                spent = true;
+                return Err(std::io::Error::other("collection work spent"));
+            }
+            read_stat(pid)
+        });
     let mut selected = crate::discovery::engine::select_excluding_given(
         sweep,
         &excluded,
@@ -1314,8 +1360,6 @@ pub(crate) fn capped_member_selection(
         budget,
         &crate::discovery::scan_pass::MemberTiers::default(),
     );
-    let excluded =
-        crate::discovery::engine::kernel_thread_exclusions_with(sweep, unavailable, read_stat);
     let eligible: BTreeSet<u32> = sweep
         .iter()
         .map(|(pid, _)| *pid)
@@ -2425,7 +2469,45 @@ mod tests {
                     }
                 },
             );
-            assert_eq!(reads, allowed, "one charged read per candidate ({allowed} credits)");
+            assert_eq!(
+                reads, allowed,
+                "one charged read per candidate ({allowed} credits)"
+            );
+        }
+    }
+
+    /// The capped census reads one charged stat per member, stops once
+    /// the verdict is known, reads nothing under the raw cap, and reads
+    /// nothing more once credits run out (answering over-cap).
+    #[test]
+    fn charged_census_reads_within_credits_and_stops_at_the_verdict() {
+        let pids: Vec<u32> = (1..=70).collect();
+        for (allowed, cap, expect_reads, expect) in [
+            (usize::MAX, 64usize, 65usize, true),
+            (10, 64, 10, true),
+            (0, 64, 0, true),
+            (usize::MAX, 70, 0, false),
+        ] {
+            let mut reads = 0usize;
+            let mut charges = 0usize;
+            let verdict = super::charged_census_over_cap(
+                &pids,
+                cap,
+                &mut |_| {
+                    reads += 1;
+                    true
+                },
+                &mut || {
+                    if charges < allowed {
+                        charges += 1;
+                        true
+                    } else {
+                        false
+                    }
+                },
+            );
+            assert_eq!(verdict, expect, "credits {allowed}, cap {cap}");
+            assert_eq!(reads, expect_reads, "credits {allowed}, cap {cap}");
         }
     }
 }

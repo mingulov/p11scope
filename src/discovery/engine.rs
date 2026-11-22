@@ -12877,6 +12877,29 @@ fn unlink_table_interfaces(
     }
 }
 
+/// Same-file identity for carried module rows: [`merge_scanned_module`]'s
+/// push key minus the view. Rows an exited view leaves behind merge under
+/// one reserved owner per file, so 1100 sequential mappers of one provider
+/// commit one row, not 1100.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CarriedModuleKey {
+    mount_namespace: crate::process::MountNamespaceId,
+    key: ObjectKey,
+    path: String,
+    pre_copy_up: Option<u32>,
+}
+
+impl CarriedModuleKey {
+    fn of(module: &ScannedModule) -> Self {
+        Self {
+            mount_namespace: module.mount_namespace,
+            key: module.key,
+            path: module.path.clone(),
+            pre_copy_up: module.pre_copy_up,
+        }
+    }
+}
+
 /// Union `incoming` into its same-file module, or file it beside its
 /// ABI-mismatched twin. Returns how many fresh tables the per-module
 /// cap dropped (counted overflow, never silent): callers accumulate it
@@ -13108,6 +13131,64 @@ fn merge_scanned_module_counted(
 ) {
     let fresh = merge_scanned_module(modules, incoming);
     *dropped = dropped.saturating_add(fresh);
+}
+
+/// Re-own carried rows under the reserved carrier, merge same-file
+/// carriers, and retire redundant or proven-unmapped ones. `raw_modules`
+/// is the assembled scan-input vec (carried-over plus refreshed plus
+/// new, already merged); `removed` holds this tick's retired views, all
+/// of whose surviving rows the caller kept for still-attached objects.
+/// `live` holds the views that stay live past this tick (including the
+/// just-admitted ones); `newcomers_pending` is true while unscanned
+/// successors may still map a carried file. Coverage is by pinned
+/// object (resolved through `pins`): a live row in another mount
+/// namespace still covers the same canonical file.
+///
+/// Newly-carried rows always ride this tick (the exit transition still
+/// reports the object); riding carriers drop once a live row covers
+/// their object (redundant) or once proven unmapped (no live cover and
+/// no newcomer waiting), so the object detaches with a removal decision
+/// instead of riding forever on its own slots.
+fn normalize_carried_modules(
+    raw_modules: &mut Vec<ScannedModule>,
+    pins: &PinnedObjects,
+    removed: &BTreeSet<ProcessViewId>,
+    live: &BTreeSet<ProcessViewId>,
+    newcomers_pending: bool,
+    tables_dropped: &mut u64,
+) {
+    let mut newly_carried: BTreeSet<CarriedModuleKey> = BTreeSet::new();
+    for raw in raw_modules.iter_mut() {
+        if removed.contains(&raw.view) {
+            raw.view = Engine::CARRIED_VIEW_ID;
+            newly_carried.insert(CarriedModuleKey::of(raw));
+        }
+    }
+    let mut carriers: Vec<ScannedModule> = raw_modules
+        .extract_if(.., |module| module.view == Engine::CARRIED_VIEW_ID)
+        .collect();
+    if carriers.is_empty() {
+        return;
+    }
+    let mut merged: Vec<ScannedModule> = Vec::with_capacity(carriers.len());
+    for carrier in carriers.drain(..) {
+        merge_scanned_module_counted(&mut merged, carrier, tables_dropped);
+    }
+    let live_objects: BTreeSet<PinnedObjectId> = raw_modules
+        .iter()
+        .filter(|module| live.contains(&module.view))
+        .filter_map(|module| pins.id_for_scanned(module, module.key, &module.path))
+        .collect();
+    merged.retain(|carrier| {
+        if newly_carried.contains(&CarriedModuleKey::of(carrier)) {
+            return true;
+        }
+        match pins.id_for_scanned(carrier, carrier.key, &carrier.path) {
+            Some(object) => !live_objects.contains(&object) && newcomers_pending,
+            None => newcomers_pending,
+        }
+    });
+    raw_modules.extend(merged);
 }
 
 fn usable_path(maps: &MapIndex<'_>, mapping: &MapEntry) -> Option<PathBuf> {
@@ -16769,14 +16850,17 @@ impl Engine {
             return inventory.reserve_owner(&mut self.next_view_id);
         }
         // Recycled-ID holdback (merge-ownership spec §8 D1): a numeric ID
-        // whose previous generation still has a committed carried row is
+        // whose previous generation still has a committed row is
         // unavailable for admission — the retained row would otherwise ride
         // alongside the reused-ID generation and both would file claims
-        // under one view. Held IDs stay on the free list, so they become
-        // available again on their own once the last carried row retires;
-        // with every free ID held, allocation falls through to minting (or
-        // defers at capacity) exactly as on exhaustion. The pick stays
-        // last-in-first-out among the available IDs.
+        // under one view. Carried rows ride under the reserved carrier
+        // instead of naming numeric IDs, so they never hold anything
+        // back; any other residual holder still holds. Held IDs stay on
+        // the free list, so they become available again on their own once
+        // the last naming row retires; with every free ID held, allocation
+        // falls through to minting (or defers at capacity) exactly as on
+        // exhaustion. The pick stays last-in-first-out among the
+        // available IDs.
         let pick = self.retired_view_ids.iter().rposition(|id| {
             !self
                 .modules
@@ -19223,10 +19307,12 @@ impl Engine {
         // generation: it must never enter generation-currency
         // checks (admission staleness, attach pre/post-checks), or
         // every candidate carrying learned tables aborts as stale.
+        // The reserved carried-row owner is excluded for the same
+        // reason: it names no generation.
         let views = modules
             .iter()
             .map(|module| module.scanned.view)
-            .filter(|view| *view != Self::RUN_LEARNED_VIEW_ID)
+            .filter(|view| *view != Self::RUN_LEARNED_VIEW_ID && *view != Self::CARRIED_VIEW_ID)
             .collect();
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
@@ -19513,7 +19599,7 @@ impl Engine {
             self.retire_view_or_keep_with_gap(&mut pinned, *view, &carry_objects);
         }
         let skipped = pinned.reapply_rejected_keys(keys);
-        let raw_modules = self
+        let mut raw_modules: Vec<ScannedModule> = self
             .modules
             .iter()
             .filter(|module| {
@@ -19522,6 +19608,25 @@ impl Engine {
             })
             .map(|module| module.scanned.clone())
             .collect();
+        // Reserved-owner carry, same shape as the inventory assembly:
+        // retired views' surviving rows are re-owned by the carrier and
+        // merged by file, so the numeric IDs recycle at once; riding
+        // carriers drop when redundant or proven unmapped.
+        let live_past_replay: BTreeSet<ProcessViewId> = self
+            .views
+            .iter()
+            .map(ProcessView::id)
+            .filter(|id| !retirements.contains(id))
+            .collect();
+        let newcomers_pending = !self.newcomer_first_seen.is_empty();
+        normalize_carried_modules(
+            &mut raw_modules,
+            &pinned,
+            retirements,
+            &live_past_replay,
+            newcomers_pending,
+            &mut self.merge_tables_dropped,
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "conservative_assemble",
@@ -19803,6 +19908,20 @@ impl Engine {
                 !module.scanned.tables.is_empty() || !module.scanned.interfaces.is_empty()
             })
             .filter_map(|module| {
+                if module.scanned.view == Self::CARRIED_VIEW_ID {
+                    // Retired prover (its numeric ID already recycled): the
+                    // row's tables still teach the run (E1 custody), but no
+                    // pidfd survives to name the loader, so it resolves to
+                    // the finite unknown exactly like an exited loader.
+                    return Some(OwnedLearnProof {
+                        view: Self::CARRIED_VIEW_ID,
+                        path: module.scanned.path.clone(),
+                        object: module.object,
+                        loader_exe: None,
+                        loader_unknown_reason: Some(crate::fanotify::LOADER_EXE_UNREADABLE_REASON),
+                        module: module.scanned.clone(),
+                    });
+                }
                 let proving: &ProcessView = self
                     .views
                     .iter()
@@ -32188,6 +32307,49 @@ impl Engine {
         })
     }
 
+    /// True when a committed carried row would drop on a full rebuild:
+    /// a live row covers its object (redundant) or no newcomer waits
+    /// while no live row covers it (proven unmapped). The quiet-tick
+    /// fast paths check this so they never shelter a droppable carrier;
+    /// with no carriers committed the scan short-circuits false.
+    fn carried_rows_would_drop(&self) -> bool {
+        if !self
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == Self::CARRIED_VIEW_ID)
+        {
+            return false;
+        }
+        let live: BTreeSet<ProcessViewId> = self.views.iter().map(ProcessView::id).collect();
+        let live_objects: BTreeSet<PinnedObjectId> = self
+            .modules
+            .iter()
+            .filter(|module| live.contains(&module.scanned.view))
+            .map(|module| module.object)
+            .collect();
+        let newcomers_pending = !self.newcomer_first_seen.is_empty();
+        self.modules
+            .iter()
+            .filter(|module| module.scanned.view == Self::CARRIED_VIEW_ID)
+            .any(|module| live_objects.contains(&module.object) || !newcomers_pending)
+    }
+
+    /// Retired IDs the free list cannot hand out: a numeric ID whose
+    /// previous generation still has a committed row stays held. Carried
+    /// rows no longer name numeric IDs (they ride under the reserved
+    /// carrier), so this is normally zero; the scheduler still deducts
+    /// it so any residual holder cannot blind admission.
+    fn held_view_id_count(&self) -> usize {
+        self.retired_view_ids
+            .iter()
+            .filter(|id| {
+                self.modules
+                    .iter()
+                    .any(|module| module.scanned.view == ProcessViewId(**id))
+            })
+            .count()
+    }
+
     fn inventory_candidate(
         &mut self,
         removed: &BTreeSet<ProcessViewId>,
@@ -32226,6 +32388,7 @@ impl Engine {
             && declined.is_empty()
             && self.plan_rebuild_stable
             && !fast_path_disabled
+            && !self.carried_rows_would_drop()
         {
             let mut candidate_pins = self.pinned.clone();
             let (folds, lost) = canonicalize_scanned_overlays(&mut candidate_pins);
@@ -32301,6 +32464,7 @@ impl Engine {
                         .any(|module| module.scanned.view == *view)
             })
             && new_views.iter().all(|(_, modules, _)| modules.is_empty())
+            && !self.carried_rows_would_drop()
         {
             let mut candidate_pins = self.pinned.clone();
             for view in removed {
@@ -32390,6 +32554,25 @@ impl Engine {
                 );
             }
         }
+        // Reserved-owner carry: removed views' surviving rows are re-owned
+        // by the carrier and merged by file, so the numeric IDs recycle at
+        // once; riding carriers drop when redundant or proven unmapped.
+        let live_past_tick: BTreeSet<ProcessViewId> = self
+            .views
+            .iter()
+            .map(ProcessView::id)
+            .filter(|id| !removed.contains(id))
+            .chain(new_views.iter().map(|(view, _, _)| view.id()))
+            .collect();
+        let newcomers_pending = !self.newcomer_first_seen.is_empty();
+        normalize_carried_modules(
+            &mut raw_modules,
+            &candidate_pins,
+            removed,
+            &live_past_tick,
+            newcomers_pending,
+            &mut self.merge_tables_dropped,
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Merge,
             "inventory_assemble",
@@ -32983,7 +33166,10 @@ impl Engine {
                             .filter(|pid| self.held_back_waiting(*pid)),
                     )
                     .collect();
-                let free_slots = max_scan_pids.saturating_sub(self.views.len());
+                // Retired-but-held IDs admit nothing, so they are not free.
+                let free_slots = max_scan_pids
+                    .saturating_sub(self.views.len())
+                    .saturating_sub(self.held_view_id_count());
                 let window = DiscoveryScheduler::rotation_window(pids, &exclude, free_slots);
                 desired.extend(window.iter().copied());
                 let fresh = desired.iter().filter(|pid| !known.contains(pid)).count();
@@ -33008,8 +33194,11 @@ impl Engine {
                 // slots plus a bounded number of evictable views, then only
                 // as many victims as the selection actually needs are
                 // evicted. Ordinary passes never reach this arm, so ticks
-                // outside reconciliation still displace nothing.
-                let free_slots = max_scan_pids.saturating_sub(self.views.len());
+                // outside reconciliation still displace nothing. Retired-
+                // but-held IDs admit nothing, so they are not free.
+                let free_slots = max_scan_pids
+                    .saturating_sub(self.views.len())
+                    .saturating_sub(self.held_view_id_count());
                 let evictable = self.exploratory_evictable_views();
                 let evict_budget = evictable.len().min(self.scheduler.max_evictions_per_pass());
                 let selected = self.reconcile_slice(pids, &known, free_slots + evict_budget);
@@ -33201,6 +33390,17 @@ impl Engine {
     /// `ProcessView` ever carries this ID, and no engine path may
     /// open, retain, refresh or retire it.
     pub(crate) const RUN_LEARNED_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX - 1);
+
+    /// Reserved owner for carried module rows: an exited view's rows for
+    /// still-attached objects are re-owned here on the removal tick
+    /// (merged by [`CarriedModuleKey`]) so the numeric ID recycles at
+    /// once instead of staying held while the row rides. Like the
+    /// run-learned owner, never allocated and never a live view: the
+    /// rebuild choke denies it claims (carried rows bind but file
+    /// nothing, exactly as before), and it never enters currency,
+    /// stale or admission checks. No `ProcessView` ever carries this
+    /// ID, and no engine path may open, retain, refresh or retire it.
+    pub(crate) const CARRIED_VIEW_ID: ProcessViewId = ProcessViewId(u32::MAX - 2);
 
     /// Probationary provider probe for a pending newcomer with no view slot
     /// and no evictable view anywhere (Lane-A P3, the last resort). Opens

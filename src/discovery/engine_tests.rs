@@ -1221,10 +1221,12 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
     // rides for its still-attached object WITHOUT ownership claims
     // under the retired view (resolvable but claimless is the carried
     // shape). Candidate 2 is an unrelated owner's refresh with an empty
-    // preserve set: it must not purge the carried pin while the carried
-    // slot is still needed. A rebind that files claims under the retired
-    // view breaks the derived carried classification, and the unrelated
-    // refresh then drops the provider with a missing-pin bind skip.
+    // preserve set and no newcomer waiting: nothing maps the carried
+    // object, so the proven-unmapped carrier drops and the object
+    // detaches with a removal decision. The carried pin stays
+    // resolvable but claimless throughout: a rebind that files claims
+    // under the retired view would break the derived carried
+    // classification.
     let raw_a = overlay_module(overlay_key(86));
     let raw_b = overlay_module(overlay_key(87));
     // Distinct kernel files and pin ctimes: fixtures sharing /dev/null
@@ -1320,12 +1322,12 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         "an unrelated refresh never purges a needed carried pin"
     );
     assert!(
-        next.modules.iter().any(|module| module.object == object_a),
-        "the carried module still binds after the refresh"
+        next.modules.iter().all(|module| module.object != object_a),
+        "the refresh drops the proven-unmapped carrier"
     );
     assert!(
-        slot_active(&next, object_a),
-        "the carried slot stays attached across the refresh"
+        !slot_active(&next, object_a),
+        "the dropped carrier detaches its slot on the refresh"
     );
     // A later rebuild must not re-claim the carried view: the refresh
     // rebind files claims for every bound module, so the previously
@@ -1344,8 +1346,8 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         next.built_by_full_rebuild,
         "the refresh rebuilds (no cached-plan shortcut)"
     );
-    // A second empty-preserve refresh must keep the carry claimless,
-    // and stale retirement must still spare it.
+    // A second empty-preserve refresh keeps the detached state and
+    // the carry claimless; stale retirement spares the pins.
     engine.plan = next.plan;
     engine.pinned = next.pinned;
     engine.modules = next.modules;
@@ -1362,12 +1364,12 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         "a second refresh never purges a needed carried pin"
     );
     assert!(
-        third.modules.iter().any(|module| module.object == object_a),
-        "the carried module still binds after the second refresh"
+        third.modules.iter().all(|module| module.object != object_a),
+        "the carrier stays dropped after the second refresh"
     );
     assert!(
-        slot_active(&third, object_a),
-        "the carried slot stays attached across the second refresh"
+        !slot_active(&third, object_a),
+        "the slot stays detached across the second refresh"
     );
     assert!(
         third.pinned.view_claims(view_a).is_none(),
@@ -1383,8 +1385,8 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
     let mut staled = third;
     engine.retire_stale_candidate_sources(&mut session, &mut staled, &stale, &mut outcome);
     assert!(
-        slot_active(&staled, object_a),
-        "stale retirement keeps slots carried across refreshes"
+        !slot_active(&staled, object_a),
+        "stale retirement keeps the detached slot retired"
     );
     assert!(
         staled.pinned.summary(object_a).is_some(),
@@ -1394,8 +1396,8 @@ fn generational_removal_carry_stays_claimless_across_unrelated_refresh() {
         staled
             .modules
             .iter()
-            .any(|module| module.object == object_a),
-        "stale retirement keeps modules carried across refreshes"
+            .all(|module| module.object != object_a),
+        "stale retirement keeps the carrier dropped"
     );
 }
 
@@ -1445,7 +1447,9 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
     // The conservative carry has the same rebind shape as the inventory
     // one: retired views' modules ride for still-attached objects, and
     // the replay rebind must not file ownership claims under the retired
-    // view for them.
+    // view for them. A later replay with no live cover and no newcomer
+    // waiting drops the proven-unmapped carrier and detaches; the
+    // claimless pins stay resolvable.
     let dir = tempfile::tempdir().expect("scope dir");
     std::fs::write(dir.path().join("cgroup.procs"), "").expect("cgroup.procs");
     let cgroup = crate::scope::cgroup(dir.path()).expect("scope");
@@ -1482,8 +1486,9 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
         "the replayed pin reads as carried coverage"
     );
     // A later replay takes the first replay's carried module as an
-    // already-carried input: with no new retirements the replay rebind
-    // must still file no claims under the carried view.
+    // already-carried input: with no live cover and no newcomer
+    // waiting, the proven-unmapped carrier drops and the object
+    // detaches, still filing no claims under the carried view.
     engine.plan = carried.plan;
     engine.pinned = carried.pinned;
     engine.modules = carried.modules;
@@ -1495,12 +1500,12 @@ fn owned_run_conservative_replay_keeps_carried_pins_claimless() {
         "a later replay never purges a needed carried pin"
     );
     assert!(
-        !later.plan.modules.is_empty(),
-        "the carried module still binds after the later replay"
+        later.plan.modules.is_empty(),
+        "the later replay drops the proven-unmapped carrier"
     );
     assert!(
-        later.plan.is_active(0),
-        "the carried slot stays attached across the later replay"
+        !later.plan.is_active(0),
+        "the dropped carrier detaches its slot on the later replay"
     );
     assert!(
         later.pinned.view_claims(view).is_none(),
@@ -98578,7 +98583,7 @@ fn loader_scan_after_spent_tick_gets_fresh_teardown_budget_on_finish_drain() {
 //
 // Ownership cells (retired R claimless, live owners intact, pins resolvable):
 //   E1 inventory × shared-pin      → merge_ownership_e1_inventory_shared_pin_stays_claimless (RED)
-//   E1 inventory × view-id reuse   → merge_ownership_e1_reused_view_id_holds_while_carried_row_rides (RED)
+//   E1 inventory × view-id reuse   → merge_ownership_e1_reused_view_id_releases_while_carried_row_rides (GREEN)
 //   E1 inventory × shared decay    → merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry (GREEN guard)
 //   E1 inventory × carried         → generational_removal_carry_stays_claimless_across_unrelated_refresh (pre-existing, GREEN)
 //   E2 conservative × shared-pin   → merge_ownership_e2_conservative_shared_pin_stays_claimless (RED)
@@ -98999,12 +99004,12 @@ fn mo_sole_engine() -> (Engine, PinnedObjectId, PinnedObjectId) {
 #[test]
 fn merge_ownership_e1_inventory_shared_pin_stays_claimless() {
     // E1 × shared-pin: R retires with live co-owner L on one canonical
-    // pin. Candidate 1 carries R; candidate 2 is an unrelated refresh
-    // while a newcomer waits, so the carried pin is preserved (not
-    // purged) and R's module binds again. The rebind must not refile
-    // claims under R just because L owns the pin — suppression is
-    // per-view, never per-object. Stale retirement then drops R's
-    // module as redundant (L covers the object) without touching L.
+    // pin. Candidate 1 carries R under the reserved carrier; candidate 2
+    // is an unrelated refresh while a newcomer waits. The live co-owner
+    // covers the file, so the redundant carrier drops at assembly — the
+    // rebind never happens and no claims can refile under R. Suppression
+    // is per-view, never per-object; stale retirement then no-ops
+    // without touching L.
     let parts = mo_shared_pin_parts();
     let module_b = overlay_module(overlay_key(u64::from(MO_VIEW_B)));
     let mut pins = parts.pins;
@@ -99075,8 +99080,8 @@ fn merge_ownership_e1_inventory_shared_pin_stays_claimless() {
     assert!(
         next.modules
             .iter()
-            .any(|module| module.scanned.view == view_r),
-        "R's carried module binds again through the preserved pin"
+            .all(|module| module.scanned.view != Engine::CARRIED_VIEW_ID),
+        "the redundant carrier drops at assembly instead of rebinding"
     );
     mo_assert_retired_claimless(&next.pinned, "unrelated refresh");
     mo_assert_live_owner(
@@ -99095,8 +99100,8 @@ fn merge_ownership_e1_inventory_shared_pin_stays_claimless() {
         false,
         "unrelated refresh",
     );
-    // Stale retirement drops R's module as redundant: the live co-owner
-    // covers the object, so the carry ends without losing coverage.
+    // Stale retirement no-ops: assembly already dropped the redundant
+    // carrier, so the live co-owner keeps the coverage untouched.
     let stale: BTreeSet<ProcessViewId> = BTreeSet::from([view_r]);
     let mut session = ScriptedSession::default();
     let mut outcome = super::ApplyOutcome::default();
@@ -99129,13 +99134,13 @@ fn merge_ownership_e1_inventory_shared_pin_stays_claimless() {
 }
 
 #[test]
-fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
+fn merge_ownership_e1_reused_view_id_releases_while_carried_row_rides() {
     // E1 × view-id reuse: R retires live alongside L with carry, so R's
-    // numeric ID returns to the free list while its carried row stays
-    // committed. A later admission must NOT hand that ID to a new
-    // generation: the retained row would ride alongside the reused-ID
-    // generation and both would file claims under one numeric view. The
-    // ID becomes available again once the carried row retires.
+    // row is re-owned by the reserved carrier while its numeric ID
+    // returns to the free list. A later admission reuses that ID at
+    // once: the retained row rides claimless under the carrier and can
+    // never file claims under the reused numeric view. Once a live row
+    // covers the carrier's file, the redundant carrier drops.
     let parts = mo_shared_pin_parts();
     let mut pins = parts.pins;
     // R stays live here (both views file claims); the retirement below
@@ -99203,14 +99208,14 @@ fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
     engine.views.retain(|view| view.id() != view_r);
     engine.release_view_id(view_r);
     assert!(
-        engine
-            .modules
-            .iter()
-            .any(|module| module.scanned.view == view_r),
-        "R's carried row stays committed after the release"
+        engine.modules.iter().any(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+        }),
+        "R's carried row stays committed under the reserved carrier after the release"
     );
-    // The real admission path skips the held ID even though it sits on
-    // the free list.
+    // The real admission path reuses the freed ID at once: the retained
+    // row rides under the reserved carrier (claimless, binds only), so no
+    // numeric view collides with the reused-ID generation.
     let me = std::process::id();
     let max_scan_pids = engine.max_scan_pids;
     let (new_views, _, _) = engine.admit_inventory_new_views(
@@ -99225,16 +99230,20 @@ fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
         .iter()
         .find(|(view, _, _)| view.pid() == me)
         .expect("the admission staged the member");
-    assert_ne!(
+    assert_eq!(
         admitted.0.id(),
         view_r,
-        "the held ID is not reused while its carried row rides"
+        "the freed ID is reused while its carried row rides under the carrier"
     );
-    // The replacement generation is admitted on another ID and files
-    // exactly its own rows' claims; R stays claimless with both slots
-    // attached.
+    // The next allocation mints: the free list is empty again. The
+    // replacement generation files exactly its own rows' claims; R stays
+    // claimless with both slots attached.
     let fresh = engine.allocate_view_id_for_newcomer(me).unwrap();
-    assert_ne!(fresh, view_r, "allocation skips the held ID");
+    assert_eq!(
+        fresh,
+        ProcessViewId(100),
+        "allocation mints once the freed ID is taken"
+    );
     let fresh_view = ProcessView::open(fresh, me).unwrap();
     let module_n = overlay_module(overlay_key(u64::from(fresh.0)));
     assert_eq!(module_n.view, fresh);
@@ -99255,8 +99264,8 @@ fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
         candidate
             .modules
             .iter()
-            .any(|module| module.scanned.view == view_r),
-        "R's carried row still rides beside the replacement generation"
+            .all(|module| module.scanned.view != Engine::CARRIED_VIEW_ID),
+        "the redundant carrier drops once the live co-owner covers its file"
     );
     let object_n = candidate
         .modules
@@ -99300,30 +99309,34 @@ fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
         false,
         "replacement admission",
     );
-    // Retiring the carried row frees the numeric ID for admission.
-    let mut session = ScriptedSession::default();
-    let mut outcome = super::ApplyOutcome::default();
-    let mut staled = engine
-        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
-        .unwrap();
-    engine.retire_stale_candidate_sources(
-        &mut session,
-        &mut staled,
-        &BTreeSet::from([view_r]),
-        &mut outcome,
-    );
+    // Committing the replacement candidate leaves the live co-owner and
+    // the replacement generation reporting, the object attached, and no
+    // carried rows behind: every file has a live row.
+    engine.plan = candidate.plan;
+    engine.pinned = candidate.pinned;
+    engine.modules = candidate.modules;
+    engine.views.push(ProcessView::open(fresh, me).unwrap());
     assert!(
-        staled
+        engine
             .modules
             .iter()
-            .all(|module| module.scanned.view != view_r),
-        "stale retirement drops the live-co-owned carried module as redundant"
+            .any(|module| module.scanned.view == view_l && module.object == object),
+        "the live co-owner still reports the object"
     );
-    engine.plan = staled.plan;
-    engine.pinned = staled.pinned;
-    engine.modules = staled.modules;
-    let reused = engine.allocate_view_id().unwrap();
-    assert_eq!(reused, view_r, "the retired row's ID returns to admission");
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == fresh && module.object == object_n),
+        "the replacement generation still reports its object"
+    );
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.view != Engine::CARRIED_VIEW_ID),
+        "no carried rows remain once live rows cover every object"
+    );
 }
 
 #[test]
@@ -99353,7 +99366,13 @@ fn carried_view_ids_system_sequential_views_recycle_ids_and_bound_modules() {
         pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
         let removed = prev.map(|p| BTreeSet::from([p])).unwrap_or_default();
         let candidate = engine
-            .inventory_candidate(&removed, &[], &[(view, vec![module], pins)], Vec::new(), &empty)
+            .inventory_candidate(
+                &removed,
+                &[],
+                &[(view, vec![module], pins)],
+                Vec::new(),
+                &empty,
+            )
             .unwrap();
         engine.plan = candidate.plan;
         engine.pinned = candidate.pinned;
@@ -99419,7 +99438,13 @@ fn carried_view_ids_system_carried_row_reports_until_detach() {
         record_scan_ownership(&mut pins, id, key, &module.path);
         pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
         let candidate = engine
-            .inventory_candidate(&empty, &[], &[(view, vec![module], pins)], Vec::new(), &empty)
+            .inventory_candidate(
+                &empty,
+                &[],
+                &[(view, vec![module], pins)],
+                Vec::new(),
+                &empty,
+            )
             .unwrap();
         engine.plan = candidate.plan;
         engine.pinned = candidate.pinned;
@@ -99565,9 +99590,10 @@ fn carried_view_ids_owned_conservative_releases_and_bounds() {
 fn merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry() {
     // E1 × shared-pin decay shape (GREEN guard): with an empty preserve
     // set the unrelated refresh purges R's unowned raw alias — the pin
-    // stays via L's alias — so R's module stops binding and the carry
-    // ends early with no claims ever refiled. Coverage continues through
-    // the live co-owner. This pins the soundness of the decay; the
+    // stays via L's alias — and the live co-owner covers the file, so
+    // the redundant carrier drops at assembly with no claims ever
+    // refiled. Coverage continues through the live co-owner. This pins
+    // the pin-level decay plus the synchronous end of the carry; the
     // refile hazard (preserved pin, module still binding) is the twin
     // above.
     let parts = mo_shared_pin_parts();
@@ -99605,11 +99631,10 @@ fn merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry() {
         .inventory_candidate(&BTreeSet::from([view_r]), &[], &[], Vec::new(), &empty)
         .unwrap();
     assert!(
-        carried
-            .modules
-            .iter()
-            .any(|module| module.scanned.view == view_r),
-        "R's module rides the removal carry"
+        carried.modules.iter().any(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+        }),
+        "R's module rides the removal carry under the reserved carrier"
     );
     engine.plan = carried.plan;
     engine.pinned = carried.pinned;
@@ -100731,7 +100756,9 @@ fn mo_entry_e2_retirement() -> MoEntryOutcome {
 }
 
 /// E2 × carried, through the production replay entry: a later replay
-/// with R's carried row riding refuses at the currency check.
+/// drops the proven-unmapped carrier (no live cover, no newcomer
+/// waiting) and commits the detach. No retired numeric view rides, so
+/// the currency check has nothing to refuse.
 fn mo_entry_e2_carried() -> MoEntryOutcome {
     let (_dir, mut engine, object, view) = mo_entry_e2_engine();
     let keys: BTreeSet<ObjectKey> = BTreeSet::new();
@@ -100742,32 +100769,36 @@ fn mo_entry_e2_carried() -> MoEntryOutcome {
     engine.pinned = carried.pinned;
     engine.modules = carried.modules;
     engine.views.retain(|candidate| candidate.id() != view);
-    let modules_before = engine.modules.clone();
-    let plan_before = engine.plan.clone();
+    assert!(
+        engine.modules.iter().any(|module| {
+            module.scanned.view == Engine::CARRIED_VIEW_ID && module.object == object
+        }),
+        "the replay carries under the reserved carrier"
+    );
     assert_eq!(mo_generation_markers(&engine), 0);
     let mut session = ScriptedSession::with_records([], 0);
     let mut additions = true;
     let mut pending = PendingViewRetirements::new();
     let outcome = engine.replay_pending_conservative(&mut session, &mut additions, &mut pending);
-    assert!(!outcome.accepted(), "the carried-riding replay refuses");
-    assert_eq!(
-        engine.modules, modules_before,
-        "the refusal commits no modules"
+    assert!(outcome.accepted(), "the detach replay commits");
+    assert!(
+        engine.modules.iter().all(|module| module.object != object),
+        "the commit drops the proven-unmapped carrier"
     );
-    assert_eq!(
-        engine.plan, plan_before,
-        "the refusal leaves the plan untouched"
+    assert!(
+        !engine.plan.is_active(0),
+        "the commit retires the detached slot"
     );
     assert!(
         engine.pinned.view_claims(view).is_none(),
-        "the refused replay files no claims under the carried view"
+        "the replay files no claims under the carried view"
     );
     assert!(
         engine.pinned.carried_ids().contains(&object),
         "the carried pin still reads as carried coverage"
     );
     MoEntryOutcome {
-        committed: false,
+        committed: true,
         generation_markers: mo_generation_markers(&engine),
     }
 }
@@ -101269,7 +101300,10 @@ fn merge_ownership_entry_outcomes_follow_the_case_table() {
     // One executable case table over production entries × input shapes:
     // every entry commits its healthy input and refuses its
     // carried-riding input at the currency check (D2) — the refusal
-    // witnessed by the generation marker, never a silent no-op. E5's
+    // witnessed by the generation marker, never a silent no-op — except
+    // E2's carried-riding replay, which drops the proven-unmapped
+    // carrier and commits the detach (no retired numeric view rides, so
+    // D2 has nothing to refuse). E5's
     // healthy cell is the empty-scan control (the rescan runs — its
     // memory-scan attempt is witnessed — and honestly commits nothing
     // because the harness stages no found modules); the committing E5
@@ -101294,10 +101328,10 @@ fn merge_ownership_entry_outcomes_follow_the_case_table() {
             expect_markers: 0,
         },
         MoEntryCase {
-            name: "E2 carried-riding replay refuses",
+            name: "E2 unmapped-carrier replay commits the detach",
             run: mo_entry_e2_carried,
-            expect_committed: false,
-            expect_markers: 1,
+            expect_committed: true,
+            expect_markers: 0,
         },
         MoEntryCase {
             name: "E2 retirement replay commits",

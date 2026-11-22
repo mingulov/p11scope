@@ -42,6 +42,9 @@ pub(crate) use finalizer::{
     JointPublicationPorts, SessionAuditInput, SessionDisposedAuditInput, SessionH3Finalizer,
     UnauditedH3Take,
 };
+pub(crate) use joint::BirthDisposeCause;
+pub(crate) use joint::BirthReserveArms;
+pub(crate) use joint::JointBirthFunnel;
 pub(super) use joint::JointCommitInput;
 pub(crate) use joint::PreparedSemanticBatch;
 use joint::{PendingSemanticBatch, PreparedAdmission, PreparedH3};
@@ -2924,6 +2927,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .semantic_finalizer
             .get_or_insert_with(|| SessionFinalizerState::new(domain));
         if namespace.domain != domain {
+            let births = Self::drained_batch_births(&batch);
+            self.joint_birth_funnel.dropped_foreign_session = self
+                .joint_birth_funnel
+                .dropped_foreign_session
+                .saturating_add(births);
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -2945,6 +2953,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (disclosures, continued, joined, carried) = batch.take_reload_disclosures();
         self.drain_reload_disclosures_into_ledger(domain, disclosures, continued, joined, carried);
         if backpressure {
+            let births = Self::drained_batch_births(&batch);
+            self.joint_birth_funnel.dropped_backpressure = self
+                .joint_birth_funnel
+                .dropped_backpressure
+                .saturating_add(births);
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -3156,6 +3169,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         batch: crate::inventory_semantics::SemanticBatch,
     ) {
+        let births = Self::drained_batch_births(&batch);
+        self.joint_birth_funnel.dropped_ended_domain = self
+            .joint_birth_funnel
+            .dropped_ended_domain
+            .saturating_add(births);
         self.record_semantic_drop(&batch);
         let domain = batch.domain();
         let (outcomes, _current, negatives) = batch.into_parts();
@@ -3212,6 +3230,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Err(reason) => self.conversion_gap(None, reason),
             }
         }
+    }
+
+    /// Count one dropped collected batch's birth-bearing receipts
+    /// for the funnel. Every batch-drop gate counts through this, so
+    /// dropped offers are named, never silent.
+    fn drained_batch_births(batch: &crate::inventory_semantics::SemanticBatch) -> u64 {
+        crate::semantic_capture::count_birth_receipts(batch.current_receipts())
     }
 
     /// Record one dropped semantic batch's disposition shadow: its
@@ -3461,12 +3486,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         match pending {
             None => {}
             Some(PendingSemanticBatch::Collected(batch)) => {
+                let births = Self::drained_batch_births(&batch);
+                self.joint_birth_funnel.dropped_abandoned = self
+                    .joint_birth_funnel
+                    .dropped_abandoned
+                    .saturating_add(births);
                 self.record_semantic_drop(&batch);
                 let counted = crate::semantic_capture::unjoined_shed_counts(batch.outcomes());
                 self.publish_drop_shed(lane, "abandoned", counted);
             }
             Some(PendingSemanticBatch::Prepared(mut prepared)) => {
-                self.drain_prepared_s1(&mut prepared);
+                self.drain_prepared_s1(&mut prepared, joint::BirthDisposeCause::Abandoned);
                 self.finish_semantic_preparation(prepared, lane.stash_pending_floor());
             }
         }
@@ -3501,6 +3531,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .as_mut()
                     .and_then(SessionFinalizerState::take_collected)
                 {
+                    let births = Self::drained_batch_births(&dropped);
+                    self.joint_birth_funnel.dropped_no_lane = self
+                        .joint_birth_funnel
+                        .dropped_no_lane
+                        .saturating_add(births);
                     self.registry.record_gap(RegistryGap {
                         caller: None,
                         module: None,
@@ -3776,7 +3811,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(mut prepared) = self.prepare_semantic_batch(lane, batch, floor) else {
             return;
         };
-        self.drain_prepared_s1(&mut prepared);
+        self.drain_prepared_s1(&mut prepared, joint::BirthDisposeCause::S1Finalize);
         self.finish_semantic_preparation(prepared, lane.stash_pending_floor());
     }
 
@@ -3804,6 +3839,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return None;
         }
         if domain != lane.domain() {
+            // Defensive: staging enforces the domain match, so this
+            // is unreachable; if it ever fires the batch drops as
+            // foreign, counted with its family.
+            let births = Self::drained_batch_births(&batch);
+            self.joint_birth_funnel.dropped_foreign_session = self
+                .joint_birth_funnel
+                .dropped_foreign_session
+                .saturating_add(births);
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -4586,6 +4629,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         prepared: PreparedSemanticBatch,
         stash_pending_floor: Option<u64>,
     ) {
+        // Bug-catcher: every path decides or disposes births before
+        // finishing. Any nonzero here is a funnel bug, never silent loss.
+        if !prepared.birth_funnel_decided() {
+            let drops = crate::semantic_capture::count_birth_receipts(prepared.current_receipts());
+            self.joint_birth_funnel.undecided_at_finish = self
+                .joint_birth_funnel
+                .undecided_at_finish
+                .saturating_add(drops);
+        }
         let mut h3 = prepared.into_h3();
         let state = self
             .semantic_finalizer

@@ -1461,6 +1461,10 @@ pub(crate) struct LiveJointMachine {
     /// Running quanta abandoned and re-armed past in this run: the
     /// stop gap's count. The rate window bounds, not this total.
     running_rearms: u32,
+    /// Diagnostic-only birth-funnel drops: birth-bearing receipts in
+    /// collected batches refused at the accumulator merge. Saturating;
+    /// instrumentation only, never authority.
+    birth_merge_refused: u64,
     /// Stamps of the re-arms inside the current [`RUNNING_REARM_WINDOW`],
     /// in boot-clock nanoseconds: a fixed ring, so the window costs no
     /// heap past the machine's own pool reservation. `None` slots are
@@ -1575,6 +1579,7 @@ impl LiveJointMachine {
             skip_absence_once: false,
             rearm_eligible: false,
             running_rearms: 0,
+            birth_merge_refused: 0,
             rearm_window: [None; RUNNING_REARM_LIMIT as usize],
             #[cfg(test)]
             posed_rearm_now: None,
@@ -1687,6 +1692,26 @@ impl LiveJointMachine {
     #[cfg(test)]
     pub(crate) fn running_rearms_for_test(&self) -> u32 {
         self.running_rearms
+    }
+
+    /// Diagnostic-only birth-funnel drops: birth-bearing receipts in
+    /// collected batches refused at the accumulator merge.
+    pub(crate) fn birth_merge_refused(&self) -> u64 {
+        self.birth_merge_refused
+    }
+
+    /// Count one merge-refused batch's birth-bearing receipts into
+    /// the funnel. The refused batch is never retried, so this counts
+    /// exactly once.
+    fn note_merge_refused_births(&mut self, original: &Collected) {
+        let births = original
+            .reports
+            .as_ref()
+            .and_then(|reports| reports.refused.as_ref())
+            .map_or(0, |refused| {
+                crate::semantic_capture::count_birth_receipts(refused.current_receipts())
+            });
+        self.birth_merge_refused = self.birth_merge_refused.saturating_add(births);
     }
 
     /// Why the last attempted running re-arm was refused (`None`
@@ -3952,7 +3977,10 @@ impl LiveJointMachine {
                     .merge(batch)
                 {
                     Ok(complete) => complete,
-                    Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
+                    Err(reason) => {
+                        self.note_merge_refused_births(&original);
+                        return (Phase::AwaitH0(original), Err(reason));
+                    }
                 };
                 if !complete {
                     if original.note_h0_merge(before, has_pending_scans, has_future_job, has_hold) {
@@ -3971,7 +3999,10 @@ impl LiveJointMachine {
                             .merge(expired)
                         {
                             Ok(complete) => complete,
-                            Err(reason) => return (Phase::AwaitH0(original), Err(reason)),
+                            Err(reason) => {
+                                self.note_merge_refused_births(&original);
+                                return (Phase::AwaitH0(original), Err(reason));
+                            }
                         };
                         if !complete {
                             return (Phase::AwaitH0(original), Err(SemanticRefusal::Unavailable));
@@ -4140,7 +4171,12 @@ impl LiveJointMachine {
                     false
                 };
                 if self.grant.is_none() || empty_disposition {
-                    coordinator.dispose_prepared_claims_s1();
+                    let cause = if self.grant.is_none() {
+                        crate::discovery::engine::inventory_coordinator::semantics::BirthDisposeCause::SkippedNoGrant
+                    } else {
+                        crate::discovery::engine::inventory_coordinator::semantics::BirthDisposeCause::SkippedEmpty
+                    };
+                    coordinator.dispose_prepared_claims_s1_for_cause(cause);
                     return (Phase::StagingNegative(original), Ok(Step::Continue));
                 }
                 let result = original.raw.ingest(
@@ -4323,7 +4359,9 @@ impl LiveJointMachine {
                 // lane cannot re-offer lands its original refusal
                 // as final, exactly once.
                 for reoffer in &disposition.reoffers {
-                    if !lane.reoffer_birth_for(reoffer.image, reoffer.file) {
+                    if lane.reoffer_birth_for(reoffer.image, reoffer.file) {
+                        coordinator.note_birth_reoffer_armed();
+                    } else {
                         coordinator.disclose_birth_reoffer_exhausted(reoffer);
                     }
                 }

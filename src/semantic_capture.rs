@@ -1083,6 +1083,16 @@ pub(crate) fn union_reload_disclosures(
     u32::try_from(shed).unwrap_or(u32::MAX)
 }
 
+/// Birth-funnel counting helper: how many receipts carry a birth.
+/// Every gate that drops receipts counts its birth-bearing ones
+/// through this, so the funnel equation balances.
+pub(crate) fn count_birth_receipts(receipts: &[CurrentPartitionReceipt]) -> u64 {
+    receipts
+        .iter()
+        .filter(|receipt| receipt.birth_quantum().is_some())
+        .count() as u64
+}
+
 impl TickReport {
     /// Tests-only report: finalizer and terminal tests script batches
     /// that only the audited collect→audit→route path mints. Production
@@ -1113,6 +1123,11 @@ impl TickReport {
     /// Merge lane-stashed refresh receipts behind this tick's own: fresh
     /// receipts first, stashed appended, truncated to batch capacity so
     /// the merged batch never refuses on bounds. Returns shed receipts.
+    /// The truncation is defensive-only: a tick accepts at most
+    /// MAX_PENDING scans and the stash holds at most MAX_PENDING
+    /// receipts, so the merged length never exceeds twice MAX_PENDING,
+    /// far below MAX_INSTANCES. Stash overflow itself counts on the
+    /// stash's birth shed instead.
     pub(crate) fn merge_stashed_current(&mut self, stashed: Vec<CurrentPartitionReceipt>) -> u64 {
         self.current.extend(stashed);
         let shed = self.current.len().saturating_sub(MAX_INSTANCES);
@@ -1945,6 +1960,12 @@ pub(crate) struct SemanticCapture {
     pending_discovery_status: CollectionStatus,
     stopped: bool,
     continuity_cuts: u64,
+    /// Diagnostic-only birth-funnel formation: sighting receipts minted
+    /// carrying a birth, and New/AdmittedFirst births withheld by the
+    /// one-observation re-offer cooldown despite a present cut.
+    /// Saturating; instrumentation only, never authority.
+    birth_offers_formed: u64,
+    birth_cooled_withheld: u64,
     /// Hook recursion-miss total and miss-caused fault raises at the last
     /// audit (counts only): a raise count that moved marks the fault move
     /// as a hook-miss era for the router's instance carry.
@@ -2090,6 +2111,8 @@ impl SemanticCapture {
             pending_discovery_status: CollectionStatus::Complete,
             stopped: false,
             continuity_cuts: 0,
+            birth_offers_formed: 0,
+            birth_cooled_withheld: 0,
             hook_misses: 0,
             miss_raises: 0,
             take_drift_tolerated: AtomicU64::new(0),
@@ -2218,6 +2241,13 @@ impl SemanticCapture {
     /// Admitted-mint telemetry for the stop disclosure (counts only).
     pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
         self.router.admitted_mint_counts()
+    }
+
+    /// Diagnostic-only birth-funnel formation for the stop disclosure
+    /// (counts only): sighting receipts minted carrying a birth, and
+    /// New/AdmittedFirst births withheld by the re-offer cooldown.
+    pub(crate) fn birth_offer_counts(&self) -> (u64, u64) {
+        (self.birth_offers_formed, self.birth_cooled_withheld)
     }
 
     /// Diagnostic-only mark funnel for the stop disclosure (counts
@@ -5188,6 +5218,24 @@ impl SemanticCapture {
                     && self
                         .router
                         .take_birth_reoffer_cooldown(job.image, job.endpoint.file_slot);
+                let birth = if (!cooled
+                    && (outcome == ObserveOutcome::New || outcome == ObserveOutcome::AdmittedFirst))
+                    || birth_retry
+                {
+                    job.birth_cut
+                        .clone()
+                        .map(|(cut, quantum)| (self.identity, cut, quantum))
+                } else {
+                    None
+                };
+                if birth.is_some() {
+                    self.birth_offers_formed = self.birth_offers_formed.saturating_add(1);
+                } else if cooled
+                    && (outcome == ObserveOutcome::New || outcome == ObserveOutcome::AdmittedFirst)
+                    && job.birth_cut.is_some()
+                {
+                    self.birth_cooled_withheld = self.birth_cooled_withheld.saturating_add(1);
+                }
                 report.current.push(CurrentPartitionReceipt {
                     domain: self.router.domain(),
                     image: job.image,
@@ -5199,17 +5247,7 @@ impl SemanticCapture {
                     fence,
                     deadline: job.deadline,
                     ids,
-                    birth: if (!cooled
-                        && (outcome == ObserveOutcome::New
-                            || outcome == ObserveOutcome::AdmittedFirst))
-                        || birth_retry
-                    {
-                        job.birth_cut
-                            .clone()
-                            .map(|(cut, quantum)| (self.identity, cut, quantum))
-                    } else {
-                        None
-                    },
+                    birth,
                     birth_retry,
                 });
                 // The admitted mint installed: later admissions for this

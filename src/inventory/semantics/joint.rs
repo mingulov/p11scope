@@ -74,6 +74,16 @@ pub(crate) struct RetainedBirthSlot<'a> {
     // The consumed negative's allocations stay charged across native I/O.
     _pending_storage: Option<ResourceLease>,
 }
+
+/// Which retained-birth reservation arm refused: the receipt's
+/// nested-bytes ledger charge, or the witness-table capacity
+/// growth (overflow, the registry-instances cap, its own charge
+/// or the reallocation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BirthReserveRefusal {
+    Ledger,
+    Table,
+}
 impl RetainedJointBirths {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -96,19 +106,34 @@ impl RetainedJointBirths {
         reserve: &SemanticResourceReserver,
         nested_bytes: usize,
     ) -> Result<RetainedBirthSlot<'_>, ()> {
-        self.reserve_at(reserve, nested_bytes, None)
+        self.reserve_at(reserve, nested_bytes, None).map_err(|_| ())
     }
 
     pub(crate) fn reserve_for_current(
         &mut self,
         reserve: &SemanticResourceReserver,
         current: &CurrentPartitionReceipt,
+        arms: &mut crate::discovery::engine::inventory_coordinator::semantics::BirthReserveArms,
     ) -> Result<RetainedBirthSlot<'_>, ()> {
         let pending = self.witnesses.iter().position(|entry| {
             matches!(&entry.birth, RetainedBirth::PendingAbsence(negative)
                 if negative.matches_current(current))
         });
-        self.reserve_at(reserve, current.owned_storage_bytes().ok_or(())?, pending)
+        let nested = current.owned_storage_bytes().ok_or(())?;
+        match self.reserve_at(reserve, nested, pending) {
+            Ok(slot) => Ok(slot),
+            Err(arm) => {
+                match arm {
+                    BirthReserveRefusal::Ledger => {
+                        arms.ledger = arms.ledger.saturating_add(1);
+                    }
+                    BirthReserveRefusal::Table => {
+                        arms.table = arms.table.saturating_add(1);
+                    }
+                }
+                Err(())
+            }
+        }
     }
 
     fn reserve_at(
@@ -116,21 +141,28 @@ impl RetainedJointBirths {
         reserve: &SemanticResourceReserver,
         nested_bytes: usize,
         pending: Option<usize>,
-    ) -> Result<RetainedBirthSlot<'_>, ()> {
-        let storage = reserve.reserve(nested_bytes).map_err(|_| ())?;
+    ) -> Result<RetainedBirthSlot<'_>, BirthReserveRefusal> {
+        let storage = reserve
+            .reserve(nested_bytes)
+            .map_err(|_| BirthReserveRefusal::Ledger)?;
         if pending.is_none() && self.witnesses.len() == self.witnesses.capacity() {
-            let next = self.witnesses.capacity().checked_mul(2).ok_or(())?.max(1);
+            let next = self
+                .witnesses
+                .capacity()
+                .checked_mul(2)
+                .ok_or(BirthReserveRefusal::Table)?
+                .max(1);
             if next > crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES {
-                return Err(());
+                return Err(BirthReserveRefusal::Table);
             }
             // Full replacement is reserved while the old physical allocation
             // and its charge are live, before either reallocation or query.
             let capacity_storage = reserve
-                .reserve(Self::capacity_charge(next).ok_or(())?)
-                .map_err(|_| ())?;
+                .reserve(Self::capacity_charge(next).ok_or(BirthReserveRefusal::Table)?)
+                .map_err(|_| BirthReserveRefusal::Table)?;
             self.witnesses
                 .try_reserve_exact(next - self.witnesses.len())
-                .map_err(|_| ())?;
+                .map_err(|_| BirthReserveRefusal::Table)?;
             assert!(
                 self.witnesses.capacity() <= next,
                 "retained birth capacity exceeds its precharge"

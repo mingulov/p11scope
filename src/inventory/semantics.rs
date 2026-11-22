@@ -1264,6 +1264,9 @@ pub(crate) struct RefreshReceiptStash {
     /// the next tick report's own shed, never a refused endpoint.
     /// Saturating u32, matching the carried-shed vocabulary.
     disclosure_shed: u32,
+    /// Birth-bearing receipts shed past the cap. The stop line
+    /// reads it, so shed offers are named, never silent.
+    birth_shed: u64,
     shed: u64,
     /// Minimum shed outcome position: stash overflow drops positioned
     /// history, so the next merge carries it as a loss barrier. Taken
@@ -1349,7 +1352,10 @@ impl RefreshReceiptStash {
         let mut shed = 0;
         self.stashed.extend(receipts);
         while self.stashed.len() > MAX_STASHED_REFRESH_RECEIPTS {
-            self.stashed.pop_front();
+            let dropped = self.stashed.pop_front();
+            if dropped.is_some_and(|receipt| receipt.birth_quantum().is_some()) {
+                self.birth_shed = self.birth_shed.saturating_add(1);
+            }
             shed += 1;
         }
         self.outcomes.extend(outcomes);
@@ -1419,6 +1425,13 @@ impl RefreshReceiptStash {
     #[cfg(test)]
     pub(crate) fn disclosure_shed(&self) -> u32 {
         self.disclosure_shed
+    }
+
+    /// Tests-only stash birth shed: production reads it on the
+    /// stop line instead.
+    #[cfg(test)]
+    pub(crate) fn birth_shed_for_test(&self) -> u64 {
+        self.birth_shed
     }
 
     /// Drain the stashed receipts in order into the next tick batch.
@@ -2023,6 +2036,58 @@ pub(crate) fn joint_reentry_line(
     )
 }
 
+/// One stderr line for the diagnostic birth-funnel summary: sighting
+/// receipts minted carrying a birth, births installed, and every
+/// silent gate's dropped offers. Offers formed minus births
+/// installed must equal silent drops plus terminal birth gaps plus
+/// pending re-offers (deferred gaps are transient delay notices);
+/// anything else is silent loss. Counts only; no identities, paths
+/// or payloads. Diagnostic-only: printed beside the stop line only
+/// while stage timings are requested, never a contract.
+pub(crate) fn joint_birth_funnel_line(
+    formed: u64,
+    cooled: u64,
+    installed: u64,
+    funnel: &crate::discovery::engine::inventory_coordinator::semantics::JointBirthFunnel,
+    oversized: u64,
+    stashed: u64,
+    merge_refused: u64,
+) -> String {
+    format!(
+        "p11scope: joint birth funnel: formed={formed} cooled={cooled} installed={installed} \
+         unlinked={} prepare_owner={} prepare_cursor={} \
+         prepare_entry={} prepare_capacity_count={} prepare_capacity_bytes={} \
+         prepare_duplicate={} skip_no_grant={} skip_empty={} abandoned_prepared={} \
+         storage_refused={} s1_finalize={} dropped_ended_domain={} \
+         dropped_foreign_session={} dropped_backpressure={} dropped_no_lane={} \
+         dropped_abandoned={} undecided_at_finish={} resource_ledger={} resource_table={} \
+         reoffer_armed={} reoffer_exhausted={} oversized={oversized} stash_shed={stashed} \
+         merge_refused={merge_refused}",
+        funnel.unlinked,
+        funnel.prepare_owner,
+        funnel.prepare_cursor,
+        funnel.prepare_entry,
+        funnel.prepare_capacity_count,
+        funnel.prepare_capacity_bytes,
+        funnel.prepare_duplicate,
+        funnel.skip_no_grant,
+        funnel.skip_empty,
+        funnel.abandoned_prepared,
+        funnel.storage_refused,
+        funnel.s1_finalize,
+        funnel.dropped_ended_domain,
+        funnel.dropped_foreign_session,
+        funnel.dropped_backpressure,
+        funnel.dropped_no_lane,
+        funnel.dropped_abandoned,
+        funnel.undecided_at_finish,
+        funnel.resource.ledger,
+        funnel.resource.table,
+        funnel.reoffer_armed,
+        funnel.reoffer_exhausted,
+    )
+}
+
 /// One stderr line for the diagnostic seal-bootstrap summary:
 /// which bootstrap check refused a seal, by arm, plus retained
 /// takes that succeeded across same-instance drift and
@@ -2231,6 +2296,10 @@ pub(crate) struct LiveLane {
     unrouted_returns: u64,
     drained_batches: u64,
     semantic_loss: bool,
+    /// Diagnostic-only birth-funnel drops: birth-bearing receipts in
+    /// oversized tick reports dropped at batch construction.
+    /// Saturating; instrumentation only, never authority.
+    oversized_birth_shed: u64,
     stashed_refresh: RefreshReceiptStash,
     /// Lazy, paid from the canonical registry pool at the initial Joint
     /// service. The ordinary driver does not select it in this slice.
@@ -2572,6 +2641,46 @@ impl AttestedSemanticLane {
         true
     }
 
+    /// Diagnostic-only birth-funnel formation for the stop
+    /// disclosure (counts only): sighting receipts minted carrying
+    /// a birth, and cooldown-withheld births. Zeros without a live
+    /// lane. Counts only.
+    pub(crate) fn birth_offer_counts(&self) -> (u64, u64) {
+        self.live
+            .as_ref()
+            .map_or((0, 0), |live| live.capture.birth_offer_counts())
+    }
+
+    /// Diagnostic-only birth-funnel lane drops for the stop
+    /// disclosure (counts only): birth-bearing receipts in dropped
+    /// oversized reports. Zero without a live lane. Counts only.
+    pub(crate) fn oversized_birth_shed(&self) -> u64 {
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.oversized_birth_shed)
+    }
+
+    /// Diagnostic-only birth-funnel stash drops for the stop
+    /// disclosure (counts only): birth-bearing refresh receipts shed
+    /// past the stash cap. Zero without a live lane. Counts only.
+    pub(crate) fn stashed_birth_shed(&self) -> u64 {
+        self.live
+            .as_ref()
+            .map_or(0, |live| live.stashed_refresh.birth_shed)
+    }
+
+    /// Diagnostic-only birth-funnel machine drops for the stop
+    /// disclosure (counts only): birth-bearing receipts in
+    /// merge-refused collected batches. Zero without a live Joint
+    /// machine. Counts only.
+    pub(crate) fn merge_refused_births(&self) -> u64 {
+        self.live.as_ref().map_or(0, |live| {
+            live.joint_machine
+                .as_ref()
+                .map_or(0, |machine| machine.birth_merge_refused())
+        })
+    }
+
     /// Lane-stash pending floor for the finalizer's disposition: the
     /// minimum stashed (undisposed, awaiting merge) outcome position. A
     /// shell lane stashes nothing. Stash overflow sheds ride the merged
@@ -2648,6 +2757,7 @@ impl AttestedSemanticLane {
                 unrouted_returns: 0,
                 drained_batches: 0,
                 semantic_loss: false,
+                oversized_birth_shed: 0,
                 stashed_refresh: RefreshReceiptStash::new(),
                 joint_machine: None,
             })),
@@ -4235,6 +4345,7 @@ impl AttestedSemanticLane {
         let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         let counted = unjoined_shed_counts(report.outcomes());
+        let oversized_births = crate::semantic_capture::count_birth_receipts(report.current());
         self.last_collection_saturated = saturated;
         match SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns()) {
             Ok(batch) => Ok(batch),
@@ -4244,7 +4355,7 @@ impl AttestedSemanticLane {
                 // the caps). Its collected calls are already counted
                 // above, so its unjoined calls shed here with the
                 // oversized label; the next finalize discloses them.
-                self.stash_oversized_shed(counted);
+                self.stash_oversized_shed(counted, oversized_births);
                 Err(SemanticRefusal::Unavailable)
             }
         }
@@ -4252,11 +4363,16 @@ impl AttestedSemanticLane {
 
     /// Count a refused report's unjoined calls into shed now and stash
     /// their route labels for the next finalize's disclosure gap.
-    fn stash_oversized_shed(&mut self, counted: BTreeMap<&'static str, u64>) {
+    /// Birth-bearing receipts in the dropped report count on the
+    /// live funnel, so shed offers are named, never silent.
+    fn stash_oversized_shed(&mut self, counted: BTreeMap<&'static str, u64>, births: u64) {
         for (label, count) in counted {
             let slot = self.oversized_drop_shed.entry(label).or_default();
             *slot = slot.saturating_add(count);
             self.disclosed_calls_shed = self.disclosed_calls_shed.saturating_add(count);
+        }
+        if let Some(live) = self.live.as_deref_mut() {
+            live.oversized_birth_shed = live.oversized_birth_shed.saturating_add(births);
         }
     }
 
@@ -4322,10 +4438,11 @@ impl AttestedSemanticLane {
         live.continuity_cuts = live.capture.continuity_cuts();
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         let counted = unjoined_shed_counts(report.outcomes());
+        let oversized_births = crate::semantic_capture::count_birth_receipts(report.current());
         match SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()) {
             Ok(batch) => Ok(batch),
             Err(_) => {
-                self.stash_oversized_shed(counted);
+                self.stash_oversized_shed(counted, oversized_births);
                 Err(SemanticRefusal::Unavailable)
             }
         }
@@ -4352,10 +4469,11 @@ impl AttestedSemanticLane {
             .map_err(|_| SemanticRefusal::Unavailable)?;
         live.continuity_cuts = live.capture.continuity_cuts();
         let counted = unjoined_shed_counts(report.outcomes());
+        let oversized_births = crate::semantic_capture::count_birth_receipts(report.current());
         match SemanticBatch::from_tick_report(self.domain, report, Vec::new(), now_ns()) {
             Ok(batch) => Ok(batch),
             Err(_) => {
-                self.stash_oversized_shed(counted);
+                self.stash_oversized_shed(counted, oversized_births);
                 Err(SemanticRefusal::Unavailable)
             }
         }

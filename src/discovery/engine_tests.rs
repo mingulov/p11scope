@@ -99327,6 +99327,241 @@ fn merge_ownership_e1_reused_view_id_holds_while_carried_row_rides() {
 }
 
 #[test]
+fn carried_view_ids_system_sequential_views_recycle_ids_and_bound_modules() {
+    // C1: Scope::System admitting and exiting 1100 sequential views mapping
+    // one object. Allocation must keep succeeding (an exited view's ID
+    // recycles once its carried row no longer names it) and committed
+    // modules must stay bounded (carried rows merge under one reserved
+    // owner and drop once a live row covers the object).
+    let key = overlay_key(777);
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let mut prev: Option<ProcessViewId> = None;
+    let mut admitted: u32 = 0;
+    for i in 0..=1100u32 {
+        let id = match engine.allocate_view_id_for_newcomer(me) {
+            Ok(id) => id,
+            Err(_) => break,
+        };
+        let view = ProcessView::open(id, me).unwrap();
+        let mut module = overlay_module(key);
+        module.view = id;
+        let mut pins = overlay_view_pin(&module, 5000 + u64::from(i), OVERLAY_SHA, 1, false);
+        record_scan_ownership(&mut pins, id, key, &module.path);
+        pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+        let removed = prev.map(|p| BTreeSet::from([p])).unwrap_or_default();
+        let candidate = engine
+            .inventory_candidate(&removed, &[], &[(view, vec![module], pins)], Vec::new(), &empty)
+            .unwrap();
+        engine.plan = candidate.plan;
+        engine.pinned = candidate.pinned;
+        engine.modules = candidate.modules;
+        if let Some(p) = prev {
+            engine.views.retain(|view| view.id() != p);
+            engine.release_view_id(p);
+        }
+        engine.views.push(ProcessView::open(id, me).unwrap());
+        if i == 0 {
+            let object = engine
+                .modules
+                .iter()
+                .find(|module| module.scanned.view == id)
+                .expect("the first row commits")
+                .object;
+            assert!(
+                engine
+                    .plan
+                    .slots
+                    .iter()
+                    .any(|slot| engine.plan.is_active(slot.index) && slot.object == object),
+                "the fixture starts attached (carry gate open)"
+            );
+        }
+        prev = Some(id);
+        admitted += 1;
+    }
+    eprintln!(
+        "carried-view-ids probe: admitted={admitted} modules={}",
+        engine.modules.len()
+    );
+    assert_eq!(
+        admitted, 1101,
+        "allocation keeps succeeding across 1100 sequential views"
+    );
+    assert!(
+        engine.modules.len() <= 4,
+        "committed modules stay bounded, got {}",
+        engine.modules.len()
+    );
+}
+
+#[test]
+fn carried_view_ids_system_carried_row_reports_until_detach() {
+    // Twin: the carried row still reports (covers its object) on the tick
+    // its view exits, then retires once no live view maps the object and no
+    // newcomer waits (proven unmapped) instead of riding forever.
+    let key = overlay_key(778);
+    let me = std::process::id();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let covers = |engine: &Engine, object: PinnedObjectId| {
+        engine.modules.iter().any(|module| module.object == object)
+    };
+    let admit = |engine: &mut Engine, raw_id: u64| {
+        let id = engine.allocate_view_id_for_newcomer(me).unwrap();
+        let view = ProcessView::open(id, me).unwrap();
+        let mut module = overlay_module(key);
+        module.view = id;
+        let mut pins = overlay_view_pin(&module, raw_id, OVERLAY_SHA, 1, false);
+        record_scan_ownership(&mut pins, id, key, &module.path);
+        pins.prove_scanned_entries_for_test(std::slice::from_ref(&module));
+        let candidate = engine
+            .inventory_candidate(&empty, &[], &[(view, vec![module], pins)], Vec::new(), &empty)
+            .unwrap();
+        engine.plan = candidate.plan;
+        engine.pinned = candidate.pinned;
+        engine.modules = candidate.modules;
+        engine.views.push(ProcessView::open(id, me).unwrap());
+        id
+    };
+    let id_r = admit(&mut engine, 6000);
+    let object = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == id_r)
+        .expect("the seed row commits")
+        .object;
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && slot.object == object),
+        "the fixture starts attached (carry gate open)"
+    );
+    // Tick 1: R exits with no successor and no pending newcomer.
+    let removed = engine
+        .inventory_candidate(&BTreeSet::from([id_r]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = removed.plan;
+    engine.pinned = removed.pinned;
+    engine.modules = removed.modules;
+    engine.views.retain(|view| view.id() != id_r);
+    engine.release_view_id(id_r);
+    assert!(
+        covers(&engine, object),
+        "the carried row still reports on its view's exit tick"
+    );
+    // Tick 2 (quiet, nothing pending): the unmapped carrier retires.
+    let quiet = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = quiet.plan;
+    engine.pinned = quiet.pinned;
+    engine.modules = quiet.modules;
+    assert!(
+        !covers(&engine, object),
+        "the unmapped carried row retires instead of riding forever"
+    );
+    // Ticks 3-4: the quiet-tick fast path must not shelter a droppable
+    // carrier. Re-carry under a pending newcomer (hold), drain the mark,
+    // settle, then tick quietly.
+    let id_s = admit(&mut engine, 6001);
+    engine.newcomer_first_seen.insert(424242, None);
+    let recarried = engine
+        .inventory_candidate(&BTreeSet::from([id_s]), &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = recarried.plan;
+    engine.pinned = recarried.pinned;
+    engine.modules = recarried.modules;
+    engine.views.retain(|view| view.id() != id_s);
+    engine.release_view_id(id_s);
+    assert!(
+        covers(&engine, object),
+        "the carrier holds while a newcomer waits"
+    );
+    engine.newcomer_first_seen.remove(&424242);
+    engine.plan_rebuild_stable = true;
+    let settled = engine
+        .inventory_candidate(&empty, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    engine.plan = settled.plan;
+    engine.pinned = settled.pinned;
+    engine.modules = settled.modules;
+    assert!(
+        !covers(&engine, object),
+        "the settled quiet tick drops the proven-unmapped carrier"
+    );
+}
+
+#[test]
+fn carried_view_ids_owned_conservative_releases_and_bounds() {
+    // Owned-run shape of the same leak: conservative_candidate carries with
+    // the same reserved owner, drops live-covered carriers synchronously,
+    // and frees the numeric ID at once.
+    let parts = mo_shared_pin_parts();
+    let mut pins = parts.pins;
+    let (bound, skipped) =
+        bind_scanned_modules(&[parts.module_r, parts.module_l.clone()], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(bound.len(), 2, "both live views bind");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(std::process::id());
+    engine.owned_run_pid = Some(std::process::id());
+    engine.next_view_id = 100;
+    engine.plan = plan::build_from_reconciled_modules(&bound);
+    engine.pinned = pins;
+    engine.modules = bound;
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    for view in [MO_VIEW_R, MO_VIEW_L] {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(view), std::process::id()).unwrap());
+    }
+    let view_r = ProcessViewId(MO_VIEW_R);
+    let view_l = ProcessViewId(MO_VIEW_L);
+    let object = parts.object;
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| engine.plan.is_active(slot.index) && slot.object == object),
+        "the fixture starts attached (carry gate open)"
+    );
+    let carried = engine
+        .conservative_candidate(&BTreeSet::from([view_r]), &BTreeSet::new())
+        .unwrap();
+    engine.plan = carried.plan;
+    engine.pinned = carried.pinned;
+    engine.modules = carried.modules;
+    engine.views.retain(|view| view.id() != view_r);
+    engine.release_view_id(view_r);
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view_l && module.object == object),
+        "the live co-owner still reports the object"
+    );
+    assert!(
+        !engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view_r),
+        "the retired view names no committed row"
+    );
+    let reused = engine.allocate_view_id().unwrap();
+    assert_eq!(reused, view_r, "the retired row's ID returns to admission");
+}
+
+#[test]
 fn merge_ownership_e1_inventory_shared_pin_empty_preserve_ends_carry() {
     // E1 × shared-pin decay shape (GREEN guard): with an empty preserve
     // set the unrelated refresh purges R's unowned raw alias — the pin

@@ -4790,9 +4790,9 @@ fn completed_from_drained_return(
 /// completes at its END's ordinal. The corroborated return's ordinal
 /// is stale once a prior seal settled past it, and completing there
 /// contradicts the covered prefix (the model voids the domain); the
-/// abandonment is always fresh. The settled table and the terminal
-/// conversion share this one predicate, so a drained call completes
-/// in both or neither.
+/// abandonment is always fresh. The settled table, the frozen
+/// retained table and the terminal conversion share this one
+/// predicate, so a drained call completes in all three or none.
 fn drained_return_cut(entry: &OpenEntry, frontier: u64) -> Option<u64> {
     let staged = entry.abandon.filter(|staged| {
         staged.ordinal <= frontier
@@ -9836,6 +9836,12 @@ impl JournalAdapter {
             if disposable.contains(native) {
                 continue;
             }
+            // A drained return settled in its conversion seal; a held
+            // sibling keeps the entry staged past it, and a later seal
+            // must not re-mint the row. Converted calls settle once.
+            if entry.drained_converted {
+                continue;
+            }
             let abandoned = entry.abandon.is_some_and(|staged| {
                 staged.ordinal <= frontier
                     && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
@@ -9878,6 +9884,11 @@ impl JournalAdapter {
                 .filter(|entry| entry.converted_for == Some(key))
                 .map(|entry| {
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
+                    // A held drained completion keeps its completion
+                    // cut here too: the deferred End step matches this
+                    // row by (phase, cut), and an abandoned-looking row
+                    // would stall the feed head instead of replaying.
+                    let drained = drained_return_cut(entry, frontier);
                     SealedCall {
                         ticket: entry.converted_ticket.expect("converted original"),
                         key: entry.call_key.expect("converted original key"),
@@ -9886,10 +9897,12 @@ impl JournalAdapter {
                         end_cut: entry
                             .end
                             .filter(|staged| staged.ordinal <= frontier)
-                            .map(|staged| staged.ordinal),
+                            .map(|staged| staged.ordinal)
+                            .or(drained),
                         abandoned: entry
                             .abandon
-                            .is_some_and(|staged| staged.ordinal <= frontier),
+                            .is_some_and(|staged| staged.ordinal <= frontier)
+                            && drained.is_none(),
                         session,
                         mechanism,
                         length: sealed_length(

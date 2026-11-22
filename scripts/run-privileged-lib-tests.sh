@@ -74,8 +74,9 @@
 #     Session::start may raise soft to hard at attach; wide cells attach
 #     thousands of links, hence `ulimit -n 65536` before the campaign.
 #
-# Pass criterion: a test PASSES only if the harness exited 0 and its last
-# libtest summary is, as a full line,
+# Pass criterion: a test PASSES only if the harness exited 0 and its log
+# holds exactly one libtest summary, as the last nonblank line, reading as a
+# full line
 #   "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; N filtered out; finished in S.SSs"
 # (exactly one test ran). An exit code alone is not accepted, and "0 passed"
 # (renamed/missing test) or a malformed summary is a FAIL. FULL_MATRIX_TESTS
@@ -2173,6 +2174,8 @@ main() {
                 matrix_note=" (JOINT: the verdict validator produced no verdict; see $log.verdict)"
             fi
         elif [ "$rc" -eq 0 ] \
+            && [ "$(command grep -c 'test result:' "$log" || true)" = 1 ] \
+            && [ "$(awk 'NF { last = $0 } END { print last }' "$log")" = "$result_line" ] \
             && printf '%s\n' "$result_line" | command grep -qE '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9]+\.[0-9]{2}s$'; then
             verdict=PASS
         fi

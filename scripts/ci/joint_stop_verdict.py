@@ -81,17 +81,41 @@ OFFSET_RE = re.compile(
     r"P11SCOPE_CELL_BRANCH=offset" + OFFSET
     + r":(latched|no-latch):(published|abandoned|not-begun|unpublished)")
 COMPLETE_RE = re.compile(r"P11SCOPE_STOP_COMPLETE=wp7-stop" + CASE)
-RECORD_PREFIXES = ("P11SCOPE_CELL_BRANCH=", "P11SCOPE_STOP_COMPLETE")
+# Reserved record stems: any line carrying one must be a full record,
+# whatever separator follows the stem.
+RECORD_STEMS = ("P11SCOPE_CELL_BRANCH", "P11SCOPE_STOP_COMPLETE")
+# No-feed branch words: outside a full branch record they are a
+# malformed no-feed record, never free text.
+NO_FEED_WORDS = ("s1-precluded", "no-feeds-unattributed")
 RECEIPT_TEXT = "no joint feeds"
+# Decision text owned by the terminal records; never free text.
+WEDGE_PHRASE = "Published then WoundDown"
 S1_RECEIPT = ("Error: wp7-stop{k}: no joint feeds with S1 seal "
               "(producers unlinked, zero installs); not attempted")
 UNATTRIBUTED_RECEIPT = ("Error: wp7-stop{k}: no joint feeds without S1 seal "
                         "(producers linked, zero installs unexplained); "
                         "not attempted")
-WEDGE_RE = re.compile(
+# The Rust terminal check's error with the StopOutcome Display
+# (src/inventory/joint_stop_races_privileged_tests.rs).
+WEDGE_HEAD_RE = re.compile(
     r"Error: offset " + OFFSET
-    + r": the finish must reach Published then WoundDown: offset=" + OFFSET
-    + r" begin=\S+ finish=(\S+) .*")
+    + r": the finish must reach Published then WoundDown: (.*)")
+OUTCOME_RE = re.compile(
+    r"offset=" + OFFSET + r" begin=(\S+) finish=(published|abandoned|"
+    r"not-begun|unpublished) \(([0-9]+) polls\) first_error=(None|Some\(.*\)) "
+    r"latched=(true|false) latch=(None|Some\(.*\)) h0=(\S+) "
+    r"wound=(joined|unwound|wound-refused:.*) \(([0-9]+) polls\) "
+    r"taken=(true|false) minted=(true|false) stash=(None|Some\(.*\)) "
+    r"stop_counts=(.*) api_a=([0-9]+) a_sem=([0-9]+) shed=([0-9]+) "
+    r"reconciled=(true|false) abandon_gap=(None|Some\(.*\)) branch=(linked)")
+OUTCOME_KEYS = (" begin=", " finish=", " first_error=", " latched=",
+                " latch=", " h0=", " wound=", " taken=", " minted=",
+                " stash=", " stop_counts=", " api_a=", " a_sem=", " shed=",
+                " reconciled=", " abandon_gap=", " branch=")
+# Case-bound diagnostics: legal only inside the linked case they name.
+OUTCOME_LINE_RE = re.compile(r"JOINT_STOP (outcome: offset=|offset=)"
+                             + OFFSET + r"\b.*")
+CASE_MENTION_RE = re.compile(r"wp7-stop([0-9]+)")
 BACKTRACE_HEAD = "Stack backtrace:"
 BACKTRACE_FRAME_RE = re.compile(r" +([0-9]+: \S.*|at \S.*)")
 BACKTRACE_NOTE_RE = re.compile(r"note: Some details are omitted, .*")
@@ -106,7 +130,9 @@ CHECKS = (
     "error-not-terminal", "sequence", "offset-binding", "finish-binding",
     "matrix-short", "pass-with-no-feed", "unexpected-pass",
     "s1-after-linked", "receipt-mismatch", "no-feed-unattributed",
-    "wedge-binding", "wedge-unexpected",
+    "wedge-binding", "wedge-unexpected", "text-reserved", "text-binding",
+    "evidence-after-preclusion", "terminal-reserved", "wedge-record",
+    "wedge-success",
 )
 
 
@@ -175,11 +201,12 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
     passed_run = None
     if match is not None:
         word = match.group(1)
-        counts = tuple(int(match.group(i)) for i in range(2, 6))
-        want = (1, 0, 0, 0) if word == "ok" else (0, 1, 0, 0)
+        counts = tuple(match.group(i) for i in range(2, 6))
+        want = ("1", "0", "0", "0") if word == "ok" else ("0", "1", "0", "0")
         check("summary-counts", counts == want,
               "summary counts %s are not exactly one %s test"
-              % (counts, "passing" if word == "ok" else "failing"))
+              % (tuple(c[:12] for c in counts),
+                 "passing" if word == "ok" else "failing"))
         check("summary-status",
               (word == "ok" and status == 0)
               or (word == "FAILED" and status == 101),
@@ -220,32 +247,43 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
         body = lines[body_start:end]
     body = [line for line in body if line != timeout_line]
 
-    # Body records.
-    events = []
+    # Body records, in order. Free text is allowed only where it carries
+    # no evidence: reserved stems and no-feed words must form full
+    # records, receipts and the wedge phrase belong to the terminal
+    # error, and case-bound diagnostics must sit inside the linked case
+    # they name. Positions are checked against the case sequence below.
+    items = []
     errors = []
     for index, line in enumerate(body):
         if line.startswith("Error: "):
             errors.append(index)
+            items.append(("error", index, None))
             continue
         check("stray-framing",
               not (line in ("ok", "FAILED") or line.startswith("test ")
                    or line.startswith("running ") or line == "failures:"),
               "stray libtest framing inside the cell output: %r" % line[:200])
-        if any(prefix in line for prefix in RECORD_PREFIXES):
+        if any(stem in line for stem in RECORD_STEMS) \
+                or any(word in line for word in NO_FEED_WORDS):
             branch = BRANCH_RE.fullmatch(line)
             offset = OFFSET_RE.fullmatch(line)
             complete = COMPLETE_RE.fullmatch(line)
             check("record-malformed", branch or offset or complete,
                   "malformed or embedded record: %r" % line[:200])
             if branch:
-                events.append(("tag", int(branch.group(1)), branch.group(2)))
+                items.append(("tag", int(branch.group(1)), branch.group(2)))
             elif offset:
-                events.append(("offset", int(offset.group(1)),
-                               offset.group(3)))
+                items.append(("offset", int(offset.group(1)),
+                              (offset.group(3), offset.group(2))))
             elif complete:
-                events.append(("complete", int(complete.group(1)), None))
+                items.append(("complete", int(complete.group(1)), None))
+            continue
         check("receipt-stray", RECEIPT_TEXT not in line,
               "no-feed receipt outside the terminal error: %r" % line[:200])
+        check("text-reserved", WEDGE_PHRASE not in line
+              and "test result:" not in line,
+              "terminal decision text inside a diagnostic: %r" % line[:200])
+        items.append(("text", index, line))
 
     if passed_run:
         check("error-count", not errors,
@@ -266,6 +304,13 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
         check("receipt-stray", RECEIPT_TEXT not in body[index],
               "no-feed receipt outside the terminal error: %r"
               % body[index][:200])
+    if terminal is not None:
+        check("terminal-reserved",
+              not any(stem in terminal for stem in RECORD_STEMS)
+              and not any(word in terminal for word in NO_FEED_WORDS)
+              and "test result:" not in terminal,
+              "the terminal error embeds a reserved record: %r"
+              % terminal[:200])
 
     # Case sequence: linked, offset diagnostic, completion; in order.
     next_case = 0
@@ -273,7 +318,16 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
     current = None
     nofeed = None
     finish = None
-    for kind, value, extra in events:
+    latch = None
+    for kind, value, extra in items:
+        if kind == "error":
+            # The terminal error decides; what follows it is the
+            # backtrace block, checked above.
+            break
+        if kind == "text":
+            if extra != "":
+                _check_text(check, extra, phase, next_case, current)
+            continue
         if phase == "start" and kind == "tag" and value == next_case:
             current = value
             if extra == "linked":
@@ -287,7 +341,7 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
                   "wp7-stop%d ran at offset %d ms, not its matrix offset "
                   "%d ms" % (current, value, OFFSETS_MS[current % 4]))
             phase = "offset"
-            finish = extra
+            finish, latch = extra
             continue
         if phase == "offset" and kind == "complete" and value == current:
             check("finish-binding", finish == "published",
@@ -341,14 +395,32 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
     check("receipt-mismatch", RECEIPT_TEXT not in terminal,
           "no-feed receipt without its case tag (ambiguous): %r"
           % terminal[:200])
-    wedge = WEDGE_RE.fullmatch(terminal)
+    wedge = WEDGE_HEAD_RE.fullmatch(terminal)
     if wedge and phase == "offset":
         want = OFFSETS_MS[current % 4]
-        check("wedge-binding",
-              int(wedge.group(1)) == want and int(wedge.group(2)) == want
-              and wedge.group(3) == finish,
-              "wedge error does not belong to wp7-stop%d (offset %d ms, "
-              "finish=%s): %r" % (current, want, finish, terminal[:200]))
+        outcome = OUTCOME_RE.fullmatch(wedge.group(2))
+        check("wedge-record",
+              outcome is not None
+              and all(wedge.group(2).count(key) == 1 for key in OUTCOME_KEYS),
+              "wedge terminal is not one whole linked StopOutcome record: %r"
+              % terminal[:300])
+        if outcome is not None:
+            check("wedge-binding",
+                  int(wedge.group(1)) == want
+                  and int(outcome.group(1)) == want
+                  and outcome.group(3) == finish
+                  and outcome.group(6) == ("true" if latch == "latched"
+                                           else "false"),
+                  "wedge error does not belong to wp7-stop%d (offset %d ms, "
+                  "finish=%s, %s): %r"
+                  % (current, want, finish, latch, terminal[:200]))
+            check("wedge-success",
+                  not (outcome.group(3) == "published"
+                       and outcome.group(9) == "joined"
+                       and outcome.group(11) == "true"),
+                  "wedge terminal describes a successful stop (published, "
+                  "joined, taken); the terminal check cannot fail on it: %r"
+                  % terminal[:200])
         check("wedge-unexpected", expect_wedge,
               "wedge reproduced under JOINT_EXPECTED_FAILURE=0 "
               "(regression); set 1 to re-arm the expectation")
@@ -367,6 +439,30 @@ def _classify(text, status, cell, expect_wedge, disabled, state):
                   % (where, terminal[:300]))
 
 
+def _check_text(check, line, phase, next_case, current):
+    """Position rules for free text: no evidence after a no-feed tag,
+    and case-bound diagnostics only inside the case they name."""
+    check("evidence-after-preclusion", phase != "nofeed",
+          "output after the no-feed tag of wp7-stop%s; the tag must be "
+          "followed directly by its receipt: %r" % (current, line[:200]))
+    bound = next_case if phase == "start" else current
+    for mention in CASE_MENTION_RE.findall(line):
+        check("text-binding", phase != "done" and int(mention) == bound,
+              "diagnostic names wp7-stop%s outside that case (phase %s of "
+              "wp7-stop%s): %r" % (mention, phase, bound, line[:200]))
+    outcome = OUTCOME_LINE_RE.fullmatch(line)
+    if outcome is not None:
+        stage = "linked" if outcome.group(1).startswith("outcome") else "offset"
+        check("text-binding",
+              phase == stage and current is not None
+              and int(outcome.group(2)) == OFFSETS_MS[current % 4],
+              "stop outcome diagnostic outside its linked case's %s stage: "
+              "%r" % (stage, line[:200]))
+    if re.search(r"wp7-stop[0-9]+: finish=", line):
+        check("text-binding", phase == "linked",
+              "stop finish diagnostic outside a linked case: %r" % line[:200])
+
+
 def _backtrace_only(after):
     """Only blank lines and one anyhow backtrace block may follow."""
     rest = [line for line in after]
@@ -377,6 +473,9 @@ def _backtrace_only(after):
     if rest[0] != BACKTRACE_HEAD:
         return False
     for line in rest[1:]:
+        if any(stem in line for stem in RECORD_STEMS) \
+                or RECEIPT_TEXT in line or WEDGE_PHRASE in line:
+            return False
         if line == "" or BACKTRACE_FRAME_RE.fullmatch(line) \
                 or BACKTRACE_NOTE_RE.fullmatch(line):
             continue

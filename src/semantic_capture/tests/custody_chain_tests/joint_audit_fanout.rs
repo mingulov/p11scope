@@ -9202,7 +9202,10 @@ fn joint_machine_unlinked_followup_publishes_without_break() {
 /// publishes its counted negative and ends the Joint feed with its
 /// named gap; the next collect ends Joint for every existing key and
 /// re-syncs above a fence on the consumed history, so the follow-up
-/// call still publishes its S1 edge.
+/// call still publishes its S1 edge. A fresh instance may then
+/// re-enter Joint past the fence (owner ruling: a loss never stops
+/// handling — disclose and continue); only the pre-break feed itself
+/// is pinned S1Only.
 #[test]
 fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     let mut fixture = MachineScene::new(1);
@@ -9211,6 +9214,15 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
         "the break is taken on a linked lane"
     );
     fixture.prime(1);
+    let pre_break_ids: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| record.id)
+        .collect();
     let revision = fixture
         .scene
         .real
@@ -9370,17 +9382,38 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
         )),
         "the malformed negative stays disclosed: {gaps:?}"
     );
-    assert_eq!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .registry()
-            .joint_feeds(),
-        0,
-        "the pre-break key never resumes Joint; its calls stay S1"
+    let feeds: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|record| (record.id, record.feed.mode()))
+        .collect();
+    for (id, mode) in &feeds {
+        if pre_break_ids.contains(id) {
+            assert_eq!(
+                *mode,
+                crate::semantics_key_use::FeedMode::S1Only,
+                "the pre-break feed never resumes Joint: {feeds:?}"
+            );
+        }
+    }
+    let joint: Vec<_> = feeds
+        .iter()
+        .filter(|(_, mode)| *mode == crate::semantics_key_use::FeedMode::Joint)
+        .collect();
+    assert!(
+        joint.len() <= 1,
+        "at most the fresh instance re-enters Joint: {feeds:?}"
     );
+    for (id, _) in &joint {
+        assert!(
+            !pre_break_ids.contains(id),
+            "only a fresh instance re-enters Joint, never the pre-break feed: {feeds:?}"
+        );
+    }
     // The void itself is named too, not only the break quantum's seal:
     // its own fenced loss (consumed history fenced, staged custody
     // voided, no key refused) is disclosed even when no seal fails

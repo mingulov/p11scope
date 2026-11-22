@@ -529,8 +529,8 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   one shim, straight to `libc`: std's wrappers retry `EINTR` or grow
   buffers under one unit and are not used. An open buys two units
   (itself and its close, issued on drop); each read, `fstat`, `fstatfs`,
-  `stat`, readlink, pidfd poll and pid probe one unit, each after a
-  stop check, and none retries. The row reader reads 4 KiB chunks, buys
+  `stat`, readlink, pidfd poll, pid probe and replay `pread` one unit,
+  each after a stop check, and none retries. The row reader reads 4 KiB chunks, buys
   one more unit per 64 rows and refuses a row over 64 KiB before
   decoding or matching it. The stat start time is read as a whole
   record to end of file (a task name can hold a newline). The readlink
@@ -547,15 +547,25 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   one debit (a stop check plus one charged work unit) per native call:
   one `stat` of the mount-namespace link, compared with the admitted
   namespace, then one generation probe. A view whose namespace link is
-  gone, or whose leader already exited, keeps the cold retained-member
-  proof. A failed check is probed again only through the units
+  gone, or whose leader already exited, takes only the cold
+  retained-member proof: it requires the original leader at Z and every
+  member live, and never falls back to the warm leader route, so a
+  hidden namespace link on a live leader fails closed. There is one
+  closing path. A failed check is probed again only through the units
   reserved when the view's scan starts (five, the fallback pin's worst
   case), at most once, shared by the keep, staging and retirement
   decisions: only current keeps or stages, only changed retires,
   unknown leaves carried cursors untouched. The cache victim sorts live
   unless its generation is proved changed.
+- The replay re-reads each cached table's declared extent with one
+  metered `pread` of the held memory descriptor. A 3.x table whose
+  declared extension is unmapped, with its complete 68-slot legacy
+  prefix readable, re-proves that prefix alone and keeps publishing it
+  as `known_prefix` (the extension stays an unproven gap, OD35); a full
+  row or a tail refutation still needs the declared extent.
 - Replay outcomes are typed: bytes read, divergent, unavailable (a
-  short or failed read) or refused (the pass stop, the work charge, a
+  failed read, or a short one that stops inside the legacy prefix) or
+  refused (the pass stop, the work charge, a
   retained table key or a target charge). Only divergent bytes drop the
   carried cursor. On a running pass an unavailable or refused replay
   keeps the cursor and its rows and names the object as waiting for a
@@ -564,7 +574,9 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
 - A source guard test forbids std I/O and errno inspection inside the
   primitives, requires every kernel entry point to sit inside the shim,
   forbids raw I/O and errno inspection in the audited callers, and
-  requires the production closing proof and the typed replay outcomes.
+  requires the production closing proof (the cold arms through the
+  cold-only proof), the typed replay outcomes and one metered replay
+  read.
   A behaviour test runs every primitive at every credit count and with
   `EINTR` and `ENOENT` injected at each native call, counting the calls
   at the shim against the debits.

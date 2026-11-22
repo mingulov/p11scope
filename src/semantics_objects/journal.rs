@@ -6748,44 +6748,54 @@ impl JournalAdapter {
             && (!state.era_ended || self.death_marks.get(&key).is_some_and(|marks| marks.ended))
     }
 
-    /// Whether one image holds a void-fenced key a quarantine-end
-    /// mint could recover: a fenced key that is image-blocked but
-    /// live-flagged, or dead with recorded (possibly capable)
-    /// grounding. Ingest admits establishing calls for such images
-    /// so their proof can stage; every other tainted image keeps
-    /// refusing. Shed-tainted images hold no keys by construction
-    /// (the shed refusal no-ops once any key binds), so they never
-    /// offer a candidate; their own lift owns them.
+    /// Whether one image holds a key a quarantine-end mint could
+    /// recover: some void fenced history this run, and a key that is
+    /// image-blocked but live-flagged, or dead with recorded
+    /// (possibly capable) grounding. Ingest admits establishing
+    /// calls for such images so their proof can stage; every other
+    /// tainted image keeps refusing. Shed-tainted images hold no
+    /// keys by construction (the shed refusal no-ops once any key
+    /// binds), so they never offer a candidate; their own lift owns
+    /// them.
     fn quarantine_recovery_candidate(&self, image: (u64, u64)) -> bool {
         if !self.tainted_images.contains(&image) {
+            return false;
+        }
+        if self.voided_through == 0 {
             return false;
         }
         self.image_keys.get(&image).is_some_and(|siblings| {
             siblings.iter().any(|key| {
                 self.keys.get(key).is_some_and(|state| {
-                    state.void_fence > 0
-                        && ((state.refused || state.tainted || state.era_ended)
-                            && self.quarantine_death_recorded(*key)
-                            || (!state.refused
-                                && !state.tainted
-                                && !state.era_ended
-                                && self.image_taint_blocks(image, self.voided_through)))
+                    (state.refused || state.tainted || state.era_ended)
+                        && self.quarantine_death_recorded(*key)
+                        || (!state.refused
+                            && !state.tainted
+                            && !state.era_ended
+                            && self.image_taint_blocks(image, self.voided_through))
                 })
             })
         })
     }
 
-    /// Whether one admission ends its binding's quarantine: the
-    /// binding's latest incarnation is void-fenced and blocked
-    /// (image-tainted with live flags, or dead with recorded
-    /// grounding, capable allowed), and this admission carries new
-    /// object proof entirely after the void fence — an establishing
-    /// call whose retained staged original sits above the global
-    /// fence. The caller has already established that no live
-    /// incarnation exists. The mint itself certifies nothing: the
-    /// fresh incarnation converts only its own claimed post-fence
-    /// calls in a fresh model domain, while seals keep refusing the
-    /// old proof and births keep refusing below the fence.
+    /// Whether one admission ends its binding's quarantine: some
+    /// void fenced history this run (the global fence), the
+    /// binding's latest incarnation is blocked (image-tainted with
+    /// live flags, or dead with recorded grounding, capable
+    /// allowed), and this admission carries new object proof
+    /// entirely after the void fence — an establishing call whose
+    /// retained staged original sits above the global fence. The
+    /// caller has already established that no live incarnation
+    /// exists. The fence is deliberately global, not per-key: a key
+    /// minted after the last void never earns a per-key fence, and
+    /// requiring one strands its capable dooms (seen live); the
+    /// proof itself is current (admissions are current-quantum and
+    /// the staged original matches them physically), so it always
+    /// postdates the doom, and establishing calls are rare enough
+    /// to bound mints. The mint itself certifies nothing: the fresh
+    /// incarnation converts only its own claimed post-fence calls
+    /// in a fresh model domain, while seals keep refusing the old
+    /// proof and births keep refusing below the fence.
     fn quarantine_end_eligible(
         &self,
         admitted: &AdmittedInstanceCall,
@@ -6794,7 +6804,7 @@ impl JournalAdapter {
         let Some(state) = self.keys.get(&latest) else {
             return false;
         };
-        if state.void_fence == 0 || self.voided_through == 0 {
+        if self.voided_through == 0 {
             return false;
         }
         let image = (latest.cookie, latest.exec);
@@ -6982,52 +6992,22 @@ impl JournalAdapter {
         // ones).
         let fresh = !self.keys.contains_key(&key);
         let minted_incarnation = fresh && key.incarnation > 0;
-        // The authorizing siblings' newest fence (0 when none
-        // authorizes): a fresh binding beside void-fenced live
-        // registered siblings inherits it below.
-        let sibling_fence = if fresh && !minted_incarnation {
-            self.image_keys
+        let fenced_siblings = fresh
+            && !minted_incarnation
+            && self
+                .image_keys
                 .get(&(key.cookie, key.exec))
-                .map(|siblings| {
-                    siblings
-                        .iter()
-                        .filter(|sibling| {
-                            **sibling != key
-                                && self.key_is_live(**sibling)
-                                && self.keys.get(*sibling).is_some_and(|state| {
-                                    state.model_registered
-                                        && state.void_fence > 0
-                                        && state.void_fence >= state.sealed_through
-                                })
-                        })
-                        .map(|sibling| self.keys.get(sibling).map_or(0, |state| state.void_fence))
-                        .max()
-                        .unwrap_or(0)
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let fenced_siblings = sibling_fence > 0;
-        // Fence inheritance: a mint descends from the void era that
-        // authorized it, so a doom before the next void still mints
-        // onward on new proof instead of stranding unfenced. Vacuous
-        // for the newborn (no history at or below the inherited
-        // fence; births cut at the frontier) and invisible to every
-        // fence reader (all max with the global fence; the sibling
-        // rule keys on sealed progress past it, which a newborn
-        // never has).
-        let inherited_fence = if minted_incarnation {
-            let parent = JournalDomainKey {
-                incarnation: key.incarnation.saturating_sub(1),
-                ..key
-            };
-            self.keys.get(&parent).map_or(0, |parent| parent.void_fence)
-        } else if fenced_siblings {
-            sibling_fence
-        } else {
-            0
-        };
+                .is_some_and(|siblings| {
+                    siblings.iter().any(|sibling| {
+                        *sibling != key
+                            && self.key_is_live(*sibling)
+                            && self.keys.get(sibling).is_some_and(|state| {
+                                state.model_registered
+                                    && state.void_fence > 0
+                                    && state.void_fence >= state.sealed_through
+                            })
+                    })
+                });
         if let std::collections::btree_map::Entry::Vacant(vacant) = self.keys.entry(key) {
             if minted_incarnation {
                 self.reentry_incarnations = self.reentry_incarnations.saturating_add(1);
@@ -7037,10 +7017,12 @@ impl JournalAdapter {
             } else if fenced_siblings {
                 self.reentry_sibling_binds = self.reentry_sibling_binds.saturating_add(1);
             }
-            vacant.insert(JournalDomainState {
-                void_fence: inherited_fence,
-                ..JournalDomainState::default()
-            });
+            // Newborn keys start unfenced: the death rule mints only
+            // past a real void fence (one mint per void era per
+            // binding — the brake that stops doom/mint cycles), and
+            // quarantine-end scopes itself on the global fence plus
+            // current post-fence proof instead.
+            vacant.insert(JournalDomainState::default());
             self.image_keys
                 .entry((key.cookie, key.exec))
                 .or_default()

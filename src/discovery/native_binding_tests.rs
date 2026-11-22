@@ -1943,6 +1943,7 @@ fn bounds_are_counted_never_silent() {
         pending: 1,
         cookies: 1,
         exec_tgids: 1,
+        retry: 10,
     });
     let d = run.domain;
     run.world.admit(T, 1, 0, 1_000);
@@ -1969,6 +1970,7 @@ fn bounds_are_counted_never_silent() {
         pending: 1,
         cookies: 10,
         exec_tgids: 10,
+        retry: 10,
     });
     let w = waiting.domain;
     waiting.read(vec![
@@ -2541,10 +2543,7 @@ fn a_decided_no_live_caller_row_rebinds_once_its_caller_is_admitted() {
     let d = run.domain;
     run.read(vec![row(d, 7, 1, T, 1_500)]);
     run.settle();
-    assert_eq!(
-        run.verdicts(),
-        vec![unbound(UnboundReason::NoLiveCaller)]
-    );
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
     let x = run.world.admit(T, 1, 0, 2_000);
     run.world.answer(T, 1, d, cookie(d, 7));
     run.read(Vec::new());
@@ -2570,10 +2569,7 @@ fn a_decided_no_live_caller_row_never_rebinds_a_mismatched_cookie() {
     let d = run.domain;
     run.read(vec![row(d, 7, 1, T, 1_500)]);
     run.settle();
-    assert_eq!(
-        run.verdicts(),
-        vec![unbound(UnboundReason::NoLiveCaller)]
-    );
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
     run.world.admit(T, 1, 0, 2_000);
     run.world.answer(T, 1, d, cookie(d, 99));
     run.read(Vec::new());
@@ -2589,10 +2585,196 @@ fn a_decided_no_live_caller_row_never_rebinds_a_mismatched_cookie() {
         ),
         (1, 0, 1, 0)
     );
+    assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+}
+
+#[test]
+fn identity_retry_pass_is_bounded_per_pass_and_resumes() {
+    // Seventy decided rows wait for re-observation and every caller is
+    // admitted with a matching ticket: one pass queries exactly its
+    // allowance (64) and re-pends those rows in queue order, the rest
+    // stay queued, and the next pass resumes with them.
+    let mut run = Run::new();
+    let d = run.domain;
+    let rows: Vec<WitnessRow> = (0..70)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(rows);
+    run.settle();
+    assert_eq!(run.verdicts().len(), 70);
+    for i in 0..70 {
+        run.world.admit(T + i as u32, 1, 1_000 + i as u32, 2_000);
+        run.world.answer(T + i as u32, 1, d, cookie(d, 100 + i));
+    }
+    run.read(Vec::new());
+    let verdicts = run.verdicts();
+    assert_eq!(verdicts.len(), 64);
+    assert!(
+        verdicts
+            .iter()
+            .enumerate()
+            .all(|(at, verdict)| *verdict == bound(CallerId(1_000 + at as u32))),
+        "re-pends in queue order: {verdicts:?}"
+    );
+    assert_eq!(run.world.queries, 64);
+    assert_eq!(run.binder.retry_len_for_test(d), 6);
+    run.read(Vec::new());
+    let verdicts = run.verdicts();
+    assert_eq!(verdicts.len(), 6);
+    assert!(
+        verdicts
+            .iter()
+            .enumerate()
+            .all(|(at, verdict)| *verdict == bound(CallerId(1_064 + at as u32))),
+        "the next pass resumes with the remainder: {verdicts:?}"
+    );
+    assert_eq!(run.binder.retry_len_for_test(d), 0);
+    let census = run.binder.census();
     assert_eq!(
-        census.unbound.get(&UnboundReason::NoLiveCaller),
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (70, 70, 0, 0)
+    );
+}
+
+#[test]
+fn identity_retry_visits_unvisited_rows_first() {
+    // More retained rows than the visit allowance: one pass visits
+    // the first 1,024 and leaves the rest queued ahead of the
+    // revisited ones. When only those unvisited rows' callers are
+    // admitted, the next pass re-sights exactly them first — a
+    // restart would revisit the same first 1,024 and sight nothing.
+    let mut run = Run::new();
+    let d = run.domain;
+    let rows: Vec<WitnessRow> = (0..1_030)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(rows);
+    run.settle();
+    assert_eq!(run.verdicts().len(), 1_024);
+    run.read(Vec::new());
+    assert_eq!(run.verdicts().len(), 6);
+    assert_eq!(run.binder.retry_len_for_test(d), 1_030);
+    // Drain the visit allowance once with nobody admitted: rows past
+    // it stay queued ahead of the revisited ones.
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), Vec::new());
+    for i in 1_024..1_030 {
+        run.world.admit(T + i as u32, 1, 2_000 + i as u32, 2_000);
+        run.world.answer(T + i as u32, 1, d, cookie(d, 100 + i));
+    }
+    run.world.lookups.set(0);
+    run.read(Vec::new());
+    let verdicts = run.verdicts();
+    assert_eq!(verdicts.len(), 6);
+    assert!(
+        verdicts
+            .iter()
+            .enumerate()
+            .all(|(at, verdict)| *verdict == bound(CallerId(3_024 + at as u32))),
+        "the unvisited rows go first: {verdicts:?}"
+    );
+    assert_eq!(run.world.lookups.get(), 1_024);
+    assert_eq!(run.binder.retry_len_for_test(d), 1_024);
+}
+
+/// The retry completion clock answers far ahead of the scripted
+/// horizons: a re-pended row waits for horizons past its fresh query
+/// instead of deciding on its old read.
+fn retry_completed_far_ahead() -> Option<u64> {
+    Some(999_999)
+}
+
+#[test]
+fn identity_retry_flush_at_finish_flips_the_outcome() {
+    // A re-pended row still waiting for its fresh horizons when the
+    // domain finishes flushes as a re-observation: the finish verdict
+    // supersedes the retained live-miss, the census flips, and the
+    // retry set clears.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.binder.set_resight_clock(retry_completed_far_ahead);
+    run.read(vec![row(d, 7, 1, T, 1_500), row(d, 8, 1, T + 1, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![
+            unbound(UnboundReason::NoLiveCaller),
+            unbound(UnboundReason::NoLiveCaller)
+        ]
+    );
+    let _ = run.world.admit(T, 1, 0, 2_000);
+    run.world.answer(T, 1, d, cookie(d, 7));
+    run.read(Vec::new());
+    assert_eq!(run.verdicts(), Vec::new(), "fresh horizons still owed");
+    assert_eq!(run.binder.census().pending, 1);
+    assert_eq!(run.binder.retry_len_for_test(d), 1);
+    run.binder.finish(d);
+    let decisions = run.binder.take_decisions();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|decision| (decision.binding, decision.retry))
+            .collect::<Vec<_>>(),
+        vec![(
+            unbound(UnboundReason::EvidenceIncomplete),
+            DecisionRetry::Reobserved
+        )]
+    );
+    assert_eq!(run.binder.retry_len_for_test(d), 0);
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (2, 0, 2, 0)
+    );
+    assert_eq!(
+        census.unbound.get(&UnboundReason::EvidenceIncomplete),
         Some(&1)
     );
+    assert_eq!(
+        census.unbound.get(&UnboundReason::NoLiveCaller),
+        Some(&1),
+        "only the queued row keeps its live-miss"
+    );
+}
+
+#[test]
+fn identity_retry_sheds_past_its_bound() {
+    // A retry set of one: the first decided row is retained, the
+    // second sheds and keeps exactly its initial unbound verdict.
+    let mut run = Run::with_limits(BinderLimits {
+        pending: 10,
+        cookies: 10,
+        exec_tgids: 10,
+        retry: 1,
+    });
+    let d = run.domain;
+    run.read(vec![row(d, 7, 1, T, 1_500), row(d, 8, 1, T + 1, 1_500)]);
+    run.settle();
+    let decisions = run.binder.take_decisions();
+    assert_eq!(
+        decisions
+            .iter()
+            .map(|decision| (decision.binding, decision.retry))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                unbound(UnboundReason::NoLiveCaller),
+                DecisionRetry::RetainedForRetry
+            ),
+            (unbound(UnboundReason::NoLiveCaller), DecisionRetry::Initial),
+        ]
+    );
+    assert_eq!(run.binder.retry_len_for_test(d), 1);
 }
 
 #[test]

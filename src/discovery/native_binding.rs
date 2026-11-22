@@ -432,11 +432,28 @@ pub(crate) enum Binding {
     Unbound(UnboundReason),
 }
 
+/// Which observation of the row a decision reports: its first decision
+/// (`Initial`), a first `NoLiveCaller` decision whose row the binder
+/// retains for re-observation (`RetainedForRetry`), or the re-observation
+/// of such a row from fresh proof on a later pass (`Reobserved`). Only
+/// `NoLiveCaller` rows are ever retained: every other refusal names a
+/// condition later proof cannot repair (a dirty window, a competing
+/// image, lost evidence, or infrastructure), while a live-miss may only
+/// mean the scan has not admitted the caller yet. A re-observation never
+/// retains again: one retry per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecisionRetry {
+    Initial,
+    RetainedForRetry,
+    Reobserved,
+}
+
 /// One decided witness row.
 #[derive(Debug, Clone)]
 pub(crate) struct Decision {
     pub row: WitnessRow,
     pub binding: Binding,
+    pub retry: DecisionRetry,
 }
 
 /// Proof that one incarnation's image ended, seen natively: under the
@@ -533,7 +550,10 @@ pub(crate) struct BinderRetentionRows {
 }
 
 /// Table bounds. Every bound reached is a counted `Capacity` verdict (or a
-/// lifecycle loss for the exec table), never silent.
+/// lifecycle loss for the exec table), never silent. A decided
+/// `NoLiveCaller` row past the retry bound is shed instead of retained:
+/// it keeps its unbound verdict (the coordinator discloses the shed),
+/// exactly the pre-retry behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BinderLimits {
     /// Rows waiting for their horizons, per domain.
@@ -542,6 +562,8 @@ pub(crate) struct BinderLimits {
     pub cookies: usize,
     /// Distinct tgids with a remembered exec instant, per domain.
     pub exec_tgids: usize,
+    /// Decided `NoLiveCaller` rows retained for re-observation, per domain.
+    pub retry: usize,
 }
 
 /// The default bound: the caller-pair default `P` (a domain never holds
@@ -554,6 +576,7 @@ impl Default for BinderLimits {
             pending: DEFAULT_BINDER_LIMIT,
             cookies: DEFAULT_BINDER_LIMIT,
             exec_tgids: DEFAULT_BINDER_LIMIT,
+            retry: DEFAULT_BINDER_LIMIT,
         }
     }
 }
@@ -582,6 +605,20 @@ pub(crate) const RESIGHT_QUERIES_PER_PASS: usize = 64;
 /// visit allowance never reached keep their owed attempt for the
 /// next batch, in queue order.
 pub(crate) const RESIGHT_VISITS_PER_PASS: usize = 1_024;
+
+/// Cookie queries charged to one witness batch's identity-retry pass:
+/// the same cost model as the re-sight pass (one query is one slow
+/// unit under the INV-2 step contract), with its own allowance so
+/// decided rows awaiting re-observation never starve undecided rows
+/// waiting for their first attempt, or the reverse.
+pub(crate) const RETRY_QUERIES_PER_PASS: usize = 64;
+
+/// Live-lookup visits charged to one witness batch's identity-retry
+/// pass: each retained row the pass pops costs one visit. Rows the
+/// visit allowance never reached stay queued ahead of the revisited
+/// ones, so the next batch resumes with them in queue order (fair
+/// round-robin, never a restart, never a whole-queue scan).
+pub(crate) const RETRY_VISITS_PER_PASS: usize = 1_024;
 
 /// What the cookie query said when the row was read, through the live
 /// incarnation's pin.
@@ -638,6 +675,22 @@ struct Pending {
     /// A row decides sightingless only on a miss from its own batch;
     /// an earlier miss is stale once later evidence may have arrived.
     last_attempt: Option<u64>,
+    /// A re-observation from the identity-retry queue (`true`) rather
+    /// than the row's first sighting (`false`). A re-observation
+    /// decides through the same §3.3 rules but is never retained
+    /// again: one retry per row.
+    retried: bool,
+}
+
+/// One decided `NoLiveCaller` row retained for re-observation: the
+/// row plus its original read stamp. The retry pass re-sights it
+/// against the live incarnation table on later passes; a fresh
+/// ticket match re-pends it with a fresh late sighting, and the
+/// normal horizons-plus-§3.3 path decides it from current proof.
+#[derive(Debug, Clone)]
+struct RetryRow {
+    row: WitnessRow,
+    read_ns: Option<u64>,
 }
 
 /// Whether `candidate` may carry the row at `event_ns`: proven
@@ -711,6 +764,14 @@ struct DomainState {
     callers: HashMap<CallerId, (DomainCookie, u64)>,
     /// Incarnations whose image already ended (a transition was emitted).
     ended: HashSet<CallerId>,
+    /// Decided `NoLiveCaller` rows retained for re-observation, in
+    /// decision order. Each witness batch's retry pass pops from the
+    /// front within its visit and query allowances and pushes
+    /// unmatched rows back, so a backlog past the allowances is
+    /// revisited in queue order (fair round-robin) without ever
+    /// scanning. Bounded by [`BinderLimits::retry`]; past it decided
+    /// rows shed (they keep their unbound verdict).
+    retry: VecDeque<RetryRow>,
 }
 
 /// One exec sequence of one ticket: who holds it, and its latest row.
@@ -746,6 +807,7 @@ impl DomainState {
             cookies: HashMap::new(),
             callers: HashMap::new(),
             ended: HashSet::new(),
+            retry: VecDeque::new(),
         }
     }
 
@@ -1172,6 +1234,21 @@ impl NativeBinder {
         self.domains.iter().map(|domain| domain.exec_ns.len()).sum()
     }
 
+    /// Test-only: decided rows retained for re-observation in `domain`.
+    #[cfg(test)]
+    pub(crate) fn retry_len_for_test(&self, domain: NativeDomainId) -> usize {
+        self.domain_indices
+            .get(&domain)
+            .map(|index| self.domains[*index].retry.len())
+            .unwrap_or(0)
+    }
+
+    /// Test-only: shrink the per-domain retry bound (shed coverage).
+    #[cfg(test)]
+    pub(crate) fn set_retry_limit_for_test(&mut self, limit: usize) {
+        self.limits.retry = limit;
+    }
+
     /// Test-only: remembered exec sequences across all open domains.
     #[cfg(test)]
     pub(crate) fn cookie_sequences_for_test(&self) -> usize {
@@ -1278,6 +1355,11 @@ impl NativeBinder {
         // newly reads were just attempted by the read-time lookup, so
         // the pass only owes rows carried from earlier batches.
         let outcome = self.resight_pass(index, lookup, identity);
+        // The identity-retry pass runs next, under its own allowances:
+        // decided `NoLiveCaller` rows carried from earlier batches get
+        // their fresh re-sight, while undecided rows keep their
+        // first-attempt priority above.
+        self.retry_pass(index, lookup, identity);
         let read_ns = stamp(batch.rows_read_ns);
         self.census.integrity += batch.integrity.len() as u64;
         for row in &batch.rows {
@@ -1290,13 +1372,17 @@ impl NativeBinder {
                 .and_then(|execs| execs.get(&row.exec_id()))
                 .and_then(|seen| seen.bound)
             {
-                self.record(row.clone(), Binding::Bound(caller));
+                self.record(row.clone(), Binding::Bound(caller), DecisionRetry::Initial);
                 continue;
             }
             if !state.cookies.contains_key(&cookie) && state.cookies.len() >= limits.cookies
                 || state.pending.len() >= limits.pending
             {
-                self.record(row.clone(), Binding::Unbound(UnboundReason::Capacity));
+                self.record(
+                    row.clone(),
+                    Binding::Unbound(UnboundReason::Capacity),
+                    DecisionRetry::Initial,
+                );
                 continue;
             }
             let seen = state
@@ -1347,6 +1433,7 @@ impl NativeBinder {
                 retained,
                 resight_due: due,
                 last_attempt: None,
+                retried: false,
             });
             state.next_pos += 1;
             self.census.pending += 1;
@@ -1473,6 +1560,112 @@ impl NativeBinder {
             ResightOutcome::Complete
         } else {
             ResightOutcome::Incomplete
+        }
+    }
+
+    /// One bounded identity-retry pass over the domain's retained
+    /// rows, in queue order: at most [`RETRY_VISITS_PER_PASS`] popped
+    /// rows get their live lookup, and at most
+    /// [`RETRY_QUERIES_PER_PASS`] live hits are queried. A hit whose
+    /// fresh cookie answer equals the row's ticket re-pends the row
+    /// with a fresh late sighting (an exited hit with the one
+    /// unambiguous retained incarnation re-pends through that
+    /// fallback instead, exactly like the read loop); the normal
+    /// horizons-plus-§3.3 path then decides it from current proof, one
+    /// to two batches later. Anything else — a miss, a mismatched or
+    /// unavailable answer, an exited hit without a fallback, a hit
+    /// past the query allowance, or an unstamped query under a modeled
+    /// clock — keeps its place for a later pass, pushed back in queue
+    /// order, so the next batch resumes fairly. A re-pended row
+    /// decides through the full §3.3 rules, never around them: PID
+    /// reuse answers another ticket and never re-pends, and an exec
+    /// or loss since the admission refuses at re-decision.
+    fn retry_pass<Pin>(
+        &mut self,
+        index: usize,
+        lookup: &dyn CallerLookup<Pin>,
+        identity: &mut dyn NativeIdentity<Pin>,
+    ) {
+        let mut visits = 0usize;
+        let mut queries = 0usize;
+        let mut sighted: Vec<(RetryRow, Sighting, Option<RetainedCaller>)> = Vec::new();
+        while visits < RETRY_VISITS_PER_PASS {
+            let Some(candidate) = self.domains[index].retry.pop_front() else {
+                break;
+            };
+            visits += 1;
+            let Some(hit) = lookup.live_caller(candidate.row.host_tgid) else {
+                self.domains[index].retry.push_back(candidate);
+                continue;
+            };
+            if queries >= RETRY_QUERIES_PER_PASS {
+                // A hit past the query allowance stays queued for the
+                // next pass while later rows are still visited.
+                self.domains[index].retry.push_back(candidate);
+                continue;
+            }
+            queries += 1;
+            let query = identity.query_cookie(candidate.row.domain, hit.pin);
+            let matched = matches!(&query, CookieQuery::Cookie(answered) if *answered == candidate.row.cookie());
+            // An exited hit may still re-pend through the one
+            // unambiguous retained incarnation, exactly like the read
+            // loop; anything else without a ticket match waits.
+            let retained = (matches!(&query, CookieQuery::Exited) && !matched)
+                .then(|| lookup.retained_callers(candidate.row.host_tgid))
+                .and_then(|held| {
+                    let [only] = held.as_slice() else {
+                        return None;
+                    };
+                    retained_candidate(only, candidate.row.recorded_at_ns).then_some(*only)
+                });
+            if !matched && retained.is_none() {
+                self.domains[index].retry.push_back(candidate);
+                continue;
+            }
+            sighted.push((
+                candidate,
+                Sighting {
+                    caller: hit.id,
+                    first_seen_ns: hit.first_seen_ns,
+                    query,
+                    late: true,
+                    sighted_ns: None,
+                },
+                retained,
+            ));
+        }
+        // Pass completion, read after every query: it covers each
+        // query's completion, so horizons past it are past them. A
+        // modeled clock that answers nothing sends every sighted row
+        // back unstamped for a retry (mirroring the re-sight pass); an
+        // unmodeled test clock keeps the legacy read-threshold
+        // fallback below.
+        let completed = if sighted.is_empty() {
+            None
+        } else {
+            self.resight_stamp()
+        };
+        if completed.is_none() && !sighted.is_empty() && self.resight_clock_modeled() {
+            let state = &mut self.domains[index];
+            for (candidate, _, _) in sighted {
+                state.retry.push_back(candidate);
+            }
+            return;
+        }
+        let state = &mut self.domains[index];
+        for (candidate, mut sighting, retained) in sighted {
+            sighting.sighted_ns = completed;
+            state.pending.push_back(Pending {
+                row: candidate.row,
+                read_ns: candidate.read_ns,
+                sighting: Some(sighting),
+                retained,
+                resight_due: false,
+                last_attempt: None,
+                retried: true,
+            });
+            state.next_pos += 1;
+            self.census.pending += 1;
         }
     }
 
@@ -1710,6 +1903,9 @@ impl NativeBinder {
         let index = self.domain_index(domain);
         self.domains[index].finished = true;
         self.domains[index].owed.clear();
+        // Retained rows were already decided and disclosed; their folds
+        // stand and no re-observation follows the domain's end.
+        self.domains[index].retry.clear();
         while let Some(pending) = self.domains[index].pending.pop_front() {
             self.domains[index].popped += 1;
             self.census.pending -= 1;
@@ -1718,16 +1914,42 @@ impl NativeBinder {
             } else {
                 UnboundReason::EvidenceIncomplete
             };
-            self.record(pending.row, Binding::Unbound(reason));
+            // A flushed re-observation still flips its row's outcome
+            // (and releases its pair): the finish verdict supersedes
+            // the retained live-miss like any re-decision.
+            let retry = if pending.retried {
+                DecisionRetry::Reobserved
+            } else {
+                DecisionRetry::Initial
+            };
+            self.record(pending.row, Binding::Unbound(reason), retry);
         }
     }
 
-    fn record(&mut self, row: WitnessRow, binding: Binding) {
+    fn record(&mut self, row: WitnessRow, binding: Binding, retry: DecisionRetry) {
         match binding {
             Binding::Bound(_) => self.census.bound += 1,
             Binding::Unbound(reason) => *self.census.unbound.entry(reason).or_default() += 1,
         }
-        self.decided.push(Decision { row, binding });
+        // A re-observation flips the row's outcome instead of counting
+        // it twice: only `NoLiveCaller` rows are ever retained, so the
+        // re-decision moves exactly one row out of that bucket. The
+        // census keeps reading one outcome per row seen
+        // (`rows == bound + unbound + pending`); the superseded verdict
+        // stays visible in the staged diagnostics history.
+        if retry == DecisionRetry::Reobserved
+            && let Some(count) = self.census.unbound.get_mut(&UnboundReason::NoLiveCaller)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.census.unbound.remove(&UnboundReason::NoLiveCaller);
+            }
+        }
+        self.decided.push(Decision {
+            row,
+            binding,
+            retry,
+        });
     }
 
     fn decide_ready(&mut self, index: usize) {
@@ -1803,7 +2025,28 @@ impl NativeBinder {
                 self.exit_clocks_comparable,
                 &mut self.transitions,
             );
-            self.record(pending.row, binding);
+            // A first `NoLiveCaller` decision retains the row for
+            // re-observation: the scan may admit the caller later, and a
+            // later pass can then bind from fresh proof. Past the retry
+            // bound the row sheds (it keeps exactly its unbound verdict).
+            // A re-observation is never retained again.
+            let mut retry = if pending.retried {
+                DecisionRetry::Reobserved
+            } else {
+                DecisionRetry::Initial
+            };
+            if !pending.retried && matches!(binding, Binding::Unbound(UnboundReason::NoLiveCaller))
+            {
+                let state = &mut self.domains[index];
+                if state.retry.len() < self.limits.retry {
+                    state.retry.push_back(RetryRow {
+                        row: pending.row.clone(),
+                        read_ns: pending.read_ns,
+                    });
+                    retry = DecisionRetry::RetainedForRetry;
+                }
+            }
+            self.record(pending.row, binding, retry);
         }
     }
 }

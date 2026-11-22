@@ -3705,6 +3705,20 @@ enum Mutation {
         /// `no_mapping_edge` path whose caller is known).
         image: Option<UnboundImage>,
     },
+    /// Retract one staged single-module unbound fold after the
+    /// identity retry bound the row from fresh proof: the edge now
+    /// carries the calls, so the module-level fold (rows, entries,
+    /// reason count, image calls, and the module placement) unwinds
+    /// exactly once. Gaps and diagnostics stay: the row genuinely
+    /// was unbound, and the retraction is itself ordered history.
+    /// Staged only for folds this capture staged (the coordinator
+    /// tracks them); anything missing is a defensive no-op.
+    RetractUnboundFold {
+        module: ModuleKey,
+        code: &'static str,
+        entries: u64,
+        cookie: DomainCookie,
+    },
     NoteUnresolvedWitness,
     NoteUseBeforeAdmission {
         caller: CallerId,
@@ -5506,6 +5520,25 @@ impl CallerRegistry {
         });
     }
 
+    /// Stage the retraction of one single-module unbound fold after
+    /// the identity retry bound the row from fresh proof. `entries`
+    /// and `cookie` are the folded values; `code` is the fold's
+    /// reason code.
+    pub(crate) fn retract_unbound_fold(
+        &mut self,
+        module: ModuleKey,
+        code: &'static str,
+        entries: u64,
+        cookie: DomainCookie,
+    ) {
+        self.staged.push(Mutation::RetractUnboundFold {
+            module,
+            code,
+            entries,
+            cookie,
+        });
+    }
+
     /// Stage one decided witness row whose endpoint resolved to no admitted
     /// module (the caller records the gap): counted, never shown.
     pub(crate) fn note_unresolved_witness(&mut self) {
@@ -6598,6 +6631,12 @@ impl CallerRegistry {
                 [] => self.witness_placement.unresolved += 1,
                 shared => self.apply_shared_endpoint(shared, reason.text()),
             },
+            Mutation::RetractUnboundFold {
+                module,
+                code,
+                entries,
+                cookie,
+            } => self.apply_retract_unbound_fold(&module, code, entries, cookie),
             Mutation::NoteUnresolvedWitness => self.witness_placement.unresolved += 1,
             Mutation::NoteUseBeforeAdmission {
                 caller,
@@ -7423,6 +7462,74 @@ impl CallerRegistry {
                      attributed by pid"
                 ),
             );
+        }
+    }
+
+    /// Unwind one staged single-module unbound fold after the
+    /// identity retry bound the row: rows, folded entries, the reason
+    /// count, the image's folded calls (per-module and run-wide), and
+    /// the module placement each step back exactly once, so the
+    /// placement invariants (`module` equals the rows sum; the total
+    /// equals the census outcomes) hold across the flip. A reason or
+    /// image count that reaches zero leaves its map: no row with that
+    /// reason or image remains. A fully emptied fold (no rows,
+    /// entries, reasons, or images, and no sticky saturation history)
+    /// clears back to no unbound use, so a later fold re-baselines
+    /// its first instant instead of inheriting a stale minimum.
+    /// Earliest-instant minimums otherwise keep their committed
+    /// values (a minimum cannot unwind without the other rows'
+    /// instants): bounded informational staleness under partial
+    /// retraction, documented, never a count. Gaps stay: they are
+    /// event history, and the row genuinely was unbound.
+    fn apply_retract_unbound_fold(
+        &mut self,
+        key: &ModuleKey,
+        code: &'static str,
+        entries: u64,
+        cookie: DomainCookie,
+    ) {
+        let Some(id) = self.modules_by_key.get(key).copied() else {
+            debug_assert!(false, "retraction names a registered module");
+            return;
+        };
+        {
+            let module = self.modules.get_mut(&id).expect("indexed module");
+            let Some(unbound) = module.unbound_use.as_mut() else {
+                debug_assert!(false, "retraction unwinds a staged fold");
+                return;
+            };
+            unbound.rows = unbound.rows.saturating_sub(1);
+            unbound.entries = unbound.entries.saturating_sub(entries);
+            if let Some(count) = unbound.reasons.get_mut(code) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    unbound.reasons.remove(code);
+                }
+            }
+            if let Some(known) = unbound.images.get_mut(&cookie) {
+                known.calls_at_least = known.calls_at_least.saturating_sub(entries);
+                if known.calls_at_least == 0 {
+                    unbound.images.remove(&cookie);
+                }
+            }
+        }
+        if let Some(known) = self.unidentified_images.get_mut(&cookie) {
+            known.calls_at_least = known.calls_at_least.saturating_sub(entries);
+            if known.calls_at_least == 0 {
+                self.unidentified_images.remove(&cookie);
+            }
+        }
+        self.witness_placement.module = self.witness_placement.module.saturating_sub(1);
+        let module = self.modules.get_mut(&id).expect("indexed module");
+        if module.unbound_use.as_ref().is_some_and(|unbound| {
+            unbound.rows == 0
+                && unbound.entries == 0
+                && unbound.reasons.is_empty()
+                && unbound.images.is_empty()
+                && !unbound.images_saturated
+                && unbound.pids_dropped == 0
+        }) {
+            module.unbound_use = None;
         }
     }
 

@@ -202,7 +202,7 @@ fn dropped_pair_raw_reads_remain_diagnostic_without_becoming_published_counts() 
             coordinator
                 .registry
                 .note_retirement_count_gap(scene.caller, 161950, 162003);
-            coordinator.drop_pair_count(&row, DiagnosticReason::IdentityChanged);
+            coordinator.drop_pair_count(&row, DiagnosticReason::IdentityChanged, false);
             coordinator.commit_batch(false).unwrap();
             let NativeBatch::Witness(mut read) =
                 scene.native.stamps.read(scene.native.domain, Vec::new())

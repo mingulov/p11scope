@@ -1878,6 +1878,7 @@ impl CallerRegistry {
             | Mutation::NoteWitness { .. }
             | Mutation::NoteBoundWitness { .. }
             | Mutation::NoteUnboundWitness { .. }
+            | Mutation::RetractUnboundFold { .. }
             | Mutation::NoteUnresolvedWitness
             | Mutation::NoteUseBeforeAdmission { .. }
             | Mutation::NoteWitnessCensus { .. }

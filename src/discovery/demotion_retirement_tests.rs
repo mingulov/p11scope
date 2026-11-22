@@ -8404,6 +8404,7 @@ fn demotion_retirement_round6_dropped_pair_recovery_settles_at_fold() {
     let base = scene.native.scene.coordinator.drop_pair_count(
         &row,
         crate::inventory_diagnostics::DiagnosticReason::NotAdmitted,
+        false,
     );
     let coordinator = &scene.native.scene.coordinator;
     assert!(
@@ -8601,6 +8602,7 @@ fn demotion_retirement_round6_gone_caller_recovery_settles_without_suspend() {
     let base = scene.native.scene.coordinator.drop_pair_count(
         &row,
         crate::inventory_diagnostics::DiagnosticReason::NotAdmitted,
+        false,
     );
     assert_ne!(
         base, watermark,

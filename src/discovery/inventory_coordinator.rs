@@ -53,8 +53,8 @@ use crate::discovery::inventory_attach_set::{
 };
 use crate::discovery::native_binding::{
     BinderLimits, Binding, BoundImage, CallerLookup, CurrentBindingCheck, CurrentBindingRequest,
-    CurrentBindingSighting, Decision, ExecTransition, LiveCaller, NativeBinder, NativeIdentity,
-    RetainedCaller, UnboundReason,
+    CurrentBindingSighting, Decision, DecisionRetry, ExecTransition, LiveCaller, NativeBinder,
+    NativeIdentity, RetainedCaller, UnboundReason,
 };
 use crate::discovery::scan::{
     INVENTORY_WINDOW_IO_BYTES, InventoryDiscoveryLimits, InventoryRetainedLimits,
@@ -732,6 +732,18 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// `pair_dropped_tombstones` once their base is older than the
     /// grace, keeping the exact base for a late revival.
     pair_targets: HashMap<PairKey, PairTarget>,
+    /// Dropped pairs whose `NoLiveCaller` row the binder retained for
+    /// re-observation: while marked, refresh absolutes keep merging
+    /// into the held count (re-observed, never staged) and the prune
+    /// pass leaves the target alone, so a later re-bind places the
+    /// fresh absolute. The value names the staged single-module fold
+    /// to retract on a retry bind (`None`: the drop folded nothing —
+    /// an unadmitted module or a shared endpoint). One entry per
+    /// retained row at most, so the map is bounded by the binder's
+    /// retry bound; entries release on the re-decision (bind or
+    /// second unbound verdict), on the domain's finish, or never for
+    /// a row that never re-decides (its fold stands, honestly).
+    retry_owed: HashMap<PairKey, Option<RetryFold>>,
     /// Dropped pair bases pruned out of `pair_targets`, bounded. A late
     /// row for one of these pairs still rebases past this exact base,
     /// so pruning never double-counts it. Past the bound a due row is
@@ -1402,6 +1414,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             timens_boottime_ok: None,
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
+            retry_owed: HashMap::new(),
             pair_dropped_tombstones: HashMap::new(),
             pair_dropped_totals: HashMap::new(),
             pair_prune_overflow: 0,
@@ -5682,7 +5695,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .iter()
             .filter_map(|(key, target)| match target {
                 PairTarget::Dropped { base_since, .. }
-                    if now_ns.saturating_sub(*base_since) >= EXEC_STATE_GRACE_NS =>
+                    if now_ns.saturating_sub(*base_since) >= EXEC_STATE_GRACE_NS
+                        && !self.retry_owed.contains_key(key) =>
                 {
                     Some(*key)
                 }
@@ -8245,13 +8259,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The domain will produce no more evidence: drop its departed
     /// tombstone maps (both would otherwise live for the whole capture)
     /// and its EXEC-loss latch. Pair totals stay: they are the exact
-    /// counted aggregate, not per-pair revival state.
+    /// counted aggregate, not per-pair revival state. Retained retry
+    /// pairs release their held absolutes (their folds stand: no
+    /// re-observation follows the domain's end) and prune normally
+    /// afterwards.
     fn finish_native_domain(&mut self, domain: NativeDomainId) {
         self.exec_pruned
             .retain(|cookie, _| cookie.domain() != domain);
         self.exec_loss_domains.remove(&domain);
         self.pair_dropped_tombstones
             .retain(|key, _| key.image.domain() != domain);
+        let owed: Vec<PairKey> = self
+            .retry_owed
+            .keys()
+            .filter(|key| key.image.domain() == domain)
+            .copied()
+            .collect();
+        for key in owed {
+            self.retry_owed.remove(&key);
+            self.pair_counts.remove(&key);
+        }
     }
 
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
@@ -8670,7 +8697,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.pair_targets.get(&key),
                 Some(PairTarget::Dropped { .. })
             ) || self.pair_dropped_tombstones.contains_key(&key);
-            if !dropped {
+            // A pair the binder retained for re-observation keeps
+            // merging absolutes while dropped (re-observed, never
+            // staged: the target arms below still ignore it), so a
+            // later re-bind places the fresh absolute. Every other
+            // dropped pair gains no retained count state or placement.
+            let reobserve = dropped && self.retry_owed.contains_key(&key);
+            if !dropped || reobserve {
                 self.pair_counts
                     .entry(key)
                     .or_insert(HeldPairCount::new(PairCount {
@@ -8695,10 +8728,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             // Copy the already acquired read before declining attribution.
             // A dropped pair gains no retained count state or placement.
-            if dropped {
+            if dropped && !reobserve {
                 continue;
             }
             let held = self.pair_counts.get_mut(&key).expect("inserted row count");
+            if reobserve {
+                // A duplicate row for a retained pair (scripts only;
+                // production rows are seen-set deduplicated): merge the
+                // absolute without moving the pair's first record.
+                if row.entry_count > held.count {
+                    held.count = row.entry_count;
+                    held.anchor_ns = batch.rows_anchor_ns;
+                    held.last_ns = batch.rows_read_ns;
+                    held.retirement_usable = false;
+                }
+                continue;
+            }
             // The row sets its first record whatever arrived before: a
             // refresh can only precede it in a scripted batch.
             held.first_ns = row.recorded_at_ns;
@@ -8720,7 +8765,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Keep the refresh PRE bound for future base coverage and
             // the common POST bound for this count's observation. Neither
             // claims exactly when this particular pair was looked up.
-            if !dropped {
+            // Retained pairs merge while dropped (re-observed, never
+            // staged: the target arms below still ignore them).
+            let reobserve = dropped && self.retry_owed.contains_key(&key);
+            if !dropped || reobserve {
                 self.pair_counts
                     .entry(key)
                     .or_insert(HeldPairCount::new(PairCount {
@@ -8743,7 +8791,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     valid_retirement_refresh(batch, update.count),
                 );
             }
-            if dropped {
+            if dropped && !reobserve {
                 continue;
             }
             let (held, advanced) = {
@@ -9433,13 +9481,55 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .is_some_and(|live| *live < started)
     }
 
-    fn bind_pair_count(&mut self, row: &WitnessRow, caller: CallerId, modules: &[ModuleKey]) {
+    fn bind_pair_count(
+        &mut self,
+        row: &WitnessRow,
+        caller: CallerId,
+        modules: &[ModuleKey],
+        retried: bool,
+    ) {
         let key = PairKey::of(row);
         let held_first = self
             .pair_counts
             .get(&key)
             .map(|count| count.first_ns)
             .unwrap_or(row.recorded_at_ns);
+        // A re-observed bind over its retained drop starts fresh from
+        // the re-observed absolute — but only when the placement is
+        // provably single-edged: the bind resolves to exactly the
+        // folded module (a drop that folded nothing constrains
+        // nothing), its edge exists, and it is admitted, so the
+        // publication places witness and count on that edge and the
+        // retraction below keeps the calls counted exactly once. No
+        // same-window staged mutation can flip that verdict: removals
+        // stage only from commit tails, and the just-sighted caller
+        // and module are live. Anything else keeps ordinary revival
+        // semantics with the fold standing (a pair another row
+        // already resolved, a changed module set, or a missing edge:
+        // duplicate rows only exist in scripts), so the pre-drop
+        // subtotal is never counted twice nor silently lost. Every
+        // other bind keeps its base.
+        let retry_rebind = retried && self.retry_owed.contains_key(&key);
+        let retry_target_ok = matches!(
+            self.pair_targets.get(&key),
+            Some(PairTarget::Dropped { .. })
+        ) || self.pair_dropped_tombstones.contains_key(&key);
+        let retry_place_ok = match (modules, self.retry_owed.get(&key)) {
+            ([only], Some(fold)) if fold.as_ref().is_none_or(|fold| &fold.module == only) => {
+                self.registry.module_id_for(only).and_then(|id| {
+                    self.registry.module(id).filter(|record| {
+                        record.admission == AdmissionState::Admitted
+                            && self.registry.edge(caller, id).is_some()
+                    })
+                })
+            }
+            _ => None,
+        }
+        .is_some();
+        let retry_rule = retry_rebind && retry_target_ok && retry_place_ok;
+        if retry_rebind && !retry_rule {
+            self.retry_owed.remove(&key);
+        }
         let (base, staged, staged_ns, base_since) = match self.pair_targets.get(&key) {
             Some(PairTarget::Pending {
                 base,
@@ -9455,6 +9545,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
                 ..
             }) => (*base, *staged, *staged_ns, *base_since),
+            Some(PairTarget::Dropped { .. }) if retry_rule => (0, 0, 0, held_first),
             Some(
                 PairTarget::Dropped { base, base_since }
                 | PairTarget::Suspended {
@@ -9484,16 +9575,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 } else {
                     (0, 0, 0, held_first)
                 };
-                self.pair_dropped_tombstones
-                    .get(&key)
-                    .map_or(fresh, |pruned| {
-                        (
-                            pruned.base,
-                            pruned.base,
-                            pruned.base_since,
-                            pruned.base_since,
-                        )
-                    })
+                if retry_rule && self.pair_dropped_tombstones.contains_key(&key) {
+                    // Defensive: retained pairs skip the prune pass, so a
+                    // tombstone under a retry mark is unreachable — but the
+                    // same fresh-absolute rule covers it (the tombstone
+                    // consume below keeps the class aggregate exact).
+                    (0, 0, 0, held_first)
+                } else {
+                    self.pair_dropped_tombstones
+                        .get(&key)
+                        .map_or(fresh, |pruned| {
+                            (
+                                pruned.base,
+                                pruned.base,
+                                pruned.base_since,
+                                pruned.base_since,
+                            )
+                        })
+                }
             }
         };
         if self.diagnostics.is_some() {
@@ -9557,6 +9656,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
             },
         );
+        // A re-observed bind consumes its retry mark: the pair counts
+        // from here, and the stale fold retracts so the edge carries
+        // the calls exactly once.
+        if retry_rule {
+            self.release_retry_for_bind(key);
+        }
         if let Some(count) = self.pair_counts.get(&key).map(|held| held.read)
             && count.count > staged
         {
@@ -9568,6 +9673,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 *staged = count.count;
                 *staged_ns = count.anchor_ns;
             }
+        }
+    }
+
+    /// Consume a retry mark on its re-observed bind: the pair counts
+    /// from here, so the mark leaves and the staged single-module fold
+    /// (when the drop folded one) retracts — the edge carries the
+    /// calls from this publication on. Only `NoLiveCaller` rows are
+    /// ever retained, so the fold's reason code is constant.
+    fn release_retry_for_bind(&mut self, key: PairKey) {
+        if let Some(Some(fold)) = self.retry_owed.remove(&key) {
+            self.registry.retract_unbound_fold(
+                fold.module,
+                UnboundReason::NoLiveCaller.code(),
+                fold.entries,
+                fold.cookie,
+            );
         }
     }
 
@@ -10747,7 +10868,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .unwrap_or((0, 0))
     }
 
-    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) -> u64 {
+    fn drop_pair_count(
+        &mut self,
+        row: &WitnessRow,
+        reason: DiagnosticReason,
+        keep_held: bool,
+    ) -> u64 {
         let key = PairKey::of(row);
         let (base, base_since) = self.pair_drop_base(&key);
         if let Some(recorder) = &mut self.diagnostics {
@@ -10771,7 +10897,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let _ = self.take_pruned_pair_base(&key);
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
-        self.pair_counts.remove(&key);
+        // A drop the binder retained for re-observation keeps its held
+        // absolute as the re-observation basis: later refreshes merge
+        // into it (never staged) until the re-decision consumes or
+        // releases it. Every other drop forgets it, as before.
+        if !keep_held {
+            self.pair_counts.remove(&key);
+        }
         base
     }
 
@@ -10783,28 +10915,71 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         decision: Decision,
         learned: &mut Option<LearnedExeMaps>,
     ) -> Result<(), String> {
-        let Decision { row, binding } = decision;
+        let Decision {
+            row,
+            binding,
+            retry,
+        } = decision;
+        // A first `NoLiveCaller` verdict without retention is a shed
+        // retry: the binder's retry set was full, so the row keeps
+        // exactly its unbound verdict. One deduplicated gap discloses
+        // every shed row (the verdict itself already names the row).
+        let shed = retry == DecisionRetry::Initial
+            && matches!(binding, Binding::Unbound(UnboundReason::NoLiveCaller));
         let modules = match self.witness_modules(&row) {
             Ok(modules) => modules,
             Err(reason) => {
-                self.drop_pair_count(&row, DiagnosticReason::NotAdmitted);
+                // A re-observation that still resolves to no module
+                // releases without noting unresolved twice: the first
+                // staging already recorded the row's placement, and the
+                // re-drop diagnostic carries the fresh verdict.
+                if retry == DecisionRetry::Reobserved {
+                    self.drop_pair_count(&row, DiagnosticReason::NotAdmitted, false);
+                    self.retry_owed.remove(&PairKey::of(&row));
+                    return Ok(());
+                }
+                // A retained row keeps its held absolute as the
+                // re-observation basis even here (no fold lands on this
+                // path).
+                let retained = retry == DecisionRetry::RetainedForRetry;
+                self.drop_pair_count(&row, DiagnosticReason::NotAdmitted, retained);
+                if retained {
+                    self.retry_owed.insert(PairKey::of(&row), None);
+                }
                 if let Binding::Unbound(unbound) = binding {
                     self.note_preadmission(row.host_tgid, &[None], unbound, row.recorded_at_ns);
+                }
+                if shed {
+                    self.note_retry_shed();
                 }
                 return Err(reason);
             }
         };
         match binding {
             Binding::Bound(caller) => {
-                self.bind_pair_count(&row, caller, &modules);
+                self.bind_pair_count(&row, caller, &modules, retry == DecisionRetry::Reobserved);
                 self.registry
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
+                // A re-observation that refuses again releases the pair
+                // without folding twice: the original fold stands and
+                // the fresh verdict discloses through the drop
+                // diagnostic and the census flip.
+                if retry == DecisionRetry::Reobserved {
+                    self.drop_pair_count(&row, diagnostic_binding_reason(reason), false);
+                    self.retry_owed.remove(&PairKey::of(&row));
+                    return Ok(());
+                }
                 // The dropped absolute folds into the single module's
                 // lower bound: the pair never publishes, but its held
                 // entries are a positive module-level fact.
-                let folded = self.drop_pair_count(&row, diagnostic_binding_reason(reason));
+                let retained = retry == DecisionRetry::RetainedForRetry;
+                let folded =
+                    self.drop_pair_count(&row, diagnostic_binding_reason(reason), retained);
+                if shed {
+                    self.note_retry_shed();
+                }
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason, row.recorded_at_ns);
                 let cookie = row.cookie();
@@ -10852,15 +11027,53 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     exe,
                 };
                 self.registry.note_unbound_witness_with_image(
-                    modules,
+                    modules.clone(),
                     row.recorded_at_ns,
                     reason,
                     folded,
                     Some(image),
-                )
+                );
+                // A retained row marks its pair for re-observation and
+                // remembers exactly the fold a retry bind retracts: the
+                // single registered module's fold, or nothing when the
+                // row folds nowhere (shared endpoint, unresolved, or an
+                // unregistered module). Staging is single-threaded, so
+                // the registration read below sees what the commit
+                // applies.
+                let fold = retained.then(|| {
+                    let [module] = modules.as_slice() else {
+                        return None;
+                    };
+                    self.registry.module_id_for(module).map(|_| RetryFold {
+                        module: module.clone(),
+                        entries: folded,
+                        cookie,
+                    })
+                });
+                if retained {
+                    self.retry_owed.insert(PairKey::of(&row), fold.flatten());
+                }
             }
         }
         Ok(())
+    }
+
+    /// Disclose one shed identity retry: the binder's retry set was
+    /// full, so a decided `NoLiveCaller` row was not retained for
+    /// re-observation and keeps exactly its unbound verdict. Fixed
+    /// fields: every shed row lands on one deduplicated gap row with
+    /// repeats, never a per-row flood.
+    fn note_retry_shed(&mut self) {
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "identity retry shed".into(),
+            reason: "a decided no-live-caller row could not be retained for re-observation: \
+                 the per-domain retry set is full, so its unbound verdict is final"
+                .into(),
+            budget: None,
+        });
     }
 
     /// R-C51-1 (fail-safe): an unbound CALLER_USE row of `pid` — refused
@@ -13148,6 +13361,16 @@ impl PairKey {
 struct PairKeyClass {
     domain: NativeDomainId,
     object: u32,
+}
+
+/// One staged single-module unbound fold owed to a retained
+/// identity-retry row: the module, folded entries, and image cookie
+/// a retry bind retracts, so the edge carries the calls exactly once.
+#[derive(Debug, Clone)]
+struct RetryFold {
+    module: ModuleKey,
+    entries: u64,
+    cookie: DomainCookie,
 }
 
 /// One pruned dropped pair's absolute base and its read anchor: a late
@@ -25021,10 +25244,7 @@ exit 0
         assert_eq!(census.rows, 2);
         assert_eq!(census.bound, 1);
         assert_eq!(census.unbound_total(), 1);
-        assert_eq!(
-            census.unbound.get(&UnboundReason::ExecAmbiguous),
-            Some(&1)
-        );
+        assert_eq!(census.unbound.get(&UnboundReason::ExecAmbiguous), Some(&1));
         assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), None);
         let unbound = native.module_unbound().expect("module-level positive");
         assert_eq!(unbound.rows, 1, "no second fold for the re-decision");
@@ -25106,9 +25326,269 @@ exit 0
             ),
             (1, 0, 1, 0)
         );
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+    }
+
+    #[test]
+    fn identity_retry_shed_is_disclosed_once_and_keeps_the_verdict() {
+        // A retry set of zero sheds every decided row: one
+        // deduplicated gap discloses every shed row, and each keeps
+        // exactly its unbound verdict and fold. The control leg with
+        // room retains instead and discloses no shed.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        native.scene.coordinator.binder.set_retry_limit_for_test(0);
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        native.witness(vec![first]);
+        let mut second = native.row(42, 1, 9, 50, 1);
+        second.entry_count = 5;
+        native.witness(vec![second]);
+        let shed = native
+            .gap_subjects()
+            .iter()
+            .filter(|subject| subject.as_str() == "identity retry shed")
+            .count();
         assert_eq!(
-            census.unbound.get(&UnboundReason::NoLiveCaller),
-            Some(&1)
+            shed,
+            1,
+            "one deduplicated shed row: {:?}",
+            native.gap_subjects()
+        );
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!((unbound.rows, unbound.entries), (2, 8));
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&2));
+        let (mut roomy, _) = NativeScene::new();
+        roomy.scene.source.spawn(9, 600);
+        roomy.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        roomy.scene.coordinator.binder.set_retry_limit_for_test(1);
+        let row = roomy.row(41, 1, 9, 40, 1);
+        roomy.witness(vec![row]);
+        assert!(
+            !roomy
+                .gap_subjects()
+                .contains(&"identity retry shed".to_string()),
+            "room retains instead of shedding: {:?}",
+            roomy.gap_subjects()
+        );
+    }
+
+    #[test]
+    fn a_retained_pair_survives_the_prune_grace_and_binds_after_it() {
+        // The prune pass leaves a retained pair's target and held
+        // absolute alone past the grace, so a member admitted later
+        // still rebinds from the fresh absolute.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(super::EXEC_STATE_GRACE_NS + 1_000_000);
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (0, 0),
+            "a retained pair never prunes"
+        );
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+    }
+
+    #[test]
+    fn a_finished_domain_releases_retained_pairs() {
+        // The domain's end releases retained held absolutes (their
+        // folds stand) and the pairs prune normally afterwards: no
+        // re-observation follows the domain's end.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        let domain = native.domain;
+        native.scene.coordinator.finish_native_domain(domain);
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(super::EXEC_STATE_GRACE_NS + 1_000_000);
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 3),
+            "the released pair prunes with its drop base"
+        );
+        assert_eq!(
+            native.module_unbound().unwrap().rows,
+            1,
+            "the fold stands after the release"
+        );
+    }
+
+    #[test]
+    fn a_retry_bind_retracts_only_its_own_fold() {
+        // Two members drop; only the first rebinds. The retraction
+        // unwinds exactly its rows, entries, reason count, and image
+        // calls, while the standing fold keeps the second member's.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 45, 1);
+        second.entry_count = 7;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        let first_caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(10, ImageAuthority::ScanPinned, 55)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.project(10, 65);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == first_caller)
+            .expect("the retried member has an edge");
+        assert_eq!(edge.entry_count, 43);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.entries, 7);
+        assert_eq!(unbound.reasons.get("no_live_caller"), Some(&1));
+        assert_eq!(unbound.images.len(), 1);
+        let cookie42 = crate::attach::capture::DomainCookie::scripted(native.domain, 42);
+        assert_eq!(
+            unbound
+                .images
+                .get(&cookie42)
+                .map(|image| image.calls_at_least),
+            Some(7)
+        );
+        assert_eq!(registry.unidentified_images(), 1);
+        let census = registry.witness_census();
+        assert_eq!(
+            (census.rows, census.bound, census.unbound_total()),
+            (2, 1, 1)
+        );
+        let placement = registry.witness_placement();
+        assert_eq!(
+            (placement.total(), placement.edge, placement.module),
+            (2, 1, 1)
+        );
+    }
+
+    #[test]
+    fn a_retry_bind_without_an_admitted_module_releases() {
+        // The retry binds, but the endpoint still resolves to no
+        // module: the pair releases without noting unresolved twice
+        // (the first staging already recorded the placement), the
+        // re-drop carries the fresh absolute into its base, and the
+        // census keeps one outcome for the row.
+        let scene = CaptureScene::new(2);
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.endpoint = crate::discovery::inventory_attach_set::EndpointId(999);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            (placement.total(), placement.unresolved),
+            (1, 1),
+            "one unresolved placement for the twice-staged row"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .all(|edge| edge.entry_count == 0),
+            "no counted edge without a module"
+        );
+        native
+            .scene
+            .coordinator
+            .prune_departed_native_state(super::EXEC_STATE_GRACE_NS + 1_000_000);
+        assert_eq!(
+            native.scene.coordinator.pruned_pair_totals(),
+            (1, 43),
+            "the released pair prunes with the fresh re-drop base"
         );
     }
 
@@ -37684,7 +38164,10 @@ int main(void) {
         // A late row revives the pruned pair: its base returns to the
         // live target and leaves the aggregate (no double count).
         let row = native.row(41, 1, 7, at, 0);
-        native.scene.coordinator.bind_pair_count(&row, caller, &[]);
+        native
+            .scene
+            .coordinator
+            .bind_pair_count(&row, caller, &[], false);
         assert_eq!(
             native.scene.coordinator.pruned_pair_totals(),
             (0, 0),
@@ -37699,10 +38182,11 @@ int main(void) {
         );
         // The revived target is dropped again without a newer count and
         // re-pruned: the same base lands in the aggregate exactly once.
-        let _ = native
-            .scene
-            .coordinator
-            .drop_pair_count(&row, DiagnosticReason::NotAdmitted);
+        let _ =
+            native
+                .scene
+                .coordinator
+                .drop_pair_count(&row, DiagnosticReason::NotAdmitted, false);
         assert!(matches!(
             native.scene.coordinator.pair_targets.get(&key),
             Some(PairTarget::Dropped { base: 5, .. })

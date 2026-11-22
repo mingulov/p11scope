@@ -1,9 +1,13 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
-//! WP-7 stop-after-last-waiter cell: request the Joint finish 0, 1, 5 and
-//! 20 ms after the refresh that resolves the last waiter, and pin
+//! WP-7 linked-stop cell (12-case prep/offset matrix): request the Joint
+//! finish 0, 1, 5 and 20 ms after the post-release prep flow, and pin
 //! Published-then-WoundDown, the at-Q stash publication, and the abandon
-//! naming lines. Root BPF lane, run serially. The held-call fixture below
+//! naming lines. Root BPF lane, run serially. A live last waiter before
+//! stop is unreachable (collected ticks resolve waiters same tick), so
+//! the matrix stands as linked stop coverage; the last-waiter invariant
+//! is carried by the machine twins named on the test cell.
+//! The held-call fixture below
 //! is duplicated from `privileged_tests.rs` (same revision): that file is
 //! owned by another lane and its helpers are private, so this cell carries
 //! its own copies (each provenance-noted); crate-visible production APIs
@@ -1159,7 +1163,8 @@ fn drive<L: CaptureLane<PidPin>>(
     stopped.context("a native run stops its lane")
 }
 
-// WP-7 stop-after-last-waiter cell.
+// WP-7 linked-stop cell (a live last waiter before stop is unreachable;
+// the matrix stands as linked stop coverage, see the cell doc).
 // ---------------------------------------------------------------------------
 
 /// Collected terminal state of one stop-offset sub-case. Every finish loop
@@ -1638,20 +1643,27 @@ fn run_stop_offset(
     })
 }
 
-/// WP-7 S3: stop the Joint finish 0, 1, 5 and 20 ms after the refresh
-/// that resolves the last waiter, across three prep shapes (one service
-/// slice, one service+poll slice, the full q2). Every combination must
-/// reach Published, then WoundDown; the at-Q tick publishes the stashed
-/// calls; a latched machine names its code in both the abandon gap and
-/// the run error; and a finish that abandons with resolved calls still
-/// in the lane stash counts them or gaps them, never silently. The lane
-/// requests the production journal session (builds that omit the
-/// journal object refuse at lane start); an S1 seal fails loudly with
-/// the s1-precluded branch tag instead of passing dry.
+/// WP-7 S3, curated as linked Joint stop coverage: stop the Joint finish
+/// 0, 1, 5 and 20 ms after the post-release prep flow, across three prep
+/// shapes (one service slice, one service+poll slice, the full q2). Every
+/// combination must reach Published, then WoundDown; the at-Q tick
+/// publishes the stashed calls; a latched machine names its code in both
+/// the abandon gap and the run error; and a finish that abandons with
+/// resolved calls still in the lane stash counts them or gaps them, never
+/// silently. The lane requests the production journal session (builds that
+/// omit the journal object refuse at lane start); an S1 seal fails loudly
+/// with the s1-precluded branch tag instead of passing dry.
+/// Last-waiter disposition: a live last waiter before stop is unreachable
+/// (collected ticks resolve waiters same tick; 1,390 slice samples,
+/// 0 waiters), so this matrix never stages the twins' refresh-to-stash
+/// handoff. The invariant is carried by the machine twins
+/// `joint_machine_finish_after_pass_refresh_resolution_publishes_linked`,
+/// `joint_machine_finish_after_pass_refresh_resolution_publishes_unlinked`
+/// and `joint_machine_finish_at_q_expiry_storage_refusal_still_latches`.
 /// `WP7_STOP_PREPS` / `WP7_STOP_OFFSETS` (comma-separated indices,
 /// default all) narrow the matrix for exploration.
 #[test]
-#[ignore = "privileged: live Joint stop after the last waiter resolves"]
+#[ignore = "privileged: linked Joint stop coverage (12-case matrix)"]
 fn privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64() -> Result<()> {
     let workload = JointWorkload::build()?;
     let soft_manifest = provider_joint_manifest(

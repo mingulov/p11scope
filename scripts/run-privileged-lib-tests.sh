@@ -820,9 +820,11 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_b
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n20480_default_lp64
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8193_refuses_lp64
-# WP-7 stop-after-last-waiter: the full prep/offset matrix over a linked
+# WP-7 linked stop coverage: the full prep/offset matrix over a linked
 # journal session (~3 min, gcc + SoftHSM2); the S3 suite also rows it
-# through scripts/ci/stop-races.sh.
+# through scripts/ci/stop-races.sh. A live last waiter before stop is
+# unreachable (collected ticks resolve waiters same tick); the invariant
+# lives in the machine twins named in tests/ignored-tests.json.
 inventory::joint_stop_races_privileged_tests::privileged_joint_stop_after_last_waiter_resolves_publishes_final_lp64
 # G21 default-ring wrap needs 266 changing observed rounds per leg (532 per
 # two-leg cell; 260 counted + 4 shared + fence + proof per leg, 264 without

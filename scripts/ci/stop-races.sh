@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Denis Mingulov <denis@mingulov.com>
 # scripts/ci/stop-races.sh P11SCOPE OUTDIR: S3 stop-path race cells for CI.
-# Runs the seeded sweep + newcomer burst, then the Joint last-waiter library
+# Runs the seeded sweep + newcomer burst, then the Joint linked-stop library
 # cell. Writes OUTDIR/results.jsonl rows
 # {cell, pass, qualification, detail} with qualification in
 # qualified|expected-failure|environment-precluded|failed. Exit 0 means

@@ -1764,11 +1764,40 @@ impl InstanceRouter {
 
     /// Ends this image only. Eviction compresses its refusal into permanent
     /// per-cookie metadata, without retiring a surviving task or successor.
+    /// Only admitted keys' pending calls shed as retired: a key no scan
+    /// ever observed keeps its calls pending until a later counted refusal
+    /// (expiry), instead of shedding on a retirement for an admission it
+    /// never had. The retirement still marks, so late observations and
+    /// newcomers refuse as before.
     pub(crate) fn retire_image(&mut self, image: ImageIdentity) -> Vec<(u64, Route)> {
         if RetirementLedger::index(image.task_cookie).is_none() {
             return Vec::new();
         }
         let key = ImageKey::from(image);
+        // Snapshot the image's admitted files BEFORE dropping: the shed
+        // below runs after the drop, when the predicate could no longer
+        // tell an admitted key from a never-observed one.
+        let admitted: BTreeSet<u32> = self
+            .observed
+            .keys()
+            .filter(|(owner, _)| *owner == key)
+            .map(|(_, file)| *file)
+            .collect();
+        self.retire_image_state(key);
+        self.fail_pending(
+            |call| {
+                call.facts.image == image
+                    && stamp_file(&call.facts).is_some_and(|file| admitted.contains(&file))
+            },
+            UnknownReason::Retired,
+        )
+    }
+
+    /// Marks one image retired and drops its router state (observations,
+    /// absence flags, admission and birth bookkeeping) without shedding
+    /// its pending calls. Both retirement paths share this; each sheds
+    /// only admitted keys' pending afterwards (see [`Self::retire_image`]).
+    fn retire_image_state(&mut self, key: ImageKey) {
         if self.limits.retired_cookies == 0 {
             self.retirement.retire_image(key);
         } else {
@@ -1801,7 +1830,6 @@ impl InstanceRouter {
         self.birth_reoffer_cooldown
             .retain(|(owner, _)| *owner != key);
         self.debug_check_absent_subset();
-        self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
 
     #[cfg(test)]
@@ -1811,15 +1839,38 @@ impl InstanceRouter {
 
     // Accessible in production only through the adapter's sealed
     // original-pidfd terminal proof; tests exercise the same retirement body.
+    // Only admitted keys' pending calls shed as retired (see
+    // [`Self::retire_image`]); never-observed keys stay pending for a
+    // later counted refusal. Resolution order is unchanged (exec 0 first).
     fn retire_task_cookie(&mut self, cookie: u64) -> Vec<(u64, Route)> {
         if RetirementLedger::index(cookie).is_none() {
             return Vec::new();
         }
         self.retirement.retire_task(cookie);
-        let mut resolved = self.retire_image(ImageIdentity {
+        // Snapshot the task's admitted keys BEFORE dropping: the sheds
+        // below run after the drop, when the predicate could no longer
+        // tell an admitted key from a never-observed one.
+        let admitted: BTreeSet<(ImageKey, u32)> = self
+            .observed
+            .keys()
+            .filter(|(owner, _)| owner.cookie == cookie)
+            .copied()
+            .collect();
+        let admitted_key = |image: &ImageIdentity, file: Option<u32>| {
+            file.is_some_and(|file| admitted.contains(&(ImageKey::from(*image), file)))
+        };
+        self.retire_image_state(ImageKey::from(ImageIdentity {
             task_cookie: cookie,
             exec_id: 0,
-        });
+        }));
+        let mut resolved = self.fail_pending(
+            |call| {
+                call.facts.image.task_cookie == cookie
+                    && call.facts.image.exec_id == 0
+                    && admitted_key(&call.facts.image, stamp_file(&call.facts))
+            },
+            UnknownReason::Retired,
+        );
         let keys: Vec<_> = self
             .observed
             .keys()
@@ -1843,7 +1894,10 @@ impl InstanceRouter {
         self.birth_reoffer_cooldown
             .retain(|(owner, _)| owner.cookie != cookie);
         resolved.extend(self.fail_pending(
-            |call| call.facts.image.task_cookie == cookie,
+            |call| {
+                call.facts.image.task_cookie == cookie
+                    && admitted_key(&call.facts.image, stamp_file(&call.facts))
+            },
             UnknownReason::Retired,
         ));
         self.debug_check_absent_subset();

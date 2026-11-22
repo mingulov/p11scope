@@ -155,6 +155,7 @@ pub(crate) mod prearm_pin_test {
 
     thread_local! {
         static INJECT_CHANGE_ONCE: Cell<bool> = const { Cell::new(false) };
+        static PAD_MOUNTINFO: Cell<Option<(u32, usize)>> = const { Cell::new(None) };
     }
 
     pub fn inject_file_change_once() {
@@ -164,6 +165,68 @@ pub(crate) mod prearm_pin_test {
     pub(crate) fn take_injected_file_change() -> bool {
         INJECT_CHANGE_ONCE.with(|flag| flag.replace(false))
     }
+
+    /// Appends `append_bytes` of synthetic high-mount-ID rows to
+    /// each of the next `reads` observer mount-table reads,
+    /// preserving the real prefix byte-identical so mount
+    /// resolution is unchanged. The chained bytes stream through
+    /// the real reader, budget and identity path without touching
+    /// the host mounts.
+    pub fn inject_mountinfo_append_for_reads(reads: u32, append_bytes: usize) {
+        PAD_MOUNTINFO.with(|slot| slot.set(Some((reads, append_bytes))));
+    }
+
+    pub(crate) fn take_mountinfo_append() -> Option<usize> {
+        PAD_MOUNTINFO.with(|slot| match slot.get() {
+            Some((remaining, append)) if remaining > 0 => {
+                slot.set(if remaining == 1 {
+                    None
+                } else {
+                    Some((remaining - 1, append))
+                });
+                Some(append)
+            }
+            _ => None,
+        })
+    }
+}
+
+/// Generates at least `append_bytes` of synthetic mount rows with
+/// high mount IDs (9M+) and a fake device that never match a real
+/// fd mount, so `mapping_file_key_in_mountinfo` still resolves
+/// through the preserved real prefix; the lenient line scan skips
+/// the rest. Each row is ~1 KiB, keeping entry counts under the
+/// ceiling while the byte cap stays the binding limit.
+#[cfg(test)]
+fn synthetic_mountinfo_append(append_bytes: usize) -> String {
+    let mut synthetic = String::new();
+    let mut index: u32 = 0;
+    while synthetic.len() < append_bytes {
+        synthetic.push_str(&format!(
+            "9{:06} 1 999:999 / /fake-p11-test-mount-{:06}-{} rw - tmpfs tmpfs rw\n",
+            100_000 + index,
+            index,
+            "x".repeat(880),
+        ));
+        index = index.saturating_add(1);
+    }
+    synthetic
+}
+
+/// Reads one observer mount table for prearm pinning, chaining the
+/// test synthetic suffix when the injector armed one. Production
+/// reads the file directly.
+fn read_mountinfo_for_prearm<R: std::io::Read>(
+    reader: R,
+    budget: &mut CaptureWorkBudget,
+) -> Result<String, String> {
+    #[cfg(test)]
+    if let Some(append_bytes) = prearm_pin_test::take_mountinfo_append() {
+        use std::io::Read as _;
+        let synthetic = synthetic_mountinfo_append(append_bytes);
+        return read_mountinfo(reader.chain(synthetic.as_bytes()), budget);
+    }
+    read_mountinfo(reader, budget)
 }
 
 /// Prefix of every prearm-worker refusal reason
@@ -9559,7 +9622,7 @@ fn prove_prearm_requests_in_views(
             None => {
                 let table = match std::fs::File::open("/proc/self/mountinfo")
                     .map_err(|error| format!("cannot open observer mount table: {error}"))
-                    .and_then(|table| read_mountinfo(table, budget))
+                    .and_then(|table| read_mountinfo_for_prearm(table, budget))
                 {
                     Ok(table) => table,
                     Err(error) => {

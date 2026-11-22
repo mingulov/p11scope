@@ -87851,6 +87851,154 @@ fn learned_pin_retry_recovers_when_pressure_lands_between_passes() {
     );
 }
 
+/// A file-changed learned pin stages from the same large mount table
+/// the initial pin accepted: the retry re-proves through the
+/// production pin path with the same per-operation proof limits as
+/// the initial pin, so a supported table above the old 1 MiB retry
+/// cap (here ~1.06 MiB with preserved mount identities) stages
+/// instead of refusing. The re-proof still draws no capture credit.
+#[test]
+fn learned_pin_retry_stages_from_large_mount_table() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_mountinfo_append_for_reads(
+        2, 1_048_589,
+    );
+    crate::discovery::identity::prearm_pin_test::inject_file_change_once();
+    engine.service_learned_files();
+    assert!(
+        !engine.pending_learned.is_empty(),
+        "the race requeues the candidate on the large table"
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    let attempted_before_retry = engine.budget.attempted_io_bytes();
+    assert!(
+        attempted_before_retry > 1_048_576,
+        "the initial pin proved the large table on capture credit: {attempted_before_retry}"
+    );
+    engine.service_learned_files();
+    assert_eq!(
+        engine.learned_staged_files_for_test(),
+        1,
+        "the retry stages from the same supported table"
+    );
+    assert!(engine.learned_settled.contains(&(dev, ino)));
+    assert_eq!(
+        engine.budget.attempted_io_bytes(),
+        attempted_before_retry,
+        "the large-table re-proof drew no capture credit"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        !public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "no prearm gap after a large-table retry stages: {public:?}"
+    );
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.name == "learned provider file"),
+        "the staged file files its first-use row: {public:?}"
+    );
+}
+
+/// A mount table above the 64 MiB table cap refuses on the initial
+/// pin with the named mount-table ceiling: the refusal is permanent
+/// (same cap the retry enforces), files at once with no retry slot,
+/// and names its mountinfo stage.
+#[test]
+fn learned_pin_refuses_overlimit_mount_table() {
+    let (fixture, _view, _module, _pins) = loaded_seed_provider();
+    let library = fixture._dir.path().join("seed-provider.so");
+    let file = std::fs::File::open(&library).unwrap();
+    let (dev, ino) = crate::fanotify::file_identity(&file).unwrap();
+    let (tx, rx) = std::sync::mpsc::sync_channel(8);
+    tx.send(crate::fanotify::LearnMsg::Candidate(
+        crate::fanotify::LearnedCandidate {
+            file,
+            dev,
+            ino,
+            display_path: library.to_string_lossy().into_owned(),
+            loader_exe: Some("/usr/bin/pkcs11-tool".to_string()),
+            loader_unknown_reason: None,
+            run_learned: false,
+            proving_retained: false,
+        },
+    ))
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine.set_learned_rx_for_test(rx);
+    let _drain_alive = &tx;
+    crate::discovery::identity::prearm_pin_test::inject_mountinfo_append_for_reads(
+        1,
+        67_108_865,
+    );
+    engine.service_learned_files();
+    assert!(
+        engine.learned_settled.contains(&(dev, ino)),
+        "an over-limit pin settles at once"
+    );
+    assert!(
+        engine.pending_learned.is_empty(),
+        "an over-limit pin requeues nothing"
+    );
+    assert!(
+        !engine.learned_pin_retries.contains_key(&(dev, ino)),
+        "an over-limit pin leaves no retry count"
+    );
+    assert_eq!(engine.learned_staged_files_for_test(), 0);
+    let internal: Vec<_> = engine.counters.object_skips.iter().collect();
+    assert!(
+        internal.iter().any(|skip| skip.reason.contains("mount table")),
+        "the refusal names the mount table: {internal:?}"
+    );
+    assert!(
+        internal.iter().any(|skip| {
+            crate::discovery::identity::learned_pin_stage(&skip.reason) == "mountinfo"
+        }),
+        "the refusal maps to the mountinfo stage: {internal:?}"
+    );
+    let public: Vec<_> = engine
+        .counters
+        .object_skips
+        .iter()
+        .map(render::capture_skipped_out)
+        .collect();
+    assert!(
+        public
+            .iter()
+            .any(|skip| skip.reason == "prearm object unavailable"),
+        "an over-limit pin files its failure at once: {public:?}"
+    );
+}
+
 /// A learned pin that keeps hitting the file-changed race files after
 /// a bounded number of retries instead of requeueing forever: a
 /// persistent failure is a real loss and must be disclosed, never

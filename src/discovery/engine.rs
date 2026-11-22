@@ -40,10 +40,10 @@ use crate::discovery::loader::{LoaderContextId, LoaderContextSpec, LoaderRegistr
 use crate::discovery::noise::DiscoveryNoiseAggregator;
 use crate::discovery::scan::{
     CaptureWorkBudget, LoaderElfFacts, LoaderFactsKey, MapsReadBuffers, MapsReadLimits,
-    ObjectExports, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface, ScannedModule,
-    ScannedTable, Skipped, decode_exact_table, decode_observed_words, decoded_table_addresses,
-    exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes, export_agreement,
-    index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
+    ObjectExports, ScanLimits, ScanOutcome, ScanRequest, ScannedEntry, ScannedInterface,
+    ScannedModule, ScannedTable, Skipped, decode_exact_table, decode_observed_words,
+    decoded_table_addresses, exact_legacy_prefix_bytes, exact_table_addresses_n, exact_table_bytes,
+    export_agreement, index_maps_or_refuse, is_provider_mapping, published_walk, read_elf_snapshot,
     read_maps_or_refuse, read_maps_or_refuse_with_buffers, scan_process_view,
     scan_process_view_examined, scan_process_view_without_memory, scan_skip_truncates,
     table_evidence_score, table_has_only_opaque_interfaces, table_linkage, target_layout,
@@ -24463,13 +24463,34 @@ impl Engine {
             open,
             candidate.display_path.clone(),
         );
+        // Pin-failure retries re-prove against a fresh per-pass budget
+        // instead of the capture budget: a transient race under capture
+        // pressure must still recover, and the re-proof must not spend
+        // capture credit. The allowance covers one mountinfo re-read
+        // plus the pin-time maps probe (measured ~9.6 KiB per re-proof;
+        // 1 MiB holds it with wide margin) and dies with the attempt —
+        // no charge-back, like the identify batch allowance, with each
+        // retry recorded on the operator channel. First attempts keep
+        // the capture budget (normal accounting).
+        const LEARNED_RETRY_PASS_IO_BYTES: u64 = 1 << 20;
+        let retrying = self.learned_pin_retries.contains_key(&identity);
+        let mut retry_budget;
+        let budget = if retrying {
+            retry_budget = CaptureWorkBudget::new(ScanLimits {
+                per_object_bytes: LEARNED_RETRY_PASS_IO_BYTES,
+                total_bytes: LEARNED_RETRY_PASS_IO_BYTES,
+            });
+            &mut retry_budget
+        } else {
+            &mut self.budget
+        };
         let mut pinning = match crate::discovery::identity::pin_prearm_requests_in_views_with_budget(
             std::slice::from_ref(&request),
             &[],
             None,
             prior_objects,
             prior_bytes,
-            &mut self.budget,
+            budget,
             Filing::Acquire(&mut self.handle_table, DeferredReason::Learned),
         ) {
             Ok(pinning) => pinning,

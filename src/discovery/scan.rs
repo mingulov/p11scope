@@ -1237,7 +1237,7 @@ impl RetainedFileFacts {
             file: InspectedFileKey {
                 device: Device { major: 8, minor: 1 },
                 inode: 11,
-                pin: pin.clone(),
+                pin,
                 fd_dev: 7,
             },
             exec: None,

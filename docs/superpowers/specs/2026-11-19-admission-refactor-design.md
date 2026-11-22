@@ -497,17 +497,26 @@ lane-3 bug-1 ordering + cut-short twins, lane-4 `Gone` twins
   are never evicted and each pair's ground is bounded by its layout,
   so rises are finite and the snapshot terminates. At the
   8,192-pair bound, new unfinished work evicts the oldest unprotected
-  completed pair (one that arrived complete and can never rise), so
-  completed-only history never starves advancing work; when every
-  pair is protected or still unfinished, the record is refused,
-  counted and named (`scan resume history full`, a protected concise
-  row). The boundary: more than 8,192 objects that each earned a
-  resumed pass or still scan. A recurring layout, a restart behind a
+  completed pair (one that arrived complete and can never rise) into
+  a bounded completion record (8,192 more pairs, never shrinking); a
+  complete arrival at the bound joins that record directly. A pair in
+  the record is covered ground for good, so a layout that once
+  completed never re-earns a pass after eviction or restart.
+  Completed-only history therefore never starves advancing work while
+  the record has room; admission at the bound is refused, counted and
+  named (`scan resume history full`, a protected concise row) when
+  every tracked pair is protected or unfinished or the completion
+  record is full. The run's refusal count is stashed on the
+  coordinator at every take and accepted return (the larger of the
+  stash and the bundle's monotonic total, never summed), so it
+  survives worker custody and a discarded return. A recurring layout, a restart behind a
   frontier, an alternating return to covered ground, a disappearance
   or a restart after completion stalls instead of re-earning a pass;
   arrivals seed without granting. A collection discarded in worker
-  custody loses the bundle and its history with it (pre-existing
-  posture: the next pass re-scans fresh). When nothing rises, the
+  custody loses the bundle and its history with it; a discard is
+  terminal (the loop moves the retained pass to its terminal phase and
+  the continuation was consumed), so no later pass can re-earn ground
+  through the lost history. When nothing rises, the
   snapshot stops and the live in-progress gap names the work left.
 - Full privileged campaign on fedora: all owners.
 - 20-minute soak recording `attempted_io_bytes`: owner 2 headroom

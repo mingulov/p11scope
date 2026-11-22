@@ -1877,7 +1877,7 @@ fn cgroup_snapshot_resume_admits_advancing_work_past_completed_history() {
     assert_eq!(resume.posed.refused(), 2, "each refused record is counted");
     assert!(
         crate::discovery::scan_pass::scan_resume_history_full_reason(resume.posed.refused())
-            .starts_with("2 unfinished object cursor record(s)"),
+            .starts_with("2 resume record(s) of unfinished work were refused"),
         "the refusal is named with its count"
     );
 }

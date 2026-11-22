@@ -374,6 +374,15 @@ pub(crate) struct JointStaging {
     /// degrade; ticked once per quantum by
     /// [`Self::tick_reseed_cooldown`]. Zero means no cooldown.
     reseeded_cooldown: u32,
+    /// A stuck-degrade barred fresh-proof reseeds until the next void
+    /// opens a new era. Same-proof F6 retries are untouched (they
+    /// cannot reseed: same proof on a destroyed segment refuses, on
+    /// a voided one the void already cleared this); but a fresh
+    /// incarnation must not pile a new segment onto audits that just
+    /// proved stuck — seen live, such a reseed re-arms the stuck
+    /// session and spends the lane's interruption budget. A void
+    /// delivery clears it ([`Self::record_fence`]).
+    fresh_reseed_barred: bool,
 }
 
 /// One charged staged-queue peek: `Yield` (no credit: retry with
@@ -454,6 +463,10 @@ pub(crate) enum ReselectRefusal {
     NoProgress,
     /// Below the recorded void fence (would certify voided history).
     BelowFence,
+    /// A fresh proof must not reseed onto audits that stuck-degraded
+    /// without an intervening void: it would re-arm the stuck
+    /// session. S1 rides it out; the next void lifts the bar.
+    StuckBarred,
 }
 
 impl JointStaging {
@@ -492,6 +505,7 @@ impl JointStaging {
             reseeded_stuck_streak: 0,
             reseeded_last_stuck_ns: 0,
             reseeded_cooldown: 0,
+            fresh_reseed_barred: false,
         }
     }
 
@@ -721,6 +735,7 @@ impl JointStaging {
         }
         self.close_segment(true, false, None);
         self.reseeded_cooldown = RESEED_COOLDOWN_PASSES;
+        self.fresh_reseed_barred = true;
         true
     }
 
@@ -839,6 +854,9 @@ impl JointStaging {
             .is_some_and(|fence| receipt.birth_cut() < fence)
         {
             return Err(ReselectRefusal::BelowFence);
+        }
+        if superseding && self.fresh_reseed_barred {
+            return Err(ReselectRefusal::StuckBarred);
         }
         self.mode = FeedMode::Joint;
         self.selected_receipt = Some(*receipt);
@@ -963,9 +981,12 @@ impl JointStaging {
     /// Record a void fence as a running maximum: a later void raises
     /// the bound, while a fenceless ending (local fallback, proof-only
     /// refusal) never lowers or clears it. Only a clean resume clears.
+    /// A void also opens a new era for fresh-proof reseeds: it lifts
+    /// the stuck bar (the audits get a clean slate to prove on).
     fn record_fence(&mut self, fence: Option<u64>) {
         if let Some(next) = fence {
             self.segment_fence = Some(self.segment_fence.map_or(next, |kept| kept.max(next)));
+            self.fresh_reseed_barred = false;
         }
     }
 

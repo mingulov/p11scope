@@ -38,6 +38,11 @@ CHECKER = ROOT / "scripts" / "check-ignored-tests.py"
 INVENTORY = ROOT / "tests" / "ignored-tests.json"
 RUNNER = ROOT / "scripts" / "run-privileged-lib-tests.sh"
 BTRFS_HELPER = ROOT / "scripts" / "ci" / "prepare-btrfs-tmpdir.sh"
+sys.path.insert(0, str(ROOT / "tests" / "python"))
+from joint_stop_logs import (  # noqa: E402
+    CELL as JOINT_CELL, FAILED_SUMMARY, OK_SUMMARY, S1_ERROR,
+    UNATTRIBUTED_ERROR, frame, matrix_body,
+)
 CHECKER_MOD = runpy.run_path(str(CHECKER))
 
 CELLS = {
@@ -1612,166 +1617,160 @@ class IgnoredTestsTests(unittest.TestCase):
         )
 
     def test_full_matrix_gate_matches_stop_completion_lines_exactly(self):
-        # The full-matrix gate qualifies a pass only on the twelve
-        # post-stop completion lines, each matched as a full line: a
-        # pre-stop linkage tag (or a completion marker embedded in
-        # another line) must never qualify its case. A no-feed
-        # preclusion tag on a passing matrix fails it as mixed. The
-        # pass verdict follows the terminal libtest result line only,
-        # with one pass and zero failures.
+        # Full-matrix cells are judged by the one shared fail-closed
+        # validator (scripts/ci/joint_stop_verdict.py, also the S3
+        # judge), never by ad hoc greps in the runner: the runner
+        # hands it the cell name and the child's exit status, passes
+        # only its qualified verdict, and prints its validated summary
+        # line and named reason. Every other cell's pass needs exit 0
+        # and a full-line strict one-test summary.
         text = RUNNER.read_text(encoding="utf-8")
         self.assertIn(
-            'command grep -qxF "P11SCOPE_STOP_COMPLETE=wp7-stop$i" "$log"',
-            text,
-        )
-        self.assertNotIn("P11SCOPE_CELL_BRANCH=wp7-stop$i:linked", text)
-        self.assertIn("s1-precluded|no-feeds-unattributed", text)
-        self.assertIn("a pass never precludes", text)
-        self.assertIn("command grep '^test result:'", text)
-        self.assertIn("1 passed; 0 failed; 0 ignored;", text)
-        self.assertIn('printf \'%s\\n\' "$result_line" | command grep -qE', text)
+            "JOINT_VERDICT=$REPO_ROOT/scripts/ci/joint_stop_verdict.py", text)
+        self.assertIn(
+            'python3 -I "$JOINT_VERDICT" --cell "$name" --status "$rc"', text)
+        self.assertIn('if [ "${joint_verdict[0]}" = qualified ]; then', text)
+        self.assertIn('[${joint_verdict[1]}]', text)
+        self.assertNotIn('grep -qxF "P11SCOPE_STOP_COMPLETE', text)
+        self.assertNotIn("s1-precluded|no-feeds-unattributed", text)
+        self.assertIn(
+            "command grep -qE '^test result: ok\\. 1 passed; 0 failed; "
+            "0 ignored; 0 measured; [0-9]+ filtered out; finished in "
+            "[0-9]+\\.[0-9]{2}s$'", text)
         self.assertNotIn("command grep -q '^test result: ok\\. 1 passed' \"$log\"", text)
 
-    def test_full_matrix_gate_verbatim_block_judges_completion_fixtures(self):
-        # Drive the runner's shipped full-matrix block verbatim (the
-        # exact lines between its guard and its closing fi) against
-        # fixture logs: a full matrix passes, a linked-but-incomplete
-        # one (case 7 linked, never completed) fails naming 7, a
-        # diagnostic-embedded completion line fails too, and a full
-        # matrix with an S1 preclusion tag fails as mixed.
+    def _run_verdict_block(self, cases):
+        """Drive the runner's shipped verdict block verbatim (from the
+        result line through the closing fi of the full-matrix / generic
+        verdict) against (name, log, rc, full_matrix) cases; returns one
+        `verdict=... result=... note=...` line per case."""
         text = RUNNER.read_text(encoding="utf-8")
-        guard = ('if [ -n "${full_matrix_set[$name]+present}" ]'
-                 ' && [ "$verdict" = PASS ]; then')
-        start = text.index(guard)
-        end = text.index("\n        fi\n", start) + len("\n        fi\n")
+        start = text.index("        result_line=$(command grep")
+        guard = text.index('        if [ -n "${full_matrix_set[$name]+present}" ]; then',
+                           start)
+        end = text.index("\n        fi\n", guard) + len("\n        fi\n")
         block = text[start:end]
-        self.assertIn("matrix_missing", block)
-        self.assertIn("MATRIX SHORT", block)
-        self.assertIn("MIXED", block)
-
-        def linkage(i):
-            return "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i
-
-        def complete(i):
-            return "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i
-
-        full = "".join(linkage(i) for i in range(12))
-        full += "".join(complete(i) for i in range(12))
-        incomplete = "".join(linkage(i) for i in range(12))
-        incomplete += "".join(complete(i) for i in range(12) if i != 7)
-        embedded = "".join(linkage(i) for i in range(12))
-        embedded += "".join(complete(i) for i in range(7))
-        embedded += ("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
-                     "emitted late\n")
-        embedded += "".join(complete(i) for i in range(8, 12))
-        mixed = full + "P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded\n"
+        self.assertIn("verdict=PASS", block)
+        self.assertIn('"$JOINT_VERDICT"', block)
         with tempfile.TemporaryDirectory() as tmp:
-            paths = {}
-            for name, body in (("full.log", full),
-                               ("incomplete.log", incomplete),
-                               ("embedded.log", embedded),
-                               ("mixed.log", mixed)):
-                path = Path(tmp) / name
+            script = ('JOINT_VERDICT="%s"; '
+                      % (ROOT / "scripts/ci/joint_stop_verdict.py"))
+            for index, (label, body, rc, full) in enumerate(cases):
+                path = Path(tmp) / ("%d.log" % index)
                 path.write_text(body, encoding="utf-8")
-                paths[name] = path
-            script = ""
-            for name, path in paths.items():
                 script += (
-                    'name="probe-cell"; verdict=PASS; matrix_note=; '
-                    'matrix_missing=; '
-                    'declare -A full_matrix_set=([probe-cell]=1); '
-                    'log="%s"; ' % path +
-                    block + "\n" +
-                    'printf "<@@%s verdict=%%s missing=%%s note=%%s@@>\\n" '
-                    '"$verdict" "$matrix_missing" "$matrix_note"; ' % name
-                )
-            result = subprocess.run(
-                ["bash", "-c", script],
-                capture_output=True, text=True, cwd=ROOT,
-            )
-        self.assertEqual(result.returncode, 0,
-                         result.stdout + result.stderr)
+                    'name="%s"; rc=%d; ' % (JOINT_CELL, rc) +
+                    ('declare -A full_matrix_set=([%s]=1); ' % JOINT_CELL
+                     if full else 'declare -A full_matrix_set=(); ') +
+                    'log="%s"; ' % path + block + "\n" +
+                    'printf "<@@%s verdict=%%s result=%%s note=%%s@@>\\n" '
+                    '"$verdict" "$result_line" "$matrix_note"; ' % label)
+            result = subprocess.run(["bash", "-c", script],
+                                    capture_output=True, text=True, cwd=ROOT)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), 4, lines)
+        self.assertEqual(len(lines), len(cases), lines)
+        for (label, _body, _rc, _full), line in zip(cases, lines):
+            self.assertTrue(line.startswith("<@@%s " % label), (label, line))
+        return lines
+
+    def test_full_matrix_gate_verbatim_block_judges_completion_fixtures(self):
+        # A full matrix passes; a linked-but-incomplete one (case 7
+        # linked, never completed) fails naming 7; a diagnostic-embedded
+        # completion line fails; a full matrix with an S1 preclusion tag
+        # fails; a narrowed one-case pass fails as matrix-short.
+        incomplete = [line for line in matrix_body()
+                      if line != "P11SCOPE_STOP_COMPLETE=wp7-stop7"]
+        embedded = [("JOINT_STOP wp7-stop7: P11SCOPE_STOP_COMPLETE=wp7-stop7 "
+                     "emitted late")
+                    if line == "P11SCOPE_STOP_COMPLETE=wp7-stop7" else line
+                    for line in matrix_body()]
+        mixed = matrix_body() + ["P11SCOPE_CELL_BRANCH=wp7-stop0:s1-precluded"]
+        lines = self._run_verdict_block([
+            ("full", frame(matrix_body(), True, threaded=False), 0, True),
+            ("incomplete", frame(incomplete, True, threaded=False), 0, True),
+            ("embedded", frame(embedded, True, threaded=False), 0, True),
+            ("mixed", frame(mixed, True, threaded=False), 0, True),
+            ("short", frame(matrix_body(range(1)), True, threaded=False), 0,
+             True),
+        ])
         self.assertIn("verdict=PASS", lines[0], lines)
-        self.assertNotIn("MATRIX SHORT", lines[0], lines)
-        self.assertNotIn("MIXED", lines[0], lines)
+        self.assertIn("note=@@>", lines[0], lines)
         self.assertIn("verdict=FAIL", lines[1], lines)
-        self.assertIn("7", lines[1], lines)
-        self.assertIn("MATRIX SHORT", lines[1], lines)
+        self.assertIn("[sequence]", lines[1], lines)
+        self.assertIn("wp7-stop7", lines[1], lines)
         self.assertIn("verdict=FAIL", lines[2], lines)
-        self.assertIn("7", lines[2], lines)
-        self.assertIn("MATRIX SHORT", lines[2], lines)
+        self.assertIn("[record-malformed]", lines[2], lines)
+        self.assertIn("wp7-stop7", lines[2], lines)
         self.assertIn("verdict=FAIL", lines[3], lines)
-        self.assertIn("MIXED", lines[3], lines)
+        self.assertIn("[sequence]", lines[3], lines)
+        self.assertIn("verdict=FAIL", lines[4], lines)
+        self.assertIn("[matrix-short]", lines[4], lines)
 
     def test_full_matrix_verdict_requires_a_strict_terminal_result(self):
-        # Drive the runner's shipped verdict-plus-matrix block verbatim
-        # (the terminal result line plus the twelve completion lines)
-        # against fixture logs: a full matrix with a valid terminal
-        # result passes, a malformed pass summary fails, and a valid
-        # summary followed by a failed terminal result fails. The
-        # verdict and the printed result line come from the same
-        # terminal line.
-        text = RUNNER.read_text(encoding="utf-8")
-        verdict_start = text.index("result_line=$(command grep")
-        guard = ('if [ -n "${full_matrix_set[$name]+present}" ]'
-                 ' && [ "$verdict" = PASS ]; then')
-        matrix_start = text.index(guard)
-        matrix_end = text.index("\n        fi\n", matrix_start) + len("\n        fi\n")
-        block = text[verdict_start:matrix_end]
-        self.assertIn("verdict=FAIL", block)
-        self.assertIn("verdict=PASS", block)
-        self.assertIn("matrix_missing", block)
-
-        def linkage(i):
-            return "P11SCOPE_CELL_BRANCH=wp7-stop%d:linked\n" % i
-
-        def complete(i):
-            return "P11SCOPE_STOP_COMPLETE=wp7-stop%d\n" % i
-
-        ok = ("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
-              "0 filtered out; finished in 180.00s\n")
-        malformed = ("test result: ok. 1 passed_suspected; 9 failed; 0 ignored; "
-                     "0 measured; 0 filtered out; finished in 180.00s\n")
-        failed = ("test result: FAILED. 0 passed; 1 failed; 0 ignored; "
-                  "0 measured; 0 filtered out; finished in 180.01s\n")
-        full = "".join(linkage(i) for i in range(12))
-        full += "".join(complete(i) for i in range(12))
-        healthy = full + ok
-        bad_summary = full + malformed
-        valid_then_failed = full + ok + failed
-        with tempfile.TemporaryDirectory() as tmp:
-            paths = {}
-            for name, body in (("healthy.log", healthy),
-                               ("malformed.log", bad_summary),
-                               ("valid-then-failed.log", valid_then_failed)):
-                path = Path(tmp) / name
-                path.write_text(body, encoding="utf-8")
-                paths[name] = path
-            script = ""
-            for name, path in paths.items():
-                script += (
-                    'name="probe-cell"; rc=0; '
-                    'declare -A full_matrix_set=([probe-cell]=1); '
-                    'log="%s"; ' % path +
-                    block + "\n" +
-                    'printf "<@@%s verdict=%%s result=%%s@@>\\n" '
-                    '"$verdict" "$result_line"; ' % name
-                )
-            result = subprocess.run(
-                ["bash", "-c", script],
-                capture_output=True, text=True, cwd=ROOT,
-            )
-        self.assertEqual(result.returncode, 0,
-                         result.stdout + result.stderr)
-        lines = result.stdout.splitlines()
-        self.assertEqual(len(lines), 3, lines)
-        self.assertIn("verdict=PASS", lines[0], lines)
-        self.assertIn("1 passed; 0 failed", lines[0], lines)
-        self.assertIn("verdict=FAIL", lines[1], lines)
-        self.assertIn("verdict=FAIL", lines[2], lines)
-        self.assertIn("FAILED", lines[2], lines)
+        # The verdict and the printed result line come from the one
+        # validated terminal summary: a malformed pass summary, garbage
+        # after the ignored count, a valid summary followed by a failed
+        # one, a healthy summary followed by an error, a pass carrying a
+        # no-feed receipt of either cause (with or without the Error
+        # prefix), and an exit-0 log after a signal-shaped status all
+        # fail with the validator's reason. Generic cells keep their
+        # own strict full-line summary check.
+        ok = OK_SUMMARY
+        cases = [
+            ("healthy", frame(matrix_body(), True, threaded=False), 0, True),
+            ("healthy-threaded", frame(matrix_body(), True), 0, True),
+            ("malformed", frame(matrix_body(), True, threaded=False, summary=(
+                "test result: ok. 1 passed_suspected; 9 failed; 0 ignored; "
+                "0 measured; 0 filtered out; finished in 180.00s")), 0, True),
+            ("garbage", frame(matrix_body(), True, threaded=False, summary=(
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 9 failed; "
+                "garbage")), 0, True),
+            ("valid-then-failed", frame(matrix_body(), True, threaded=False,
+                                        tail=[FAILED_SUMMARY]), 0, True),
+            ("then-error", frame(matrix_body(), True, threaded=False,
+                                 tail=["Error: joint cleanup failed"]), 0,
+             True),
+            ("unattributed-receipt", frame(
+                matrix_body() + [UNATTRIBUTED_ERROR.format(k=0)], True,
+                threaded=False), 0, True),
+            ("unattributed-text", frame(
+                matrix_body() + [UNATTRIBUTED_ERROR.format(k=0)[7:]], True,
+                threaded=False), 0, True),
+            ("s1-receipt", frame(
+                matrix_body() + [S1_ERROR.format(k=0)], True,
+                threaded=False), 0, True),
+            ("signal", frame(matrix_body(), True, threaded=False), 137, True),
+            ("generic-ok", "\nrunning 1 test\ntest x ... ok\n\n" + ok + "\n",
+             0, False),
+            ("generic-garbage", "\nrunning 1 test\ntest x ... ok\n\n"
+             "test result: ok. 1 passed; 0 failed; 0 ignored; 9 failed; "
+             "garbage\n", 0, False),
+            ("generic-prefix", "\nrunning 1 test\ntest x ... ok\n\n"
+             "test result: ok. 1 passed\n", 0, False),
+        ]
+        lines = self._run_verdict_block(cases)
+        want = {
+            "healthy": ("PASS", None), "healthy-threaded": ("PASS", None),
+            "malformed": ("FAIL", "summary-malformed"),
+            "garbage": ("FAIL", "summary-malformed"),
+            "valid-then-failed": ("FAIL", "summary-duplicate"),
+            "then-error": ("FAIL", "summary-not-terminal"),
+            "unattributed-receipt": ("FAIL", "error-count"),
+            "unattributed-text": ("FAIL", "receipt-stray"),
+            "s1-receipt": ("FAIL", "error-count"),
+            "signal": ("FAIL", "exit-status"),
+            "generic-ok": ("PASS", None), "generic-garbage": ("FAIL", None),
+            "generic-prefix": ("FAIL", None),
+        }
+        for (label, _body, _rc, _full), line in zip(cases, lines):
+            verdict, reason = want[label]
+            with self.subTest(case=label):
+                self.assertIn("verdict=%s " % verdict, line)
+                if reason is not None:
+                    self.assertIn("[%s]" % reason, line)
+        self.assertIn("result=%s note=" % OK_SUMMARY, lines[0])
+        self.assertIn("result=test result: ok. 1 passed_suspected", lines[2])
 
     def test_btrfs_pair_staging_surfaces_tool_stderr(self):
         # A hosted pair-staging failure must print the tool's

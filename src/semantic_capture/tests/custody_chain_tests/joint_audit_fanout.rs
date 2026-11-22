@@ -17096,6 +17096,145 @@ fn joint_machine_preparation_refusal_keeps_the_latch() {
     );
 }
 
+/// Kill-chain twin (round 4): the live verify5m3 lane stopped here —
+/// a reseed armed into a stuck session, its quantum's staging
+/// refused, and the re-arm gave up with WrongPhase, holding the
+/// lane for the rest of the run. Staging now re-arms like the audit
+/// step: the refused quantum abandons through the same counted
+/// paths (the prepared batch drains S1, any staged calls dispose
+/// as named loss, the stuck session's history voids for the next
+/// collect), and the next quantum publishes. No lane stop.
+#[test]
+fn joint_machine_staging_refusal_rearms_and_next_quantum_publishes() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_CreateObject", 2);
+    fixture.reach_phase("Staging");
+    // Stage the batch's entry first, so the latch hits mid-Staging
+    // (mutations staged, unpublished) rather than at entry zero.
+    // Feed queues stay empty until publish by design; the affected
+    // work here is the prepared batch the re-arm drains S1.
+    for _ in 0..64 {
+        let (_, stage, _, _) = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .prepared_staging_progress(&fixture.scene.real.lane)
+            .expect("the prepared batch stages entry by entry");
+        if stage >= 1 {
+            break;
+        }
+        fixture.service(1).expect("staging advances entry by entry");
+    }
+    // The posed ForeignCapture refuses the next admission with the
+    // adapter untouched, so resync stays possible for the re-arm.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .pose_prepared_batch_domain_for_test(crate::attach::capture::NativeDomainId::mint());
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed domain mismatch latches at Staging"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Staging");
+    let latched = fixture.call_accounting();
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "Staging re-arms past the refused quantum instead of stopping the lane"
+    );
+    assert!(!fixture.h3_pending(), "Staging leaves no untaken H3 slot");
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        None,
+        "the re-arm succeeds, so nothing is recorded"
+    );
+    assert_eq!(
+        fixture.machine.running_rearms_for_test(),
+        1,
+        "the Staging continuation counts against the shared bound"
+    );
+    let rearmed = fixture.call_accounting();
+    assert_eq!(rearmed.4, 0, "nothing stays staged after the re-arm");
+    fixture.assert_recovers("staging", 5);
+    let (api, reduced, disposed, _, staged, direct, _) = fixture.call_accounting();
+    assert_eq!(staged, 0, "nothing stays staged");
+    assert_eq!(
+        api,
+        reduced + disposed + direct,
+        "every S1 return is reduced, disposed or counted not attributed"
+    );
+    let _ = latched;
+}
+
+/// Disclosure twin for the Staging re-arm: the counted gap names
+/// the staging sub-exit that refused (not just the abandon), so a
+/// soak can confirm or redirect the Staging hypothesis from events
+/// alone; the latch clears exactly like an audit-step re-arm.
+#[test]
+fn joint_machine_staging_rearm_names_staging_cause_in_its_gap() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    let pid = std::process::id();
+    fixture.scene.push(pid, 0, "C_SignInit", 2);
+    fixture.scene.push(pid, 0, "C_SignUpdate", 3);
+    fixture.scene.push(pid, 0, "C_SignFinal", 4);
+    fixture.reach_phase("Staging");
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .pose_prepared_batch_domain_for_test(crate::attach::capture::NativeDomainId::mint());
+    assert_eq!(
+        fixture.service(1024),
+        Err(SemanticRefusal::Unavailable),
+        "the posed domain mismatch latches at Staging"
+    );
+    assert_eq!(fixture.machine.diagnostic_snapshot_for_test().0, "Staging");
+    assert_eq!(
+        fixture.rearm("semantic_unavailable"),
+        Some(false),
+        "Staging re-arms past the refused quantum"
+    );
+    let abandoned: Vec<String> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .filter(|gap| gap.subject == QUANTUM_ABANDONED)
+        .map(|gap| gap.reason.clone())
+        .collect();
+    assert_eq!(
+        abandoned.len(),
+        1,
+        "one counted gap names the abandoned quantum"
+    );
+    assert!(
+        abandoned[0].contains("stage_next:ForeignCapture@"),
+        "the gap names the staging sub-exit that refused: {}",
+        abandoned[0]
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "the re-arm clears the latch"
+    );
+    assert_eq!(
+        fixture.machine.rearm_refusal_for_test(),
+        None,
+        "the re-arm succeeds, so nothing is recorded"
+    );
+}
+
 /// Trip twin: the running no-progress wedge latches, then re-arms past
 /// the stuck frame (owner partial-not-stop): the trip records its cause
 /// for the re-arm's counted gaps, and the re-arm clears the latch.

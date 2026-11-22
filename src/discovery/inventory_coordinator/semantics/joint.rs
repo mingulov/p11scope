@@ -2072,6 +2072,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Test-only: pose the pending prepared batch's domain, so a
+    /// Staging twin can stage a genuine `ForeignCapture` latch with
+    /// the adapter untouched (resync stays possible, unlike the
+    /// stopped-adapter pose, which can only pin the latch itself).
+    /// The posed domain dies with the abandoned batch; recovery
+    /// prepares fresh.
+    #[cfg(test)]
+    pub(crate) fn pose_prepared_batch_domain_for_test(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+    ) {
+        if let Some(PendingSemanticBatch::Prepared(batch)) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.as_mut())
+        {
+            batch.domain = domain;
+        }
+    }
+
     pub(crate) fn dispose_prepared_claims_s1(&mut self) {
         self.dispose_prepared_claims_s1_for_cause(BirthDisposeCause::S1Finalize);
     }

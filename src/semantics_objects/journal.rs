@@ -33725,19 +33725,30 @@ pub(crate) mod tests {
         (check, scene.adapter.barrier_row_visits_for_test() - before)
     }
 
-    /// Finding 1: a one-credit conversion on a table past one slice (101
-    /// calls beside a 2000-row foreign refused shelf) pays
+    /// Finding 1: a one-credit conversion on a table past one slice pays
     /// every row, identity and prepaid application unit one per poll;
     /// the deciding poll visits no row and debits no scan unit, and the
     /// application's own row visits never exceed what was prepaid. The
-    /// poll bound comes from the charge model.
+    /// poll bound comes from the charge model. Two scenes pin each
+    /// table's charge on its own: 101 calls alone (the open charge must
+    /// cover them), and the same calls beside a 2000-row foreign refused
+    /// shelf whose visits outweigh the open rows' whole charge (the
+    /// refused charge must cover it).
     #[test]
     fn seal_metered_one_credit_conversion_prepays_its_apply() {
+        metered_one_credit_conversion(0);
+        metered_one_credit_conversion(2000);
+    }
+
+    fn metered_one_credit_conversion(refused_shelf: usize) {
         let (mut scene, bootstrap, audit) = metered_seal_scene(101);
-        // A foreign refused shelf (clear, barring nothing) that the
-        // conversion's refused selection still visits. It outweighs the
-        // open rows' whole charge, so only the refused charge covers it.
-        scene.adapter.populate_foreign_refused_rows_for_test(2000);
+        if refused_shelf > 0 {
+            // Clear foreign refused rows bar nothing, but the
+            // conversion's refused selection still visits them.
+            scene
+                .adapter
+                .populate_foreign_refused_rows_for_test(refused_shelf);
+        }
         let image = (COOKIE, EXEC);
         let rows = scene.adapter.open.len() + scene.adapter.refused.len();
         assert!(rows > SCOPED_RECOVERY_SLICE, "past one slice: {rows}");

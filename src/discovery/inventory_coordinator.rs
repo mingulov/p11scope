@@ -43622,6 +43622,146 @@ int main(void) {
         );
     }
 
+    /// One `LEADER_EXIT` lifecycle record for pid 7 stamped `hook_ts_ns`,
+    /// drained at `at`.
+    fn leader_exit_drain(domain: NativeDomainId, at: u64, hook_ts_ns: u64) -> DiscoveryBatch {
+        let mut drain = DiscoveryBatch::scripted(domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = hook_ts_ns;
+        record.pid_tgid = (7u64 << 32) | 7u64;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        drain.records.push(record);
+        drain
+    }
+
+    /// A system-scope caller admitted at 50 whose exit reconcile observed
+    /// at 500, with its kernel leader exit stamped `exit_ns` (staged
+    /// after the retirement, the order a pass drains them in).
+    fn system_caller_with_witnessed_exit(
+        exit_ns: Option<u64>,
+        comparable: bool,
+    ) -> (NativeScene, CallerId) {
+        let (mut native, caller) = watched_native();
+        native.scene.coordinator.engine.scope = Scope::System;
+        native.scene.coordinator.exit_clocks_comparable = comparable;
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        if let Some(exit_ns) = exit_ns {
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                exit_ns,
+            )));
+        }
+        (native, caller)
+    }
+
+    #[test]
+    fn a_system_scope_row_before_the_witnessed_leader_exit_binds() {
+        // The kernel stamped the leader's exit at 450: the tgid belonged
+        // to the admitted caller from its admission (50) until then, so
+        // no reused pid can have fired the row at 400. It binds and
+        // counts like the PID-scope retained twin.
+        let (mut native, caller) = system_caller_with_witnessed_exit(Some(450), true);
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        assert!(
+            matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_system_scope_row_read_before_the_leader_exit_arrives_binds_on_resight() {
+        // The row is read before its leader exit drains: it joins the
+        // owed queue, and the next batch's re-sight finds the now
+        // witnessed lifetime instead of deciding it sightingless.
+        let (mut native, caller) = system_caller_with_witnessed_exit(None, true);
+        let row = native.row(41, 1, 7, 400, 0);
+        let read = native.stamps.read(native.domain, vec![row]);
+        native.stage(read);
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+            native.domain,
+            at,
+            450,
+        )));
+        native.witness(Vec::new());
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        assert!(
+            matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_system_scope_row_after_the_witnessed_leader_exit_stays_unbound() {
+        // The row at 460 follows the leader's exit at 450: the pid may
+        // already name another process, so it keeps its live-miss gap.
+        let (mut native, caller) = system_caller_with_witnessed_exit(Some(450), true);
+        let row = native.row(41, 1, 7, 460, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+        assert!(
+            !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_system_scope_leader_exit_under_incomparable_clocks_proves_nothing() {
+        // Without comparable clocks the hook stamp cannot be ordered
+        // against the admission or the row: the row stays unbound.
+        let (mut native, _) = system_caller_with_witnessed_exit(Some(450), false);
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+    }
+
+    #[test]
+    fn a_system_scope_leader_exit_before_the_admission_never_bounds_the_lifetime() {
+        // A hook stamped before the caller's admission (40 < 50) is an
+        // earlier holder's delayed exit: it must not become this
+        // caller's lifetime bound, so the genuine exit at 450 still
+        // carries the row at 400.
+        let (mut native, caller) = system_caller_with_witnessed_exit(Some(40), true);
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+            native.domain,
+            at,
+            450,
+        )));
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        assert!(
+            matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
     #[test]
     fn a_cgroup_scope_retained_row_stays_unbound() {
         // PID-scope-only fallback under cgroup scope: only the engine

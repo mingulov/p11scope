@@ -514,38 +514,72 @@ pub(crate) fn stat_path(path: &str, admit: &mut dyn FnMut() -> bool) -> Option<N
 
 /// The mount-id bit of `statx(2)`'s mask (Linux 5.8).
 const STATX_MNT_ID: u32 = 0x0000_1000;
+/// The inode bit of `statx(2)`'s mask.
+const STATX_INO: u32 = 0x0000_0100;
+
+/// The kernel's `struct statx` (uapi `linux/stat.h`, 256 bytes), read
+/// through the raw syscall: not every libc target binds `statx` (musl's
+/// `libc` crate does not), so the layout is the kernel's own.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "the kernel layout: unread fields keep the offsets"
+)]
+pub(crate) struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    spare0: u16,
+    pub(crate) stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_times: [[u64; 2]; 4],
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    pub(crate) stx_dev_major: u32,
+    pub(crate) stx_dev_minor: u32,
+    pub(crate) stx_mnt_id: u64,
+    spare: [u64; 13],
+}
+
+const _: () = assert!(std::mem::size_of::<Statx>() == 256);
 
 /// One `statx(2)` of `path` (following links) for its device, inode and
 /// mount id: one unit, no retry.
-pub(crate) fn statx_path(
-    path: &str,
-    admit: &mut dyn FnMut() -> bool,
-) -> Option<Native<libc::statx>> {
+pub(crate) fn statx_path(path: &str, admit: &mut dyn FnMut() -> bool) -> Option<Native<Statx>> {
     let path = match c_path(path) {
         Ok(path) => path,
         Err(error) => return Some(Err(error)),
     };
-    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let mut stat = std::mem::MaybeUninit::<Statx>::zeroed();
     if !admit() {
         return None;
     }
     let target = stat.as_mut_ptr();
-    let mask = libc::STATX_INO | STATX_MNT_ID;
-    // SAFETY: `path` is NUL-terminated; `stat` is zeroed and written by
-    // the kernel, read only on success.
-    let result = native(NativeOp::Statx, || {
-        unsafe { libc::statx(libc::AT_FDCWD, path.as_ptr(), 0, mask, target) }.into()
+    let mask = STATX_INO | STATX_MNT_ID;
+    // SAFETY: `path` is NUL-terminated; `stat` is a zeroed kernel-layout
+    // `struct statx` written by the kernel, read only on success.
+    let result = native(NativeOp::Statx, || unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            mask,
+            target,
+        )
     });
     Some(match result {
         // SAFETY: zero-initialized and filled by the successful call above.
         Ok(_) => Ok(unsafe { stat.assume_init() }),
         Err(error) => Err(Unproven(error)),
     })
-}
-
-/// The device number a `statx(2)` result names (`st_dev` encoding).
-pub(crate) fn statx_device(stat: &libc::statx) -> u64 {
-    libc::makedev(stat.stx_dev_major, stat.stx_dev_minor)
 }
 
 /// The entry names of `getdents64(2)` records in `buf[..len]` (no

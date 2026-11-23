@@ -951,7 +951,10 @@ if prep:
 # run deadline, the designed collection bound (ruling CI-GAP-2,
 # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
 # plus the staged-refresh facts-retained refusal (one row per owning
-# caller) and the eight preparation failures above. A reason under the
+# caller) and the eight preparation failures above. A recovered
+# same-pass activation deferral (checked above: the designed
+# one-commit-per-transaction disclosure) never reaches this list.
+# A reason under the
 # wrong subject (the fallback reason under a preparation subject, the
 # retained reason under a novel subject) or a ninth preparation reason
 # fails loudly here, on both branches.
@@ -962,9 +965,22 @@ if prep:
 # the shared transaction, so 'cgroup member scan was incomplete' is
 # deliberately NOT allowed here: its reappearance fails loudly below
 # instead of hiding.
+# One scoped owner commit per transaction: when two members settle in
+# the same pass, one activates and the other defers by name and stages
+# again from fresh proof on a later pass. The deferral is a delay, never
+# a resting state: the named caller must end with an activated native
+# owner. This runs on every substrate, like the retained check above.
+deferred_reason='only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained'
+def deferral(g):
+    return g.get('reason')==deferred_reason and g.get('subject')=='native owner activation refused'
+for g in report.get('gaps',[]):
+    if deferral(g):
+        c=callers.get(g.get('caller'))
+        recovered=c is not None and c.get('pid')==g.get('pid') and (c.get('image') or {}).get('authority')=='native_exact'
+        refuse_unless(recovered, 'deferred activation never recovered: %r' % (g,))
 allowed_pairs={('native owner activation refused','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'),('cgroup scope transaction incomplete','cgroup collection deadline reached'),('native owner refresh refused','the final-sample permit was not granted; prior owner facts retained')}
 allowed_pairs|={('cgroup provider preparation incomplete',reason) for reason in prep_reasons}
-rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g)]
+rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g) and not deferral(g)]
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the

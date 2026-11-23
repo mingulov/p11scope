@@ -21,6 +21,16 @@ ROOT = Path(__file__).resolve().parents[2]
 QUAL = ROOT / "scripts/qualify-public-cli.sh"
 
 
+def verdict(text):
+    """Keep only the lines a check emits: a failure is matched on its
+    final exception line, never on traceback frames (a frame's source
+    line would show a check's message text even when another error
+    raised there)."""
+    return "\n".join(line for line in text.splitlines()
+                     if line and not line[0].isspace()
+                     and not line.startswith("Traceback (most recent call last)"))
+
+
 def extract_functions(*names):
     """Extract named shell functions plus REASON_* lines from the qualifier."""
     parts = []
@@ -183,7 +193,7 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
              str(GENERATIONS[100]), str(GENERATIONS[101])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
-    return proc.returncode, proc.stdout + proc.stderr
+    return proc.returncode, verdict(proc.stdout + proc.stderr)
 
 
 class SummaryTests(unittest.TestCase):
@@ -539,7 +549,7 @@ class GenerationHandoffTests(unittest.TestCase):
             proc = subprocess.run(["bash", "-u", "-c", body],
                                   capture_output=True, text=True,
                                   timeout=30, cwd=raw)
-        return proc.stdout + proc.stderr
+        return verdict(proc.stdout + proc.stderr)
 
     def test_registered_generations_qualify_in_order(self):
         out = self.run_invocation(GENERATIONS[100], GENERATIONS[101])
@@ -1245,7 +1255,7 @@ class WholePrearmBlockTests(unittest.TestCase):
             proc = subprocess.run(argv + ["-c", PREARM_RUNNER, release, "block.py"],
                                   cwd=tmp, capture_output=True, text=True,
                                   timeout=30, env=env)
-            return proc.returncode, proc.stdout + proc.stderr
+            return proc.returncode, verdict(proc.stdout + proc.stderr)
 
     def expect(self, twins, release, *, ok, marker):
         for label, argv, extra_env in self.MODES:

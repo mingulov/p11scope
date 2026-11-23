@@ -25,6 +25,16 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[2]
 QUAL = ROOT / "scripts" / "qualify-public-cli.sh"
 
+
+def verdict(text):
+    """Keep only the lines a check emits: a failure is matched on its
+    final exception line, never on traceback frames (a frame's source
+    line would show a check's message text even when another error
+    raised there)."""
+    return "\n".join(line for line in text.splitlines()
+                     if line and not line[0].isspace()
+                     and not line.startswith("Traceback (most recent call last)"))
+
 MODES = (("plain", ["python3", "-I"], None),
          ("-O", ["python3", "-O", "-I"], None),
          ("PYTHONOPTIMIZE", ["python3"], {"PYTHONOPTIMIZE": "1"}))
@@ -52,7 +62,7 @@ def run_block(anchor, files, argv=(), env=None, mode=MODES[0]):
         proc = subprocess.run(interp + ["block.py"] + list(argv), cwd=tmp,
                               capture_output=True, text=True, timeout=30,
                               env=full)
-        return proc.returncode, proc.stdout + proc.stderr
+        return proc.returncode, verdict(proc.stdout + proc.stderr)
 
 
 class GuardCase(unittest.TestCase):
@@ -108,6 +118,11 @@ class SecondSigintReportTests(GuardCase):
     def test_settled_partial_report_passes(self):
         self.check(sigint_report(), ok=True)
 
+    def test_one_drain_sample_passes(self):
+        report = sigint_report()
+        report["evidence"]["scheduling"]["inter_drain_gap"]["samples"] = 1
+        self.check(report, ok=True)
+
     def test_unproven_drain_matching_its_evidence_passes(self):
         for path in (["state"], ["post_q_events"], ["post_q_discovery"]):
             with self.subTest(field=path[0]):
@@ -133,6 +148,8 @@ class SecondSigintReportTests(GuardCase):
         ("samples-zero", sig_set(E + ["scheduling", "inter_drain_gap", "samples"], 0),
          "report must carry this capture live-loop drain samples"),
         ("samples-string", sig_set(E + ["scheduling", "inter_drain_gap", "samples"], "3"),
+         "report must carry this capture live-loop drain samples"),
+        ("samples-bool", sig_set(E + ["scheduling", "inter_drain_gap", "samples"], True),
          "report must carry this capture live-loop drain samples"),
         ("samples-missing", sig_set(E + ["scheduling"], DELETE),
          "report must carry this capture live-loop drain samples"),
@@ -273,6 +290,19 @@ class EventStdoutGuardTests(GuardCase):
                 case = event_case(2)
                 mutate(case)
                 self.check(case, ok=False, marker=marker)
+
+    def test_repeated_totals_for_one_long_pass_pass(self):
+        # A pass longer than the interval gets a second totals; its
+        # marker is still the last pass_committed, not the totals row.
+        case = event_case(1)
+        stream = case["stream"]
+        again = json.loads(json.dumps(stream[2]))
+        again["at_ns"] = 2 * INTERVAL
+        stream.insert(3, again)
+        stream[-1]["at_ns"] = 3 * INTERVAL
+        for seq, row in enumerate(stream):
+            row["seq"] = seq
+        self.check(case, ok=True, marker="ok lines=5 totals=2")
 
     def test_five_totals_fail(self):
         self.check(event_case(5), ok=False, marker="totals count 5")

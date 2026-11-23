@@ -4221,14 +4221,17 @@ impl LiveJointMachine {
                                     );
                                 }
                             }
-                            // F4: the close-reason counts for the R2 decision.
+                            // F4: the close-reason counts for the R2 decision,
+                            // only when the disposal released open calls.
                             #[cfg(debug_assertions)]
-                            eprintln!(
+                            if !disposed.pregrant_losses().is_empty() {
+                                eprintln!(
                                 "p11scope: pre-grant disposal released open calls as loss: \
                                  reason={reason:?} closes={:?} images={}",
                                 self.pregrant_close_counts,
                                 disposed.pregrant_losses().len(),
                             );
+                            }
                         }
                         (
                             Phase::Negative {

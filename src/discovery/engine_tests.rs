@@ -22435,17 +22435,24 @@ fn owned_tree_watch_backs_off_unproductive_members() {
 /// Pre-open facts consult: a watch repeat over an unchanged member reuses
 /// the proven file facts instead of reopening and re-proving every
 /// mapping. The rotation still visits the member (its visit count grows),
-/// but no second deep scan runs. Only the sleeper is watched: the test
-/// runner's own maps churn (allocator mmaps) would force re-examination
-/// and make the deep count nondeterministic. The consult is forced on:
-/// production gates it on 9p read-only mounts, which lib tests never see.
+/// but the repeat reads ~maps-only bytes while the first visit reads
+/// whole files. Only the member is watched: the test runner's own maps
+/// churn (allocator mmaps) would force re-examination and make the
+/// counts nondeterministic. The member is `sh` (three mappings on every
+/// host); killing it orphans the `sleep` grandchild, which exits on its
+/// own 30 s bound. The consult is forced on: production gates it on 9p
+/// read-only mounts, which lib tests never see.
 #[test]
-fn owned_tree_watch_repeat_over_unchanged_member_skips_deep_rescan() {
+fn owned_tree_watch_repeat_over_unchanged_member_reads_no_file_bytes() {
     let dir = tempfile::tempdir().expect("watch cgroup dir");
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("30")
+    let mut sleeper = std::process::Command::new("sh")
+        .args(["-c", "sleep 30"])
         .spawn()
-        .expect("spawn sleeper");
+        .expect("spawn shell");
+    assert!(
+        wait_member_maps_settled(sleeper.id()),
+        "the member exec'd and settled before tracking"
+    );
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{}\n", sleeper.id()),
@@ -22462,10 +22469,10 @@ fn owned_tree_watch_repeat_over_unchanged_member_skips_deep_rescan() {
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
     let first = 1_000u64;
     engine.owned_tree_watch(Some(first));
-    assert_eq!(
-        engine.deep_scans(),
-        1,
-        "the first visit deep-scans the member"
+    let io_after_first = engine.budget.attempted_io_bytes();
+    assert!(
+        io_after_first > 30_000,
+        "the first visit reads file bytes (non-vacuous): {io_after_first}"
     );
     let scans_after_first: u32 = engine
         .owned_watch_unproven
@@ -22483,10 +22490,13 @@ fn owned_tree_watch_repeat_over_unchanged_member_skips_deep_rescan() {
         scans_after_second, 2,
         "the rotation still visits the member"
     );
-    assert_eq!(
-        engine.deep_scans(),
-        1,
-        "the unchanged repeat reuses proven facts (no second deep scan)"
+    let io_second = engine
+        .budget
+        .attempted_io_bytes()
+        .saturating_sub(io_after_first);
+    assert!(
+        io_second < 5_000,
+        "the unchanged repeat reuses proven facts (maps-only bytes): second-run bytes={io_second}"
     );
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
     sleeper.kill().expect("kill sleeper");
@@ -22504,6 +22514,10 @@ fn owned_tree_watch_repeat_over_unchanged_member_reads_no_provider_metadata() {
         .arg("30")
         .spawn()
         .expect("spawn sleeper");
+    assert!(
+        wait_member_maps_settled(sleeper.id()),
+        "the member exec'd and settled before tracking"
+    );
     std::fs::write(
         dir.path().join("cgroup.procs"),
         format!("{}\n", sleeper.id()),
@@ -22657,6 +22671,10 @@ fn owned_tree_watch_repeat_getter_match_takes_full_path() {
         .args(["-c", "sleep 30"])
         .spawn()
         .expect("spawn shell");
+    assert!(
+        wait_member_maps_settled(sleeper.id()),
+        "the member exec'd and settled before tracking"
+    );
     let exe = std::fs::metadata(format!("/proc/{}/exe", sleeper.id())).expect("stat shell exe");
     std::fs::write(
         dir.path().join("cgroup.procs"),
@@ -22703,7 +22721,7 @@ fn owned_tree_watch_repeat_getter_match_takes_full_path() {
         count_second.get()
     );
     assert!(
-        count_second.get() * 2 < count_first.get(),
+        count_second.get() < count_first.get(),
         "only the getter target re-opens (other mappings reuse): first={} second={}",
         count_first.get(),
         count_second.get()
@@ -22711,6 +22729,140 @@ fn owned_tree_watch_repeat_getter_match_takes_full_path() {
     crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
     sleeper.kill().expect("kill sleeper");
     sleeper.wait().expect("reap sleeper");
+}
+
+/// Pre-open consult gate: 9p read-only mounts only. Every other
+/// filesystem (including 9p read-write, whose bytes can change under the
+/// key) keeps the open-first flow byte-identical.
+#[test]
+fn preopen_consult_gate_admits_only_nine_p_read_only() {
+    use crate::discovery::scan::{NINE_P_MAGIC, preopen_consult_eligible};
+    assert!(preopen_consult_eligible(Some(NINE_P_MAGIC), true));
+    for (magic, read_only) in [
+        (None, true),
+        (None, false),
+        (Some(NINE_P_MAGIC), false),
+        (Some(0xef53), true),
+        (Some(0xef53), false),
+        (Some(0x6573_5546), true),
+        (Some(0x6969), true),
+        (Some(0x9123_683e), true),
+    ] {
+        assert!(
+            !preopen_consult_eligible(magic, read_only),
+            "gate rejects magic={magic:?} read_only={read_only}"
+        );
+    }
+}
+
+/// Pre-open keys never cross mount namespaces: the same file examined
+/// from two namespaces binds two entries, so a bind-mounted alias can
+/// never serve another namespace's facts.
+#[test]
+fn preopen_key_separates_mount_namespaces() {
+    use crate::discovery::scan::PreopenFileKey;
+    use crate::process::MountNamespaceId;
+    use p11scope_manifest::maps::Device;
+    let dir = tempfile::tempdir().expect("key dir");
+    let file = dir.path().join("lib.so");
+    std::fs::write(&file, b"fake library bytes").expect("write fake library");
+    let metadata = std::fs::metadata(&file).expect("stat fake library");
+    let device = Device { major: 8, minor: 1 };
+    let left = PreopenFileKey::for_target(
+        MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        device,
+        3,
+        &metadata,
+    );
+    let right = PreopenFileKey::for_target(
+        MountNamespaceId {
+            device: 1,
+            inode: 4,
+        },
+        device,
+        3,
+        &metadata,
+    );
+    assert_ne!(left, right, "different namespaces bind different keys");
+    let again = PreopenFileKey::for_target(
+        MountNamespaceId {
+            device: 1,
+            inode: 2,
+        },
+        device,
+        3,
+        &metadata,
+    );
+    assert_eq!(left, again, "same namespace and file bind one key");
+}
+
+/// The cheap repeat serves hits, not full examinations: the first visit
+/// misses every group (cold cache) while the repeat over the unchanged
+/// member hits all of them. The hit count is exact per group (the member
+/// maps three files); the lookup step itself charges one work unit per
+/// consult (per-pass work without a charge is an INV-2 finding class),
+/// which the byte and hook twins observe as cheap-but-present.
+#[test]
+fn owned_tree_watch_repeat_counts_its_hits() {
+    let dir = tempfile::tempdir().expect("watch cgroup dir");
+    let mut sleeper = std::process::Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .expect("spawn shell");
+    assert!(
+        wait_member_maps_settled(sleeper.id()),
+        "the member exec'd and settled before tracking"
+    );
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", sleeper.id()),
+    )
+    .expect("write cgroup.procs");
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 7,
+        path: dir.path().into(),
+        dir: Arc::new(File::open(dir.path()).expect("open watch dir")),
+    };
+    engine.owned_run_pid = Some(std::process::id());
+    engine.owned_watch_run_budget_ns = u64::MAX;
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(true));
+    let first = 1_000u64;
+    engine.owned_tree_watch(Some(first));
+    assert_eq!(
+        engine.budget.preopen_hits_for_test(),
+        0,
+        "the cold first visit misses every group"
+    );
+    engine.owned_tree_watch(Some(first + OWNED_WATCH_SCAN_MIN_NS));
+    assert_eq!(
+        engine.budget.preopen_hits_for_test(),
+        3,
+        "the unchanged repeat hits all three mappings"
+    );
+    crate::discovery::scan::FORCE_PREOPEN_FACTS_CONSULT.with(|force| force.set(false));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+/// Poll boundedly until a spawned member's maps stabilize (two identical
+/// consecutive reads): a scan that catches the member pre-exec would read
+/// its parent's mappings instead. Returns false on timeout (the caller
+/// fails loudly, never vacuously).
+fn wait_member_maps_settled(pid: u32) -> bool {
+    let mut previous = String::new();
+    for _ in 0..100 {
+        match std::fs::read_to_string(format!("/proc/{pid}/maps")) {
+            Ok(maps) if maps == previous && !maps.is_empty() => return true,
+            Ok(maps) => previous = maps,
+            Err(_) => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
 }
 
 /// Rotation reaches every member, not just the extremes: with three

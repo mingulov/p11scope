@@ -3266,3 +3266,109 @@ fn a_resight_visit_backlog_beyond_the_pass_allowance_resumes_to_complete() {
         "every row misses its attempt before it refuses"
     );
 }
+
+#[test]
+fn retry_mismatches_do_not_starve_the_sixty_fifth_ticket() {
+    // Liveness: 64 retained rows whose live callers persistently answer a
+    // nonmatching ticket, plus one matching tail. Every action spends at
+    // most 64 queries, and the matching tail binds within a bounded
+    // number of actions (it must not starve behind the same mismatches
+    // forever). RED: the base requeues the mismatches ahead of the tail
+    // every pass, so the tail never binds.
+    let mut run = Run::new();
+    let d = run.domain;
+    let retained: Vec<WitnessRow> = (0..65)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(retained);
+    run.settle();
+    assert_eq!(run.verdicts().len(), 65);
+    assert_eq!(run.binder.retry_len_for_test(d), 65);
+    for i in 0..64 {
+        run.world.admit(T + i as u32, 1, 1_000 + i as u32, 2_000);
+        run.world.answer(T + i as u32, 1, d, cookie(d, 99));
+    }
+    run.world.admit(T + 64, 1, 1_064, 2_000);
+    run.world.answer(T + 64, 1, d, cookie(d, 164));
+    let mut tail_bound = false;
+    for action in 0..4 {
+        let queries_before = run.world.queries;
+        run.drain(&[]);
+        run.read(Vec::new());
+        let batch_queries = run.world.queries - queries_before;
+        assert!(
+            batch_queries <= 64,
+            "action {action}: at most 64 queries, saw {batch_queries}"
+        );
+        for verdict in run.verdicts() {
+            if verdict == bound(CallerId(1_064)) {
+                tail_bound = true;
+            }
+        }
+        if tail_bound {
+            break;
+        }
+    }
+    assert!(tail_bound, "the matching tail binds within 4 actions");
+}
+
+#[test]
+fn fresh_read_and_retry_share_the_action_allowance() {
+    // One action allowance: 64 retained rows with matching tickets plus
+    // one fresh uncached live row in the servicing batch. The action
+    // spends at most 64 queries total (the fresh row defers its query
+    // when the allowance is exhausted), and every row eventually decides
+    // across later actions. RED: the base spends 64 on the retries plus
+    // one more on the fresh row (65).
+    let mut run = Run::new();
+    let d = run.domain;
+    let retained: Vec<WitnessRow> = (0..64)
+        .map(|i| row(d, 100 + i, 1, T + i as u32, 1_500))
+        .collect();
+    run.read(retained);
+    run.settle();
+    assert_eq!(run.verdicts().len(), 64);
+    assert_eq!(run.binder.retry_len_for_test(d), 64);
+    for i in 0..64 {
+        run.world.admit(T + i as u32, 1, 1_000 + i as u32, 2_000);
+        run.world.answer(T + i as u32, 1, d, cookie(d, 100 + i));
+    }
+    run.world.admit(T + 100, 1, 2_000, 2_000);
+    run.world.answer(T + 100, 1, d, cookie(d, 200));
+    let queries_before = run.world.queries;
+    run.drain(&[]);
+    run.read(vec![row(d, 200, 1, T + 100, 1_500)]);
+    let batch_queries = run.world.queries - queries_before;
+    assert!(
+        batch_queries <= 64,
+        "one action spends at most 64 queries, saw {batch_queries}"
+    );
+    // Every row eventually decides: the 64 retries plus the deferred
+    // fresh row, each within the per-action bound.
+    let mut decided = run.verdicts().len();
+    for _ in 0..8 {
+        if run.binder.census().pending == 0 && run.binder.retry_len_for_test(d) == 0 {
+            break;
+        }
+        let queries_before = run.world.queries;
+        run.drain(&[]);
+        run.read(Vec::new());
+        let batch_queries = run.world.queries - queries_before;
+        assert!(
+            batch_queries <= 64,
+            "resume spends at most 64 queries, saw {batch_queries}"
+        );
+        decided += run.verdicts().len();
+    }
+    assert_eq!(decided, 65, "all 64 retries plus the fresh row decide");
+    let census = run.binder.census();
+    assert_eq!(
+        (
+            census.rows,
+            census.bound,
+            census.unbound_total(),
+            census.pending
+        ),
+        (65, 65, 0, 0)
+    );
+}

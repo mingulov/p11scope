@@ -29642,6 +29642,337 @@ exit 0
         );
     }
 
+    /// Sum named terminal retry calls weighted by repeats: each retained
+    /// `identity retry terminal` gap leads with its count, and equal
+    /// gaps share one row with `repeats` > 1.
+    fn terminal_retry_total(native: &NativeScene) -> u64 {
+        let registry = &native.scene.coordinator.registry;
+        let mut total = 0u64;
+        for (gap, repeats) in registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+        {
+            if gap.subject == "identity retry terminal" {
+                let first = gap.reason.split_whitespace().next().unwrap_or("?");
+                let count: u64 = first
+                    .parse()
+                    .unwrap_or_else(|_| panic!("terminal gap leads with a count: {gap:?}"));
+                total = total.saturating_add(count.saturating_mul(*repeats));
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn terminal_retry_total_survives_general_gap_saturation() {
+        // Per-cause conservation under quota pressure, finish leg: the
+        // retained 3 -> 43 scene fills every ordinary and reserve detail
+        // slot with distinct gaps, then finishes. The 40 excluded calls
+        // and their cause stay visible through the per-cause aggregate
+        // even though individual detail rows are capped. RED: the base
+        // suppresses the only copy behind the generic counter (0 vs 40).
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 99);
+        native.read(Vec::new());
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let max_gaps = native.scene.coordinator.registry.limits().max_gaps;
+        for n in 0..max_gaps {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("filler-{n}"),
+                reason: format!("filler gap {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.registry.enter_terminal_phase();
+        for n in 0..crate::discovery::caller_registry::TERMINAL_GAP_RESERVE {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("terminal-filler-{n}"),
+                reason: format!("terminal filler {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            40,
+            "the 40 excluded calls stay counted under saturation"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "identity retry terminal"
+                    && gap.reason.contains("domain finish")),
+            "the terminal cause stays named"
+        );
+    }
+
+    #[test]
+    fn rerefused_retry_total_survives_active_gap_saturation() {
+        // Active cap pressure, re-refusal leg: fill the ordinary slots,
+        // then re-refuse a retained row grown 3 -> 43. The 40 calls stay
+        // counted with their cause. RED: the base suppresses (0 vs 40).
+        let mut native = retained_with_growth();
+        let max_gaps = native.scene.coordinator.registry.limits().max_gaps;
+        for n in 0..max_gaps {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("active-filler-{n}"),
+                reason: format!("active filler {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        let mut second = native.row(41, 2, 9, 1_000, 0);
+        second.entry_count = 5;
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            40,
+            "the refused growth stays counted under active pressure"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "identity retry terminal"
+                    && gap.reason.contains("re-refusal")),
+            "the re-refusal cause stays named"
+        );
+    }
+
+    #[test]
+    fn terminal_retry_aggregates_unequal_deltas_per_cause() {
+        // Two retained rows with unequal growth (3 -> 13 and 5 -> 25)
+        // finish under saturation: one per-cause aggregate discloses 30
+        // (10 + 20). RED: the base suppresses both (0 vs 30).
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 5;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 13), (42, 1, 1, 25)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let max_gaps = native.scene.coordinator.registry.limits().max_gaps;
+        for n in 0..max_gaps {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("multi-filler-{n}"),
+                reason: format!("multi filler {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.registry.enter_terminal_phase();
+        for n in 0..crate::discovery::caller_registry::TERMINAL_GAP_RESERVE {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("multi-terminal-{n}"),
+                reason: format!("multi terminal {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            30,
+            "unequal deltas aggregate per cause under saturation"
+        );
+    }
+
+    #[test]
+    fn terminal_retry_with_zero_growth_discloses_nothing() {
+        // A retained row with no growth (3 -> 3) finishes: no terminal
+        // gap. Pins that zero growth stays silent.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 3)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            0,
+            "zero growth discloses nothing"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "identity retry terminal"),
+            "no terminal row for zero growth"
+        );
+    }
+
+    #[test]
+    fn terminal_retry_conserves_equal_deltas_with_repeats() {
+        // Two identical deltas (3 -> 13 twice) finish without pressure:
+        // the weighted total is 20 whether the store dedupes by repeats
+        // or aggregates in place. Pins conservation counting repeats.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 3;
+        native.witness(vec![first, second]);
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 13), (42, 1, 1, 13)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            20,
+            "equal deltas conserve with repeats"
+        );
+    }
+
+    #[test]
+    fn finish_settlement_resumes_across_actions() {
+        // Resumable terminal settlement: 65 retained folds (1 -> 2 each)
+        // finish in chunks of at most 64 leaf operations per action.
+        // After the first Finish stage 64 settle and one remains; after
+        // the resume all 65 settle with exact totals and placement. RED:
+        // the base settles all 65 synchronously in one action.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let rows: Vec<WitnessRow> = (0..65)
+            .map(|i| {
+                let mut row = native.row(100 + i, 1, 9, 40, 1);
+                row.entry_count = 1;
+                row
+            })
+            .collect();
+        native.witness(rows);
+        let counts: Vec<(u64, u64, usize, u64)> =
+            (0..65).map(|i| (100 + i, 1, 1, 2)).collect();
+        native.counts_read(Vec::new(), counts);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            64,
+            "the first action settles 64 of 65"
+        );
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            65,
+            "the resume settles the last fold"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (65, 0, 65, 0)
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(placement.total(), 65);
+        assert_eq!(placement.module, 65);
+        let unbound = native.module_unbound().expect("the folds stand");
+        assert_eq!((unbound.rows, unbound.entries), (65, 65));
+    }
+
     /// The retry completion stamp lands strictly between the re-pend
     /// batch's horizons and the next batch's: the re-pended row waits
     /// exactly one batch, then decides together with the newly read row

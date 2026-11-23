@@ -622,7 +622,7 @@ samples=evidence.get('scheduling',{}).get('inter_drain_gap',{}).get('samples')
 if not (type(samples) is int and samples>0): raise AssertionError('report must carry this capture live-loop drain samples')
 if not (evidence.get('child_still_running') is False): raise AssertionError('owned child must be settled, not still running')
 PY
-  result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && [ "$report_ok" = 1 ] && grep -qa 'p11scope: cleanup incomplete' sig2.stderr && ! grep -qa panicked sig2.stderr && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok report_ok=$report_ok"
+  result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && [ "$report_ok" = 1 ] && [ "$(grep -cxF 'p11scope: cleanup incomplete' sig2.stderr 2>/dev/null)" = 1 ] && ! grep -qa panicked sig2.stderr && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok report_ok=$report_ok"
 }
 fifo_refused() {
   local wl rc=125
@@ -633,7 +633,7 @@ fifo_refused() {
     timeout 60 "$P" profile --pid "$wl" --duration 2 -o "$OUT/fifo" > fifo.stdout 2> fifo.stderr; rc=$?
   fi
   terminate "$wl"
-  result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qF 'exists and is a FIFO; refusing to replace it' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
+  result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && [ "$(grep -cxF "p11scope: output $OUT/fifo exists and is a FIFO; refusing to replace it (-o publishes the report by renaming a new file over that name). Name a new or regular file, or leave out -o to write no report file" fifo.stderr 2>/dev/null)" = 1 ] && echo 1 || echo 0)" "rc=$rc"
 }
 # Event stdout: `--event-log -` streams pure JSONL to stdout (Docker/
 # Fluent Bit/Loki with no file mount) while the -o report agrees on
@@ -696,6 +696,25 @@ if not (report["observation"]["passes"] == stream[-1]["event"]["passes"]): raise
 final = [row for row in stream if row["kind"] == "pass_committed"][-1]["event"]
 for key in ["callers", "modules", "edges"]:
     if not (len(report[key]) == final["totals"][key]): raise AssertionError((key, len(report[key]), final["totals"]))
+
+
+def event_output(document, what):
+    # The report's typed event-log outcome: exactly these four fields,
+    # exact types (a bool is not a count).
+    outcome = document.get("event_output")
+    if type(outcome) is not dict: raise AssertionError("%s report event_output %r" % (what, outcome))
+    if set(outcome) != {"status", "lines_lost", "bytes_lost", "reason"}: raise AssertionError("%s event_output fields %r" % (what, sorted(outcome)))
+    for key in ("status", "reason"):
+        if type(outcome[key]) is not str: raise AssertionError("%s event_output %s %r" % (what, key, outcome[key]))
+    for key in ("lines_lost", "bytes_lost"):
+        if type(outcome[key]) is not int or outcome[key] < 0: raise AssertionError("%s event_output %s %r" % (what, key, outcome[key]))
+    return outcome
+
+
+# The full run lost nothing: the report says so, and so does `ended`.
+COMPLETE = {"status": "complete", "lines_lost": 0, "bytes_lost": 0, "reason": "none"}
+if event_output(report, "full") != COMPLETE: raise AssertionError("full run event_output %r" % (report["event_output"],))
+if stream[-1]["event"].get("stdout_lost") != {"lines": 0, "bytes": 0}: raise AssertionError("full run ended stdout_lost %r" % (stream[-1]["event"].get("stdout_lost"),))
 # Totals kept their cadence: a couple of snapshots, never none. The
 # cadence is anchored at `started`, not at a pass number: on a slow
 # attach the first pass commits after the interval is already due, so
@@ -718,8 +737,11 @@ with open("event-epipe.head", "rb") as handle:
     if not (handle.read(1) == b"{"): raise AssertionError("the head holds event bytes")
 epipe = strict(open(os.environ["epipe_out"]).read())
 if not (epipe["schema"] == "p11scope/inventory/v1"): raise AssertionError(epipe.get("schema"))
-with open("event-epipe.stderr") as handle:
-    if not ("shed" in handle.read()): raise AssertionError("the loss is reported on stderr")
+# Loss proof comes only from the report's typed outcome: the closed
+# reader truncated the stream, with counted lines and bytes.
+lost = event_output(epipe, "early-close")
+if lost["status"] != "truncated" or lost["reason"] != "broken_pipe": raise AssertionError("early-close event_output %r" % (lost,))
+if not (lost["lines_lost"] >= 1 and lost["bytes_lost"] >= lost["lines_lost"]): raise AssertionError("early-close event_output counts %r" % (lost,))
 print("ok lines=%d totals=%d" % (len(stream), len(totals)))
 PY
   result inventory-event-stdout "$([ "$judge_rc" = 0 ] && echo 1 || echo 0)" "rc1=$rc1 rc2=$rc2 $(tail -n 1 event-stdout.judge 2>/dev/null | head -c 300)"
@@ -780,7 +802,7 @@ cgroup_capture() {
   local inside_ready=0 outside_ready=0 in_cgroup=0
   if waitfor "$cell-inside.wl" "^READY pid=$inside$" "$inside" "$READY_TICKS"; then
     inside_ready=1; readygen=$(generation "$inside")
-    if echo "$inside" > "$CG/cgroup.procs" 2>/dev/null && grep -qw "$inside" "$CG/cgroup.procs" 2>/dev/null; then
+    if echo "$inside" > "$CG/cgroup.procs" 2>/dev/null && grep -qxF "$inside" "$CG/cgroup.procs" 2>/dev/null; then
       in_cgroup=1
     fi
   fi

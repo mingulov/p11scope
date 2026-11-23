@@ -191,21 +191,28 @@ def event_stream(n_totals=2):
         rows.append({"kind": "totals", "at_ns": INTERVAL * (index + 1),
                      "event": dict(totals, **{"pass": index, "passes": index + 1})})
     rows.append({"kind": "ended", "at_ns": INTERVAL * (n_totals + 1),
-                 "event": {"passes": n_totals}})
+                 "event": {"passes": n_totals, "stdout_lost": {"lines": 0, "bytes": 0}}})
     for seq, row in enumerate(rows):
         row["schema"] = "p11scope/inventory-events/v1"
         row["seq"] = seq
     return rows
 
 
+EVENT_COMPLETE = {"status": "complete", "lines_lost": 0, "bytes_lost": 0, "reason": "none"}
+EVENT_TRUNCATED = {"status": "truncated", "lines_lost": 12, "bytes_lost": 2400,
+                   "reason": "broken_pipe"}
+
+
 def event_case(n_totals=2):
     stream = event_stream(n_totals)
     report = {"schema": "p11scope/inventory/v1",
               "observation": {"passes": n_totals},
-              "callers": [{}] * n_totals, "modules": [{}], "edges": [{}] * n_totals}
+              "callers": [{}] * n_totals, "modules": [{}], "edges": [{}] * n_totals,
+              "event_output": dict(EVENT_COMPLETE)}
     return {"stream": stream, "report": report,
-            "epipe": {"schema": "p11scope/inventory/v1"},
-            "head": "{\"schema\"", "stderr": "p11scope: event log: shed 12 rows\n",
+            "epipe": {"schema": "p11scope/inventory/v1", "event_output": dict(EVENT_TRUNCATED)},
+            # stderr is a human rendering only: it never decides loss.
+            "head": "{\"schema\"", "stderr": "p11scope: event log: no rows shed\n",
             "rc1": "0", "rc2": "1", "jsonl": None}
 
 
@@ -244,6 +251,11 @@ class EventStdoutGuardTests(GuardCase):
     def setter(key, value):
         def go(case):
             case[key] = value
+        return go
+
+    def output_set(document, **changes):
+        def go(case):
+            case[document]["event_output"].update(changes)
         return go
 
     def drop_totals(case):
@@ -289,11 +301,54 @@ class EventStdoutGuardTests(GuardCase):
         ("totals-early", stream_row(2, "at_ns", INTERVAL - 1), "'at_ns': 1999999999"),
         ("early-close-rc", setter("rc2", "0"), "early-close rc=0"),
         ("head-empty", setter("head", ""), "the head holds event bytes"),
-        ("epipe-schema", setter("epipe", {"schema": "other"}), "other"),
-        # Codex r7 F1: the loss diagnostic itself.
-        ("no-shed-diagnostic", setter("stderr", "p11scope: event log: closed\n"),
-         "the loss is reported on stderr"),
+        ("epipe-schema", lambda c: c["epipe"].update(schema="other"), "other"),
+        # Loss proof is the typed report outcome, on both runs.
+        ("full-output-missing", lambda c: c["report"].pop("event_output"),
+         "full report event_output None"),
+        ("full-output-truncated", output_set("report", status="truncated"),
+         "full run event_output"),
+        ("full-output-lines", output_set("report", lines_lost=1), "full run event_output"),
+        ("full-output-bytes", output_set("report", bytes_lost=1), "full run event_output"),
+        ("full-output-reason", output_set("report", reason="broken_pipe"), "full run event_output"),
+        ("full-output-extra", output_set("report", extra=0), "full event_output fields"),
+        ("full-output-bool", output_set("report", lines_lost=False), "full event_output lines_lost False"),
+        ("ended-lost", lambda c: c["stream"][-1]["event"].update(stdout_lost={"lines": 1, "bytes": 0}),
+         "full run ended stdout_lost"),
+        ("ended-lost-missing", lambda c: c["stream"][-1]["event"].pop("stdout_lost"),
+         "full run ended stdout_lost None"),
+        ("epipe-output-missing", lambda c: c["epipe"].pop("event_output"),
+         "early-close report event_output None"),
+        ("epipe-complete", output_set("epipe", status="complete", lines_lost=0, bytes_lost=0, reason="none"),
+         "early-close event_output"),
+        ("epipe-failed", output_set("epipe", status="failed"), "early-close event_output"),
+        ("epipe-slow-reader", output_set("epipe", reason="slow_reader"), "early-close event_output"),
+        ("epipe-zero-lines", output_set("epipe", lines_lost=0), "early-close event_output counts"),
+        ("epipe-bytes-below-lines", output_set("epipe", bytes_lost=11), "early-close event_output counts"),
+        ("epipe-negative", output_set("epipe", bytes_lost=-1), "early-close event_output bytes_lost -1"),
+        ("epipe-float", output_set("epipe", lines_lost=12.0), "early-close event_output lines_lost 12.0"),
+        ("epipe-status-type", output_set("epipe", status=None), "early-close event_output status None"),
+        ("epipe-reason-type", output_set("epipe", reason=1), "early-close event_output reason 1"),
+        ("epipe-missing-field", lambda c: c["epipe"]["event_output"].pop("reason"),
+         "early-close event_output fields"),
+        ("epipe-not-object", lambda c: c["epipe"].update(event_output=[]),
+         "early-close report event_output []"),
     ]
+
+    def test_stderr_never_decides_loss(self):
+        # Codex r8 F3: any stderr text, including a contradictory
+        # one, leaves the typed verdict unchanged in both directions.
+        for text in ("", "p11scope: event log: no rows shed\n",
+                     "p11scope: inventory event log stdout shed 12 lines\n"):
+            with self.subTest(stderr=text, outcome="truncated"):
+                case = event_case(2)
+                case["stderr"] = text
+                self.check(case, ok=True, marker="ok lines=6 totals=2")
+            with self.subTest(stderr=text, outcome="complete"):
+                # Unrelated exit 1 with zero measured loss fails.
+                case = event_case(2)
+                case["stderr"] = text
+                case["epipe"]["event_output"] = dict(EVENT_COMPLETE)
+                self.check(case, ok=False, marker="early-close event_output")
 
     def test_each_guard_row_fails(self):
         for name, mutate, marker in self.ROWS:

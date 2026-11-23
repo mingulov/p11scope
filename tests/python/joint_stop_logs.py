@@ -39,10 +39,15 @@ UNATTRIBUTED_RECEIPT = ("no joint feeds without S1 seal (producers linked, "
 STARVED_RECEIPT = ("no joint feeds from the linked session: the held "
                    "caller's birth receipt was deferred (no_receipt) or "
                    "refused (partition) and no later birth bound")
+SHED_RECEIPT = ("no joint feeds from the linked session: fixture calls "
+                "were shed without a route (counted in shed) and no birth "
+                "bound")
 RECEIPTS = {"s1-precluded": S1_RECEIPT,
             "no-feeds-receipt-starved": STARVED_RECEIPT,
+            "no-feeds-calls-shed": SHED_RECEIPT,
             "no-feeds-unattributed": UNATTRIBUTED_RECEIPT}
-LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-unattributed")
+LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-calls-shed",
+                  "no-feeds-unattributed")
 JOIN_QUANTA = 32
 JOIN_PASSES = 4  # passes before join quanta 2, 10, 18 and 26
 BACKTRACE = [
@@ -92,7 +97,9 @@ def no_feed_probe(branch="no-feeds-unattributed"):
             "backstop_routed": 0, "birth_capacity": None,
             "drive": "live=1 gated=0 finished=0 ticks=3 feeds=0",
             "gaps": gaps, "no_receipt": 2 if starved else 0,
-            "partition": 1 if starved else 0, "shed": 18 if starved else 0}
+            "partition": 1 if starved else 0,
+            "shed": 18 if starved else (17 if branch == "no-feeds-calls-shed"
+                                        else 0)}
 
 
 def join_of(branch):

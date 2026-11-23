@@ -26,6 +26,7 @@ types, no floats, no duplicate keys):
               "offset_ms": (0, 1, 5, 20)[K % 4],
               "branch": null | "linked" | "s1-precluded"
                         | "no-feeds-receipt-starved"
+                        | "no-feeds-calls-shed"
                         | "no-feeds-unattributed",
               "join_quanta": null | int, "join_passes": null | int,
               "outcome": null | OUTCOME,
@@ -55,9 +56,11 @@ join_passes counts the discovery passes the join ran (a deferred or
 refused receipt is retried only on a pass); it must equal the
 schedule's count for join_quanta (a pass before every quantum q with
 q % JOIN_PASS_EVERY == 1, so 4 over the full bound). A
-linked no-feed case is receipt-starved exactly when its probe counts a
-`no_receipt` deferral or a `partition` receipt refusal; that cause is
-named but never accepted.
+linked no-feed case names its typed cause from its probe: receipt-
+starved exactly when it counts a `no_receipt` deferral or a
+`partition` receipt refusal, else calls-shed exactly when the lane
+shed calls (`shed` > 0), else unattributed. Each cause is named, none
+is accepted.
 
 OUTCOME is the StopOutcome struct field for field. The validator
 recomputes the cell's stop checks (at-q, latch, abandon, terminal,
@@ -110,11 +113,15 @@ NO_FEED = {
         "no joint feeds from the linked session: the held caller's birth "
         "receipt was deferred (no_receipt) or refused (partition) and no "
         "later birth bound",
+    "no-feeds-calls-shed":
+        "no joint feeds from the linked session: fixture calls were shed "
+        "without a route (counted in shed) and no birth bound",
     "no-feeds-unattributed":
         "no joint feeds without S1 seal (producers linked, zero installs "
         "unexplained)",
 }
-LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-unattributed")
+LINKED_NO_FEED = ("no-feeds-receipt-starved", "no-feeds-calls-shed",
+                  "no-feeds-unattributed")
 JOIN_QUANTA = 32
 JOIN_PASS_EVERY = 8
 
@@ -127,7 +134,8 @@ STOP_CHECKS = ("at-q", "latch", "abandon", "terminal", "reconcile")
 STAGES = ("setup", "drive", "check")
 BEGINS = ("polling", "published-at-begin", "abandoned-at-begin", "not-begun")
 FINISHES = ("published", "abandoned", "not-begun", "unpublished")
-OUTCOME_BRANCHES = ("linked", "s1", "receipt-starved", "unattributed")
+OUTCOME_BRANCHES = ("linked", "s1", "receipt-starved", "calls-shed",
+                    "unattributed")
 U64_MAX = 2 ** 64 - 1
 
 # Every check the validator applies, by the reason it reports. The
@@ -142,7 +150,8 @@ CHECKS = (
     "completion", "terminal-status", "terminal-case", "qualified-count",
     "unexpected-pass",
     "precluded-binding", "no-feed-binding", "s1-after-linked",
-    "no-feed-receipt-starved", "no-feed-unattributed", "wedge-binding", "wedge-unexpected",
+    "no-feed-receipt-starved", "no-feed-calls-shed", "no-feed-unattributed",
+    "wedge-binding", "wedge-unexpected",
     "case-failed-binding", "narrowed",
 )
 
@@ -332,13 +341,17 @@ def _judge(record, status, expect_wedge, check):
               % (k, join, passes, case["branch"], JOIN_QUANTA, JOIN_QUANTA))
         probe = case["no_feed"]
         if case["branch"] in LINKED_NO_FEED and probe is not None:
-            starved = probe["no_receipt"] + probe["partition"] > 0
-            check("no-feed-cause",
-                  (case["branch"] == "no-feeds-receipt-starved") == starved,
+            if probe["no_receipt"] + probe["partition"] > 0:
+                cause = "no-feeds-receipt-starved"
+            elif probe["shed"] > 0:
+                cause = "no-feeds-calls-shed"
+            else:
+                cause = "no-feeds-unattributed"
+            check("no-feed-cause", case["branch"] == cause,
                   "wp7-stop%d: branch %r contradicts its typed cause "
-                  "(no_receipt=%d partition=%d)"
+                  "(no_receipt=%d partition=%d shed=%d)"
                   % (k, case["branch"], probe["no_receipt"],
-                     probe["partition"]))
+                     probe["partition"], probe["shed"]))
         failing = first_failing_check(outcome) if outcome else "absent"
         check("completion",
               case["completed"] == (outcome is not None and failing is None)
@@ -395,6 +408,12 @@ def _judge(record, status, expect_wedge, check):
               % (last, NO_FEED["no-feeds-receipt-starved"],
                  open_case["no_feed"]["no_receipt"],
                  open_case["no_feed"]["partition"],
+                 open_case["no_feed"]["shed"], open_case["join_quanta"],
+                 open_case["join_passes"], probe))
+        check("no-feed-calls-shed", branch != "no-feeds-calls-shed",
+              "wp7-stop%d: %s; shed=%d after %d join quanta and %d "
+              "discovery passes; %s"
+              % (last, NO_FEED["no-feeds-calls-shed"],
                  open_case["no_feed"]["shed"], open_case["join_quanta"],
                  open_case["join_passes"], probe))
         check("no-feed-unattributed", branch != "no-feeds-unattributed",

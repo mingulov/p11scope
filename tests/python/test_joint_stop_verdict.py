@@ -29,7 +29,7 @@ sys.path.insert(0, str(ROOT / "tests/python"))
 import joint_stop_verdict as jv  # noqa: E402
 from joint_stop_logs import (  # noqa: E402
     CELL, JOIN_QUANTA, MARKER, OK_SUMMARY, PREAMBLE, S1_RECEIPT,
-    STARVED_RECEIPT, UNATTRIBUTED_RECEIPT,
+    SHED_RECEIPT, STARVED_RECEIPT, UNATTRIBUTED_RECEIPT,
     body_for, case_failed_record, case_record, frame, healthy_outcome,
     log_for, no_feed_probe, no_feed_record, offset_of, passing, precluded,
     precluded_record, qualified_record, record_line, wedge_outcome,
@@ -380,6 +380,25 @@ ROWS = [
         2, "no-feeds-receipt-starved")), 101, False, F,
      "no-feed-receipt-starved", "seal r9: stop2 starvation is named, "
      "never accepted"),
+    ("calls-shed-case0", log_for(no_feed_record(
+        0, "no-feeds-calls-shed")), 101, False, F, "no-feed-calls-shed",
+     "live r12: shed fixture calls are a named cause, never accepted"),
+    ("unattributed-hiding-shed", log_for(edited(no_feed_record(
+        2, "no-feeds-unattributed"), lambda r: r["cases"][2][
+            "no_feed"].update(shed=17))), 101, False, F, "no-feed-cause",
+     "live r12: a typed cause is never unattributed"),
+    ("shed-without-shed", log_for(edited(no_feed_record(
+        0, "no-feeds-calls-shed"), lambda r: r["cases"][0][
+            "no_feed"].update(shed=0))), 101, False, F, "no-feed-cause",
+     "derived"),
+    ("shed-hiding-starvation", log_for(edited(no_feed_record(
+        0, "no-feeds-calls-shed"), lambda r: r["cases"][0][
+            "no_feed"].update(partition=1))), 101, False, F,
+     "no-feed-cause", "derived: starvation outranks shed"),
+    ("shed-before-the-bound", log_for(edited(no_feed_record(
+        0, "no-feeds-calls-shed"), case_set(0, join_quanta=1,
+                                            join_passes=0))), 101, False, F,
+     "join-bound", "live r12"),
     ("receipt-starved-case0", log_for(no_feed_record(
         0, "no-feeds-receipt-starved")), 101, False, F,
      "no-feed-receipt-starved", "seal r9: never environmental"),
@@ -573,6 +592,10 @@ class JointStopVerdictTableTests(unittest.TestCase):
                 'JointBranch::Unattributed => Some("no-feeds-unattributed"),',
                 'JointBranch::ReceiptStarved => Some("no-feeds-receipt-starved"),',
                 'JointBranch::ReceiptStarved => "receipt-starved",',
+                'JointBranch::CallsShed => Some("no-feeds-calls-shed"),',
+                'JointBranch::CallsShed => "calls-shed",',
+                'let branch = joint_branch(&coordinator, '
+                'lane.shed_calls_disclosed());',
                 'const STOP_JOIN_QUANTA: u64 = %d;' % jv.JOIN_QUANTA,
                 'const STOP_JOIN_PASS_EVERY: u64 = %d;' % jv.JOIN_PASS_EVERY,
                 'quanta % STOP_JOIN_PASS_EVERY == 1',
@@ -593,12 +616,14 @@ class JointStopVerdictTableTests(unittest.TestCase):
         self.assertEqual(jv.NO_FEED, {"s1-precluded": S1_RECEIPT,
                                       "no-feeds-receipt-starved":
                                           STARVED_RECEIPT,
+                                      "no-feeds-calls-shed": SHED_RECEIPT,
                                       "no-feeds-unattributed":
                                           UNATTRIBUTED_RECEIPT})
         self.assertEqual(JOIN_QUANTA, jv.JOIN_QUANTA)
         # A Rust string continuation (backslash, newline, indentation)
         # joins its lines with nothing.
         self.assertIn(STARVED_RECEIPT, re.sub(r"\\\n\s*", "", rust))
+        self.assertIn(SHED_RECEIPT, re.sub(r"\\\n\s*", "", rust))
         case = rust.split("struct StopCaseRecord {", 1)[1].split("\n}", 1)[0]
         self.assertEqual(
             sorted(re.findall(r"^    (\w+):", case, re.M)) ,
@@ -628,6 +653,14 @@ class JointStopVerdictTableTests(unittest.TestCase):
         self.assertEqual(failing(wound="unwound"), "terminal")
         self.assertEqual(failing(reconciled=False), "reconcile")
         self.assertIsNone(failing(api_a=1, lane_shed=1))
+
+    def test_shed_detail_names_the_typed_cause(self):
+        got = jv.classify(log_for(no_feed_record(0, "no-feeds-calls-shed")),
+                          101, CELL)
+        self.assertEqual(got["reason"], "no-feed-calls-shed")
+        self.assertIn("shed=17 after %d join quanta and 4 discovery passes"
+                      % JOIN_QUANTA, got["detail"])
+        self.assertNotIn("unexplained", got["detail"])
 
     def test_starved_detail_names_the_typed_cause(self):
         got = jv.classify(log_for(no_feed_record(

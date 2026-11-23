@@ -1782,7 +1782,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Self::scan_exe_identities_cached(
             &self.adapter,
             &mut self.exe_probe_cache,
-            crate::discovery::unbound_exe::real_maps_identity,
+            probe_exe_path,
         )
     }
 
@@ -1828,7 +1828,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (learned, all_learned) = Self::scan_exe_candidates_cached(
             &self.adapter,
             &mut self.exe_probe_cache,
-            crate::discovery::unbound_exe::real_maps_identity,
+            probe_exe_path,
         );
         let exe = self.resolve_unbound_exe(exec, &learned, &all_learned);
         self.registry.attach_unbound_exe(cookie, exe);
@@ -1860,7 +1860,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let scan = ScanLearned {
             by_identity: learned,
-            verify: Box::new(crate::discovery::unbound_exe::real_maps_identity),
+            verify: Box::new(probe_exe_path),
             all_by_identity: Some(all_learned),
         };
         self.exe_resolver.resolve(
@@ -11346,7 +11346,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             Self::scan_exe_candidates_cached(
                                 &self.adapter,
                                 &mut self.exe_probe_cache,
-                                crate::discovery::unbound_exe::real_maps_identity,
+                                probe_exe_path,
                             )
                         });
                         self.resolve_unbound_exe(stashed, learned, all_learned)
@@ -44366,6 +44366,309 @@ int main(void) {
             "each of the two stalled passes records its verdict exactly once: {exhaustion:?}"
         );
     }
+
+    // ---- Retry conservation and counted-disclosure classes (r7) ----
+
+    /// Fill every ordinary gap slot with distinct fillers (and, with
+    /// `reserve`, enter the terminal phase and fill its headroom too).
+    fn fill_gap_quota(native: &mut NativeScene, reserve: bool) {
+        let max_gaps = native.scene.coordinator.registry.limits().max_gaps;
+        for n in 0..max_gaps {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("quota-filler-{n}"),
+                reason: format!("quota filler {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        if reserve {
+            native.scene.coordinator.registry.enter_terminal_phase();
+            for n in 0..crate::discovery::caller_registry::TERMINAL_GAP_RESERVE {
+                native.scene.coordinator.registry.record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: format!("reserve-filler-{n}"),
+                    reason: format!("reserve filler {n}"),
+                    budget: None,
+                });
+            }
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+    }
+
+    /// The shared-endpoint retry fixture up to its revival: a 3-call
+    /// first sight placed ambiguous (folds nowhere), refreshed to 43,
+    /// then a fresh cookie binds while the endpoint is still shared
+    /// and the caller has no edge — the retry rule misses.
+    fn shared_revival_miss() -> NativeScene {
+        let scene = capture_scene_shared_endpoint();
+        scene.source.spawn(9, 600);
+        scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut native = NativeScene::over(scene, 0);
+        let mut row = native.row(41, 1, 9, 40, 0);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!((placement.total(), placement.ambiguous), (1, 1));
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native
+    }
+
+    #[test]
+    fn a_retry_revival_on_a_still_shared_endpoint_settles_the_uncounted_prefix() {
+        // Conservation across a revival miss, ambiguous first placement:
+        // the first sight (3) folded nowhere, the revival rebases at the
+        // dropped absolute 3 and only the growth (40) enters the count
+        // pipeline. The 3-call prefix is excluded exactly once under the
+        // revival cause, so 3 + 40 conserves the 43 observed.
+        // RED: the base released the mark without settling (0 vs 3).
+        let native = shared_revival_miss();
+        let registry = &native.scene.coordinator.registry;
+        let placement = registry.witness_placement();
+        assert_eq!((placement.total(), placement.ambiguous), (1, 1));
+        assert_eq!(registry.edges().count(), 0, "no edge without a mapping");
+        assert_eq!(
+            registry.terminal_retry_totals_for_test(),
+            BTreeMap::from([("a revival without the retry proof".to_string(), (3, 1))]),
+            "the uncarried prefix is counted once, under its cause"
+        );
+        assert!(
+            native.scene.coordinator.retry_owed.is_empty(),
+            "the mark released after settling"
+        );
+    }
+
+    #[test]
+    fn a_retry_revival_without_an_edge_settles_the_unresolved_prefix() {
+        // Unresolved first placement, revival-miss twin: the endpoint
+        // names no module at the drop (folds nowhere), rejoins before
+        // the re-sight, but the caller never gains a mapping edge, so
+        // the rule misses and the 3-call prefix is excluded.
+        // RED: the base dropped it silently.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let pins = native.scene.pins.clone();
+        let path = native.scene.path.clone();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &path, &fx::offsets(1))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        native.scene.verdicts.extend(absorbed.verdicts);
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.witness(vec![row]);
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!((placement.total(), placement.unresolved), (1, 1));
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        let absorbed = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&pins, &path, &fx::offsets(2))),
+                &pins,
+                policy,
+            ),
+            &pins,
+        );
+        native.scene.verdicts.extend(absorbed.verdicts);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let placement = registry.witness_placement();
+        assert_eq!((placement.total(), placement.unresolved), (1, 1));
+        assert_eq!(
+            registry.terminal_retry_totals_for_test(),
+            BTreeMap::from([("a revival without the retry proof".to_string(), (3, 1))]),
+        );
+        assert!(native.scene.coordinator.retry_owed.is_empty());
+    }
+
+    #[test]
+    fn a_retry_revival_with_a_window_reuse_keeps_a_folded_prefix_counted() {
+        // Folded-module control: a pid reuse in the window makes the
+        // re-observed bind miss the retry rule, but the first
+        // placement's fold already carries the 3-call prefix, so the
+        // revival settles nothing as excluded and the fold stands.
+        let mut native = retained_with_growth();
+        native.answer(9, 600, 41);
+        native.scene.coordinator.binder.note_pid_reuse(9, 45);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        assert_eq!(registry.terminal_retry_totals_for_test(), BTreeMap::new());
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        let caller = native.scene.coordinator.adapter.live_id(9).unwrap();
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the revival binds");
+        assert_eq!(edge.entry_count, 40, "revival carries post-drop growth only");
+        assert!(native.scene.coordinator.retry_owed.is_empty());
+    }
+
+    /// The unproven late-rebase fixture (`counts_for_a_late_bound_row_
+    /// rebase_past_the_pre_admission_sight`) run after `fill`.
+    fn late_rebase_after(fill: impl FnOnce(&mut NativeScene)) -> (NativeScene, CallerId) {
+        let (mut native, caller) = watched_native();
+        fill(&mut native);
+        native.answer(7, 500, 41);
+        native.scene.coordinator.binder.note_pid_reuse(7, 45);
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 2;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+        native.drain();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        (native, caller)
+    }
+
+    fn counted_before_tracking_rows(native: &NativeScene, caller: CallerId) -> usize {
+        native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| {
+                gap.subject == crate::discovery::caller_registry::COUNTED_BEFORE_TRACKING
+                    && gap.caller == Some(caller)
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_late_rebase_names_its_exclusion_when_the_gap_quota_is_full() {
+        // Quota-independent disclosure: the ordinary allotment is full
+        // when the unproven late rebase excludes its 2-call sight. The
+        // named member row still publishes and the edge still reads the
+        // growth only. RED: the base suppressed the only copy (0 rows).
+        let (native, caller) = late_rebase_after(|native| fill_gap_quota(native, false));
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert_eq!(edge.entry_count, 3, "only post-admission growth stages");
+        assert_eq!(counted_before_tracking_rows(&native, caller), 1);
+    }
+
+    #[test]
+    fn a_late_rebase_names_its_exclusion_when_the_terminal_reserve_is_full() {
+        // Both the ordinary allotment and the terminal reserve are full.
+        let (native, caller) = late_rebase_after(|native| fill_gap_quota(native, true));
+        assert_eq!(counted_before_tracking_rows(&native, caller), 1);
+    }
+
+    #[test]
+    fn a_retry_shed_stays_disclosed_when_the_gap_quota_is_full() {
+        // The shed disclosure is the only statement that a shed
+        // verdict is final; a full quota must not hide it.
+        // RED: the base suppressed it.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        fill_gap_quota(&mut native, false);
+        native.scene.coordinator.binder.set_retry_limit_for_test(0);
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        native.witness(vec![first]);
+        let shed = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "identity retry shed")
+            .count();
+        assert_eq!(shed, 1);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+    }
+
+    #[test]
+    fn no_finish_probes_more_executables_than_its_credit() {
+        // Base-observable bound: one pending row with a stashed EXEC
+        // over 65 cold caller paths. Every Finish action probes at most
+        // its 64-unit credit, the learn still covers every path, and the
+        // row stages its verdict. RED: the base probed every cold path
+        // inside the single Finish that charged one row.
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        for i in 0..65u32 {
+            let pid = 3_000 + i;
+            native.scene.source.spawn(pid, 100);
+            native
+                .scene
+                .source
+                .exec(pid, 101, &format!("/nonexistent-p11scope-r7/tool-{i}"));
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, 100)
+                .unwrap();
+        }
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        let staged = native.read(vec![native.row(41, 1, 9, 210, 0)]);
+        assert_eq!(staged.decided, 0, "no horizon yet: the row stays pending");
+        let domain = native.domain;
+        let mut probes = Vec::new();
+        loop {
+            let before = exe_probe_calls();
+            let receipt = native.stage(NativeBatch::Finish { domain });
+            probes.push(exe_probe_calls() - before);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            if !receipt.settlement_owed {
+                break;
+            }
+            assert!(probes.len() < 8, "the finish converges: {probes:?}");
+        }
+        assert!(probes.iter().all(|probes| *probes <= 64), "{probes:?}");
+        assert!(probes.iter().sum::<u64>() >= 65, "{probes:?}");
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+    }
 }
 
 #[cfg(test)]
@@ -46062,3 +46365,25 @@ mod stop_diff_tests {
         );
     }
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Production executable mapping probes performed on this thread
+    /// (test-observed: every probe is one charged slow unit).
+    static EXE_PROBE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The production mapping probe for learned caller paths and for
+/// learned-spelling verification.
+fn probe_exe_path(path: &str) -> Option<(u64, u64)> {
+    #[cfg(test)]
+    EXE_PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    crate::discovery::unbound_exe::real_maps_identity(path)
+}
+
+/// Production executable probes this thread performed so far.
+#[cfg(test)]
+fn exe_probe_calls() -> u64 {
+    EXE_PROBE_CALLS.with(std::cell::Cell::get)
+}
+

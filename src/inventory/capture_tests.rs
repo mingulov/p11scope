@@ -958,6 +958,8 @@ struct Scene {
     poll_acquisitions: Vec<Option<NativeDomainId>>,
     /// Acquisition domains the loop forwarded to ticks, in order.
     tick_acquisitions: Vec<Option<NativeDomainId>>,
+    /// Refresh-loss boundaries the stop drivers reported (typed count).
+    refresh_losses: usize,
 }
 
 impl Scene {
@@ -995,6 +997,7 @@ impl Scene {
             staged_counts: Vec::new(),
             poll_acquisitions: Vec::new(),
             tick_acquisitions: Vec::new(),
+            refresh_losses: 0,
         }
     }
 
@@ -1286,6 +1289,7 @@ impl LaneHost<Pin> for Scene {
     }
 
     fn note_refresh_loss(&mut self, reason: String) {
+        self.refresh_losses += 1;
         self.note(format!("refresh-loss:{reason}"));
         self.coordinator.note_refresh_loss(reason);
     }
@@ -3478,6 +3482,168 @@ fn a_stop_with_owed_resight_work_reads_past_the_first_exact_refresh() {
         ["read", "stage:witness", "read", "stage:witness"],
         "the exact read stages the row and the continuation attempts it"
     );
+}
+
+/// The terminal refresh's proof is latched for the stop: read 3 is an
+/// exact gap-free refresh sweep that leaves a re-sight attempt owed (a
+/// row for a tgid the scene never admitted), so the stop reads on, and
+/// every continuation sweep after it ends partial until the deadline.
+/// The unfinished continuation never revokes the completed sweep: no
+/// refresh loss is reported and the admitted pair's count stays exact.
+/// RED: the blocking driver tested only the most recent read and
+/// reported a false loss, demoting the count to a lower bound.
+#[test]
+fn a_blocking_stop_keeps_its_exact_refresh_when_a_continuation_read_is_partial() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.reads.extend([
+        vec![RowSpec {
+            endpoint: 0,
+            tgid: PID,
+            ticket: TICKET,
+        }],
+        vec![],
+        vec![RowSpec {
+            endpoint: 0,
+            tgid: 4242,
+            ticket: TICKET + 7,
+        }],
+    ]);
+    lane.partial_refresh_reads.extend(4..=300);
+    lane.read_delay = Duration::from_millis(10);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    assert!(
+        stopped.capture.read_stamps.len() >= 4,
+        "the owed re-sight work read on past the exact sweep: {}",
+        stopped.capture.read_stamps.len()
+    );
+    assert_eq!(scene.refresh_losses, 0, "a completed sweep is never a loss");
+    assert!(
+        matches!(scene.coverage(), UseCoverage::Counted { lossy: false, .. }),
+        "the exact refresh keeps the count exact: {:?}",
+        scene.coverage()
+    );
+}
+
+/// Never-complete twin of the latch: no gap-free refresh sweep ever
+/// completes after stop, so exactly one refresh loss is reported and
+/// the count demotes.
+#[test]
+fn a_blocking_stop_without_any_exact_refresh_reports_exactly_one_loss() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.reads.push_back(vec![RowSpec {
+        endpoint: 0,
+        tgid: PID,
+        ticket: TICKET,
+    }]);
+    lane.partial_refresh_reads.extend(3..=300);
+    lane.read_delay = Duration::from_millis(10);
+    let _ = run(&mut scene, lane, 1);
+    assert_eq!(scene.refresh_losses, 1);
+    assert!(
+        matches!(scene.coverage(), UseCoverage::Counted { lossy: true, .. }),
+        "{:?}",
+        scene.coverage()
+    );
+}
+
+/// Later-failure twin: the exact sweep at read 3 is followed by a
+/// continuation sweep that completes with a skipped row (gappy) and
+/// then partial ones. The gappy later generation is not the refresh
+/// boundary the loss names — the stop already holds a gap-free
+/// sweep — so it reports no loss, while a stop whose only completed
+/// sweep is gappy still reports one.
+#[test]
+fn a_blocking_stop_latches_only_gap_free_sweeps() {
+    for (gappy, losses) in [(vec![4usize], 0usize), (vec![3usize], 1usize)] {
+        let log = Log::default();
+        let mut scene = Scene::new(&log);
+        let mut lane = ScriptedLane::new(&log);
+        lane.reads.extend([
+            vec![RowSpec {
+                endpoint: 0,
+                tgid: PID,
+                ticket: TICKET,
+            }],
+            vec![],
+            vec![RowSpec {
+                endpoint: 0,
+                tgid: 4242,
+                ticket: TICKET + 7,
+            }],
+        ]);
+        lane.gappy_refresh_reads.extend(gappy.iter().copied());
+        lane.partial_refresh_reads.extend(5..=300);
+        if losses == 1 {
+            lane.partial_refresh_reads.insert(4);
+        }
+        lane.read_delay = Duration::from_millis(10);
+        let _ = run(&mut scene, lane, 1);
+        assert_eq!(scene.refresh_losses, losses, "gappy reads {gappy:?}");
+    }
+}
+
+/// The phased driver keeps the same latch: an exact first refresh read
+/// with owed re-sight work, then only partial continuation sweeps until
+/// the deadline, finishes without a refresh loss. RED: the phased
+/// branch tested only the last read and selected `RefreshLoss`.
+#[test]
+fn a_phased_stop_keeps_its_exact_refresh_when_a_continuation_read_is_partial() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    // The stop starts past its pass, so the lane holds the attached
+    // endpoint the first refresh read reports through.
+    lane.attached = fabricated_delta(1).endpoints;
+    lane.reads.push_back(vec![RowSpec {
+        endpoint: 0,
+        tgid: 4242,
+        ticket: TICKET + 7,
+    }]);
+    lane.partial_refresh_reads.extend(2..=300);
+    lane.read_delay = Duration::from_millis(10);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    started.passes = 1;
+    let mut stop = match started.into_finite_stop(NativeStopDisposition::Completed, None) {
+        Ok(stop) => stop,
+        Err(_) => panic!("a completed stop is admissible after a pass"),
+    };
+    stop.retired = true;
+    stop.phase = NativeStopPhase::PostWitness;
+    let deadline = Instant::now() + stop.lane.windows.terminal_sweep_budget;
+    stop.refresh_deadline = Some(deadline);
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &|| false,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut steps = 0;
+    let stopped = loop {
+        let now = Instant::now();
+        let slice_end = now + Duration::from_secs(600);
+        match stop.step(&mut scene, now, slice_end, &clock) {
+            NativeStopProgress::Pending(next) => {
+                stop = next;
+                steps += 1;
+                assert!(steps < 100_000, "the phased stop converges");
+            }
+            NativeStopProgress::Stopped(stopped) => break stopped,
+        }
+    };
+    assert!(
+        stopped.capture.read_stamps.len() >= 2,
+        "the owed re-sight work read on past the exact sweep: {}",
+        stopped.capture.read_stamps.len()
+    );
+    assert_eq!(scene.refresh_losses, 0, "a completed sweep is never a loss");
 }
 
 /// The terminal sweep is bounded: a sweep that never completes stops

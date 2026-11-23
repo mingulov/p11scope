@@ -1904,21 +1904,37 @@ class ShellControls(unittest.TestCase):
     def test_guest_output_redirects_then_restores_verified_bytes(self):
         self.control("healthy", 0, local_output=True)
 
+    FIFO_REFUSAL = ("p11scope: output PATH exists and is a FIFO; refusing to replace it (-o publishes "
+                    "the report by renaming a new file over that name). Name a new or regular file, "
+                    "or leave out -o to write no report file")
+
     def test_guest_output_redirect_preserves_fifo_refusal(self):
+        self.fifo_refusal(self.FIFO_REFUSAL, True)
+
+    def test_fifo_refusal_needs_the_exact_full_line(self):
+        # A fragment, another prefix or a repeated line is not the refusal.
+        for message in ("output PATH exists and is a FIFO; refusing to replace it",
+                        "p11scope: output PATH exists and is a FIFO; refusing to replace it",
+                        "warning: " + self.FIFO_REFUSAL,
+                        self.FIFO_REFUSAL + "\n" + self.FIFO_REFUSAL):
+            with self.subTest(message=message[:40]):
+                self.fifo_refusal(message, False)
+
+    def fifo_refusal(self, message, passed):
         with tempfile.TemporaryDirectory() as raw:
             root=Path(raw);out=root/'out';out.mkdir();local=root/'local';local.mkdir(mode=0o700)
             fixture=root/'fixture'
             fixture.write_text('#!/usr/bin/python3\nimport os,signal,time\nprint("READY pid=%d"%os.getpid(),flush=True)\nsignal.signal(signal.SIGTERM,lambda a,b:exit(0))\nwhile True: time.sleep(.02)\n')
             fixture.chmod(0o755)
             observer=root/'observer'
-            observer.write_text('#!/usr/bin/python3\nimport json,os,pathlib,stat,sys\np=pathlib.Path(sys.argv[sys.argv.index("-o")+1])\npathlib.Path(os.environ["CONTROL_OUT"],"selected-output.json").write_text(json.dumps(str(p)))\nif stat.S_ISFIFO(p.stat().st_mode):\n print(f"output {p} exists and is a FIFO; refusing to replace it",file=sys.stderr);sys.exit(1)\np.write_text("{}");sys.exit(0)\n')
+            observer.write_text('#!/usr/bin/python3\nimport json,os,pathlib,stat,sys\nMESSAGE='+repr(message)+'\np=pathlib.Path(sys.argv[sys.argv.index("-o")+1])\npathlib.Path(os.environ["CONTROL_OUT"],"selected-output.json").write_text(json.dumps(str(p)))\nif stat.S_ISFIFO(p.stat().st_mode):\n print(MESSAGE.replace("PATH",str(p)),file=sys.stderr);sys.exit(1)\np.write_text("{}");sys.exit(0)\n')
             observer.chmod(0o755)
             env=dict(os.environ,CONTROL_OUT=str(out),P11SCOPE_LOCAL_OUTPUT_ROOT=str(local))
             result=subprocess.run(['bash',str(SHELL),'--control-fifo',str(observer),str(out),str(fixture)],
                                   env=env,text=True,capture_output=True,timeout=5)
-            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertEqual(result.returncode,0 if passed else 1,result.stdout+result.stderr)
             rows=[json.loads(line) for line in (out/'results.jsonl').read_text().splitlines()]
-            self.assertEqual([(row['cell'],row['pass']) for row in rows],[('fifo-refused',True)])
+            self.assertEqual([(row['cell'],row['pass']) for row in rows],[('fifo-refused',passed)])
             self.assertTrue(stat.S_ISFIFO((out/'fifo').stat().st_mode))
             self.assertEqual(json.loads((out/'selected-output.json').read_text()),str(out/'fifo'))
             self.assertEqual(list(local.iterdir()),[])

@@ -37,7 +37,7 @@ def extract_judge():
     heredoc = next(i for i in range(start, len(lines)) if "<<'PY'" in lines[i])
     end = next(i for i in range(heredoc + 1, len(lines)) if lines[i] == "PY")
     block = "\n".join(lines[heredoc + 1 : end]) + "\n"
-    assert SCHEMA in block and "event-epipe.stderr" in block, (
+    assert SCHEMA in block and "event-epipe.head" in block, (
         "extracted the wrong heredoc"
     )
     return block
@@ -71,13 +71,18 @@ def totals(pass_no):
     }
 
 
-def report(passes):
+COMPLETE = {"status": "complete", "lines_lost": 0, "bytes_lost": 0, "reason": "none"}
+TRUNCATED = {"status": "truncated", "lines_lost": 2, "bytes_lost": 310, "reason": "broken_pipe"}
+
+
+def report(passes, event_output=COMPLETE):
     return {
         "schema": "p11scope/inventory/v1",
         "observation": {"passes": passes},
         "callers": [0],
         "modules": [0],
         "edges": [0],
+        "event_output": dict(event_output),
     }
 
 
@@ -93,7 +98,7 @@ def run_judge(stream, full_report):
             json.dumps(full_report), encoding="utf-8"
         )
         (tmpdir / "event-epipe.json").write_text(
-            json.dumps(report(1)), encoding="utf-8"
+            json.dumps(report(1, TRUNCATED)), encoding="utf-8"
         )
         (tmpdir / "event-epipe.head").write_bytes(b"{" + b"x" * 199)
         (tmpdir / "event-epipe.stderr").write_text(
@@ -126,7 +131,7 @@ class EventStdoutJudgeTests(unittest.TestCase):
             row(0, STARTED, "started", {"started_ns": STARTED}),
             row(1, commit, "pass_committed", marker(0)),
             row(2, commit, "totals", totals(0)),
-            row(3, commit + 100_000_000, "ended", {"passes": 1}),
+            row(3, commit + 100_000_000, "ended", {"stdout_lost": {"lines": 0, "bytes": 0}, "passes": 1}),
         ]
         result = run_judge(stream, report(1))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -139,7 +144,7 @@ class EventStdoutJudgeTests(unittest.TestCase):
             row(1, commit0, "pass_committed", marker(0)),
             row(2, commit1, "pass_committed", marker(1)),
             row(3, commit1, "totals", totals(1)),
-            row(4, commit1 + 100_000_000, "ended", {"passes": 2}),
+            row(4, commit1 + 100_000_000, "ended", {"stdout_lost": {"lines": 0, "bytes": 0}, "passes": 2}),
         ]
         result = run_judge(stream, report(2))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -150,7 +155,7 @@ class EventStdoutJudgeTests(unittest.TestCase):
             row(0, STARTED, "started", {"started_ns": STARTED}),
             row(1, commit, "pass_committed", marker(0)),
             row(2, commit, "totals", totals(0)),
-            row(3, commit + 100_000_000, "ended", {"passes": 1}),
+            row(3, commit + 100_000_000, "ended", {"stdout_lost": {"lines": 0, "bytes": 0}, "passes": 1}),
         ]
         result = run_judge(stream, report(1))
         self.assertNotEqual(result.returncode, 0)
@@ -164,7 +169,7 @@ class EventStdoutJudgeTests(unittest.TestCase):
             row(0, STARTED, "started", {"started_ns": STARTED}),
             row(1, commit, "pass_committed", marker(0)),
             row(2, commit, "totals", bad),
-            row(3, commit + 100_000_000, "ended", {"passes": 1}),
+            row(3, commit + 100_000_000, "ended", {"stdout_lost": {"lines": 0, "bytes": 0}, "passes": 1}),
         ]
         result = run_judge(stream, report(1))
         self.assertNotEqual(result.returncode, 0)

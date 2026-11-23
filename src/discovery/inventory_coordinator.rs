@@ -36983,6 +36983,92 @@ int main(void) {
     }
 
     #[test]
+    fn a_system_scope_exit_shrunk_by_the_deciding_drain_stays_unbound() {
+        // The drain that covers the horizons also carries the true
+        // exit: hook 450 drains, the row at 400 is read, a healthy
+        // read covers health, then the 300 drain covers lifecycle. The
+        // decision that drain releases revalidates against its own
+        // hooks and refuses the stale snapshot.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[450]);
+            let row = native.row(41, 1, 7, 400, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            native.stage(native.stamps.read(native.domain, Vec::new()));
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                300,
+            )));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
+    fn a_system_scope_unhealthy_read_signals_never_bind_on_a_healthy_resight() {
+        // Every unhealthy signal on the producing read withholds the
+        // exit path: transport failures and a health regression behave
+        // like the unproven-health twin and never bind on a later
+        // healthy re-sight.
+        for signal in ["failures", "regression"] {
+            agreeing(|| {
+                let (mut native, _) = proven_system_native(false);
+                retire_then_exits(&mut native, &[450]);
+                let row = native.row(41, 1, 7, 300, 0);
+                let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, vec![row])
+                else {
+                    unreachable!("the scripted read constructs a witness batch");
+                };
+                match signal {
+                    "failures" => {
+                        batch.health.failures = vec!["scripted transport failure".into()];
+                    }
+                    _ => {
+                        batch.health_regression = Some("scripted health regression".into());
+                    }
+                }
+                native.stage(NativeBatch::Witness(batch));
+                native.witness(Vec::new());
+                assert_eq!(bound_census(&native), (1, 0, 0), "{signal}");
+                assert_eq!(no_live_caller(&native), Some(1), "{signal}");
+            });
+        }
+    }
+
+    #[test]
+    fn a_system_scope_resight_snapshot_shrunk_before_the_horizons_stays_unbound() {
+        // The re-sight snapshot revalidates too: the row is read owed,
+        // a clock-failed drain stamps 450 without covering horizons,
+        // the next batch re-sights the snapshot, then the true 300
+        // shrinks it before the horizons arrive. The row stays unbound.
+        agreeing(|| {
+            let (mut native, _) = proven_system_native(false);
+            retire_then_exits(&mut native, &[]);
+            let row = native.row(41, 1, 7, 400, 0);
+            let read = native.stamps.read(native.domain, vec![row]);
+            native.stage(read);
+            let at = native.stamps.tick();
+            let mut drain = leader_exit_drain(native.domain, at, 450);
+            drain.started_ns = u64::MAX;
+            native.stage(NativeBatch::Lifecycle(drain));
+            native.stage(native.stamps.read(native.domain, Vec::new()));
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(leader_exit_drain(
+                native.domain,
+                at,
+                300,
+            )));
+            native.witness(Vec::new());
+            assert_eq!(bound_census(&native), (1, 0, 0));
+            assert_eq!(no_live_caller(&native), Some(1));
+        });
+    }
+
+    #[test]
     fn a_cgroup_scope_retained_row_stays_unbound() {
         // PID-scope-only fallback under cgroup scope: only the engine
         // scope differs from the bound twin (production cgroup batches

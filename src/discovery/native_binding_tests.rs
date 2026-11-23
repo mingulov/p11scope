@@ -1327,6 +1327,84 @@ fn a_later_holder_without_a_recorded_reuse_does_not_void_the_retained_binding() 
 }
 
 #[test]
+fn an_exit_snapshot_decides_only_against_a_validator() {
+    // Binder-level contract for the kernel-witnessed exit path: the
+    // read-time snapshot binds only when a validator still resolves
+    // the row to the same holder at decide time. Without a validator
+    // the row keeps its live-miss gap; with a matching one it binds.
+    struct ExitOnly;
+    impl CallerLookup<Pin> for ExitOnly {
+        fn live_caller(&self, _pid: u32) -> Option<LiveCaller<'_, Pin>> {
+            None
+        }
+
+        fn exit_witnessed_caller(&self, pid: u32, event_ns: u64) -> Option<RetainedCaller> {
+            (pid == T && event_ns == 1_500).then(|| RetainedCaller {
+                id: CallerId(7),
+                first_seen_ns: 1_000,
+                last_seen_ns: 2_000,
+                retired: true,
+                start_time: Some(100),
+                exe_present: true,
+                exec_observed: true,
+                lifecycle: CallerLifecycle::Exited,
+            })
+        }
+    }
+
+    struct Holder7;
+    impl ExitWitnessValidator for Holder7 {
+        fn current_holder(&self, pid: u32, event_ns: u64) -> Option<CallerId> {
+            (pid == T && event_ns == 1_500).then_some(CallerId(7))
+        }
+    }
+
+    fn absorb(run: &mut Run, batch: &WitnessBatch, validator: Option<&dyn ExitWitnessValidator>) {
+        let lookup = ExitOnly;
+        let answers = HashMap::new();
+        let mut queries = 0usize;
+        let mut identity = AnswerTable {
+            answers: &answers,
+            queries: &mut queries,
+        };
+        run.binder
+            .absorb_witnesses_with_validator(batch, &lookup, &mut identity, validator);
+    }
+
+    // Without a validator the snapshot never binds.
+    let mut run = Run::new();
+    let d = run.domain;
+    let at = run.tick();
+    absorb(
+        &mut run,
+        &read_at(d, vec![row(d, 7, 1, T, 1_500)], at, Some(0)),
+        None,
+    );
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+
+    // With a validator resolving to the same holder it binds.
+    let mut run = Run::new();
+    let d = run.domain;
+    let at = run.tick();
+    absorb(
+        &mut run,
+        &read_at(d, vec![row(d, 7, 1, T, 1_500)], at, Some(0)),
+        Some(&Holder7),
+    );
+    let at = run.tick();
+    run.binder
+        .absorb_lifecycle_with_validator(&drained(d, &[], at), Some(&Holder7));
+    let at = run.tick();
+    absorb(
+        &mut run,
+        &read_at(d, Vec::new(), at, Some(0)),
+        Some(&Holder7),
+    );
+    assert_eq!(run.verdicts(), vec![bound(CallerId(7))]);
+}
+
+#[test]
 fn a_recorded_reuse_without_an_admitted_successor_leaves_the_retained_row_unbound() {
     // A PID reuse recorded at or after the retained admission voids the
     // retained identity even when no successor was admitted (its

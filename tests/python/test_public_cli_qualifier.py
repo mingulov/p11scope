@@ -81,10 +81,22 @@ INSIDE_LEDGER = "LEDGER " + json.dumps({
                             "C_FindObjectsFinal")]})
 
 
+GENERATIONS = {100: 5000, 101: 5001}
+
+
+def workload_callers():
+    """One live incarnation per workload process, activated."""
+    return [{"id": cid, "pid": pid, "start_time": GENERATIONS[pid],
+             "start_time_unit": "clock_ticks_since_boot", "retired": False,
+             "image": {"authority": "native_exact"}}
+            for cid, pid in (("c0", 100), ("c1", 101))]
+
+
 def counted_edge(caller, module="m0", count=1507):
     return {"caller": caller, "module": module,
             "entries": {"count": count, "observation": "observed",
                         "saturated": False,
+                        "in_flight": False,
                         "coverage": {"state": "counted", "lossy": False}}}
 
 
@@ -97,7 +109,7 @@ def overlay_report():
         "schema": "p11scope/inventory/v1",
         "scope": "cgroup",
         "modules": [],
-        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        "callers": workload_callers(),
         "edges": [],
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
@@ -128,9 +140,7 @@ def overlay_published_report():
                      "admission": {"state": "admitted"}}],
         # Each refused caller recovers to an activated native owner
         # (recover and continue); a resting refusal fails the cell.
-        "callers": [
-            {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
-            {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}],
+        "callers": workload_callers(),
         "edges": [counted_edge("c0"), counted_edge("c1")],
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
@@ -161,7 +171,8 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
             ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), MODPATH, modfs],
+             json.dumps(pin), MODPATH, modfs,
+             str(GENERATIONS[100]), str(GENERATIONS[101])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
     return proc.returncode, proc.stdout + proc.stderr
@@ -599,8 +610,7 @@ class InventoryOverlayTests(unittest.TestCase):
                          "identity": {"device": {"major": 8, "minor": 1},
                                       "inode": 42, "sha256": "ab" * 32},
                          "admission": {"state": "admitted"}}],
-            "callers": [{"id": "c0", "pid": 100},
-                        {"id": "c1", "pid": 101}],
+            "callers": workload_callers(),
             "edges": [counted_edge("c0"), counted_edge("c1")],
             "gaps": [],
         }

@@ -107,6 +107,22 @@ def witnessed_zero():
             "saturated": False}
 
 
+# Process generations the harness registered for the workload (field 22
+# of /proc/PID/stat, clock ticks since boot); the report's start_time of
+# the one incarnation per workload process must match.
+GENERATIONS = {100: 5000, 101: 5001}
+
+
+def workload_caller(cid, pid, authority="native_exact"):
+    return {"id": cid, "pid": pid, "start_time": GENERATIONS[pid],
+            "start_time_unit": "clock_ticks_since_boot", "retired": False,
+            "image": {"authority": authority}}
+
+
+def workload_callers():
+    return [workload_caller("c0", 100), workload_caller("c1", 101)]
+
+
 def owned_edges():
     return [{"caller": "c0", "module": "m0", "entries": counted()},
             {"caller": "c1", "module": "m0", "entries": counted()}]
@@ -131,8 +147,11 @@ def extract_inventory_oracle():
     return "".join(lines[start + 1:end])
 
 
-def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None):
+def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
+               generations=None):
     """Run the extracted oracle against a fixture report."""
+    if generations is None:
+        generations = (GENERATIONS[100], GENERATIONS[101])
     block = extract_inventory_oracle()
     if pin is None:
         pin = PIN
@@ -147,7 +166,8 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None):
         (tmp / "out.wl").write_text(outside_wl)
         proc = subprocess.run(
             ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), modpath, modfs],
+             json.dumps(pin), modpath, modfs,
+             str(generations[0]), str(generations[1])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp))
     return proc.returncode, proc.stdout + proc.stderr
@@ -192,9 +212,7 @@ def decided_report():
                      "paths": [MODPATH]}],
         # Recover and continue: each refused caller activates from
         # fresh proof on a later pass and ends native_exact.
-        "callers": [
-            {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
-            {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}],
+        "callers": workload_callers(),
         "edges": owned_edges(),
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
@@ -361,14 +379,13 @@ def healthy_report_with_unbound():
     """The healthy-leg shape (host ext4/btrfs evidence, local pids).
 
     The kernel witness is available (no per-caller unproven gaps, no
-    scan-pinned fallback), the owned module is admitted with inside
-    edges from both callers, and the fork-after-attach child's first
-    witness row arrived before any member scan admitted it — so the
-    report carries exactly the named module-level unidentified-caller
-    positive (fail-safe R-C51-1: the late edge reads
-    use_before_admission). The race is independent of the witness
-    substrate, so the healthy leg accepts the same named shape the
-    degraded leg does.
+    scan-pinned fallback), the owned module is admitted, and both
+    workload callers end native_exact with exactly counted edges. Beside
+    them the report carries one named module-level unidentified-caller
+    positive: a witness row the binder could not attribute to any
+    caller incarnation. That positive is an extra disclosure; it never
+    stands in for a workload caller's own count. The healthy leg accepts
+    it as a named gap, as the degraded leg does.
     """
     return {
         "schema": "p11scope/inventory/v1",
@@ -379,7 +396,7 @@ def healthy_report_with_unbound():
                      "admission": {"state": "admitted", "endpoints": 68},
                      "lifecycle": "mapped",
                      "paths": [MODPATH]}],
-        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        "callers": workload_callers(),
         "edges": owned_edges(),
         "gaps": [
             {"caller": None, "module": "m0", "pid": None,
@@ -1316,9 +1333,7 @@ def deferred_recovered_report(*, modfs_witness=False):
     witness row binds to c1, so no module-level unbound positive exists.
     """
     report = witness_available_report() if modfs_witness else decided_report()
-    report["callers"] = [
-        {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
-        {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}]
+    report["callers"] = workload_callers()
     report["gaps"] = [
         g for g in report["gaps"]
         if g.get("subject") != UNBOUND_SUBJECT
@@ -1510,19 +1525,19 @@ class RefusalIdentityTests(unittest.TestCase):
                 self.assertIn("activation refusal under another subject", out)
 
     def test_refusal_of_another_incarnation_at_the_same_pid_fails(self):
-        # The child pid's activated incarnation does not recover a
-        # refusal of a different incarnation (new start time) there.
+        # The fork child never execs, so its pid holds exactly one
+        # caller incarnation. A second one there fails the expected
+        # table before any refusal could be recovered through it.
         for modfs, witness in self.SHAPES:
             with self.subTest(modfs=modfs):
                 report = deferred_recovered_report(modfs_witness=witness)
-                report["callers"][1]["start_time"] = 500
-                report["callers"].append(
-                    {"id": "c2", "pid": 101, "start_time": 900,
-                     "image": {"authority": "scan_pinned"}})
+                second = workload_caller("c2", 101, authority="scan_pinned")
+                second["start_time"] = 9000
+                report["callers"].append(second)
                 report["gaps"][-1]["caller"] = "c2"
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
-                self.assertIn("deferred activation never recovered", out)
+                self.assertIn("fork child has 2 caller incarnations", out)
 
     def test_refusal_of_an_unknown_caller_fails(self):
         for modfs, witness in self.SHAPES:
@@ -1532,6 +1547,153 @@ class RefusalIdentityTests(unittest.TestCase):
                 rc, out = run_oracle(report, modfs=modfs)
                 self.assertNotEqual(rc, 0, out)
                 self.assertIn("deferred activation never recovered", out)
+
+
+def _split_child_count(report):
+    # Codex r3 F1: 1507 conserved across two incarnations at one pid.
+    second = workload_caller("c2", 101)
+    second["start_time"] = 9000
+    report["callers"].append(second)
+    report["edges"][1]["entries"] = counted(1007)
+    report["edges"].append({"caller": "c2", "module": "m0",
+                            "entries": counted(500)})
+    if any((g.get("reason") or "").startswith("original_file_unproven")
+           for g in report["gaps"]):
+        report["gaps"].append({"caller": "c2", "module": None, "pid": 101,
+                               "reason": UNPROVEN, "subject": MODPATH,
+                               "repeats": 1})
+
+
+def _provision_failed_child(report):
+    # Codex r3 F2: another activation reason under the canonical
+    # subject, the child still scan-pinned, both edges exactly counted.
+    report["callers"][1]["image"]["authority"] = "scan_pinned"
+    report["gaps"] = [g for g in report["gaps"]
+                      if g.get("reason") != DEFERRED]
+    report["gaps"].append({"caller": "c1", "module": None, "pid": 101,
+                           "reason": "staged owner provision failed: scripted error",
+                           "subject": ACTIVATION, "repeats": 1})
+
+
+def _scan_pinned_child_without_gap(report):
+    report["callers"][1]["image"]["authority"] = "scan_pinned"
+    report["gaps"] = [g for g in report["gaps"]
+                      if g.get("reason") != DEFERRED]
+
+
+def _retired_child(report):
+    report["callers"][1]["retired"] = True
+
+
+def _wrong_generation(report):
+    report["callers"][1]["start_time"] = 7777
+
+
+def _other_unit(report):
+    report["callers"][1]["start_time_unit"] = "jiffies"
+
+
+def _child_flag(key, value):
+    def mutate(report):
+        report["edges"][1]["entries"][key] = value
+    return mutate
+
+
+def _child_lossy(report):
+    # Codex r3 F3: a lossy lower bound at the exact total.
+    report["edges"][1]["entries"]["coverage"]["lossy"] = True
+
+
+def _child_second_edge(report):
+    report["edges"].append({"caller": "c1", "module": "m9",
+                            "entries": counted(1)})
+
+
+def _edge_from_unknown_caller(report):
+    report["edges"].append({"caller": "c9", "module": "m0",
+                            "entries": counted(1)})
+
+
+def _third_pid_caller(report):
+    # Hy4 N2: a refusal naming a known caller outside the workload.
+    third = workload_caller("c3", 100)
+    third["pid"] = 103
+    report["callers"].append(third)
+    report["gaps"].append({"caller": "c3", "module": None, "pid": 103,
+                           "reason": NATIVE, "subject": ACTIVATION,
+                           "repeats": 1})
+
+
+def _unknown_gap(report):
+    # Hy4 N4: every substrate sweeps unclassified gaps.
+    report["gaps"].append({"caller": None, "module": None, "pid": None,
+                           "reason": "something new", "subject": "novel gap",
+                           "repeats": 1})
+
+
+class ExpectedTableTests(unittest.TestCase):
+    """One typed record per workload caller against the ledger table.
+
+    Each row is one refused class: (name, mutation, failure marker).
+    Every row runs on the degraded (overlayfs) and witness-available
+    (ext4) shapes of the recovered report; the unmutated report passes.
+    """
+
+    ROWS = [
+        ("split-incarnations", _split_child_count,
+         "fork child has 2 caller incarnations"),
+        ("provision-failure", _provision_failed_child,
+         "unexpected activation refusal"),
+        ("scan-pinned-without-gap", _scan_pinned_child_without_gap,
+         "fork child never activated a native owner"),
+        ("retired-at-report", _retired_child,
+         "fork child caller retired at report time"),
+        ("wrong-generation", _wrong_generation,
+         "fork child start time 7777 is not the workload generation 5001"),
+        ("other-start-unit", _other_unit,
+         "fork child start time unit 'jiffies'"),
+        ("lossy-lower-bound", _child_lossy,
+         "fork child calls not counted exactly"),
+        ("lossy-unknown", lambda r: r["edges"][1]["entries"]["coverage"].update(lossy=None),
+         "fork child calls not counted exactly"),
+        ("saturated", _child_flag("saturated", True),
+         "fork child calls not counted exactly"),
+        ("in-flight", _child_flag("in_flight", True),
+         "fork child calls not counted exactly"),
+        ("not-observed", _child_flag("observation", "lower bound"),
+         "fork child calls not counted exactly"),
+        ("second-edge", _child_second_edge,
+         "fork child has 2 edges, expected its one owned edge"),
+        ("edge-from-unknown-caller", _edge_from_unknown_caller,
+         "edge from a caller outside the workload"),
+        ("third-pid-caller", _third_pid_caller,
+         "unexpected caller outside the workload"),
+        ("unknown-gap", _unknown_gap, "published extra gap"),
+    ]
+
+    def test_recovered_report_passes(self):
+        for modfs, witness in (("overlayfs", False), ("ext4", True)):
+            with self.subTest(modfs=modfs):
+                rc, out = run_oracle(
+                    deferred_recovered_report(modfs_witness=witness),
+                    modfs=modfs)
+                self.assertEqual(rc, 0, out)
+
+    def test_each_refused_class_fails_on_every_substrate(self):
+        for name, mutate, marker in self.ROWS:
+            for modfs, witness in (("overlayfs", False), ("ext4", True)):
+                with self.subTest(row=name, modfs=modfs):
+                    report = deferred_recovered_report(modfs_witness=witness)
+                    mutate(report)
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(marker, out)
+
+    def test_missing_generation_fails(self):
+        rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                             modfs="ext4", generations=(5000, ""))
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("fork child generation not recorded", out)
 
 
 class NeverSettledTests(unittest.TestCase):

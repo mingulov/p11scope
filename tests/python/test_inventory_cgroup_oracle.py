@@ -112,14 +112,23 @@ def extract_inventory_oracle():
     start = next(
         i for i, line in enumerate(lines)
         if '"$cell-inside.wl"' in line
-        and line.strip().startswith("python3 - "))
+        and line.strip().startswith(("python3 -I - ", "python3 - ")))
     end = next(i for i in range(start, len(lines))
                if lines[i].rstrip("\n") == "PY")
     return "".join(lines[start + 1:end])
 
 
+# Interpreters the oracle must hold under: the plain test interpreter,
+# an optimized one (-O strips assert statements), and the live line's
+# plain "python3 -" with PYTHONOPTIMIZE inherited from the environment.
+PLAIN = (["python3", "-I", "-"], None)
+OPTIMIZED = (["python3", "-O", "-I", "-"], None)
+INHERITED = (["python3", "-"], {"PYTHONOPTIMIZE": "1"})
+
+
 def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
-               generations=None, inside_wl=None, outside_wl=None):
+               generations=None, inside_wl=None, outside_wl=None,
+               interpreter=PLAIN, report_text=None):
     """Run the extracted oracle against a fixture report."""
     if generations is None:
         generations = (GENERATIONS[100], GENERATIONS[101])
@@ -134,15 +143,23 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
         outside_wl = "READY pid=102\nLEDGER y\n"
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
-        (tmp / "r.json").write_text(json.dumps(report))
+        (tmp / "r.json").write_text(
+            json.dumps(report) if report_text is None else report_text)
         (tmp / "in.wl").write_text(inside_wl)
         (tmp / "out.wl").write_text(outside_wl)
+        argv, extra_env = interpreter
+        env = None
+        if extra_env is not None:
+            import os
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("PYTHON")}
+            env.update(extra_env)
         proc = subprocess.run(
-            ["python3", "-I", "-", "r.json", "in.wl", "out.wl",
-             json.dumps(pin), modpath, modfs,
-             str(generations[0]), str(generations[1])],
+            argv + ["r.json", "in.wl", "out.wl",
+                    json.dumps(pin), modpath, modfs,
+                    str(generations[0]), str(generations[1])],
             input=block, capture_output=True, text=True, timeout=30,
-            cwd=str(tmp))
+            cwd=str(tmp), env=env)
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -1234,6 +1251,146 @@ class CheckCoverageTests(unittest.TestCase):
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("overlay unproven pid", out)
+
+
+def _identity_token(report, token):
+    """Serialize the report with the owned inode replaced by a raw JSON
+    token (floats and huge decimals do not survive a Python round trip)."""
+    text = json.dumps(report)
+    needle = '"inode": %d' % PIN["ino"]
+    assert text.count(needle) == 1
+    return text.replace(needle, '"inode": %s' % token)
+
+
+class IdentityTypeTests(unittest.TestCase):
+    """The provider pin matches by exact JSON integers and strings."""
+
+    SHAPES = (("overlayfs", False), ("ext4", True))
+    BIG = 9007199254740992
+
+    def test_integer_identity_control_passes(self):
+        pin = dict(PIN, ino=self.BIG)
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                rc, out = run_oracle(report, modfs=modfs, pin=pin,
+                                     report_text=_identity_token(report, str(self.BIG)))
+                self.assertEqual(rc, 0, out)
+
+    def test_decimal_inode_token_fails(self):
+        # Codex r6 F2: 9007199254740993.0 rounds to the pinned integer.
+        pin = dict(PIN, ino=self.BIG)
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                rc, out = run_oracle(report, modfs=modfs, pin=pin,
+                                     report_text=_identity_token(report, "9007199254740993.0"))
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("module inode has type float", out)
+
+    def test_float_inode_fails(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                rc, out = run_oracle(report, modfs=modfs,
+                                     report_text=_identity_token(report, "%d.0" % PIN["ino"]))
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn("module inode has type float", out)
+
+    ROWS = [
+        ("major-bool", ["identity", "device", "major"], False,
+         "module device major has type bool"),
+        ("minor-string", ["identity", "device", "minor"], "46",
+         "module device minor has type str"),
+        ("device-missing", ["identity", "device"], _DELETE,
+         "module device missing"),
+        ("identity-missing", ["identity"], _DELETE,
+         "module identity missing"),
+        ("sha-int", ["identity", "sha256"], 7, "module sha256 has type int"),
+        ("admission-state-int", ["admission", "state"], 1,
+         "module admission state has type int"),
+    ]
+
+    def test_each_identity_type_row_fails(self):
+        for name, path, value, marker in self.ROWS:
+            for modfs, witness in self.SHAPES:
+                with self.subTest(row=name, modfs=modfs):
+                    report = deferred_recovered_report(modfs_witness=witness)
+                    _set(["modules", 0] + path, value)(report)
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(marker, out)
+
+    def test_pin_types_are_exact(self):
+        report = deferred_recovered_report(modfs_witness=True)
+        for name, pin, marker in (
+                ("pin-ino-bool", dict(PIN, ino=True), "pin ino has type bool"),
+                ("pin-dev-float", dict(PIN, dev=[0.0, 46]), "pin dev has type float"),
+                ("pin-sha-null", dict(PIN, sha256=None), "pin sha256 has type NoneType")):
+            with self.subTest(row=name):
+                rc, out = run_oracle(report, modfs="ext4", pin=pin)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(marker, out)
+
+
+class FieldPresenceTests(unittest.TestCase):
+    """Nullable attribution fields must be present (codex r6 N3)."""
+
+    def test_missing_gap_fields_fail(self):
+        for key in ("caller", "pid", "module", "reason", "subject"):
+            for modfs, witness in (("overlayfs", False), ("ext4", True)):
+                with self.subTest(field=key, modfs=modfs):
+                    report = deferred_recovered_report(modfs_witness=witness)
+                    report["gaps"].append(_deadline())
+                    del report["gaps"][-1][key]
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn("gap %s missing" % key, out)
+
+    def test_missing_lossy_fails(self):
+        report = deferred_recovered_report(modfs_witness=True)
+        del report["edges"][1]["entries"]["coverage"]["lossy"]
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("edge coverage lossy missing", out)
+
+
+def _never_recovered_zero(report):
+    # Codex r6 F1: the child stays scan-pinned and loses all its calls.
+    report["callers"][1]["image"]["authority"] = "scan_pinned"
+    report["edges"][1]["entries"]["count"] = 0
+
+
+class OptimizedInterpreterTests(unittest.TestCase):
+    """Optimization never strips a check: every refused row still fails
+    under -O and under an inherited PYTHONOPTIMIZE."""
+
+    def all_rows(self):
+        rows = [("never-recovered-zero", _never_recovered_zero,
+                 "deferred activation never recovered")]
+        rows += ExpectedTableTests.ROWS + CheckCoverageTests.REPORT_ROWS
+        return rows
+
+    def test_refused_rows_fail_optimized(self):
+        for label, interpreter in (("-O", OPTIMIZED),
+                                   ("PYTHONOPTIMIZE", INHERITED)):
+            for name, mutate, marker in self.all_rows():
+                for modfs, witness in (("overlayfs", False), ("ext4", True)):
+                    with self.subTest(mode=label, row=name, modfs=modfs):
+                        report = deferred_recovered_report(modfs_witness=witness)
+                        mutate(report)
+                        rc, out = run_oracle(report, modfs=modfs,
+                                             interpreter=interpreter)
+                        self.assertNotEqual(rc, 0, out)
+                        self.assertIn(marker, out)
+
+    def test_healthy_report_passes_optimized(self):
+        for label, interpreter in (("-O", OPTIMIZED),
+                                   ("PYTHONOPTIMIZE", INHERITED)):
+            with self.subTest(mode=label):
+                rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                                     modfs="ext4", interpreter=interpreter)
+                self.assertEqual(rc, 0, out)
 
 
 class NeverSettledTests(unittest.TestCase):

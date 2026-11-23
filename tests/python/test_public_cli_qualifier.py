@@ -57,7 +57,7 @@ def extract_inventory_oracle():
     start = next(
         i for i, line in enumerate(lines)
         if '"$cell-inside.wl"' in line
-        and line.strip().startswith("python3 - "))
+        and line.strip().startswith(("python3 -I - ", "python3 - ")))
     end = next(i for i in range(start, len(lines))
                if lines[i].rstrip("\n") == "PY")
     return "".join(lines[start + 1:end])
@@ -501,7 +501,7 @@ def extract_inventory_invocation():
     start = next(
         i for i, line in enumerate(lines)
         if '"$cell-inside.wl"' in line
-        and line.strip().startswith("python3 - "))
+        and line.strip().startswith(("python3 -I - ", "python3 - ")))
     end = next(i for i in range(start, len(lines))
                if lines[i].rstrip("\n") == "PY")
     return "".join(lines[start:end + 1])
@@ -511,17 +511,18 @@ class GenerationHandoffTests(unittest.TestCase):
     """The shell hands each registered workload generation to the
     oracle in its own position; a swap fails the healthy cell."""
 
-    def run_invocation(self, gen, childgen):
+    def run_invocation(self, gen, childgen, report=None, optimize=False):
         body = (
             "cell=inventory-cgroup; ext=json; module_fs=overlayfs\n"
-            "MODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n%s"
+            "%sMODULE=%s\nbefore='%s'\ngen=%s; childgen=%s\n%s"
             "echo RC=$?\ncat \"$cell.detail\"\n"
-            % (MODPATH, json.dumps(PUBLISHED_PIN), gen, childgen,
+            % ("export PYTHONOPTIMIZE=1\n" if optimize else "",
+               MODPATH, json.dumps(PUBLISHED_PIN), gen, childgen,
                extract_inventory_invocation()))
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
             (tmp / "inventory-cgroup.json").write_text(
-                json.dumps(overlay_published_report()))
+                json.dumps(report or overlay_published_report()))
             (tmp / "inventory-cgroup-inside.wl").write_text(
                 "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER)
             (tmp / "inventory-cgroup-outside.wl").write_text(
@@ -542,9 +543,57 @@ class GenerationHandoffTests(unittest.TestCase):
         self.assertIn("inside parent start time 5000 is not the "
                       "workload generation 5001", out)
 
+    def test_live_line_fails_a_never_recovered_child_when_optimized(self):
+        # Codex r6 F1: an inherited PYTHONOPTIMIZE must not strip the
+        # checks on the real invocation.
+        report = overlay_published_report()
+        report["callers"][1]["image"]["authority"] = "scan_pinned"
+        report["edges"][1]["entries"]["count"] = 0
+        out = self.run_invocation(GENERATIONS[100], GENERATIONS[101],
+                                  report=report, optimize=True)
+        self.assertIn("RC=1", out)
+        self.assertIn("native activation never recovered", out)
+
+    def test_live_line_qualifies_a_healthy_report_when_optimized(self):
+        out = self.run_invocation(GENERATIONS[100], GENERATIONS[101],
+                                  optimize=True)
+        self.assertIn("RC=0", out)
+
     def test_invocation_passes_parent_then_child(self):
         line = extract_inventory_invocation().splitlines()[0]
         self.assertIn('"$module_fs" "$gen" "$childgen" <<', line)
+
+
+def qualifier_heredocs():
+    """(invocation line, body) for every python heredoc in the qualifier."""
+    lines = QUAL.read_text().splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        if "<<'PY'" in line:
+            end = next(j for j in range(i + 1, len(lines)) if lines[j] == "PY")
+            out.append((line, "\n".join(lines[i + 1:end])))
+    return out
+
+
+class OptimizationProofTests(unittest.TestCase):
+    """No qualifier check depends on assert statements, and every python
+    heredoc runs isolated from inherited PYTHON* settings."""
+
+    def test_heredocs_found(self):
+        self.assertGreaterEqual(len(qualifier_heredocs()), 9)
+
+    def test_no_heredoc_uses_assert_statements(self):
+        for line, body in qualifier_heredocs():
+            with self.subTest(invocation=line.strip()[:60]):
+                tree = ast.parse(body)
+                asserts = [node.lineno for node in ast.walk(tree)
+                           if isinstance(node, ast.Assert)]
+                self.assertEqual(asserts, [], "assert statements are stripped by -O")
+
+    def test_every_heredoc_runs_isolated(self):
+        for line, _ in qualifier_heredocs():
+            with self.subTest(invocation=line.strip()[:60]):
+                self.assertIn("python3 -I - ", line + " ")
 
 
 class InventoryOverlayTests(unittest.TestCase):
@@ -679,7 +728,7 @@ def extract_handoff_oracle():
     lines = QUAL.read_text().splitlines(keepends=True)
     start = next(
         i for i, line in enumerate(lines)
-        if line.strip() == "detail=$(python3 - <<'PY' 2>&1")
+        if line.strip() in ("detail=$(python3 -I - <<'PY' 2>&1", "detail=$(python3 - <<'PY' 2>&1"))
     end = next(i for i in range(start, len(lines))
                if lines[i].rstrip("\n") == "PY")
     return "".join(lines[start + 1:end])

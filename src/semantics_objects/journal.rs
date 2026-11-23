@@ -2868,6 +2868,11 @@ impl JournalAdapter {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_drain_proof_visits_for_test(&self) -> usize {
+        self.test_drain_proof_visits.get()
+    }
+
     pub(crate) fn consumed_frontier(&self) -> ConsumptionOrdinal {
         ConsumptionOrdinal(self.consumed_through)
     }
@@ -22977,7 +22982,7 @@ pub(crate) mod tests {
             .effects
             .iter()
             .filter_map(|effect| match effect {
-                ObjectEffect::SessionOpened { session, .. } => Some(*session),
+                ObjectEffect::SessionOpened { call, session } => Some((*call, *session)),
                 _ => None,
             })
             .collect();
@@ -22986,6 +22991,10 @@ pub(crate) mod tests {
             1,
             "exactly one deferred End delivery opens one incarnation: {:?}",
             second.effects.effects
+        );
+        assert_eq!(
+            opened[0].0, drained.ticket,
+            "the deferred End delivers the drained call's own ticket"
         );
         assert!(
             !second.effects.effects.iter().any(|effect| matches!(
@@ -23006,6 +23015,10 @@ pub(crate) mod tests {
             .filter(|view| view.origin == SessionOrigin::Opened && view.state == SessionState::Live)
             .collect();
         assert_eq!(live.len(), 1, "one live incarnation from the drained words");
+        assert_eq!(
+            live[0].id, opened[0].1,
+            "the live incarnation is the deferred End's own session"
+        );
         assert!(
             scene.adapter.open.is_empty(),
             "both calls release once the model need is served"

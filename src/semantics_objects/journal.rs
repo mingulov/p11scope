@@ -3454,11 +3454,21 @@ impl JournalAdapter {
     /// whose return lands in the next quantum.
     #[cfg(test)]
     pub(crate) fn populate_unbound_barrier_row_for_test(&mut self, frontier: u64) {
+        self.populate_unbound_in_flight_row_at_for_test((u64::MAX, 0), frontier);
+    }
+
+    /// Test-only: [`Self::populate_unbound_barrier_row_for_test`] at an
+    /// explicit native key and begin ordinal (several in-flight rows).
+    #[cfg(test)]
+    pub(crate) fn populate_unbound_in_flight_row_at_for_test(
+        &mut self,
+        native: JournalNativeKey,
+        ordinal: u64,
+    ) {
         let template = *self.open.values().next().expect("a retained open entry");
-        let native = (u64::MAX, 0);
         let mut entry = template;
         entry.image = (template.image.0 ^ 0x5eed_0000, template.image.1);
-        entry.begin_ordinal = frontier;
+        entry.begin_ordinal = ordinal;
         entry.end = None;
         entry.abandon = None;
         entry.converted_ticket = None;
@@ -36903,5 +36913,38 @@ pub(crate) mod tests {
             Some("joint_pregrant_raw_loss_history_loss calls=1")
         );
         assert_eq!(pregrant_loss_gap_reason(JournalGap::ImageTainted, 1), None);
+    }
+
+    /// The grace keys on the lowest in-flight row: an older in-flight
+    /// row that already had its grace frame keeps the retry even beside
+    /// a newer one (a max would re-grant the orphan forever).
+    #[test]
+    fn seal_unbound_in_flight_grace_keys_on_the_oldest_row() {
+        let (mut scene, bootstrap, audit) = metered_seal_scene(3);
+        let frontier = scene.adapter.consumed_frontier().0;
+        assert!(frontier >= 2, "room for an older in-flight row");
+        scene
+            .adapter
+            .populate_unbound_in_flight_row_at_for_test((u64::MAX, 1), frontier - 1);
+        scene
+            .adapter
+            .populate_unbound_barrier_row_for_test(frontier);
+        let mut barrier = SealBarrierState::default();
+        let mut budget = usize::MAX;
+        let SealAttempt::Decided(Err(_)) =
+            metered_seal_poll(&mut scene, &audit, &bootstrap, &mut barrier, &mut budget)
+        else {
+            panic!("the unbound rows barrier the seal");
+        };
+        assert_eq!(
+            scene.adapter.seal_unbound_in_flight.get(),
+            Some(frontier - 1)
+        );
+        // The older row already had its grace at its own frame.
+        scene.adapter.unbound_grace_through.set(frontier - 1);
+        assert!(
+            !scene.adapter.take_unbound_in_flight_grace(frontier),
+            "the orphaned older row retries toward the void shed"
+        );
     }
 }

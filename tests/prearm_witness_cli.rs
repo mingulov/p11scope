@@ -1533,7 +1533,17 @@ impl TmpfsMount {
 
 impl Drop for TmpfsMount {
     fn drop(&mut self) {
-        let _ = Command::new("umount").arg(&self.path).status();
+        let status = Command::new("umount").arg(&self.path).status();
+        if !status.as_ref().is_ok_and(|status| status.success()) {
+            // A red-run holder may still hold the mount busy: detach
+            // lazily so the tmpfs cannot leak over the deleted tempdir
+            // path, and say so — the leak would otherwise be silent.
+            let _ = Command::new("umount").args(["-l"]).arg(&self.path).status();
+            eprintln!(
+                "p11scope test: umount {} failed ({status:?}); retried with -l",
+                self.path.display()
+            );
+        }
     }
 }
 

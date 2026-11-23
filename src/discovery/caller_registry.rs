@@ -1965,6 +1965,14 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             .filter_map(|id| Some((*id, self.callers.get(id)?.leader_alive_ns?)))
     }
 
+    /// How many proven holders `pid` retains: the O(1) pre-count a
+    /// holder scan charges before inspecting them (the scan itself
+    /// may yield fewer when records left, so the charge is
+    /// conservative, never short).
+    pub(crate) fn proven_count(&self, pid: u32) -> usize {
+        self.proven_by_pid.get(&pid).map_or(0, Vec::len)
+    }
+
     /// The detection stamp of `id` when its leader thread was proven
     /// alive at that instant (bracketed by the held pin and a later
     /// live leader read), `None` otherwise: a raced, cold or unstamped

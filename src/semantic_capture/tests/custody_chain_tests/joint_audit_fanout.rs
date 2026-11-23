@@ -43412,3 +43412,162 @@ fn joint_birth_refuses_doomed_segment_before_install() {
         "the doomed birth names its install-time refusal exactly once"
     );
 }
+
+/// The disposed frame's terminal check is the seal's paid scan under the
+/// frame's own budget: an unreturned BEGIN waits as future input, a
+/// quiet disposed frame audits clean, 97 foreign rows join the table,
+/// and the frame delivers
+/// with one-unit budgets. Every yielded delivery pays exactly one scan
+/// unit; the delivery that advances the consumer pays its credit with
+/// zero new units; the total equals rows plus identities. An unmetered
+/// check reads the whole table in the first delivery.
+#[test]
+fn joint_disposed_terminal_check_is_metered() {
+    use crate::semantics_objects::journal::joint_driver::RawDisposeReason;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let pid = std::process::id();
+    let (begin, _end) = fixture.scene.encoded(pid, 0, "C_SignInit", 2);
+    fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    let mut q1 = fixture.audited(0, 0, &BirthFault);
+    {
+        let h0 = fixture.scene.real.h0.clone();
+        let mut births = NativeFrameBirths {
+            h0: &h0,
+            attached: &fixture.attached,
+            retained: &mut fixture.births,
+            seen: Vec::new(),
+            unreadable: false,
+        };
+        let mut ports = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_frame_ports(&fixture.scene.producers)
+            .unwrap();
+        q1.bind_targets(&ports).unwrap();
+        let mut future = false;
+        for _ in 0..16 {
+            q1.seal_next(&mut ports, &mut births, &BirthFault).unwrap();
+            let mut work = 1;
+            let mut diagnosis =
+                crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
+            if q1
+                .deliver_next_bounded(&mut ports, &mut work, &mut diagnosis)
+                .unwrap()
+                == QuantumSealProgress::AwaitFutureInput
+            {
+                future = true;
+                break;
+            }
+        }
+        assert!(future, "the unreturned BEGIN waits as future input");
+        q1.finish_frame(&mut ports)
+            .unwrap_or_else(|(_, reason)| panic!("genuine waiting BEGIN: {reason:?}"));
+    }
+    let raw = fixture.scene.prepare(0);
+    let disposed = raw
+        .dispose_without_ingest(
+            fixture.scene.real.scene.coordinator.joint_capture_mut(),
+            &fixture.scene.producers,
+            RawDisposeReason::Empty,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("quiet raw: {reason:?}"));
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .dispose_prepared_claims_s1();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.scene.real.lane)
+    );
+    let mut frame = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .audit_disposed_quantum(
+            disposed,
+            &fixture.scene.producers,
+            &fixture.attached,
+            &BirthFault,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("future-only disposed frame: {reason:?}"));
+    assert!(frame.failure_for_test().is_none());
+    // 97 foreign rows (above every cut, barring nothing) join the table
+    // after the clean disposed audit.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .populate_foreign_open_rows_for_test(97);
+    let mut births = DisposedMustNotReadBirth;
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert!(rows > 64, "the table holds past one slice: {rows}");
+    let keys = ports.read().1.adapter().key_count_for_test();
+    let bound = seal_poll_bound(rows, keys, 1, 1);
+    let units0 = ports.read().1.adapter().seal_scan_units_for_test();
+    let mut polls = 0usize;
+    loop {
+        assert!(polls < bound, "the disposed check advances within {bound}");
+        frame
+            .seal_next(&mut ports, &mut births, &BirthFault)
+            .unwrap();
+        let units = ports.read().1.adapter().seal_scan_units_for_test();
+        let progress = frame.consumer_progress_for_test();
+        let mut work = 1;
+        let mut diagnosis =
+            crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
+        let outcome = frame
+            .deliver_next_bounded(&mut ports, &mut work, &mut diagnosis)
+            .unwrap();
+        polls += 1;
+        let units = ports.read().1.adapter().seal_scan_units_for_test() - units;
+        assert_eq!(work, 0, "delivery {polls} spends its one-unit budget");
+        if frame.consumer_progress_for_test() != progress {
+            assert_eq!(
+                units, 0,
+                "the advancing delivery pays its credit, no scan unit"
+            );
+            break;
+        }
+        assert_eq!(
+            outcome,
+            QuantumSealProgress::DeliveryReady,
+            "delivery {polls} yields"
+        );
+        assert_eq!(units, 1, "delivery {polls} pays exactly one scan unit");
+    }
+    let scan = frame
+        .seal_scan_for_test()
+        .expect("the frame holds its scan");
+    assert!(scan.done);
+    assert_eq!(
+        ports.read().1.adapter().seal_scan_units_for_test() - units0,
+        rows + scan.identities,
+        "one unit per row and identity"
+    );
+    assert_eq!(
+        polls,
+        rows + scan.identities + 1,
+        "one delivery per paid unit, then the advance"
+    );
+}

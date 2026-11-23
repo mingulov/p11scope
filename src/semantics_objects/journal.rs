@@ -12892,7 +12892,7 @@ pub(crate) mod tests {
         bytes
     }
 
-    fn begin_bytes_image(
+    pub(crate) fn begin_bytes_image(
         thread: u64,
         sequence: u64,
         function: u32,

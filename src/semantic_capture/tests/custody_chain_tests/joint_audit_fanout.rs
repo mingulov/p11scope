@@ -8306,6 +8306,139 @@ fn joint_machine_collected_finish_budget_refusal_preserves_originals() {
     assert_eq!(ending.finish.as_ref().unwrap().stops, 1);
 }
 
+/// Derived seal-poll bound from the barrier charge model: one seal
+/// advance costs its barrier scan (`rows` units, one per staged row)
+/// plus one decision unit, spread across polls of `budget_per_poll`
+/// units each. `advances` counts the seal advances the wait needs.
+/// Callers sample `rows` from the live `seal_stage_diagnosis` at the
+/// wait's start and prove per-poll progress inside the loop, so the
+/// bound can never hide a liveness bug. Never a bare constant.
+fn seal_poll_bound(rows: usize, budget_per_poll: usize, advances: usize) -> usize {
+    assert!(budget_per_poll > 0, "a seal poll needs a nonzero budget");
+    rows.saturating_add(1)
+        .saturating_mul(advances)
+        .div_ceil(budget_per_poll)
+}
+
+/// Drive one-unit machine polls until `done`, within a bound derived
+/// from the barrier charge model. Every poll must charge and advance
+/// the barrier cursor (new row visits) or decide (consumer progress
+/// moves, the wait finishes, or the service leaves `Pending`); a poll
+/// that does neither fails at once instead of burning the bound.
+/// Returns the polls used and the final outcome. The wait must start
+/// undecided, so an already-finished wait fails instead of passing
+/// vacuously.
+fn drive_machine_seal_polls(
+    fixture: &mut MachineScene,
+    rows: usize,
+    advances: usize,
+    label: &str,
+    mut done: impl FnMut(&MachineScene) -> bool,
+) -> (
+    usize,
+    Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal>,
+) {
+    use crate::inventory_semantics::JointServiceProgress;
+    let bound = seal_poll_bound(rows, 1, advances);
+    assert!(
+        !done(fixture),
+        "{label}: the seal wait starts undecided (rows={rows})"
+    );
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < bound,
+            "{label}: the seal wait lands within its derived bound (polls={polls} bound={bound} rows={rows} advances={advances})"
+        );
+        let visits_before = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .barrier_row_visits_for_test();
+        let progress_before = fixture.machine.retained_consumer_progress_for_test();
+        let outcome = fixture.service(1);
+        polls += 1;
+        let visits_after = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .barrier_row_visits_for_test();
+        let progress_after = fixture.machine.retained_consumer_progress_for_test();
+        let finished = done(fixture);
+        assert!(
+            visits_after > visits_before
+                || progress_after != progress_before
+                || finished
+                || !matches!(outcome, Ok(JointServiceProgress::Pending)),
+            "{label}: poll {polls} of {bound} charged and advanced the barrier cursor or decided (visits {visits_before}->{visits_after}, progress {progress_before:?}->{progress_after:?}, outcome {outcome:?})"
+        );
+        if finished || !matches!(outcome, Ok(JointServiceProgress::Pending)) {
+            eprintln!("{label}: seal wait finished in {polls} polls (bound={bound} rows={rows})");
+            return (polls, outcome);
+        }
+    }
+}
+
+/// Drive one-unit frame seals until one decides (anything but
+/// `LocalPending`), within a bound derived from the barrier charge
+/// model. Every yielded poll must spend its whole slice examining
+/// exactly one row with no consumer advance; anything else fails at
+/// once instead of burning the bound. Returns the polls used, the
+/// deciding outcome, its remaining budget, and the rows the deciding
+/// poll examined.
+fn drive_frame_seal_until_decided(
+    frame: &mut IngestedJointQuantum,
+    ports: &mut crate::discovery::engine::inventory_coordinator::semantics::JointPublicationPorts<
+        '_,
+    >,
+    births: &mut impl JointBirthEvidenceSource,
+    fault: &impl crate::semantics_objects::journal::FaultEpoch,
+    rows: usize,
+    label: &str,
+) -> (usize, QuantumSealProgress, usize, usize) {
+    let bound = seal_poll_bound(rows, 1, 1);
+    let mut polls = 0usize;
+    loop {
+        assert!(
+            polls < bound,
+            "{label}: the frame seal decides within its derived bound (polls={polls} bound={bound} rows={rows})"
+        );
+        let before_visits = ports.read().1.adapter().barrier_row_visits_for_test();
+        let before_progress = frame.consumer_progress_for_test();
+        let mut remaining = 1;
+        let outcome = frame
+            .seal_next_bounded(ports, births, fault, &mut remaining)
+            .unwrap();
+        polls += 1;
+        let visits = ports.read().1.adapter().barrier_row_visits_for_test() - before_visits;
+        if !matches!(outcome, QuantumSealProgress::LocalPending) {
+            eprintln!(
+                "{label}: frame seal decided in {polls} polls (bound={bound} rows={rows} outcome={outcome:?})"
+            );
+            return (polls, outcome, remaining, visits);
+        }
+        assert_eq!(
+            remaining, 0,
+            "{label}: a yielded poll spends its whole slice"
+        );
+        assert_eq!(
+            visits, 1,
+            "{label}: a budget-1 yielded poll examines exactly one row"
+        );
+        assert_eq!(
+            frame.consumer_progress_for_test(),
+            before_progress,
+            "{label}: a yielded poll advances no consumer"
+        );
+    }
+}
+
 /// Keep the original A BEGIN unfinished while the same image's B has a real
 /// END. The next service call is the first visit to this original Audited
 /// frame: its actual target snapshot has not been bound yet.
@@ -8464,7 +8597,23 @@ fn joint_machine_real_future_consumer_keeps_original_until_q2_end() {
     use crate::inventory_semantics::JointServiceProgress;
     let (mut fixture, begin_a, end_a, before) = machine_with_first_future_consumer();
     let original = fixture.machine.retained_original_for_test().unwrap();
-    let progress = fixture.service(1);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .seal_stage_diagnosis();
+    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let (polls, progress) =
+        drive_machine_seal_polls(&mut fixture, rows, 1, "first Future advance", |fixture| {
+            fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1))
+        });
+    assert!(
+        polls > 1,
+        "the charged barrier scan yields instead of deciding in one poll"
+    );
     assert_eq!(
         fixture.machine.retained_consumer_progress_for_test(),
         Some((1, 1, 1)),
@@ -8487,7 +8636,26 @@ fn joint_machine_real_future_consumer_progress_resets_running_stall_bound() {
     fixture.machine.set_finish_no_progress_since_for_test(Some(
         Instant::now() - (Duration::from_secs(6) + Duration::from_millis(100)),
     ));
-    let progress = fixture.service(1);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .seal_stage_diagnosis();
+    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let (polls, progress) = drive_machine_seal_polls(
+        &mut fixture,
+        rows,
+        1,
+        "stall-reset Future advance",
+        |fixture| fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1)),
+    );
+    assert!(
+        polls > 1,
+        "the charged barrier scan yields instead of deciding in one poll"
+    );
     assert_eq!(
         fixture.machine.retained_consumer_progress_for_test(),
         Some((1, 1, 1)),
@@ -13665,7 +13833,26 @@ fn joint_machine_idle_void_drops_call_held_behind_running_call() {
         fixture.scene.drain.source_mut().push_record(bytes);
     }
     fixture.reach_phase("Audited");
-    let progress = fixture.service(1);
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .seal_stage_diagnosis();
+    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let (polls, progress) = drive_machine_seal_polls(
+        &mut fixture,
+        rows,
+        1,
+        "held-behind-running Future advance",
+        |fixture| fixture.machine.retained_consumer_progress_for_test() == Some((1, 1, 1)),
+    );
+    assert!(
+        polls > 1,
+        "the charged barrier scan yields instead of deciding in one poll"
+    );
     assert_eq!(
         fixture.machine.retained_consumer_progress_for_test(),
         Some((1, 1, 1)),
@@ -19212,7 +19399,26 @@ fn watchdog_same_quantum_healthy_stage_survives_rearm() {
         );
     // A is unfinished (Future, awaiting input) and B is Pending;
     // neither retried nor parked, so the posed failure alone proves
-    // A stuck while B stays clean.
+    // A stuck while B stays clean. The charged barrier scan yields
+    // across polls; drive A's advance within its derived bound.
+    let diagnosis = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .seal_stage_diagnosis();
+    let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    let (_polls, _outcome) = drive_machine_seal_polls(&mut fixture, rows, 1, ROW, |fixture| {
+        fixture
+            .machine
+            .frame_consumer_states_for_test()
+            .iter()
+            .map(|(_, state, _, _)| *state)
+            .collect::<Vec<_>>()
+            == ["Future", "Pending"]
+    });
     let states = fixture.machine.frame_consumer_states_for_test();
     assert_eq!(
         states
@@ -27967,6 +28173,8 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                 "zero credit still validates the original target binding"
             );
             q1.bind_targets(&ports).unwrap();
+            let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+            let rows = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
             let mut future = 0;
             let mut delivered = 0;
             for _ in 0..2 {
@@ -27993,13 +28201,23 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                     assert_eq!(owner.ledger().roles_for_test(), roles);
                     assert_eq!(owner.adapter().invocation_claims_for_test(), claims);
                 }
-                let mut remaining = 1;
-                match q1
-                    .seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining)
-                    .unwrap()
-                {
+                let (_polls, outcome, mut remaining, decided_visits) =
+                    drive_frame_seal_until_decided(
+                        &mut q1,
+                        &mut ports,
+                        &mut births,
+                        &BirthFault,
+                        rows,
+                        "q1 advance",
+                    );
+                match outcome {
                     QuantumSealProgress::AwaitFutureInput => {
                         future += 1;
+                        assert_eq!(
+                            decided_visits + 1,
+                            1 - remaining,
+                            "the deciding poll charges its scan plus the one-unit Future advance"
+                        );
                         assert_eq!(
                             remaining, 0,
                             "one real Future transition costs one shared action"
@@ -28033,6 +28251,10 @@ fn joint_future_end_disposes_frame_without_disposing_call() {
                     }
                     QuantumSealProgress::DeliveryReady => {
                         delivered += 1;
+                        assert_eq!(
+                            decided_visits, 0,
+                            "the deciding poll scans nothing new past the completed barrier"
+                        );
                         assert_eq!(
                             remaining, 1,
                             "ordinary delivery keeps its own existing charges"

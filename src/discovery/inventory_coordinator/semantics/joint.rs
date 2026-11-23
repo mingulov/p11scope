@@ -1829,7 +1829,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // stopped the lane on provider storage; the probes keep
             // the table for births that can arm. A queued rebirth
             // retries from the next fresh proof (refinds re-offer;
-            // voids lift the bar; clean passes open the window).
+            // voids lift the bar, as does a served cooldown in a
+            // healthy session; clean passes open the window). The
+            // cooldown tick runs after this pass's births, so the pass
+            // that serves it still refuses StuckBarred and the reseed
+            // re-offers on the next pass (one pass of delay).
             // Worst case a probe misses and the arm refuses as before.
             if unhealthy {
                 drop(reservation);

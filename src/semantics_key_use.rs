@@ -733,8 +733,8 @@ impl JointStaging {
     /// abandon, the audits that proved stuck have since proved
     /// auditable again, so a fresh incarnation may reseed. Live, a feed
     /// stuck-degraded after a busy-host void stayed barred for the rest
-    /// of the run (no later void reached the S1Only feed), refusing
-    /// 10,327 fresh births. The duty bound is unchanged: each stuck
+    /// of the run (no later void reached the S1Only feed) and refused
+    /// every later fresh birth as stuck-barred. The duty bound is unchanged: each stuck
     /// episode still costs at most [`RESEED_STUCK_DEGRADE_STREAK`]
     /// passes plus a [`RESEED_COOLDOWN_PASSES`]-quantum cooldown, and the
     /// health gate keeps every reseed out of an unhealthy window.

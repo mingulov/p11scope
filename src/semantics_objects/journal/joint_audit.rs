@@ -531,8 +531,11 @@ fn failure_rank(failure: &SealFailure) -> u8 {
 /// quantum, so the immutable frame finishes and the next frame
 /// retries with new input, instead of retrying until the lane-wide
 /// no-progress bound stops every caller. Unbound staging stays retry
-/// (only a void sheds the barrier); an awaited terminal advances
-/// regardless of the wait.
+/// here: only a barrier made entirely of BEGINs in flight at the cut
+/// advances, once per row, through
+/// `JournalAdapter::take_unbound_in_flight_grace` (settled unbound
+/// history only a void or a refusal disposal sheds); an awaited
+/// terminal advances regardless of the wait.
 pub(crate) fn seal_wait_advances_as_future(wait: super::SealWait, awaits_terminal: bool) -> bool {
     use super::SealWait;
     awaits_terminal
@@ -2442,12 +2445,19 @@ impl IngestedJointQuantum {
             // staging. Only an undecided wait consults the terminal
             // fallback, which the same paid seal scan decided, and a
             // decided UnboundStaging barrier is still present, so no
-            // terminal is awaited past it.
+            // terminal is awaited past it. An UnboundStaging barrier made
+            // only of BEGINs still in flight at this cut is future input
+            // too: their returns, and the S1 calls that dispose or refuse
+            // their images, arrive in a later quantum. Each such row gets
+            // one grace frame; one that still bars a later frame retries
+            // toward the void shed.
             let wait = adapter.last_seal_wait();
             if failure.gap == JournalGap::BoundNotReady
                 && (seal_wait_advances_as_future(wait, false)
                     || (wait != super::SealWait::UnboundStaging
-                        && adapter.last_seal_awaits_terminal()))
+                        && adapter.last_seal_awaits_terminal())
+                    || (wait == super::SealWait::UnboundStaging
+                        && adapter.take_unbound_in_flight_grace(self.frontier.0)))
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's

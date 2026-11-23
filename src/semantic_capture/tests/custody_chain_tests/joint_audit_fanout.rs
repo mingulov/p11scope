@@ -3485,7 +3485,9 @@ fn unbound_staging(fixture: &MachineScene) -> std::collections::BTreeSet<(u64, u
 
 /// A seal that can only be retried, with nothing delivered, is no
 /// progress: the running Audited bound ends it with a named gap instead
-/// of spinning its retry budget until the run deadline.
+/// of spinning its retry budget until the run deadline. (The orphaned
+/// in-flight BEGIN first spends its one grace frame; the frame after
+/// it can only retry.)
 #[test]
 fn joint_machine_retry_without_delivery_trips_the_running_bound() {
     use crate::inventory_semantics::JointServiceProgress;
@@ -3499,6 +3501,11 @@ fn joint_machine_retry_without_delivery_trips_the_running_bound() {
     // keeps unbound staging that no bound key can account for.
     let _foreign = push_unbound_foreign_call(&mut fixture, 2, false);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    // The BEGIN in flight at the first cut is that frame's future input
+    // (its one grace frame): the transaction publishes.
+    fixture.published_labeled("in-flight-unbound-grace", None);
+    // It never returns: the next frame it still bars retries.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
     fixture.reach_phase("Audited");
     for n in 0..64 {
         match fixture.service(1024) {
@@ -38144,9 +38151,10 @@ fn joint_seal_future_wait_skips_terminal_scan_with_populated_staging() {
 }
 
 /// Unbound staging stays retry (the control twin of the future-wait
-/// seals): a seal barriered by history no bound key can account for
-/// keeps retrying instead of advancing as future input — only a void
-/// sheds the barrier — so the lane stays Pending and the lane-wide
+/// seals) once its one grace frame is spent: a BEGIN in flight at the
+/// first cut is that frame's future input, but the same BEGIN still
+/// barring a later frame (it never returned) keeps retrying instead of
+/// advancing — only a void sheds it — so the lane stays Pending and the lane-wide
 /// no-progress bound trips past its deadline instead of publishing.
 /// The wait names its gate and counts its stage counter. (A finished
 /// foreign call is shed by S1 before any seal, so only the machine
@@ -38165,6 +38173,11 @@ fn joint_seal_unbound_staging_stays_retry() {
     // keeps unbound staging that no bound key can account for.
     let _foreign = push_unbound_foreign_call(&mut fixture, 2, false);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    // The BEGIN in flight at the first cut is that frame's future input
+    // (its one grace frame): the transaction publishes.
+    fixture.published_labeled("in-flight-unbound-grace", None);
+    // It never returns: the next frame it still bars retries.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
     fixture.reach_phase("Audited");
     for n in 0..8 {
         match fixture.service(1024) {
@@ -38406,7 +38419,8 @@ fn joint_seal_barrier_scan_yields_across_bounded_polls_when_clear() {
 }
 
 /// A late barrier scans once and reuses its completed decision: 97
-/// clear rows plus one unbound row at the end of the open table, so
+/// clear rows plus one unbound row at the end of the open table whose
+/// END the frame already holds (settled unbound history), so
 /// each ten-unit seal yields until the final poll visits the barrier
 /// and waits `UnboundStaging` as a retry (DeliveryReady, no Future
 /// charge, no advance). The next same-frame retry reuses the
@@ -38472,7 +38486,7 @@ fn joint_seal_barrier_scan_reuses_completed_barrier_across_retries() {
             .joint_capture_mut()
             .adapter_mut();
         adapter.populate_foreign_open_rows_for_test(97);
-        adapter.populate_unbound_barrier_row_for_test(frontier);
+        adapter.populate_unbound_settled_barrier_row_for_test(frontier);
     }
     let h0 = fixture.scene.real.h0.clone();
     let mut births = NativeFrameBirths {
@@ -38602,6 +38616,163 @@ fn joint_seal_barrier_scan_reuses_completed_barrier_across_retries() {
             .unbound_staging,
         2,
         "each retry still counts its barrier gate"
+    );
+}
+
+/// Seal fix (round 8, live `comb20m1`/`diag5m`): an unbound BEGIN still
+/// in flight at the frame's cut (a churn caller's `C_Initialize` whose
+/// return lands in the next quantum) is future input, not a retry. The
+/// immutable frame can never see that return, so retrying it ran 897
+/// polls into the 6 s no-progress abandon and voided every Joint key
+/// on the live soak. The frame now advances the consumer as Future,
+/// keeps the barrier row and the key's staged calls untouched (no
+/// attribution past the barrier), and records its one grace frame: the
+/// same row barring a later frame retries toward the void shed. The
+/// settled twin above keeps the retry.
+#[test]
+fn joint_seal_unbound_in_flight_barrier_advances_as_future_input() {
+    use crate::semantics_objects::journal::SealWait;
+    use crate::semantics_objects::journal::tests::abandon_bytes;
+    use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let (target, pid) = fixture.replay_target();
+    let (open, ordinary) =
+        fixture
+            .scene
+            .encoded_with_rv(pid, 0, "C_SignUpdate", 2, pkcs11_types::CkRv::PENDING.0);
+    let (held, complete) = fixture.scene.encoded(pid, 0, "C_SignInit", 3);
+    let image = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(target.caller())
+        .unwrap()
+        .image();
+    let mut abandon = abandon_bytes(
+        u64::from(pid),
+        2,
+        JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+        (image.task_cookie, image.exec_id),
+    );
+    abandon[24..32].copy_from_slice(&open[24..32]);
+    abandon[48..52].copy_from_slice(&open[104..108]);
+    abandon[56..64].copy_from_slice(&open[48..56]);
+    let source = fixture.scene.drain.source_mut();
+    source.push_record(open.to_vec());
+    source.push_record(ordinary[24..392].to_vec());
+    source.push_record(abandon.to_vec());
+    source.push_record(held.to_vec());
+    source.push_record(complete.to_vec());
+    let mut frame = fixture.audited(2, 2, &BirthFault);
+    assert!(
+        frame.failure_for_test().is_none(),
+        "clean audit: {:?}",
+        frame.failure_for_test()
+    );
+    let frontier = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .consumed_through_for_test();
+    {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .adapter_mut();
+        adapter.populate_foreign_open_rows_for_test(97);
+        adapter.populate_unbound_barrier_row_for_test(frontier);
+    }
+    let h0 = fixture.scene.real.h0.clone();
+    let mut births = NativeFrameBirths {
+        h0: &h0,
+        attached: &fixture.attached,
+        retained: &mut fixture.births,
+        seen: Vec::new(),
+        unreadable: false,
+    };
+    let mut ports = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_frame_ports(&fixture.scene.producers)
+        .unwrap();
+    frame.bind_targets(&ports).unwrap();
+    let diagnosis = ports.read().1.adapter().seal_stage_diagnosis();
+    let total = diagnosis.open_staged as usize + diagnosis.refused_staged as usize;
+    assert!(
+        total > 64,
+        "the staging table holds past one credit of rows: {total}"
+    );
+    let staged_before = ports.read().1.adapter().seal_stage_diagnosis().open_staged;
+    let rows = staged_before as usize
+        + ports
+            .read()
+            .1
+            .adapter()
+            .seal_stage_diagnosis()
+            .refused_staged as usize;
+    // One unit per row and identity before the barrier decides, plus
+    // the decision credit; the charge model bounds the polls.
+    let poll_bound = rows * 2 + 2;
+    let mut polls = 0;
+    let progress = loop {
+        assert!(
+            polls < poll_bound,
+            "decides within the charge model bound {poll_bound}"
+        );
+        let mut remaining = 1;
+        let progress =
+            frame.seal_next_bounded(&mut ports, &mut births, &BirthFault, &mut remaining);
+        polls += 1;
+        if progress != Ok(QuantumSealProgress::LocalPending) {
+            break progress;
+        }
+        assert_eq!(
+            remaining, 0,
+            "poll {polls}: a yielded poll spends its slice"
+        );
+    };
+    assert_eq!(
+        ports.read().1.adapter().last_seal_wait(),
+        SealWait::UnboundStaging,
+        "the in-flight row still barriers the seal"
+    );
+    assert_eq!(
+        progress,
+        Ok(QuantumSealProgress::AwaitFutureInput),
+        "an in-flight unbound barrier waits as future input instead of retrying"
+    );
+    let (_, future, _) = frame.consumer_progress_for_test();
+    assert_eq!(future, 1, "the barriered consumer advances as Future");
+    assert!(
+        frame.active_seal_for_test().is_none(),
+        "a Future wait sets no active delivery"
+    );
+    assert_eq!(
+        ports.read().1.adapter().seal_stage_diagnosis().open_staged,
+        staged_before,
+        "the Future wait drops no staged row (no attribution past the barrier)"
+    );
+    // Its one grace frame is spent: the same row (still in flight)
+    // barring a later frontier retries toward the void shed.
+    let adapter = ports.read().1.adapter();
+    assert!(
+        adapter.take_unbound_in_flight_grace(frontier),
+        "re-asking for the granted frame is idempotent"
+    );
+    assert!(
+        !adapter.take_unbound_in_flight_grace(frontier + 1),
+        "a row that already had its grace frame retries at a later frontier"
     );
 }
 

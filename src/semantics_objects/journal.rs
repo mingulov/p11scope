@@ -2217,6 +2217,15 @@ enum ClaimValidation {
 struct SealScanFacts {
     birth_mismatch: bool,
     barrier: bool,
+    /// Some barrier row is settled history this frame already holds:
+    /// an unbound open BEGIN with its terminal at or below the
+    /// frontier, or an unbound refused BEGIN.
+    barrier_settled: bool,
+    /// The lowest begin ordinal of the unbound open BEGINs still in
+    /// flight at the cut (no terminal at or below the frontier): their
+    /// return, and the S1 call that disposes or refuses their image,
+    /// can only arrive in a later quantum.
+    barrier_in_flight_min: Option<u64>,
     attribution_pending: bool,
     unmatched_perm: bool,
     unmatched_max: Option<u64>,
@@ -2240,6 +2249,8 @@ impl Default for SealScanFacts {
         Self {
             birth_mismatch: false,
             barrier: false,
+            barrier_settled: false,
+            barrier_in_flight_min: None,
             attribution_pending: false,
             unmatched_perm: false,
             unmatched_max: None,
@@ -2316,6 +2327,19 @@ pub(crate) fn seal_advance_units_bound(rows: usize, keys: usize) -> usize {
         .max(rows * SEAL_TAINT_PASSES)
         .max(keys * SEAL_DOOM_KEY_PASSES);
     rows + rows + prepay + 1
+}
+
+/// Whether an `UnboundStaging` barrier whose lowest in-flight row is
+/// `in_flight_min` (None when any barrier row is settled history) gets
+/// its grace frame at `frontier`, given the last granted frontier: every
+/// barrier row must be newer than the last grant, or this is the same
+/// frame asking again.
+fn unbound_in_flight_grace_applies(
+    in_flight_min: Option<u64>,
+    granted: u64,
+    frontier: u64,
+) -> bool {
+    in_flight_min.is_some_and(|min| min > granted || granted == frontier)
 }
 
 /// Open-table row visits one conversion makes per open row after its
@@ -2481,6 +2505,16 @@ pub(crate) struct JournalAdapter {
     /// grounded by a future terminal, from the same paid scan that
     /// decided it (internal; never authority). Reset with `seal_wait`.
     seal_awaits_terminal: std::cell::Cell<bool>,
+    /// The lowest begin ordinal of the current attempt's unbound
+    /// barrier rows when every one of them is still in flight at the
+    /// cut, from the same paid scan (internal; never authority).
+    /// Reset with `seal_wait`.
+    seal_unbound_in_flight: std::cell::Cell<Option<u64>>,
+    /// The frontier of the last frame an in-flight unbound barrier let
+    /// advance as future input. A barrier row at or below it already
+    /// had its one grace frame: if it still bars a later frame, its
+    /// return never came and the frame retries toward the void shed.
+    unbound_grace_through: std::cell::Cell<u64>,
     limits: JournalLimits,
     consumed_through: u64,
     stream_boundary: Option<crate::events::EventsConsumptionCut>,
@@ -2798,6 +2832,8 @@ impl JournalAdapter {
         Self {
             seal_wait: std::cell::Cell::new(SealWait::None),
             seal_awaits_terminal: std::cell::Cell::new(false),
+            seal_unbound_in_flight: std::cell::Cell::new(None),
+            unbound_grace_through: std::cell::Cell::new(0),
             limits,
             consumed_through: 0,
             stream_boundary: None,
@@ -3345,12 +3381,33 @@ impl JournalAdapter {
         self.refused.edit().push(refused);
     }
 
+    /// Test-only: [`Self::populate_unbound_barrier_row_for_test`] whose
+    /// BEGIN already has its END at `frontier`: settled unbound history
+    /// the frame holds, which only a void or a refusal disposal sheds,
+    /// so the seal retries instead of advancing as future input.
+    #[cfg(test)]
+    pub(crate) fn populate_unbound_settled_barrier_row_for_test(&mut self, frontier: u64) {
+        let end = self
+            .open
+            .values()
+            .find_map(|entry| entry.end)
+            .expect("a retained open entry with an END");
+        self.populate_unbound_barrier_row_for_test(frontier);
+        let mut entry = self.open.get_mut(&(u64::MAX, 0)).expect("staged barrier");
+        entry.end = Some(StagedEnd {
+            ordinal: frontier,
+            end: end.end,
+        });
+    }
+
     /// Test-only: stage one unbound barrier row at the end of the open
     /// table (native `(u64::MAX, 0)`, past every
     /// [`Self::populate_foreign_open_rows_for_test`] clear), on the same
     /// foreign image but at `frontier` so it bars every seal past it. A
     /// bounded scan must visit every clear before it; a cached decision
-    /// must spare every same-frame retry the rescan.
+    /// must spare every same-frame retry the rescan. Its BEGIN is still
+    /// in flight at the cut (no terminal), like a live caller's call
+    /// whose return lands in the next quantum.
     #[cfg(test)]
     pub(crate) fn populate_unbound_barrier_row_for_test(&mut self, frontier: u64) {
         let template = *self.open.values().next().expect("a retained open entry");
@@ -9140,6 +9197,7 @@ impl JournalAdapter {
         let (audit, bootstrap, frontier) = input.into_parts();
         self.seal_wait.set(SealWait::None);
         self.seal_awaits_terminal.set(false);
+        self.seal_unbound_in_flight.set(None);
         let requested = self.retained_failure_domain(bootstrap);
         let attempt = (|| {
             if let Err(failure) = self.check_seal_entry(audit, frontier.0) {
@@ -9363,6 +9421,12 @@ impl JournalAdapter {
             SealScanMode::Seal,
         ) {
             BarrierCheck::Barrier => {
+                let facts = &barrier.scan.as_ref().expect("a decided seal scan").facts;
+                self.seal_unbound_in_flight.set(
+                    facts
+                        .barrier_in_flight_min
+                        .filter(|_| !facts.barrier_settled),
+                );
                 self.note_seal_stage(SealStageGate::UnboundStaging);
                 return SealAttempt::Decided(Err(self.wait(SealWait::UnboundStaging)));
             }
@@ -10146,6 +10210,19 @@ impl JournalAdapter {
         let within = entry.begin_ordinal <= frontier;
         if unconverted && within && !self.image_keys.contains_key(&entry.image) {
             facts.barrier = true;
+            let terminated = entry.end.is_some_and(|end| end.ordinal <= frontier)
+                || entry
+                    .abandon
+                    .is_some_and(|abandon| abandon.ordinal <= frontier);
+            if terminated {
+                facts.barrier_settled = true;
+            } else {
+                facts.barrier_in_flight_min = Some(
+                    facts
+                        .barrier_in_flight_min
+                        .map_or(entry.begin_ordinal, |min| min.min(entry.begin_ordinal)),
+                );
+            }
         }
         let shape = shape_of_entry(entry);
         let identity = shape.identity;
@@ -10255,6 +10332,7 @@ impl JournalAdapter {
         let within = refused.cut <= frontier;
         if within && !self.image_keys.contains_key(&refused.image) {
             facts.barrier = true;
+            facts.barrier_settled = true;
         }
         let shape = refused.shape();
         let identity = shape.identity;
@@ -11156,6 +11234,27 @@ impl JournalAdapter {
     /// future terminal, decided on the same paid scan as the wait.
     pub(crate) fn last_seal_awaits_terminal(&self) -> bool {
         self.seal_awaits_terminal.get()
+    }
+
+    /// Whether the last decided `UnboundStaging` wait may advance the
+    /// frame at `frontier` as future input, recording the grace when it
+    /// does. Only a barrier made entirely of unbound BEGINs still in
+    /// flight at the cut qualifies: their returns, and the S1 calls
+    /// that dispose or refuse their images, arrive in a later quantum,
+    /// so retrying this immutable frame can only end in the
+    /// no-progress void. Each row gets one grace frame: a row at or
+    /// below the last granted frontier that still bars a later frame
+    /// never returned, and that frame retries toward the void shed as
+    /// before. Re-asking for the granted frontier is idempotent (a
+    /// settle that yields for budget asks again).
+    pub(crate) fn take_unbound_in_flight_grace(&self, frontier: u64) -> bool {
+        let granted = self.unbound_grace_through.get();
+        let grants =
+            unbound_in_flight_grace_applies(self.seal_unbound_in_flight.get(), granted, frontier);
+        if grants {
+            self.unbound_grace_through.set(frontier);
+        }
+        grants
     }
 
     fn failure(&self, gap: JournalGap) -> SealFailure {
@@ -34262,5 +34361,78 @@ pub(crate) mod tests {
             apply <= prepaid,
             "live-set visits {apply} within the prepay {prepaid}"
         );
+    }
+
+    /// Round 8: the paid scan tells an unbound barrier still in flight
+    /// at the cut (no terminal at or below the frontier) from settled
+    /// unbound history, and only the in-flight one offers its single
+    /// grace frame. RED before the fix: no in-flight fact existed, so
+    /// every unbound barrier retried the immutable frame into the
+    /// no-progress void.
+    #[test]
+    fn seal_unbound_barrier_in_flight_offers_one_grace_frame() {
+        for settled in [false, true] {
+            let (mut scene, bootstrap, audit) = metered_seal_scene(3);
+            let frontier = scene.adapter.consumed_frontier().0;
+            if settled {
+                scene
+                    .adapter
+                    .populate_unbound_settled_barrier_row_for_test(frontier);
+            } else {
+                scene
+                    .adapter
+                    .populate_unbound_barrier_row_for_test(frontier);
+            }
+            let mut barrier = SealBarrierState::default();
+            let mut budget = usize::MAX;
+            let SealAttempt::Decided(Err(failure)) =
+                metered_seal_poll(&mut scene, &audit, &bootstrap, &mut barrier, &mut budget)
+            else {
+                panic!("the unbound row barriers the seal");
+            };
+            assert_eq!(failure.gap, JournalGap::BoundNotReady);
+            assert_eq!(scene.adapter.last_seal_wait(), SealWait::UnboundStaging);
+            if settled {
+                assert_eq!(scene.adapter.seal_unbound_in_flight.get(), None);
+                assert!(
+                    !scene.adapter.take_unbound_in_flight_grace(frontier),
+                    "settled unbound history retries toward the void shed"
+                );
+            } else {
+                assert_eq!(scene.adapter.seal_unbound_in_flight.get(), Some(frontier));
+                assert!(
+                    scene.adapter.take_unbound_in_flight_grace(frontier),
+                    "a BEGIN in flight at the cut is future input"
+                );
+                assert!(
+                    scene.adapter.take_unbound_in_flight_grace(frontier),
+                    "the same frame asking again keeps its grace"
+                );
+                assert!(
+                    !scene.adapter.take_unbound_in_flight_grace(frontier + 1),
+                    "a row that already had its grace frame retries later"
+                );
+            }
+        }
+    }
+
+    /// The grace rule alone: every barrier row newer than the last
+    /// grant, or the granted frame asking again.
+    #[test]
+    fn seal_unbound_in_flight_grace_rule() {
+        for (min, granted, frontier, grants) in [
+            (None, 0, 10, false),
+            (Some(10), 0, 10, true),
+            (Some(10), 10, 10, true),
+            (Some(10), 10, 11, false),
+            (Some(11), 10, 12, true),
+            (Some(9), 10, 12, false),
+        ] {
+            assert_eq!(
+                unbound_in_flight_grace_applies(min, granted, frontier),
+                grants,
+                "min={min:?} granted={granted} frontier={frontier}"
+            );
+        }
     }
 }

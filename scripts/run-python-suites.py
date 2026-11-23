@@ -173,6 +173,7 @@ RUN = [
     ("test_real_provider_oracle.py", []),
     ("test_python_suite_registry.py", []),
     ("test_qualify_inventory_judge.py", []),
+    ("test_qualify_records.py", []),
     ("test_release_matrix_contract.py", []),
     ("test_release_build_jobs.py", []),
     ("test_release_notices.py", []),

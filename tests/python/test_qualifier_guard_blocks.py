@@ -40,28 +40,49 @@ MODES = (("plain", ["python3", "-I"], None),
          ("PYTHONOPTIMIZE", ["python3"], {"PYTHONOPTIMIZE": "1"}))
 
 
-def extract_block(anchor):
-    lines = QUAL.read_text(encoding="utf-8").splitlines()
-    starts = [i for i, line in enumerate(lines) if anchor in line and "<<'PY'" in line]
-    if len(starts) != 1:
-        raise AssertionError("%d heredocs match %r" % (len(starts), anchor))
-    end = next(j for j in range(starts[0] + 1, len(lines)) if lines[j] == "PY")
-    return "\n".join(lines[starts[0] + 1:end]) + "\n"
+RECORDS = ROOT / "scripts" / "qualify_records.py"
+RUN_ID = "test-run"
+SIGINT = "second-sigint"
+EVENT = "event-stdout"
+CHAIN = "parent-chain"
+CELLS = {SIGINT: "second-sigint", EVENT: "inventory-event-stdout", CHAIN: "parent-chain"}
 
 
-def run_block(anchor, files, argv=(), env=None, mode=MODES[0]):
+def judge_argv(judge, files, argv, env):
+    """The judge's named arguments, as the shell passes them."""
+    if judge == SIGINT:
+        files.setdefault("sig2.stderr", "p11scope: cancel\np11scope: cleanup incomplete\n")
+        return ["--report", argv[0], "--stderr", "sig2.stderr", "--rc", "130",
+                "--custody", "1", "--cleanup", "1"]
+    if judge == EVENT:
+        return ["--jsonl", "event-stdout.jsonl", "--full-report", env["full_out"],
+                "--epipe-report", env["epipe_out"], "--epipe-head", "event-epipe.head",
+                "--rc1", env["rc1"], "--rc2", env["rc2"]]
+    report, concise, verbose, wl, wl_gen, parent, parent_gen = argv
+    return ["--report", report, "--concise", concise, "--verbose", verbose,
+            "--workload-pid", wl, "--workload-gen", wl_gen,
+            "--parent-pid", parent, "--parent-gen", parent_gen]
+
+
+def run_block(judge, files, argv=(), env=None, mode=MODES[0], verdict_out=None):
+    """Run one judge of the typed loader on fixture files."""
     _, interp, extra = mode
+    files = dict(files)
+    named = judge_argv(judge, files, list(argv), env or {})
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
-        (tmp / "block.py").write_text(extract_block(anchor))
+        cell = CELLS[judge]
+        subprocess.run(["python3", "-I", str(RECORDS), "stamp", str(tmp / (cell + ".stamp")),
+                        RUN_ID, cell], check=True)
         for name, text in files.items():
             (tmp / name).write_text(text)
         full = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
-        full.update(env or {})
         full.update(extra or {})
-        proc = subprocess.run(interp + ["block.py"] + list(argv), cwd=tmp,
-                              capture_output=True, text=True, timeout=30,
-                              env=full)
+        proc = subprocess.run(interp + [str(RECORDS), judge, "--stamp", cell + ".stamp",
+                                        "--run-id", RUN_ID, "--verdict", "verdict.json"] + named,
+                              cwd=tmp, capture_output=True, text=True, timeout=30, env=full)
+        if verdict_out is not None:
+            verdict_out.update(json.loads((tmp / "verdict.json").read_text()))
         return proc.returncode, verdict(proc.stdout + proc.stderr)
 
 
@@ -108,7 +129,7 @@ DELETE = object()
 
 
 class SecondSigintReportTests(GuardCase):
-    ANCHOR = "python3 -I - sigint2.json"
+    ANCHOR = SIGINT
 
     def check(self, report, *, ok, marker=""):
         self.expect(ok=ok, marker=marker,
@@ -189,7 +210,8 @@ def event_stream(n_totals=2):
         rows.append({"kind": "pass_committed", "at_ns": INTERVAL * index + INTERVAL // 2,
                      "event": {"pass": index, "totals": totals}})
         rows.append({"kind": "totals", "at_ns": INTERVAL * (index + 1),
-                     "event": dict(totals, **{"pass": index, "passes": index + 1})})
+                     "event": dict(totals, **{"pass": index, "passes": index + 1,
+                                              "stdout_lost": {"lines": 0, "bytes": 0}})})
     rows.append({"kind": "ended", "at_ns": INTERVAL * (n_totals + 1),
                  "event": {"passes": n_totals, "stdout_lost": {"lines": 0, "bytes": 0}}})
     for seq, row in enumerate(rows):
@@ -217,7 +239,7 @@ def event_case(n_totals=2):
 
 
 class EventStdoutGuardTests(GuardCase):
-    ANCHOR = "python3 -I - <<'PY' > event-stdout.judge"
+    ANCHOR = EVENT
 
     def check(self, case, *, ok, marker=""):
         jsonl = case["jsonl"]
@@ -420,7 +442,7 @@ def chain_report(ancestors=None, **caller):
 
 
 class ParentChainGuardTests(GuardCase):
-    ANCHOR = '"$cell-v.stdout" "$wl" "$wl_gen"'
+    ANCHOR = CHAIN
 
     def check(self, report, *, ok, marker="", concise="gated (from chain-parent)\n",
               verbose="gated <- chain-parent <- bash\n"):

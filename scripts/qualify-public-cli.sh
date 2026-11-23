@@ -24,6 +24,9 @@ set -u
 _SRC=${BASH_SOURCE[0]:-$0}
 HERE=$(cd "$(dirname "$_SRC")" && pwd) || exit 64
 ORACLE=$HERE/public-cli-oracle.py
+# Every structured-evidence decision below is one judge of the typed
+# loader (strict records, run-bound inputs, declared rules).
+RECORDS=$HERE/qualify_records.py
 CONTROL=0
 CONTROL_KIND=gated
 if [ "${1:-}" = --control-gated ]; then CONTROL=1; shift
@@ -97,6 +100,18 @@ publish_output() {
   python3 -I "$HERE/release-matrix-contract.py" --copy-file "$LOCAL_OUTPUT/$1" "$OUT/$1"
 }
 : > results.jsonl
+# This invocation's run id: every judged input must carry a stamp of it.
+RUN_ID=$(cat /proc/sys/kernel/random/uuid) || exit 64
+# stamp_leg CELL PATH...: remove each destination, prove it absent, then
+# stamp the run; a judged input must be written at or after the stamp.
+stamp_leg() {
+  local cell=$1 path; shift
+  for path in "$cell.stamp" "$@"; do
+    rm -f -- "$path" || return 1
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+  done
+  python3 -I "$RECORDS" stamp "$cell.stamp" "$RUN_ID" "$cell"
+}
 # PID generations limit cleanup to children created in this invocation.
 declare -A CHILDREN
 # Owned cgroups for EXIT cleanup (prevents leaks if a cell fails before rmdir).
@@ -581,7 +596,7 @@ second_sigint() {
   local pp child='' rc=125 custody=0 cleanup_ok=1 pid
   local output; output=$(product_output sigint2.json)
   rm -f sigint2.json second-child.pid
-  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  stamp_leg second-sigint "$output" "$OUT/sigint2.json" sig2.stdout sig2.stderr second-sigint.verdict.json || { result second-sigint 0 'run stamp failed' failed; return 1; }
   : > second-child.pid
   if [ "$CONTROL" = 0 ]; then chown "$RUNUID:$RUNGID" second-child.pid; fi
   chmod 600 second-child.pid
@@ -601,39 +616,22 @@ second_sigint() {
     terminate "$pid" || cleanup_ok=0
   done
   publish_output sigint2.json || cleanup_ok=0
-  report_ok=0
-  if python3 -I - sigint2.json <<'PY' 2>/dev/null; then report_ok=1; fi
-import json,sys
-def unique_keys(pairs):
-    # A repeated JSON object key fails instead of last-wins.
-    result={}
-    for key,value in pairs:
-        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
-        result[key]=value
-    return result
-report=json.loads(open(sys.argv[1]).read(),object_pairs_hook=unique_keys)
-if not (report.get('schema')=='p11scope/observed-profile/v3'): raise AssertionError('schema')
-evidence=report['evidence']
-if not (evidence.get('completeness')=='PARTIAL'): raise AssertionError('abandoned teardown cannot seal COMPLETE')
-stop=evidence['stop_quiescence']
-proven=stop.get('state')=='proven' and stop.get('post_q_events') is False and stop.get('post_q_discovery') is False
-if not (evidence.get('drain_proven') is proven): raise AssertionError('drain_proven must match the stop-gate evidence')
-samples=evidence.get('scheduling',{}).get('inter_drain_gap',{}).get('samples')
-if not (type(samples) is int and samples>0): raise AssertionError('report must carry this capture live-loop drain samples')
-if not (evidence.get('child_still_running') is False): raise AssertionError('owned child must be settled, not still running')
-PY
-  result second-sigint "$([ "$custody" = 1 ] && [ "$cleanup_ok" = 1 ] && [ "$rc" = 130 ] && [ "$report_ok" = 1 ] && [ "$(grep -cxF 'p11scope: cleanup incomplete' sig2.stderr 2>/dev/null)" = 1 ] && ! grep -qa panicked sig2.stderr && echo 1 || echo 0)" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok report_ok=$report_ok"
+  local judged=0 detail
+  detail=$(python3 -I "$RECORDS" second-sigint --stamp second-sigint.stamp --run-id "$RUN_ID" --verdict second-sigint.verdict.json --report sigint2.json --stderr sig2.stderr --rc "$rc" --custody "$custody" --cleanup "$cleanup_ok") && judged=1
+  result second-sigint "$judged" "rc=$rc child_custody=$custody child=${child:-unknown} cleanup_complete=$cleanup_ok $(printf '%.300s' "$detail")"
 }
 fifo_refused() {
-  local wl rc=125
+  local wl rc=125 judged=0 detail
   rm -f fifo; mkfifo fifo || return 1
+  stamp_leg fifo-refused fifo.stdout fifo.stderr fifo-refused.verdict.json || { result fifo-refused 0 'run stamp failed' failed; return 1; }
   asuser "$GATED" "$MODULE" 100000000 1000 - > fifo.wl 2>&1 & wl=$!; register "$wl" || true
   if waitfor fifo.wl '^READY pid=' "$wl" "$READY_TICKS"; then
     # This negative must keep the actual FIFO destination, even in local-output mode.
     timeout 60 "$P" profile --pid "$wl" --duration 2 -o "$OUT/fifo" > fifo.stdout 2> fifo.stderr; rc=$?
   fi
   terminate "$wl"
-  result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && [ "$(grep -cxF "p11scope: output $OUT/fifo exists and is a FIFO; refusing to replace it (-o publishes the report by renaming a new file over that name). Name a new or regular file, or leave out -o to write no report file" fifo.stderr 2>/dev/null)" = 1 ] && echo 1 || echo 0)" "rc=$rc"
+  detail=$(python3 -I "$RECORDS" fifo-refusal --stamp fifo-refused.stamp --run-id "$RUN_ID" --verdict fifo-refused.verdict.json --stderr fifo.stderr --fifo "$OUT/fifo" --rc "$rc") && judged=1
+  result fifo-refused "$judged" "rc=$rc $(printf '%.300s' "$detail")"
 }
 # Event stdout: `--event-log -` streams pure JSONL to stdout (Docker/
 # Fluent Bit/Loki with no file mount) while the -o report agrees on
@@ -643,107 +641,24 @@ inventory_event_stdout() {
   local wl rc1=125 rc2=125 full_out epipe_out judge_rc=1
   full_out=$(product_output event-stdout.json)
   epipe_out=$(product_output event-epipe.json)
-  rm -f event-stdout.jsonl event-stdout.stderr event-epipe.stderr event-epipe.head event-stdout.wl
+  rm -f event-stdout.wl
+  # Both report destinations (local and published) start absent, so only
+  # this run's reports can be judged.
+  stamp_leg inventory-event-stdout "$full_out" "$epipe_out" "$OUT/event-stdout.json" "$OUT/event-epipe.json" event-stdout.jsonl event-stdout.stderr event-epipe.stderr event-epipe.head event-stdout.judge inventory-event-stdout.verdict.json || { result inventory-event-stdout 0 'run stamp failed' failed; return 1; }
   asuser "$GATED" "$MODULE" 100000000 1000 - > event-stdout.wl 2>&1 & wl=$!; register "$wl" || true
   if waitfor event-stdout.wl '^READY pid=' "$wl" "$READY_TICKS"; then
     timeout 120 "$P" inventory --pid "$wl" --duration 6 -o "$full_out" --event-log - --event-interval 2s 2> event-stdout.stderr | cat > event-stdout.jsonl; rc1=${PIPESTATUS[0]}
     timeout 120 "$P" inventory --pid "$wl" --duration 4 -o "$epipe_out" --event-log - 2> event-epipe.stderr | head -c 200 > event-epipe.head; rc2=${PIPESTATUS[0]}
   fi
   terminate "$wl"
-  publish_output event-stdout.json || true
-  publish_output event-epipe.json || true
-  full_out=$full_out epipe_out=$epipe_out rc1=$rc1 rc2=$rc2 python3 -I - <<'PY' > event-stdout.judge 2>&1 && judge_rc=0
-import json
-import os
-
-
-def unique_keys(pairs):
-    # A repeated JSON object key fails instead of last-wins.
-    result={}
-    for key,value in pairs:
-        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
-        result[key]=value
-    return result
-
-
-def strict(text):
-    return json.loads(text, object_pairs_hook=unique_keys)
-
-
-def load_jsonl(path):
-    rows = []
-    with open(path) as handle:
-        for number, line in enumerate(handle):
-            line = line.rstrip("\n")
-            if not (line): raise AssertionError(f"{path}:{number}: blank line breaks the JSONL framing")
-            rows.append(strict(line))
-    return rows
-
-
-# Full run: stdout is pure JSONL, sequenced, started to ended.
-if not (os.environ["rc1"] == "0"): raise AssertionError("full run rc=%s" % os.environ["rc1"])
-stream = load_jsonl("event-stdout.jsonl")
-if not (len(stream) >= 3): raise AssertionError("started, a pass marker and ended")
-for index, row in enumerate(stream):
-    if not (row["schema"] == "p11scope/inventory-events/v1"): raise AssertionError(row)
-    if not (row["seq"] == index): raise AssertionError("seq %s != %s" % (row["seq"], index))
-if not (stream[0]["kind"] == "started"): raise AssertionError(stream[0])
-if not (stream[-1]["kind"] == "ended"): raise AssertionError(stream[-1])
-# The stream and the -o report agree on the counts.
-report = strict(open(os.environ["full_out"]).read())
-if not (report["schema"] == "p11scope/inventory/v1"): raise AssertionError(report.get("schema"))
-if not (report["observation"]["passes"] == stream[-1]["event"]["passes"]): raise AssertionError("passes agree")
-final = [row for row in stream if row["kind"] == "pass_committed"][-1]["event"]
-for key in ["callers", "modules", "edges"]:
-    if not (len(report[key]) == final["totals"][key]): raise AssertionError((key, len(report[key]), final["totals"]))
-
-
-def event_output(document, what):
-    # The report's typed event-log outcome: exactly these four fields,
-    # exact types (a bool is not a count).
-    outcome = document.get("event_output")
-    if type(outcome) is not dict: raise AssertionError("%s report event_output %r" % (what, outcome))
-    if set(outcome) != {"status", "lines_lost", "bytes_lost", "reason"}: raise AssertionError("%s event_output fields %r" % (what, sorted(outcome)))
-    for key in ("status", "reason"):
-        if type(outcome[key]) is not str: raise AssertionError("%s event_output %s %r" % (what, key, outcome[key]))
-    for key in ("lines_lost", "bytes_lost"):
-        if type(outcome[key]) is not int or outcome[key] < 0: raise AssertionError("%s event_output %s %r" % (what, key, outcome[key]))
-    return outcome
-
-
-# The full run lost nothing: the report says so, and so does `ended`.
-COMPLETE = {"status": "complete", "lines_lost": 0, "bytes_lost": 0, "reason": "none"}
-if event_output(report, "full") != COMPLETE: raise AssertionError("full run event_output %r" % (report["event_output"],))
-if stream[-1]["event"].get("stdout_lost") != {"lines": 0, "bytes": 0}: raise AssertionError("full run ended stdout_lost %r" % (stream[-1]["event"].get("stdout_lost"),))
-# Totals kept their cadence: a couple of snapshots, never none. The
-# cadence is anchored at `started`, not at a pass number: on a slow
-# attach the first pass commits after the interval is already due, so
-# the first totals legitimately trails pass 0.
-totals = [row for row in stream if row["kind"] == "totals"]
-if not (1 <= len(totals) <= 4): raise AssertionError("totals count %d" % len(totals))
-last_at = stream[0]["at_ns"]
-for row in totals:
-    position = stream.index(row)
-    marker = [r for r in stream[:position] if r["kind"] == "pass_committed"][-1]["event"]
-    if not (marker["pass"] == row["event"]["pass"]): raise AssertionError((marker["pass"], row["event"]))
-    if not (row["event"]["passes"] == row["event"]["pass"] + 1): raise AssertionError(row["event"])
-    for key in ["callers", "modules", "edges"]:
-        if not (row["event"][key] == marker["totals"][key]): raise AssertionError((key, row["event"], marker["totals"]))
-    if not (row["at_ns"] - last_at >= 2_000_000_000): raise AssertionError(row)
-    last_at = row["at_ns"]
-# Early close: the observer sheds, reports, keeps its report, exits 1.
-if not (os.environ["rc2"] == "1"): raise AssertionError("early-close rc=%s" % os.environ["rc2"])
-with open("event-epipe.head", "rb") as handle:
-    if not (handle.read(1) == b"{"): raise AssertionError("the head holds event bytes")
-epipe = strict(open(os.environ["epipe_out"]).read())
-if not (epipe["schema"] == "p11scope/inventory/v1"): raise AssertionError(epipe.get("schema"))
-# Loss proof comes only from the report's typed outcome: the closed
-# reader truncated the stream, with counted lines and bytes.
-lost = event_output(epipe, "early-close")
-if lost["status"] != "truncated" or lost["reason"] != "broken_pipe": raise AssertionError("early-close event_output %r" % (lost,))
-if not (lost["lines_lost"] >= 1 and lost["bytes_lost"] >= lost["lines_lost"]): raise AssertionError("early-close event_output counts %r" % (lost,))
-print("ok lines=%d totals=%d" % (len(stream), len(totals)))
-PY
+  local copied=1
+  publish_output event-stdout.json || copied=0
+  publish_output event-epipe.json || copied=0
+  if [ "$copied" = 1 ]; then
+    python3 -I "$RECORDS" event-stdout --stamp inventory-event-stdout.stamp --run-id "$RUN_ID" --verdict inventory-event-stdout.verdict.json --jsonl event-stdout.jsonl --full-report "$full_out" --epipe-report "$epipe_out" --epipe-head event-epipe.head --rc1 "$rc1" --rc2 "$rc2" > event-stdout.judge 2>&1 && judge_rc=0
+  else
+    echo 'report copy failed' > event-stdout.judge
+  fi
   result inventory-event-stdout "$([ "$judge_rc" = 0 ] && echo 1 || echo 0)" "rc1=$rc1 rc2=$rc2 $(tail -n 1 event-stdout.judge 2>/dev/null | head -c 300)"
 }
 # Open a cell's workload gates only once the observer is ready and every
@@ -768,7 +683,8 @@ cgroup_capture() {
   local inside_gate=$OUT/$cell-inside.gate outside_gate=$OUT/$cell-outside.gate
   rm -f -- "$inside_gate" "$outside_gate" "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
   local output; output=$(product_output "$cell.$ext")
-  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
+  stamp_leg "$cell" "$output" "$OUT/$cell.$ext" "$cell.detail" "$cell.verdict.json" || { result "$cell" 0 'run stamp failed' failed; return 1; }
+  local child_owned=''
   local before after gen='' childgen='' readygen='' inside='' outside='' child='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
   local scope=cgroup wl=''
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
@@ -802,7 +718,7 @@ cgroup_capture() {
   local inside_ready=0 outside_ready=0 in_cgroup=0
   if waitfor "$cell-inside.wl" "^READY pid=$inside$" "$inside" "$READY_TICKS"; then
     inside_ready=1; readygen=$(generation "$inside")
-    if echo "$inside" > "$CG/cgroup.procs" 2>/dev/null && grep -qxF "$inside" "$CG/cgroup.procs" 2>/dev/null; then
+    if echo "$inside" > "$CG/cgroup.procs" 2>/dev/null && python3 -I "$RECORDS" cgroup-member --procs "$CG/cgroup.procs" --pid "$inside" > /dev/null; then
       in_cgroup=1
     fi
   fi
@@ -827,7 +743,9 @@ cgroup_capture() {
         if waitfor "$cell-inside.wl" '^LEDGER ' "$inside" "$LEDGER_TICKS" 1 && waitfor "$cell-outside.wl" '^LEDGER ' "$outside" "$LEDGER_TICKS" 1; then
           child=$(grep -m1 '^CHILD pid=' "$cell-inside.wl" 2>/dev/null | sed 's/^CHILD pid=//')
           [[ "$child" =~ ^[1-9][0-9]*$ ]] || child=''
-          if [ -n "$child" ]; then register "$child" && childgen=${CHILDREN[$child]}; fi
+          # The fork child counts only as the kernel-verified live child
+          # of the inside parent (never a generic registration).
+          if [ -n "$child" ] && register_owned_child "$child" "$inside"; then childgen=${CHILDREN[$child]}; child_owned=$child; fi
           if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
         fi
       fi
@@ -856,343 +774,7 @@ cgroup_capture() {
     # stat(1) spells the type "overlayfs" (coreutils S_MAGIC_OVERLAYFS),
     # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
-    python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$inside_iters" "$outside_iters" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
-import json,re,sys
-# Every JSON input decodes strictly: a repeated object key would let a
-# later value silently replace an earlier one (last-wins), so it fails.
-def unique_keys(pairs):
-    result={}
-    for key,value in pairs:
-        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
-        result[key]=value
-    return result
-def strict_json(text,what):
-    try:
-        return json.loads(text,object_pairs_hook=unique_keys)
-    except ValueError:
-        raise AssertionError('%s is not JSON: %r' % (what,text[:200]))
-    except AssertionError as error:
-        raise AssertionError('%s: %s' % (what,error))
-report=strict_json(open(sys.argv[1]).read(),'inventory report')
-inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
-pin=strict_json(sys.argv[4],'provider pin')
-inside_iters=int(sys.argv[5]); outside_iters=int(sys.argv[6])
-modpath=sys.argv[7]; modfs=sys.argv[8]
-# Every refusal below raises explicitly, never bare assert: the
-# verdicts must read identically under python3 -O (which strips
-# asserts), pinned by the oracle's explicit-refusal twins.
-class Refusal(Exception):
-    pass
-def refuse_unless(condition, message):
-    if not condition:
-        raise Refusal(message)
-refuse_unless(report.get('schema')=='p11scope/inventory/v1', 'inventory schema')
-refuse_unless(report.get('scope')=='cgroup', 'inventory scope')
-# Workload protocol lines: exactly one READY (and for the inside
-# parent one CHILD) line, each exactly "<TAG> pid=<positive int>".
-def protocol_pid(text,tag,what):
-    rows=[l for l in text.splitlines() if l.startswith(tag+' ')]
-    if len(rows)!=1: raise AssertionError('%s workload printed %d %s lines' % (what,len(rows),tag))
-    match=re.fullmatch(tag+r' pid=([1-9][0-9]*)',rows[0])
-    if match is None: raise AssertionError('%s workload %s line malformed: %r' % (what,tag,rows[0]))
-    return int(match.group(1))
-inside_pid=protocol_pid(inside,'READY','inside')
-child_pid=protocol_pid(inside,'CHILD','inside')
-outside_pid=protocol_pid(outside,'READY','outside')
-refuse_unless(sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing')
-refuse_unless(sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)')
-# Strict types while parsing: every field a typed record uses has
-# exactly its JSON type (a null, missing field or wrong type fails here,
-# before any index or match is built; bool is never an int).
-NONE=type(None)
-def typed(value,types,what):
-    refuse_unless(type(value) in types, '%s has type %s: %r' % (what,type(value).__name__,value))
-    return value
-for c in typed(report.get('callers'),(list,),'callers'):
-    typed(c,(dict,),'caller')
-    typed(c.get('id'),(str,),'caller id')
-    typed(c.get('pid'),(int,),'caller pid')
-    typed(c.get('start_time'),(int,),'caller start_time')
-    typed(c.get('start_time_unit'),(str,),'caller start_time_unit')
-    typed(c.get('retired'),(bool,),'caller retired')
-    typed(typed(c.get('image'),(dict,),'caller image').get('authority'),(str,),'caller authority')
-MISSING=object()
-def field(obj,key,types,what):
-    # Presence first: a nullable field is published as an explicit null,
-    # never left out.
-    value=obj.get(key,MISSING)
-    if value is MISSING: raise AssertionError('%s missing' % what)
-    return typed(value,types,what)
-for m in typed(report.get('modules'),(list,),'modules'):
-    typed(typed(m,(dict,),'module').get('id'),(str,),'module id')
-    # The physical identity matches the pin by exact JSON integers: a
-    # float token, a numeric string or a bool never stands for an inode
-    # or device number.
-    ident=field(m,'identity',(dict,),'module identity')
-    dev=field(ident,'device',(dict,),'module device')
-    field(dev,'major',(int,),'module device major')
-    field(dev,'minor',(int,),'module device minor')
-    field(ident,'inode',(int,),'module inode')
-    field(ident,'sha256',(str,NONE),'module sha256')
-    field(field(m,'admission',(dict,),'module admission'),'state',(str,),'module admission state')
-for e in typed(report.get('edges'),(list,),'edges'):
-    typed(e,(dict,),'edge')
-    typed(e.get('caller'),(str,),'edge caller')
-    typed(e.get('module'),(str,),'edge module')
-    n=typed(e.get('entries'),(dict,),'edge entries')
-    typed(n.get('count'),(int,),'edge count')
-    cov=typed(n.get('coverage'),(dict,),'edge coverage')
-    typed(cov.get('state'),(str,),'edge coverage state')
-    field(cov,'lossy',(bool,NONE),'edge coverage lossy')
-    typed(n.get('observation'),(str,),'edge observation')
-    typed(n.get('saturated'),(bool,),'edge saturated')
-    typed(n.get('in_flight'),(bool,),'edge in_flight')
-for g in typed(report.get('gaps'),(list,),'gaps'):
-    typed(g,(dict,),'gap')
-    field(g,'caller',(str,NONE),'gap caller')
-    field(g,'pid',(int,NONE),'gap pid')
-    field(g,'module',(str,NONE),'gap module')
-    field(g,'subject',(str,),'gap subject')
-    field(g,'reason',(str,NONE),'gap reason')
-# Ids are unique in the raw arrays before any index is built: a
-# repeated id would let one row hide another (the diff reader refuses
-# the same shape).
-for kind in ('callers','modules'):
-    ids=[x.get('id') for x in report.get(kind,[])]
-    refuse_unless(len(ids)==len(set(ids)), 'duplicate %s id: %r' % (kind[:-1],ids))
-# The pin is typed at the comparison boundary too.
-typed(pin,(dict,),'pin')
-pin_dev=field(pin,'dev',(list,),'pin dev')
-refuse_unless(len(pin_dev)==2, 'pin dev is not [major, minor]: %r' % (pin_dev,))
-for part in pin_dev:
-    typed(part,(int,),'pin dev')
-field(pin,'ino',(int,),'pin ino')
-field(pin,'sha256',(str,),'pin sha256')
-modules={m['id']:m for m in report.get('modules',[])}
-owned=None
-for mid,m in modules.items():
-    ident=m['identity']; dev=ident['device']
-    if [dev['major'],dev['minor']]==pin_dev and ident['inode']==pin['ino'] and ident['sha256']==pin['sha256']:
-        owned=mid; break
-# Data-always: the scan-pinned fallback publishes the found module
-# with its named gap on every filesystem — an empty view never
-# qualifies, on overlayfs or anywhere else.
-refuse_unless(owned is not None, 'owned provider not inventoried (modfs=%s): empty view never qualifies' % modfs)
-state=modules[owned].get('admission',{}).get('state')
-if modfs=='overlayfs':
-    # The cgroup witness stays deactivated (the userspace-only path),
-    # so the published module carries its named unproven gap per
-    # inside caller below; the attach set may or may not judge it.
-    refuse_unless(state in ('admitted','unresolved'), 'overlay owned provider admission: %r' % state)
-else:
-    refuse_unless(state=='admitted', 'owned provider not admitted')
-# The expected table: one row per workload process, derived from the
-# complete ledger. The ledger totals parent plus child; each member runs
-# total/2 iterations of six calls plus four setup (Initialize,
-# GetSlotList, OpenSession, Login) and three teardown (Logout,
-# CloseSession, Finalize) entries.
-# Both workload ledgers are typed records from their producers
-# (cgroup-fork inside, gated outside): v1 schema, the producer's pid,
-# complete, the six driven functions in order, and exact integer
-# attempts (a float or bool never equals an int here).
-LEDGER_SCHEMA='p11scope/public-cli-ledger/v1'
-LEDGER_FUNCTIONS=['C_GenerateRandom','C_DigestInit','C_Digest','C_FindObjectsInit','C_FindObjects','C_FindObjectsFinal']
-def ledger_record(text,what,pid):
-    line=[l for l in text.splitlines() if l.startswith('LEDGER ')][0][len('LEDGER '):]
-    record=strict_json(line,'%s ledger' % what)
-    typed(record,(dict,),'%s ledger' % what)
-    if field(record,'schema',(str,),'%s ledger schema' % what)!=LEDGER_SCHEMA: raise AssertionError('%s ledger schema: %r' % (what,record['schema']))
-    if field(record,'pid',(int,),'%s ledger pid' % what)!=pid: raise AssertionError('%s ledger pid %r is not the workload %d' % (what,record['pid'],pid))
-    for f in field(record,'functions',(list,),'%s ledger functions' % what):
-        typed(f,(dict,),'%s ledger function' % what)
-        field(f,'name',(str,),'%s ledger function name' % what)
-    return record
-def ledger_names(record,what):
-    # The workloads only drive calls that succeed on their own token:
-    # every attempt of every row succeeded, exactly.
-    for f in record['functions']:
-        if field(f,'successful',(int,),'%s ledger function successful' % what)!=f.get('attempts'):
-            raise AssertionError('%s ledger %r successful %r of %r attempts' % (what,f['name'],f['successful'],f.get('attempts')))
-    names=[f['name'] for f in record['functions']]
-    if names!=LEDGER_FUNCTIONS: raise AssertionError('%s ledger functions are not the six driven calls: %r' % (what,names))
-ledger=ledger_record(inside,'inside',inside_pid)
-if not (ledger.get('complete') is True): raise AssertionError('inside ledger incomplete: driven counts unknown: %r' % (ledger,))
-functions=ledger['functions']
-attempts={(type(f.get('attempts')),f.get('attempts')) for f in functions}
-if not (len(functions)==6 and len(attempts)==1): raise AssertionError('inside ledger attempts differ per function: %r' % (ledger,))
-total=attempts.pop()[1]
-if not (type(total) is int and total>0 and total%2==0): raise AssertionError('inside ledger attempts not split per member: %r' % (total,))
-ledger_names(ledger,'inside')
-if total!=2*inside_iters: raise AssertionError('inside ledger attempts %d are not two members of %d launched iterations' % (total,inside_iters))
-driven=6*(total//2)+7
-# The outside workload is the exclusion control: only a complete run
-# that drove its calls proves that its absence is an exclusion.
-outside_ledger=ledger_record(outside,'outside',outside_pid)
-if outside_ledger.get('complete') is not True: raise AssertionError('outside ledger incomplete: exclusion control unproven: %r' % (outside_ledger,))
-ledger_names(outside_ledger,'outside')
-for f in outside_ledger['functions']:
-    if field(f,'attempts',(int,),'outside ledger function attempts')!=outside_iters: raise AssertionError('outside ledger %s attempts %r, drove %d' % (f['name'],f['attempts'],outside_iters))
-expected=[('inside parent',inside_pid,sys.argv[9]),('fork child',child_pid,sys.argv[10])]
-# One typed record per published caller: identity, live state, final
-# authority and its edges with their exactness flags.
-callers={c['id']:c for c in report.get('callers',[])}
-edges=report.get('edges',[])
-def entries_record(e):
-    n=e.get('entries') or {}
-    cov=n.get('coverage') or {}
-    return {'count':n.get('count'),'state':cov.get('state'),'lossy':cov.get('lossy'),'observation':n.get('observation'),'saturated':n.get('saturated'),'in_flight':n.get('in_flight')}
-EXACT={'state':'counted','lossy':False,'observation':'observed','saturated':False,'in_flight':False}
-records=[{'id':cid,'pid':c.get('pid'),'start_time':c.get('start_time'),'start_time_unit':c.get('start_time_unit'),'retired':c.get('retired'),'authority':(c.get('image') or {}).get('authority'),'edges':[(e.get('module'),entries_record(e)) for e in edges if e.get('caller')==cid]} for cid,c in callers.items()]
-refuse_unless(not [r for r in records if r['pid']==outside_pid], 'outside workload leaked into cgroup inventory')
-refuse_unless(any(r['pid'] in (inside_pid,child_pid) and m==owned for r in records for m,_ in r['edges']), 'no inside edge to owned module')
-extra=[r for r in records if r['pid'] not in (inside_pid,child_pid)]
-refuse_unless(not extra, 'unexpected caller outside the workload: %r' % (extra,))
-row={}
-for label,pid,gen in expected:
-    found=[r for r in records if r['pid']==pid]
-    # The fixture forks once and never execs: each workload process is
-    # exactly one caller incarnation, so a split is never conserved.
-    refuse_unless(len(found)==1, '%s has %d caller incarnations, expected one: %r' % (label,len(found),found))
-    row[label]=found[0]
-workload={r['id']:r for r in row.values()}
-orphans=[e for e in edges if e.get('caller') not in workload]
-refuse_unless(not orphans, 'edge from a caller outside the workload: %r' % (orphans,))
-# Every gap is one named, typed allowance, on every substrate; anything
-# unclassified fails. The degraded (overlay or no-witness) shape adds
-# exactly one unproven row per workload caller.
-ACTIVATION='native owner activation refused'
-UNPROVEN='original_file_unproven: kernel witness unavailable'
-DEADLINE='cgroup collection deadline reached'
-RETAINED='the final-sample permit was not granted; prior owner facts retained'
-deferred_reason='only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained'
-settle_reason='no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'
-activation_refusals={deferred_reason:'deferred activation never recovered',settle_reason:'native activation never recovered'}
-# The decided no-witness shape (PARTIAL): the module-level
-# unidentified-caller positive frames one diagnosed binder first-cause,
-# so the oracle matches its fixed framing (same precedent as the
-# unproven prefix).
-def named_unbound(g):
-    if g.get('module')!=owned: return False
-    if g.get('subject')!='used by an unidentified caller image': return False
-    if g.get('caller') is not None or g.get('pid') is not None: return False
-    reason=g.get('reason') or ''
-    return reason.startswith(modpath+': native witness rows of this module were not bound to a caller incarnation (first: ') and reason.endswith('); module-level positive use only, never attributed by pid')
-# The producer files eight reasons under this subject and shape
-# (src/discovery/inventory_attach_set.rs prepare_absorption); each
-# prep row carries the same producer shape as the deadline row
-# (fixed subject, explicit nulls, positive count, deduped), and a
-# ninth reason — or a prep reason under another subject — fails
-# closed as unclassified below. A preparation failure only comes
-# with a run-deadline straddle on every substrate: the pass was
-# cancelled mid-preparation, so the deadline gap must be present
-# in the same run.
-prep_reasons={'cgroup provider preparation input ceiling reached','cgroup provider preparation interrupted or allowance exhausted','cgroup provider preparation interrupted after retention','cgroup provider resolution interrupted','cgroup provider preparation comparison ceiling reached','cgroup provider identity comparison interrupted','cgroup provider input comparison interrupted','cgroup provider preparation interrupted before completion'}
-def classify(g):
-    reason=g.get('reason') or ''
-    if reason in activation_refusals: return 'activation'
-    if g.get('subject')==ACTIVATION: return 'unexpected-activation'
-    if reason.startswith(UNPROVEN): return 'unproven'
-    if g.get('subject')=='module admission changed': return 'admission-note'
-    if named_unbound(g): return 'unbound'
-    if reason==DEADLINE: return 'deadline'
-    if reason==RETAINED: return 'retained'
-    if reason in prep_reasons and g.get('subject')=='cgroup provider preparation incomplete': return 'prep'
-    return None
-# Each allowance carries exactly the producer's attribution: a
-# per-caller row names a workload caller at that caller's own pid and
-# the module its producer sets (none, or the owned module for an
-# admission note).
-# The producer records only upward admission transitions (rank
-# unresolved < refused < admitted), with optional parenthesized reasons.
-TRANSITIONS=('unresolved to refused','unresolved to admitted','refused to admitted')
-def admission_framed(reason):
-    prefix=modpath+': admission changed from '
-    if not reason.startswith(prefix): return False
-    rest=reason[len(prefix):]
-    return any(rest==t or (rest.startswith(t+' (') and rest.endswith(')') and len(rest)>len(t)+3) for t in TRANSITIONS)
-def at_workload(g,module=None):
-    r=workload.get(g.get('caller'))
-    return r is not None and g.get('pid')==r['pid'] and g.get('module')==module
-gaps=report.get('gaps',[])
-kinds=[(classify(g),g) for g in gaps]
-degraded=modfs=='overlayfs' or any(k=='unproven' for k,_ in kinds)
-for kind,g in kinds:
-    if kind is None:
-        refuse_unless(g.get('module')!=owned, 'inventory gaps about owned module: %r' % (g,))
-        refuse_unless(not degraded, 'overlay published extra gap: %r' % (g,))
-        refuse_unless(False, 'witness-available published extra gap: %r' % (g,))
-    # Recover and continue: both transient refusals are delays, never a
-    # resting state, and bind to the refused incarnation: the row's
-    # caller id must be a workload caller at the row's pid.
-    if kind=='activation':
-        refuse_unless(g.get('subject')==ACTIVATION, 'activation refusal under another subject: %r' % (g,))
-        refuse_unless(at_workload(g) and workload[g['caller']]['authority']=='native_exact', '%s: %r' % (activation_refusals[g['reason']],g))
-    refuse_unless(kind!='unexpected-activation', 'unexpected activation refusal: %r' % (g,))
-    if kind=='retained':
-        refuse_unless(g.get('subject')=='native owner refresh refused' and at_workload(g), 'retained refresh attribution: %r' % (g,))
-    if kind=='deadline':
-        refuse_unless(g.get('subject')=='cgroup scope transaction incomplete' and g.get('caller') is None and g.get('pid') is None and g.get('module') is None, 'collection deadline attribution: %r' % (g,))
-    if kind=='admission-note':
-        refuse_unless(at_workload(g,owned) and admission_framed(g.get('reason') or ''), 'admission note attribution: %r' % (g,))
-# The run-deadline row carries the same producer shape with or
-# without a companion gap: the fixed subject and null attribution
-# (gated by the loop above), explicitly present keys, an explicitly
-# present null budget (the row records no budget refusal), and a
-# positive integer recording count. The producer dedupes identical
-# rows, so duplicates are malformed.
-deadline_rows=[g for k,g in kinds if k=='deadline']
-if deadline_rows:
-    for g in deadline_rows:
-        refuse_unless('caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed run deadline scope: %r' % (g,))
-        refuse_unless('budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,))
-        refuse_unless(type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,))
-    refuse_unless(len(deadline_rows)==1, 'duplicate run deadline rows: %r' % (deadline_rows,))
-prep=[g for k,g in kinds if k=='prep']
-if prep:
-    for g in prep:
-        refuse_unless('caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed interrupted preparation scope: %r' % (g,))
-        refuse_unless('budget' in g and g['budget'] is None, 'malformed interrupted preparation budget: %r' % (g,))
-        refuse_unless(type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,))
-    refuse_unless(len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,))
-    refuse_unless(any(k=='deadline' for k,_ in kinds), 'interrupted preparation without a run deadline: %r' % (prep,))
-# The facts-retained refresh refusal only comes with a run-deadline
-# straddle: the deadline gap must be present in the same run, and at
-# most one retained row per owning caller.
-retained=[g for k,g in kinds if k=='retained']
-if retained:
-    refuse_unless(any(k=='deadline' for k,_ in kinds), 'retained refresh without a run deadline: %r' % (retained,))
-    refuse_unless(len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,))
-# The table, exactly: each workload process is one live incarnation of
-# the registered generation, ends with an activated native owner
-# (independent of any gap), and has exactly its one owned edge counted
-# exactly at what it drove. No lower bound, loss or saturation passes.
-for label,pid,gen in expected:
-    r=row[label]
-    refuse_unless(gen.isdigit(), '%s generation not recorded: %r' % (label,gen))
-    refuse_unless(r['start_time_unit']=='clock_ticks_since_boot', '%s start time unit %r' % (label,r['start_time_unit']))
-    refuse_unless(r['start_time']==int(gen), '%s start time %r is not the workload generation %s' % (label,r['start_time'],gen))
-    refuse_unless(r['retired'] is False, '%s caller retired at report time: %r' % (label,r))
-    refuse_unless(r['authority']=='native_exact', '%s never activated a native owner: %r' % (label,r))
-    own=[x for m,x in r['edges'] if m==owned]
-    refuse_unless(own, '%s has no edge to the owned module' % label)
-    refuse_unless(len(r['edges'])==1, '%s has %d edges, expected its one owned edge: %r' % (label,len(r['edges']),r['edges']))
-    x=own[0]
-    refuse_unless({k:x[k] for k in EXACT}==EXACT, '%s calls not counted exactly: %r' % (label,x))
-    refuse_unless(x['count']==driven, '%s counted %r entries, drove %d' % (label,x['count'],driven))
-unproven=[g for k,g in kinds if k=='unproven']
-if degraded:
-    # The published degraded shape keeps the named unproven gap per
-    # workload caller (PARTIAL coverage via the gaps): the witness never
-    # ran, so no proof is claimed.
-    want=sorted(workload)
-    refuse_unless(sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover')
-    for g in unproven:
-        refuse_unless(g.get('subject')==modpath, 'overlay unproven subject')
-        refuse_unless(g.get('module') is None, 'overlay unproven module')
-        refuse_unless(g.get('pid')==workload[g.get('caller')]['pid'], 'overlay unproven pid')
-    refuse_unless(len(gaps)>0, 'overlay published shape carries no gaps')
-print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
-PY
+    python3 -I "$RECORDS" cgroup-inventory --stamp "$cell.stamp" --run-id "$RUN_ID" --verdict "$cell.verdict.json" --cell "$cell" --report "$cell.$ext" --inside-wl "$cell-inside.wl" --outside-wl "$cell-outside.wl" --pin "$before" --inside-iters "$inside_iters" --outside-iters "$outside_iters" --module "$MODULE" --module-fs "$module_fs" --inside-pid "$inside" --inside-gen "$gen" --child-pid "${child_owned}" --child-gen "$childgen" --outside-pid "$outside" > "$cell.detail" 2>&1
     rc=$?
     detail=$(cat "$cell.detail" 2>/dev/null || echo "inventory check failed rc=$rc")
     detail="$detail observer_rc=$observer_rc"
@@ -1247,6 +829,7 @@ run_prearm() {
   # [late_discovery, mapped_unattached] instead). The oracle accepts
   # exactly these two disclosures per twin; anything else fails.
   local name policy ledger output rc pp detail
+  stamp_leg run-prearm "$(product_output run-prearm-held.txt)" "$(product_output run-prearm-passive.txt)" run-prearm-held.txt run-prearm-passive.txt run-prearm-held.wl run-prearm-passive.wl run-prearm.verdict.json || { result run-prearm 0 'run stamp failed' prearm-exactness; return 1; }
   for name in held passive; do
     policy=auto; [ "$name" = passive ] && policy=never
     ledger=$OUT/run-prearm-$name.wl
@@ -1262,123 +845,7 @@ run_prearm() {
     publish_output "run-prearm-$name.txt" || rc=1
     [ "$rc" = 0 ] || { result run-prearm 0 "$name twin failed rc=$rc" prearm-exactness; return 1; }
   done
-  detail=$(python3 -I - <<'PY' 2>&1
-import json
-import platform
-
-def kernel_is_pre_68():
-    release = platform.release()
-    parts = release.split(".")
-    try:
-        major = int(parts[0])
-        minor = int("".join(ch for ch in parts[1] if ch.isdigit()) or "0")
-    except (IndexError, ValueError):
-        raise SystemExit(f"unparseable kernel release {release!r}")
-    return (major, minor) < (6, 8)
-
-def assert_handoff_pair(module):
-    # The exact W8B-66 live-handoff disclosure: the live join lands
-    # across an id change, so the late discovery reads late_discovery
-    # up to the declared attach and the out-of-declared-set mapping
-    # reads mapped_unattached from the same start. Nothing else passes.
-    # The undeclared end is an independent real attach stamp: the
-    # producer (PrearmState::assemble) takes it as the maximum over
-    # undeclared slots, unordered against the declared maximum, so a
-    # same-tick or later undeclared attach is a correct disclosure.
-    # Only the window's own well-formedness is asserted here.
-    windows = module["unobserved_windows"]
-    reasons = [w["reason"] for w in windows]
-    if not (reasons == ["late_discovery", "mapped_unattached"]): raise AssertionError(windows)
-    late, unattached = windows
-    if not (late["end_ns"] == module["attached_at_ns"]): raise AssertionError(windows)
-    if not (unattached["start_ns"] == late["start_ns"]): raise AssertionError(windows)
-    if not (unattached["start_ns"] <= unattached["end_ns"]): raise AssertionError(windows)
-
-def assert_pre68_held(module):
-    # Pre-6.8 held twin: the overlay split either absorbs into the
-    # kept pre-arm object at absorb time (the >= 6.8 exact shape, [])
-    # or joins live across the id change (the exact handoff pair).
-    # The reasons dispatch; nothing else passes. Returns the observed
-    # shape label for the detail line.
-    reasons = [w["reason"] for w in (module.get("unobserved_windows") or [])]
-    if reasons == ["late_discovery", "mapped_unattached"]:
-        assert_handoff_pair(module)
-        return "handoff pair"
-    if not (module["unobserved_windows"] == []): raise AssertionError(module["unobserved_windows"])
-    return "merged []"
-
-def assert_pre68_passive(module):
-    # Pre-6.8 passive twin: same dispatch as the held twin, with the
-    # merged arm the exact single pre_attach window of the >= 6.8
-    # branch. Returns the observed shape label for the detail line.
-    reasons = [w["reason"] for w in (module.get("unobserved_windows") or [])]
-    if reasons == ["late_discovery", "mapped_unattached"]:
-        assert_handoff_pair(module)
-        return "handoff pair"
-    windows = module["unobserved_windows"]
-    if not (windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach"): raise AssertionError(windows)
-    if not (windows[0]["end_ns"] == module["attached_at_ns"]): raise AssertionError(windows)
-    return "merged pre_attach"
-
-def unique_keys(pairs):
-    # A repeated JSON object key fails instead of last-wins.
-    result={}
-    for key,value in pairs:
-        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
-        result[key]=value
-    return result
-
-def load(name):
-    # EVIDENCE rides the -o report file (default stdout omits the blob;
-    # diagnostics go to stderr).
-    with open(f"run-prearm-{name}.txt") as handle:
-        text = handle.read()
-    evidence = None
-    for line in text.splitlines():
-        if line.startswith("EVIDENCE "):
-            evidence = json.loads(line[len("EVIDENCE "):], object_pairs_hook=unique_keys)
-    if evidence is None:
-        raise SystemExit(f"{name}: no EVIDENCE line")
-    with open(f"run-prearm-{name}.wl") as handle:
-        ledger = [json.loads(line, object_pairs_hook=unique_keys) for line in handle if line.strip()]
-    return evidence, ledger, text
-
-def prearmed_module(evidence):
-    mods = [m for m in evidence["discovery"] if "prearm" in m.get("sources", [])]
-    if not (len(mods) == 1): raise AssertionError(f"one pre-armed module, got {len(mods)}")
-    return mods[0]
-
-def completed_calls(text, function):
-    return sum(1 for line in text.splitlines()
-               if f" {function} " in line and " -> " in line)
-
-pre_68 = kernel_is_pre_68()
-held_evidence, held_ledger, held_text = load("held")
-held = prearmed_module(held_evidence)
-if pre_68:
-    held_shape = assert_pre68_held(held)
-else:
-    if not (held["unobserved_windows"] == []): raise AssertionError(held["unobserved_windows"])
-if not ("scan" in held["sources"]): raise AssertionError(held["sources"])
-summary = held_ledger[-1]
-if not ((summary["initializes"], summary["finalizes"]) == (3, 3)): raise AssertionError(summary)
-counts = tuple(completed_calls(held_text, name)
-               for name in ("C_Initialize", "C_Finalize", "C_GetFunctionList"))
-if not (counts == (3, 3, 1)): raise AssertionError(counts)
-passive = prearmed_module(load("passive")[0])
-if not ("scan" in passive["sources"]): raise AssertionError(passive["sources"])
-if pre_68:
-    passive_shape = assert_pre68_passive(passive)
-else:
-    windows = passive["unobserved_windows"]
-    if not (windows and len(windows) == 1 and windows[0]["reason"] == "pre_attach"): raise AssertionError(windows)
-    if not (windows[0]["end_ns"] == passive["attached_at_ns"]): raise AssertionError(windows)
-if pre_68:
-    print(f"pre-6.8 exact: held {held_shape}, passive {passive_shape}, 3/3 ledger and 3/3/1 trace")
-else:
-    print("held [] with 3/3 ledger and 3/3/1 trace; passive keeps single pre_attach")
-PY
-) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
+  detail=$(python3 -I "$RECORDS" run-prearm --stamp run-prearm.stamp --run-id "$RUN_ID" --verdict run-prearm.verdict.json --held-report run-prearm-held.txt --held-ledger run-prearm-held.wl --passive-report run-prearm-passive.txt --passive-ledger run-prearm-passive.wl 2>&1) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
   result run-prearm 1 "$detail" prearm-exactness
 }
 # The launcher-chain cell (v0.7.0 parent-chain lane): a named parent
@@ -1391,7 +858,7 @@ parent_chain_cell() {
   rm -f -- "$gate" "$cell.json" "$cell-v.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell-v.stderr" "$cell-v.stdout"
   local output output_v
   output=$(product_output "$cell.json"); output_v=$(product_output "$cell-v.json")
-  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output" "$output_v"
+  stamp_leg "$cell" "$output" "$output_v" "$OUT/$cell.json" "$OUT/$cell-v.json" "$cell.verdict.json" || { result "$cell" 0 'run stamp failed' failed; return 1; }
   local before wl='' pp='' parent='' observer_rc=125
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   asuser "$CHAIN_PARENT" "$GATED" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & parent=$!; register "$parent" || { result "$cell" 0 'parent registration failed' failed; return 1; }
@@ -1417,45 +884,7 @@ parent_chain_cell() {
   [ "$observer_rc" = 0 ] || { result "$cell" 0 "verbose observer rc=$observer_rc" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   publish_output "$cell-v.json" || { result "$cell" 0 'output copy failed' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   local detail
-  detail=$(python3 -I - "$cell.json" "$cell.stdout" "$cell-v.stdout" "$wl" "$wl_gen" "$parent" "$parent_gen" <<'PY' 2>&1
-import json,sys
-doc,concise,verbose,wl,wl_gen,parent,parent_gen=sys.argv[1:8]
-def unique_keys(pairs):
-    # A repeated JSON object key fails instead of last-wins.
-    result={}
-    for key,value in pairs:
-        if key in result: raise AssertionError('duplicate JSON key %r' % (key,))
-        result[key]=value
-    return result
-report=json.loads(open(doc).read(),object_pairs_hook=unique_keys)
-wl=int(wl); wl_gen=int(wl_gen); parent=int(parent); parent_gen=int(parent_gen)
-callers=[c for c in report.get('callers',[]) if c.get('pid')==wl]
-if not (len(callers)==1): raise AssertionError('one incarnation for the workload')
-c=callers[0]
-if not (c.get('start_time')==wl_gen): raise AssertionError('caller generation unchanged')
-lb=c.get('launched_by')
-if not (isinstance(lb,list) and 1<=len(lb)<=4): raise AssertionError('walk keeps 1..=4 ancestors')
-if not (lb[0]['pid']==parent and lb[0]['exe']=='chain-parent' and lb[0]['start_time']==parent_gen): raise AssertionError('named parent first: %r' % (lb[0],))
-for a in lb:
-    if not (a['pid']!=1): raise AssertionError('init is never shown as the launcher: %r' % (a,))
-for a in lb[1:]:
-    if not (type(a['pid']) is int and a['pid']>0 and type(a['start_time']) is int): raise AssertionError('ancestor generation: %r' % (a,))
-if not (c.get('launched_by_origin')=='chain'): raise AssertionError('real chain origin: %r' % (c.get('launched_by_origin'),))
-if not (c.get('launched_by_unit') is None): raise AssertionError('no unit beside a real chain')
-gap=c.get('launched_by_gap')
-if gap is not None:
-    if not (gap['subject']=='caller parent chain'): raise AssertionError(gap)
-    if not (gap['reason'] in ('launcher exited before read',
-                    'launcher hidden by /proc hidepid',
-                    'parent chain truncated after 4 ancestors',
-                    'parent chain not sampled in cgroup transaction')):
-        raise AssertionError(gap)
-concise_text=open(concise).read(); verbose_text=open(verbose).read()
-if not ('gated (from chain-parent)' in concise_text): raise AssertionError('concise one-hop')
-if not ('gated <- chain-parent' in verbose_text): raise AssertionError('verbose chain')
-print('chain to chain-parent with %d ancestors; concise and -v agree' % len(lb))
-PY
-) || { result "$cell" 0 "$(printf '%.600s' "$detail")" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  detail=$(python3 -I "$RECORDS" parent-chain --stamp "$cell.stamp" --run-id "$RUN_ID" --verdict "$cell.verdict.json" --report "$cell.json" --concise "$cell.stdout" --verbose "$cell-v.stdout" --workload-pid "$wl" --workload-gen "$wl_gen" --parent-pid "$parent" --parent-gen "$parent_gen" 2>&1) || { result "$cell" 0 "$(printf '%.600s' "$detail")" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
   terminate "$parent" || true; terminate "$wl" || true
   result "$cell" 1 "$detail"
 }

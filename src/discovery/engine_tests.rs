@@ -104314,3 +104314,46 @@ fn carried_fix2_selection_stash_tracks_deferral() {
         "the under-cap tick clears the stash"
     );
 }
+
+#[test]
+fn carried_fix2_unresolvable_carrier_keeps_unless_absence_proven() {
+    // Normalize's unresolvable arm: a carrier no pin resolves (its pins
+    // left without carry, e.g. across a failed-start restore) rides
+    // unless absence rules out every other mapper. Unit-pinned at the
+    // normalize boundary: no committed fixture leaves a riding carrier
+    // unresolvable, so the integration twins cannot reach this arm.
+    let key = overlay_key(787);
+    let mut carrier = overlay_module(key);
+    carrier.view = Engine::CARRIED_VIEW_ID;
+    let pins = PinnedObjects::empty();
+    assert!(
+        pins.id_for_scanned(&carrier, carrier.key, &carrier.path)
+            .is_none(),
+        "the carrier resolves through no pin"
+    );
+    for absence_proven in [false, true] {
+        let mut raw = vec![carrier.clone()];
+        let mut dropped = 0u64;
+        normalize_carried_modules(
+            &mut raw,
+            &pins,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            absence_proven,
+            &mut dropped,
+        );
+        if absence_proven {
+            assert!(
+                raw.is_empty(),
+                "proven absence drops the unresolvable carrier"
+            );
+        } else {
+            assert_eq!(
+                raw.len(),
+                1,
+                "unproven absence keeps the unresolvable carrier"
+            );
+            assert_eq!(raw[0].view, Engine::CARRIED_VIEW_ID);
+        }
+    }
+}

@@ -462,8 +462,9 @@ silent. `ended` gets its own fresh batch, so a sweep that consumed
 the completion budget cannot shed it without waiting. Shed lines
 keep their consumed sequence
 numbers, so a slow or closed reader shows as seq gaps accounted by
-`stdout_lost` (in `totals` and the terminal `ended`, plus the stderr
-notices and the nonzero exit), and a shed that leaves a partial line
+`stdout_lost` (in `totals` and the terminal `ended`, in the `-o`
+report's `event_output`, plus the stderr notices and the nonzero
+exit), and a shed that leaves a partial line
 is terminated before the next line so every delivered line still
 starts at a line boundary. A line that does not parse as JSON is a
 shed fragment: skip it; its `seq` gap and `stdout_lost` account for

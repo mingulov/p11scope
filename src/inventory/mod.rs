@@ -585,6 +585,10 @@ pub(crate) struct EventLogState {
     first_error: Option<String>,
     stdout_loss: Option<String>,
     stdout_requested: bool,
+    /// The stdout shed totals and first reason label, kept past a
+    /// retirement so the report's `event_output` stays exact.
+    lost: (u64, u64),
+    lost_kind: Option<&'static str>,
 }
 
 impl EventLogState {
@@ -595,6 +599,8 @@ impl EventLogState {
             first_error: None,
             stdout_loss: None,
             stdout_requested,
+            lost: (0, 0),
+            lost_kind: None,
         }
     }
 
@@ -604,7 +610,10 @@ impl EventLogState {
         action: impl FnOnce(&mut EventWriter) -> Result<(), String>,
     ) -> Option<String> {
         let writer = self.writer.as_mut()?;
-        if let Err(error) = action(writer) {
+        let result = action(writer);
+        self.lost = writer.stdout_lost();
+        self.lost_kind = writer.stdout_loss_kind();
+        if let Err(error) = result {
             return Some(self.retire(stage, error));
         }
         // A shed stdout batch reports its delta now; the writer stays
@@ -645,6 +654,31 @@ impl EventLogState {
     /// The refreshed stdout shed totals, if any lines shed so far.
     pub(crate) fn stdout_loss(&self) -> Option<&str> {
         self.stdout_loss.as_deref()
+    }
+
+    /// The report's typed event-log outcome, or `None` when no event
+    /// log was requested: `failed` when the writer retired with an
+    /// error, else `truncated` when stdout shed lines, else `complete`.
+    /// The counts are the writer's own shed totals (`totals` and
+    /// `ended` carry the same `stdout_lost`).
+    pub(crate) fn event_output(&self) -> Option<serde_json::Value> {
+        if self.writer.is_none() && self.first_error.is_none() {
+            return None;
+        }
+        let (lines, bytes) = self.lost;
+        let (status, reason) = if self.first_error.is_some() {
+            ("failed", "event_log_error")
+        } else if lines > 0 || bytes > 0 {
+            ("truncated", self.lost_kind.unwrap_or("unknown"))
+        } else {
+            ("complete", "none")
+        };
+        Some(serde_json::json!({
+            "status": status,
+            "lines_lost": lines,
+            "bytes_lost": bytes,
+            "reason": reason,
+        }))
     }
 
     /// Whether this run streams events to stdout (`--event-log -`):
@@ -8450,14 +8484,6 @@ pub(crate) fn finish_output(
     if let Some(summary) = identity {
         note_identity_observation(&mut document, summary);
     }
-    // Render the immutable JSON payload once. Both destinations receive
-    // exactly these bytes; one transport cannot suppress the other's attempt.
-    let mut document_bytes = Vec::new();
-    if sink.is_some() || json {
-        document_bytes = serde_json::to_vec_pretty(&document)
-            .expect("an inventory document contains only serializable JSON values");
-        document_bytes.push(b'\n');
-    }
     let event_requested = stream.writer.is_some() || stream.first_error().is_some();
     stream.attempt("completion", |writer| {
         // One bounded stdout wait for the whole completion tail (a
@@ -8571,6 +8597,19 @@ pub(crate) fn finish_output(
         // ended record is not proof that finish confirmed completion.
         writer.finish(payload, presentation.ended_ns)
     });
+    // The event-log outcome is known only once completion ran: the
+    // report records it, additively, when an event log was requested.
+    if let Some(event_output) = stream.event_output() {
+        document["event_output"] = event_output;
+    }
+    // Render the immutable JSON payload once. Both destinations receive
+    // exactly these bytes; one transport cannot suppress the other's attempt.
+    let mut document_bytes = Vec::new();
+    if sink.is_some() || json {
+        document_bytes = serde_json::to_vec_pretty(&document)
+            .expect("an inventory document contains only serializable JSON values");
+        document_bytes.push(b'\n');
+    }
     let mut outcome = FinalOutputOutcome {
         diagnostics_failed: false,
         event_log_confirmed: event_requested
@@ -14092,6 +14131,111 @@ mod tests {
         assert_eq!(ended["event"]["stdout_lost"]["lines"], 0);
     }
 
+    /// The report's `event_output` twins over one view: a drained
+    /// reader reads `complete` with zero loss, and an early-closed
+    /// reader reads `truncated` (`broken_pipe`) losing exactly the
+    /// lines and bytes the drained twin received.
+    #[test]
+    fn event_output_reports_the_exact_stdout_loss() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = super::Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let run = |close_reader: bool| {
+            let (mut read, write) = event_stdout_test_pipe();
+            let mut writer = super::EventWriter::create_stdout_on_fd(
+                write.as_raw_fd(),
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap();
+            writer.begin_batch();
+            let reader = if close_reader {
+                drop(read);
+                None
+            } else {
+                Some(std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    read.read_to_end(&mut bytes).unwrap();
+                    bytes
+                }))
+            };
+            let mut stream = super::EventLogState::new(Some(writer));
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let outcome = super::finish_output(
+                None,
+                &mut stream,
+                &mut super::StreamState::new(),
+                &view,
+                true,
+                false,
+                &mut super::WriterStdoutWithStderr(&mut stdout, &mut stderr),
+                None,
+                None,
+            );
+            drop(stream);
+            drop(write);
+            let received = reader.map(|reader| reader.join().unwrap());
+            let document: serde_json::Value = serde_json::from_slice(&stderr).unwrap();
+            (outcome.exit_code(), document, received)
+        };
+        let (rc, complete, received) = run(false);
+        let received = received.unwrap();
+        let lines = received.iter().filter(|byte| **byte == b'\n').count() as u64;
+        assert_eq!(rc, 0);
+        assert!(lines > 0, "the drained twin received the completion tail");
+        assert_eq!(
+            complete["event_output"],
+            serde_json::json!({
+                "status": "complete", "lines_lost": 0, "bytes_lost": 0, "reason": "none",
+            })
+        );
+        let (rc, truncated, _) = run(true);
+        assert_eq!(rc, 1, "measured loss fails the command");
+        assert_eq!(
+            truncated["event_output"],
+            serde_json::json!({
+                "status": "truncated",
+                "lines_lost": lines,
+                "bytes_lost": received.len() as u64,
+                "reason": "broken_pipe",
+            })
+        );
+        // Additive only: every other field is the drained twin's.
+        let strip = |mut document: serde_json::Value| {
+            document.as_object_mut().unwrap().remove("event_output");
+            document
+        };
+        assert_eq!(strip(complete), strip(truncated));
+    }
+
+    /// No event log, no `event_output`: the field never appears in a
+    /// report that streamed nothing.
+    #[test]
+    fn event_output_is_absent_without_an_event_log() {
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = super::Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let mut stream = super::EventLogState::new(None);
+        let mut stdout = Vec::new();
+        let outcome = super::finish_output(
+            None,
+            &mut stream,
+            &mut super::StreamState::new(),
+            &view,
+            true,
+            false,
+            &mut super::WriterStdout(&mut stdout),
+            None,
+            None,
+        );
+        assert_eq!(outcome.exit_code(), 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert!(document.get("event_output").is_none(), "{document}");
+        assert_eq!(document, super::render_json_from_presentation(&view));
+    }
+
     #[test]
     fn event_stdout_move_failure_is_reported_like_stdout() {
         use crate::inventory_output::StdoutFailure;
@@ -14462,6 +14606,8 @@ mod tests {
                     ),
                     stdout_loss: None,
                     stdout_requested: false,
+                    lost: (0, 0),
+                    lost_kind: None,
                 };
                 let result = finish_output(
                     None,

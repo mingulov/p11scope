@@ -1753,6 +1753,30 @@ exact across the fold. Layer-self-answered entries appear
 only in the forwarding split, and one layer entry reaching several providers
 counts at each.
 
+## Event-log outcome (additive within v1)
+
+A run with `--event-log` adds top-level `event_output`, the event log's
+final outcome, settled after the stream's completion tail (so the `-o`
+report and `--json` stdout carry the same value). Runs without
+`--event-log` omit the field.
+
+```json
+"event_output": {"status": "truncated", "lines_lost": 12, "bytes_lost": 2400, "reason": "broken_pipe"}
+```
+
+- `status`: `complete` (every line delivered, and for a file stream the
+  writer never failed), `truncated` (an `--event-log -` reader was slow
+  or closed, so lines shed with counters), or `failed` (the event writer
+  failed and retired; capture still completed).
+- `lines_lost` / `bytes_lost`: the stdout lines and line bytes shed,
+  the same counters `totals` and `ended` carry as `stdout_lost`; always
+  zero for a file stream.
+- `reason`: `none` for `complete`; `event_log_error` for `failed`;
+  otherwise the first shed cause: `broken_pipe`, `slow_reader`,
+  `write_error`, `zero_write` or `invalid_descriptor`.
+
+Counts only: no event content, paths or payload bytes.
+
 ## Example (abridged)
 
 ```json

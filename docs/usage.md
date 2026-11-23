@@ -2036,8 +2036,8 @@ Limits that matter in pods:
   accepted bytes), so a large summary arrives whole or fails
   explicitly. A stdout that stops reading or is
   closed never stalls capture: each commit batch waits bounded, then sheds lines
-  with counters reported on stderr, in `totals`/`ended`, and the exit
-  status, while capture continues to its normal stop. A line that
+  with counters reported on stderr, in `totals`/`ended`, in the `-o`
+  report's `event_output`, and the exit status, while capture continues to its normal stop. A line that
   does not parse as JSON is a shed fragment: skip it; its `seq` gap
   and `stdout_lost` account for it. Only an stdout that cannot be
   acquired at all fails fast before scanning: an unsupported fd

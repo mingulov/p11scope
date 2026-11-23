@@ -97,13 +97,33 @@ struct StdoutEventSink {
     reported_lines: u64,
     reported_bytes: u64,
     first_reason: Option<String>,
+    first_kind: Option<&'static str>,
+}
+
+/// Why a stdout line shed: a stable machine label (the report's
+/// `event_output.reason`) plus the human text for the stderr notice.
+struct ShedReason {
+    kind: &'static str,
+    text: String,
+}
+
+impl ShedReason {
+    fn new(kind: &'static str, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+        }
+    }
 }
 
 /// One bounded line write: delivered whole, or shed with the count of
 /// bytes that did land (a partial line needs its framing repaired).
 enum LineOutcome {
     Delivered,
-    Shed { delivered: usize, reason: String },
+    Shed {
+        delivered: usize,
+        reason: ShedReason,
+    },
 }
 
 impl StdoutEventSink {
@@ -118,6 +138,7 @@ impl StdoutEventSink {
             reported_lines: 0,
             reported_bytes: 0,
             first_reason: None,
+            first_kind: None,
         }
     }
 
@@ -168,17 +189,25 @@ impl StdoutEventSink {
                     .lost_bytes
                     .saturating_add(line.len().saturating_sub(delivered) as u64);
                 self.mid_line = delivered > 0;
-                self.first_reason.get_or_insert(reason);
+                self.note_reason(reason);
             }
         }
     }
 
     /// Count one line shed whole (its repair failed, so none of its
     /// bytes may land).
-    fn shed_whole(&mut self, len: usize, reason: String) {
+    fn shed_whole(&mut self, len: usize, reason: ShedReason) {
         self.lost_lines = self.lost_lines.saturating_add(1);
         self.lost_bytes = self.lost_bytes.saturating_add(len as u64);
-        self.first_reason.get_or_insert(reason);
+        self.note_reason(reason);
+    }
+
+    /// Keep the first shed reason, text and label together.
+    fn note_reason(&mut self, reason: ShedReason) {
+        if self.first_reason.is_none() {
+            self.first_reason = Some(reason.text);
+            self.first_kind = Some(reason.kind);
+        }
     }
 
     /// Write `rest` within the batch budget: nonblocking writes with
@@ -198,7 +227,10 @@ impl StdoutEventSink {
                 Ok(0) => {
                     return LineOutcome::Shed {
                         delivered,
-                        reason: "stdout accepted zero bytes from a nonempty line".into(),
+                        reason: ShedReason::new(
+                            "zero_write",
+                            "stdout accepted zero bytes from a nonempty line",
+                        ),
                     };
                 }
                 Ok(wrote) => {
@@ -222,7 +254,10 @@ impl StdoutEventSink {
             if remaining.is_zero() {
                 return LineOutcome::Shed {
                     delivered,
-                    reason: "slow reader: the batch bounded wait expired".into(),
+                    reason: ShedReason::new(
+                        "slow_reader",
+                        "slow reader: the batch bounded wait expired",
+                    ),
                 };
             }
             let slice = remaining.min(SINK_POLL_SLICE);
@@ -251,7 +286,10 @@ impl StdoutEventSink {
             } else if fd.revents & libc::POLLNVAL != 0 {
                 return LineOutcome::Shed {
                     delivered,
-                    reason: "stdout descriptor became invalid".into(),
+                    reason: ShedReason::new(
+                        "invalid_descriptor",
+                        "stdout descriptor became invalid",
+                    ),
                 };
             }
         }
@@ -457,6 +495,16 @@ impl EventWriter {
         match &self.sink {
             EventSink::File(_) => None,
             EventSink::Stdout(stdout) => stdout.first_reason.as_deref(),
+        }
+    }
+
+    /// The stable label of the first stdout shed reason
+    /// (`broken_pipe`, `slow_reader`, ...); `None` for files and while
+    /// nothing shed.
+    pub(crate) fn stdout_loss_kind(&self) -> Option<&'static str> {
+        match &self.sink {
+            EventSink::File(_) => None,
+            EventSink::Stdout(stdout) => stdout.first_kind,
         }
     }
 
@@ -842,11 +890,11 @@ impl EventWriter {
 
 /// Name a stdout transport failure for the shed accounting: a
 /// closed reader reads as broken pipe, never a bare errno.
-fn describe_write_error(error: &std::io::Error) -> String {
+fn describe_write_error(error: &std::io::Error) -> ShedReason {
     if error.kind() == std::io::ErrorKind::BrokenPipe {
-        return "broken pipe: the stdout reader closed".into();
+        return ShedReason::new("broken_pipe", "broken pipe: the stdout reader closed");
     }
-    format!("stdout write failed: {error}")
+    ShedReason::new("write_error", format!("stdout write failed: {error}"))
 }
 
 fn rotated_path(live: &Path, seq: u64) -> PathBuf {

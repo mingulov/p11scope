@@ -1222,12 +1222,12 @@ one of:
   be live and unchanged. This row never claims exit or change; a
   work-ceiling stop files the scan-budget row instead.
 - `process generation unverified mid-flight; exit or change unproven`:
-  one of three unverified-generation pairs — a stale candidate or
-  inventory preflight whose pin could not prove exit or change
-  (poll failure, unreadable `/proc`, missing custody, or a
-  contradicted recheck) while the process may be live and
-  unchanged. This row never claims either event; only proven
-  exit or change files the changed row above.
+  one of twelve unverified-generation pairs (three sites times four
+  refusal causes) — a stale candidate or inventory preflight whose
+  pin could not prove exit or change (poll failure, unreadable
+  `/proc`, missing custody, or a contradicted recheck) while the
+  process may be live and unchanged. This row never claims either
+  event; only proven exit or change files the changed row above.
 - `terminal discovery record failed exact resolution`: the terminal
   record-resolution pair — a consumed terminal record that failed
   exact resolution without exit proof. A named loss, never ambient

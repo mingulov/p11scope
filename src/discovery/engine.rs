@@ -12075,8 +12075,9 @@ fn start_retained_with<S>(
             break;
         }
         if named {
-            // A pin read error proves neither exit nor change: refuse
-            // the unverified generation instead of claiming a change.
+            // Anything but positive exit/reuse proof proves neither
+            // exit nor change: refuse the unverified generation
+            // instead of claiming a change.
             if discovered.named_generation_unproven_on_pin_recheck(&stale) {
                 bail!(
                     "the named process generation was unverified before attach; exit or change unproven"
@@ -12096,8 +12097,9 @@ fn start_retained_with<S>(
         // No event/map consumer can see this session. Dropping it first tears
         // down every just-created link before the named capture fails.
         drop(session);
-        // A pin read error proves neither exit nor change: refuse
-        // the unverified generation instead of claiming a change.
+        // Anything but positive exit/reuse proof proves neither
+        // exit nor change: refuse the unverified generation
+        // instead of claiming a change.
         if discovered.named_generation_unproven_on_pin_recheck(&stale) {
             bail!(
                 "the named process generation was unverified while attaching; exit or change unproven"
@@ -27326,9 +27328,16 @@ impl Engine {
             );
             // A named target that provably exited mid-arm is the target
             // ending: its retirement is queued as an expected removal and the
-            // capture ends the ordinary way. Only a replaced or unprovable
-            // generation fails the named capture.
+            // capture ends the ordinary way. Only a proven exit or change
+            // fails the named capture as changed; anything the pin cannot
+            // prove refuses as unverified instead (same guard as the
+            // loader-arming and attach bails).
             if matches!(self.scope, Scope::Pid(_)) && !self.original_exited(view_id) {
+                if self.named_generation_unproven_on_pin_recheck(&[view_id]) {
+                    return Err(LoaderArmFailure::ordinary(anyhow!(
+                        "the named process generation was unverified during loader attachment; exit or change unproven"
+                    )));
+                }
                 return Err(LoaderArmFailure::ordinary(anyhow!(
                     "the named process generation changed during loader attachment"
                 )));
@@ -27950,9 +27959,10 @@ impl Engine {
                     _ if named && exited => Ok(changed),
                     Some(LoaderArmFailure::Ordinary(error)) if named => Err(error),
                     _ if named => {
-                        // A pin read error proves neither exit nor
-                        // change: refuse the unverified generation
-                        // instead of claiming a change.
+                        // Anything but positive exit/reuse proof
+                        // proves neither exit nor change: refuse the
+                        // unverified generation instead of claiming a
+                        // change.
                         if self.named_generation_unproven_on_pin_recheck(&[view_id]) {
                             bail!(
                                 "the named process generation was unverified during loader arming; exit or change unproven"
@@ -28980,9 +28990,10 @@ impl Engine {
     /// or change, the existing proven-exit suppression, silent, which
     /// `queue_retirement` turns into expected removals — else the
     /// changed-generation label when at least one affected original
-    /// proves exit or change AND the named not-proven gap when any
-    /// affected original is unproven, independently, so a mixed batch
-    /// names both), plus whether any retained stale view's fate is
+    /// proves exit or change AND the named not-proven gaps (one per
+    /// distinct cause) when any affected original is unproven,
+    /// independently, so a mixed batch names both), plus whether any
+    /// retained stale view's fate is
     /// unproven (which gates the named-target bail: a proven exit or
     /// change ends orderly through retirement, but an unproven target
     /// generation must not be observed further). Preserves every
@@ -29380,27 +29391,26 @@ impl Engine {
         Ok(false)
     }
 
-    /// Recheck stale named views with the Result-typed pin read: any
-    /// view the pin cannot judge (a read error, or no retained view at
-    /// all) makes the generation unverified instead of a claimed
-    /// change. A readable pin keeps the stale report's change claim,
-    /// which stays positive exit-or-change evidence outside read
-    /// errors: only `Err` reroutes, never a readable verdict. Tests
-    /// script the recheck with `State` answers (fault injection); an
-    /// empty script reads the live pins.
+    /// Recheck stale named views through the sealed generation
+    /// authority: only positive exit/reuse proof keeps the stale
+    /// report's change claim. Every other outcome — a read error, a
+    /// permission denial, a contradicted report that re-reads
+    /// `Current`, or no retained view at all — makes the generation
+    /// unverified instead of a claimed change. A stale report that
+    /// contradicts on recheck proves the only evidence of change was
+    /// a transient pin error, so keeping "changed" would be wrong
+    /// attribution. Tests script the recheck with `State` answers
+    /// (fault injection); an empty script reads the live pins.
     fn named_generation_unproven_on_pin_recheck(&self, stale: &[ProcessViewId]) -> bool {
         stale.iter().any(|id| {
             #[cfg(test)]
             if let Some(answer) = self.pop_pin_probe_state() {
-                return match answer {
-                    Some(Err(_)) | None => true,
-                    Some(Ok(_)) => false,
-                };
+                return GenerationProof::judge_scripted(answer).is_err();
             }
-            self.views
-                .iter()
-                .find(|view| view.id() == *id)
-                .is_none_or(|view| view.retained_pin().original_discovery_state().is_err())
+            match self.views.iter().find(|view| view.id() == *id) {
+                None => true,
+                Some(view) => GenerationProof::judge_pin(view.retained_pin()).is_err(),
+            }
         })
     }
 

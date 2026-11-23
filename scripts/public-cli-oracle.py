@@ -81,7 +81,7 @@ DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery 
 # pairs to the changed reason, the live stale-deferral mark to its
 # own deferral reason, the permission-refusal mark to its own
 # permission row, the unreadable-member mark to its own unreadable
-# row, the three unverified-generation pairs to their own unverified
+# row, the twelve unverified-generation pairs to their own unverified
 # row, and the terminal record-resolution pair to its own terminal
 # row (never dropped, never a pid). No row proves an exit — the
 # changed row covers proven exit-or-change, the deferral row is filed

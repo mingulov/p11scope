@@ -23,7 +23,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from skip_projection_fixture import assert_binary_row, check_row
+from skip_projection_fixture import assert_binary_row, check_row, project_rows
 
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = ROOT / "scripts/public-cli-oracle.py"
@@ -452,19 +452,21 @@ def producer_unverified_row():
     """The public unverified-generation row, from the real binary.
 
     All twelve internal pairs (three sites times four refusal
-    causes) project to the one row; each is exact-matched through
-    the binary here, and the candidate pair's row is returned for
-    the rejection twins. The expected row is pinned by value above.
+    causes) project to the one row in a single probe call; each is
+    exact-matched here, and the candidate pair's row is returned
+    for the rejection twins. The expected row is pinned by value
+    above.
     """
     row = None
-    for subject, reason in UNVERIFIED_INTERNAL_PAIRS:
-        projected = binary_row(
-            subject, reason,
-            UNVERIFIED_PUBLIC_ROW["name"], UNVERIFIED_PUBLIC_ROW["reason"],
-            context="unverified-generation projection")
+    pairs = list(UNVERIFIED_INTERNAL_PAIRS)
+    for (subject, reason), projected in zip(pairs, project_rows(pairs)):
+        check_row(projected,
+                  UNVERIFIED_PUBLIC_ROW["name"],
+                  UNVERIFIED_PUBLIC_ROW["reason"],
+                  context="unverified-generation projection")
         if (subject, reason) == ("live discovery generation",
                                  UNVERIFIED_CANDIDATE_INTERNAL_REASON):
-            row = projected
+            row = {"name": projected[0], "reason": projected[1]}
     assert row is not None
     return row
 

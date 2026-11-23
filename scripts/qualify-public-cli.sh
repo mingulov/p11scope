@@ -809,13 +809,21 @@ report=json.load(open(sys.argv[1]))
 inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
 pin=json.loads(sys.argv[4])
 modpath=sys.argv[5]; modfs=sys.argv[6]
-assert report.get('schema')=='p11scope/inventory/v1', 'inventory schema'
-assert report.get('scope')=='cgroup', 'inventory scope'
+# Every refusal below raises explicitly, never bare assert: the
+# verdicts must read identically under python3 -O (which strips
+# asserts), pinned by the oracle's explicit-refusal twins.
+class Refusal(Exception):
+    pass
+def refuse_unless(condition, message):
+    if not condition:
+        raise Refusal(message)
+refuse_unless(report.get('schema')=='p11scope/inventory/v1', 'inventory schema')
+refuse_unless(report.get('scope')=='cgroup', 'inventory scope')
 inside_pid=int([l for l in inside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
 child_pid=int([l for l in inside.splitlines() if l.startswith('CHILD pid=')][0].split('=')[1])
 outside_pid=int([l for l in outside.splitlines() if l.startswith('READY pid=')][0].split('=')[1])
-assert sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing'
-assert sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)'
+refuse_unless(sum(l.startswith('LEDGER ') for l in inside.splitlines())==1, 'inside ledger missing')
+refuse_unless(sum(l.startswith('LEDGER ') for l in outside.splitlines())==1, 'outside ledger missing (leak test invalid)')
 modules={m['id']:m for m in report.get('modules',[])}
 owned=None
 for mid,m in modules.items():
@@ -826,24 +834,24 @@ for mid,m in modules.items():
 # Data-always: the scan-pinned fallback publishes the found module
 # with its named gap on every filesystem — an empty view never
 # qualifies, on overlayfs or anywhere else.
-assert owned is not None, 'owned provider not inventoried (modfs=%s): empty view never qualifies' % modfs
+refuse_unless(owned is not None, 'owned provider not inventoried (modfs=%s): empty view never qualifies' % modfs)
 state=modules[owned].get('admission',{}).get('state')
 if modfs=='overlayfs':
     # The cgroup witness stays deactivated (the userspace-only path),
     # so the published module carries its named unproven gap per
     # inside caller below; the attach set may or may not judge it.
-    assert state in ('admitted','unresolved'), 'overlay owned provider admission: %r' % state
+    refuse_unless(state in ('admitted','unresolved'), 'overlay owned provider admission: %r' % state)
 else:
-    assert state=='admitted', 'owned provider not admitted'
+    refuse_unless(state=='admitted', 'owned provider not admitted')
 callers={c['id']:c for c in report.get('callers',[])}
 inside_ids=[cid for cid,c in callers.items() if c.get('pid')==inside_pid]
 child_ids=[cid for cid,c in callers.items() if c.get('pid')==child_pid]
 outside_ids=[cid for cid,c in callers.items() if c.get('pid')==outside_pid]
-assert inside_ids, 'inside parent not a caller'
-assert child_ids, 'fork-after-attach child not a caller'
-assert not outside_ids, 'outside workload leaked into cgroup inventory'
+refuse_unless(inside_ids, 'inside parent not a caller')
+refuse_unless(child_ids, 'fork-after-attach child not a caller')
+refuse_unless(not outside_ids, 'outside workload leaked into cgroup inventory')
 edges=report.get('edges',[])
-assert any(e.get('caller') in inside_ids+child_ids and e.get('module')==owned for e in edges), 'no inside edge to owned module'
+refuse_unless(any(e.get('caller') in inside_ids+child_ids and e.get('module')==owned for e in edges), 'no inside edge to owned module')
 owned_gaps=[g for g in report.get('gaps',[]) if g.get('module')==owned]
 # The decided no-witness shape (PARTIAL): with no kernel witness the
 # observer keeps the admitted module and its data, plus exactly the
@@ -865,7 +873,7 @@ degraded=modfs=='overlayfs' or no_witness
 # is the decided named shape (also seen witness-available on the
 # host leg); anything else about the owned module still fails.
 owned_other=[g for g in owned_gaps if g.get('subject')!='module admission changed' and not named_unbound(g)]
-assert owned_other==[], 'inventory gaps about owned module: %r' % owned_other
+refuse_unless(owned_other==[], 'inventory gaps about owned module: %r' % owned_other)
 unproven=[]
 # The run-deadline row carries the same producer shape with or
 # without a companion gap: a clean preparation pass can still hit
@@ -881,26 +889,30 @@ unproven=[]
 deadline=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup collection deadline reached']
 if deadline:
     for g in deadline:
-        assert g.get('subject')=='cgroup scope transaction incomplete', 'malformed run deadline row: %r' % (g,)
-        assert 'caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed run deadline scope: %r' % (g,)
-        assert 'budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,)
-        assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,)
-    assert len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,)
+        refuse_unless(g.get('subject')=='cgroup scope transaction incomplete', 'malformed run deadline row: %r' % (g,))
+        refuse_unless('caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed run deadline scope: %r' % (g,))
+        refuse_unless('budget' in g and g['budget'] is None, 'malformed run deadline budget: %r' % (g,))
+        refuse_unless(type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed run deadline count: %r' % (g,))
+    refuse_unless(len(deadline)==1, 'duplicate run deadline rows: %r' % (deadline,))
 # The producer files every incomplete transaction under the one
 # fixed subject with many possible reasons (operator stop, shared
 # work allowance, membership, process, generation, scan, deep-scan
 # limit, deadline), and only the named deadline disclosure
 # qualifies (CI-GAP-2). A transaction row counts as a deadline
-# only after its exact reason and shape are validated above. The
-# degraded branch below already refuses any other reason —
-# missing, unknown, or a real refusal like the member scan —
-# through its reason list; witness-available reports have no such
-# gate, so this one closes the same hole there. Scoped to
-# transaction rows on the non-degraded branch only.
-if not degraded:
-    tx=[g for g in report.get('gaps',[]) if g.get('subject')=='cgroup scope transaction incomplete']
-    for g in tx:
-        assert g.get('reason')=='cgroup collection deadline reached', 'unrecognized cgroup transaction row: %r' % (g,)
+# only after its exact reason and shape are validated above. Both
+# branches gate the transaction subject here: the degraded branch
+# below checks the reason against its list only, so without this
+# gate a transaction row carrying a known-but-foreign reason (the
+# scan-pinned fallback, filed only under the native-refusal
+# subject) would qualify there. The refusal carries the
+# branch-appropriate marker: the degraded extra-gap marker where
+# the witness never ran, the unrecognized-row marker where it did.
+tx=[g for g in report.get('gaps',[]) if g.get('subject')=='cgroup scope transaction incomplete']
+for g in tx:
+    if degraded:
+        refuse_unless(g.get('reason')=='cgroup collection deadline reached', 'overlay published extra gap: %r' % (g,))
+    else:
+        refuse_unless(g.get('reason')=='cgroup collection deadline reached', 'unrecognized cgroup transaction row: %r' % (g,))
 # The facts-retained refresh refusal only comes with a
 # run-deadline straddle on every substrate: the deadline gap must
 # be present in the same run, and at most one retained row per
@@ -909,8 +921,8 @@ if not degraded:
 # retained row past the qualifier.
 retained=[g for g in report.get('gaps',[]) if g.get('reason')=='the final-sample permit was not granted; prior owner facts retained']
 if retained:
-    assert deadline, 'retained refresh without a run deadline: %r' % (retained,)
-    assert len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,)
+    refuse_unless(deadline, 'retained refresh without a run deadline: %r' % (retained,))
+    refuse_unless(len(set(g.get('caller') for g in retained))==len(retained), 'duplicate retained refresh for one caller: %r' % (retained,))
 # The interrupted provider-input comparison only comes with a
 # run-deadline straddle on every substrate: the pass was cancelled
 # mid-preparation, so the deadline gap must be present in the same
@@ -923,23 +935,23 @@ if retained:
 prep=[g for g in report.get('gaps',[]) if g.get('reason')=='cgroup provider input comparison interrupted']
 if prep:
     for g in prep:
-        assert g.get('subject')=='cgroup provider preparation incomplete', 'malformed interrupted preparation row: %r' % (g,)
-        assert 'caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed interrupted preparation scope: %r' % (g,)
-        assert 'budget' in g and g['budget'] is None, 'malformed interrupted preparation budget: %r' % (g,)
-        assert type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,)
-    assert len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,)
-    assert deadline, 'interrupted preparation without a run deadline: %r' % (prep,)
+        refuse_unless(g.get('subject')=='cgroup provider preparation incomplete', 'malformed interrupted preparation row: %r' % (g,))
+        refuse_unless('caller' in g and g['caller'] is None and 'module' in g and g['module'] is None and 'pid' in g and g['pid'] is None, 'malformed interrupted preparation scope: %r' % (g,))
+        refuse_unless('budget' in g and g['budget'] is None, 'malformed interrupted preparation budget: %r' % (g,))
+        refuse_unless(type(g.get('repeats')) is int and g.get('repeats')>=1, 'malformed interrupted preparation count: %r' % (g,))
+    refuse_unless(len(prep)==1, 'duplicate interrupted preparation rows: %r' % (prep,))
+    refuse_unless(deadline, 'interrupted preparation without a run deadline: %r' % (prep,))
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the
     # gaps): the witness never ran, so no proof is claimed.
     want=sorted(set(inside_ids+child_ids))
     unproven=[g for g in report.get('gaps',[]) if (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
-    assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
+    refuse_unless(sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover')
     pidof={cid:callers[cid].get('pid') for cid in want}
     for g in unproven:
-        assert g.get('subject')==modpath, 'overlay unproven subject'
-        assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
+        refuse_unless(g.get('subject')==modpath, 'overlay unproven subject')
+        refuse_unless(g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid')
     rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g)]
     # The per-caller activation refusal plus, when a pass straddles
     # the run deadline, the designed collection bound (ruling CI-GAP-2,
@@ -962,8 +974,8 @@ if degraded:
     # is deliberately NOT known here: its reappearance fails loudly
     # below instead of hiding.
     known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained','cgroup provider input comparison interrupted'}
-    assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
-    assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
+    refuse_unless(all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest)
+    refuse_unless(len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps')
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))
 PY
     rc=$?

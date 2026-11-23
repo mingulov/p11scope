@@ -24471,12 +24471,13 @@ impl Engine {
         // budget keeps the normal per-operation proof allowance with a
         // total derived from their joint worst case (64 MiB mountinfo
         // plus the probe's full 256 MiB per-operation range plus
-        // lookahead margin) — the same per-pass resumable semantics as
-        // the initial pin, never a smaller fixed cap: any table the
-        // initial pin accepts the retry also accepts, with room for
-        // EOF proof, and the maps probe resumes from its own cursor
-        // under its full range instead of being cut by the mountinfo
-        // spend; over-limit tables refuse identically on both paths.
+        // lookahead margin): a retry re-proves from scratch with the
+        // same per-operation range the initial pass used, never a
+        // smaller fixed cap — any table the initial pin accepts the
+        // retry also accepts, with room for EOF proof, and the shared
+        // total never binds before the per-operation caps, so the
+        // maps probe is never cut by the mountinfo spend; over-limit
+        // tables refuse identically on both paths.
         // The budget dies with the attempt — no charge-back, like the
         // identify batch allowance, with each retry recorded on the
         // operator channel. First attempts keep the capture budget

@@ -85,10 +85,10 @@ pub(crate) const PROOF_PER_OPERATION_IO_BYTES: u64 = 256 * 1024 * 1024;
 /// through its fresh isolated budget — never capture credit — so the
 /// total covers their joint worst case instead of the capture total.
 /// The total stays above the mount-table cap plus the probe's full
-/// per-operation range, so each operation resumes its proof from its
-/// own cursor under the same allowance the initial pass used: the
-/// shared total never binds before the per-operation caps, and a
-/// retry never restarts or cuts a proof the initial pin completes.
+/// per-operation range, so a retry re-proves from scratch with the
+/// same per-operation range the initial pass used: the shared total
+/// never binds before the per-operation caps, so a retry never cuts
+/// a proof the initial pin completes.
 /// Over-limit tables refuse identically on both paths. Derived from
 /// the caps above, never a smaller fixed number.
 pub(crate) const LEARNED_RETRY_TOTAL_IO_BYTES: u64 =

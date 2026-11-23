@@ -7306,8 +7306,8 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
     // token). A pasted literal at any call site fails here instead of
     // filing the label without proof.
     let changed_ctor = source
-        .splitn(2, "fn changed_generation_skip")
-        .nth(1)
+        .split_once("fn changed_generation_skip")
+        .map(|(_, after)| after)
         .expect("the changed-generation constructor must exist")
         .split("\n}\n")
         .next()
@@ -7330,8 +7330,8 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
     // The unverified-generation gap is constructor-gated the same way:
     // every unproven outcome files through `unproven_generation_skip`.
     let unproven_ctor = source
-        .splitn(2, "fn unproven_generation_skip")
-        .nth(1)
+        .split_once("fn unproven_generation_skip")
+        .map(|(_, after)| after)
         .expect("the unverified-generation constructor must exist")
         .split("\n}\n")
         .next()

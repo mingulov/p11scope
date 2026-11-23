@@ -318,6 +318,17 @@ mod current_receipts_tests {
             capture.validate_current_with(&mut io, &receipt, &mut report),
             Err(CurrentReceiptRefusal::Partition)
         );
+        // A partition refusal never strands the caller: the next
+        // refresh at the live epoch mints a fresh receipt that validates
+        // (the per-pass retry a deferred or refused admission relies on).
+        io.local = 5;
+        let pin = io.pin.clone();
+        let mut retried = capture.refresh_with(&mut io, pin, 0).unwrap();
+        let fresh = retried.current.pop().expect("the retry mints a receipt");
+        assert_eq!(
+            capture.validate_current_with(&mut io, &fresh, &mut retried),
+            Ok(())
+        );
         capture.router.retire_image(receipt.image);
         assert_eq!(
             capture.validate_current_with(&mut io, &receipt, &mut report),

@@ -71,6 +71,21 @@ NATIVE = ("no settled expected native image for this caller in the "
 
 
 PUBLISHED_PIN = {"dev": [8, 1], "ino": 42, "sha256": "ab" * 32}
+# cgroup-fork's LEDGER totals parent plus child; each member drives
+# 250 x six calls plus seven setup/teardown entries.
+INSIDE_LEDGER = "LEDGER " + json.dumps({
+    "schema": "p11scope/public-cli-ledger/v1", "pid": 100, "complete": True,
+    "functions": [{"name": n, "attempts": 500, "successful": 500}
+                  for n in ("C_GenerateRandom", "C_DigestInit", "C_Digest",
+                            "C_FindObjectsInit", "C_FindObjects",
+                            "C_FindObjectsFinal")]})
+
+
+def counted_edge(caller, module="m0", count=1507):
+    return {"caller": caller, "module": module,
+            "entries": {"count": count, "observation": "observed",
+                        "saturated": False,
+                        "coverage": {"state": "counted", "lossy": False}}}
 
 
 def overlay_report():
@@ -116,8 +131,7 @@ def overlay_published_report():
         "callers": [
             {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
             {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}],
-        "edges": [{"caller": "c0", "module": "m0"},
-                  {"caller": "c1", "module": "m0"}],
+        "edges": [counted_edge("c0"), counted_edge("c1")],
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
              "reason": UNPROVEN_DIAGNOSED, "subject": MODPATH, "repeats": 12},
@@ -138,7 +152,7 @@ def run_oracle(report, *, modfs="overlayfs", pin=None):
     block = extract_inventory_oracle()
     if pin is None:
         pin = {"dev": [0, 0], "ino": 0, "sha256": "00"}
-    inside_wl = "READY pid=100\nCHILD pid=101\nLEDGER x\n"
+    inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % INSIDE_LEDGER
     outside_wl = "READY pid=102\nLEDGER y\n"
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -410,6 +424,65 @@ class ScriptTextTests(unittest.TestCase):
                       "unknown overlay gaps must fail loudly")
 
 
+class ObserverGateTests(unittest.TestCase):
+    """The inventory cell opens its workload gates only after the
+    observer published pass 0 (its endpoints attached); a fixed sleep
+    let a loaded host run the whole workload before attach."""
+
+    def run_gate(self, stub, kind="inventory"):
+        funcs = extract_functions("register", "generation", "alive",
+                                  "waitfor", "observer_gate")
+        body = (
+            "declare -A CHILDREN; READY_TICKS=60\n"
+            "( %s ) 2> obs.err & pp=$!; register \"$pp\"\n"
+            "sleep 30 & other=$!; register \"$other\"\n"
+            "start=$(date +%%s%%N)\n"
+            "if observer_gate %s obs.err \"$pp\" \"$other\"; then rc=0; else rc=1; fi\n"
+            "end=$(date +%%s%%N)\n"
+            "seen=$(grep -c '^p11scope: pass 0: ' obs.err || true)\n"
+            "kill \"$pp\" \"$other\" 2>/dev/null; wait 2>/dev/null\n"
+            "echo \"RC=$rc MS=$(( (end-start)/1000000 )) SEEN=$seen\"\n"
+            % (stub, kind))
+        with tempfile.TemporaryDirectory() as raw:
+            proc = subprocess.run(["bash", "-u", "-c", funcs + "\n" + body],
+                                  capture_output=True, text=True,
+                                  timeout=30, cwd=raw)
+        m = re.search(r"RC=(\d) MS=(\d+) SEEN=(\d+)", proc.stdout)
+        self.assertIsNotNone(m, proc.stdout + proc.stderr)
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+    def test_gate_waits_for_a_delayed_first_pass(self):
+        rc, ms, seen = self.run_gate(
+            "sleep 1.5; echo 'p11scope: capturing: x' >&2; sleep 1; "
+            "echo 'p11scope: pass 0: committed' >&2; sleep 20")
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, 1, "the gate opened before pass 0")
+        self.assertGreaterEqual(ms, 2400)
+
+    def test_gate_stays_shut_when_the_observer_dies_before_pass_0(self):
+        rc, _, seen = self.run_gate(
+            "echo 'p11scope: capturing: x' >&2; sleep 1; exit 1")
+        self.assertEqual(rc, 1)
+        self.assertEqual(seen, 0)
+
+    def test_other_kinds_open_on_capturing(self):
+        rc, ms, _ = self.run_gate(
+            "sleep 1; echo 'p11scope: capturing: x' >&2; sleep 20",
+            kind="profile")
+        self.assertEqual(rc, 0)
+        self.assertGreaterEqual(ms, 900)
+
+    def test_cgroup_capture_uses_the_gate(self):
+        text = QUAL.read_text()
+        body = text[text.index("cgroup_capture() {"):]
+        body = body[:body.index("\n}\n")]
+        self.assertTrue('observer_gate "$kind" "$cell.stderr" "$pp" '
+                        '"$inside" "$outside"' in body,
+                        "cgroup_capture must open its gates through observer_gate")
+        self.assertFalse("sleep 2" in body,
+                         "a fixed sleep must not stand in for the pass-0 gate")
+
+
 class InventoryOverlayTests(unittest.TestCase):
     def test_overlay_published_shape_passes(self):
         rc, out = run_oracle(overlay_published_report(), pin=PUBLISHED_PIN)
@@ -528,7 +601,7 @@ class InventoryOverlayTests(unittest.TestCase):
                          "admission": {"state": "admitted"}}],
             "callers": [{"id": "c0", "pid": 100},
                         {"id": "c1", "pid": 101}],
-            "edges": [{"caller": "c0", "module": "m0"}],
+            "edges": [counted_edge("c0"), counted_edge("c1")],
             "gaps": [],
         }
         rc, out = run_oracle(report, modfs="ext4", pin=pin)

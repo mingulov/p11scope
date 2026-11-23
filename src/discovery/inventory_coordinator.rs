@@ -32301,6 +32301,112 @@ exit 0
         );
     }
 
+    /// A system-scope native lane attached at 30 with pid 7 (start 500)
+    /// alive but not yet admitted: no caller holds its tgid.
+    fn attached_before_admission() -> NativeScene {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(30, ScopeCustody::System);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native
+    }
+
+    /// Admits pid 7 at 50 the way a later scan does, and projects it.
+    fn admit_late(native: &mut NativeScene) -> CallerId {
+        let caller = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        caller
+    }
+
+    #[test]
+    fn counts_for_a_row_read_before_admission_carry_across_the_late_resight() {
+        // The cgroup fork-child ordering: the probe is live, the child
+        // fires 1507 calls and its row is read while no caller holds
+        // the tgid; a later pass admits the same process, and the next
+        // witness read re-sights it. The held count stays pending
+        // across that interval and lands on the bound caller from t0.
+        let mut native = attached_before_admission();
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 1507;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 1507)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        assert_eq!(registry.edges().count(), 0, "nothing is attributed yet");
+        assert_eq!(registry.witness_census().pending, 1);
+        assert_eq!(native.module_unbound(), None, "the row is still owed");
+        let caller = admit_late(&mut native);
+        native.answer(7, 500, 41);
+        native.read(Vec::new());
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        assert_eq!(registry.witness_census().pending, 0);
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the late-admitted caller has an edge");
+        assert_eq!(edge.entry_count, 1507, "the held count is never dropped");
+        assert_eq!(edge.entry_first_seen_ns, Some(40));
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 40,
+                lossy: false,
+                pid_exit: false
+            }
+        );
+        assert_eq!(native.module_unbound(), None);
+    }
+
+    #[test]
+    fn counts_for_a_row_read_before_an_unclean_admission_stay_module_level() {
+        // Guard twin: an exec between the row and the admission voids
+        // the late window. The earlier count never reaches the caller
+        // edge; it survives as the module's lower bound instead.
+        let mut native = attached_before_admission();
+        let mut row = native.row(41, 1, 7, 40, 0);
+        row.entry_count = 1507;
+        native.read(vec![row]);
+        native.counts_read(Vec::new(), vec![(41, 1, 0, 1507)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let caller = admit_late(&mut native);
+        native.answer(7, 500, 41);
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exec_record(41, 7, 45, 8, 99)],
+            at,
+        )));
+        native.read(Vec::new());
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        assert_eq!(registry.witness_census().pending, 0);
+        assert!(
+            registry
+                .edges()
+                .filter(|edge| edge.caller == caller)
+                .all(|edge| edge.entry_count == 0),
+            "the pre-exec calls are never the caller's"
+        );
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.entries, 1507, "the known count folds to the module");
+    }
+
     /// The prepared cgroup commit preserves counts for unnamed slots:
     /// one real cgroup pass over the provider fixture absorbs
     /// endpoints through the no-read commit, and its plan slots all

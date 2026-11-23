@@ -704,6 +704,18 @@ print("ok lines=%d totals=%d" % (len(stream), len(totals)))
 PY
   result inventory-event-stdout "$([ "$judge_rc" = 0 ] && echo 1 || echo 0)" "rc1=$rc1 rc2=$rc2 $(tail -n 1 event-stdout.judge 2>/dev/null | head -c 300)"
 }
+# Open a cell's workload gates only once the observer is ready and every
+# named workload still runs. An inventory observer is ready after its first
+# pass published (its endpoints attached): a fixed sleep let a loaded host
+# run the whole workload before attach, so no row was ever read. The other
+# kinds are ready when capturing starts.
+observer_gate() {
+  local kind=$1 stderr=$2 pp=$3; shift 3
+  local pattern='p11scope: capturing:' pid
+  [ "$kind" = inventory ] && pattern='^p11scope: pass 0: '
+  waitfor "$stderr" "$pattern" "$pp" "$READY_TICKS" || return 1
+  for pid in "$pp" "$@"; do alive "$pid" || return 1; done
+}
 # Cgroup capture: inside (cgroup-fork, parent+child) and outside (gated) use the
 # same owned provider copy; a leak breaks equality. The fork child inherits the
 # cgroup after attach and must be counted. The owned cgroup is removed afterwards.
@@ -761,17 +773,8 @@ cgroup_capture() {
     else args=(inventory --cgroup "$CG" --duration 12 -o "$output"); fi
     "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
     local observer_started=0
-    if [ "$kind" = inventory ]; then
-      # Release the gates only after the first pass committed (its
-      # endpoints attached): a fixed sleep let a loaded host run the
-      # whole workload before attach, so no row was ever read.
-      if waitfor "$cell.stderr" '^p11scope: pass 0: ' "$pp" "$READY_TICKS" && alive "$inside" && alive "$outside" && alive "$pp"; then
-        observer_started=1; capturing=1
-      fi
-    else
-      if waitfor "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$inside" && alive "$outside" && alive "$pp"; then
-        capturing=1; observer_started=1
-      fi
+    if observer_gate "$kind" "$cell.stderr" "$pp" "$inside" "$outside"; then
+      observer_started=1; capturing=1
     fi
     if [ "$observer_started" = 1 ]; then
       if touch "$inside_gate" && touch "$outside_gate"; then
@@ -849,6 +852,31 @@ assert child_ids, 'fork-after-attach child not a caller'
 assert not outside_ids, 'outside workload leaked into cgroup inventory'
 edges=report.get('edges',[])
 assert any(e.get('caller') in inside_ids+child_ids and e.get('module')==owned for e in edges), 'no inside edge to owned module'
+# Driven equals counted, per caller: each member of the completed
+# workload has its own counted edge to the owned module, and its count
+# is exactly what it drove. The ledger totals parent plus child; each
+# member runs total/2 iterations of six calls plus four setup
+# (Initialize, GetSlotList, OpenSession, Login) and three teardown
+# (Logout, CloseSession, Finalize) entries. A witnessed zero, a missing
+# edge or any other count fails on every substrate.
+ledger=json.loads([l for l in inside.splitlines() if l.startswith('LEDGER ')][0][len('LEDGER '):])
+assert ledger.get('complete') is True, 'inside ledger incomplete: driven counts unknown: %r' % (ledger,)
+functions=ledger.get('functions') or []
+attempts={f.get('attempts') for f in functions}
+assert len(functions)==6 and len(attempts)==1, 'inside ledger attempts differ per function: %r' % (ledger,)
+total=attempts.pop()
+assert isinstance(total,int) and total>0 and total%2==0, 'inside ledger attempts not split per member: %r' % (total,)
+driven=6*(total//2)+7
+for label,pid in (('inside parent',inside_pid),('fork child',child_pid)):
+    ids=[cid for cid,c in callers.items() if c.get('pid')==pid]
+    own=[e for e in edges if e.get('caller') in ids and e.get('module')==owned]
+    assert own, '%s has no edge to the owned module' % label
+    def exact(e):
+        n=e.get('entries') or {}
+        return (n.get('coverage') or {}).get('state')=='counted' and n.get('observation')=='observed' and not n.get('saturated') and isinstance(n.get('count'),int)
+    assert all(exact(e) for e in own), '%s calls not counted: %r' % (label,[e.get('entries') for e in own])
+    got=sum(e['entries']['count'] for e in own)
+    assert got==driven, '%s counted %d entries, drove %d' % (label,got,driven)
 owned_gaps=[g for g in report.get('gaps',[]) if g.get('module')==owned]
 # The decided no-witness shape (PARTIAL): with no kernel witness the
 # observer keeps the admitted module and its data, plus exactly the
@@ -887,23 +915,27 @@ if retained:
 # again from fresh proof on a later pass. The deferral is a delay, never
 # a resting state: the named caller must end with an activated native
 # owner. This runs on every substrate, like the retained check above.
-deferred_reason='only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained'
-def deferral(g):
-    return g.get('reason')==deferred_reason and g.get('subject')=='native owner activation refused'
-def recovered(g):
-    c=callers.get(g.get('caller'))
-    return c is not None and c.get('pid')==g.get('pid') and (c.get('image') or {}).get('authority')=='native_exact'
-for g in report.get('gaps',[]):
-    if deferral(g):
-        assert recovered(g), 'deferred activation never recovered: %r' % (g,)
 # Recover and continue: a caller refused for want of a settled expected
 # image retries from fresh proof every pass and must end activated. A
 # refusal that rests (the caller stays scan-pinned) fails the cell on
 # every substrate.
+# Both reasons are recognized by their exact text before the substrate
+# split, whatever subject they carry: the producer frames them under the
+# canonical subject only, so another subject fails. Recovery binds to the
+# refused incarnation: the row's caller id (one pid and start time) must
+# be a workload caller at the row's pid that ends native_exact.
+deferred_reason='only one native owner activation per transaction; the staged owner is deferred to a later pass; scan-pinned fallback retained'
 settle_reason='no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'
+activation_refusals={deferred_reason:'deferred activation never recovered',settle_reason:'native activation never recovered'}
+def activation_refusal(g):
+    return g.get('reason') in activation_refusals
+def recovered(g):
+    c=callers.get(g.get('caller'))
+    return g.get('caller') in inside_ids+child_ids and c is not None and c.get('pid')==g.get('pid') and (c.get('image') or {}).get('authority')=='native_exact'
 for g in report.get('gaps',[]):
-    if g.get('reason')==settle_reason and g.get('subject')=='native owner activation refused':
-        assert recovered(g), 'native activation never recovered: %r' % (g,)
+    if activation_refusal(g):
+        assert g.get('subject')=='native owner activation refused', 'activation refusal under another subject: %r' % (g,)
+        assert recovered(g), '%s: %r' % (activation_refusals[g['reason']],g)
 if degraded:
     # The published degraded (overlay or no-witness) shape keeps the
     # named unproven gap per inside caller (PARTIAL coverage via the
@@ -915,11 +947,11 @@ if degraded:
     for g in unproven:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
-    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g) and not deferral(g)]
-    # The per-caller activation refusal plus, when a pass straddles
-    # the run deadline, the designed collection bound (ruling CI-GAP-2,
-    # confirmed docs/superpowers/decisions/2026-11-06-schedule-dl10.md),
-    # plus the named module-level positive (excluded above).
+    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable') and g.get('subject')!='module admission changed' and not named_unbound(g) and not activation_refusal(g)]
+    # Known: when a pass straddles the run deadline, the designed
+    # collection bound (ruling CI-GAP-2, confirmed
+    # docs/superpowers/decisions/2026-11-06-schedule-dl10.md); the named
+    # module-level positive is excluded above.
     # A straddling pass also refuses a staged refresh of an
     # already-active owner by name (a permit-missing refresh refuses
     # at any outcome) and retains its facts: the incomplete
@@ -928,13 +960,14 @@ if degraded:
     # The bare member-lost variant (no retention suffix: the member
     # died after the final sample of a still-complete transaction)
     # is deliberately NOT known here: it fails loudly below.
-    # A recovered same-pass activation deferral (checked above) is
-    # the designed one-commit-per-transaction disclosure.
+    # The validated activation refusals (checked above, a recovered
+    # settle refusal or the one-commit-per-transaction deferral) are
+    # excluded from the rest by the same exact reasons.
     # The unproven member gaps degrade per caller without incompleting
     # the shared transaction, so 'cgroup member scan was incomplete'
     # is deliberately NOT known here: its reappearance fails loudly
     # below instead of hiding.
-    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained'}
+    known={'cgroup collection deadline reached','the final-sample permit was not granted; prior owner facts retained'}
     assert all(g.get('reason') in known for g in rest), 'overlay published extra gap: %r' % rest
     assert len(report.get('gaps',[]))>0, 'overlay published shape carries no gaps'
 print('inventory cgroup: inside=%d child=%d outside=%d excluded module=%s admission=%s unproven=%d gaps=%d' % (inside_pid,child_pid,outside_pid,owned,state,len(unproven),len(report.get('gaps',[]))))

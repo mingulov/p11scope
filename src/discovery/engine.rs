@@ -27142,6 +27142,7 @@ impl Engine {
             #[cfg(test)]
             self.getter_prefault_latch_frame_trip(GetterPrefaultStrideSite::Proof);
             if self.frame_work_exhausted() {
+                cursor.op_bytes = op_bytes;
                 Self::store_prefault_resume(&mut cursor);
                 self.getter_prefault_cursors.insert(view, cursor);
                 return Deferred { frame_spent: true };
@@ -27152,6 +27153,7 @@ impl Engine {
             let object = cursor.ranges[index].object;
             if let std::collections::btree_map::Entry::Vacant(slot) = held_cache.entry(object) {
                 if proofs_spent >= proofs_per_pass {
+                    cursor.op_bytes = op_bytes;
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: false };
@@ -27187,6 +27189,7 @@ impl Engine {
                 continue;
             } else {
                 if proofs_spent >= proofs_per_pass {
+                    cursor.op_bytes = op_bytes;
                     Self::store_prefault_resume(&mut cursor);
                     self.getter_prefault_cursors.insert(view, cursor);
                     return Deferred { frame_spent: false };

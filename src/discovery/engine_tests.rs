@@ -39730,6 +39730,169 @@ fn prefault_manifest_getter_data_keeps_progress_when_the_frame_expires_mid_proof
     assert_eq!(attempts[1].0, ranges[1].0, "resumes at range one");
 }
 
+/// A frame expiring mid-proof carries the pass's read bytes: with one
+/// range finished and one freshly warmed, the trip defers with the
+/// cumulative total, and the fresh frame resumes at the pending range
+/// (twin: dropping the total would under-count the per-object
+/// allowance on the next pass).
+#[test]
+fn prefault_manifest_getter_data_carries_read_bytes_across_a_proof_yield() {
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, vec![input]);
+    let object = engine.modules[0].object;
+    let sites = vec![(object, 0x80, "C_GetFunctionList".to_string())];
+    // SAFETY: private read-only mappings of the held fixture file,
+    // unmapped below before the fixture drops.
+    let mut mappings = Vec::new();
+    for _ in 0..2 {
+        mappings.push(map_fixture_readonly(&fixture.file, padded));
+    }
+    let ranges = install_prefault_fast_proof(&mut engine, object);
+    assert_eq!(ranges.len(), 3, "premise: exactly three chunks");
+    engine.set_prefault_caps_for_test(Some(1), None);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "premise: the first pass warms one range and defers"
+    );
+    engine.set_prefault_frame_trip_for_test(GetterPrefaultStrideSite::Proof, 2);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: true },
+        "the proof trip yields the pass after one more range"
+    );
+    let cursor = engine
+        .getter_prefault_cursors
+        .get(&id)
+        .expect("a deferred pass saves its cursor")
+        .clone();
+    assert_eq!(cursor.ranges.len(), 3, "the ranges survive the yield");
+    assert!(
+        cursor.enumerated,
+        "reconciliation completed before the proof yield"
+    );
+    assert_eq!(
+        cursor.ranges[0].next_addr, ranges[0].1,
+        "the first range stays finished"
+    );
+    assert_eq!(
+        cursor.ranges[1].next_addr, ranges[1].1,
+        "the second range warmed before the trip"
+    );
+    assert_eq!(
+        cursor.ranges[2].next_addr, ranges[2].0,
+        "the pending range keeps its offset"
+    );
+    assert_eq!(
+        cursor.op_bytes,
+        (ranges[0].1 - ranges[0].0) + (ranges[1].1 - ranges[1].0),
+        "the yield carries the pass's read bytes"
+    );
+    assert_eq!(
+        engine.prefault_attempts_for_test().len(),
+        2,
+        "two ranges warmed, nothing further attempted"
+    );
+    engine.frame_deadline_ns = Some(u64::MAX);
+    engine.set_prefault_caps_for_test(None, None);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    for mapping in mappings {
+        // SAFETY: each successful mapping above, released once.
+        assert_eq!(unsafe { libc::munmap(mapping, padded) }, 0);
+    }
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    let attempts = engine.prefault_attempts_for_test();
+    assert_eq!(
+        attempts.len(),
+        3,
+        "exactly one more chunk, never a finished range: {attempts:?}"
+    );
+    assert_eq!(attempts[2].0, ranges[2].0, "resumes at range two");
+}
+
+/// A proof-credit deferral at a new object's held lookup carries the
+/// pass's read bytes: with one object's range warmed, the pass defers
+/// with the cumulative total instead of restarting the allowance
+/// (twin: dropping the total would under-count it on the next pass).
+#[test]
+fn prefault_manifest_getter_data_carries_read_bytes_across_a_held_yield() {
+    use crate::discovery::identity::{FileIdentity, MappedFile};
+    const TMPFS: u64 = 0x0102_1994;
+    let fixture = ScanManifestFixture::new();
+    let padded = page_align_fixture_file(&fixture);
+    let (copies, mut inputs) = pin_liveness_copies(&fixture, padded, 2);
+    let (view, modules, pins, input) = same_object_scan_and_manifest(&fixture, 0x40);
+    let id = view.id();
+    inputs.insert(0, input);
+    let mut engine = discovered_from_inputs(vec![view], modules, pins, inputs);
+    let mut objects = Vec::with_capacity(2);
+    for path in &copies.paths {
+        let summary = engine
+            .pinned
+            .pinned()
+            .find(|summary| summary.path == path.to_str().unwrap())
+            .expect("every copy pins its own object");
+        objects.push(summary.id);
+    }
+    assert_ne!(objects[0], objects[1], "premise: two distinct objects");
+    let sites: Vec<(PinnedObjectId, u64, String)> = objects
+        .iter()
+        .map(|object| (*object, 0x80, "C_GetFunctionList".to_string()))
+        .collect();
+    for (index, object) in objects.iter().enumerate() {
+        let identity = FileIdentity {
+            dev: 7000 + index as u64,
+            ino: 8000 + index as u64,
+        };
+        let base = copies.readable[index] as u64;
+        engine.set_prefault_proof_for_test(
+            *object,
+            MappedFile {
+                identity,
+                fs_magic: Some(TMPFS),
+            },
+            vec![((base, base + padded as u64), Some(identity))],
+        );
+    }
+    // Three proof credits: the first range's held lookup, batch stat and
+    // re-proof spend them all, so the second range's held lookup defers.
+    engine.set_prefault_caps_for_test(None, Some(3));
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(
+        outcome,
+        GetterPrefaultOutcome::Deferred { frame_spent: false },
+        "pass 1 defers at the second held lookup"
+    );
+    let cursor = engine
+        .getter_prefault_cursors
+        .get(&id)
+        .expect("a deferred pass saves its cursor")
+        .clone();
+    assert_eq!(
+        cursor.op_bytes, padded as u64,
+        "the yield carries the warmed range's bytes"
+    );
+    assert_eq!(
+        engine.prefault_attempts_for_test().len(),
+        1,
+        "exactly one range warmed: {:?}",
+        engine.prefault_attempts_for_test()
+    );
+    engine.set_prefault_caps_for_test(None, None);
+    let outcome = engine.prefault_manifest_getter_data(id, &sites);
+    assert_eq!(outcome, GetterPrefaultOutcome::Complete);
+    assert_eq!(
+        engine.prefault_attempts_for_test().len(),
+        2,
+        "both ranges read exactly once"
+    );
+}
+
 /// A frame expiring mid-read keeps the saved range progress: the trip
 /// defers after the proven chunk, and the fresh frame resumes mid-range
 /// (twin: restarting from the bases would re-read finished bytes).
@@ -39853,6 +40016,11 @@ fn prefault_manifest_getter_data_meters_every_reproof_under_the_proof_cap() {
     assert!(
         cursor.ranges[0].proven && cursor.ranges[1].proven && !cursor.ranges[2].proven,
         "pass 1 proves exactly two ranges under the shared cap"
+    );
+    assert_eq!(
+        cursor.op_bytes,
+        (ranges[0].1 - ranges[0].0) + (ranges[1].1 - ranges[1].0),
+        "pass 1 carries its read bytes across the proof-credit deferral"
     );
     assert_eq!(
         engine.prefault_proof_attempts_for_test(),

@@ -995,6 +995,205 @@ impl InspectedFileKey {
     }
 }
 
+/// 9p filesystem magic: the vng guest rootfs. 9p inodes are not unique
+/// (`NONUNIQUE_INODE_FILESYSTEMS`), so the post-open facts cache never
+/// stores there and every scan re-opens, re-proves and re-parses every
+/// mapping — over 9p round-trips that collapses admission throughput.
+pub(crate) const NINE_P_MAGIC: u64 = 0x0102_1997;
+
+/// Whether the pre-open facts consult may run for a range on this
+/// filesystem: 9p read-only mounts only. Read-only means the bytes cannot
+/// change under the key (a remount shows new flags on the next consult,
+/// an overwrite through a read-write alias bumps ctime and misses), so a
+/// key hit names the proven bytes. Every other filesystem keeps the
+/// existing open-first flow byte-identical.
+pub(crate) fn preopen_consult_eligible(fs_magic: Option<u64>, read_only: bool) -> bool {
+    fs_magic == Some(NINE_P_MAGIC) && read_only
+}
+
+/// Pre-open cache key: the mount namespace (usable paths resolve per
+/// namespace, so identity never crosses one), the maps (device, inode)
+/// the group was keyed by, and the target file's pin plus `st_dev` read
+/// from the usable path itself before any open. A hit reuses facts a full
+/// examination proved for this exact generation; any replacement,
+/// overwrite, remount or copy-up misses and takes the full path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PreopenFileKey {
+    mount_ns: (u64, u64),
+    maps_device: Device,
+    maps_inode: u64,
+    pin: Pin,
+    fd_dev: u64,
+}
+
+impl PreopenFileKey {
+    pub(crate) fn for_target(
+        mount_ns: MountNamespaceId,
+        maps_device: Device,
+        maps_inode: u64,
+        target: &std::fs::Metadata,
+    ) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            mount_ns: (mount_ns.device, mount_ns.inode),
+            maps_device,
+            maps_inode,
+            pin: crate::discovery::identity::pin_from_metadata(target),
+            fd_dev: target.dev(),
+        }
+    }
+}
+
+/// Identity, generation and filesystem of one usable mapping path, read
+/// before any open: the pre-open consult's whole input (one statx plus
+/// one statfs on the path itself, no privileges needed). `None` on any
+/// failure falls back to the full path.
+fn preopen_target_metadata(
+    path: &std::path::Path,
+) -> Option<(std::fs::Metadata, Option<u64>, bool)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let metadata = std::fs::metadata(path).ok()?;
+    let bytes = path.as_os_str().as_bytes();
+    let cpath = std::ffi::CString::new(bytes).ok()?;
+    // Filesystem magic via `statfs`, like `map_files_entry_file`.
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `statfs` fills `buf` for a valid C path; read only on success.
+    let magic = (unsafe { libc::statfs(cpath.as_ptr(), fs.as_mut_ptr()) } == 0).then(|| {
+        // SAFETY: initialized by the successful `statfs`.
+        let fs = unsafe { fs.assume_init() };
+        #[allow(clippy::unnecessary_cast)]
+        let magic = fs.f_type as u64 & 0xffff_ffff;
+        magic
+    });
+    // Mount flags via `statvfs` (x86_64 `statfs` omits them). An
+    // unreadable filesystem is never read-only for the gate.
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `statvfs` fills `buf` for a valid C path; read only on success.
+    let read_only = if unsafe { libc::statvfs(cpath.as_ptr(), vfs.as_mut_ptr()) } == 0 {
+        // SAFETY: initialized by the successful `statvfs`.
+        let vfs = unsafe { vfs.assume_init() };
+        vfs.f_flag & libc::ST_RDONLY != 0
+    } else {
+        false
+    };
+    Some((metadata, magic, read_only))
+}
+
+/// Whether the scanned view shares the observer's mount namespace: the
+/// pre-open consult resolves usable paths in the observer root, which
+/// names the target's file only then. Read once per scan; unreadable
+/// means no consult.
+fn preopen_same_mount_ns(view: &ProcessView) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let retained = view.mount_namespace();
+    std::fs::metadata("/proc/self/ns/mnt")
+        .is_ok_and(|current| current.dev() == retained.device && current.ino() == retained.inode)
+}
+
+/// Whether the pre-open consult is forced on (tests only; production
+/// reads the thread-local default of false).
+fn preopen_consult_forced() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_PREOPEN_FACTS_CONSULT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// Whether every range in the group resolves to one file path: the
+/// consult stats a single path, so a group spanning distinct paths
+/// (hardlinks, or same-key different files on exotic filesystems) keeps
+/// the full path, whose guards sort out each range.
+fn preopen_group_single_path(group: &[&MapEntry], map_index: &MapIndex<'_>) -> bool {
+    let mut paths = group
+        .iter()
+        .filter_map(|entry| match map_index.resolve(entry.start) {
+            Resolved::File {
+                path: MappedPath::Usable(path),
+                ..
+            } => Some(path),
+            _ => None,
+        });
+    match paths.next() {
+        None => false,
+        Some(first) => paths.all(|path| path == first),
+    }
+}
+
+/// Outcome of one pre-open facts consult for a usable-path group.
+enum PreopenConsult {
+    /// No consult ran (gated out, unreadable, or the budget refused the
+    /// lookup step): take the full path exactly as without the consult.
+    Skip,
+    /// No entry for this generation: take the full path, then store
+    /// proven non-provider facts under the returned key.
+    Miss(PreopenFileKey),
+    /// Proven facts plus the target identity to synthesize the examined
+    /// entry from: non-provider files skip the open entirely, while
+    /// hook-bearing files still fall through to the full path.
+    Hit(ElfExportFacts, MappedFile),
+}
+
+/// Consult proven facts before opening: on 9p read-only mounts (or forced
+/// in tests), reuse a previous full examination of this exact file
+/// generation instead of reopening, re-proving and re-parsing it. The
+/// caller keeps narrowed, deleted, custody-held, hinted and excluded
+/// groups on the full path; inside, multi-path groups, foreign
+/// namespaces, getter matches, unreadable inputs and budget refusals of
+/// the lookup step itself also fall back.
+#[allow(clippy::too_many_arguments)]
+fn preopen_consult(
+    view: &ProcessView,
+    key: ObjectKey,
+    group: &[&MapEntry],
+    map_index: &MapIndex<'_>,
+    usable: &std::path::Path,
+    budget: &mut CaptureWorkBudget,
+    same_mount_ns: bool,
+) -> PreopenConsult {
+    use std::os::unix::fs::MetadataExt as _;
+    if !(same_mount_ns && preopen_group_single_path(group, map_index)) {
+        return PreopenConsult::Skip;
+    }
+    let Some((target, magic, read_only)) = preopen_target_metadata(usable) else {
+        return PreopenConsult::Skip;
+    };
+    if !(preopen_consult_forced() || preopen_consult_eligible(magic, read_only)) {
+        return PreopenConsult::Skip;
+    }
+    if budget
+        .getter_objects
+        .contains(&(target.dev(), target.ino()))
+    {
+        return PreopenConsult::Skip;
+    }
+    if budget.spend(1).is_err() {
+        return PreopenConsult::Skip;
+    }
+    let candidate =
+        PreopenFileKey::for_target(view.mount_namespace(), key.device, key.inode, &target);
+    match budget.preopen_facts_for(&candidate) {
+        Some(facts) => {
+            let mapped = MappedFile {
+                identity: FileIdentity {
+                    dev: target.dev(),
+                    ino: target.ino(),
+                },
+                fs_magic: magic,
+            };
+            #[cfg(test)]
+            {
+                budget.preopen_hits = budget.preopen_hits.saturating_add(1);
+            }
+            PreopenConsult::Hit(facts, mapped)
+        }
+        None => PreopenConsult::Miss(candidate),
+    }
+}
+
 /// The digest-sized facts one ELF contributes to every scan: its ABI plus the
 /// `(name, file offset)` exports matching the capture's hook names. File-derived
 /// only — safe to share across views the way the raw snapshot never is.
@@ -1088,6 +1287,33 @@ fn table_refusal_cache_bytes(key: &InspectedFileKey, value: &str) -> u64 {
 }
 
 fn export_cache_bytes(key: &InspectedFileKey, value: &ElfExportFacts) -> u64 {
+    let dynamic = value
+        .exports
+        .iter()
+        .fold(0usize, |bytes, (name, _)| bytes.saturating_add(name.len()));
+    u64::try_from(
+        std::mem::size_of_val(key)
+            .saturating_add(std::mem::size_of_val(value))
+            .saturating_add(
+                value
+                    .exports
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(String, u64)>()),
+            )
+            .saturating_add(dynamic)
+            .saturating_add(
+                value
+                    .excluded_anchor_ranges
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(u64, u64)>()),
+            ),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Retained bytes of one pre-open entry: same accounting as the export
+/// facts, under the pre-open key.
+fn preopen_cache_bytes(key: &PreopenFileKey, value: &ElfExportFacts) -> u64 {
     let dynamic = value
         .exports
         .iter()
@@ -1391,6 +1617,14 @@ pub struct CaptureWorkBudget {
     /// re-reading the whole loader for its locator, snapshot and both
     /// revalidation brackets.
     loader_elf_facts: BTreeMap<LoaderFactsKey, LoaderElfFacts>,
+    /// Export facts one completed examination proved, keyed before any
+    /// open (mount namespace plus maps and target identity). The pre-open
+    /// consult hits here for unchanged files on 9p read-only mounts,
+    /// where the post-open cache never stores; every other filesystem
+    /// never consults and never stores, keeping its flow byte-identical.
+    /// Entries share the retained byte ceiling with the other file-fact
+    /// maps (separate entry count, like the refusal map).
+    preopen_file_facts: BTreeMap<PreopenFileKey, ElfExportFacts>,
     /// Keys of this pass's file-fact maps that a lookup hit or an insertion
     /// touched. Carried entries missing here are dead for this pass (a
     /// changed pin, a replaced library, a remounted overlay) and are the
@@ -1399,6 +1633,7 @@ pub struct CaptureWorkBudget {
     /// prefer entries dead since then.
     touched_inspected_files: BTreeSet<InspectedFileKey>,
     touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
+    touched_preopen_files: BTreeSet<PreopenFileKey>,
     /// The previous pass's touched keys, installed with a carried bundle.
     /// An entry the previous pass used but this pass has not reached yet
     /// is still live for a member walked later, so it is only a fallback
@@ -1406,11 +1641,16 @@ pub struct CaptureWorkBudget {
     /// first.
     previous_touched_inspected_files: BTreeSet<InspectedFileKey>,
     previous_touched_loader_elf_facts: BTreeSet<LoaderFactsKey>,
+    previous_touched_preopen_files: BTreeSet<PreopenFileKey>,
     /// Whether this budget installed a non-empty carried bundle. Only
     /// such a budget can hold a carried entry this pass has not touched;
     /// every other budget's entries were inserted here and are touched,
     /// so it refuses a full map or byte ceiling without scanning.
     carries_file_facts: bool,
+    /// Test-only: pre-open consult hits served. Twins assert reuse
+    /// counts through this without depending on byte or timing noise.
+    #[cfg(test)]
+    preopen_hits: u64,
     /// Test-only: insertion refusals that ran the untouched-entry
     /// eviction scan. Capture and engine budgets never carry file facts
     /// and must keep the O(1) refusal.
@@ -1663,11 +1903,16 @@ impl CaptureWorkBudget {
             elf_export_facts: BTreeMap::new(),
             table_cap_refusals: BTreeMap::new(),
             loader_elf_facts: BTreeMap::new(),
+            preopen_file_facts: BTreeMap::new(),
             touched_inspected_files: BTreeSet::new(),
             touched_loader_elf_facts: BTreeSet::new(),
+            touched_preopen_files: BTreeSet::new(),
             previous_touched_inspected_files: BTreeSet::new(),
             previous_touched_loader_elf_facts: BTreeSet::new(),
+            previous_touched_preopen_files: BTreeSet::new(),
             carries_file_facts: false,
+            #[cfg(test)]
+            preopen_hits: 0,
             #[cfg(test)]
             eviction_scans: 0,
             interface_records: 0,
@@ -2302,6 +2547,61 @@ impl CaptureWorkBudget {
             value,
             bytes,
             export_cache_bytes,
+        )
+    }
+
+    /// Test-only pre-open hit count, for twins that assert reuse.
+    #[cfg(test)]
+    pub(crate) fn preopen_hits_for_test(&self) -> u64 {
+        self.preopen_hits
+    }
+
+    /// Look up pre-open facts by a key built before any open. A hit marks
+    /// the key touched like the post-open lookup.
+    pub(crate) fn preopen_facts_for(&mut self, key: &PreopenFileKey) -> Option<ElfExportFacts> {
+        let value = self.preopen_file_facts.get(key).cloned();
+        if value.is_some() {
+            self.touched_preopen_files.insert(*key);
+        }
+        value
+    }
+
+    /// Retain pre-open facts under their pre-open key. Same entry limit
+    /// value as the export facts (separate count, like the refusal map)
+    /// and the same shared byte ceiling.
+    pub(crate) fn note_preopen_facts(
+        &mut self,
+        key: PreopenFileKey,
+        value: ElfExportFacts,
+    ) -> bool {
+        if !self.may_mutate_retained_state() {
+            return false;
+        }
+        let bytes = preopen_cache_bytes(&key, &value);
+        let entry_limit = self
+            .pass
+            .inventory_limits()
+            .map(|limits| limits.retained.export_cache_entries)
+            .or(Some(CAPTURE_EXPORT_CACHE_ENTRIES));
+        let byte_limit = self.retained_byte_limit();
+        FileFactRetention {
+            retained_cache_bytes: &mut self.retained_cache_bytes,
+            #[cfg(test)]
+            eviction_scans: &mut self.eviction_scans,
+            byte_limit,
+            entry_limit,
+            carries_file_facts: self.carries_file_facts,
+        }
+        .retain(
+            &mut self.preopen_file_facts,
+            TouchedKeys {
+                current: &mut self.touched_preopen_files,
+                previous: &self.previous_touched_preopen_files,
+            },
+            key,
+            value,
+            bytes,
+            preopen_cache_bytes,
         )
     }
 
@@ -9068,6 +9368,10 @@ fn scan_view_examined_mode(
             .collect();
         budget.drop_unmapped_decode_cursors(pid, start_time, &mapped);
     }
+    // One mount-namespace comparison serves every pre-open consult below.
+    // Charged: the comparison is consult work even when no group consults.
+    let _ = budget.spend(1);
+    let consult_same_mount_ns = preopen_same_mount_ns(view);
     for (key, group) in ordered {
         if budget.scan_stopped() {
             break;
@@ -9211,6 +9515,51 @@ fn scan_view_examined_mode(
             continue;
         };
         let path = usable.display().to_string();
+        // Pre-open consult: reuse proven facts for this exact generation
+        // without opening it. A hit on a non-provider file synthesizes
+        // the examined entry and skips the open, the guards and the
+        // parse; anything else (including hook-bearing files, which
+        // always re-prove) takes the full path below.
+        let mut preopen_key: Option<PreopenFileKey> = None;
+        // Hinted and excluded runs evaluate per-file attribution below
+        // that needs the open file, so they keep the full path; the
+        // consult only skips unhinted, unexcluded examinations.
+        if deleted_open.is_none()
+            && !narrowed_out
+            && custody.is_none()
+            && request.hints.is_empty()
+            && exclude_paths.is_empty()
+            && exclude_names.is_empty()
+        {
+            match preopen_consult(
+                view,
+                key,
+                &group,
+                &map_index,
+                &usable,
+                budget,
+                consult_same_mount_ns,
+            ) {
+                PreopenConsult::Skip => {}
+                PreopenConsult::Miss(candidate) => {
+                    preopen_key = Some(candidate);
+                }
+                PreopenConsult::Hit(facts, mapped) => {
+                    let hit_has_hooks = facts
+                        .exports
+                        .iter()
+                        .any(|(name, _)| request.hooks.abi(name).is_some());
+                    if !hit_has_hooks {
+                        examined.push(ExaminedObject {
+                            key,
+                            identity: mapped.identity,
+                            key_is_identity: mapped.key_is_identity(key),
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
         let sub_open = Instant::now();
         // A joined replaced file is already open and proven above; every
         // other group opens in the target root (with the fallback).
@@ -9336,6 +9685,16 @@ fn scan_view_examined_mode(
             // Opened, identified, and read: examined, and not a provider.
             if let Some(held) = held {
                 offer_examined_file(&mut examined, &mut custody, key, held, file, budget);
+            }
+            // Warm the pre-open consult: proven non-provider facts under
+            // the pre-open key. Overlay-unproven files resolve later via
+            // the witness, so only cleanly guarded examinations store;
+            // hook-bearing files never store (their hits fall through to
+            // a fresh proof below).
+            if let Some(candidate) = preopen_key
+                && matches!(guarded, GuardOutcome::Proven)
+            {
+                budget.note_preopen_facts(candidate, facts.clone());
             }
             continue;
         }

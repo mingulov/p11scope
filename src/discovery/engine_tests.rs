@@ -7047,6 +7047,18 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
         ),
         (
             "live discovery generation",
+            "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+        ),
+        (
+            "live discovery generation",
             "a stale generation report was contradicted or unprovable on pin recheck; retirement deferred",
         ),
         (
@@ -7134,6 +7146,15 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     assert_eq!(
         reasons
             .iter()
+            .filter(|reason| **reason
+                == "process generation unverified mid-flight; exit or change unproven")
+            .count(),
+        3,
+        "{reasons:?}"
+    );
+    assert_eq!(
+        reasons
+            .iter()
             .filter(|reason| **reason == "scan budget exhausted")
             .count(),
         4,
@@ -7155,17 +7176,18 @@ fn folded_pairs_publish_and_project_with_every_record_kept() {
     );
 }
 
-/// Drift guard for all eight folded gap-noise pairs (three mid-flight
-/// changed, one stale-deferral, one permission-refusal, one
-/// unreadable-member, two loader-context): filing sites without a
-/// cheap live seam pin their exact strings in source, so a reword
-/// must update the projection allowlist in the same patch instead of
-/// silently unfolding back to generic. Each pair also asserts its
-/// `capture_skipped_out` projection.
+/// Drift guard for all eleven folded gap-noise pairs (three
+/// mid-flight changed, three unverified-generation, one
+/// stale-deferral, one permission-refusal, one unreadable-member, two
+/// loader-context): filing sites without a cheap live seam pin their
+/// exact strings in source, so a reword must update the projection
+/// allowlist in the same patch instead of silently unfolding back to
+/// generic. Each pair also asserts its `capture_skipped_out`
+/// projection.
 #[test]
 fn folded_gap_noise_pairs_match_their_filing_sites() {
     let source = include_str!("engine.rs");
-    // (subject, reason, public reason): the six pairs filed as
+    // (subject, reason, public reason): the nine pairs filed as
     // quoted literals in `engine.rs` source.
     let pairs: &[(&str, &str, &str)] = &[
         (
@@ -7182,6 +7204,21 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "live inventory generation",
             "an exact retained or newly opened process generation changed during post-retirement preflight",
             "process exited or changed mid-flight",
+        ),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
+        ),
+        (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+            "process generation unverified mid-flight; exit or change unproven",
         ),
         (
             "live discovery generation",
@@ -7219,7 +7256,7 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
             "folded pair ({subject}, {reason})"
         );
     }
-    // The seventh pair lives in split `UNREADABLE_UNCHECKED_*`
+    // The tenth pair lives in split `UNREADABLE_UNCHECKED_*`
     // constants, so its filing site pins the constant definitions
     // instead of one quoted literal (the joined reason still asserts
     // its projection).
@@ -7242,7 +7279,7 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         projected.reason,
         "process unreadable mid-flight; not checked this pass"
     );
-    // The eighth pair lives in split `UNREADABLE_PERMISSION_*`
+    // The eleventh pair lives in split `UNREADABLE_PERMISSION_*`
     // constants, pinned the same way.
     for marker in [
         "UNREADABLE_PERMISSION_SUBJECT",
@@ -7263,6 +7300,57 @@ fn folded_gap_noise_pairs_match_their_filing_sites() {
         projected.reason,
         "process unreadable mid-flight; permission denied"
     );
+    // The changed-generation label is constructor-gated: each of its
+    // three reasons appears exactly once in the filing source, inside
+    // `changed_generation_skip` (which requires a `GenerationProof`
+    // token). A pasted literal at any call site fails here instead of
+    // filing the label without proof.
+    let changed_ctor = source
+        .splitn(2, "fn changed_generation_skip")
+        .nth(1)
+        .expect("the changed-generation constructor must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for reason in [
+        "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+        "an exact retained or newly opened process generation changed during inventory preflight",
+        "an exact retained or newly opened process generation changed during post-retirement preflight",
+    ] {
+        assert_eq!(
+            changed_ctor.matches(reason).count(),
+            1,
+            "the constructor must hold the changed pair exactly once: {reason}"
+        );
+        assert!(
+            !source.replacen(changed_ctor, "", 1).contains(reason),
+            "the changed pair must not be pasted outside its constructor: {reason}"
+        );
+    }
+    // The unverified-generation gap is constructor-gated the same way:
+    // every unproven outcome files through `unproven_generation_skip`.
+    let unproven_ctor = source
+        .splitn(2, "fn unproven_generation_skip")
+        .nth(1)
+        .expect("the unverified-generation constructor must exist")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    for reason in [
+        "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+        "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+        "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+    ] {
+        assert_eq!(
+            unproven_ctor.matches(reason).count(),
+            1,
+            "the constructor must hold the unverified pair exactly once: {reason}"
+        );
+        assert!(
+            !source.replacen(unproven_ctor, "", 1).contains(reason),
+            "the unverified pair must not be pasted outside its constructor: {reason}"
+        );
+    }
     // Retired changed-generation pairs never come back: no member
     // path and no terminal record proves exit or change, so their
     // strings stay out of the filing source. A reintroduction fails
@@ -97020,10 +97108,12 @@ fn mo_bind_and_carry(pins: &mut PinnedObjects, modules: &[ScannedModule]) -> Vec
 
 /// How many currency-check refusals the engine recorded: a carried-riding
 /// candidate refused at the generation check records the loud `live
-/// discovery generation` marker. An entry that returns early records
-/// nothing, and a refusal for any other cause records a different
-/// marker — so the count proves the entry attempted the apply and
-/// refused for that specific cause.
+/// discovery generation` marker — the changed row when an affected
+/// original proves exit or change, else the unverified row (the
+/// carried view has no retained pin to judge). An entry that returns
+/// early records nothing, and a refusal for any other cause records a
+/// different marker — so the count proves the entry attempted the
+/// apply and refused for that specific cause.
 fn mo_generation_markers(engine: &Engine) -> usize {
     engine
         .counters
@@ -97031,8 +97121,10 @@ fn mo_generation_markers(engine: &Engine) -> usize {
         .iter()
         .filter(|skip| {
             skip.subject == "live discovery generation"
-                && skip.reason
+                && (skip.reason
                     == "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+                    || skip.reason
+                        == "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged")
         })
         .count()
 }

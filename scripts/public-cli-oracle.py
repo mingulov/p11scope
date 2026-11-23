@@ -80,16 +80,17 @@ DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery 
 # Mid-flight rows: the render layer folds the three changed-generation
 # pairs to the changed reason, the live stale-deferral mark to its
 # own deferral reason, the permission-refusal mark to its own
-# permission row, and the unreadable-member mark to its own
-# unreadable row (never dropped, never a pid). No row proves an
+# permission row, the unreadable-member mark to its own unreadable
+# row, and the three unverified-generation pairs to their own
+# unverified row (never dropped, never a pid). No row proves an
 # exit — the changed row covers proven exit-or-change, the deferral
-# row is filed for a possibly still-live process, and the permission
-# and unreadable rows for a possibly still-live, unchanged process
-# whose read was denied or failed — so an exit excuse requires proof
-# the process actually exited, which no public row carries. The
-# oracle therefore never qualifies any of these rows: any report
-# containing one fails closed at the gap gate, in every mode. Kept
-# as named constants so the vocabulary pin
+# row is filed for a possibly still-live process, and the permission,
+# unreadable and unverified rows for a possibly still-live, unchanged
+# process whose read was denied, failed, or unproven — so an exit
+# excuse requires proof the process actually exited, which no public
+# row carries. The oracle therefore never qualifies any of these
+# rows: any report containing one fails closed at the gap gate, in
+# every mode. Kept as named constants so the vocabulary pin
 # (test_skip_reason_vocabulary.py) keeps them tied to the producer.
 # (Historical constant name: the changed row no longer claims an
 # exit.)
@@ -97,6 +98,7 @@ EXIT_MID_FLIGHT_SKIP = {"name": "discovery subject", "reason": "process exited o
 STALE_DEFERRAL_SKIP = {"name": "discovery subject", "reason": "stale process report deferred mid-flight"}
 PERMISSION_REFUSAL_SKIP = {"name": "discovery subject", "reason": "process unreadable mid-flight; permission denied"}
 UNREADABLE_NOT_CHECKED_SKIP = {"name": "discovery subject", "reason": "process unreadable mid-flight; not checked this pass"}
+GENERATION_UNVERIFIED_SKIP = {"name": "discovery subject", "reason": "process generation unverified mid-flight; exit or change unproven"}
 # R1 fixed row: live attached counting slots a mid-capture global
 # retirement detached with no same-apply reattach. The affected-slot
 # count rides in evidence.coverage_retired_slots, never in the reason.
@@ -777,11 +779,11 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # No mid-flight arm: no public mid-flight row proves an
     # exit — the changed row covers proven exit-or-change without
     # naming which, the deferral row is filed for a possibly
-    # still-live process, and the permission and unreadable rows
-    # for a possibly still-live, unchanged one. An exit excuse
-    # requires proof the process actually exited; until the
-    # producer publishes per-row proof, every report carrying any
-    # of these rows fails closed at the gap gate, in every mode.
+    # still-live process, and the permission, unreadable and
+    # unverified rows for a possibly still-live, unchanged one. An
+    # exit excuse requires proof the process actually exited; until
+    # the producer publishes per-row proof, every report carrying
+    # any of these rows fails closed at the gap gate, in every mode.
     # The quiet arm above keeps the pure single-deferral shape.
     # Wave-1 lone-gap lane 2026-11-12 (extends the Nov-9 ambient
     # ruling to the system and mt-system cells): quiet VNG guests

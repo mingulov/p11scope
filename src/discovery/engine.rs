@@ -14095,6 +14095,148 @@ fn delta_module_owned_by_stale_view(
     !known
 }
 
+/// Proof that a stale generation actually ended or changed: the ONLY
+/// token that can file the changed-generation label. Each variant is
+/// positive pin evidence from `original_generation_state`; anything
+/// else (poll failure, unreadable `/proc`, missing custody, a
+/// contradicted recheck) is `GenerationUnproven` and files the named
+/// not-proven gap instead. Constructed solely by `prove_stale_set`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationProof {
+    /// At least one affected original provably exited.
+    ProvenExit,
+    /// At least one affected original provably changed (PID reuse: the
+    /// same numeric PID now names a different start time).
+    ProvenChange,
+}
+
+/// Why a stale generation could NOT be proven exited or changed: every
+/// other outcome of the pin check. All variants file the same named
+/// not-proven gap (never the changed label); the variant rides in
+/// diagnostics, never in the public row. Budget refusals never reach
+/// this classifier — the work ceiling stops the pass upstream and files
+/// the scan-budget row, which likewise claims neither event — so no
+/// budget variant exists here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationUnproven {
+    /// The pin check failed (pidfd poll error, `/proc` read error).
+    PinFailure,
+    /// The pin check was denied (EACCES/EPERM).
+    PermissionDenied,
+    /// No view is retained for the stale ID (missing custody).
+    MissingCustody,
+    /// The pin re-reads Current: the stale report was contradicted (a
+    /// transient poll error ahead of a successful recheck).
+    Contradicted,
+    /// Any other unclassified failure.
+    Unknown,
+}
+
+/// The three sites that may file the changed-generation label, each
+/// with its exact internal pair. The pairs live ONLY in the two
+/// constructors below; the drift guard asserts the literals appear
+/// nowhere else in this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangedGenerationSite {
+    Candidate,
+    InventoryPreflight,
+    PostRetirementPreflight,
+}
+
+/// The ONE constructor for the changed-generation internal pair: it
+/// takes a `GenerationProof`, which only `prove_stale_set` can produce
+/// from positive pin evidence. No other path can file this label. Both
+/// proof variants file the same exit-or-change row, which never names
+/// which event proved it.
+fn changed_generation_skip(proof: GenerationProof, site: ChangedGenerationSite) -> Skipped {
+    // Total: a future proof variant must choose its row here.
+    match proof {
+        GenerationProof::ProvenExit | GenerationProof::ProvenChange => {}
+    }
+    let (subject, reason) = match site {
+        ChangedGenerationSite::Candidate => (
+            "live discovery generation",
+            "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+        ),
+        ChangedGenerationSite::InventoryPreflight => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during inventory preflight",
+        ),
+        ChangedGenerationSite::PostRetirementPreflight => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation changed during post-retirement preflight",
+        ),
+    };
+    Skipped {
+        subject: subject.into(),
+        reason: reason.into(),
+    }
+}
+
+/// The ONE constructor for the unverified-generation internal pair:
+/// every `GenerationUnproven` outcome at every site files the named
+/// not-proven gap, which claims neither exit nor change.
+fn unproven_generation_skip(unproven: GenerationUnproven, site: ChangedGenerationSite) -> Skipped {
+    // Total: a future unproven outcome must map to the gap here, so no
+    // new failure mode can silently become an exit/change claim.
+    match unproven {
+        GenerationUnproven::PinFailure
+        | GenerationUnproven::PermissionDenied
+        | GenerationUnproven::MissingCustody
+        | GenerationUnproven::Contradicted
+        | GenerationUnproven::Unknown => {}
+    }
+    let (subject, reason) = match site {
+        ChangedGenerationSite::Candidate => (
+            "live discovery generation",
+            "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+        ),
+        ChangedGenerationSite::InventoryPreflight => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+        ),
+        ChangedGenerationSite::PostRetirementPreflight => (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+        ),
+    };
+    Skipped {
+        subject: subject.into(),
+        reason: reason.into(),
+    }
+}
+
+/// One observation of a stale generation set: the first proof (if any
+/// affected original proves exit or change), the first unproven reason
+/// (otherwise), and whether every retained stale view proved (the
+/// inventory silence condition). Classified once so the silence check
+/// and the label share the observation — and so tests script one
+/// answer per stale ID.
+struct StaleSetVerdict {
+    first_proof: Option<GenerationProof>,
+    first_unproven: Option<GenerationUnproven>,
+    all_retained_proven: bool,
+}
+
+/// Map one pin verdict to proof or unproven reason: `None` (no view
+/// retained, or a scripted missing answer) has no custody; `Current`
+/// contradicts the stale report; an error is a permission denial when
+/// it carries the EACCES/EPERM markers, else a pin failure.
+fn classify_generation_state(
+    state: Option<Result<OriginalGenerationState, String>>,
+) -> Result<GenerationProof, GenerationUnproven> {
+    match state {
+        Some(Ok(OriginalGenerationState::Exited)) => Ok(GenerationProof::ProvenExit),
+        Some(Ok(OriginalGenerationState::Reused)) => Ok(GenerationProof::ProvenChange),
+        Some(Ok(OriginalGenerationState::Current)) => Err(GenerationUnproven::Contradicted),
+        Some(Err(detail)) if is_permission_denial(&detail) => {
+            Err(GenerationUnproven::PermissionDenied)
+        }
+        Some(Err(_)) => Err(GenerationUnproven::PinFailure),
+        None => Err(GenerationUnproven::MissingCustody),
+    }
+}
+
 fn validate_loader_record_context<'a>(
     registry: &'a mut LoaderRegistry,
     terminal_owner: Option<LoaderContextId>,
@@ -19675,10 +19817,16 @@ impl Engine {
                     "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",
                 );
             } else {
-                self.mark_partial(
-                    "live discovery generation",
-                    "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
-                );
+                // Staleness alone never proves: the changed label
+                // needs positive exit/change proof from at least one
+                // affected original, else the named not-proven gap.
+                let skip = match self.prove_stale_set(&outcome.stale_views, extra_views) {
+                    Ok(proof) => changed_generation_skip(proof, ChangedGenerationSite::Candidate),
+                    Err(unproven) => {
+                        unproven_generation_skip(unproven, ChangedGenerationSite::Candidate)
+                    }
+                };
+                self.mark_partial(&skip.subject, &skip.reason);
             }
             if crate::run::capture_diagnostics_on() && carries_run_learned {
                 eprintln!("p11scope: run-learned apply refused on stale generation");
@@ -28848,27 +28996,127 @@ impl Engine {
         ))
     }
 
-    /// Whether an inventory preflight's stale views include a generation
-    /// that was *lost*, not one that merely ended. A newly opened view is
-    /// counted as before; a retained view whose original pin proves it exited
-    /// is the process ending, which `queue_retirement` turns into an expected
-    /// removal — and for a named target, the ordinary end of the capture.
-    /// Asked before the retirement drops the view, while the pin is still held.
-    fn inventory_preflight_lost_generation(
+    /// Classify one stale view's generation from its pin: positive
+    /// exit/reuse proof, or the reason proof is unavailable. Retained
+    /// views read through `retained_generation_state` (scripted in
+    /// tests); newcomers read their live pin, or a scripted State
+    /// answer in stale-ID order when the test armed one (fault
+    /// injection for the preflight twins). Unknown IDs have no
+    /// custody at all. Asked before the retirement drops the view,
+    /// while the pin is still held.
+    fn classify_stale_view(
+        &self,
+        id: ProcessViewId,
+        extra_views: &[&ProcessView],
+    ) -> Result<GenerationProof, GenerationUnproven> {
+        if self.views.iter().any(|view| view.id() == id) {
+            return classify_generation_state(self.retained_generation_state(id));
+        }
+        if let Some(view) = extra_views.iter().find(|view| view.id() == id) {
+            #[cfg(test)]
+            if let Some(answer) = self.pop_pin_probe_state() {
+                return classify_generation_state(answer);
+            }
+            return classify_generation_state(Some(view.original_generation_state()));
+        }
+        Err(GenerationUnproven::MissingCustody)
+    }
+
+    /// Judge a stale generation set in one observation: the first proof
+    /// (if any affected original proves exit or change), the first
+    /// unproven reason (otherwise), and whether every retained stale
+    /// view proved. The single authority behind every
+    /// changed-generation label; staleness alone never proves.
+    fn judge_stale_set(
+        &self,
+        stale: &BTreeSet<ProcessViewId>,
+        retained_stale: &BTreeSet<ProcessViewId>,
+        extra_views: &[&ProcessView],
+    ) -> StaleSetVerdict {
+        let mut verdict = StaleSetVerdict {
+            first_proof: None,
+            first_unproven: None,
+            all_retained_proven: true,
+        };
+        for id in stale {
+            match self.classify_stale_view(*id, extra_views) {
+                Ok(proof) => {
+                    verdict.first_proof.get_or_insert(proof);
+                }
+                Err(unproven) => {
+                    verdict.first_unproven.get_or_insert(unproven);
+                    if retained_stale.contains(id) {
+                        verdict.all_retained_proven = false;
+                    }
+                }
+            }
+        }
+        verdict
+    }
+
+    /// Prove a stale generation set for the changed-generation label:
+    /// `Ok` when at least one affected original has positive exit or
+    /// reuse proof, else the first unproven reason.
+    fn prove_stale_set(
+        &self,
+        stale: &BTreeSet<ProcessViewId>,
+        extra_views: &[&ProcessView],
+    ) -> Result<GenerationProof, GenerationUnproven> {
+        // The candidate path has no retained/newcomer partition (its
+        // silence gate already ran); only proof-or-unproven matters.
+        let verdict = self.judge_stale_set(stale, &BTreeSet::new(), extra_views);
+        match verdict.first_proof {
+            Some(proof) => Ok(proof),
+            None => Err(verdict
+                .first_unproven
+                .unwrap_or(GenerationUnproven::Unknown)),
+        }
+    }
+
+    /// Decide an inventory preflight's stale views: `None` when the
+    /// generations merely ended (no newly-opened stale ID and every
+    /// retained stale view proves exit or change — the existing
+    /// proven-exit suppression, silent, which `queue_retirement` turns
+    /// into expected removals); otherwise the skip to file — the
+    /// changed-generation label when at least one affected original
+    /// proves exit or change, else the named not-proven gap. Preserves
+    /// every loud/silent decision; only the label changes, and only
+    /// from unproven to unverified.
+    fn inventory_preflight_generation_skip(
         &self,
         retained_stale: &BTreeSet<ProcessViewId>,
         stale: &BTreeSet<ProcessViewId>,
-    ) -> bool {
-        self.retained_generation_lost(retained_stale)
-            || stale.iter().any(|view| !retained_stale.contains(view))
+        extra_views: &[&ProcessView],
+        site: ChangedGenerationSite,
+    ) -> Option<Skipped> {
+        let newly_opened = stale.iter().any(|view| !retained_stale.contains(view));
+        let verdict = self.judge_stale_set(stale, retained_stale, extra_views);
+        if !newly_opened && verdict.all_retained_proven {
+            return None;
+        }
+        match verdict.first_proof {
+            Some(proof) => Some(changed_generation_skip(proof, site)),
+            None => Some(unproven_generation_skip(
+                verdict
+                    .first_unproven
+                    .unwrap_or(GenerationUnproven::Unknown),
+                site,
+            )),
+        }
     }
 
-    /// Whether any of these retained views changed generation other than by
-    /// a provable exit of its original process.
-    fn retained_generation_lost(&self, retained_stale: &BTreeSet<ProcessViewId>) -> bool {
+    /// Whether any retained stale view's fate is unproven (its pin
+    /// could not judge exit or change). Gates the named-target bail:
+    /// a proven exit or change ends orderly through retirement, but an
+    /// unproven target generation must not be observed further.
+    fn retained_generation_unproven(
+        &self,
+        retained_stale: &BTreeSet<ProcessViewId>,
+        extra_views: &[&ProcessView],
+    ) -> bool {
         retained_stale
             .iter()
-            .any(|view| !self.original_exited(*view))
+            .any(|view| self.classify_stale_view(*view, extra_views).is_err())
     }
 
     #[track_caller]
@@ -34323,8 +34571,14 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
-            let generation_lost =
-                self.inventory_preflight_lost_generation(&retained_stale, &admission.stale_views);
+            let extra_views: Vec<&ProcessView> =
+                new_views.iter().map(|(view, _, _)| view).collect();
+            let generation_skip = self.inventory_preflight_generation_skip(
+                &retained_stale,
+                &admission.stale_views,
+                &extra_views,
+                ChangedGenerationSite::InventoryPreflight,
+            );
             self.queue_stale_views(&retained_stale, pending_views);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
@@ -34332,13 +34586,9 @@ impl Engine {
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            if generation_lost {
-                self.mark_live_loss(
-                    "live inventory generation",
-                    "an exact retained or newly opened process generation changed during inventory preflight",
-                );
-            } else {
-                self.invalidate_causal_timing();
+            match generation_skip {
+                Some(skip) => self.mark_live_loss(&skip.subject, &skip.reason),
+                None => self.invalidate_causal_timing(),
             }
             changed |= self.process_discovery_records(
                 session,
@@ -34785,22 +35035,26 @@ impl Engine {
                 .intersection(&retained_ids)
                 .copied()
                 .collect();
-            let generation_lost =
-                self.inventory_preflight_lost_generation(&retained_stale, &admission.stale_views);
-            let retained_lost = self.retained_generation_lost(&retained_stale);
+            let extra_views: Vec<&ProcessView> =
+                new_views.iter().map(|(view, _, _)| view).collect();
+            let generation_skip = self.inventory_preflight_generation_skip(
+                &retained_stale,
+                &admission.stale_views,
+                &extra_views,
+                ChangedGenerationSite::PostRetirementPreflight,
+            );
+            let retained_unproven =
+                self.retained_generation_unproven(&retained_stale, &extra_views);
             for (view, _, _) in new_views.iter() {
                 if admission.stale_views.contains(&view.id()) {
                     self.request_refresh(view.pid(), crate::attach::monotonic_ns());
                     failed_refresh_pids.insert(view.pid());
                 }
             }
-            if generation_lost {
-                self.mark_live_loss(
-                    "live inventory generation",
-                    "an exact retained or newly opened process generation changed during post-retirement preflight",
-                );
-            } else if !admission.stale_views.is_empty() {
-                self.invalidate_causal_timing();
+            match generation_skip {
+                Some(skip) => self.mark_live_loss(&skip.subject, &skip.reason),
+                None if !admission.stale_views.is_empty() => self.invalidate_causal_timing(),
+                None => {}
             }
             let outcome = ApplyOutcome {
                 stale_views: retained_stale,
@@ -34834,7 +35088,7 @@ impl Engine {
             for view in removed.iter().chain(&refreshed_ok) {
                 self.scan_inputs.remove(view);
             }
-            if matches!(self.scope, Scope::Pid(_)) && retained_lost {
+            if matches!(self.scope, Scope::Pid(_)) && retained_unproven {
                 bail!("the named process generation changed during inventory preflight");
             }
             return Ok(changed);

@@ -125,7 +125,7 @@ TERMINAL_INTERNAL_REASON = (
 UNVERIFIED_PUBLIC_ROW = {
     "name": "discovery subject",
     "reason": ("process generation unverified mid-flight; "
-               "not proven exited or changed"),
+               "exit or change unproven"),
 }
 TERMINAL_PUBLIC_ROW = {
     "name": "discovery subject",

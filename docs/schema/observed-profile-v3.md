@@ -1193,7 +1193,7 @@ exactly:
   The counts ride in `evidence.deep_scan_selection`, never in the
   reason, which carries no digits.
 
-Gap-noise folds file under the discovery subject with six finite
+Gap-noise folds file under the discovery subject with seven finite
 reasons (in addition to the v2 list and the reasons above). Each
 record is `{name: "discovery subject", reason}` with `reason` exactly
 one of:
@@ -1201,13 +1201,13 @@ one of:
 - `process exited or changed mid-flight`: one of three mid-flight
   changed-generation pairs — a short-lived process exited or
   changed while discovery was mid-read (candidate or inventory
-  preflight), each backed by a pin-currency check that the
-  generation is no longer current. Exact internal pairs only; near
-  misses stay generic. The row covers exit-or-change without
-  naming which: a process whose pid was reused is still running.
-  Unreadable members and unresolvable terminal records never file
-  this row: without proof of exit or change they file the
-  unreadable row below (or the generic redaction for records).
+  preflight), each backed by positive exit or reuse proof from the
+  retained pin for at least one affected original. Exact internal
+  pairs only; near misses stay generic. The row covers
+  exit-or-change without naming which: a process whose pid was
+  reused is still running. Only the typed proof token files this
+  row: unproven pins, unreadable members and unresolvable terminal
+  records never do.
 - `stale process report deferred mid-flight`: the live
   stale-deferral mark — the pin recheck contradicted the loss
   report or could not judge it, so retirement was deferred and the
@@ -1221,6 +1221,13 @@ one of:
   failed scan, or any unclassified failure — while the process may
   be live and unchanged. This row never claims exit or change; a
   work-ceiling stop files the scan-budget row instead.
+- `process generation unverified mid-flight; exit or change unproven`:
+  one of three unverified-generation pairs — a stale candidate or
+  inventory preflight whose pin could not prove exit or change
+  (poll failure, unreadable `/proc`, missing custody, or a
+  contradicted recheck) while the process may be live and
+  unchanged. This row never claims either event; only proven
+  exit or change files the changed row above.
 - `scan budget exhausted`: a work-ceiling stop, bare or wrapped in
   a scan refusal, whatever subject filed it — including a member
   the exhausted budget never read. Function subjects keep
@@ -1234,10 +1241,10 @@ single reason `process exited mid-flight`, which claimed an exit
 even for a still-live process (and, for a refused read, an exit or
 change even for a live, unchanged one). v0.8.0 emits the split
 vocabulary instead: the changed row above, the deferral row, the
-permission row, and the unreadable row. The producer no longer emits
-the single row; the schema and the evidence checker still accept it,
-so archived captures keep validating. Validators pinned to the old
-vocabulary need the revised one.
+permission row, the unreadable row, and the unverified row. The
+producer no longer emits the single row; the schema and the evidence
+checker still accept it, so archived captures keep validating.
+Validators pinned to the old vocabulary need the revised one.
 
 Folding renames rows, never drops them: JSON keeps one row per
 underlying internal record. The text names each folded row with its

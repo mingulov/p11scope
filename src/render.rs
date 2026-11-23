@@ -2039,15 +2039,15 @@ pub(crate) const LEARNED_UNMARKED_REASON: &str = "some filesystems were not mark
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 /// Gap-noise folds: mid-flight changed generations, the live
 /// stale-deferral mark, permission refusals, unreadable members,
-/// scan-budget stops and loader-context misses project to these
-/// finite public reasons instead of the generic redaction. Each
-/// folds exact internal pairs only (the ceiling by its fixed reason
-/// sentence, whatever subject filed it); function subjects always
-/// keep their entry row, and folding renames rows, never drops them.
-/// Neither mid-flight row claims an exit: proven exits are ordinary
-/// ends and file no public row. The permission and unreadable rows
-/// claim neither exit nor change: a refused or failed read proves
-/// neither.
+/// unverified generations, scan-budget stops and loader-context
+/// misses project to these finite public reasons instead of the
+/// generic redaction. Each folds exact internal pairs only (the
+/// ceiling by its fixed reason sentence, whatever subject filed it);
+/// function subjects always keep their entry row, and folding renames
+/// rows, never drops them. Neither mid-flight row claims an exit:
+/// proven exits are ordinary ends and file no public row. The
+/// permission, unreadable and unverified rows claim neither exit nor
+/// change: a refused, failed or unproven read proves neither.
 const MID_FLIGHT_REASON: &str = "process exited or changed mid-flight";
 /// The live stale-deferral mark's own public reason: it is filed
 /// for a possibly still-live process with retirement deferred, so
@@ -2062,6 +2062,12 @@ const PERMISSION_REFUSAL_REASON: &str = "process unreadable mid-flight; permissi
 /// an unclassified reason, so it must never call the process exited
 /// or changed.
 const UNREADABLE_NOT_CHECKED_REASON: &str = "process unreadable mid-flight; not checked this pass";
+/// The unverified-generation mark's own public reason: it is filed
+/// for a possibly still-live, unchanged process whose stale report
+/// the pin could not prove, so it must never call the process exited
+/// or changed.
+const GENERATION_UNVERIFIED_REASON: &str =
+    "process generation unverified mid-flight; exit or change unproven";
 const SCAN_BUDGET_REASON: &str = "scan budget exhausted";
 const LOADER_CONTEXT_REASON: &str = "no unique attached loader context";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
@@ -2283,6 +2289,28 @@ fn is_unreadable_not_checked_pair(subject: &str, reason: &str) -> bool {
         )
 }
 
+/// Whether an internal skip is one of the three unverified-generation
+/// pairs: a stale candidate or inventory preflight the pin could not
+/// prove exited or changed, filed for a possibly still-live,
+/// unchanged process. Exact subject and reason, never prefix or
+/// substring: near misses stay generic. None must ever fold into the
+/// changed row: an unproven check proves neither exit nor change.
+fn is_generation_unverified_pair(subject: &str, reason: &str) -> bool {
+    matches!(
+        (subject, reason),
+        (
+            "live discovery generation",
+            "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+        ) | (
+            "live inventory generation",
+            "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+        )
+    )
+}
+
 /// Whether an internal skip is one of the two no-unique-loader-context
 /// pairs (exact): kept distinct from the ceiling row, a different
 /// operator action.
@@ -2396,6 +2424,8 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         PERMISSION_REFUSAL_REASON
     } else if is_unreadable_not_checked_pair(&s.subject, &s.reason) {
         UNREADABLE_NOT_CHECKED_REASON
+    } else if is_generation_unverified_pair(&s.subject, &s.reason) {
+        GENERATION_UNVERIFIED_REASON
     } else if s
         .reason
         .contains(crate::discovery::scan::WORK_CEILING_REASON)
@@ -4915,6 +4945,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                             && skip.reason != STALE_DEFERRAL_REASON
                             && skip.reason != PERMISSION_REFUSAL_REASON
                             && skip.reason != UNREADABLE_NOT_CHECKED_REASON
+                            && skip.reason != GENERATION_UNVERIFIED_REASON
                             && skip.reason != SCAN_BUDGET_REASON
                             && skip.reason != LOADER_CONTEXT_REASON
                         {
@@ -4957,6 +4988,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec
                     STALE_DEFERRAL_REASON,
                     PERMISSION_REFUSAL_REASON,
                     UNREADABLE_NOT_CHECKED_REASON,
+                    GENERATION_UNVERIFIED_REASON,
                     SCAN_BUDGET_REASON,
                     LOADER_CONTEXT_REASON,
                     LEARNED_FIRST_RUN_REASON,
@@ -20314,7 +20346,7 @@ pub(crate) mod tests {
             assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
             assert_eq!(
                 projected.reason,
-                "process generation unverified mid-flight; not proven exited or changed",
+                "process generation unverified mid-flight; exit or change unproven",
                 "{subject} {reason}"
             );
             assert!(
@@ -20361,9 +20393,7 @@ pub(crate) mod tests {
         assert_eq!(ev.skipped.len(), 3);
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
-            text.contains(
-                "process generation unverified mid-flight; not proven exited or changed: 3"
-            ),
+            text.contains("process generation unverified mid-flight; exit or change unproven: 3"),
             "{text}"
         );
         assert!(!text.contains("discovery steps unavailable"), "{text}");

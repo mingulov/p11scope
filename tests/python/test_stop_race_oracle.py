@@ -299,7 +299,22 @@ class OracleTests(unittest.TestCase):
             box["workload"][-1] = "LEDGER " + json.dumps(payload)
             for row in box["report"]["functions"]:
                 row["calls"] = 4
+            box["report"]["capture"]["scope"] = "cgroup"
         self.run_case(mutate, command="run", ledger_complete=0)
+
+    def test_sweep_run_reports_its_owned_cgroup_scope(self):
+        # A root `run` captures its own run cgroup: capture.scope reads
+        # `cgroup` (docs/usage.md); `pid` is the degraded no-cgroup
+        # path, which the root sweep never takes, and `system` is
+        # another command.
+        def scoped(scope):
+            def mutate(box):
+                box["report"]["capture"]["scope"] = scope
+            return mutate
+        self.run_case(scoped("cgroup"), command="run")
+        for scope in ("pid", "system"):
+            with self.subTest(scope=scope):
+                self.run_case(scoped(scope), command="run", want=1)
 
     def test_sweep_inventory_complete_equal_pass(self):
         self.run_case(command="inventory-system")

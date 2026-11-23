@@ -36,7 +36,9 @@ NAMES = BASE["NAMES"]
 LOSS_COUNTERS = BASE["LOSS_COUNTERS"]
 VERDICT = BASE["VERDICT"]
 
-PROFILE_COMMANDS = {"profile-pid": "pid", "profile-system": "system", "run": "pid"}
+# `run` captures its own run cgroup as root (capture.scope `cgroup`;
+# `pid` only on the degraded no-cgroup path, see docs/usage.md).
+PROFILE_COMMANDS = {"profile-pid": "pid", "profile-system": "system", "run": "cgroup"}
 SWEEP_COMMANDS = set(PROFILE_COMMANDS) | {"inventory-system"}
 STORAGE_REFUSAL = "provider_storage_refused"
 # Call-path loss is never a newcomer backlog: dropped or unsettled calls are

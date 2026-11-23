@@ -97,7 +97,11 @@ def decided_report():
                      "admission": {"state": "admitted", "endpoints": 68},
                      "lifecycle": "mapped",
                      "paths": [MODPATH]}],
-        "callers": [{"id": "c0", "pid": 100}, {"id": "c1", "pid": 101}],
+        # Recover and continue: each refused caller activates from
+        # fresh proof on a later pass and ends native_exact.
+        "callers": [
+            {"id": "c0", "pid": 100, "image": {"authority": "native_exact"}},
+            {"id": "c1", "pid": 101, "image": {"authority": "native_exact"}}],
         "edges": [{"caller": "c0", "module": "m0"},
                   {"caller": "c1", "module": "m0"}],
         "gaps": [
@@ -500,6 +504,50 @@ class DeferredActivationTests(unittest.TestCase):
         rc, out = run_oracle(report, modfs="overlayfs")
         self.assertNotEqual(rc, 0, out)
         self.assertIn("overlay published extra gap", out)
+
+
+class NeverSettledTests(unittest.TestCase):
+    """A per-caller settle refusal is a delay, never a resting state."""
+
+    def test_settle_refusal_that_never_recovers_fails_degraded(self):
+        # The pre-late-binding shape (main, CI run 44046420097): the
+        # fork child is refused on every pass and stays scan_pinned.
+        report = decided_report()
+        report["callers"][1]["image"]["authority"] = "scan_pinned"
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("native activation never recovered", out)
+
+    def test_settle_refusal_that_never_recovers_fails_witness_available(self):
+        report = witness_available_report()
+        report["callers"][1]["image"]["authority"] = "scan_pinned"
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("native activation never recovered", out)
+
+    def test_settle_refusal_on_a_caller_without_image_fails(self):
+        report = decided_report()
+        del report["callers"][0]["image"]
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("native activation never recovered", out)
+
+    def test_settle_refusal_at_another_pid_fails(self):
+        report = decided_report()
+        report["gaps"][1]["pid"] = 999
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("native activation never recovered", out)
+
+    def test_both_callers_never_recovering_fails(self):
+        # The loaded-host shape: no witness row was ever read, so
+        # neither caller settles; that is lost data, never a pass.
+        report = decided_report()
+        for caller in report["callers"]:
+            caller["image"]["authority"] = "scan_pinned"
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("native activation never recovered", out)
 
 
 if __name__ == "__main__":

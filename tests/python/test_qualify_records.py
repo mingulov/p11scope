@@ -10,9 +10,15 @@ scripts/qualify-public-cli.sh as declared rules. This suite:
   row (decided by the verdict record's exact rule id, never by message
   text) and at least one positive row that evaluates the rule and holds
   (the loader's `require` is traced in-process);
-- fuzzes every field of the valid fixtures (delete, wrong JSON type,
-  integral float/bool twins of ints, u64 range edges) and reports
-  killed/total; every survivor must be a named, explained allowance;
+- fuzzes every field of every valid fixture (each base case and each
+  positive row's case where it differs: delete, wrong JSON type,
+  integral float/bool twins of ints, u64 range edges, bool flips,
+  unknown keys) and decides each outcome from the verdict's `stage`:
+  a wrong type must be refused by typing, a flip or an in-type value
+  by a relation rule, an unknown key exactly where the record is
+  closed; every pass must be a named, explained allowance;
+- holds every numeric argument at its exact bounds and the loader's
+  kinds at their exact ranges;
 - exercises the shell side of run binding (fresh destinations in both
   output layouts, a failed report copy failing the event cell).
 
@@ -230,7 +236,9 @@ def write_inputs(case, tmp):
         put("sig2.stderr", case["stderr"], "stderr")
     elif judge == "fifo-refusal":
         fifo = tmp / "fifo"
-        if case["fifo"]:
+        if case["fifo"] == "regular":
+            fifo.write_text("")
+        elif case["fifo"]:
             os.mkfifo(fifo)
         put("fifo.stderr", case["stderr"].replace("{path}", str(fifo)), "stderr")
         argv.extend(["--fifo", str(fifo)])
@@ -281,7 +289,11 @@ def run_case(case, *, stamp=True, before=None):
         argv = [judge, "--verdict", str(tmp / "verdict.json")]
         if judge != "cgroup-member":
             stamp_path = tmp / "cell.stamp"
-            if stamp:
+            if case.get("stamp_dir"):
+                stamp_path.mkdir()
+            elif "stamp_text" in case:
+                stamp_path.write_text(case["stamp_text"])
+            elif stamp:
                 Q.write_stamp(str(stamp_path), case.get("stamp_run_id", RUN_ID),
                               case.get("stamp_cell", CELLS[judge]))
             argv += ["--stamp", str(stamp_path), "--run-id", case.get("run_id", RUN_ID)]
@@ -297,6 +309,12 @@ def run_case(case, *, stamp=True, before=None):
             os.utime(tmp / name, ns=(info.st_atime_ns, info.st_mtime_ns - delta))
         for name in case.get("remove", ()):
             os.unlink(tmp / name)
+        for name in case.get("symlink", ()):
+            # The same bytes behind a symlink: an input is never followed.
+            os.rename(tmp / name, tmp / (name + ".real"))
+            os.symlink(name + ".real", tmp / name)
+        for name, size in case.get("sparse", {}).items():
+            os.truncate(tmp / name, size)
         if before:
             before(tmp)
         with Trace() as trace, contextlib.redirect_stdout(io.StringIO()):
@@ -376,6 +394,39 @@ def ledger_fn(side, index, key, value):
         else:
             record["functions"][index][key] = value
         wl[line] = "LEDGER " + json.dumps(record)
+    return go
+
+
+def ledger_edit(side, edit):
+    """Apply `edit` to one workload's decoded LEDGER record."""
+    def go(case):
+        wl = case[side]
+        line = [n for n, text in enumerate(wl) if text.startswith("LEDGER ")][0]
+        record = json.loads(wl[line][len("LEDGER "):])
+        edit(record)
+        wl[line] = "LEDGER " + json.dumps(record)
+    return go
+
+
+def all_attempts(side, attempts, successful):
+    def edit(record):
+        for function in record["functions"]:
+            function.update(attempts=attempts, successful=successful)
+    return ledger_edit(side, edit)
+
+
+def drop_rows(*kinds):
+    """Keep only the stream rows not of these kinds, resequenced."""
+    def go(case):
+        case["stream"] = [r for r in case["stream"] if r["kind"] not in kinds]
+        resequence(case)
+    return go
+
+
+def totals_case(n_totals):
+    def go(case):
+        case["stream"] = event_rows(n_totals)
+        case["report"]["observation"]["passes"] = n_totals
     return go
 
 
@@ -719,6 +770,80 @@ NEGATIVE = [
                                                                  "reason": "made up"})),
     ("chain.text", "parent-chain", lambda c: c.update(concise="gated\n")),
     ("chain.text", "parent-chain", lambda c: c.update(verbose="gated\n")),
+    # run binding: the stamp, then every input (class: a reused, linked,
+    # oversized or foreign input never stands for this run's evidence)
+    ("record.stamp", "event-stdout", lambda c: c.update(stamp_text=json.dumps(
+        {"schema": Q.STAMP_SCHEMA, "run_id": 1, "cell": "inventory-event-stdout"}))),
+    ("record.stamp", "event-stdout", lambda c: c.update(stamp_text=json.dumps(
+        {"schema": Q.STAMP_SCHEMA, "run_id": RUN_ID, "cell": None}))),
+    ("fresh.run", "event-stdout", lambda c: c.update(stamp_dir=True)),
+    ("fresh.run", "event-stdout", lambda c: c.update(stamp_run_id="", run_id="")),
+    ("fresh.file", "event-stdout", lambda c: c.update(symlink=["full.json"])),
+    ("fresh.file", "event-stdout", lambda c: c.update(sparse={"full.json": Q.MAX_INPUT_BYTES + 1})),
+    ("json.decode", "event-stdout", lambda c: c.update(sparse={"full.json": Q.MAX_INPUT_BYTES})),
+    # second SIGINT and FIFO boundaries
+    ("fifo.exit", "fifo-refusal", arg("rc", "125")),
+    ("fifo.exit", "fifo-refusal", arg("rc", "0")),
+    ("fifo.kept", "fifo-refusal", lambda c: c.update(fifo="regular")),
+    # event stdout: framing, cadence and marker relations, one row per site
+    ("event.totals-count", "event-stdout", drop_rows("totals")),
+    ("event.totals-count", "event-stdout", chain(drop_rows("totals"), lambda c: c["stream"].__delitem__(2),
+                                                  resequence, stream_event(-1, passes=1),
+                                                  at(("report", "observation", "passes"), 1))),
+    ("event.totals-count", "event-stdout", totals_case(5)),
+    ("event.framing", "event-stdout", lambda c: c.update(stream=c["stream"][:2])),
+    ("event.framing", "event-stdout", lambda c: c["stream"].pop()),
+    ("event.totals-marker", "event-stdout", stream_event(2, passes=5)),
+    ("event.totals-marker", "event-stdout", stream_event(2, modules=9)),
+    ("event.totals-marker", "event-stdout", stream_event(2, edges=9)),
+    ("event.report-totals", "event-stdout", at(("report", "modules"), [{}, {}])),
+    ("event.report-totals", "event-stdout", at(("report", "edges"), [])),
+    ("event.early-output", "event-stdout", at(("epipe", "event_output"), {
+        "status": "failed", "lines_lost": 6, "bytes_lost": 5660, "reason": "broken_pipe"})),
+    # cgroup inventory: one row per relation site
+    ("record.provider-pin", "cgroup-inventory", at(("pin", "dev"), [0])),
+    ("record.inside-ledger", "cgroup-inventory", ledger_edit("inside", lambda r: r.pop("complete"))),
+    ("workload.launched", "cgroup-inventory", chain(lambda c: c["inside"].__setitem__(1, "CHILD pid=1"),
+                                                    arg("child-pid", ""))),
+    ("cgroup.unique-ids", "cgroup-inventory", lambda c: c["report"]["modules"].append(
+        copy.deepcopy(c["report"]["modules"][0]))),
+    ("cgroup.owned-admission", "cgroup-inventory",
+     at(("report", "modules", 0, "admission", "state"), "unresolved")),
+    ("cgroup.owned-admission", "overlay", at(("report", "modules", 0, "admission", "state"), "refused")),
+    ("ledger.inside-attempts", "cgroup-inventory", ledger_edit("inside", lambda r: r["functions"].pop())),
+    ("ledger.inside-attempts", "cgroup-inventory", all_attempts("inside", 500.0, 500)),
+    ("ledger.inside-attempts", "cgroup-inventory", chain(all_attempts("inside", 2**64, 2**64),
+                                                         arg("inside-iters", str(2**63)))),
+    ("ledger.outside-attempts", "cgroup-inventory", all_attempts("outside", 500.0, 500)),
+    ("gap.admission-note", "cgroup-inventory", add_gaps(dict(
+        ADMISSION_GAP, reason="X" + MODPATH[1:] + ": admission changed from unresolved to admitted"))),
+    ("gap.admission-note", "cgroup-inventory", add_gaps(dict(
+        ADMISSION_GAP, reason=ADMISSION_GAP["reason"] + " ()"))),
+    ("gap.unproven-cover", "overlay", lambda c: c["report"].update(gaps=[])),
+    ("gap.unproven-cover", "cgroup-inventory", add_gaps(gap(caller="c0", pid=100, subject=MODPATH,
+                                                            reason=Q.UNPROVEN))),
+    ("gap.activation", "cgroup-inventory", chain(add_gaps(ACTIVATION_GAP),
+                                                 caller(0, image={"authority": "scan_pinned"}))),
+    ("gap.retained", "cgroup-inventory", add_gaps(dict(RETAINED_GAP, subject="other"), DEADLINE_GAP)),
+    ("gap.deadline", "cgroup-inventory", add_gaps(dict(DEADLINE_GAP, subject="other"))),
+    ("gap.deadline", "cgroup-inventory", add_gaps(dict(DEADLINE_GAP, caller="c0"))),
+    ("gap.deadline", "cgroup-inventory", add_gaps(dict(DEADLINE_GAP, module="m0"))),
+    ("cgroup.owned-edge", "cgroup-inventory", lambda c: c["report"]["edges"][1].update(module="m9")),
+    # run pre-arm: the kernel split and each window site
+    ("prearm.release", "run-prearm", arg("kernel-release", "6")),
+    ("prearm.release", "run-prearm", arg("kernel-release", "6.x")),
+    ("prearm.held-windows", "run-prearm", chain(arg("kernel-release", "6.8.0"),
+                                                 prearm_module("held", unobserved_windows=HANDOFF))),
+    ("prearm.held-windows", "run-prearm", prearm_module("held", unobserved_windows=HANDOFF)),
+    ("prearm.passive-window", "run-prearm", prearm_module("passive", unobserved_windows=HANDOFF)),
+    ("prearm.passive-window", "run-prearm", prearm_module(
+        "passive", unobserved_windows=[dict(PRE_ATTACH[0], reason="late_discovery")])),
+    # parent chain: walk bounds and the named parent's identity
+    ("chain.walk", "parent-chain", chain_caller(launched_by=[
+        {"pid": PARENT, "exe": "chain-parent", "start_time": PARENT_GEN}] + [
+        {"pid": 50 + n, "exe": "sh", "start_time": 70 + n} for n in range(4)])),
+    ("chain.named-parent", "parent-chain", ancestor(0, pid=PARENT - 1)),
+    ("record.chain-caller", "parent-chain", chain_caller(launched_by_unit=1)),
 ]
 
 # Positive rows beyond each judge's valid base case: (rule, judge, mutation).
@@ -736,12 +861,39 @@ POSITIVE = [
     ("prearm.handoff-pair", "run-prearm", chain(
         arg("kernel-release", "6.6.0"), prearm_module("held", unobserved_windows=HANDOFF),
         prearm_module("passive", unobserved_windows=HANDOFF))),
-    ("chain.gap", "parent-chain", chain_caller(launched_by_gap={
-        "subject": "caller parent chain", "reason": "parent chain truncated after 4 ancestors"})),
+] + [("chain.gap", "parent-chain", chain_caller(launched_by_gap={"subject": "caller parent chain", "reason": r}))
+     for r in Q.CHAIN_GAP_REASONS] + [
     ("chain.ancestor", "parent-chain", ancestor(1, exe=None, label="bash", folded=2, exe_gap="hidden")),
     ("cgroup.procs-once", "cgroup-member", lambda c: c.update(procs="100")),
     ("sigint.cleanup-line", "second-sigint", at(("stderr",), "a\np11scope: cleanup incomplete")),
     ("event-output.consistent", "event-stdout", at(("epipe", "event_output", "lines_lost"), 1)),
+    ("fresh.file", "event-stdout", lambda c: c.update(age={"events.jsonl": 0, "full.json": 0})),
+    ("sigint.drain-samples", "second-sigint",
+     at(("report", "evidence", "scheduling", "inter_drain_gap", "samples"), 1)),
+    ("event-output.consistent", "event-stdout", at(("epipe", "event_output"), {
+        "status": "truncated", "lines_lost": 1, "bytes_lost": 1, "reason": "broken_pipe"})),
+    ("event.totals-count", "event-stdout", totals_case(4)),
+    ("event.totals-count", "event-stdout", totals_case(1)),
+    ("event.report-totals", "event-stdout", chain(
+        lambda c: c["stream"][1]["event"]["totals"].update(callers=2), stream_event(2, callers=2))),
+    ("workload.protocol", "cgroup-inventory", chain(
+        lambda c: c.update(outside=["READY pid=4194304", "LEDGER " + json.dumps(ledger(4194304, OUT_ITERS))]),
+        arg("outside-pid", "4194304"))),
+    ("gap.admission-note", "cgroup-inventory", add_gaps(dict(
+        ADMISSION_GAP, reason=ADMISSION_GAP["reason"] + " (r)"))),
+    ("gap.admission-note", "cgroup-inventory", add_gaps(dict(
+        ADMISSION_GAP, reason=MODPATH + ": admission changed from unresolved to refused"))),
+    ("gap.admission-note", "cgroup-inventory", add_gaps(dict(
+        ADMISSION_GAP, reason=MODPATH + ": admission changed from refused to admitted"))),
+    ("gap.deadline", "overlay", add_gaps(DEADLINE_GAP)),
+    ("prearm.held-windows", "run-prearm", arg("kernel-release", "6.6.0")),
+    ("prearm.release", "run-prearm", arg("kernel-release", "6.7-rc1")),
+    ("prearm.handoff-pair", "run-prearm", chain(
+        arg("kernel-release", "6.6.0"),
+        prearm_module("held", unobserved_windows=[HANDOFF[0], dict(HANDOFF[1], end_ns=10)]))),
+    ("chain.walk", "parent-chain", chain_caller(launched_by=[
+        {"pid": PARENT, "exe": "chain-parent", "start_time": PARENT_GEN}] + [
+        {"pid": 50 + n, "exe": "sh", "start_time": 70 + n} for n in range(3)])),
 ]
 
 
@@ -853,67 +1005,225 @@ DOCUMENTS = {
     "parent-chain": [("report",)],
 }
 
-# Survivors that are valid by contract, each with its reason.
+# A pattern is a path in which "*" stands for any list index.
+def matches(pattern, path, prefix=False):
+    if len(path) < len(pattern) or (not prefix and len(path) != len(pattern)):
+        return False
+    return all(p == "*" or p == q for p, q in zip(pattern, path))
+
+
+# Survivors that are valid by contract, each with its reason
+# (a pattern also covers every path under it).
 ALLOWED = {
-    # The started event is not consumed (its at_ns anchors the cadence).
-    ("event-stdout", ("stream", 0, "event")): "started payload is not consumed",
-    # Documents whose items are only counted.
-    ("event-stdout", ("report", "callers", 0)): "only the callers count is consumed",
-    ("event-stdout", ("report", "modules", 0)): "only the modules count is consumed",
-    ("event-stdout", ("report", "edges", 0)): "only the edges count is consumed",
+    # Payload fields of the started event and of counted report items are
+    # not consumed (each payload is still typed as an object).
+    ("event-stdout", ("stream", 0, "event", "*")): "started payload fields are not consumed",
+    ("event-stdout", ("report", "callers", "*", "*")): "only the callers count is consumed",
+    ("event-stdout", ("report", "modules", "*", "*")): "only the modules count is consumed",
+    ("event-stdout", ("report", "edges", "*", "*")): "only the edges count is consumed",
     # Another discovery module's nullable attach stamp and free text.
-    ("run-prearm", ("held_evidence", 0, "discovery", 0, "attached_at_ns")): "nullable by schema",
-    ("run-prearm", ("passive_evidence", 0, "discovery", 0, "attached_at_ns")): "nullable by schema",
-    ("run-prearm", ("held_evidence", 0, "discovery", 0, "sources", 0)): "free source name of another module",
-    ("run-prearm", ("passive_evidence", 0, "discovery", 0, "sources", 0)): "free source name of another module",
-    # A further ancestor's exe and the chain gap are nullable.
-    ("parent-chain", ("report", "callers", 1, "launched_by", 1, "exe")): "nullable by schema",
+    ("run-prearm", ("*", 0, "discovery", 0, "attached_at_ns")): "nullable by schema",
+    ("run-prearm", ("*", 0, "discovery", 0, "sources", "*")): "free source name of another module",
+    # A further ancestor's exe, its optional fields and the chain gap.
+    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "exe")): "a further ancestor's exe is nullable",
+    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "label")): "optional by schema",
+    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "folded")): "optional by schema",
+    ("parent-chain", ("report", "callers", 1, "launched_by", "*", "exe_gap")): "optional by schema",
     ("parent-chain", ("report", "callers", 1, "launched_by_gap")): "a gap object is optional when the chain is whole",
 }
 
 
 def allowed(judge, path):
-    return any(j == judge and path[:len(prefix)] == prefix for j, prefix in ALLOWED)
+    return any(j == judge and matches(pattern, path, prefix=True) for j, pattern in ALLOWED)
+
+
+# A replacement that stays inside the field's type (a null in a nullable
+# field, another string) is decided by a relation rule, not by typing:
+# (judge, path pattern, replacement).
+VALUE_DECIDED = {
+    ("cgroup-inventory", ("report", "modules", 0, "identity", "sha256"), None),
+    ("cgroup-inventory", ("report", "edges", "*", "entries", "coverage", "lossy"), None),
+    ("second-sigint", ("report", "evidence", "stop_quiescence", "post_q_events"), None),
+    ("second-sigint", ("report", "evidence", "stop_quiescence", "post_q_discovery"), None),
+    ("run-prearm", ("*", 0, "discovery", 1, "attached_at_ns"), None),
+    ("parent-chain", ("report", "callers", 1, "launched_by", 0, "exe"), None),
+    ("parent-chain", ("report", "callers", 1, "launched_by_unit"), "x"),
+} | {("cgroup-inventory", ("report", "gaps", "*", key), item)
+     for key in ("caller", "module", "reason") for item in (None, "x")} | {
+    ("cgroup-inventory", ("report", "gaps", "*", "pid"), None)}
+
+
+def value_decided(judge, path, item):
+    return any(j == judge and matches(pattern, path) and type(item) is type(want) and item == want
+               for j, pattern, want in VALUE_DECIDED)
+
+
+# Closed records: an unknown key is a type-stage refusal there and is
+# accepted (forward-compatible) everywhere else.
+CLOSED = {
+    ("event-stdout", ("stream", "*")),
+    ("event-stdout", ("stream", "*", "event", "totals")),
+    ("event-stdout", ("stream", "*", "event", "stdout_lost")),
+    ("event-stdout", ("*", "event_output")),
+    ("run-prearm", ("*", 0, "discovery", 1, "unobserved_windows", "*")),
+    ("run-prearm", ("held_ledger", "*")),
+    ("run-prearm", ("passive_ledger", "*")),
+}
+
+
+def closed(judge, path):
+    return any(j == judge and matches(pattern, path) for j, pattern in CLOSED)
+
+
+def lookup(value, path):
+    for key in path:
+        try:
+            value = value[key]
+        except (KeyError, IndexError, TypeError):
+            return MISSING_PATH
+    return value
+
+
+MISSING_PATH = object()
+
+
+def valid_fixtures():
+    """Each judge's base case, then every positive row's case; a positive
+    row's case is fuzzed where it differs from its base case."""
+    out = [(judge, judge, base(judge), None) for judge in DOCUMENTS]
+    out.append(("cgroup-inventory", "overlay", base("overlay"), base("cgroup-inventory")))
+    for rule, judge, mutate in POSITIVE:
+        if judge in DOCUMENTS or judge == "overlay":
+            target = "cgroup-inventory" if judge == "overlay" else judge
+            out.append((target, rule, build(judge, mutate), base(judge)))
+    return out
 
 
 class FieldFuzzTests(unittest.TestCase):
     def test_every_field_mutation_of_the_valid_fixtures_is_killed(self):
         killed = total = 0
-        survivors = []
-        for judge, documents in DOCUMENTS.items():
-            for document in documents:
-                original = base(judge)
-                node = original
-                for key in document:
-                    node = node[key]
-                for path, value in leaf_paths(node):
-                    if not path:
+        off = []
+        for judge, name, valid, reference in valid_fixtures():
+            for document in DOCUMENTS[judge]:
+                for path, value in leaf_paths(lookup(valid, document)):
+                    full = document + path
+                    if not path or (reference is not None and lookup(reference, full) == value):
                         continue
                     mutations = [("delete", None)] if type(path[-1]) is str else []
                     mutations += [("set", item) for item in replacements(value)]
                     if type(value) is dict and value:
                         mutations.append(("extra", None))
+                    if type(value) is bool:
+                        mutations.append(("flip", not value))
                     for kind, item in mutations:
-                        case = base(judge)
-                        target = case
-                        for key in document + path[:-1]:
-                            target = target[key]
+                        case = copy.deepcopy(valid)
+                        target = lookup(case, full[:-1])
                         if kind == "delete":
-                            del target[path[-1]]
-                        elif kind == "set":
-                            target[path[-1]] = copy.deepcopy(item)
+                            del target[full[-1]]
+                        elif kind in ("set", "flip"):
+                            target[full[-1]] = copy.deepcopy(item)
                         else:
-                            target[path[-1]]["unexpected_key"] = 0
+                            target[full[-1]]["unexpected_key"] = 0
                         total += 1
                         record, _ = run_case(case)
+                        got = (record["verdict"], record["stage"])
+                        if kind == "extra":
+                            want = ("fail", "type") if closed(judge, full) else ("pass", None)
+                        elif kind == "flip":
+                            # Every consumed flag is decided: its flip is
+                            # refused by a relation rule.
+                            want = ("fail", "relation")
+                        elif kind == "set" and value_decided(judge, full, item):
+                            want = ("fail", "relation")
+                        elif allowed(judge, full) and record["verdict"] == "pass":
+                            want = got
+                        else:
+                            want = ("fail", "type")
                         if record["verdict"] == "fail":
                             killed += 1
-                        elif kind != "extra" and not allowed(judge, document + path):
-                            survivors.append((judge, document + path, kind, item))
-        print("\nfield fuzz: killed %d/%d (survivors outside the allowances: %d)"
-              % (killed, total, len(survivors)), file=sys.stderr)
-        self.assertEqual(survivors, [])
-        self.assertGreater(total, 500)
+                        if got != want:
+                            off.append((name, full, kind, item, record["rule"], record["stage"]))
+        print("\nfield fuzz: killed %d/%d (outcomes off the expected stage: %d)"
+              % (killed, total, len(off)), file=sys.stderr)
+        self.assertEqual(off, [])
+        self.assertGreater(total, 2000)
+
+
+# -- loader kernel: kinds, rules and argument bounds --------------------------------
+
+U64_MAX = 2**64 - 1
+# (judge, option, low, high): every numeric argument of every judge.
+ARGUMENTS = [
+    ("second-sigint", "rc", 0, 255), ("second-sigint", "custody", 0, 1), ("second-sigint", "cleanup", 0, 1),
+    ("fifo-refusal", "rc", 0, 255), ("cgroup-member", "pid", 1, Q.PID_MAX),
+    ("event-stdout", "rc1", 0, 255), ("event-stdout", "rc2", 0, 255),
+    ("cgroup-inventory", "inside-iters", 1, U64_MAX), ("cgroup-inventory", "outside-iters", 1, U64_MAX),
+    ("cgroup-inventory", "inside-pid", 1, Q.PID_MAX), ("cgroup-inventory", "outside-pid", 1, Q.PID_MAX),
+    ("cgroup-inventory", "child-pid", 0, Q.PID_MAX),
+    ("parent-chain", "workload-pid", 1, Q.PID_MAX), ("parent-chain", "workload-gen", 0, U64_MAX),
+    ("parent-chain", "parent-pid", 1, Q.PID_MAX), ("parent-chain", "parent-gen", 0, U64_MAX),
+]
+
+
+def with_arg(judge, option, value):
+    case = base(judge)
+    case["args"][option] = str(value)
+    return case
+
+
+class LoaderKernelTests(unittest.TestCase):
+    def test_every_numeric_argument_holds_its_exact_bounds(self):
+        for judge, option, low, high in ARGUMENTS:
+            for value, inside in ((low, True), (high, True), (low - 1, False), (high + 1, False)):
+                with self.subTest(judge=judge, option=option, value=value):
+                    record, _ = run_case(with_arg(judge, option, value))
+                    self.assertEqual(record["rule"] == "arg.integer", not inside, record)
+
+    def test_kinds_hold_their_exact_ranges(self):
+        cases = [
+            (Q.U64, 0, True), (Q.U64, U64_MAX, True), (Q.U64, -1, False), (Q.U64, 2**64, False),
+            (Q.U64, True, False), (Q.U64, 1.0, False),
+            (Q.PID, 1, True), (Q.PID, Q.PID_MAX, True), (Q.PID, 0, False), (Q.PID, Q.PID_MAX + 1, False),
+            (Q.ListOf(Q.U64, 2, 2), [0, 1], True), (Q.ListOf(Q.U64, 2, 2), [0], False),
+            (Q.ListOf(Q.U64, 2, 2), [0, 1, 2], False),
+            (Q.Record("t", {"a": (Q.Anything(), "a")}, rule="record.stamp"), {}, False),
+            (Q.Record("t", {"a": (Q.Anything(), "a")}, rule="record.stamp"), {"a": None}, True),
+            (Q.OneOf("a"), "a", True), (Q.OneOf("a"), "b", False), (Q.OneOf("a"), ["a"], False),
+        ]
+        for kind, value, ok in cases:
+            with self.subTest(kind=type(kind).__name__, value=value):
+                try:
+                    kind.check(value, "v", "record.stamp")
+                    outcome = None
+                except Q.Refusal as refusal:
+                    outcome = (refusal.rule, refusal.stage)
+                self.assertEqual(outcome, None if ok else ("record.stamp", "type"))
+
+    def test_rules_are_declared_once_and_never_invented(self):
+        with self.assertRaises(KeyError):
+            Q.declare("fresh.run", "again")
+        with self.assertRaises(KeyError):
+            Q.require(True, "made.up", "x")
+        with self.assertRaises(KeyError):
+            Q.Refusal("made.up", "x")
+
+    def test_event_output_consistency_per_status(self):
+        ok = [("complete", 0, 0, "none"), ("failed", 0, 0, "event_log_error"),
+              ("failed", 3, 90, "event_log_error")]
+        ok += [("truncated", 1, 1, reason) for reason in Q.SHED_REASONS]
+        bad = [("complete", 1, 1, "none"), ("complete", 0, 1, "none"), ("complete", 0, 0, "broken_pipe"),
+               ("truncated", 0, 0, "broken_pipe"), ("truncated", 2, 1, "broken_pipe"),
+               ("truncated", 1, 1, "none"), ("truncated", 1, 1, "event_log_error"),
+               ("failed", 0, 0, "unknown"), ("failed", 0, 0, "broken_pipe")]
+        for row, good in [(r, True) for r in ok] + [(r, False) for r in bad]:
+            outcome = dict(zip(("status", "lines_lost", "bytes_lost", "reason"), row))
+            with self.subTest(outcome=outcome):
+                try:
+                    Q.check_event_output_consistent(outcome, "x")
+                    rule = None
+                except Q.Refusal as refusal:
+                    rule = refusal.rule
+                self.assertEqual(rule, None if good else "event-output.consistent")
 
 
 # -- shell side of run binding ----------------------------------------------------------------
@@ -1012,6 +1322,10 @@ class ShellBindingTests(unittest.TestCase):
         self.assertIn('--child-pid "${child_owned}"', body)
 
 
+# Rows whose setup is done by run_case (not by write_inputs alone).
+SETUP_HOOKS = {"age", "remove", "symlink", "sparse", "stamp_dir", "stamp_text", "run_id"}
+
+
 class OptimizedInterpreterTests(unittest.TestCase):
     """The judges keep every rule under -O and inherited PYTHONOPTIMIZE."""
 
@@ -1020,7 +1334,7 @@ class OptimizedInterpreterTests(unittest.TestCase):
         for interp, extra in ((["python3", "-O", "-I"], None), (["python3"], {"PYTHONOPTIMIZE": "1"})):
             for rule, judge, mutate in rows:
                 case = build(judge, mutate)
-                if case.pop("raw_stamp", False) or "age" in case or "remove" in case:
+                if case.pop("raw_stamp", False) or set(case) & SETUP_HOOKS:
                     continue
                 with self.subTest(interp=" ".join(interp), rule=rule), tempfile.TemporaryDirectory() as raw:
                     tmp = Path(raw)

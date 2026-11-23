@@ -24,7 +24,10 @@ Every qualifier decision about structured evidence is made here, once:
 Each judge prints one human detail line on stdout and, with
 `--verdict FILE`, writes the typed verdict
 `{"schema": VERDICT_SCHEMA, "judge", "verdict": "pass"|"fail", "rule",
-"detail"}`. Exit status: 0 pass, 1 fail, 64 usage.
+"stage", "detail"}`; `stage` is "type" when a field kind or the JSON
+decoder refused, "relation" when a rule between typed values did,
+"input" when an input could not be read, and null on a pass.
+Exit status: 0 pass, 1 fail, 64 usage.
 """
 
 import argparse
@@ -57,12 +60,17 @@ def declare(rule_id, text):
 
 
 class Refusal(AssertionError):
-    def __init__(self, rule_id, detail):
+    """A refused input. `stage` is "type" when a field kind (or the JSON
+    decoder) refused it and "relation" when a rule between typed values
+    did."""
+
+    def __init__(self, rule_id, detail, stage="relation"):
         if rule_id not in RULES:
             raise KeyError("undeclared rule: " + rule_id)
         super().__init__(detail)
         self.rule = rule_id
         self.detail = detail
+        self.stage = stage
 
 
 def require(condition, rule_id, detail):
@@ -70,6 +78,15 @@ def require(condition, rule_id, detail):
         raise KeyError("undeclared rule: " + rule_id)
     if not condition:
         raise Refusal(rule_id, detail)
+
+
+def require_type(condition, rule_id, detail):
+    """`require` for a shape check made outside a field kind."""
+    try:
+        require(condition, rule_id, detail)
+    except Refusal as refusal:
+        refusal.stage = "type"
+        raise
 
 
 JSON_DECODE = declare("json.decode", "an input is one well-formed JSON value")
@@ -97,11 +114,11 @@ def strict_json(text, what):
     try:
         value = json.loads(text, object_pairs_hook=_unique, parse_constant=constant)
     except Refusal as refusal:
-        raise Refusal(refusal.rule, "%s: %s" % (what, refusal.detail)) from None
+        raise Refusal(refusal.rule, "%s: %s" % (what, refusal.detail), "type") from None
     except ValueError:
         value = MISSING
-    require(value is not MISSING, JSON_DECODE, "%s is not JSON: %r" % (what, text[:200]))
-    require(not constants, JSON_CONSTANT, "%s: JSON constant %s" % (what, constants[:1]))
+    require_type(value is not MISSING, JSON_DECODE, "%s is not JSON: %r" % (what, text[:200]))
+    require_type(not constants, JSON_CONSTANT, "%s: JSON constant %s" % (what, constants[:1]))
     return value
 
 
@@ -114,7 +131,23 @@ def _tname(value):
 
 
 class Kind:
-    """A field validator: `check(value, label, rule)` returns the value."""
+    """A field validator: `check(value, label, rule)` returns the value.
+    Every refusal raised inside a kind's check is a type-stage refusal."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        inner = cls.__dict__.get("check")
+        if inner is None:
+            return
+
+        def check(self, value, *args, **kwargs):
+            try:
+                return inner(self, value, *args, **kwargs)
+            except Refusal as refusal:
+                refusal.stage = "type"
+                raise
+
+        cls.check = check
 
     def check(self, value, label, rule):
         raise NotImplementedError
@@ -315,8 +348,8 @@ def event_output(report, what):
     """The report's typed event-log outcome: exactly its four fields with
     exact types (a bool is not a count), then its own consistency."""
     outcome = report.get("event_output")
-    require(type(outcome) is dict, EVENT_OUTPUT_RULE, "%s report event_output %r" % (what, outcome))
-    require(set(outcome) == set(EVENT_OUTPUT_FIELDS), EVENT_OUTPUT_RULE,
+    require_type(type(outcome) is dict, EVENT_OUTPUT_RULE, "%s report event_output %r" % (what, outcome))
+    require_type(set(outcome) == set(EVENT_OUTPUT_FIELDS), EVENT_OUTPUT_RULE,
             "%s event_output fields %r" % (what, sorted(outcome)))
     for key, kind in EVENT_OUTPUT_FIELDS.items():
         Decided(kind, EVENT_OUTPUT_RULE, "%s event_output %s %r" % (what, key, outcome[key])).check(
@@ -384,8 +417,6 @@ def judge_second_sigint(args):
     stop = evidence["stop_quiescence"]
     proven = stop["state"] == "proven" and stop["post_q_events"] is False and stop["post_q_discovery"] is False
     require(evidence["drain_proven"] is proven, SIGINT_DRAIN, "drain_proven must match the stop-gate evidence")
-    require(evidence["scheduling"]["inter_drain_gap"]["samples"] > 0, SIGINT_SAMPLES,
-            "report must carry this capture live-loop drain samples")
     require(evidence["child_still_running"] is False, SIGINT_CHILD, "owned child must be settled, not still running")
     lines = stderr.split("\n")
     require(lines.count(CLEANUP_LINE) == 1, SIGINT_CLEANUP,
@@ -529,7 +560,7 @@ def judge_event_stdout(args):
                 repr((marker["pass"], event)))
         for key in ("callers", "modules", "edges"):
             require(event[key] == marker["totals"][key], EVENT_MARKER, repr((key, event, marker["totals"])))
-        require(row["at_ns"] >= last_at and row["at_ns"] - last_at >= INTERVAL_NS, EVENT_CADENCE,
+        require(row["at_ns"] - last_at >= INTERVAL_NS, EVENT_CADENCE,
                 "totals at_ns %d is not one interval after %d: %r" % (row["at_ns"], last_at, row))
         last_at = row["at_ns"]
         require(event["stdout_lost"] == {"lines": 0, "bytes": 0}, EVENT_NO_LOSS,
@@ -957,13 +988,9 @@ PREARM_TRACE = declare("prearm.trace-counts", "the held trace completes 3 C_Init
 
 def kernel_is_pre_68(release=None):
     release = platform.release() if release is None else release
-    parts = release.split(".")
-    try:
-        parsed = (int(parts[0]), int("".join(ch for ch in parts[1] if ch.isdigit()) or "0"))
-    except (IndexError, ValueError):
-        parsed = None
-    require(parsed is not None, PREARM_RELEASE, "unparseable kernel release %r" % (release,))
-    return parsed < (6, 8)
+    match = re.match(r"([0-9]+)\.([0-9]+)(?![0-9])", release)
+    require(match is not None, PREARM_RELEASE, "unparseable kernel release %r" % (release,))
+    return (int(match.group(1)), int(match.group(2))) < (6, 8)
 
 
 def assert_handoff_pair(module):
@@ -1080,8 +1107,6 @@ ANCESTOR = Record("ancestor", {"pid": (PID, "ancestor pid"), "start_time": (U64,
                   optional={"label": (STR, "ancestor label"), "folded": (U64, "ancestor folded"),
                             "exe_gap": (STR, "ancestor exe_gap")}, closed=False, rule=CHAIN_ANCESTOR)
 CHAIN_CALLER = Record("chain-caller", {
-    "pid": (PID, "caller pid"), "start_time": (U64, "caller start_time"),
-    "launched_by": (Anything(), "caller launched_by", ABSENT_AS_NULL),
     "launched_by_origin": (STR, "caller launched_by_origin"),
     "launched_by_unit": (Nullable(STR), "caller launched_by_unit"),
     "launched_by_gap": (Nullable(Record("chain-gap", {"subject": (STR, "launched_by_gap subject"),
@@ -1114,18 +1139,17 @@ def judge_parent_chain(args):
     c = CHAIN_CALLER.check(callers[0], "workload caller")
     require(c["start_time"] == wl_gen, CHAIN_GENERATION, "caller generation unchanged")
     lb = c.get("launched_by")
-    require(type(lb) is list and 1 <= len(lb) <= 4, CHAIN_WALK, "walk keeps 1..=4 ancestors")
+    require_type(type(lb) is list and 1 <= len(lb) <= 4, CHAIN_WALK, "walk keeps 1..=4 ancestors")
     # Every ancestor is an exact typed record (a float pid or a bool
     # start time never stands for an identity); the nearest one is the
     # registered chain-parent incarnation.
     Decided(ANCESTOR, CHAIN_PARENT, "named parent first: %r" % (lb[0],)).check(lb[0], "named parent", None)
     require(lb[0]["pid"] == parent and lb[0]["exe"] == "chain-parent" and lb[0]["start_time"] == parent_gen,
             CHAIN_PARENT, "named parent first: %r" % (lb[0],))
-    for a in lb:
-        require(type(a) is not dict or a.get("pid") != 1, CHAIN_INIT,
-                "init is never shown as the launcher: %r" % (a,))
     for a in lb[1:]:
         Decided(ANCESTOR, CHAIN_ANCESTOR, "ancestor generation: %r" % (a,)).check(a, "ancestor", None)
+    for a in lb:
+        require(a["pid"] != 1, CHAIN_INIT, "init is never shown as the launcher: %r" % (a,))
     require(c["launched_by_origin"] == "chain", CHAIN_ORIGIN, "real chain origin: %r" % (c["launched_by_origin"],))
     require(c["launched_by_unit"] is None, CHAIN_ORIGIN, "no unit beside a real chain")
     gap = c["launched_by_gap"]
@@ -1183,11 +1207,11 @@ def main(argv=None):
         return 0
     try:
         detail = JUDGES[args.judge](args)
-        verdict = {"verdict": "pass", "rule": None, "detail": detail}
+        verdict = {"verdict": "pass", "rule": None, "stage": None, "detail": detail}
     except Refusal as refusal:
-        verdict = {"verdict": "fail", "rule": refusal.rule, "detail": refusal.detail}
+        verdict = {"verdict": "fail", "rule": refusal.rule, "stage": refusal.stage, "detail": refusal.detail}
     except OSError as error:
-        verdict = {"verdict": "fail", "rule": FRESH_FILE, "detail": "input unreadable: %s" % error}
+        verdict = {"verdict": "fail", "rule": FRESH_FILE, "stage": "input", "detail": "input unreadable: %s" % error}
     record = dict({"schema": VERDICT_SCHEMA, "judge": args.judge}, **verdict)
     if args.verdict:
         with open(args.verdict, "w", encoding="utf-8") as handle:

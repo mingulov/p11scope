@@ -30068,6 +30068,839 @@ exit 0
         assert_eq!(edges.iter().sum::<u64>(), 8, "3 + 5 carried exactly once");
     }
 
+    #[test]
+    fn finish_flushes_at_most_one_credit_of_pending_rows() {
+        // Bounded Finish, flush leg: 65 rows read before either horizon
+        // stay pending; one Finish stages at most 64 decisions and
+        // reports more work, and the resume finishes the last row.
+        // RED: the base flushes and stages all 65 in one action.
+        let (mut native, _) = NativeScene::new();
+        let rows: Vec<WitnessRow> = (0..65)
+            .map(|i| {
+                let mut row = native.row(100 + i, 1, 5000 + i as u32, 40, 1);
+                row.entry_count = 1;
+                row
+            })
+            .collect();
+        let staged = native.read(rows);
+        assert_eq!(staged.decided, 0, "no horizon yet: all 65 stay pending");
+        assert_eq!(
+            native.scene.coordinator.binder.census().pending,
+            65,
+            "65 rows owed before Finish"
+        );
+        let domain = native.domain;
+        let first = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(first.decided, 64, "one Finish flushes at most one credit");
+        assert!(first.settlement_owed, "the last row still owes a credit");
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.pending), (65, 1));
+        let second = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(second.decided, 1, "the resume flushes the last row");
+        assert!(
+            !second.settlement_owed,
+            "no work left after the flush drains"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (65, 0, 65, 0)
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(placement.total(), 65, "every flushed row places once");
+    }
+
+    #[test]
+    fn finish_shares_one_credit_between_flush_and_settlement() {
+        // One Finish credit covers flush and settlement together: 65
+        // retained folds (1 -> 2 each) plus 64 fresh pending rows. The
+        // first Finish spends its whole credit flushing and settles
+        // nothing; later credits drain the queue with exact totals.
+        // RED: the base settles 64 pairs alongside the flush.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let rows: Vec<WitnessRow> = (0..65)
+            .map(|i| {
+                let mut row = native.row(100 + i, 1, 9, 40, 1);
+                row.entry_count = 1;
+                row
+            })
+            .collect();
+        native.witness(rows);
+        let counts: Vec<(u64, u64, usize, u64)> = (0..65).map(|i| (100 + i, 1, 1, 2)).collect();
+        native.counts_read(Vec::new(), counts);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let fresh: Vec<WitnessRow> = (0..64)
+            .map(|i| {
+                let mut row = native.row(200 + i, 1, 5000 + i as u32, 40, 1);
+                row.entry_count = 1;
+                row
+            })
+            .collect();
+        let staged = native.read(fresh);
+        assert_eq!(staged.decided, 0, "fresh rows wait for horizons");
+        let domain = native.domain;
+        let first = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(first.decided, 64, "the flush spends the whole credit");
+        assert!(first.settlement_owed, "the queue still owes credits");
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            0,
+            "nothing settles while the flush owns the credit"
+        );
+        let second = native.stage(NativeBatch::Finish { domain });
+        assert!(second.settlement_owed, "one pair still owes a credit");
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            64,
+            "the second credit settles 64 pairs"
+        );
+        let third = native.stage(NativeBatch::Finish { domain });
+        assert!(
+            !third.settlement_owed,
+            "no work left after the queue drains"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            65,
+            "the last credit settles the final pair"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (129, 0, 129, 0)
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(placement.total(), 129, "every row places once");
+    }
+
+    #[test]
+    fn finish_withholds_cleanup_until_flush_and_settlement_drain() {
+        // Domain tombstone/latch cleanup waits for the whole Finish
+        // continuation: with 65 pending rows plus seeded departed
+        // state, the first Finish leaves that state for the still-owed
+        // flush (a later-flushed row still reads it); the last credit
+        // drops it. RED: the base drops it on the first Finish, whose
+        // settlement queue is empty.
+        let (mut native, _) = NativeScene::new();
+        let cookie = DomainCookie::scripted(native.domain, 41);
+        native.scene.coordinator.exec_pruned.insert(cookie, 1_000);
+        native
+            .scene
+            .coordinator
+            .exec_loss_domains
+            .insert(native.domain);
+        native.scene.coordinator.pair_dropped_tombstones.insert(
+            PairKey {
+                image: cookie,
+                exec: 1,
+                object: 0,
+            },
+            PrunedPairBase {
+                base: 5,
+                base_since: 100,
+            },
+        );
+        let rows: Vec<WitnessRow> = (0..65)
+            .map(|i| {
+                let mut row = native.row(100 + i, 1, 5000 + i as u32, 40, 1);
+                row.entry_count = 1;
+                row
+            })
+            .collect();
+        let staged = native.read(rows);
+        assert_eq!(staged.decided, 0, "no horizon yet: all 65 stay pending");
+        let domain = native.domain;
+        let first = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(first.decided, 64, "one Finish flushes at most one credit");
+        assert!(first.settlement_owed, "the last row still owes a credit");
+        assert_eq!(
+            native.scene.coordinator.exec_pruned_for_test(),
+            1,
+            "departed EXEC state waits for the owed flush"
+        );
+        assert_eq!(
+            native.scene.coordinator.exec_loss_domains_for_test(),
+            1,
+            "the EXEC-loss latch waits for the owed flush"
+        );
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            1,
+            "departed pair state waits for the owed flush"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let second = native.stage(NativeBatch::Finish { domain });
+        assert_eq!(second.decided, 1, "the resume flushes the last row");
+        assert!(
+            !second.settlement_owed,
+            "no work left after the flush drains"
+        );
+        assert_eq!(
+            native.scene.coordinator.exec_pruned_for_test(),
+            0,
+            "the last credit drops the finished domain's EXEC state"
+        );
+        assert_eq!(
+            native.scene.coordinator.exec_loss_domains_for_test(),
+            0,
+            "the last credit drops the finished domain's latch"
+        );
+        assert_eq!(
+            native.scene.coordinator.dropped_pair_tombstones_for_test(),
+            0,
+            "the last credit drops the finished domain's pair state"
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (65, 0, 65, 0)
+        );
+    }
+
+    #[test]
+    fn finish_release_before_commit_leaves_no_orphan_receipt() {
+        // Ordered receipt lifetime, Finish caller: the retained fold
+        // stages but its publication has not applied when Finish
+        // releases the standing mark. The fold stands, the 40 excluded
+        // calls keep their cause, and no receipt survives the commit.
+        // RED: the immediate discard misses the unapplied insert and
+        // the commit leaves one orphan receipt.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        // No commit: the fold insert is staged but unapplied.
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(
+            terminal_retry_total(&native),
+            40,
+            "the 40 excluded calls keep their cause"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the standing release consumes the unapplied insert's receipt"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn finish_release_after_commit_leaves_no_orphan_receipt() {
+        // Control: the same Finish release after the fold insert
+        // applied. Passes before and after the ordering fix.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            1,
+            "the applied insert records its receipt"
+        );
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(terminal_retry_total(&native), 40);
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the standing release consumes the applied receipt"
+        );
+    }
+
+    #[test]
+    fn rerefusal_release_before_commit_leaves_no_orphan_receipt() {
+        // Ordered receipt lifetime, re-refusal caller: the retained row
+        // grows 3 -> 43, its re-observation refuses (a newer exec
+        // sequence of the same ticket competes), and the release stages
+        // before any commit applies the fold insert. The fold stands
+        // and no receipt survives. RED: the immediate discard misses
+        // and the commit leaves one orphan receipt.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.answer(9, 600, 41);
+        let mut second = native.row(41, 2, 9, 1_000, 0);
+        second.entry_count = 5;
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        // Single commit for the retention and the re-refusal alike.
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.rows, 2);
+        assert_eq!(census.bound, 1);
+        assert_eq!(census.unbound_total(), 1);
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecAmbiguous),
+            Some(&1),
+            "the re-observation refuses against its competitor"
+        );
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(terminal_retry_total(&native), 40);
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the standing release consumes the unapplied insert's receipt"
+        );
+    }
+
+    #[test]
+    fn rerefusal_release_after_commit_leaves_no_orphan_receipt() {
+        // Control: the same re-refusal release after the fold insert
+        // applied. Passes before and after the ordering fix.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.project(9, 60);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        let mut second = native.row(41, 2, 9, 1_000, 0);
+        second.entry_count = 5;
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(terminal_retry_total(&native), 40);
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the standing release consumes the applied receipt"
+        );
+    }
+
+    #[test]
+    fn endpoint_loss_release_before_commit_carries_no_receipt() {
+        // Ordered receipt lifetime, endpoint-loss caller: the retained
+        // row's first staging resolves to no module, so its owed mark
+        // carries no fold and no receipt ever exists for the release
+        // to drop — before or after the commit. This pins the
+        // construction (fold None) and the neutrality (zero receipts,
+        // one unresolved placement, the whole 43-call subtotal
+        // disclosed). Passes before and after the ordering fix.
+        let scene = CaptureScene::new(2);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.endpoint = crate::discovery::inventory_attach_set::EndpointId(999);
+        row.entry_count = 3;
+        let key = PairKey::of(&row);
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        assert!(
+            native.scene.coordinator.retry_owed.get(&key).is_some_and(
+                |owed| owed.fold.is_none() && owed.placement == FirstPlacement::Unresolved
+            ),
+            "a module-less retention carries no fold"
+        );
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        // Single commit for the retention and the endpoint loss alike.
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            (placement.total(), placement.unresolved),
+            (1, 1),
+            "one unresolved placement for the twice-staged row"
+        );
+        assert_eq!(
+            terminal_retry_total(&native),
+            43,
+            "the entire held subtotal discloses"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "no fold, no receipt, no orphan"
+        );
+    }
+
+    #[test]
+    fn endpoint_loss_release_after_commit_carries_no_receipt() {
+        // Control: the same endpoint-loss release after the retention
+        // applied. Passes before and after the ordering fix.
+        let scene = CaptureScene::new(2);
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.endpoint = crate::discovery::inventory_attach_set::EndpointId(999);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 43)]);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            (placement.total(), placement.unresolved),
+            (1, 1),
+            "one unresolved placement for the twice-staged row"
+        );
+        assert_eq!(terminal_retry_total(&native), 43);
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "no fold, no receipt, no orphan"
+        );
+    }
+
+    #[test]
+    fn revival_miss_release_before_commit_leaves_no_orphan_receipt() {
+        // Ordered receipt lifetime, revival-miss caller: the re-pended
+        // row binds at the binder but misses the retry rule (its edge
+        // was never projected), so the pair releases with the fold
+        // standing and the bound outcome keeps the first placement —
+        // all before any commit applies the fold insert. RED: the
+        // immediate discard misses and the commit leaves one orphan.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        // No projection: the re-observed bind misses the retry rule.
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.drain();
+        native.read(Vec::new());
+        // Single commit for the retention and the revival miss alike.
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0),
+            "the bound outcome stands without its placement"
+        );
+        let placement = native.scene.coordinator.registry.witness_placement();
+        assert_eq!(
+            (placement.total(), placement.module),
+            (1, 1),
+            "the first placement stands"
+        );
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(
+            terminal_retry_total(&native),
+            0,
+            "a revival miss settles nothing"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the standing release consumes the unapplied insert's receipt"
+        );
+    }
+
+    #[test]
+    fn revival_miss_release_after_commit_leaves_no_orphan_receipt() {
+        // Control: the same revival miss after the fold insert
+        // applied. Passes before and after the ordering fix.
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 600);
+        native.scene.source.set_leader_exit_observation(
+            9,
+            crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+        );
+        let mut row = native.row(41, 1, 9, 40, 1);
+        row.entry_count = 3;
+        native.read(vec![row]);
+        native.drain();
+        native.read(Vec::new());
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(9, 600, 41);
+        native.read(Vec::new());
+        native.drain();
+        native.read(Vec::new());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            (
+                census.rows,
+                census.bound,
+                census.unbound_total(),
+                census.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        let unbound = native.module_unbound().expect("the fold stands");
+        assert_eq!((unbound.rows, unbound.entries), (1, 3));
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "the standing release consumes the applied receipt"
+        );
+    }
+
+    #[test]
+    fn release_after_suspended_publication_leaves_no_orphan_receipt() {
+        // A publication suspended across intervening evidence: two
+        // retained rows (3 -> 13 and 5 -> 25) stage through one
+        // uncommitted window, then one Finish releases both standing
+        // marks before the single commit. Both folds stand, the one
+        // per-cause aggregate discloses 30, and no receipt survives.
+        // RED: the immediate discards miss both unapplied inserts.
+        let (mut native, _) = NativeScene::new();
+        for (pid, start) in [(9, 600), (10, 700)] {
+            native.scene.source.spawn(pid, start);
+            native.scene.source.set_leader_exit_observation(
+                pid,
+                crate::process::leader_exit::LeaderExitObservation::LiveNonleader,
+            );
+        }
+        let mut first = native.row(41, 1, 9, 40, 1);
+        first.entry_count = 3;
+        let mut second = native.row(42, 1, 10, 40, 1);
+        second.entry_count = 5;
+        native.read(vec![first]);
+        native.drain();
+        native.read(Vec::new());
+        native.read(vec![second]);
+        native.drain();
+        native.read(Vec::new());
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 13), (42, 1, 1, 25)]);
+        for (pid, at) in [(9, 50), (10, 50)] {
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, at)
+                .unwrap();
+            native.scene.project(pid, 60);
+        }
+        // One Finish over the suspended window, then the single commit.
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let unbound = native.module_unbound().expect("both folds stand");
+        assert_eq!((unbound.rows, unbound.entries), (2, 8));
+        assert_eq!(
+            terminal_retry_total(&native),
+            30,
+            "unequal deltas aggregate per cause"
+        );
+        assert_eq!(
+            native.scene.coordinator.registry.fold_receipts_for_test(),
+            0,
+            "both standing releases consume their unapplied receipts"
+        );
+    }
+
+    /// The exact projected aggregate row for `total` excluded calls at
+    /// `cause` over `settlements` settlements: full-struct equality,
+    /// never a substring.
+    fn expected_terminal_aggregate(total: u64, cause: &str, settlements: u64) -> RegistryGap {
+        RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "identity retry terminal".into(),
+            reason: format!(
+                "{total} calls observed while retained for identity retry are excluded at \
+                 {cause} (aggregated over {settlements} settlements; each row keeps its \
+                 first placement)"
+            ),
+            budget: None,
+        }
+    }
+
+    #[test]
+    fn terminal_aggregate_first_leaves_full_ordinary_budget() {
+        // Quota independence, aggregate-first order: the retained 3 ->
+        // 43 scene finishes (the per-cause aggregate applies), then a
+        // full ordinary allotment stages. Every ordinary row retains
+        // and nothing suppresses: the guaranteed row consumes no
+        // ordinary slot. RED: the base admits 8,191 and suppresses one.
+        let mut native = retained_with_growth();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            terminal_retry_total(&native),
+            40,
+            "the aggregate applies before the ordinary flood"
+        );
+        // Budgeted rows already retained (the scene setup keeps one);
+        // the guaranteed aggregate itself is not one of them.
+        let aggregates = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "identity retry terminal")
+            .count();
+        assert_eq!(aggregates, 1, "exactly the one guaranteed row");
+        let budgeted_before = native.scene.coordinator.registry.gaps().len() - aggregates;
+        let max_gaps = native.scene.coordinator.registry.limits().max_gaps;
+        for n in 0..max_gaps {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("late-filler-{n}"),
+                reason: format!("late filler {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let ordinary = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.starts_with("late-filler-"))
+            .count();
+        assert_eq!(
+            ordinary,
+            max_gaps - budgeted_before,
+            "a guaranteed aggregate consumes no ordinary slot"
+        );
+        assert_eq!(
+            registry.gaps_suppressed(),
+            budgeted_before as u64,
+            "only the pre-existing budgeted rows displace fillers"
+        );
+        let position = registry
+            .gaps()
+            .iter()
+            .position(|gap| gap.subject == "identity retry terminal")
+            .expect("the aggregate row survives the flood");
+        assert_eq!(
+            registry.gaps()[position],
+            expected_terminal_aggregate(40, "domain finish", 1),
+            "the exact projected aggregate row"
+        );
+        assert_eq!(
+            registry.gap_repeats()[position],
+            1,
+            "a summed row carries repeats 1"
+        );
+    }
+
+    #[test]
+    fn ordinary_first_leaves_guaranteed_terminal_row() {
+        // Quota independence, ordinary-first order: a full ordinary
+        // allotment stages, then the retained 3 -> 43 scene finishes.
+        // The aggregate still publishes with its exact row, the
+        // ordinary count stays exactly as admitted, and the arrival
+        // suppresses nothing. Passes before and after the fix.
+        let mut native = retained_with_growth();
+        let max_gaps = native.scene.coordinator.registry.limits().max_gaps;
+        for n in 0..max_gaps {
+            native.scene.coordinator.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("early-filler-{n}"),
+                reason: format!("early filler {n}"),
+                budget: None,
+            });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let admitted = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.starts_with("early-filler-"))
+            .count();
+        let suppressed_before = native.scene.coordinator.registry.gaps_suppressed();
+        let domain = native.domain;
+        native.stage(NativeBatch::Finish { domain });
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let ordinary = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.starts_with("early-filler-"))
+            .count();
+        assert_eq!(
+            ordinary, admitted,
+            "the aggregate arrival displaces no ordinary row"
+        );
+        assert_eq!(
+            registry.gaps_suppressed(),
+            suppressed_before,
+            "the aggregate arrival suppresses nothing"
+        );
+        assert_eq!(
+            terminal_retry_total(&native),
+            40,
+            "the aggregate publishes past a full quota"
+        );
+        let position = registry
+            .gaps()
+            .iter()
+            .position(|gap| gap.subject == "identity retry terminal")
+            .expect("the aggregate row publishes");
+        assert_eq!(
+            registry.gaps()[position],
+            expected_terminal_aggregate(40, "domain finish", 1),
+            "the exact projected aggregate row"
+        );
+        assert_eq!(registry.gap_repeats()[position], 1);
+    }
+
     /// The retry completion stamp lands strictly between the re-pend
     /// batch's horizons and the next batch's: the re-pended row waits
     /// exactly one batch, then decides together with the newly read row

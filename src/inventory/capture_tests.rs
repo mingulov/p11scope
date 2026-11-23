@@ -2994,6 +2994,174 @@ fn finish_decides_the_rows_the_last_read_reported() {
     );
 }
 
+/// Bounded Finish through the blocking stop driver: the last read
+/// reports 65 rows, so the stop stages Finish twice before retiring
+/// and publishing. RED: the base stages one Finish for all 65.
+#[test]
+fn stopping_with_sixty_five_pending_rows_finishes_in_two_credits() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let mut lane = ScriptedLane::new(&log);
+    lane.reads.extend([
+        Vec::new(),
+        Vec::new(),
+        (0..65)
+            .map(|i| RowSpec {
+                endpoint: 1,
+                tgid: 5000 + i as u32,
+                ticket: TICKET + i as u64,
+            })
+            .collect(),
+    ]);
+    let (stopped, _) = run(&mut scene, lane, 1);
+    let log = entries(&log);
+    let finishes = log.iter().filter(|entry| *entry == "stage:finish").count();
+    assert!(
+        finishes >= 2,
+        "65 pending rows take two Finish credits: {log:?}"
+    );
+    assert!(
+        log.iter().any(|entry| entry == "publish:stop"),
+        "the stop still publishes: {log:?}"
+    );
+    assert!(
+        matches!(stopped.summary.retirement, Retirement::Closed(_)),
+        "retirement still closes: {:?}",
+        stopped.summary.retirement
+    );
+    let census = scene.coordinator.registry().witness_census().clone();
+    assert_eq!((census.rows, census.pending), (65, 0), "{census:?}");
+    assert_eq!(
+        census.unbound.get(&UnboundReason::EvidenceIncomplete),
+        Some(&65),
+        "{census:?}"
+    );
+}
+
+/// Bounded Finish through the phased stop driver: 65 rows preloaded
+/// as pending through the real read path take two Finish credits
+/// through `NativeStop::step`, then retirement and the stop summary
+/// run. RED: the base stages one Finish for all 65.
+#[test]
+fn phased_stop_with_sixty_five_pending_rows_finishes_in_two_credits() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let mut started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // Preload 65 pending rows (no horizons yet, so every row waits for
+    // Finish): endpoint 999 resolves nowhere, so they flush as
+    // unresolved — the continuation, not the placement, is pinned.
+    let rows: Vec<WitnessRow> = (0..65)
+        .map(|i| {
+            WitnessRow::scripted(
+                started.capture.domain,
+                TICKET + i as u64,
+                1,
+                crate::discovery::inventory_attach_set::AttachObjectId::scripted(0),
+                crate::discovery::inventory_attach_set::EndpointId(999),
+                5000 + i as u32,
+                1_000,
+            )
+        })
+        .collect();
+    let batch = WitnessBatch {
+        domain: started.capture.domain,
+        phase: CapturePhase::Active,
+        rows,
+        integrity: Vec::new(),
+        integrity_total: 0,
+        visited: 0,
+        sweep_completed: true,
+        sweeps_completed: 1,
+        row_bound_reached: false,
+        deadline_reached: false,
+        read_failures: Vec::new(),
+        unrecorded_rows: 0,
+        sweep_gaps: false,
+        counts: Vec::new(),
+        refresh_sweep_completed: true,
+        refresh_sweep_gaps: false,
+        refresh_deadline_reached: false,
+        refresh_sweeps_completed: 1,
+        seen_rows: 0,
+        pair_limit: 64,
+        lifecycle_loss: None,
+        lifecycle_proven_ns: 0,
+        health: CaptureHealth {
+            discovery_counters: Some([0, 0, 0, 0, 0]),
+            ..CaptureHealth::default()
+        },
+        health_regression: None,
+        health_unproven: None,
+        health_baseline_ns: 0,
+        health_read_ns: 1_000,
+        rows_anchor_ns: 1_001,
+        rows_read_ns: 1_001,
+        counts_read_ns: 1_001,
+        changed_objects: Vec::new(),
+        custody: ScopeCustody::System,
+        custody_proven_ns: None,
+        unsettled: false,
+    };
+    let receipt = scene.coordinator.stage_native(
+        NativeBatch::Witness(Box::new(batch)),
+        &mut started.capture,
+        1_000_000,
+    );
+    assert_eq!(receipt.decided, 0, "no horizon yet: all 65 stay pending");
+    started.passes = 1;
+    let mut stop = match started.into_finite_stop(NativeStopDisposition::Completed, None) {
+        Ok(stop) => stop,
+        Err(_) => panic!("a completed stop is admissible after a pass"),
+    };
+    // The capture already retired; this pins the Finish continuation,
+    // not the retirement poll.
+    stop.retired = true;
+    stop.phase = NativeStopPhase::Finish;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &|| false,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut steps = 0;
+    let stopped = loop {
+        let now = Instant::now();
+        let slice_end = now + Duration::from_secs(600);
+        match stop.step(&mut scene, now, slice_end, &clock) {
+            NativeStopProgress::Pending(next) => {
+                stop = next;
+                steps += 1;
+                assert!(steps < 10, "the phased stop converges");
+            }
+            NativeStopProgress::Stopped(stopped) => break stopped,
+        }
+    };
+    let log = entries(&log);
+    let finishes = log.iter().filter(|entry| *entry == "stage:finish").count();
+    assert_eq!(
+        finishes, 2,
+        "65 pending rows take exactly two Finish credits: {log:?}"
+    );
+    assert!(
+        matches!(stopped.summary.retirement, Retirement::Closed(_)),
+        "retirement still closes: {:?}",
+        stopped.summary.retirement
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    let census = scene.coordinator.registry().witness_census().clone();
+    assert_eq!((census.rows, census.pending), (65, 0), "{census:?}");
+    assert_eq!(
+        census.unbound.get(&UnboundReason::EvidenceIncomplete),
+        Some(&65),
+        "{census:?}"
+    );
+}
+
 /// Invariant 2.3: what an extend deferred is resubmitted ahead of the next
 /// delta, so the module is attached on the next pass and then watched.
 #[test]

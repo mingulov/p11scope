@@ -11364,6 +11364,171 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn guaranteed_terminal_row_leaves_full_ordinary_budget() {
+        // Quota independence, aggregate-first order: a per-cause
+        // terminal aggregate applies, then a full ordinary allotment
+        // stages. Every ordinary row retains and nothing suppresses.
+        // RED: the base admits 8,191 and suppresses one.
+        let mut registry = registry();
+        registry.record_terminal_retry_excluded("domain finish".into(), 40);
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1, "the aggregate applies first");
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("late-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        let ordinary = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.starts_with("late-"))
+            .count();
+        assert_eq!(
+            ordinary, DEFAULT_MAX_GAPS,
+            "a guaranteed aggregate consumes no ordinary slot"
+        );
+        assert_eq!(registry.gaps_suppressed(), 0);
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + 1,
+            "the bound plus the one guaranteed row"
+        );
+    }
+
+    #[test]
+    fn ordinary_budget_leaves_guaranteed_terminal_row() {
+        // Quota independence, ordinary-first order: a full ordinary
+        // allotment applies, then the per-cause aggregate stages. The
+        // aggregate still publishes and the ordinary count stays
+        // whole. Passes before and after the fix.
+        let mut registry = registry();
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("early-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        registry.record_terminal_retry_excluded("domain finish".into(), 40);
+        registry.publish();
+        let ordinary = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.starts_with("early-"))
+            .count();
+        assert_eq!(ordinary, DEFAULT_MAX_GAPS);
+        assert_eq!(registry.gaps_suppressed(), 0);
+        assert_eq!(registry.gaps().len(), DEFAULT_MAX_GAPS + 1);
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == IDENTITY_RETRY_TERMINAL),
+            "the aggregate publishes past a full quota"
+        );
+    }
+
+    #[test]
+    fn guaranteed_terminal_row_leaves_full_terminal_reserve() {
+        // Quota independence at stop time, aggregate-first order: the
+        // aggregate applies in the terminal phase, then the full 64-row
+        // reserve stages. Every reserve row retains. RED: the base
+        // admits 63 and suppresses one.
+        let mut registry = registry();
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        registry.enter_terminal_phase();
+        registry.record_terminal_retry_excluded("domain finish".into(), 40);
+        registry.publish();
+        for n in 0..TERMINAL_GAP_RESERVE {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("reserve-{n}"),
+                reason: "y".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        let reserve = registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject.starts_with("reserve-"))
+            .count();
+        assert_eq!(
+            reserve, TERMINAL_GAP_RESERVE,
+            "a guaranteed aggregate consumes no reserve slot"
+        );
+        assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
+    #[test]
+    fn terminal_reserve_leaves_guaranteed_terminal_row() {
+        // Quota independence at stop time, reserve-first order: the
+        // full bound plus the full reserve apply, then the aggregate
+        // stages. It still publishes. Passes before and after the fix.
+        let mut registry = registry();
+        for n in 0..DEFAULT_MAX_GAPS {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        registry.enter_terminal_phase();
+        for n in 0..TERMINAL_GAP_RESERVE {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("reserve-{n}"),
+                reason: "y".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        registry.record_terminal_retry_excluded("domain finish".into(), 40);
+        registry.publish();
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + TERMINAL_GAP_RESERVE + 1,
+            "the bound plus the reserve plus the guaranteed row"
+        );
+        assert_eq!(registry.gaps_suppressed(), 0);
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == IDENTITY_RETRY_TERMINAL),
+            "the aggregate publishes past a full reserve"
+        );
+    }
+
+    #[test]
     fn tiny_gap_limits_keep_every_slot_for_per_drain_gaps() {
         // No reservation when the bound itself fits inside it:
         // small-limit twins keep their exact per-drain behavior.

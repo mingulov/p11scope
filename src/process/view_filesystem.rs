@@ -326,6 +326,15 @@ fn metered_group_current(
     })
 }
 
+/// One census member's root as `statx(2)` names it: compared only with
+/// the other members' roots of the same census.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CensusRoot {
+    device: (u32, u32),
+    inode: u64,
+    mount: u64,
+}
+
 /// The cold retained-member closing proof through the metered
 /// primitives, one admitted unit per native call and none retried:
 /// the original group runs (pin), its leader is the original at Z, then
@@ -356,7 +365,7 @@ pub(crate) fn metered_cold_closing_proof(
     proven!(metered_leader_at_z(pin, admit));
     observed_z();
     let tids = proven!(metered_task_ids(pid, admit));
-    let mut shared: Option<RootIdentity> = None;
+    let mut shared: Option<CensusRoot> = None;
     for tid in &tids {
         let base = format!("/proc/{pid}/task/{tid}");
         let before = proven!(metered_task(&format!("{base}/stat"), admit));
@@ -365,10 +374,12 @@ pub(crate) fn metered_cold_closing_proof(
                 "cold process task census contains an unproven or exiting member".into(),
             ));
         }
-        let namespace = match metered_io::statx_path(&format!("{base}/ns/mnt"), admit)? {
+        // `stat(2)`, not `statx`: the retained id is a `st_dev`/`st_ino`
+        // pair, so the comparison stays in that one device domain.
+        let namespace = match metered_io::stat_path(&format!("{base}/ns/mnt"), admit)? {
             Ok(stat) => MountNamespaceId {
-                device: metered_io::statx_device(&stat),
-                inode: stat.stx_ino,
+                device: stat.st_dev,
+                inode: stat.st_ino,
             },
             Err(error) => {
                 return Some(Err(format!(
@@ -380,8 +391,10 @@ pub(crate) fn metered_cold_closing_proof(
             return Some(Err(reason));
         }
         let root = match metered_io::statx_path(&format!("{base}/root"), admit)? {
-            Ok(stat) => RootIdentity {
-                device: metered_io::statx_device(&stat),
+            // Members compare among themselves only, so the root keeps
+            // statx's own (major, minor) device pair: no `st_dev` bridge.
+            Ok(stat) => CensusRoot {
+                device: (stat.stx_dev_major, stat.stx_dev_minor),
                 inode: stat.stx_ino,
                 mount: stat.stx_mnt_id,
             },

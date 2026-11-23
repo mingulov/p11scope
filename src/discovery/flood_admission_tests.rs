@@ -266,12 +266,15 @@ fn assert_fstype_ext4(path: &Path) {
         path.display(),
         std::io::Error::last_os_error()
     );
+    // `f_type` is `i64` on glibc and `u64` on musl.
+    #[allow(clippy::unnecessary_cast)]
+    let f_type = stat.f_type as i64;
     assert_eq!(
-        stat.f_type,
+        f_type,
         EXT4_SUPER_MAGIC,
         "the provider mount is not ext4: {} has f_type {:x}",
         path.display(),
-        stat.f_type
+        f_type
     );
 }
 

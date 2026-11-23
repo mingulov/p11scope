@@ -86,6 +86,24 @@ def inside_ledger(*, iters=ITERS, complete=True):
                        "successful": 2 * iters} for name in FUNCTIONS]})
 
 
+OUTSIDE_ITERS = 500
+
+
+def outside_ledger(*, pid=102, iters=OUTSIDE_ITERS, complete=True,
+                   functions=None):
+    """The gated workload's LEDGER line (the exclusion control)."""
+    if functions is None:
+        functions = [{"name": name, "attempts": iters, "successful": iters}
+                     for name in FUNCTIONS]
+    return "LEDGER " + json.dumps({
+        "schema": "p11scope/public-cli-ledger/v1", "pid": pid,
+        "complete": complete, "functions": functions})
+
+
+def outside_wl(ledger=None):
+    return "READY pid=102\n%s\n" % (outside_ledger() if ledger is None else ledger)
+
+
 def counted(count=DRIVEN):
     """An edge's entries as published for an exactly counted caller."""
     return {"cap": 18446744073709551615, "count": count,
@@ -157,7 +175,8 @@ INHERITED = (["python3", "-"], {"PYTHONOPTIMIZE": "1"})
 
 def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
                generations=None, inside_wl=None, outside_wl=None,
-               interpreter=PLAIN, report_text=None):
+               interpreter=PLAIN, report_text=None,
+               outside_iters=OUTSIDE_ITERS):
     """Run the extracted oracle against a fixture report."""
     if generations is None:
         generations = (GENERATIONS[100], GENERATIONS[101])
@@ -169,7 +188,7 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
     if inside_wl is None:
         inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % ledger
     if outside_wl is None:
-        outside_wl = "READY pid=102\nLEDGER y\n"
+        outside_wl = globals()["outside_wl"]()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         (tmp / "r.json").write_text(
@@ -185,7 +204,8 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
             env.update(extra_env)
         proc = subprocess.run(
             argv + ["r.json", "in.wl", "out.wl",
-                    json.dumps(pin), modpath, modfs,
+                    json.dumps(pin), str(outside_iters),
+                    modpath, modfs,
                     str(generations[0]), str(generations[1])],
             input=block, capture_output=True, text=True, timeout=30,
             cwd=str(tmp), env=env)
@@ -2040,7 +2060,7 @@ class CheckCoverageTests(unittest.TestCase):
         target = ('TARGET {"name":"C_GenerateRandom","dev":[0,46],'
                   '"ino":153887,"file_offset":4096}')
         inside = "%s\nREADY pid=100\nCHILD pid=101\n%s\n" % (target, inside_ledger())
-        outside = "%s\nREADY pid=102\nLEDGER y\n" % target
+        outside = "%s\n%s" % (target, outside_wl())
         rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
                              modfs="ext4", inside_wl=inside, outside_wl=outside)
         self.assertEqual(rc, 0, out)
@@ -2230,6 +2250,106 @@ class OptimizedInterpreterTests(unittest.TestCase):
                 rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
                                      modfs="ext4", interpreter=interpreter)
                 self.assertEqual(rc, 0, out)
+
+
+def _inside_with(**changes):
+    record = json.loads(inside_ledger()[len("LEDGER "):])
+    record.update(changes)
+    return "LEDGER " + json.dumps(record)
+
+
+class WorkloadLedgerTests(unittest.TestCase):
+    """Both workload ledgers are typed producer records (codex r7 F2/N3)."""
+
+    SHAPES = (("overlayfs", False), ("ext4", True))
+
+    def fails(self, marker, **kwargs):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                rc, out = run_oracle(deferred_recovered_report(modfs_witness=witness),
+                                     modfs=modfs, **kwargs)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(marker, out)
+
+    def test_producer_shaped_ledgers_pass(self):
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                rc, out = run_oracle(deferred_recovered_report(modfs_witness=witness),
+                                     modfs=modfs)
+                self.assertEqual(rc, 0, out)
+                self.assertIn("outside=102 excluded", out)
+
+    OUTSIDE_ROWS = [
+        # Codex r7 F2: incomplete and empty still earned the exclusion.
+        ("incomplete-empty", outside_ledger(complete=False, functions=[]),
+         "outside ledger incomplete"),
+        ("incomplete", outside_ledger(complete=False), "outside ledger incomplete"),
+        ("complete-empty", outside_ledger(functions=[]),
+         "outside ledger functions are not the six driven calls"),
+        ("five-functions", outside_ledger(functions=[
+            {"name": n, "attempts": 500, "successful": 500} for n in FUNCTIONS[:5]]),
+         "outside ledger functions are not the six driven calls"),
+        ("wrong-pid", outside_ledger(pid=103), "outside ledger pid 103 is not the workload 102"),
+        ("pid-string", outside_ledger(pid="102"), "outside ledger pid has type str"),
+        ("not-json", "LEDGER y", "outside ledger is not JSON"),
+        ("not-object", "LEDGER []", "outside ledger has type list"),
+        ("schema", outside_ledger().replace("public-cli-ledger/v1", "public-cli-ledger/v2"),
+         "outside ledger schema"),
+        ("short-run", outside_ledger(iters=499), "outside ledger C_GenerateRandom attempts 499, drove 500"),
+        ("float-attempts", outside_ledger(functions=[
+            {"name": n, "attempts": 500.0, "successful": 500} for n in FUNCTIONS]),
+         "outside ledger function attempts has type float"),
+        ("bool-successful", outside_ledger(functions=[
+            {"name": n, "attempts": 500, "successful": True} for n in FUNCTIONS]),
+         "outside ledger function successful has type bool"),
+        ("renamed", outside_ledger(functions=[
+            {"name": n, "attempts": 500, "successful": 500}
+            for n in FUNCTIONS[:5] + ["C_Sign"]]),
+         "outside ledger functions are not the six driven calls"),
+    ]
+
+    def test_each_outside_row_fails(self):
+        for name, ledger, marker in self.OUTSIDE_ROWS:
+            with self.subTest(row=name):
+                self.fails(marker, outside_wl=outside_wl(ledger))
+
+    def test_launch_lines_drive_the_checked_iterations(self):
+        # The oracle's expected outside attempts and the workload launch
+        # share one shell variable.
+        text = QUAL.read_text()
+        self.assertIn('"$GATED" "$MODULE" "$outside_iters" 200 "$outside_gate"', text)
+        self.assertIn('"$before" "$outside_iters" "$MODULE"', text)
+
+    def test_outside_iterations_come_from_the_shell(self):
+        self.fails("outside ledger C_GenerateRandom attempts 500, drove 400",
+                   outside_iters=400)
+
+    INSIDE_ROWS = [
+        # Codex r7 N3: a duplicated name and a float row passed.
+        ("duplicate-name", _ledger_with(
+            [{"name": n, "attempts": 500, "successful": 500}
+             for n in FUNCTIONS[:5] + FUNCTIONS[:1]]),
+         "inside ledger functions are not the six driven calls"),
+        ("float-row", _ledger_with(_functions([500] * 5 + [500.0])),
+         "inside ledger attempts differ per function"),
+        ("bool-row", _ledger_with(_functions([1] * 5 + [True])),
+         "inside ledger attempts differ per function"),
+        ("all-float", _ledger_with(_functions([500.0] * 6)),
+         "inside ledger attempts not split per member"),
+        ("reordered", _ledger_with(
+            [{"name": n, "attempts": 500, "successful": 500}
+             for n in reversed(FUNCTIONS)]),
+         "inside ledger functions are not the six driven calls"),
+        ("wrong-pid", _inside_with(pid=101), "inside ledger pid 101 is not the workload 100"),
+        ("schema", _inside_with(schema="other"), "inside ledger schema"),
+        ("not-json", "LEDGER {", "inside ledger is not JSON"),
+        ("functions-null", _inside_with(functions=None), "inside ledger functions has type NoneType"),
+    ]
+
+    def test_each_inside_row_fails(self):
+        for name, ledger, marker in self.INSIDE_ROWS:
+            with self.subTest(row=name):
+                self.fails(marker, ledger=ledger)
 
 
 class NeverSettledTests(unittest.TestCase):

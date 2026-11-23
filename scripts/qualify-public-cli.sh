@@ -752,8 +752,11 @@ cgroup_capture() {
   SOFTHSM2_CONF=$tokdir/outside/softhsm2.conf softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { result "$cell" 0 'cgroup token init failed' failed; return 1; }
   chown -R "$RUNUID:$RUNGID" "$tokdir/child/tokens" "$tokdir/outside/tokens" || { result "$cell" 0 'cgroup token chown failed' failed; return 1; }
   chmod 644 "$tokdir/child/softhsm2.conf" "$tokdir/outside/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
+  # The outside workload's iterations: the oracle checks its ledger
+  # against exactly this count.
+  local outside_iters=500
   P11SCOPE_CGROUP_FORK_CHILD_CONF=$tokdir/child/softhsm2.conf asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
-  asuser_conf "$tokdir/outside/softhsm2.conf" "$GATED" "$MODULE" 500 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
+  asuser_conf "$tokdir/outside/softhsm2.conf" "$GATED" "$MODULE" "$outside_iters" 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
   local inside_ready=0 outside_ready=0 in_cgroup=0
   if waitfor "$cell-inside.wl" "^READY pid=$inside$" "$inside" "$READY_TICKS"; then
     inside_ready=1; readygen=$(generation "$inside")
@@ -811,12 +814,13 @@ cgroup_capture() {
     # stat(1) spells the type "overlayfs" (coreutils S_MAGIC_OVERLAYFS),
     # never the bare "overlay" of /proc/mounts.
     module_fs=$(stat -f -c %T "$MODULE" 2>/dev/null || echo unknown)
-    python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
+    python3 -I - "$cell.$ext" "$cell-inside.wl" "$cell-outside.wl" "$before" "$outside_iters" "$MODULE" "$module_fs" "$gen" "$childgen" <<'PY' > "$cell.detail" 2>&1
 import json,sys
 report=json.load(open(sys.argv[1]))
 inside=open(sys.argv[2]).read(); outside=open(sys.argv[3]).read()
 pin=json.loads(sys.argv[4])
-modpath=sys.argv[5]; modfs=sys.argv[6]
+outside_iters=int(sys.argv[5])
+modpath=sys.argv[6]; modfs=sys.argv[7]
 # Every refusal below raises explicitly, never bare assert: the
 # verdicts must read identically under python3 -O (which strips
 # asserts), pinned by the oracle's explicit-refusal twins.
@@ -922,15 +926,47 @@ else:
 # total/2 iterations of six calls plus four setup (Initialize,
 # GetSlotList, OpenSession, Login) and three teardown (Logout,
 # CloseSession, Finalize) entries.
-ledger=json.loads([l for l in inside.splitlines() if l.startswith('LEDGER ')][0][len('LEDGER '):])
-refuse_unless(ledger.get('complete') is True, 'inside ledger incomplete: driven counts unknown: %r' % (ledger,))
-functions=ledger.get('functions') or []
-attempts={f.get('attempts') for f in functions}
-refuse_unless(len(functions)==6 and len(attempts)==1, 'inside ledger attempts differ per function: %r' % (ledger,))
-total=attempts.pop()
-refuse_unless(isinstance(total,int) and total>0 and total%2==0, 'inside ledger attempts not split per member: %r' % (total,))
+# Both workload ledgers are typed records from their producers
+# (cgroup-fork inside, gated outside): v1 schema, the producer's pid,
+# complete, the six driven functions in order, and exact integer
+# attempts (a float or bool never equals an int here).
+LEDGER_SCHEMA='p11scope/public-cli-ledger/v1'
+LEDGER_FUNCTIONS=['C_GenerateRandom','C_DigestInit','C_Digest','C_FindObjectsInit','C_FindObjects','C_FindObjectsFinal']
+def ledger_record(text,what,pid):
+    line=[l for l in text.splitlines() if l.startswith('LEDGER ')][0][len('LEDGER '):]
+    try:
+        record=json.loads(line)
+    except ValueError:
+        raise AssertionError('%s ledger is not JSON: %r' % (what,line))
+    typed(record,(dict,),'%s ledger' % what)
+    if field(record,'schema',(str,),'%s ledger schema' % what)!=LEDGER_SCHEMA: raise AssertionError('%s ledger schema: %r' % (what,record['schema']))
+    if field(record,'pid',(int,),'%s ledger pid' % what)!=pid: raise AssertionError('%s ledger pid %r is not the workload %d' % (what,record['pid'],pid))
+    for f in field(record,'functions',(list,),'%s ledger functions' % what):
+        typed(f,(dict,),'%s ledger function' % what)
+        field(f,'name',(str,),'%s ledger function name' % what)
+    return record
+def ledger_names(record,what):
+    for f in record['functions']:
+        field(f,'successful',(int,),'%s ledger function successful' % what)
+    names=[f['name'] for f in record['functions']]
+    if names!=LEDGER_FUNCTIONS: raise AssertionError('%s ledger functions are not the six driven calls: %r' % (what,names))
+ledger=ledger_record(inside,'inside',inside_pid)
+if not (ledger.get('complete') is True): raise AssertionError('inside ledger incomplete: driven counts unknown: %r' % (ledger,))
+functions=ledger['functions']
+attempts={(type(f.get('attempts')),f.get('attempts')) for f in functions}
+if not (len(functions)==6 and len(attempts)==1): raise AssertionError('inside ledger attempts differ per function: %r' % (ledger,))
+total=attempts.pop()[1]
+if not (type(total) is int and total>0 and total%2==0): raise AssertionError('inside ledger attempts not split per member: %r' % (total,))
+ledger_names(ledger,'inside')
 driven=6*(total//2)+7
-expected=[('inside parent',inside_pid,sys.argv[7]),('fork child',child_pid,sys.argv[8])]
+# The outside workload is the exclusion control: only a complete run
+# that drove its calls proves that its absence is an exclusion.
+outside_ledger=ledger_record(outside,'outside',outside_pid)
+if outside_ledger.get('complete') is not True: raise AssertionError('outside ledger incomplete: exclusion control unproven: %r' % (outside_ledger,))
+ledger_names(outside_ledger,'outside')
+for f in outside_ledger['functions']:
+    if field(f,'attempts',(int,),'outside ledger function attempts')!=outside_iters: raise AssertionError('outside ledger %s attempts %r, drove %d' % (f['name'],f['attempts'],outside_iters))
+expected=[('inside parent',inside_pid,sys.argv[8]),('fork child',child_pid,sys.argv[9])]
 # One typed record per published caller: identity, live state, final
 # authority and its edges with their exactness flags.
 callers={c['id']:c for c in report.get('callers',[])}

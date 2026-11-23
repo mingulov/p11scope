@@ -15120,6 +15120,232 @@ fn a_dead_stale_view_beside_a_live_newcomer_target_stays_loud() {
     );
 }
 
+/// Fix3 RED twin: a LIVE, unchanged view whose pin cannot prove its
+/// generation either way (no pidfd, no retained start time — the shape
+/// `open` yields under FD pressure with an unreadable `/proc`) aborts
+/// the candidate as stale, but the abort must NOT claim exit or change:
+/// a failed pin check is not exit/change evidence. It files the named
+/// unverified gap instead. Pre-fix this files the changed-generation
+/// pair for a live, unchanged process.
+#[test]
+fn candidate_unproven_pin_files_unverified_gap_not_changed() {
+    let (_fixture, view, module, pins) = loaded_seed_provider();
+    let id = view.id();
+    let pid = view.pid();
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the seed child is live and unchanged throughout"
+    );
+    let mut engine = Engine::empty();
+    // Swap the seed view for its unprovable shape: same ID, same live
+    // pid, no pin evidence either way.
+    engine.views.push(
+        crate::process::unprovable_process_view_for_test(id, pid)
+            .expect("an unprovable view over the live seed child"),
+    );
+    let mut candidate = engine
+        .live_candidate(pins, vec![module.clone()], Vec::new())
+        .expect("a seed candidate builds");
+    candidate.views.insert(id);
+    // Stage the seed's first attach target exactly like the loud guard:
+    // a non-empty delta forces the loud branch (the silence is for an
+    // empty delta over proven exits only).
+    let object = candidate
+        .pinned
+        .id_for_scanned(&module, module.key, &module.path)
+        .unwrap();
+    let owner = candidate
+        .plan
+        .modules
+        .iter()
+        .find(|summary| summary.object == object)
+        .unwrap()
+        .id;
+    let file_offset = ElfSnapshot::read(candidate.pinned.file_for(object).unwrap())
+        .unwrap()
+        .defined_symbol("C_GetFunctionList")
+        .unwrap()
+        .unwrap()
+        .file_offset;
+    let slot = candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module: owner,
+            object,
+            object_path: module.path.clone(),
+            file_offset,
+        })
+        .unwrap()
+        .unwrap();
+    candidate.delta.new.push(slot);
+    assert!(
+        !candidate.delta.new.is_empty(),
+        "the seed candidate carries an attach target for the stale view"
+    );
+    assert!(
+        !engine
+            .views
+            .iter()
+            .any(|view| view.id() == id && view.still_the_same()),
+        "the unprovable view reads stale"
+    );
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert!(
+        outcome.stale_views.contains(&id),
+        "the unprovable view aborts the apply as stale: {:?}",
+        outcome.stale_views
+    );
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the child is still live and unchanged after the abort"
+    );
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.reason
+                != "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "an unproven pin never claims exit or change: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery generation"
+                && skip.reason
+                    == "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged"
+        }),
+        "an unproven pin files the named unverified gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+/// Fix3 RED twin (inventory preflight): a newcomer that ends before the
+/// first preflight reads stale, but when its exit proof is unavailable
+/// (scripted pin failure — the fault injection the review used), the
+/// tick must NOT claim exit or change: it files the named unverified
+/// gap instead. Pre-fix this files the changed-generation pair without
+/// consulting proof at all.
+#[test]
+fn inventory_preflight_unproven_newcomer_files_unverified_gap_not_changed() {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[]);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut session = ScriptedSession::default();
+    // The preflight kills and reaps this child; the proof probe is
+    // scripted to fail, so the exit is real but unproven.
+    let pid = spawn_execed_sleep().id();
+    std::fs::write(dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+    session.lose_generations_at_preflight([Some(pid)]);
+    // Fault injection: the pin cannot judge this generation (poll
+    // failure). Pre-fix the preflight path never pops State answers.
+    engine
+        .pin_probe_script
+        .borrow_mut()
+        .extend([PinProbeAnswer::State(Some(Err(
+            "simulated pin poll failure".to_string(),
+        )))]);
+    refresh_inventory_with(&mut engine, &mut session);
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.reason
+                != "an exact retained or newly opened process generation changed during inventory preflight"
+        }),
+        "an unproven generation never claims exit or change: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live inventory generation"
+                && skip.reason
+                    == "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven"
+        }),
+        "an unproven generation files the named unverified gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.pin_probe_script.borrow().is_empty(),
+        "the preflight proof probe consumed its scripted answer: {:?}",
+        engine.pin_probe_script.borrow()
+    );
+}
+
+/// Fix3 RED twin (terminal dispatch): a structurally valid export record
+/// from a live, retained process that fails exact resolution in the
+/// terminal drain (unknown hook ID — the dispatch error the review's
+/// maps-failure example stands for) must file the terminal pair's own
+/// named row, never the generic discovery gap: a consumed record that
+/// failed exact resolution is not ambient noise. Pre-fix this files
+/// the shared live record-resolution pair, which qualifies as ambient.
+#[test]
+fn terminal_dispatch_failure_files_named_terminal_gap_not_generic() {
+    let (registry, context) = prepared_loader_registry();
+    let mut engine = Engine::empty();
+    engine.loader_registry = registry;
+    engine.loader_registry.mark_attached(context).unwrap();
+    engine.loader_registry.tombstone(context).unwrap();
+    engine.terminal_journal = Some(TerminalJournal {
+        owner: context,
+        dispatch_started: false,
+        retry_used: false,
+    });
+    engine.terminal_batch = Some(TerminalBatch::empty(TerminalAuthority {
+        owner: context,
+        exports: Vec::new(),
+    }));
+    let (view, _maps, mut record) = self_export_fixture(ProcessViewId(77001));
+    let pid = view.pid();
+    engine.views.push(view);
+    // The record stays structurally valid but names no private hook,
+    // so export lowering fails deterministically on a live process.
+    record.symbol_id = 0xFFFF;
+    assert!(
+        HookRegistry::builtin().by_id(record.symbol_id).is_none(),
+        "the corrupted hook ID names no private hook"
+    );
+    assert!(
+        valid_discovery_record(&record),
+        "the corrupted record stays structurally valid"
+    );
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the exporting process is live"
+    );
+    engine.retain_terminal_batch([record], true, 0).unwrap();
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    engine
+        .dispatch_terminal_batch(
+            &mut session,
+            &mut additions_allowed,
+            &mut PendingViewRetirements::new(),
+            &mut PauseClosure::new(true),
+        )
+        .expect("a failed terminal record is loss, never a batch error");
+    assert!(
+        !crate::process::generation_dead(pid),
+        "the exporting process is still live after the failed dispatch"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live terminal record"
+                && skip.reason == "a structurally valid terminal record failed exact resolution"
+        }),
+        "a failed terminal dispatch files the named terminal gap: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            !(skip.subject == "live discovery record"
+                && skip.reason
+                    == "a structurally valid private record failed exact live resolution")
+        }),
+        "a failed terminal dispatch never files the generic live pair: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// The H2 silence gate, case by case: all-dead reads silent; anything
 /// live, mixed, or unknown reads loud (fail-closed). Direct unit cover
 /// for the predicate the candidate test above wires through the apply.

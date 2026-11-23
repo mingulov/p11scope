@@ -20282,6 +20282,156 @@ pub(crate) mod tests {
         assert!(!text.contains("discovery step unavailable"), "{text}");
     }
 
+    /// Gap-noise fold: the three unverified-generation pairs project to
+    /// their own public row, which claims neither exit nor change. A
+    /// stale report the pin could not prove (poll failure, unreadable
+    /// `/proc`, missing custody, contradicted recheck) proves neither
+    /// event, so the pairs must never fold into the changed row; near
+    /// misses stay generic, and the text names the row with its count.
+    /// Fix3 RED twin: pre-fix these pairs project to generic.
+    #[test]
+    fn unverified_generation_pairs_project_to_their_own_row() {
+        use crate::discovery::scan::Skipped;
+        let pairs = [
+            (
+                "live discovery generation",
+                "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during inventory preflight; exit or change unproven",
+            ),
+            (
+                "live inventory generation",
+                "an exact retained or newly opened process generation was unverified during post-retirement preflight; exit or change unproven",
+            ),
+        ];
+        for (subject, reason) in &pairs {
+            let projected = capture_skipped_out(&Skipped {
+                subject: (*subject).into(),
+                reason: (*reason).into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason,
+                "process generation unverified mid-flight; not proven exited or changed",
+                "{subject} {reason}"
+            );
+            assert!(
+                !projected.reason.contains("exited") && !projected.reason.contains("changed"),
+                "an unproven generation is never called exited or changed: {}",
+                projected.reason
+            );
+        }
+        for (subject, reason) in [
+            (
+                "live discovery generation",
+                "candidate generation unverified before mutation",
+            ),
+            (
+                "live discovery generation",
+                "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged; pid 42",
+            ),
+            (
+                "process view",
+                "candidate generation unverified before mutation; exit or change unproven, canonical identity, plan, and links were unchanged",
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: subject.into(),
+                reason: reason.into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        let mut ev = evidence();
+        ev.skipped = pairs
+            .iter()
+            .map(|(subject, reason)| {
+                capture_skipped_out(&Skipped {
+                    subject: (*subject).into(),
+                    reason: (*reason).into(),
+                })
+            })
+            .collect();
+        ev.verdict();
+        assert_eq!(ev.skipped.len(), 3);
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains(
+                "process generation unverified mid-flight; not proven exited or changed: 3"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("discovery steps unavailable"), "{text}");
+        assert!(!text.contains("discovery step unavailable"), "{text}");
+    }
+
+    /// Gap-noise fold: the terminal record-resolution pair projects to
+    /// its own public row, never the generic redaction. A consumed
+    /// terminal record that failed exact resolution is a named loss,
+    /// not ambient noise; near misses stay generic, and the text names
+    /// the row with its count. Fix3 RED twin: pre-fix this pair
+    /// projects to generic and qualifies as ambient.
+    #[test]
+    fn terminal_record_pair_projects_to_its_own_row() {
+        use crate::discovery::scan::Skipped;
+        let terminal = capture_skipped_out(&Skipped {
+            subject: "live terminal record".into(),
+            reason: "a structurally valid terminal record failed exact resolution".into(),
+        });
+        assert_eq!(terminal.name, "discovery subject");
+        assert_eq!(
+            terminal.reason,
+            "terminal discovery record failed exact resolution"
+        );
+        for (subject, reason) in [
+            (
+                "live terminal record",
+                "a structurally valid terminal record failed exact resolution; pid 42",
+            ),
+            (
+                "live discovery record",
+                "a structurally valid terminal record failed exact resolution",
+            ),
+            (
+                "live terminal record",
+                "a structurally valid private record failed exact live resolution",
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped {
+                subject: subject.into(),
+                reason: reason.into(),
+            });
+            assert_eq!(projected.name, "discovery subject", "{subject} {reason}");
+            assert_eq!(
+                projected.reason, "discovery unavailable",
+                "{subject} {reason}"
+            );
+        }
+        // The pre-existing live pair keeps its generic row: this lane
+        // renames the terminal fault only.
+        let live = capture_skipped_out(&Skipped {
+            subject: "live discovery record".into(),
+            reason: "a structurally valid private record failed exact live resolution".into(),
+        });
+        assert_eq!(live.name, "discovery subject");
+        assert_eq!(live.reason, "discovery unavailable");
+        let mut ev = evidence();
+        ev.skipped = vec![terminal];
+        ev.verdict();
+        let text = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(
+            text.contains("terminal discovery record failed exact resolution: 1"),
+            "{text}"
+        );
+        assert!(!text.contains("discovery steps unavailable"), "{text}");
+        assert!(!text.contains("discovery step unavailable"), "{text}");
+    }
+
     /// Gap-noise fold: every work-ceiling wording projects to one
     /// public reason, whatever subject filed it — except a function
     /// subject, which keeps its entry row (the fold must never redact

@@ -18,6 +18,9 @@ import time
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skip_projection_fixture import assert_binary_row, check_row
+
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = ROOT / "scripts/public-cli-oracle.py"
 
@@ -88,66 +91,62 @@ UNCHECKED_INTERNAL_REASON = (
     "a provider only that process mapped was never discovered")
 
 
-# Every exact-pair fold matcher `capture_skipped_out` dispatches.
-# A fold guard below asserts its pair is accepted by exactly its
-# own matcher, so a reword that silently moves a pair to another
-# row — or drops it to generic — fails here.
-FOLD_MATCHERS = (
-    "is_mid_flight_pair",
-    "is_stale_deferral_pair",
-    "is_permission_refusal_pair",
-    "is_unreadable_not_checked_pair",
-    "is_loader_context_pair",
-)
+# The engine's unverified-generation marks (src/discovery/engine.rs
+# `unproven_generation_skip`): filed when a stale candidate or
+# inventory preflight cannot prove exit or change — the process may be
+# live and unchanged, so the failure proves neither event.
+UNVERIFIED_CANDIDATE_INTERNAL_REASON = (
+    "candidate generation unverified before mutation; "
+    "exit or change unproven, canonical identity, plan, and links "
+    "were unchanged")
+UNVERIFIED_PREFLIGHT_INTERNAL_REASON = (
+    "an exact retained or newly opened process generation was "
+    "unverified during inventory preflight; exit or change unproven")
+UNVERIFIED_POST_INTERNAL_REASON = (
+    "an exact retained or newly opened process generation was "
+    "unverified during post-retirement preflight; exit or change "
+    "unproven")
 
 
-def assert_fold_projects(internal_subject, internal_reason, matcher, const, pin_test):
-    """Prove an internal pair still folds to its public row.
+# The engine's terminal record-resolution mark (src/discovery/engine.rs
+# `dispatch_terminal_batch`): filed when a consumed terminal record
+# fails exact resolution — a named loss, never ambient noise.
+TERMINAL_INTERNAL_SUBJECT = "live terminal record"
+TERMINAL_INTERNAL_REASON = (
+    "a structurally valid terminal record failed exact resolution")
 
-    End-to-end over the real producer mapping, never matcher text
-    alone: the pair must be accepted by exactly its own matcher
-    (no other fold arm claims it, and the contains-folds cannot
-    either), and the `capture_skipped_out` dispatch must route
-    that matcher to the named public constant. Checking the
-    matcher text alone stays green when the projection is broken
-    — the dispatch arm removed or re-pointed — so this asserts
-    the dispatch result itself. `pin_test` names the render.rs
-    behavioral test that must still cover the row.
+
+# The new public rows this lane introduces, pinned by value: the
+# binary must emit exactly these bytes for the internal pairs above.
+# (The older rows below are read from the producer constants; the new
+# rows are pinned here so the twins fail pre-fix, before the producer
+# constants exist — and so a later reword must update the twins, the
+# producer, the schema, the checker and the oracle together.)
+UNVERIFIED_PUBLIC_ROW = {
+    "name": "discovery subject",
+    "reason": ("process generation unverified mid-flight; "
+               "not proven exited or changed"),
+}
+TERMINAL_PUBLIC_ROW = {
+    "name": "discovery subject",
+    "reason": "terminal discovery record failed exact resolution",
+}
+
+
+def binary_row(internal_subject, internal_reason, expected_name,
+               expected_reason, *, context):
+    """Project one internal pair through the real producer binary.
+
+    The pair goes to the `skip_projection_probe` example's stdin and
+    the public row comes back from its stdout; the row must exactly
+    equal the expected pair. A re-pointed, removed, or unreachable
+    projection arm changes the binary's bytes and fails here — source
+    text alone (matcher bodies, dispatch mentions, comments) cannot.
+    Returns the projected row as {"name": ..., "reason": ...}.
     """
-    render = producer_render_source()
-    assert "fn " + matcher in render, f"producer lost matcher {matcher}"
-    own = render.split("fn " + matcher, 1)[1].split("\n}", 1)[0]
-    assert internal_subject in own and internal_reason in own, \
-        f"producer stopped folding {internal_reason!r} in {matcher}"
-    for name in FOLD_MATCHERS:
-        if name == matcher or "fn " + name not in render:
-            # A matcher that does not exist cannot claim the pair;
-            # presence of every shipped matcher is pinned by its own
-            # guard's accept check above.
-            continue
-        section = render.split("fn " + name, 1)[1].split("\n}", 1)[0]
-        assert not (internal_subject in section and internal_reason in section), \
-            f"producer folded {internal_reason!r} into {name}"
-    body = render.split("pub fn capture_skipped_out", 1)[1].split("\n}\n", 1)[0]
-    assert matcher in body, \
-        f"projection lost its {matcher} dispatch arm"
-    arm = re.split(r"\}\s*else", body.split(matcher, 1)[1], 1)[0]
-    assert const in arm, \
-        f"projection no longer maps {matcher} to {const}"
-    scan = (ROOT / "src" / "discovery" / "scan.rs").read_text(encoding="utf-8")
-    ceiling = re.search(
-        r'WORK_CEILING_REASON: &str =\s*\n?\s*"((?:[^"\\]|\\.)*)"',
-        scan,
-    )
-    assert ceiling is not None, "work-ceiling constant missing from scan.rs"
-    assert ceiling.group(1) not in internal_reason, \
-        "the ceiling fold would swallow this pair"
-    assert not any(char.isdigit() for char in internal_reason), \
-        "the limit folds require digit counts this pair must never carry"
-    assert "fn " + pin_test in render, f"behavioral pin {pin_test} missing"
-    pin = render.split("fn " + pin_test, 1)[1].split("\n    }\n", 1)[0]
-    assert producer_const(const) in pin, \
-        f"behavioral pin {pin_test} no longer covers {const}"
+    return assert_binary_row(
+        internal_subject, internal_reason, expected_name, expected_reason,
+        context=context)
 
 
 def producer_render_source():
@@ -176,93 +175,100 @@ def producer_exit_row():
 
 
 def producer_deferral_row():
-    """The public stale-deferral row as the producer defines it today.
+    """The public stale-deferral row, from the real producer binary.
 
-    Built from the render.rs constants, never a pasted copy, so the
-    rejection twin below always judges the row the producer emits.
+    The engine's internal pair goes in and the binary's bytes come
+    back; they must equal the named producer row. The rejection twin
+    below always judges the row the producer emits, never source text.
     """
-    return {"name": producer_const("DISCOVERY_SUBJECT"),
-            "reason": producer_const("STALE_DEFERRAL_REASON")}
+    return binary_row(
+        "live discovery generation", LIVE_DEFERRAL_INTERNAL_REASON,
+        producer_const("DISCOVERY_SUBJECT"),
+        producer_const("STALE_DEFERRAL_REASON"),
+        context="live stale-deferral projection")
 
 
 def producer_permission_row():
-    """The public permission-refusal row as the producer defines it today.
+    """The public permission-refusal row, from the real producer binary.
 
-    Built from the render.rs constants, never a pasted copy, so the
-    rejection twin below always judges the row the producer emits.
+    The engine's internal pair goes in and the binary's bytes come
+    back; they must equal the named producer row. A re-pointed,
+    removed, or unreachable permission arm fails here.
     """
-    return {"name": producer_const("DISCOVERY_SUBJECT"),
-            "reason": producer_const("PERMISSION_REFUSAL_REASON")}
+    return binary_row(
+        "process view", PERMISSION_INTERNAL_REASON,
+        producer_const("DISCOVERY_SUBJECT"),
+        producer_const("PERMISSION_REFUSAL_REASON"),
+        context="permission-refusal projection")
 
 
 def producer_unchecked_row():
-    """The public unreadable-member row as the producer defines it today.
+    """The public unreadable-member row, from the real producer binary.
 
-    Built from the render.rs constants, never a pasted copy, so the
-    rejection twin below always judges the row the producer emits.
+    The engine's internal pair goes in and the binary's bytes come
+    back; they must equal the named producer row.
     """
-    return {"name": producer_const("DISCOVERY_SUBJECT"),
-            "reason": producer_const("UNREADABLE_NOT_CHECKED_REASON")}
+    return binary_row(
+        "process view", UNCHECKED_INTERNAL_REASON,
+        producer_const("DISCOVERY_SUBJECT"),
+        producer_const("UNREADABLE_NOT_CHECKED_REASON"),
+        context="unreadable-member projection")
+
+
+def producer_unverified_row():
+    """The public unverified-generation row, from the real binary.
+
+    All three internal pairs project to the one row; the candidate
+    pair stands for the twins (the Rust projection test pins all
+    three). The expected row is pinned by value above.
+    """
+    return binary_row(
+        "live discovery generation", UNVERIFIED_CANDIDATE_INTERNAL_REASON,
+        UNVERIFIED_PUBLIC_ROW["name"], UNVERIFIED_PUBLIC_ROW["reason"],
+        context="unverified-generation projection")
+
+
+def producer_terminal_row():
+    """The public terminal record-resolution row, from the real binary.
+
+    The expected row is pinned by value above: a consumed terminal
+    record that failed exact resolution is a named loss, never the
+    generic ambient row.
+    """
+    return binary_row(
+        TERMINAL_INTERNAL_SUBJECT, TERMINAL_INTERNAL_REASON,
+        TERMINAL_PUBLIC_ROW["name"], TERMINAL_PUBLIC_ROW["reason"],
+        context="terminal record-resolution projection")
 
 
 def assert_permission_refusal_still_folds():
     """Prove the permission-refusal mark still folds to its own row.
 
-    Fails loudly (never vacuously green) if the producer stops
-    filing the permission mark, stops folding it to the permission
-    row, folds it into another row, or breaks the projection
-    dispatch: any of those revisits these twins, since the
-    rejection below exists only because the refusal proves neither
-    exit nor change. The behavioral pin is
-    render::mid_flight_generation_pairs_project_to_split_public_reasons.
+    Runs the binary projection (which exact-matches the named row)
+    as a guard for twins that assume the split vocabulary. Fails
+    loudly if the producer stops folding the mark to its row.
     """
-    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
-    assert "UNREADABLE_PERMISSION_REASON" in engine, \
-        "producer stopped filing the permission-refusal mark"
-    assert_fold_projects(
-        "process view", PERMISSION_INTERNAL_REASON,
-        "is_permission_refusal_pair", "PERMISSION_REFUSAL_REASON",
-        "mid_flight_generation_pairs_project_to_split_public_reasons")
+    producer_permission_row()
 
 
 def assert_live_deferral_still_folds():
     """Prove the live stale-deferral mark still folds to its own row.
 
-    Fails loudly (never vacuously green) if the producer stops
-    filing the live mark, stops folding it to the deferral row,
-    folds it into another row, or breaks the projection dispatch:
-    any of those revisits these twins, since the rejection below
-    exists only because neither public row proves an exit. The
-    behavioral pin is
-    render::mid_flight_generation_pairs_project_to_split_public_reasons.
+    Runs the binary projection (which exact-matches the named row)
+    as a guard for twins that assume the split vocabulary. Fails
+    loudly if the producer stops folding the mark to its row.
     """
-    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
-    assert LIVE_DEFERRAL_INTERNAL_REASON in engine, \
-        "producer stopped filing the live stale-deferral mark"
-    assert_fold_projects(
-        "live discovery generation", LIVE_DEFERRAL_INTERNAL_REASON,
-        "is_stale_deferral_pair", "STALE_DEFERRAL_REASON",
-        "mid_flight_generation_pairs_project_to_split_public_reasons")
+    producer_deferral_row()
 
 
 def assert_unreadable_not_checked_still_folds():
     """Prove the unreadable-member mark still folds to its own row.
 
-    Fails loudly (never vacuously green) if the producer stops
-    filing the unreadable mark, stops folding it to the unreadable
-    row, folds it into another row, or breaks the projection
-    dispatch: any of those revisits these twins, since the
-    rejection below exists only because the failure proves neither
-    exit nor change. The behavioral pin is
-    render::unreadable_not_checked_pair_projects_to_its_own_row.
+    Runs the binary projection (which exact-matches the named row)
+    as a guard for twins that assume the split vocabulary. Fails
+    loudly if the producer stops folding the mark to its row.
     """
-    engine = (ROOT / "src" / "discovery" / "engine.rs").read_text(encoding="utf-8")
-    assert "UNREADABLE_UNCHECKED_REASON" in engine, \
-        "producer stopped filing the unreadable-member mark"
-    assert_fold_projects(
-        "process view", UNCHECKED_INTERNAL_REASON,
-        "is_unreadable_not_checked_pair", "UNREADABLE_NOT_CHECKED_REASON",
-        "unreadable_not_checked_pair_projects_to_its_own_row")
+    producer_unchecked_row()
 
 
 def inputs(*, metrics=False, scope="pid", calls=None, cell="profile-pid"):
@@ -1993,7 +1999,8 @@ class SystemAmbientGapTests(unittest.TestCase):
         # filed for a possibly still-live, unchanged process whose
         # read was denied), so an all-refusal list stays red at the
         # gap gate with exact owned counts and zero loss. The row
-        # under test comes from the producer's own constants.
+        # under test comes from the real producer binary projecting
+        # the engine's internal pair.
         permission_row = producer_permission_row()
         assert_permission_refusal_still_folds()
         self.assertNotIn("exited", permission_row["reason"],
@@ -2017,7 +2024,7 @@ class SystemAmbientGapTests(unittest.TestCase):
         # read failed for an unclassified reason), so an
         # all-unreadable list stays red at the gap gate with exact
         # owned counts and zero loss. The row under test comes from
-        # the producer's own constants.
+        # the real producer binary projecting the engine's pair.
         unchecked_row = producer_unchecked_row()
         assert_unreadable_not_checked_still_folds()
         self.assertNotIn("exited", unchecked_row["reason"],
@@ -2033,6 +2040,70 @@ class SystemAmbientGapTests(unittest.TestCase):
         result = self.run_case(mutate, cell="counter-counts-system", want=1)
         self.assertIn("lossy or unknown observation gap class",
                       result["detail"])
+
+    def test_unverified_ambient_with_unverified_only_fails_strict_counter_counts_system(self):
+        # Twin of the unreadable-row rejection for the metrics cell:
+        # the unverified row proves neither exit nor change (it is
+        # filed for a possibly still-live, unchanged process whose
+        # stale report the pin could not prove), so an
+        # all-unverified list stays red at the gap gate with exact
+        # owned counts and zero loss. The row under test comes from
+        # the real producer binary projecting the engine's pair.
+        unverified_row = producer_unverified_row()
+        self.assertNotIn("exited", unverified_row["reason"],
+                         "a live process is never called exited")
+        self.assertNotIn("changed", unverified_row["reason"],
+                         "an unchanged process is never called changed")
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [dict(unverified_row), dict(unverified_row),
+                                        dict(unverified_row)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="counter-counts-system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_terminal_ambient_with_terminal_only_fails_strict_counter_counts_system(self):
+        # Twin for the terminal record-resolution row on the metrics
+        # cell: a consumed terminal record that failed exact
+        # resolution is a named loss, not ambient noise, so an
+        # all-terminal list stays red at the gap gate. The row under
+        # test comes from the real producer binary. Control: the lone
+        # generic row still qualifies via the quiet arm
+        # (test_quiet_lone_skip_passes_strict_counter_counts_system).
+        terminal_row = producer_terminal_row()
+        def mutate(d, l, r):
+            d["evidence"]["skipped"] = [dict(terminal_row), dict(terminal_row),
+                                        dict(terminal_row)]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="counter-counts-system", want=1)
+        self.assertIn("lossy or unknown observation gap class",
+                      result["detail"])
+
+    def test_projection_check_rejects_generic_for_permission(self):
+        # Negative control for review mutation B (permission arm made
+        # unreachable, so the pair falls through to generic): the
+        # exact-match check the permission twin relies on must reject
+        # a generic row. Pure logic over its arguments, no Rust build.
+        with self.assertRaises(AssertionError):
+            check_row(("discovery subject", "discovery unavailable"),
+                      producer_const("DISCOVERY_SUBJECT"),
+                      producer_const("PERMISSION_REFUSAL_REASON"),
+                      context="negative control")
+
+    def test_projection_check_rejects_mislabeled_for_permission(self):
+        # Negative control for review mutation A (permission arm
+        # re-pointed at the changed row): the check must reject a
+        # changed row when the permission row is expected.
+        with self.assertRaises(AssertionError):
+            check_row((producer_const("DISCOVERY_SUBJECT"),
+                       producer_const("MID_FLIGHT_REASON")),
+                      producer_const("DISCOVERY_SUBJECT"),
+                      producer_const("PERMISSION_REFUSAL_REASON"),
+                      context="negative control")
 
     def test_quiet_lone_skip_passes_strict_metrics_cgroup(self):
         # Ambient-skip lane 2026-11-10: the quiet 6.18 vng leg shows

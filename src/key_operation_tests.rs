@@ -25863,6 +25863,83 @@ fn key_operation_reseed_refuses_after_proven_stuck_abandon() {
     );
 }
 
+/// The early probes gate by state without installing: a voided
+/// feed probes unhealthy right after a stuck-session abandon and
+/// healthy without one; unregistered keys probe false for both
+/// (nothing to reseed onto); a same-proof birth on an unbarred
+/// voided feed probes unbarred (the F6 retry path stays open).
+/// Barred-true and the pre-install wiring ride the heavy twins.
+#[test]
+fn key_operation_early_reseed_probes_gate_by_state() {
+    use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    guarded.observe(&joint_key, position, facts.clone());
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let input = AdmittedInstanceCall::scripted(joint_key.clone(), guarded.caller, position, facts);
+    assert!(
+        !guarded.registry.joint_reselect_unhealthy(&input),
+        "a voided feed probes healthy with no abandon behind it"
+    );
+    assert!(
+        !guarded
+            .registry
+            .joint_reselect_stuck_barred(&input, &bootstrap.proof()),
+        "a same-proof birth on an unbarred feed probes unbarred"
+    );
+    guarded.registry.reset_quantum_touched_feeds();
+    let _ = guarded
+        .registry
+        .discard_quantum_touched_staged(guarded.scene.adapter.ledger_mut());
+    assert!(
+        guarded.registry.joint_reselect_unhealthy(&input),
+        "the abandon trips the early unhealthy probe"
+    );
+    let (facts, position) =
+        guarded.admit_shape(&ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0));
+    let strange = AdmittedInstanceCall::scripted(guarded.key(9), guarded.caller, position, facts);
+    assert!(
+        !guarded.registry.joint_reselect_unhealthy(&strange),
+        "an unregistered key probes healthy (nothing to reseed)"
+    );
+    assert!(
+        !guarded
+            .registry
+            .joint_reselect_stuck_barred(&strange, &bootstrap.proof()),
+        "an unregistered key probes unbarred (nothing to reseed)"
+    );
+}
+
 /// A transiently failed fresh-evidence take is unknown, not
 /// negative: its delivery retries with staging and Joint mode intact
 /// (the next tick takes again) instead of falling the whole session

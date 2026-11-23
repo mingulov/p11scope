@@ -17252,13 +17252,27 @@ fn joint_machine_unhealthy_reseed_refuses_before_install() {
         Some(false),
         "the re-arm trips the health gate"
     );
+    // A real idle void ends the feed (the re-arm's own abandon
+    // discarded nothing, so its scoped break names no members).
+    // The void delivers at the next commit and queues the reseed;
+    // the rebirth arrives the quantum after, still inside the
+    // 3-pass unhealthy window (one publish ticks to 1).
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
     let installed_before = fixture
         .scene
         .real
         .scene
         .coordinator
         .joint_births_installed();
-    fixture.assert_recovers("unhealthy-early", 5);
+    fixture.assert_recovers("unhealthy-early-void", 5);
+    fixture.assert_recovers("unhealthy-early-rebirth", 6);
     assert_eq!(
         fixture
             .scene
@@ -17298,10 +17312,7 @@ fn joint_machine_unhealthy_reseed_refuses_before_install() {
         .instance_semantic_edges()
         .map(|record| record.feed.mode())
         .collect();
-    assert!(
-        !modes.is_empty(),
-        "the recovery quantum retains its feed"
-    );
+    assert!(!modes.is_empty(), "the recovery quantum retains its feed");
     assert!(
         modes
             .iter()

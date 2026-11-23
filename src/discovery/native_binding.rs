@@ -290,11 +290,13 @@ pub(crate) trait CallerLookup<Pin> {
     fn retained_callers(&self, _pid: u32) -> Vec<RetainedCaller> {
         Vec::new()
     }
-    /// The one retained incarnation of `pid` whose lifetime a kernel
-    /// leader-exit stamp closes (its `last_seen_ns` is that exit), in
-    /// any scope: no other process can hold a tgid while its leader
-    /// lives. The default is none.
-    fn exit_witnessed_caller(&self, _pid: u32) -> Option<RetainedCaller> {
+    /// The proven incarnation of `pid` whose kernel-witnessed leader
+    /// lifetime contains `event_ns`, as a retained snapshot whose
+    /// `first_seen_ns..last_seen_ns` is that proven interval (the
+    /// instant its leader was proven alive, then its own leader exit).
+    /// No other process can hold a tgid while its leader lives. The
+    /// default is none.
+    fn exit_witnessed_caller(&self, _pid: u32, _event_ns: u64) -> Option<RetainedCaller> {
         None
     }
 }
@@ -1337,6 +1339,12 @@ impl NativeBinder {
                         return None;
                     };
                     retained_candidate(only, row.recorded_at_ns).then_some(*only)
+                })
+                .or_else(|| {
+                    needs_retained
+                        .then(|| lookup.exit_witnessed_caller(row.host_tgid, row.recorded_at_ns))
+                        .flatten()
+                        .filter(|witnessed| retained_candidate(witnessed, row.recorded_at_ns))
                 });
             // A row without a read-time sighting or a retained
             // fallback joins the owed queue: the read-time lookup was
@@ -1428,7 +1436,7 @@ impl NativeBinder {
                     // general fallback's custody gate belongs to the
                     // row's own read.
                     let event_ns = pending.row.recorded_at_ns;
-                    if let Some(only) = lookup.exit_witnessed_caller(row_tgid)
+                    if let Some(only) = lookup.exit_witnessed_caller(row_tgid, event_ns)
                         && retained_candidate(&only, event_ns)
                     {
                         pending.retained = Some(only);

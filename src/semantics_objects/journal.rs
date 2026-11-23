@@ -22810,6 +22810,74 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_drained_return_covered_by_earlier_seal_keeps_loss() {
+        // A return the first seal already covered cannot complete in a
+        // later seal even with an empty window: the abandonment arrives
+        // after the model sealed past the observed return, so
+        // completing at the abandonment cut would rewrite sealed
+        // history. The drain keeps the counted loss.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        let mut scene = Scene::new(image_default());
+        let open = function_id("C_OpenSession");
+        let proof = scene.attest_function("C_OpenSession");
+        let begin = begin_bytes(1, 1, open, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let first = scene.seal(&bootstrap).expect("first seal passes");
+        assert_eq!(first.prefix.settled().len(), 1);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let second = scene.seal(&bootstrap).expect("second seal passes");
+        let drained = *second
+            .prefix
+            .settled()
+            .iter()
+            .find(|call| call.begin_cut == 1)
+            .expect("the drained call settles in its certification seal");
+        assert!(
+            drained.abandoned,
+            "a covered return keeps the loss across seals"
+        );
+        assert_eq!(
+            drained.end_cut, None,
+            "no completion without the order proof"
+        );
+        assert_eq!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .bounded_upper,
+            Some(2),
+            "the Ticket bound names the observed return"
+        );
+        assert!(
+            !second
+                .effects
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, ObjectEffect::SessionOpened { .. })),
+            "no session opens from a covered return: {:?}",
+            second.effects.effects
+        );
+        assert!(
+            scene.model.project().sessions.is_empty(),
+            "no session survives the covered drain"
+        );
+    }
+
+    #[test]
     fn object_journal_drained_lifecycle_recovers_when_sibling_precedes_return() {
         // Order-proof pass guard: a sibling close-all fully before
         // the observed return (both its cuts below the return

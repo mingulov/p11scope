@@ -22854,12 +22854,17 @@ fn key_operation_reseeded_segment_scattered_stuck_never_degrades() {
         bootstrap.closure_generation(),
     );
     assert!(staging.reselect_joint(&fresh), "the loss reseeds");
+    // Minute-scattered transients (20 s apart, past the 15 s window)
+    // never chain: healthy hosts keep Joint through rare interruptions.
+    // Trip-paced stuck (6 s apart) DOES chain now (see the trip-paced
+    // pin): audit no-progress trips fire every 6 s on seal-stuck
+    // sessions, and the old 5 s window broke every such streak.
     for ns in [
         0u64,
-        6_000_000_000,
-        12_000_000_000,
-        18_000_000_000,
-        24_000_000_000,
+        20_000_000_000,
+        40_000_000_000,
+        60_000_000_000,
+        80_000_000_000,
     ] {
         assert!(
             !staging.note_reseeded_stuck_pass(ns),
@@ -22867,9 +22872,17 @@ fn key_operation_reseeded_segment_scattered_stuck_never_degrades() {
         );
     }
     assert_eq!(staging.mode(), FeedMode::Joint);
-    for i in 0..4u64 {
-        staging.note_reseeded_stuck_pass(30_000_000_000 + i * 1_000_000_000);
+    for i in 0..3u64 {
+        assert!(
+            !staging.note_reseeded_stuck_pass(100_000_000_000 + i * 1_000_000_000),
+            "fresh streak {} keeps Joint",
+            i + 1
+        );
     }
+    assert!(
+        staging.note_reseeded_stuck_pass(103_000_000_000),
+        "the fourth consecutive stuck pass degrades"
+    );
     assert_eq!(staging.mode(), FeedMode::S1Only);
     assert!(!staging.reseed_eligible());
     for _ in 0..19 {
@@ -22881,6 +22894,78 @@ fn key_operation_reseeded_segment_scattered_stuck_never_degrades() {
     );
     staging.tick_reseed_cooldown();
     assert!(staging.reseed_eligible(), "the cooldown resumes next pass");
+}
+
+/// Trip-paced stuck degrades: audit no-progress trips fire every 6 s
+/// on seal-stuck sessions, so a reseeded segment abandoned trip after
+/// trip must chain its streak and degrade (live acc20m2: 5 s gaps
+/// broke every streak, the feed staged 800 calls a trip forever,
+/// and the lane died on the re-arm bound). Four 6 s-spaced stuck
+/// passes degrade; the 2.5-trip-period window still breaks
+/// minute-scattered transients (see the scattered pin).
+#[test]
+fn key_operation_reseeded_segment_trip_paced_stuck_degrades() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let mut failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    failure.fence = Some(1);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { .. }
+        ),
+        "H3 loss ends the segment: {outcome:?}"
+    );
+    let fresh = BootstrapReceipt::scripted(
+        bootstrap.proof(),
+        BirthKind::AttachObserved,
+        1,
+        bootstrap.closure_generation(),
+    );
+    assert!(staging.reselect_joint(&fresh), "the loss reseeds");
+    for (i, ns) in [0u64, 6_000_000_000, 12_000_000_000]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(
+            !staging.note_reseeded_stuck_pass(ns),
+            "trip-paced streak {} keeps Joint",
+            i + 1
+        );
+        assert_eq!(staging.mode(), FeedMode::Joint);
+    }
+    assert!(
+        staging.note_reseeded_stuck_pass(18_000_000_000),
+        "the fourth trip-paced stuck pass degrades"
+    );
+    assert_eq!(staging.mode(), FeedMode::S1Only);
 }
 
 /// A pristine Joint feed (never reseeded) never degrades through the

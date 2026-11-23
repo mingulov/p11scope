@@ -119,7 +119,7 @@ def extract_inventory_oracle():
 
 
 def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
-               generations=None):
+               generations=None, inside_wl=None, outside_wl=None):
     """Run the extracted oracle against a fixture report."""
     if generations is None:
         generations = (GENERATIONS[100], GENERATIONS[101])
@@ -128,8 +128,10 @@ def run_oracle(report, *, modfs, pin=None, modpath=MODPATH, ledger=None,
         pin = PIN
     if ledger is None:
         ledger = inside_ledger()
-    inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % ledger
-    outside_wl = "READY pid=102\nLEDGER y\n"
+    if inside_wl is None:
+        inside_wl = "READY pid=100\nCHILD pid=101\n%s\n" % ledger
+    if outside_wl is None:
+        outside_wl = "READY pid=102\nLEDGER y\n"
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         (tmp / "r.json").write_text(json.dumps(report))
@@ -1041,6 +1043,197 @@ class ExpectedTableTests(unittest.TestCase):
                              modfs="ext4", generations=(5000, ""))
         self.assertNotEqual(rc, 0, out)
         self.assertIn("fork child generation not recorded", out)
+
+
+def _ledger_with(functions):
+    return "LEDGER " + json.dumps({
+        "schema": "p11scope/public-cli-ledger/v1", "pid": 100,
+        "complete": True, "functions": functions})
+
+
+def _functions(attempts):
+    return [{"name": name, "attempts": attempt, "successful": attempt}
+            for name, attempt in zip(FUNCTIONS, attempts)]
+
+
+def _unbound_gap(**override):
+    gap = {"caller": None, "module": "m0", "pid": None,
+           "reason": unbound_reason(), "subject": UNBOUND_SUBJECT,
+           "repeats": 1}
+    gap.update(override)
+    return gap
+
+
+def _unproven_rows(report):
+    return [g for g in report["gaps"]
+            if (g.get("reason") or "").startswith("original_file_unproven")]
+
+
+class CheckCoverageTests(unittest.TestCase):
+    """Rows that each kill one oracle check (mutation sweep, round 6).
+
+    Every check in the oracle block has at least one row here or in the
+    expected table whose report fails only through that check."""
+
+    SHAPES = (("overlayfs", False), ("ext4", True))
+
+    REPORT_ROWS = [
+        ("wrong-schema", _set(["schema"], "p11scope/inventory/v0"),
+         "inventory schema"),
+        ("wrong-scope", _set(["scope"], "system"), "inventory scope"),
+        ("module-other-device", _set(["modules", 0, "identity", "device", "minor"], 47),
+         "owned provider not inventoried"),
+        ("module-other-inode", _set(["modules", 0, "identity", "inode"], 1),
+         "owned provider not inventoried"),
+        ("module-other-sha", _set(["modules", 0, "identity", "sha256"], "00" * 32),
+         "owned provider not inventoried"),
+        ("unbound-other-subject", _add_gaps(_unbound_gap(subject="used by someone")),
+         "inventory gaps about owned module"),
+        ("unbound-with-caller", _add_gaps(_unbound_gap(caller="c0")),
+         "inventory gaps about owned module"),
+        ("unbound-with-pid", _add_gaps(_unbound_gap(pid=100)),
+         "inventory gaps about owned module"),
+        ("unbound-other-prefix", _add_gaps(_unbound_gap(reason="X" + unbound_reason())),
+         "inventory gaps about owned module"),
+        ("unbound-other-suffix", _add_gaps(_unbound_gap(reason=unbound_reason() + "X")),
+         "inventory gaps about owned module"),
+        ("admission-note-same-length-path",
+         _add_gaps(_admission_note(reason="X" + MODPATH[1:] + ": admission changed from refused to admitted")),
+         "admission note attribution"),
+        ("admission-note-empty-reasons",
+         _add_gaps(_admission_note(reason=MODPATH + ": admission changed from refused to admitted ()")),
+         "admission note attribution"),
+        ("retained-other-subject",
+         _add_gaps(_deadline(), _retained(subject="native owner activation retained")),
+         "retained refresh attribution"),
+        ("deadline-other-subject",
+         _add_gaps(dict(_deadline(), subject="cgroup scope ended")),
+         "collection deadline attribution"),
+        ("deadline-caller-only", _add_gaps(dict(_deadline(), caller="c0")),
+         "collection deadline attribution"),
+        ("edge-witnessed-otherwise-exact",
+         _set(["edges", 1, "entries", "coverage", "state"], "witnessed"),
+         "fork child calls not counted exactly"),
+        ("callers-not-a-list", _set(["callers"], {}), "callers has type dict"),
+        ("caller-not-an-object", lambda r: r["callers"].append("c9"),
+         "caller has type str"),
+        ("caller-start-unit-int", _set(["callers", 1, "start_time_unit"], 1),
+         "caller start_time_unit has type int"),
+        ("modules-missing", _set(["modules"], _DELETE), "modules has type NoneType"),
+        ("module-not-an-object", lambda r: r["modules"].append(["m9"]),
+         "module has type list"),
+        ("edges-not-a-list", _set(["edges"], "e"), "edges has type str"),
+        ("edge-not-an-object", lambda r: r["edges"].append(None),
+         "edge has type NoneType"),
+        ("edge-entries-missing", _set(["edges", 1, "entries"], _DELETE),
+         "edge entries has type NoneType"),
+        ("edge-state-int", _set(["edges", 1, "entries", "coverage", "state"], 1),
+         "edge coverage state has type int"),
+        ("edge-lossy-string", _set(["edges", 1, "entries", "coverage", "lossy"], "false"),
+         "edge coverage lossy has type str"),
+        ("edge-observation-null", _set(["edges", 1, "entries", "observation"], None),
+         "edge observation has type NoneType"),
+        ("edge-saturated-null", _set(["edges", 1, "entries", "saturated"], None),
+         "edge saturated has type NoneType"),
+        ("edge-in-flight-missing", _set(["edges", 1, "entries", "in_flight"], _DELETE),
+         "edge in_flight has type NoneType"),
+        ("gaps-not-a-list", _set(["gaps"], None), "gaps has type NoneType"),
+        ("gap-not-an-object", lambda r: r["gaps"].append("gap"),
+         "gap has type str"),
+        ("gap-module-int", _set(["gaps", -1, "module"], 0), "gap module has type int"),
+        ("gap-reason-int", _set(["gaps", -1, "reason"], 7), "gap reason has type int"),
+    ]
+
+    LEDGER_ROWS = [
+        ("five-functions", _ledger_with(_functions([500] * 5)),
+         "inside ledger attempts differ per function"),
+        ("mixed-attempts", _ledger_with(_functions([500] * 5 + [498])),
+         "inside ledger attempts differ per function"),
+        ("odd-attempts", _ledger_with(_functions([501] * 6)),
+         "inside ledger attempts not split per member"),
+        ("zero-attempts", _ledger_with(_functions([0] * 6)),
+         "inside ledger attempts not split per member"),
+        ("string-attempts", _ledger_with(_functions(["500"] * 6)),
+         "inside ledger attempts not split per member"),
+    ]
+
+    def test_each_report_row_fails_on_every_substrate(self):
+        for name, mutate, marker in self.REPORT_ROWS:
+            for modfs, witness in self.SHAPES:
+                with self.subTest(row=name, modfs=modfs):
+                    report = deferred_recovered_report(modfs_witness=witness)
+                    mutate(report)
+                    rc, out = run_oracle(report, modfs=modfs)
+                    self.assertNotEqual(rc, 0, out)
+                    self.assertIn(marker, out)
+
+    def test_each_ledger_row_fails(self):
+        for name, ledger, marker in self.LEDGER_ROWS:
+            with self.subTest(row=name):
+                rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                                     modfs="ext4", ledger=ledger)
+                self.assertNotEqual(rc, 0, out)
+                self.assertIn(marker, out)
+
+    def test_one_character_admission_reason_passes(self):
+        # The reasons suffix needs at least one character in its parens.
+        for modfs, witness in self.SHAPES:
+            with self.subTest(modfs=modfs):
+                report = deferred_recovered_report(modfs_witness=witness)
+                _add_gaps(_admission_note(
+                    reason=MODPATH + ": admission changed from refused to admitted (x)"))(report)
+                rc, out = run_oracle(report, modfs=modfs)
+                self.assertEqual(rc, 0, out)
+
+    def test_real_workload_line_order_passes(self):
+        # cgroup-fork and the gated workload print their TARGET lines
+        # before READY; the pids come from the READY line, not line one.
+        target = ('TARGET {"name":"C_GenerateRandom","dev":[0,46],'
+                  '"ino":153887,"file_offset":4096}')
+        inside = "%s\nREADY pid=100\nCHILD pid=101\n%s\n" % (target, inside_ledger())
+        outside = "%s\nREADY pid=102\nLEDGER y\n" % target
+        rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                             modfs="ext4", inside_wl=inside, outside_wl=outside)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("inside=100 child=101 outside=102", out)
+
+    def test_duplicate_inside_ledger_fails(self):
+        wl = "READY pid=100\nCHILD pid=101\n%s\n%s\n" % (inside_ledger(), inside_ledger())
+        rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                             modfs="ext4", inside_wl=wl)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inside ledger missing", out)
+
+    def test_missing_outside_ledger_fails(self):
+        rc, out = run_oracle(deferred_recovered_report(modfs_witness=True),
+                             modfs="ext4", outside_wl="READY pid=102\n")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("outside ledger missing", out)
+
+    def test_overlay_without_unproven_rows_fails(self):
+        # On overlayfs the witness never runs, so the unproven cover is
+        # required even when no unproven row was published.
+        report = deferred_recovered_report(modfs_witness=True)
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("overlay unproven caller cover", out)
+
+    def test_partial_unproven_cover_off_overlay_fails(self):
+        # Any unproven row makes the report degraded on every
+        # filesystem, so its cover must be complete there too.
+        report = deferred_recovered_report()
+        report["gaps"] = [g for g in report["gaps"]
+                          if not (g in _unproven_rows(report) and g["caller"] == "c1")]
+        rc, out = run_oracle(report, modfs="ext4")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("overlay unproven caller cover", out)
+
+    def test_unproven_row_at_another_pid_fails(self):
+        report = deferred_recovered_report()
+        _unproven_rows(report)[0]["pid"] = 102
+        rc, out = run_oracle(report, modfs="overlayfs")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("overlay unproven pid", out)
 
 
 class NeverSettledTests(unittest.TestCase):

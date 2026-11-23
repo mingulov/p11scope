@@ -806,7 +806,8 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                      "privileged_profile_pid_prearm_twin_exact_window",
                      "privileged_trace_system_prearm_clean_exact_counts",
                      "privileged_profile_system_learned_provider_second_round_catches_oneshots",
-                     "privileged_trace_system_prearm_shared_provider_honest_accounting"):
+                     "privileged_trace_system_prearm_shared_provider_honest_accounting",
+                     "privileged_profile_system_learned_provider_private_mount_is_learned_and_counted"):
             with self.subTest(cell=cell):
                 self.assertIn(f"--require {cell}", job)
         self.assertNotIn("--expected-failure", job)

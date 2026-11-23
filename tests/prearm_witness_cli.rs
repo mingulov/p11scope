@@ -1461,3 +1461,455 @@ fn privileged_profile_system_learned_provider_second_round_catches_oneshots() {
         "first run must be a named gap"
     );
 }
+
+/// Two-phase private-mount-namespace loader. Usage:
+/// `loader MODULE GO_FILE LEDGER_FILE POST_CALLS`.
+/// Dlopens the module and issues one pre-attach `C_Initialize` (missed:
+/// no probe for this file can exist yet), prints `READY pid=N`, blocks
+/// until `GO_FILE` appears, issues `POST_CALLS` `C_GetInfo` calls plus
+/// one `C_Finalize`, writes one `LEDGER ...` line (post-GO calls only)
+/// to the ledger file and stdout, prints `DONE` and exits 0 (3 on any
+/// call-count drift or setup failure).
+const PRIVATE_LOADER_C: &str = r#"
+#define _POSIX_C_SOURCE 200809L
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+typedef unsigned long ck_ulong_t;
+typedef ck_ulong_t ck_rv_t;
+
+typedef ck_rv_t (*c_initialize_t)(void *);
+typedef ck_rv_t (*c_finalize_t)(void *);
+typedef ck_rv_t (*c_get_info_t)(unsigned char *);
+
+static void *need_symbol(void *handle, const char *name)
+{
+    dlerror();
+    void *symbol = dlsym(handle, name);
+    const char *error = dlerror();
+    if (error != NULL || symbol == NULL) {
+        fprintf(stderr, "private-loader: missing %s\n", name);
+        exit(3);
+    }
+    return symbol;
+}
+
+int main(int argc, char **argv)
+{
+    if (sizeof(unsigned long) != 8 || sizeof(void *) != 8) {
+        fprintf(stderr, "private-loader: LP64 only\n");
+        return 3;
+    }
+    if (argc != 5) {
+        fprintf(stderr, "usage: %s MODULE GO_FILE LEDGER_FILE POST_CALLS\n", argv[0]);
+        return 2;
+    }
+    const char *module = argv[1];
+    const char *go_file = argv[2];
+    const char *ledger_file = argv[3];
+    long post_calls = strtol(argv[4], NULL, 10);
+    if (post_calls < 1 || post_calls > 1000) {
+        fprintf(stderr, "private-loader: bad post-call count\n");
+        return 2;
+    }
+    void *handle = dlopen(module, RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+        fprintf(stderr, "private-loader: cannot open %s: %s\n", module, dlerror());
+        return 3;
+    }
+    c_initialize_t c_initialize = need_symbol(handle, "C_Initialize");
+    c_finalize_t c_finalize = need_symbol(handle, "C_Finalize");
+    c_get_info_t c_get_info = need_symbol(handle, "C_GetInfo");
+    ck_rv_t rv = c_initialize(NULL);
+    if (rv != 0) {
+        fprintf(stderr, "private-loader: C_Initialize failed: 0x%lx\n", rv);
+        return 3;
+    }
+    printf("READY pid=%d\n", (int)getpid());
+    fflush(stdout);
+    {
+        struct timespec wait5ms = { 0, 5000000 };
+        while (access(go_file, F_OK) != 0)
+            nanosleep(&wait5ms, NULL);
+    }
+    unsigned char info[256];
+    long get_info = 0;
+    for (long i = 0; i < post_calls; i++) {
+        memset(info, 0, sizeof info);
+        c_get_info(info);
+        get_info++;
+    }
+    rv = c_finalize(NULL);
+    if (rv != 0) {
+        fprintf(stderr, "private-loader: C_Finalize failed: 0x%lx\n", rv);
+        return 3;
+    }
+    FILE *ledger = fopen(ledger_file, "w");
+    if (!ledger) {
+        fprintf(stderr, "private-loader: cannot write ledger\n");
+        return 3;
+    }
+    fprintf(ledger, "LEDGER C_GetInfo=%ld C_Finalize=1\n", get_info);
+    fclose(ledger);
+    printf("LEDGER C_GetInfo=%ld C_Finalize=1\n", get_info);
+    printf("DONE\n");
+    fflush(stdout);
+    if (get_info != post_calls) {
+        fprintf(stderr, "private-loader: counts drifted\n");
+        return 3;
+    }
+    return 0;
+}
+"#;
+
+/// Compiles the private-namespace loader with the system compiler.
+fn build_private_loader(dir: &Path) -> PathBuf {
+    let src = dir.join("p28-private-loader.c");
+    std::fs::write(&src, PRIVATE_LOADER_C).expect("write loader source");
+    let out = dir.join("p28-private-loader");
+    let compile = Command::new("gcc")
+        .args(["-O2", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .arg("-ldl")
+        .output()
+        .expect("execute gcc for the loader");
+    assert!(
+        compile.status.success(),
+        "loader compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    out
+}
+
+/// A tmpfs mount that unmounts on drop, before the cell tempdir goes
+/// (declared after the tempdir, so it drops first).
+struct TmpfsMount {
+    path: PathBuf,
+}
+
+impl TmpfsMount {
+    fn mount(path: &Path) -> Self {
+        std::fs::create_dir_all(path).expect("private mnt dir");
+        let status = Command::new("mount")
+            .args(["-t", "tmpfs", "tmpfs"])
+            .arg(path)
+            .status()
+            .expect("spawn mount");
+        assert!(
+            status.success(),
+            "mount tmpfs at {}",
+            path.display()
+        );
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for TmpfsMount {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.path).status();
+    }
+}
+
+/// The private-mount verdict, factored out so its negative controls
+/// run unprivileged: the post-GO `C_GetInfo` total and `C_Finalize`
+/// for the private copy's sha, the pre-attach `C_Initialize` (which
+/// must stay missed), calls outside the ledger (spurious), the
+/// record's opens-before-staging tally, and the staged learned-file
+/// count.
+fn learned_private_mount_accepts(
+    caught_getinfo: u64,
+    caught_finalize: u64,
+    caught_init: u64,
+    spurious: u64,
+    pre_attach_loads: Option<u64>,
+    staged: Option<u64>,
+) -> bool {
+    caught_getinfo == 20
+        && caught_finalize == 1
+        && caught_init == 0
+        && spurious == 0
+        && pre_attach_loads == Some(1)
+        && staged.is_some_and(|staged| staged >= 1)
+}
+
+/// Negative controls for the verdict above: only the complete
+/// private-mount round may pass.
+#[test]
+fn learned_private_mount_oracle_requires_the_full_round() {
+    assert!(learned_private_mount_accepts(20, 1, 0, 0, Some(1), Some(1)));
+    assert!(!learned_private_mount_accepts(19, 1, 0, 0, Some(1), Some(1)));
+    assert!(!learned_private_mount_accepts(21, 1, 0, 0, Some(1), Some(1)));
+    assert!(!learned_private_mount_accepts(20, 0, 0, 0, Some(1), Some(1)));
+    assert!(!learned_private_mount_accepts(20, 1, 1, 0, Some(1), Some(1)));
+    assert!(!learned_private_mount_accepts(20, 1, 0, 1, Some(1), Some(1)));
+    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(0), Some(1)));
+    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(2), Some(1)));
+    assert!(!learned_private_mount_accepts(20, 1, 0, 0, None, Some(1)));
+    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(1), Some(0)));
+    assert!(!learned_private_mount_accepts(20, 1, 0, 0, Some(1), None));
+}
+
+/// A provider loaded from a private mount namespace (owner
+/// acceptance): a tmpfs the observer sees is mounted before the
+/// capture, so its superblock is marked at startup; the loader runs
+/// under `unshare -m`, so its mount table carries the clone mount
+/// with an ID the observer's table never holds. The learned staging
+/// must resolve that ID through the loading process's mount table —
+/// through the observer's table it reads "fd mount N is missing from
+/// the mount table" and the file is lost.
+///
+/// The loader is long-lived across staging on purpose: it issues one
+/// pre-attach call, waits for GO, and only then issues the twenty
+/// counted calls, so the verdict separates the named miss from the
+/// exact post-attach counts. The capture is `profile --system` with
+/// no `--module`: learning alone must find the file.
+#[test]
+#[ignore = "privileged: learned provider from a private mount namespace is learned and counted (root, BPF, SoftHSM, unshare, mount)"]
+fn privileged_profile_system_learned_provider_private_mount_is_learned_and_counted() {
+    fn next_line_within(capture: &mut GuardedChild, what: &str, within: Duration) -> String {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(pos) = capture.buf.iter().position(|b| *b == b'\n') {
+                let line = capture.buf.drain(..=pos).collect::<Vec<_>>();
+                return String::from_utf8(line).expect("child speaks UTF-8");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "{what} silent for {within:?}");
+            let mut pfd = libc::pollfd {
+                fd: capture.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll on our own pipe end.
+            let ready = unsafe { libc::poll(&mut pfd, 1, remaining.as_millis() as i32) };
+            assert!(ready > 0, "{what} silent for {within:?}");
+            if pfd.revents & libc::POLLIN == 0 {
+                panic!("{what}: pipe hung up");
+            }
+            let mut chunk = [0u8; 8192];
+            // SAFETY: chunked read into a stack buffer.
+            let got =
+                unsafe { libc::read(capture.fd.as_raw_fd(), chunk.as_mut_ptr().cast(), 8192) };
+            if got == 0 {
+                panic!("{what}: EOF (child status: {:?})", capture.try_wait());
+            }
+            if got < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "{what} read"
+                );
+                continue;
+            }
+            capture.buf.extend_from_slice(&chunk[..got as usize]);
+        }
+    }
+    fn wait_line(capture: &mut GuardedChild, what: &str, needle: &str) {
+        loop {
+            let line = next_line_within(capture, what, Duration::from_secs(300));
+            if line.contains(needle) {
+                return;
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("cell dir");
+    let conf = init_token(dir.path());
+    // Tmpfs mounted before the capture: the observer marks its
+    // superblock at startup. The loader's private namespace clones
+    // the mount with a new ID on the same superblock, so opens
+    // still queue events while the ID stays foreign.
+    let mnt = dir.path().join("mnt");
+    let _tmpfs = TmpfsMount::mount(&mnt);
+    // Brand-new provider file with a per-copy trailing nonce, so
+    // inode and sha256 are unique to the cell and counts for its sha
+    // can only come from this cell's loader.
+    let copy = mnt.join(format!("libprivatemnt-{}-p28.so", std::process::id()));
+    std::fs::copy(softhsm_path(), &copy).expect("copy provider to tmpfs");
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&copy)
+            .expect("open copy for append");
+        let mut trailer = [0u8; 256];
+        trailer[..8].copy_from_slice(&0x51u64.to_le_bytes());
+        trailer[8..12].copy_from_slice(&std::process::id().to_le_bytes());
+        file.write_all(&trailer).expect("append unseen bytes");
+    }
+    let loader = build_private_loader(dir.path());
+    let go = dir.path().join("GO");
+    let ledger = dir.path().join("ledger");
+
+    let out = dir.path().join("out.json");
+    let mut child = Command::new(bin())
+        .args([
+            "profile",
+            "--system",
+            "--duration",
+            "600",
+            "-o",
+            out.to_str().expect("utf8 out"),
+        ])
+        .env("P11SCOPE_CAPTURE_DIAGNOSTICS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn capture");
+    let stderr = child.stderr.take().expect("capture stderr");
+    let mut capture = GuardedChild::new(child, stderr);
+    wait_line(&mut capture, "capture ready", READY_LINE);
+
+    // The loader runs in a private mount namespace: no fork, so the
+    // child pid is the loader pid and kill-on-drop reaches it.
+    let mut loader_child = Command::new("unshare")
+        .args(["-m"])
+        .arg(&loader)
+        .arg(&copy)
+        .arg(&go)
+        .arg(&ledger)
+        .arg("20")
+        .env("SOFTHSM2_CONF", &conf)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn private-namespace loader");
+    let loader_pid = loader_child.id();
+    let loader_stdout = loader_child.stdout.take().expect("loader stdout");
+    let mut loader_guarded = GuardedChild::new(loader_child, loader_stdout);
+    let ready = loader_guarded.next_line("loader READY");
+    let ready_pid: u32 = ready
+        .strip_prefix("READY pid=")
+        .unwrap_or_else(|| panic!("loader ready: {ready:?}"))
+        .trim()
+        .parse()
+        .expect("loader ready pid");
+    assert_eq!(
+        ready_pid, loader_pid,
+        "unshare must exec the loader without forking"
+    );
+    // Twin preconditions, proved while the loader is still alive: it
+    // sits in another mount namespace, and its tmpfs mount ID is
+    // absent from the observer's table (the red shape) but present
+    // in its own (the fix's resolution source).
+    let observer_ns = std::fs::read_link("/proc/self/ns/mnt").expect("observer mount ns");
+    let loader_ns =
+        std::fs::read_link(format!("/proc/{loader_pid}/ns/mnt")).expect("loader mount ns");
+    assert_ne!(observer_ns, loader_ns, "the loader needs its own mount namespace");
+    let mnt_spelling = mnt.to_str().expect("utf8 mnt");
+    let loader_mounts =
+        std::fs::read_to_string(format!("/proc/{loader_pid}/mountinfo")).expect("loader mounts");
+    let loader_row = loader_mounts
+        .lines()
+        .find(|line| line.split_whitespace().nth(4) == Some(mnt_spelling))
+        .unwrap_or_else(|| panic!("loader mounts its tmpfs at {mnt_spelling}"));
+    let loader_mnt_id = loader_row.split_whitespace().next().expect("loader mount id");
+    let observer_mounts = std::fs::read_to_string("/proc/self/mountinfo").expect("observer mounts");
+    assert!(
+        !observer_mounts
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(loader_mnt_id)),
+        "the loader mount ID must be foreign to the observer: {loader_mnt_id}"
+    );
+
+    // Wait for the learning event itself (the diagnostics staging line
+    // names the copy), then a few ordinary frames for the expedited
+    // attach, so the post-GO calls measure steady-state catching.
+    wait_line(&mut capture, "learned staging", "libprivatemnt-");
+    std::thread::sleep(Duration::from_secs(10));
+    std::fs::write(&go, b"go\n").expect("release the loader");
+    let done = loop {
+        let line = next_line_within(&mut loader_guarded, "loader DONE", Duration::from_secs(60));
+        if line.contains("DONE") {
+            break line;
+        }
+    };
+    assert!(done.contains("DONE"), "loader finishes: {done:?}");
+    let status = loader_guarded.wait_expect("loader exit");
+    assert!(status.success(), "loader exits clean: {status}");
+    let driven = read_ledger_file(&ledger);
+    assert_eq!(
+        driven.get("C_GetInfo").copied().unwrap_or(0),
+        20,
+        "the loader issued its post-GO calls: {driven:?}"
+    );
+    // Operator stop: the report must still be written (data-always).
+    // SAFETY: signalling our own capture child.
+    assert_eq!(
+        unsafe { libc::kill(capture.child.id() as i32, libc::SIGINT) },
+        0,
+        "signal capture"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    let status = loop {
+        if let Some(status) = capture.try_wait() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "capture would not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        status.success() || status.code() == Some(130),
+        "capture exits clean or as an operator interrupt: {status}"
+    );
+    let text = std::fs::read_to_string(&out).expect("read profile");
+    let profile: serde_json::Value = serde_json::from_str(&text).expect("profile is JSON");
+
+    let record = module_record(&profile, &copy);
+    let calls = function_calls(&profile, record_sha256(record));
+    let caught_getinfo = calls.get("C_GetInfo").copied().unwrap_or(0);
+    let caught_finalize = calls.get("C_Finalize").copied().unwrap_or(0);
+    let caught_init = calls.get("C_Initialize").copied().unwrap_or(0);
+    let spurious: u64 = calls
+        .iter()
+        .filter(|(name, _)| *name != "C_GetInfo" && *name != "C_Finalize")
+        .map(|(_, count)| count)
+        .sum();
+    // The provider is listed with the program that first loaded it.
+    let first = record
+        .get("first_loaded_by")
+        .unwrap_or_else(|| panic!("learned module names its first loader: {record}"));
+    let exe = first.get("exe").and_then(|exe| exe.as_str());
+    let unknown = first
+        .get("exe_unknown_reason")
+        .and_then(|reason| reason.as_str());
+    assert!(
+        exe.is_some_and(|exe| exe.ends_with("p28-private-loader"))
+            || unknown == Some("loader exe link unreadable"),
+        "first loader named or finitely unknown: {first}"
+    );
+    let pre_attach_loads = first
+        .get("pre_attach_loads")
+        .and_then(|loads| loads.as_u64());
+    let staged = profile["evidence"]["learned_staged_files"].as_u64();
+    assert!(
+        learned_private_mount_accepts(
+            caught_getinfo,
+            caught_finalize,
+            caught_init,
+            spurious,
+            pre_attach_loads,
+            staged
+        ),
+        "every post-GO call must be counted and the pre-attach call stays \
+         a named miss; C_GetInfo for the copy = {caught_getinfo}, \
+         C_Finalize = {caught_finalize}, C_Initialize = {caught_init} \
+         (all calls: {calls:?}), pre_attach_loads = {pre_attach_loads:?}, \
+         staged = {staged:?} (evidence: {})",
+        profile["evidence"]
+    );
+    // The first use is a named miss, not silent.
+    assert!(
+        text.contains("learned provider file") && text.contains("learned after its first use"),
+        "first use must be a named gap"
+    );
+}

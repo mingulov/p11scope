@@ -82,8 +82,6 @@ pub(crate) enum GenerationUnproven {
     /// The pin re-reads Current: the stale report was contradicted (a
     /// transient poll error ahead of a successful recheck).
     Contradicted,
-    /// Any other unclassified failure.
-    Unknown,
 }
 
 /// The three sites that may file the changed-generation label, each
@@ -143,8 +141,7 @@ pub(crate) fn unproven_generation_skip(
         GenerationUnproven::PinFailure
         | GenerationUnproven::PermissionDenied
         | GenerationUnproven::MissingCustody
-        | GenerationUnproven::Contradicted
-        | GenerationUnproven::Unknown => {}
+        | GenerationUnproven::Contradicted => {}
     }
     let (subject, reason) = match site {
         ChangedGenerationSite::Candidate => (

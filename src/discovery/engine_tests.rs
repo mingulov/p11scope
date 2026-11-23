@@ -15726,8 +15726,7 @@ fn inventory_preflight_mixed_set_files_both_rows_at_both_sites() {
     let dead_view = ProcessView::open(retained_id, dead_pid).unwrap();
     dead.kill().unwrap();
     dead.wait().unwrap();
-    let live = spawn_execed_sleep();
-    let live_pid = live.id();
+    let live_pid = spawn_execed_sleep().id();
     let newcomer_id = ProcessViewId(1);
     let newcomer = crate::process::unprovable_process_view_for_test(newcomer_id, live_pid)
         .expect("an unprovable newcomer over the live child");

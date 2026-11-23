@@ -744,10 +744,6 @@ impl ProcessView {
         self.pin.original_generation_state()
     }
 
-    pub(crate) fn original_discovery_state(&self) -> Result<OriginalGenerationState, String> {
-        self.pin.original_discovery_state()
-    }
-
     /// Whether this view's original thread group has exited or can never
     /// run user code again (see `PidPin::final_exit_in_progress`).
     pub(crate) fn final_exit_in_progress(&self) -> bool {

@@ -1499,17 +1499,17 @@ struct OpenEntry {
     /// Whether a drained corroborated return already converted (the
     /// `end_converted` twin for abandonment-carried completions): a
     /// held sibling keeps the entry staged past its first seal, and
-    /// the terminal must not complete twice.
-    drained_converted: bool,
-    /// The committed completion cut of a converted drain (its
-    /// abandonment ordinal, set together with `drained_converted`).
+    /// the terminal must not complete twice. A converted drain reuses
+    /// its abandonment ordinal as the committed completion cut:
+    /// abandonment stages once (a re-stage is a `DuplicateTerminal`
+    /// contradiction), so the ordinal cannot change after conversion.
     /// Prune, frozen replay, fence and later terminals reuse this
     /// committed result instead of re-running the order proof, whose
     /// sealed-frontier check flips once this seal advances. Retention
     /// follows the model need (single owner): a converted drain retires
     /// at the settlement watermark like an END, never via the raw
     /// abandonment arm, and never mints a second loss.
-    drained_cut: Option<u64>,
+    drained_converted: bool,
     converted_ticket: Option<CallToken>,
     converted_for: Option<JournalDomainKey>,
     end_converted: bool,
@@ -2618,7 +2618,6 @@ impl JournalAdapter {
             entry.converted_for = None;
             entry.end_converted = false;
             entry.drained_converted = false;
-            entry.drained_cut = None;
             entry.corroborated_return = None;
             entry.raw_resource = None;
             entry.collected_origin = None;
@@ -3166,7 +3165,6 @@ impl JournalAdapter {
                 corroborated_returned: ReturnedWords::default(),
                 negative_return: false,
                 drained_converted: false,
-                drained_cut: None,
                 converted_ticket: None,
                 converted_for: None,
                 end_converted: false,
@@ -9512,8 +9510,9 @@ impl JournalAdapter {
     /// the actual return carries lifecycle authority (negative returns,
     /// pending or ambiguous outcomes), and effect-free neutral returns
     /// replay anywhere. A drain without its proof keeps the bounded loss.
-    /// An empty window orders the replay by the proven drain order with
-    /// session incarnations allocating in true order.
+    /// An empty window means no same-image history sits between the
+    /// observed return and the abandonment, so completing at the
+    /// abandonment cut cannot move the call past dependent history.
     ///
     /// Window dispositions derive once per frontier (see
     /// [`Self::ensure_drain_proofs`]) from the incremental per-image
@@ -9530,9 +9529,7 @@ impl JournalAdapter {
         frontier: u64,
     ) -> Option<u64> {
         if entry.drained_converted {
-            return entry
-                .drained_cut
-                .or_else(|| entry.abandon.map(|staged| staged.ordinal));
+            return entry.abandon.map(|staged| staged.ordinal);
         }
         let staged = entry.abandon.filter(|staged| {
             staged.ordinal <= frontier
@@ -10221,7 +10218,6 @@ impl JournalAdapter {
                         }
                         let staged_entry = self.open.get_mut(&native).expect("staged terminal");
                         staged_entry.drained_converted = true;
-                        staged_entry.drained_cut = Some(at);
                     }
                     // A drained return is a completion, not a loss: no
                     // bounded upper is retained for it.

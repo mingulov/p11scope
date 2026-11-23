@@ -786,6 +786,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Leader exits already recorded as link loss (H6 slice 2): one entry
     /// per incarnation at most, never cleared (IDs never reuse).
     leader_link_loss_noted: BTreeSet<CallerId>,
+    /// Kernel-stamped leader exits per pid (F7 clocks only): the
+    /// earliest `LEADER_EXIT` hook at or after an incarnation's
+    /// admission, keyed by pid then caller. While the leader lived no
+    /// other process could hold its tgid, so a row stamped inside
+    /// `[admission, exit)` is that caller's even outside PID scope. One
+    /// entry per retained record at most; removed when its record folds.
+    leader_exit_witness: HashMap<u32, Vec<(CallerId, u64)>>,
     pending_leader_exits: BTreeMap<CallerId, leader_exit::PendingLeaderExit<Source::Pin>>,
     leader_exit_cursor: Option<CallerId>,
     /// Whether BPF hook timestamps and observer admission stamps share
@@ -1212,6 +1219,11 @@ fn collapse_hint_misses(
 struct RetainedGate<'a, Source: ProcessSource> {
     adapter: &'a CallerAdapter<Source>,
     allowed: bool,
+    /// Kernel leader-exit stamps per pid: outside the gate, the one
+    /// retained holder of a pid with a witnessed exit still resolves,
+    /// its lifetime ending at that exit (never at the later reconcile
+    /// that observed it), so a reused pid can never fall inside it.
+    exit_witness: &'a HashMap<u32, Vec<(CallerId, u64)>>,
 }
 
 impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, Source> {
@@ -1223,8 +1235,24 @@ impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, S
         if self.allowed {
             CallerLookup::retained_callers(self.adapter, pid)
         } else {
-            Vec::new()
+            self.exit_witnessed_caller(pid).into_iter().collect()
         }
+    }
+
+    fn exit_witnessed_caller(&self, pid: u32) -> Option<RetainedCaller> {
+        let stamps = self.exit_witness.get(&pid)?;
+        let held = CallerLookup::retained_callers(self.adapter, pid);
+        let [only] = held.as_slice() else {
+            return None;
+        };
+        stamps
+            .iter()
+            .find(|(id, _)| *id == only.id)
+            .map(|&(_, exit_ns)| RetainedCaller {
+                last_seen_ns: exit_ns,
+                retired: true,
+                ..*only
+            })
     }
 }
 
@@ -1423,6 +1451,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             folded_terminal_without_joins: 0,
             pending_successors: BTreeMap::new(),
             leader_link_loss_noted: BTreeSet::new(),
+            leader_exit_witness: HashMap::new(),
             pending_leader_exits: BTreeMap::new(),
             leader_exit_cursor: None,
             exit_clocks_comparable: exit_clocks_comparable(),
@@ -6030,6 +6059,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
                 self.registry.compact_folded_caller(id);
                 self.leader_link_loss_noted.remove(&id);
+                self.forget_leader_exit_witness(record.pid, id);
                 self.staged_retirements.remove(&id);
                 self.retired_caller_rows = self.retired_caller_rows.saturating_add(1);
                 if folded_caller.with_calls {
@@ -8155,6 +8185,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let gate = RetainedGate {
                     adapter: &self.adapter,
                     allowed: self.retained_fallback_allowed(&batch),
+                    exit_witness: &self.leader_exit_witness,
                 };
                 // An incomplete re-sight pass resumes on the next
                 // witness batch (the owed attempts persist in the
@@ -8254,6 +8285,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .retain(|key, _| key.image.domain() != domain);
     }
 
+    /// Stamps the kernel leader exit `hook_ts_ns` on the incarnation of
+    /// `pid` that held the tgid at that instant: the latest admitted at
+    /// or before the hook, live or already retired (reconcile may retire
+    /// an exited caller before its exit record drains). Only the
+    /// earliest hook after an admission is that caller's own exit; a
+    /// later one may be a reused pid's. Without comparable clocks the
+    /// hook cannot be ordered against admissions and stamps nothing.
+    fn note_leader_exit_witness(&mut self, pid: u32, hook_ts_ns: u64) {
+        if !self.exit_clocks_comparable {
+            return;
+        }
+        let Some(holder) = self
+            .adapter
+            .records()
+            .filter(|record| record.pid == pid && record.admitted_ns <= hook_ts_ns)
+            .max_by_key(|record| record.admitted_ns)
+            .map(|record| record.id)
+        else {
+            return;
+        };
+        let stamps = self.leader_exit_witness.entry(pid).or_default();
+        match stamps.iter_mut().find(|(id, _)| *id == holder) {
+            Some((_, exit_ns)) => *exit_ns = (*exit_ns).min(hook_ts_ns),
+            None => stamps.push((holder, hook_ts_ns)),
+        }
+    }
+
+    fn forget_leader_exit_witness(&mut self, pid: u32, id: CallerId) {
+        if let Some(stamps) = self.leader_exit_witness.get_mut(&pid) {
+            stamps.retain(|(held, _)| *held != id);
+            if stamps.is_empty() {
+                self.leader_exit_witness.remove(&pid);
+            }
+        }
+    }
+
     /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
     /// pin still holds is link loss, not death — record it once, keep the
     /// original custody, and make no permanent dead tombstone. A later EXEC
@@ -8280,6 +8347,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             }
             let pid = (record.pid_tgid >> 32) as u32;
+            self.note_leader_exit_witness(pid, record.hook_ts_ns);
             let Some(caller) = self.adapter.live_id(pid) else {
                 continue;
             };
